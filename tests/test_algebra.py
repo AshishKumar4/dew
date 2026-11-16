@@ -318,10 +318,11 @@ def test_literals_keep_their_exact_values_and_types():
         np.testing.assert_array_equal(np.asarray(given), np.asarray(got))
 
 
-def test_a_values_products_by_two_literals_are_one_product_by_their_sum():
-    """`a * 2 + a * 4`, whose only bounded terms are its literals, is `a * 6`: one product, exactly."""
+def test_a_bounded_values_products_by_two_literals_are_one_product_by_their_sum():
+    """`t * 2 + t * 4` of a bounded `t` is `t * 6`: one product, exactly, its bound under the reach."""
     def doubled(a):
-        return a * 2.0 + a * 4.0
+        bounded = jnp.tanh(a)
+        return bounded * 2.0 + bounded * 4.0
 
     (a,) = rows(8, (8, 64))
     assert cheaper_spliced(doubled, a)
@@ -445,6 +446,25 @@ def test_recognition_reads_a_program_inside_any_call_as_the_program(call):
     both = canonical(jax.make_jaxpr(lambda x, scale: (wrapped(scale)(x), program(x, scale)))(
         jnp.linspace(-1.0, 1.0, 8), jnp.float32(0.5)))
     assert both.outvars[0] is both.outvars[1]
+
+
+@pytest.mark.parametrize("shape", [(0, 4), (3, 4)], ids=["empty", "rows"])
+def test_constants_folded_over_broadcasts_compute_the_program(shape):
+    """A program adding constants that broadcast against each other (zeros over `shape`, ones over one row,
+    each written whole, then a row's iota broadcast over every row) to its input: recognition's normal form
+    (`canonical`, which folds the constants over their compact forms, row 6799) computes the program's
+    value, an empty program's among them, whose zero rows beside one row broadcast to none."""
+    from jax.core import eval_jaxpr
+
+    from dew.algebra.normal_form import canonical
+
+    def program(x):
+        rows = jax.lax.broadcasted_iota(jnp.float32, (1, 4), 1)
+        return x + (jnp.zeros(shape) + jnp.ones((1, 4))) * jnp.broadcast_to(rows, shape)
+
+    x = jnp.arange(np.prod(shape), dtype=jnp.float32).reshape(shape)
+    form = canonical(jax.make_jaxpr(program)(x))
+    np.testing.assert_array_equal(np.asarray(eval_jaxpr(form, (), x)[0]), np.asarray(program(x)))
 
 
 COMPLEX_EDGES = [complex(-0.0, -0.0), complex(1.5, -0.0), complex(-0.0, 2.0), complex(np.inf, 2.0),

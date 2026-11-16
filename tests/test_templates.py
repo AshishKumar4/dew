@@ -117,11 +117,18 @@ def test_a_templates_configs_are_the_ones_a_block_of_the_device_holds():
 
 
 def test_a_call_no_config_holds_is_refused_naming_its_bytes_and_the_budget():
+    """A call no config of the launch fits, made or derived, is refused naming the least any config stages
+    and the block's budget (`Unfitted`), where the call itself raised a bare `report.Exhausted` (train 929
+    F3)."""
     op = Doubling()
-    with generation.assumed("sm86"), pytest.raises(Unfitted) as refused:
-        op._get_heuristics_config(bound(op, width=8192))
-    assert (refused.value.least, refused.value.budget, refused.value.generation) == (
-        262144, 99 * 1024, "sm86")
+    x = jax.ShapeDtypeStruct((4096, 8192), jnp.float32)
+    with generation.assumed("sm86"):
+        for refuse in (lambda: op._get_heuristics_config(bound(op, width=8192)),
+                       lambda: jax.eval_shape(op, x)):
+            with pytest.raises(Unfitted) as refused:
+                refuse()
+            assert (refused.value.least, refused.value.budget, refused.value.generation) == (
+                262144, 99 * 1024, "sm86")
 
 
 @dataclasses.dataclass(frozen=True)

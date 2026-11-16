@@ -296,9 +296,9 @@ class CompressedEntries(FakeQuantizing):
         dense = functools.partial(Dense, use_bias=False, dtype=projected, precision=self.precision,
                                   dot_general=float32_dot_general)
         # The entry width or twice it: nothing to shard on the output side.
-        self.kv_proj = dense(series * self.width, name='kv_proj', kernel_axes=('embed', None))
+        self.kv_proj = dense(series * self.width, name='kv_proj', kernel_axes=('embed', 'head_dim'))
         if self.gated:
-            self.gate_proj = dense(series * self.width, name='gate_proj', kernel_axes=('embed', None))
+            self.gate_proj = dense(series * self.width, name='gate_proj', kernel_axes=('embed', 'head_dim'))
             if self.position_bias:
                 self.bias = self.param(
                     'position_bias', nn.initializers.zeros, (self.rate, series * self.width), jnp.float32)
@@ -672,7 +672,7 @@ class DeepseekV4Attention(FakeQuantizing):
         self.q_b_proj = dense(self.num_heads * self.head_dim, name='q_b_proj',
                               kernel_axes=('qlora', 'attention'))
         # One shared key/value head: nothing to shard on the output side.
-        self.kv_proj = dense(self.head_dim, name='kv_proj', kernel_axes=('embed', None))
+        self.kv_proj = dense(self.head_dim, name='kv_proj', kernel_axes=('embed', 'head_dim'))
         self.kv_norm = norm(name='kv_norm')
         # Block-diagonal over the head groups: one `[g, in, o_lora_rank]` kernel, the group its
         # batch dim (`DeepseekV4GroupedLinear`, modeling_deepseek_v4.py:294-323, whose weight
@@ -1091,6 +1091,17 @@ class DeepseekV4Mixer(MixerBase):
     """
 
     residuals = ATTENTION_CONTEXT_RESIDUALS
+
+    def fork_refusal(self) -> str | None:
+        """Why the layer reads no forks (`MixerBase.fork_refusal`): its compressed kinds pool a document's
+        keys into windows of `compress_rate` (HCA, CSA, CSA2), each document's own (`document_windows`), and
+        its indexer selects among them, so a fork's document would need its pooling and its visibility to
+        continue over its ancestors' windows, its parent's partial window among them, which no path
+        builds; its window and full kinds read no forks as any mixer that declares none does."""
+        if self.compressor is not None:
+            return (f"a DeepSeek V4 {self.compressor} layer pools each document's own windows of keys, which "
+                    "no path continues over a fork's ancestors")
+        return super().fork_refusal()
 
     q_lora_rank: int = 1024
     o_groups: int = 8

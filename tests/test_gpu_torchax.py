@@ -4,6 +4,7 @@ no process with the torch-using ones (`gpu_flow`):
 
 - A float32 torchax model's logits and its output tables are as exact as torch's under the GPU's TF32
   default (test_torchax_fallback).
+- A tier-3 source loads and runs in a process of the GPU alone, with no CPU backend (test_torchax_fallback).
 """
 
 import pytest
@@ -18,5 +19,7 @@ def test_the_torchax_fallback_runs_on_the_gpu(tmp_path):
     run_cells([
         Cell("a float32 torchax model's logits and output tables are as exact as torch's (TF32)",
              lambda: fallback.a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(
-                 tmp_path)),
+                 tmp_path / "exact")),
+        Cell("a tier-3 source runs in a process with no CPU backend",
+             lambda: fallback.a_tier_three_source_runs_in_a_process_with_no_cpu_backend(tmp_path / "alone")),
     ])

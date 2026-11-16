@@ -50,7 +50,7 @@ and `tiny_inputs`, which that file's registry-wide parametrization needs.
 import dataclasses
 import functools
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import NamedTuple
 
 import jax
@@ -425,6 +425,59 @@ def _greedy(programs: _Served, variables, tokens, forced=None, decided=None):
     return cache, jnp.stack(drawn, axis=1), scores, roundings
 
 
+def _margined_prompts(name: str, call: tuple) -> jax.Array:
+    """`ROWS` prompts of `LENGTH` tokens in `name`'s vocabulary whose float64 greedy walk through its cache
+    (the `wide` programs) selects each of its `STEPS` tokens by more than `MARGIN` of its logits' scale
+    (`top_margin`), and whose every discontinuous selection over the prompt and its draws (a mixture's
+    routing, a lightning indexer's top-k, `selection_margins.margin` of the float64 forward over them,
+    each position's as its decode step selects it) clears `MARGIN` too: the first such draw from seed 0
+    (`clearing`), so a float32 run of either cache shape selects as it does (testing.md, a selection
+    compared across programs)."""
+    import selection_margins
+    from selection_margins import MARGIN, clearing, top_margin
+
+    source = loaded(name)
+    wide, variables = _programs(name, "wide", call), widened(source.variables)
+    config, method = _decoder_selecting(name, source)
+    captured = (selection_margins.capture(float64_twin(source.model), method=method)
+                if selection_margins.selects(config) else None)
+
+    def draw(key):
+        rng = np.random.default_rng([0x6693, key])
+        return rng.integers(0, source.model.vocab_size, (ROWS, LENGTH)).astype(np.int32)
+
+    def clears(prompts) -> bool:
+        with jax.enable_x64(new_val=True):
+            _, drawn, scores, _ = _greedy(wide, variables, prompts)
+            walked = jnp.concatenate([jnp.asarray(prompts), drawn[:, :-1]], axis=1)
+            selections = None if captured is None else captured(variables, walked)
+        if not all(float(np.min(top_margin(np.asarray(score[:, -1], np.float64), 1))) > MARGIN
+                   for score in scores[:STEPS]):
+            return False
+        return selections is None or selection_margins.margin(
+            config, selections, f"{name} greedy walk") > MARGIN
+
+    return jnp.asarray(clearing(draw, clears)(0))
+
+
+def _decoder_selecting(name: str, source) -> tuple[Mapping[str, object], str | None]:
+    """The record of the decoder whose selections `source` (`name`'s `Pretrained`) makes, and the method its
+    capture runs (`selection_margins.capture`): a decoder's own record, a wrapper's text decoder's
+    (`model_config['text']`), its forward over tokens; DiffusionGemma's text model's, as the module holds
+    it, through its clean causal encoder (`logits`), not its canvas denoiser."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import to_record
+
+    if name in OWN:
+        text = source.model.text
+        record = to_record(text, CausalTransformer)
+        assert isinstance(record, dict)
+        # Its fields as a translated record holds them: a field it leaves unset is absent, not null.
+        return {"num_layers": text.num_layers,
+                **{field: value for field, value in record.items() if value is not None}}, "logits"
+    return source.model_config.get("text", source.model_config), None
+
+
 def _by_call(decisions: dict) -> list[dict]:
     """A run's decisions (`_scored`'s, `<call>/<kind>`) as each of its `STEPS + 1` calls takes them."""
     return [{name.split("/", 1)[1]: value for name, value in decisions.items()
@@ -503,7 +556,8 @@ def _reference(name: str, call: tuple) -> tuple[Callable, Callable]:
 @pytest.mark.parametrize("name", PATHS)
 def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
     """The resized model reads the same variables to the model's logits, both in one program, bit for bit,
-    and a causal one decodes into a cache of `CAPACITY` slots and draws the same tokens. Its attention
+    and a causal one decodes into a cache of `CAPACITY` slots and draws the same tokens over prompts whose
+    float64 greedy walk clears the selection margin at every step (`_margined_prompts`). Its attention
     reduces over the shorter cache, so the cached logits are the model's bits or as exact as them
     (`as_exact`). Each call is compiled, where op by op the logits took a minute of the test, and the
     greedy decodes run as the check runs its arms (`summed_as_run`), whose programs they share (ledger
@@ -517,9 +571,12 @@ def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name)
         return
     call = tuple(_decoding(name).items())
     own, at_capacity = _programs(name, "model", call), _programs(name, "sized", call)
+    # Prompts whose float64 greedy walk selects each token by a margin float32's rounding cannot cross, so
+    # the two programs' draws are the model's, whatever order each sums in.
+    prompts = _margined_prompts(name, call)
     with summed_as_run():
-        cache, drawn, _, _ = _greedy(own, variables, rows)
-        sized_cache, sized_drawn, _, _ = _greedy(at_capacity, variables, rows)
+        cache, drawn, _, _ = _greedy(own, variables, prompts)
+        sized_cache, sized_drawn, _, _ = _greedy(at_capacity, variables, prompts)
     assert jax.tree.structure(sized_cache) == jax.tree.structure(cache)
     assert (any(CAPACITY in leaf.shape for leaf in jax.tree.leaves(sized_cache))
             == any(model.max_seq_len in leaf.shape for leaf in jax.tree.leaves(cache)))

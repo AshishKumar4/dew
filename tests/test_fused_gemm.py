@@ -130,6 +130,34 @@ def test_a_regions_analysis_reads_a_divisibility_hint_as_its_value():
         fused_gemm.analysis(lambda x, w: pl.multiple_of(fused_gemm.product(x, w).astype(jnp.int32), 1), x, w)
 
 
+def test_a_regions_price_reads_its_declared_precision_and_every_bank_of_its_matrix():
+    """`fused_gemm.priced` reads what the region's product declares (a compile-only H100): a float32 product
+    with a bias declared at a three-pass algorithm (`BF16_BF16_F32_X3`) costs three passes of its one-pass
+    preset's (`algebra.cost.product_work`), where the ambient default priced both alike; and a grouped
+    product of few rows over four banks of its matrix reads every bank, at least their bytes at the device
+    memory rate, where one bank was priced. Shapes only."""
+    x32 = jax.ShapeDtypeStruct((8192, 4096), jnp.float32)
+    w32 = jax.ShapeDtypeStruct((4096, 4096), jnp.float32)
+    bias = jax.ShapeDtypeStruct((4096,), jnp.float32)
+    sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+    x = jax.ShapeDtypeStruct((64, 4096), jnp.bfloat16)
+    banks = jax.ShapeDtypeStruct((4, 4096, 4096), jnp.bfloat16)
+
+    def biased(precision):
+        return lambda x, w, bias: fused_gemm.product(x, w, precision=precision, out_dtype=jnp.float32) + bias
+
+    def grouped(x, w, sizes, bias):
+        return fused_gemm.product(x, w, sizes, out_dtype=jnp.float32) + bias
+
+    with generation.assumed("sm90"):
+        thrice = fused_gemm.analysis(biased(jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3), x32, w32, bias)
+        once = fused_gemm.analysis(biased(jax.lax.DotAlgorithmPreset.BF16_BF16_F32), x32, w32, bias)
+        found = fused_gemm.analysis(grouped, x, banks, sizes, bias)
+        rate = generation.gpu_target().memory_rate
+    assert thrice.fused_seconds > 2 * once.fused_seconds, (thrice, once)
+    assert found.fused_seconds >= 4 * 4096 * 4096 * 2 / rate, found
+
+
 def test_an_integer_regions_product_is_xlas_own_dot_with_nothing_to_analyse():
     """`fused_gemm.product` of int8 operands (a quantized dot's, int32 out) is XLA's own dot, nothing fused:
     `fused_gemm.analysis` of its region reports no stage and no price, and `fused` gives XLA's value."""

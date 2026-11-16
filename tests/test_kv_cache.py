@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from generation_support import INTERPRETS
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, kept_by_slot
 from reference_error import assert_as_exact
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -21,7 +21,6 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import generation
 from dew.nn.kv_cache import (
     BOUND,
-    TABLE,
     KVCache,
     KVSpec,
     KVStore,
@@ -484,17 +483,6 @@ def test_a_paged_write_past_its_rows_pages_drops_and_leaves_their_slots(mixed):
         np.testing.assert_array_equal(after, before)
 
 
-def _bounds_by_slot(cache, layout: KVCache) -> np.ndarray:
-    """The cache's value bound (`BOUND`) at each row's slots, `[rows, capacity, heads]`: a dense cache's
-    head-major leaf transposed, a pool's read through each row's pages."""
-    bound = np.asarray(cache[BOUND])
-    if layout.page_size is None:
-        return np.swapaxes(bound, 1, 2)
-    table = np.asarray(cache[TABLE])
-    heads, (rows, pages) = bound.shape[0], table.shape
-    return np.moveaxis(bound[:, table].reshape(heads, rows, pages * layout.page_size), 0, 2)
-
-
 @pytest.mark.parametrize("layout", [KVCache(), KVCache(page_size=4), KVCache(quantized="float8_e4m3fn"),
                                     KVCache(quantized="int8"), KVCache(page_size=4, quantized="int8")],
                          ids=["dense", "paged", "float8", "int8", "paged-int8"])
@@ -513,7 +501,7 @@ def test_a_caches_value_bound_is_its_written_values_largest_as_it_reads_them(lay
         # The mixed call writes one token a row, as a serving step's decoding rows do.
         keys, values, positions = keys[:, :1], values[:, :1], positions[:, :1]
     (_, read), held = writer.apply({"cache": cache}, keys, values, positions, mixed, mutable=["cache"])
-    bounds = _bounds_by_slot(held["cache"], layout)
+    bounds = kept_by_slot(held["cache"])[(BOUND,)]
     written = np.zeros((2, capacity), bool)
     written[np.arange(2)[:, None], np.asarray(positions)] = True
     largest = np.max(np.abs(np.asarray(read, np.float32)), axis=-1)
@@ -529,7 +517,7 @@ def test_a_head_kept_as_keys_and_values_bounds_the_keys_it_reads_as_values(layou
     holder = Holder(layout, keys_as_values=True)
     cache = holder.init(jax.random.key(0), keys, keys)["cache"]
     (read, _), held = holder.apply({"cache": cache}, keys, keys, mutable=["cache"])
-    np.testing.assert_array_equal(_bounds_by_slot(held["cache"], layout),
+    np.testing.assert_array_equal(kept_by_slot(held["cache"])[(BOUND,)],
                                   np.max(np.abs(np.asarray(read, np.float32)), axis=-1))
 
 

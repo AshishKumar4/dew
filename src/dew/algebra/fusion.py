@@ -25,8 +25,9 @@ the product's.
 A region's written program is Dew's call traced over the region's inputs' types (`_traced`): a program the
 step's own trace does not hold (the template's launch, Dew's attention or norm), which only a trace of that
 call makes. It is traced once a process for the region's identity (`Written.key`: its structure, the values
-of the constants its call reads, and which call writes it) under the state the trace reads
-(`_cache.traced_state`), and written into every later lowering of a program holding it: a step's
+of the constants its call reads, and which call writes it) in the context a kernel is chosen in
+(`choice_context`: the derivation's context and `options.held_context`), and written
+into every later lowering of a program holding it: a step's
 relowerings, its planner's candidates and every layer of a stack share one trace, which reports its kernels'
 routes and launches where each program is written as it did when it traced.
 """
@@ -34,18 +35,21 @@ routes and launches where each program is written as it did when it traced.
 from __future__ import annotations
 
 import collections
-import threading
 from collections.abc import Callable, Hashable, Sequence
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
+from dew import _cache
 from dew.nn.kernels import generation
 from dew.nn.nested import nested
 from dew.nn.programs import RaggedLayout, entrywise, ragged_layout
+
+if TYPE_CHECKING:
+    from dew.nn.kernels import tuning
 
 CAPTURED = (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p)
 """The layout equations a region takes of a captured operand only it reads (a bias broadcast over rows), so
@@ -299,6 +303,18 @@ def _shapes(variables: Sequence[jcore.Var]) -> list[jax.ShapeDtypeStruct]:
 _held: collections.OrderedDict[Hashable, bool] = collections.OrderedDict()
 
 
+def choice_context() -> Hashable:
+    """The context a kernel of Dew's is chosen in, which every held kernel decision of the algebra's keys
+    (`_cache.holding`: a region's fusion, its written program, a recognition, an attention call's kernel):
+    the derivation's (`derive.context`: the mesh, the target priced for, the numerics and precision) beside
+    the key a trace kept outside the compile point is held by (`options.held_context`: what a trace reads of
+    this thread's context, XLA's deterministic-ops flag among it, and the compiles' refused launches)."""
+    from dew.algebra import derive
+    from dew.nn.kernels.options import held_context
+
+    return derive.context(), held_context()
+
+
 def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
     """A product region's structure (`program.structure`'s, the algebra's windows' key): all its call reads
     of it (`_replayed` takes its constants as inputs, and its literals by their values)."""
@@ -309,21 +325,13 @@ def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
 
 
 def _decided(identity: Hashable, decide: Callable[[], bool]) -> bool:
-    """A region's decision (`decide`), weighed once for its structure (`_identity`) in the context it is
-    weighed in (`derive.context`: the mesh, the target, the numerics and precision; and the kernel choices a
-    call names), the latest `DECISIONS_HELD` held."""
-    from dew import _cache
-    from dew.algebra import derive
-
-    key = (identity, derive.context(), _cache.KERNEL_CHOICES.value)
-    if key not in _held:
+    """A region's decision (`decide`), weighed once for its structure (`_identity`) in the context a kernel
+    is chosen in (`choice_context`), held (`holding`)."""
+    def weighed() -> bool:
         # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
         with generation.routes(alone=True):
-            _held[key] = decide()
-        if len(_held) > DECISIONS_HELD:
-            _held.popitem(last=False)
-    _held.move_to_end(key)
-    return _held[key]
+            return decide()
+    return _cache.holding(_held, (identity, choice_context()), weighed, DECISIONS_HELD)
 
 
 def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
@@ -351,41 +359,33 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
 
 class _Trace(NamedTuple):
     """A region's written program (`_traced`): its one equation, the inputs it reads them by, and the routes
-    and launches (each its op and keyed arguments, `tuning.Seen`'s) its trace reported, which each program
-    it is written into reports."""
+    and launches (each its op and keyed arguments, and the config it took, `tuning.Seen.held`) its trace
+    reported, which each program it is written into reports."""
 
     equation: jcore.JaxprEqn
     invars: tuple[jcore.Var, ...]
     routes: tuple
-    launches: tuple
+    launches: tuning.Seen
 
 
 _traces: collections.OrderedDict[Hashable, _Trace] = collections.OrderedDict()
-_TRACES_LOCK = threading.Lock()
 
 
 def _traced(region: Written) -> _Trace:
     """`region`'s call traced as one nested program over its inputs' types (`nested`), once a process for
-    its identity (`Written.key`) under the state a trace reads (`_cache.traced_state`), the latest
-    `DECISIONS_HELD` held; its routes and launches reported where it is written, as its trace reported them
+    its identity (`Written.key`) in the context a kernel is chosen in (`choice_context`), held
+    (`_cache.holding`);
+    its routes and launches reported where it is written, as its trace reported them
     (`generation.reported`, `tuning.noted`)."""
-    from dew import _cache
     from dew.nn.kernels import tuning
 
-    key = (region.key, _cache.traced_state())
-    with _TRACES_LOCK:
-        held = _traces.get(key)
-        if held is not None:
-            _traces.move_to_end(key)
-    if held is None:
+    def traced_once() -> _Trace:
         with generation.routes(alone=True) as routes, tuning.seen() as seen:
             traced = jax.make_jaxpr(nested(region.call))(*_shapes(region.inputs))
         (equation,) = traced.jaxpr.eqns
-        held = _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), tuple(seen))
-        with _TRACES_LOCK:
-            _traces[key] = held
-            if len(_traces) > DECISIONS_HELD:
-                _traces.popitem(last=False)
+        return _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), seen.held())
+
+    held = _cache.holding(_traces, (region.key, choice_context()), traced_once, DECISIONS_HELD)
     generation.reported(held.routes)
     tuning.noted(held.launches)
     return held

@@ -48,6 +48,7 @@ from .kv_cache import Opened, compute_dtype
 from .linear import (
     DepthwiseConv1d,
     RMSNormGated,
+    as_projected,
     decode_delta_rule,
     decode_kernel,
     fused_token,
@@ -258,9 +259,9 @@ class KimiDeltaAttention(nn.Module):
                             state_dtype=wide, conv_dtype=wide, parts=heads,
                             dtype=projected.dtype if ported else wide, token=token)
         if token is not None:
-            # The fused step gated and normalized its output (`FUSED`).
-            return self.o_proj(out)
-        out = self.o_norm(out, gate).reshape(B, S, self.qkv_features)
+            # The fused step gated and normalized its output (`FUSED`), in its epilogue's dtype.
+            return self.o_proj(as_projected(out, projected.dtype))
+        out = self.o_norm(as_projected(out, projected.dtype), gate).reshape(B, S, self.qkv_features)
         return self.o_proj(out)
 
     def _fused_token(self, taps, g, beta, gate, valid, starts):

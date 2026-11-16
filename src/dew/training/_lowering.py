@@ -70,7 +70,7 @@ class KernelReport:
                 entry["configs"].append(call.config)
             stated, flops = entry["flops"], call.flops
             entry["flops"] = stated + flops * runs if stated is not None and flops is not None else None
-            traced = None if call.launch is None else report.traced(call.launch)
+            traced = report.called(call)
             share = None if traced is None else traced.padded
             held = entry["padded"]
             entry["padded"] = None if held is None or share is None else held + share * runs

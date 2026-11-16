@@ -114,7 +114,7 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float 
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
                  dtype: Dtype | None, precision: PrecisionLike = None,
                  specs: Mapping[str, NormSpec] | None = None,
-                 routed: bool | None = None) -> Callable[..., nn.Module]:
+                 routed: bool | None = None, weight_dtype_reads: bool = False) -> Callable[..., nn.Module]:
     """The decoder's norm factory, building each norm by its `name` as
     `specs` changes it there, a gated one (`NormSpec.gate_rank`) gated where
     `norm_gated` says: a layer's on the layers it names, the `routed` layer's
@@ -125,7 +125,8 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float 
     and square reduce in one pass, for a model that states it: it cancels in
     fp32 wherever a row's mean dwarfs its spread, so no port of a torch norm
     takes it. An `epsilon` of None is an RMS norm's input dtype's
-    (`RMSNorm.epsilon`); a layer norm states its own."""
+    (`RMSNorm.epsilon`); a layer norm states its own. `weight_dtype_reads` gives an RMS norm's output its
+    weight's dtype where no `dtype` is set (`RMSNorm.weight_dtype_reads`)."""
 
     def build(*, name: str) -> nn.Module:
         # A site's own name, a plain string (`NormSite`'s value): the module's path holds no enum.
@@ -136,7 +137,8 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float 
         if kind == 'rms':
             norm = functools.partial(
                 RMSNorm, epsilon=eps, scale_offset=scale_offset if spec.offset is None else spec.offset,
-                scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups, dtype=dtype)
+                scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups, dtype=dtype,
+                weight_dtype_reads=weight_dtype_reads)
             if gated and spec.gate_rank is not None:
                 return GatedRMSNorm(spec.gate_rank, norm, dtype=dtype, precision=precision, name=name)
             return norm(name=name)
@@ -461,6 +463,10 @@ class BlockWiring:
     """Initial value of learned per-feature attention and feed-forward residual scales."""
     normed_residual: bool = False
     stream_multiplier: float = 1.0
+    residual_in_fp32: bool = False
+    """Whether the stream sums in at least fp32 whatever the compute dtype
+    (`CausalTransformer.residual_in_fp32`): with no compute dtype, each norm reads it in its weight's dtype
+    (`dew.nn.norms.RMSNorm.weight_dtype_reads`), as mamba_ssm's Block does."""
     ngpt: NGPT | None = None
 
     def __post_init__(self):
@@ -559,6 +565,21 @@ delta rule's memory, and `minimal_with_scan_and_conv` and
 the conv alone, beside `minimal`'s. The context recipes keep a mixer's output
 of either kind, attention's context or a recurrence's scan. `full` keeps
 nothing but the block's inputs."""
+
+
+def recomputed_inside(remat: RematPolicy | None) -> tuple[str, ...]:
+    """The residuals the layers recompute in their own backwards under `remat`, the one statement
+    `DecoderBlock.__call__` runs its layers by and the ladder reads (`CausalTransformer.recompute_more`): a
+    rung that names its recompute (`RematPolicy.recompute`) those, no remat none; a rung recomputing the
+    block, besides it, on the heaviest rung, which keeps nothing (`full`), an in-context memory's chunks
+    (`memory_chunk`), whose scan's backward would otherwise stack them all inside the block's recompute, a
+    layer's at a time (row 6577: 320 GiB of a Titans step at 4 x 2048); a lighter rung keeps them, each step
+    that fits as fast as it ran, so the ladder recomputes them last."""
+    if remat is None:
+        return ()
+    if remat.recompute:
+        return remat.recompute
+    return () if remat.save or remat.offload else (Residual.MEMORY_CHUNK,)
 
 
 def remat_policy(
@@ -858,10 +879,13 @@ class DecoderBlock(nn.Module):
 
     def setup(self):
         projections = self.projections()
+        # A stream summing in fp32 with no compute dtype is read in each norm's weight's dtype
+        # (`BlockWiring.residual_in_fp32`).
         norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype, precision=self.precision, specs=self.norms, routed=self.routed)
+            dtype=self.dtype, precision=self.precision, specs=self.norms, routed=self.routed,
+            weight_dtype_reads=self.wiring.residual_in_fp32 and self.dtype is None)
         if self.wiring.parallel_residual and (
                 not self.wiring.pre_norms or self.wiring.output_norms
                 or self.feedforward is None or self.hyper_connections is not None
@@ -983,10 +1007,17 @@ class DecoderBlock(nn.Module):
                  prediction_phase: PredictionPhase = "ordinary") -> jax.Array | Carried:
         """The residual the next block reads, in the form `x` came in: an array (the plain stream,
         AltUp's copies, mHC's streams, the depth state), or single-pass mHC's `Carried`."""
-        if self.remat is None or self.remat.recompute or self.is_initializing() or decode:
-            with recomputing(() if self.remat is None else self.remat.recompute):
+        with recomputing(recomputed_inside(self.remat)):
+            if self.remat is None or self.remat.recompute or self.is_initializing() or decode:
                 return self._forward(x, train, decode, kv_store, per_layer_input, attention_metadata,
                                      prediction_phase)
+            return self._rematted(self.remat, x, train, kv_store, per_layer_input, attention_metadata,
+                                  prediction_phase)
+
+    def _rematted(self, remat: RematPolicy, x, train: bool, kv_store, per_layer_input, attention_metadata,
+                  prediction_phase: PredictionPhase):
+        """`__call__` under a rung that keeps named residuals (`RematPolicy.save`, `offload`): the block's
+        forward recomputed in its backward but for those."""
 
         def run(module, x, kv_store, per_layer_input, attention_metadata):
             # Providers write K/V into a dict; scanned consumers only read it.
@@ -1004,7 +1035,7 @@ class DecoderBlock(nn.Module):
         # The policy decides which named residuals the backward pass reads
         # back instead of recomputing; train stays a static closure value and
         # Linen lifts variables and RNGs with the call.
-        out, store = nn.remat(run, policy=self.remat.checkpoint_policy())(
+        out, store = nn.remat(run, policy=remat.checkpoint_policy())(
             self, x, kv_store, per_layer_input, attention_metadata)
         if kv_store is not None:
             kv_store.update(store)

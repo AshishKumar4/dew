@@ -36,6 +36,7 @@ landing-programs	"$PYTHON" site/snippets/cells.py --check
 models	JAX_PLATFORMS=cpu "$PYTHON" site/scripts/gen_models.py --check
 examples	"$PYTHON" site/scripts/gen_examples.py --check
 exports	"$PYTHON" tools/gen_exports.py --check
+hf-metadata	JAX_PLATFORMS=cpu "$PYTHON" -m tools.gen_hf_metadata --check
 pythons	"$PYTHON" tools/armada/ci.py pythons --check
 # pyright runs on Node, whose default heap limit follows the machine's memory: 2,240 MiB on an armada medium
 # container (12 GiB), where checking src/dew ran out of heap. With 8 GiB it passed, the task peaking at 4.3 GiB;

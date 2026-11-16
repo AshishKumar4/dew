@@ -66,18 +66,20 @@ class Layer:
     groups: int
 
 
-def _prefilled(module, variables, seed: int, width: int):
-    """`module`'s cache after a 3-token prefill of three rows and `DECODED` tokens after it, by seed."""
-    x = jnp.asarray(np.random.default_rng(seed).standard_normal((3, 3 + DECODED, width)).astype(np.float32))
+def _prefilled(module, variables, seed: int, width: int, rows: int = 3):
+    """`module`'s cache after a 3-token prefill of `rows` rows and `DECODED` tokens after it, by seed."""
+    drawn = np.random.default_rng(seed).standard_normal((rows, 3 + DECODED, width))
+    x = jnp.asarray(drawn.astype(np.float32))
     step = MixerCall(decode=True)
     allocated = module.apply(variables, x[:, :1], step, mutable=["cache"])[1]
     cache = module.apply({**variables, **allocated}, x[:, :3], step, mutable=["cache"])[1]["cache"]
     return cache, x[:, 3:]
 
 
-def _delta_net(seed: int, held):
-    """A gated delta net's draw (`fused_case`, Qwen3.5's widths at four heads), its state held in `held`."""
-    _, variables, cache, token = fused_case(4, 128, 3, jnp.bfloat16, held, seed)
+def _delta_net(seed: int, held, rows: int = 3):
+    """A gated delta net's draw of `rows` rows (`fused_case`, Qwen3.5's widths at four heads), its state held
+    in `held`."""
+    _, variables, cache, token = fused_case(4, 128, rows, jnp.bfloat16, held, seed)
     later = jax.random.normal(jax.random.key(3000 + seed), (token.shape[0], DECODED - 1, token.shape[-1]))
     return variables, cache, jnp.concatenate([token, later.astype(token.dtype)], axis=1)
 
@@ -95,12 +97,13 @@ def _mamba2(dtype=jnp.float32):
 
 
 def _drawn_of(make):
-    """A draw of `make()`'s variables by seed, its cache after a prefill and its tokens (`_prefilled`)."""
-    def draw(seed: int, held):
+    """A draw of `make()`'s variables by seed, its cache after a prefill of `rows` rows and its tokens
+    (`_prefilled`)."""
+    def draw(seed: int, held, rows: int = 3):
         del held
         module = make()
-        variables = nn.unbox(module.init(jax.random.key(seed), jnp.zeros((3, 1, 64))))
-        return variables, *_prefilled(module, variables, seed, 64)
+        variables = nn.unbox(module.init(jax.random.key(seed), jnp.zeros((rows, 1, 64))))
+        return variables, *_prefilled(module, variables, seed, 64, rows)
     return draw
 
 
@@ -216,3 +219,46 @@ def on_par(case: tuple[str, ...], layer: Layer | None = None) -> None:
     assert_as_exact(_decoded(module, named["kernel"], layer.state), _decoded(module, "xla", layer.state),
                     draw, "-".join(case), seeds=FEWEST_SEEDS,
                     truth_fn=_decoded(module.clone(dtype=jnp.float64), "xla", layer.state))
+
+
+SHARDED_ROWS = 4
+"""The rows a per-shard cell decodes (`per_shard`): two a device, an even split."""
+SHARDED_SEEDS = 8
+"""The per-shard cells' declared draws (check 1, `seeds_for` paired on the CPU lane: each cell's eight
+resolve it), run as map tasks of 2 (tests/test_per_shard.py's `CHECK1_SHARDS`): an interpreted cell's draw
+takes 20 to 40 s."""
+
+
+def per_shard(choice: str, kernel: str) -> dict:
+    """`kernel`'s per-shard cells (`sharded.Shard`, tests/test_per_shard.py): each layer's (`LAYERS`) first
+    case on `kernel` (`CASES`: its generation and held state) as `DECODED` decode tokens after a prefill of
+    `SHARDED_ROWS` rows, the layer asking its kernel (`linear.decode_kernel`, `kernel` named) as it decodes,
+    over the rows a two-device data axis splits, its variables whole and its cache's rows split: each
+    token's output and the conv history and state they leave on par with one device's from the layer in
+    float64, interpreted on the CPU's devices as the case's GPU. Heads split over a tensor axis are the
+    step's own sites' (tests/test_linear_attention.py)."""
+    from jax.sharding import PartitionSpec
+    from sharded import Shard
+
+    del choice
+
+    def cell(generation_: str, name: str, state: str) -> Shard:
+        layer = LAYERS[name]
+        module = layer.make()
+        draw = functools.partial(layer.drawn, held=jnp.dtype(state), rows=SHARDED_ROWS)
+
+        def specs(mesh) -> list:
+            del mesh
+            _, cache, _ = draw(0)
+            return [PartitionSpec(), jax.tree.map(lambda leaf: PartitionSpec("data"), cache),
+                    PartitionSpec("data")]
+
+        return Shard(_decoded(module, kernel, layer.state), draw, specs,
+                     _decoded(module.clone(dtype=jnp.float64), "xla", layer.state), SHARDED_SEEDS, "data",
+                     target=generation_)
+
+    first = {}
+    for generation_, name, named, state in CASES:
+        if named == kernel:
+            first.setdefault(name, (generation_, name, state))
+    return {f"{name}-data": cell(*case) for name, case in first.items()}

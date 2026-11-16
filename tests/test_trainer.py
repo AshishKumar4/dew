@@ -61,9 +61,10 @@ from dew.objectives.base import Aux, EMASpec, Objective
 from dew.objectives.lm import LMObjective
 from dew.optim import Cosine, OptimConfig, Power
 from dew.state import CHECKPOINTED, TokenCount, TrainState
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer, ema_update
+from dew.training import Checkpoints, DiLoCo, Layout, MeshSpec, Trainer, ema_update
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.runtime import Preempted
+from dew.training.trainer import refuse_non_finite
 
 
 def endless():
@@ -172,20 +173,23 @@ def test_a_run_records_where_its_optimizers_split_sent_each_parameter():
 
 def test_a_runs_start_reports_each_phase_it_took_once():
     """A run's start reports the seconds each phase took (the data's preparation, the step's compile, the
-    evaluations' warming) once, beside its first logged step's scalars, none after."""
+    evaluations' warming) once, beside its first logged step's scalars, none after; and a fresh start that
+    took the lowering begun beside its step's compile says so (`startup/start_overlapped`): its algebra
+    passed once, not again only to match the begun compile (train 914's F1, row 6847)."""
     tracker = RecordingTracker()
     trainer = make_trainer(objective=Features(), tracker=tracker)
     trainer.fit(dataset(val=val_batches(3)), steps=3, log_every=1, eval_every=2)
     reported = [{name: value for name, value in scalars.items() if name.startswith("startup/")}
                 for _, scalars in tracker.scalars]
     [first] = [phases for phases in reported if phases]
-    assert set(first) == {"startup/data_seconds", "startup/compile_seconds", "startup/warm_seconds"}
-    assert all(seconds >= 0 for seconds in first.values()) and reported[0] == first
+    seconds = {"startup/data_seconds", "startup/compile_seconds", "startup/warm_seconds"}
+    assert set(first) == seconds | {"startup/start_overlapped"} and first["startup/start_overlapped"] == 1
+    assert all(first[name] >= 0 for name in seconds) and reported[0] == first
     # A run that logs no step reports its start with its outcome, once.
     quiet = RecordingTracker()
     make_trainer(objective=Features(), tracker=quiet).fit(dataset(), steps=2, log_every=100)
     started = [name for _, scalars in quiet.scalars for name in scalars if name.startswith("startup/")]
-    assert sorted(started) == ["startup/compile_seconds", "startup/data_seconds", "startup/warm_seconds"]
+    assert sorted(started) == sorted(seconds | {"startup/start_overlapped"})
 
 
 def test_a_run_given_steps_and_tokens_is_refused_as_a_budget_named_twice():
@@ -2287,7 +2291,7 @@ def test_only_the_held_arrays_an_output_takes_over_are_donated():
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from jax.tree_util import Partial
 
-    from dew.training.distributed import placed_held, taking_over
+    from dew.training.distributed import placed_held, start_program, taking_over
 
     mesh = Mesh(np.array(jax.devices()), ("fsdp",))
     rows = 8 * jax.device_count()
@@ -2310,8 +2314,8 @@ def test_only_the_held_arrays_an_output_takes_over_are_donated():
     assert kept.keywords["variables"]["params"]["kernel"] is None
     with warnings.catch_warnings():
         warnings.filterwarnings("error", "Some donated buffers were not usable")
-        state = taking_over(lambda initializer, key: initializer(key), taken, kept, shardings)(
-            jax.random.key(0))
+        program = start_program(lambda initializer, key: initializer(key), shardings, taken)
+        state = taking_over(program, taken, kept)(jax.random.key(0))
     assert copy.is_deleted()
     assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(kept))
     assert not any(leaf.is_deleted() for leaf in (kernel, bias, table))
@@ -2454,3 +2458,41 @@ def test_a_state_built_from_a_held_tree_steps_without_freeing_the_tree():
     stepped, *_ = trainer.compile(state, batch)(state, batch)
     jax.block_until_ready(stepped)
     assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(objective.variables))
+
+
+class PoisonedThird(Counting):
+    """`Counting`'s batches, the third's features not finite: its loss and gradient are."""
+
+    def __next__(self):
+        batch = super().__next__()
+        if batch["index"][0] == 2:
+            batch = {**batch, "x": np.full_like(batch["x"], np.nan)}
+        return batch
+
+
+@pytest.mark.parametrize("tier", ["persistent", "local",
+                                  pytest.param("diloco", marks=pytest.mark.mesh(devices=2))])
+def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path, tier):
+    """A save that meets a state holding a non-finite value writes nothing and rotates nothing out, on either
+    tier: the run stops there, and the checkpoint a resume finds is the last finite one, its parameters
+    finite (row 6699). A run with no loss scale whose third batch is not finite, checkpointed every step
+    and keeping two (`persistent`), saved its non-finite parameters at steps 3 and 4 and rotated its good
+    checkpoints out; one that writes a local copy every second step and a persistent one every tenth
+    (`local`) wrote its step-4 local copy unchecked, and a resume restored it (train 901's review, F1); a
+    DiLoCo run's replicas' inner copies, which its next meeting averages into the outer model, saved
+    unchecked between meetings (`diloco`, train 904's review, F3)."""
+    def trainer():
+        if tier == "diloco":
+            # Two replicas meeting every fourth step: the third batch poisons their inner copies mid-period.
+            return make_trainer(tmp_path, keep=2, mesh=MeshSpec(diloco=2).build(jax.devices()[:2]),
+                                diloco=DiLoCo(every=4, rate=0.7, momentum=0.9))
+        return make_trainer(tmp_path, keep=2) if tier == "persistent" else local_trainer(tmp_path)
+
+    with pytest.raises(RuntimeError):
+        trainer().fit(dataset(PoisonedThird), steps=5, log_every=100,
+                      checkpoint_every=10 if tier == "local" else 1)
+    resumed = trainer()
+    assert resumed.checkpoints.latest == 2
+    restored, *_ = resumed.checkpoints.restore(resumed.initial_state())
+    assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(restored.variables))
+    refuse_non_finite(restored, 3, lambda: 2)

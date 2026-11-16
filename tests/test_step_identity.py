@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import sys
 from uuid import uuid4
 
 import numpy as np
 import pytest
 from reader_support import resumed_changes, saved_after_one
 
+from dew import _position
 from dew._records import ADDED, earlier_fields
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
@@ -124,12 +126,33 @@ class Calling:
 
 
 
+
+@dataclasses.dataclass(frozen=True)
+class Applying:
+    """A step whose field holds a class, which it makes and calls on each record."""
+
+    kind: type
+
+    def __call__(self, row):
+        return self.kind()(row)
+
+
+@dataclasses.dataclass(frozen=True)
+class Picking:
+    """A step whose field holds a callable of the standard library."""
+
+    get: object
+
+    def __call__(self, row):
+        return {**row, "id": self.get(row)}
+
 @pytest.mark.parametrize("read", ["indexed", "memory"])
-@pytest.mark.parametrize("kind", ["function", "configured", "callable", "held"])
+@pytest.mark.parametrize("kind", ["function", "configured", "callable", "held", "class"])
 def test_an_exact_resume_refuses_an_external_step_whose_code_changed(tmp_path, monkeypatch, read, kind):
     """An external step that declares no identity is what its code computes: a function, a step or the
     factory that configured one, by its module's bytes (row 3938), and an object of an external class with
-    `__call__` (`callable`), alone or held in a step's field (`held`), by its class's source (data.md §10;
+    `__call__` (`callable`), alone or held in a step's field (`held`), and a class a step's field holds and
+    calls (`class`, train 898's review), by its class's source (data.md §10;
     those resumed with other rows, spec alignment 2026-11-15). Rewritten to make other rows, each refuses
     an exact resume, where the plan names the step and where a memory read's rows name the steps that made
     them, and reads on under resume='relaxed'; unchanged, it resumes exactly. A function a field holds, a
@@ -142,7 +165,8 @@ def test_an_exact_resume_refuses_an_external_step_whose_code_changed(tmp_path, m
 
     def reader(resume="exact"):
         step = {"function": shift.shifted, "configured": Configured(shift.shifting, needs=()),
-                "callable": shift.Shifting(), "held": Calling(shift.Shifting())}[kind]
+                "callable": shift.Shifting(), "held": Calling(shift.Shifting()),
+                "class": Applying(shift.Shifting)}[kind]
         pipeline = Pipeline(ROWS).map(step).shuffle(0).repeat().batch(2)
         return compile(pipeline, read=read, loading=READ, resume=resume).train(DataPartition())
 
@@ -154,6 +178,348 @@ def test_an_exact_resume_refuses_an_external_step_whose_code_changed(tmp_path, m
         resumed_changes(reader(), state)
     (changed,) = resumed_changes(reader("relaxed"), state)
     assert changed.startswith("code.")
+
+
+SLOTTED = {"slots": """import dataclasses
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Adding:
+    by: int
+
+    def __call__(self, row):
+        return {**row, "id": row["id"] + self.by}
+""", "a mangled slot": """import dataclasses
+
+
+@dataclasses.dataclass(frozen=True)
+class Adding:
+    __slots__ = ("__by",)
+    __by: int
+
+    def __call__(self, row):
+        return {**row, "id": row["id"] + self.__by}
+"""}
+"""A frozen dataclass step of slots: a dataclass's own (`slots=True`), and one its class states, its name
+mangled, `__by` its slot and `_Adding__by` its descriptor (the base review of 201a04c58)."""
+
+
+@pytest.mark.parametrize("slotted", SLOTTED)
+@pytest.mark.parametrize("read", ["indexed", "memory"])
+def test_an_exact_resume_holds_a_slotted_steps_fields_not_its_slots_descriptors(tmp_path, monkeypatch, read,
+                                                                                 slotted):
+    """A step of a frozen, slotted dataclass of the user's file resumes exactly where nothing of it changed:
+    the descriptors its slots make are Python's machinery, whose values its fields state, not the user's code
+    (the base reviews of 826882bbf and 201a04c58: read as code, the step was inexact and its unchanged exact
+    resume refused); a step of another field's value is refused an exact resume."""
+    module = tmp_path / f"slotted_{uuid4().hex}.py"
+    module.write_text(SLOTTED[slotted])
+    monkeypatch.syspath_prepend(str(tmp_path))
+    loaded = importlib.import_module(module.stem)
+
+    def reader(by):
+        pipeline = Pipeline(ROWS).map(loaded.Adding(by)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read=read, loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(lambda: reader(1))
+    assert resumed_changes(reader(1), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(2), state)
+
+
+BASE_STEP = """import dataclasses
+
+
+@dataclasses.dataclass(frozen=True)
+class Step:
+    def __call__(self, row):
+        return {**row, "id": row["id"] + 1}
+"""
+
+CHILD_STEP = """import dataclasses
+
+from {base} import Step as Base
+
+
+@dataclasses.dataclass(frozen=True)
+class Step(Base):
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + {by}}}
+"""
+
+
+def test_an_exact_resume_holds_a_child_steps_own_code_beside_its_bases(tmp_path, monkeypatch):
+    """A step of a class whose base of the user's code has its name is held by both classes' code: an edit
+    to the child's method alone refuses its exact resume (the base review of 201a04c58: the classes keyed by
+    name alone, the base's members replaced the child's, and the edited child resumed exactly, reading other
+    rows); unchanged, it resumes exactly."""
+    base = tmp_path / f"base_{uuid4().hex}.py"
+    base.write_text(BASE_STEP)
+    child = tmp_path / f"child_{uuid4().hex}.py"
+    child.write_text(CHILD_STEP.format(base=base.stem, by=1))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    loaded = importlib.import_module(child.stem)
+
+    def reader():
+        pipeline = Pipeline(ROWS).map(loaded.Step()).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(), state) == ()
+    child.write_text(CHILD_STEP.format(base=base.stem, by=10))
+    importlib.reload(loaded)
+    with pytest.raises(ValueError):
+        resumed_changes(reader(), state)
+
+
+SCRIPT = """import dataclasses
+
+LEARNING_RATE = {rate}
+
+
+@dataclasses.dataclass(frozen=True)
+class Adding:
+    by: int
+
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + self.by * {times}}}
+"""
+
+
+def test_a_scripts_class_step_is_held_by_its_own_code_not_the_scripts_other_lines(tmp_path, monkeypatch):
+    """A step of a class of the script the process runs (`__main__`) resumes exactly over an edit of the
+    script elsewhere, and is refused an exact resume over an edit of its own method (the base review of
+    201a04c58: the whole script's digest held it, so an unrelated learning rate's edit refused its resume)."""
+    import sys
+
+    script = tmp_path / f"script_{uuid4().hex}.py"
+    script.write_text(SCRIPT.format(rate=1, times=1))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys.modules["__main__"], "__file__", str(script), raising=False)
+    loaded = importlib.import_module(script.stem)
+
+    def reader():
+        monkeypatch.setattr(loaded.Adding, "__module__", "__main__")
+        pipeline = Pipeline(ROWS).map(loaded.Adding(1)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(reader)
+    script.write_text(SCRIPT.format(rate=2, times=1))
+    assert resumed_changes(reader(), state) == ()
+    script.write_text(SCRIPT.format(rate=2, times=10))
+    importlib.reload(loaded)
+    with pytest.raises(ValueError):
+        resumed_changes(reader(), state)
+
+
+CYCLIC = {"mapping": """settings = {{"delta": {delta}}}
+settings["self"] = settings
+
+
+def shifted(row):
+    return {{**row, "id": row["id"] + settings["delta"]}}
+""", "list": """CYCLE = [{delta}]
+CYCLE.append(CYCLE)
+
+
+def shifted(row):
+    return {{**row, "id": row["id"] + CYCLE[0]}}
+""", "registry": """REGISTRY = {{}}
+
+
+def shifted(row):
+    return {{**row, "id": row["id"] + REGISTRY["delta"]}}
+
+
+REGISTRY["step"] = shifted
+REGISTRY["delta"] = {delta}
+""", "singleton": """import dataclasses
+
+
+@dataclasses.dataclass(frozen=True)
+class Config:
+    delta: int = {delta}
+
+
+Config.DEFAULT = Config()
+
+
+def shifted(row):
+    return {{**row, "id": row["id"] + Config.DEFAULT.delta}}
+"""}
+"""A step's module whose global holds itself: a mapping one of whose values is the mapping (the base review of
+b4cabd6c0), a list that holds itself (the morning audit's), a registry holding the step that reads it and a
+singleton its class holds (train 947's review), each its `delta` the step adds."""
+
+
+@pytest.mark.parametrize("cycle", CYCLIC)
+@pytest.mark.parametrize("read", ["indexed", "memory"])
+def test_a_step_reading_a_container_that_holds_itself_resumes_exactly_until_it_changes(
+        tmp_path, monkeypatch, read, cycle):
+    """A step of the user's file reading a global container that holds itself is stated finitely, the
+    container met again a reference back to it: unchanged, it resumes exactly, and with the container's value
+    edited, an exact resume is refused. Walking it recursed past Python's limit and crashed the data's
+    compile and its read (the base review of b4cabd6c0, the morning audit), and then refusing it refused an
+    unchanged step's exact resume (train 947's review)."""
+    module = tmp_path / f"cyclic_{uuid4().hex}.py"
+    module.write_text(CYCLIC[cycle].format(delta=1))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    cyclic = importlib.import_module(module.stem)
+
+    def reader(resume="exact"):
+        pipeline = Pipeline(ROWS).map(cyclic.shifted).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read=read, loading=READ, resume=resume).train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(), state) == ()
+    # An edit of another length, so the reload reads it whatever its cached bytecode's time.
+    module.write_text(CYCLIC[cycle].format(delta=10))
+    importlib.reload(cyclic)
+    with pytest.raises(ValueError):
+        resumed_changes(reader(), state)
+
+
+GENERATED = """import dataclasses
+from typing import ClassVar
+
+import attrs
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Offset:
+    by: int = {by}
+    __scale: int = {scale}
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Base:
+    over: int = 1
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Child(Base):
+    over: int = {over}
+
+
+@dataclasses.dataclass(frozen=True{slots})
+class Listed:
+    values: list = dataclasses.field(default_factory=lambda: [{value}])
+
+
+@dataclasses.dataclass(frozen=True)
+class Plain:
+    by: int = 1
+    scale: ClassVar[int] = 1
+
+
+@attrs.define(frozen=True)
+class Ranged:
+    span: int = {span}
+    marks: list = attrs.Factory(lambda: [{mark}])
+
+
+@dataclasses.dataclass(frozen=True)
+class Shifting:
+    def __call__(self, row):
+        total = (Offset().by * Offset()._Offset__scale + Child().over + int(Listed().values[0])
+                 + Plain.by * Plain.scale + Ranged().span + Ranged().marks[0])
+        return {{**row, "id": row["id"] + total}}
+"""
+"""A class step of the user's file building classes generators made, each with a default or a factory its
+code reads: a slotted dataclass's field and its name-mangled field, a slotted child's override of its base's
+default, a default factory, plain or slotted, a plain dataclass's default and class variable, an attrs class's
+default and factory."""
+
+GENERATED_AT = {"by": 1, "scale": 1, "over": 20, "value": 3, "slots": "", "span": 2, "mark": 5}
+
+
+@pytest.mark.parametrize(("edit", "assigned"), [
+    ({"by": 20}, None), ({"scale": 30}, None), ({"over": 300}, None), ({"value": 55}, None),
+    ({"value": 55, "slots": ", slots=True"}, None), ({"span": 200}, None), ({"mark": 500}, None),
+    ({}, ("by", 10)), ({}, ("scale", 10))],
+    ids=["slotted field", "mangled field", "slotted child's override", "factory", "slotted factory",
+         "attrs default", "attrs factory", "a default set at run time", "a class variable set at run time"])
+def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factory_changed(
+        tmp_path, monkeypatch, edit, assigned):
+    """A step of a class of the user's file, stated by its members, whose code builds classes of the file
+    that a generator made (`GENERATED`) reads their defaults and factories as its code: each edited in the
+    file, or a plain dataclass's default or class variable set on the class at run time, refuses an exact
+    resume, the change named in code; unchanged, the step resumes exactly. A slot's descriptor skipped its
+    default (train 942's review), a slotted child's override and every factory went unstated (train 947's),
+    and so did a value set at run time, a class variable and an attrs class's fields (train 950's)."""
+    module = tmp_path / f"generated_{uuid4().hex}.py"
+    module.write_text(GENERATED.format(**GENERATED_AT))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    generated = importlib.import_module(module.stem)
+
+    def reader(resume="exact"):
+        pipeline = Pipeline(ROWS).map(generated.Shifting()).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(), state) == ()
+    if assigned is None:
+        # An edit of another length, so the reload reads it whatever its cached bytecode's time.
+        module.write_text(GENERATED.format(**{**GENERATED_AT, **edit}))
+        importlib.reload(generated)
+    else:
+        monkeypatch.setattr(generated.Plain, *assigned)
+    with pytest.raises(ValueError):
+        resumed_changes(reader(), state)
+    (changed,) = resumed_changes(reader("relaxed"), state)
+    assert changed.startswith("code.")
+
+
+SCRIPTED = """import dataclasses
+
+
+class Meta(type):
+    scale = {scale}
+
+
+class Scaled(metaclass=Meta):
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class Settings:
+    values: list = dataclasses.field(default_factory=lambda: [{value}])
+
+
+@dataclasses.dataclass(frozen=True)
+class Stepping:
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + Settings().values[0] * Scaled.scale}}
+"""
+
+
+@pytest.mark.parametrize("edit", [{"value": 55, "scale": 1}, {"value": 3, "scale": 10}],
+                         ids=["factory", "metaclass"])
+def test_a_scripts_step_resumes_exactly_until_its_classes_factory_or_metaclass_changes(
+        tmp_path, monkeypatch, edit):
+    """A step of the script the process runs (`__main__`) whose code builds a dataclass with a default
+    factory and reads a class's metaclass resumes exactly unchanged and is refused an exact resume where
+    either is edited, the script's other bytes no part of it. Without the script's digest (the base review
+    of 201a04c58), they went unstated, and a kept program or a data resume was handed back over the edit
+    (train 947's review, row 7001)."""
+    module = tmp_path / f"scripted_{uuid4().hex}.py"
+    module.write_text(SCRIPTED.format(value=3, scale=1))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    scripted = importlib.import_module(module.stem)
+
+    def reader():
+        for held in (scripted.Meta, scripted.Scaled, scripted.Settings, scripted.Stepping):
+            monkeypatch.setattr(held, "__module__", "__main__")
+        monkeypatch.setitem(sys.modules, "__main__", scripted)
+        pipeline = Pipeline(ROWS).map(scripted.Stepping()).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(), state) == ()
+    module.write_text(SCRIPTED.format(**edit))
+    importlib.reload(scripted)
+    with pytest.raises(ValueError):
+        resumed_changes(reader(), state)
 
 
 def test_a_function_step_that_declares_its_identity_resumes_exactly_over_a_change_to_its_code(
@@ -174,3 +540,152 @@ def test_a_function_step_that_declares_its_identity_resumes_exactly_over_a_chang
     module.write_text(SHIFT.format(by=10))
     importlib.reload(shift)
     assert resumed_changes(reader(), state) == ()
+
+
+
+def test_a_step_holding_a_standard_library_callable_resumes_exactly():
+    """A callable of the standard library a step holds (`operator.itemgetter`) is the environment's code,
+    which its version states, so the step resumes exactly (train 898's review: it was refused as the
+    user's own)."""
+    import operator
+
+    def reader():
+        pipeline = Pipeline(ROWS).map(Picking(operator.itemgetter("id"))).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ).train(DataPartition())
+
+    assert resumed_changes(reader(), saved_after_one(reader)) == ()
+
+
+def test_a_notebooks_step_compiles_and_reads_its_rows(monkeypatch):
+    """A step of a notebook's own class, defined in a `__main__` with no file, has no code to hold: it
+    compiles and reads, its plan inexact, which an exact resume refuses (train 898's review: its compile
+    raised OSError looking for the file)."""
+    import sys
+
+    monkeypatch.delattr(sys.modules["__main__"], "__file__", raising=False)
+    monkeypatch.setattr(Picking, "__module__", "__main__")
+    pipeline = Pipeline(ROWS).map(Picking(len)).batch(2)
+    loader = compile(pipeline, read="indexed", loading=READ)
+    stream = loader.train(DataPartition())
+    try:
+        assert len(next(stream)["id"]) == 2
+    finally:
+        stream.close()
+    assert loader.plan is not None and not loader.plan.manifest.exact
+
+
+@pytest.mark.parametrize("saved", ["without held", "held in its code list", "held apart"])
+def test_a_position_saved_before_reached_code_is_held_to_what_it_saved(tmp_path, monkeypatch, saved):
+    """A position saved before steps' reached code was saved under its own key (`reached`): one saved before
+    any held code (`without held`), one main saved for an hour with each step's class text appended to its
+    code list (`held in its code list`) and one saved since with it under `held` (`held apart`) hold nothing
+    that proves the code the step reaches unchanged, so an exact resume is refused, changed or not, and a
+    relaxed one reads on naming the step (Main: missing evidence is not proof of unchanged code; train 909's
+    F8: the class text read as changed code)."""
+    import json
+
+    module = tmp_path / f"shift_{uuid4().hex}.py"
+    module.write_text(SHIFT.format(by=1))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    shift = importlib.import_module(module.stem)
+
+    def reader(resume="exact"):
+        pipeline = Pipeline(ROWS).map(Calling(shift.Shifting())).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
+
+    place = json.loads(saved_after_one(reader))[_position.ENVELOPE]
+    plan = {name: value for name, value in place["plan"].items() if name != "reached"}
+    if saved == "held in its code list":
+        plan["code"] = [[*code, *held] for code, held in zip(plan["code"], place["plan"]["reached"],
+                                                               strict=True)]
+    if saved == "held apart":
+        plan["held"] = place["plan"]["reached"]
+    position = json.dumps({_position.ENVELOPE: {**place, "plan": plan}}).encode()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(), position)
+    (changed,) = resumed_changes(reader("relaxed"), position)
+    assert changed.startswith("code.")
+
+
+REACHING = """import dataclasses
+
+
+def delta():
+    return {by}
+
+
+def unread():
+    return {other}
+
+
+@dataclasses.dataclass(frozen=True)
+class Reaching:
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + delta()}}
+"""
+
+
+CALLER = """import dataclasses
+
+import grain.python as grain
+
+from {base} import Reaching, delta
+
+
+@dataclasses.dataclass(frozen=True)
+class Child(Reaching):
+    pass
+
+
+def shifted(row):
+    return {{**row, "id": row["id"] + delta()}}
+
+
+@dataclasses.dataclass(frozen=True)
+class Shifting(grain.MapTransform):
+    def map(self, element):
+        return {{**element, "id": element["id"] + delta()}}
+"""
+"""A module of the user's whose steps run `REACHING`'s `delta`: a class inheriting its `__call__`, a function
+calling it, and a Grain transform (`abc.ABC`'s) calling it."""
+
+
+@pytest.mark.parametrize("kind", ["a helper it calls", "an inherited method", "a function step",
+                                  "a Grain transform"])
+def test_an_exact_resume_holds_the_code_a_steps_methods_reach(tmp_path, monkeypatch, kind):
+    """A step of the user's own code is held by the code it reaches, not its own text alone: a class whose
+    `__call__` calls a module-level `delta` (`a helper it calls`), one that inherits that `__call__` from a
+    base in another module of the user's (`an inherited method`), a function that calls `delta` from
+    another module (`a function step`), and a frozen Grain transform, an `abc.ABC`, whose `map` calls it (`a
+    Grain transform`); `delta` changed from returning 1 to 10, an exact resume is refused, naming the step,
+    where its unchanged text let it resume with other rows (the evening audit's CROSS-01, its inherited
+    case, train 909's F1 and F3); a change to a function of the module nothing reaches (`unread`) refuses
+    nothing (row 5862)."""
+    module = tmp_path / f"reaching_{uuid4().hex}.py"
+    module.write_text(REACHING.format(by=1, other=1))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    reaching = importlib.import_module(module.stem)
+    caller = tmp_path / f"caller_{uuid4().hex}.py"
+    caller.write_text(CALLER.format(base=module.stem))
+    callers = importlib.import_module(caller.stem)
+
+    def reader(resume="exact"):
+        steps = {"a helper it calls": lambda: reaching.Reaching(),
+                 "an inherited method": lambda: callers.Child(), "a function step": lambda: callers.shifted,
+                 "a Grain transform": lambda: callers.Shifting()}
+        step = steps[kind]()
+        pipeline = Pipeline(ROWS).map(step).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
+
+    state = saved_after_one(reader)
+    module.write_text(REACHING.format(by=1, other=10))
+    importlib.reload(reaching)
+    importlib.reload(callers)
+    assert resumed_changes(reader(), state) == ()
+    module.write_text(REACHING.format(by=10, other=10))
+    importlib.reload(reaching)
+    importlib.reload(callers)
+    with pytest.raises(ValueError):
+        resumed_changes(reader(), state)
+    (changed,) = resumed_changes(reader("relaxed"), state)
+    assert changed.startswith("code.")

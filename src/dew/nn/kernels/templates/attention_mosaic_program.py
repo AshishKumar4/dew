@@ -28,6 +28,7 @@ from dew.nn.kernels.templates import (
     layout,
     mosaic,
     operands,
+    outputs,
     placed,
     resources,
     swizzling,
@@ -549,6 +550,16 @@ def held_walked(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> tuple[
     query tiles where its family holds keys (`Family.holds_keys`, a keys-first placement), else its query
     block and its key tiles."""
     return (tiles.block_k, tiles.block_q) if family.holds_keys else (tiles.block_q, tiles.block_k)
+
+
+def column_share(array: jax.Array, count: int) -> outputs.Dim:
+    """A program's `count` of `array`'s columns as an output dimension (`outputs.Dim`): its last axis, or that
+    axis over the shares it is split into (`BackwardTiles.columns`), each a whole share."""
+    width = array.shape[-1]
+    if width % count:
+        raise ValueError(f"a share of {count} of {width} columns is not a whole one")
+    columns = outputs.axis(array, -1)
+    return columns if count == width else columns // (width // count)
 
 
 def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:

@@ -287,21 +287,6 @@ def partitioned(groups: Sequence[ParamGroup]) -> tuple[tuple[str, tuple[str, ...
     return tuple((group.name, group.patterns, group.bounds is not None) for group in groups)
 
 
-def trained_modules(objective: Objective[Loss, Effects],
-                    modules: Sequence[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Those of `modules`, paths under `params`, that hold a parameter `objective` trains, as its tree is
-    drawn (`Objective.init`, its shapes alone), and those that are one (a parameter a loaded module
-    gained, `Pretrained.with_model`): a tied readout is drawn with none."""
-    if not modules:
-        return (), ()
-    from dew.optim import parameter_name
-
-    trained = objective.drawn_shapes()["params"]
-    names = [parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)]
-    return (tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names)),
-            tuple(module for module in modules if module in names))
-
-
 def _local_tracker(directory: str, name: str):
     """Return the journal of a run, kept where its local records are (`local_records`)."""
     return LocalTracker(local_records(directory, name, "tracking"))
@@ -1596,30 +1581,29 @@ class RunConfig:
         return self.prepare().inspected(trainer.name or "inspected")
 
     def grouped(self, objective: Objective[Loss, Effects], name: str) -> OptimConfig:
-        """The run's optimizer as it trains under `name`: the groups that claim what it draws fresh beside a
-        loaded base, each matching those that hold a parameter (`ParamGroup.fresh`, `trained_modules`): its
-        own, or its named ones with the fresh group beside them, or none named, the default groups
+        """The run's optimizer as it trains under `name`: its groups as they take what it draws fresh beside a
+        loaded base (`OptimConfig.claiming`, as a `Trainer` given the config takes them): its own, or its
+        named ones with the fresh group beside them, or none named, the default groups
         (`OptimConfig.fresh_groups`). A resumed run that names no groups trains in those its record names,
-        as its optimizer state holds them (none for a record written before runs took them); one that
-        names some trains in its own, their rates and a bounded group's interval as it states them,
-        refused where their names, patterns or which of them are bounded are not the record's, which
-        shape the optimizer state it resumes (`partitioned`). Every process
-        agrees on the groups before any records them."""
+        as its optimizer state holds them; where its record names none, in those it takes now. One that
+        names some trains in its own, their rates and a bounded group's interval as it states them. Each
+        is refused where their names, patterns or which of them are bounded are not the record's, which
+        shape the optimizer state it resumes (`partitioned`). Every process agrees on the groups before any
+        records them."""
         def resolved() -> JSON:
             named = self.optim.param_groups
             checkpoints = self.trainer.checkpoints(name)
             saved = epath.Path(checkpoints.directory) / RUN_FILE
             recorded = recorded_param_groups(saved) if checkpoints.resumed(
                 self.trainer.resume) is not None and saved.exists() else None
-            if recorded is not None and not named:
+            if recorded and not named:
                 return to_record(recorded, tuple[ParamGroup, ...])
             if recorded is not None and partitioned(named) == partitioned(recorded):
                 # The record's own groups named again (a saved run's config), fresh claims and all.
                 return to_record(named, tuple[ParamGroup, ...])
-            modules, leaves = trained_modules(objective, objective.fresh_modules())
-            # A group named fresh claims what the run draws, or is refused where it draws none (`with_fresh`).
-            groups = self.optim.fresh_groups() if modules or leaves else named
-            claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules, leaves)
+            # A group named fresh claims what the run draws, or is refused where it draws none, as a
+            # `Trainer` given the config takes them (`OptimConfig.claiming`).
+            claimed = self.optim.claiming(*objective.fresh_trained())
             if recorded is not None and partitioned(claimed.param_groups) != partitioned(recorded):
                 raise ValueError(f"run {name!r} resumes an optimizer state partitioned by the groups "
                                  f"{partitioned(recorded)} (names, patterns and whether each is bounded), "

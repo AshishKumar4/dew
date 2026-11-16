@@ -272,3 +272,14 @@ def a_routes_training_step_is_on_par(case: tuple[str, ...]) -> None:
     recorded = {found.kernel for found in routes if found.choice == MAINLOOP}
     assert recorded <= KERNELS[MAINLOOP] and (config is None or "mosaic" in recorded), sorted(recorded)
 
+
+def per_shard(choice: str, kernel: str) -> dict:
+    """`kernel`'s per-shard cells (tests/test_per_shard.py): the template's public call
+    (`attention_kernels_matrix.heads_shard`, an H100's full attention over eight heads) with its mainloop
+    `kernel` named (the runner names `choice`), over its heads a two-device tensor axis splits."""
+    from attention_kernels_matrix import heads_shard
+
+    del choice
+    case = {"generation": "sm90", "kernel": "template", "width": "64", "heads": "mha", "mask": "full",
+            "dtype": "bfloat16"}
+    return {"tensor": heads_shard(case, "template")}

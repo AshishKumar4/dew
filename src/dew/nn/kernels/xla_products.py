@@ -1,6 +1,6 @@
 """XLA's portable grouped and dense products, the arm every grouped launch's selector falls back to and the
 GEMM's own portable branch (`kernels.gemm`): its products as the call's precision multiplies them
-(`_as_multiplied`), dense (`xla_dot`) and ragged (`xla_ragged_dot`, its rows placed past the groups,
+(`as_multiplied`), dense (`xla_dot`) and ragged (`xla_ragged_dot`, its rows placed past the groups,
 `ragged_placement`), a step-scaled one (`step_scaled`), a projection differentiated by its own products
 (`portable_projection`), and the platform choice between a kernel and them (`_on_platform`)."""
 
@@ -14,7 +14,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.custom_derivatives import SymbolicZero
 
 from ..derivatives import Protected, contracted, declared_tangent
-from ..precision import accumulated, at_least_fp32, rounded_operand
+from ..precision import accumulated, at_least_fp32, rounded_operand, twice_scaled
 from . import generation
 from .templates.product import SCALE_DEPTH, eight
 
@@ -38,7 +38,7 @@ def _on_platform(kernel, fallback, interpret_on_cpu: bool):
     return branches, fallback
 
 
-def _as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLike) -> tuple:
+def as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLike) -> tuple:
     """`tokens` and `kernel` as XLA's portable product multiplies them, and its precision (`xla_ragged_dot`,
     `xla_dot`). A precision level (`lax.Precision`) on 16-bit operands is their product's at the default,
     every level the same exact products; an explicit dot algorithm a call states (`lax.DotAlgorithm`,
@@ -65,10 +65,10 @@ def _as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLik
 def xla_dot(tokens: jax.Array, matrix: jax.Array, *, precision: PrecisionLike = None,
             preferred_element_type: Dtype | None = None) -> jax.Array:
     """A dense product, every row through one matrix (`[depth, width]`), as `xla_ragged_dot` multiplies a
-    group's rows (`_as_multiplied`), as XLA's own dot: no group, so no row masked, and no ragged dot to
+    group's rows (`as_multiplied`), as XLA's own dot: no group, so no row masked, and no ragged dot to
     trace or to expand (a dense call's portable branch, `gemm`'s), summed as `precision.accumulated` sums a
     contraction (XLA's own on a CPU, row 5448)."""
-    tokens, matrix, precision = _as_multiplied(tokens, matrix, precision)
+    tokens, matrix, precision = as_multiplied(tokens, matrix, precision)
     return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (0,)), ((), ())),
                                          precision=precision),
                        tokens, matrix, preferred_element_type=preferred_element_type)
@@ -89,7 +89,7 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     nor a dropped row's gradient carries them. Its sums are `precision.accumulated`'s (XLA's own on a CPU,
     row 5448).
     """
-    tokens, kernel, precision = _as_multiplied(tokens, kernel, precision)
+    tokens, kernel, precision = as_multiplied(tokens, kernel, precision)
     # bincount widens under x64; TPU ragged-dot only lowers int32 counts.
     # Keep the wider domain for CPU calls whose row count actually needs it.
     index_dtype = jnp.int32 if tokens.shape[0] <= np.iinfo(np.int32).max else jnp.int64
@@ -161,7 +161,9 @@ def step_scaled(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, ro
         partial = xla_ragged_dot(lhs, rhs, group_sizes, precision=precision,
                                  preferred_element_type=jnp.float32)
         columns = jnp.repeat(column_scales[:, index][owner], width // scaled, axis=1)
-        return total + partial * row_scales[index][:, None].astype(jnp.float32) * columns.astype(jnp.float32)
+        # Each scale in the order that keeps the intermediate normal (`twice_scaled`, ledger 2715).
+        return total + twice_scaled(partial, row_scales[index][:, None].astype(jnp.float32),
+                                    columns.astype(jnp.float32))
 
     return jax.lax.fori_loop(0, blocks, block, jnp.zeros((rows, width), jnp.float32))
 
@@ -201,6 +203,8 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_
     # The tangents keep their dtypes to this point whatever produced them, so an activation's bf16 cotangent
     # is not fused into a wider expression: XLA's excess-precision simplification (`SimplifyFPConversions`,
     # on under `xla_allow_excess_precision`, its default) drops a round trip through bf16 a fusion forms.
+    # Both live, the same barrier is the rule's dual (`with_tangents_formed`): its transpose returns `x`'s
+    # cotangent only with the kernel's gradient formed.
     held = dict(zip((name for name, _ in live),
                     jax.lax.optimization_barrier(tuple(tangent for _, tangent in live)),
                     strict=True))

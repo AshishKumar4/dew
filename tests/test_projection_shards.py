@@ -70,8 +70,10 @@ class _Projections(nn.Module):
                  for name in (("first", "second") if self.join else ("first",))]
         if self.join is None:
             return dense[0](x)
-        for projection in dense:
-            projection(x)
+        if self.is_initializing():
+            # Each projection's parameters made; an apply runs the joined product alone.
+            for projection in dense:
+                projection(x)
         return joined_dense(x, dense, axis=self.join)
 
 
@@ -147,23 +149,65 @@ def _specs(case: dict, mesh: Mesh) -> list:
     return [PartitionSpec(axis), *kernels, *(PartitionSpec(),) * len(names), PartitionSpec(axis)]
 
 
+def unlaunched() -> list[str]:
+    """The cases no GEMM kernel launches per shard (`gemm_matrix.launched`): the layer's own (a tensor axis's
+    product, the partitioner's; a weight stored in fp32, rounded once). Every other case is a kernel's
+    per-shard cell (`gemm_matrix.per_shard`, tests/test_per_shard.py)."""
+    from gemm_matrix import launched
+
+    taken = {name for name, _ in launched()}
+    return [name for name in CASES if name not in taken]
+
+
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("name", list(CASES))
-def test_a_projection_on_a_two_device_mesh_is_on_par_with_one_device(name):
-    """A bf16 Dense, or two joined, on a two-device mesh (`CASES`) under `LAYOUT`, the GEMM template's
-    kernel named and interpreted as an H100's (each device's launch on its own rows), its forward and
-    reverse: on par with one device's (check 1) from float64, its compiled step moving no operand between
-    devices but an fsdp weight's gather."""
+@pytest.mark.parametrize("name", unlaunched())
+def test_a_projection_no_kernel_launches_per_shard_is_on_par_with_one_device(name):
+    """A bf16 Dense, or two joined, on a two-device mesh (`unlaunched`) under `LAYOUT`: on par with one
+    device's (check 1) from float64, its compiled step moving no operand between devices but an fsdp
+    weight's gather."""
     case = CASES[name]
     mesh = Mesh(np.asarray(jax.devices()[:2]), (case["axis"],))
-    gathers = case["axis"] == "fsdp"
-    # The template named where the rows are split alone; a tensor axis's product is the partitioner's.
-    named = {} if case["axis"] == "tensor" else {"grouped_matmul": "mosaic"}
-    with (generation.assumed("sm90", interpreted=True), generation.chosen(**named),
-          nn.logical_axis_rules(DEFAULT_RULES), placing(LAYOUT), _declared()):
+    with (generation.assumed("sm90", interpreted=True), nn.logical_axis_rules(DEFAULT_RULES), placing(LAYOUT),
+          _declared()):
         assert_runs_per_shard(with_gradients(_call(case)), _draw(case), _specs(case, mesh), mesh, name,
                               seeds=SEEDS, truth_fn=_exact(case.get("join")),
-                              moves=("all-gather",) if gathers else ())
+                              moves=("all-gather",) if case["axis"] == "fsdp" else ())
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axis", ["data", "fsdp"])
+def test_a_projection_read_apart_from_its_layer_runs_per_shard_as_its_layer_does(axis):
+    """A projection read apart from its layer (`protocols.Projection`, as a vocabulary head reads
+    `project_out`, through `dense.plain_product`), its kernel the parameter at its layer's path, on a
+    two-device mesh splitting its rows, the template's kernel named and interpreted as an H100's: each
+    device's launch on its own rows, on par with one device's (check 1) from float64, its compiled step
+    moving no operand between devices but an fsdp weight's gather (row 6047: it went to the partitioner)."""
+    from dew.nn.protocols import Projection
+
+    path = tuple(jax.tree_util.DictKey(key) for key in ("params", "first", "kernel"))
+    mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
+
+    def call(x, kernel):
+        return Projection(kernel, path=path)(x)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(ROWS, LENGTH, FEATURES)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(FEATURES, WIDTH)) / 8, jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(ROWS, LENGTH, WIDTH)), jnp.bfloat16))
+
+    def truth(x, kernel, cotangent):
+        return with_gradients(lambda x, kernel: x @ kernel)(
+            *(argument.astype(jnp.float64) for argument in (x, kernel, cotangent)))
+
+    with (jax.sharding.use_abstract_mesh(mesh.abstract_mesh), nn.logical_axis_rules(DEFAULT_RULES),
+          _declared()):
+        kernel = _kernel("first", (FEATURES, WIDTH), jnp.bfloat16)
+    with (generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic"),
+          nn.logical_axis_rules(DEFAULT_RULES), placing(LAYOUT), _declared()):
+        assert_runs_per_shard(with_gradients(call), draw, [PartitionSpec(axis), kernel, PartitionSpec(axis)],
+                              mesh, f"a projection apart from its layer {axis}", seeds=SEEDS, truth_fn=truth,
+                              moves=("all-gather",) if axis == "fsdp" else ())
 
 
 @pytest.mark.mesh(devices=2)

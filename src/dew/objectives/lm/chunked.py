@@ -53,7 +53,7 @@ from dew.nn.categorical import (
     segment_log_partition,
     target_loss,
 )
-from dew.nn.derivatives import KernelGlue, Protected, contracted
+from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels.generation import linear_tangent
 from dew.nn.precision import (
     added_to,
@@ -590,8 +590,9 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
     d_columns = jax.tree.map(lambda gradient, terms: gradient.astype(terms.dtype), d_columns, columns)
     d_states = running_total(d_states)
     d_cap = None if d_cap is None else running_total(d_cap).astype(jnp.asarray(softcap).dtype)
-    return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table, zero_from_primal(targets),
-            zero_from_primal(excluded), d_cap, d_columns)
+    d_states, (d_table, d_cap, d_columns) = with_gradients_formed(
+        d_states.reshape(hidden.shape).astype(hidden.dtype), (d_table, d_cap, d_columns))
+    return d_states, d_table, zero_from_primal(targets), zero_from_primal(excluded), d_cap, d_columns
 
 
 def _softmax_cotangent(logits, first, excluded, peaks, masses, rests, labels, d_first, d_partition,
@@ -706,8 +707,9 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, save
         pullback, _softmax_cotangent(logits, 0, excluded, peaks, masses, rests, targets.reshape(-1),
                                      loss_cotangent.reshape(-1), partition_cotangent.reshape(-1), picked),
         table.astype(operands), hidden.reshape(-1, features).astype(operands), precision, work, width)
-    return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
-            zero_from_primal(targets), zero_from_primal(excluded), d_cap, d_columns)
+    d_states, (d_table, d_cap, d_columns) = with_gradients_formed(
+        d_states.reshape(hidden.shape).astype(hidden.dtype), (d_table.astype(table.dtype), d_cap, d_columns))
+    return d_states, d_table, zero_from_primal(targets), zero_from_primal(excluded), d_cap, d_columns
 
 
 def _state_product(d_raw, table, precision, work, width: int | None) -> jax.Array:
@@ -983,9 +985,10 @@ def _fused_bwd(z_loss, cap, chunk, precision, predict, temperature, excluded, sa
     d_states, d_table, d_columns = saved
     hidden, table, labels, weights, _ = operands
     scale = cotangents[0]
-    return ((scale * d_states).astype(hidden.dtype), (scale * d_table).astype(table.dtype),
-            zero_from_primal(labels), zero_from_primal(weights),
-            jax.tree.map(lambda gradient: scale * gradient, d_columns))
+    d_states, (d_table, d_columns) = with_gradients_formed(
+        (scale * d_states).astype(hidden.dtype),
+        ((scale * d_table).astype(table.dtype), jax.tree.map(lambda gradient: scale * gradient, d_columns)))
+    return d_states, d_table, zero_from_primal(labels), zero_from_primal(weights), d_columns
 
 
 FUSED_LOGIT_BYTES = 2 << 30

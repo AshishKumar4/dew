@@ -39,12 +39,12 @@ from dew.algebra.derive import FORMS_HELD
 from dew.algebra.scan import RESET_DECAY
 from dew.batch import document_firsts
 from dew.nn.attention_masks import repeat_kv_heads
-from dew.nn.derivatives import KernelGlue, Protected, contracted
+from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed_at
 from dew.nn.inputs import cu_seqlens
 from dew.nn.nested import nested
 from dew.nn.precision import asks_default_precision, at_least_fp32, exact_products, l2norm, rounds_products
 from dew.nn.residuals import Residual
-from dew.nn.sharding import grouped_heads, manual_map, rows_like, varying_like
+from dew.nn.sharding import grouped_heads, manual_map, rows_like, shard_shapes, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
 from .chunked_launch import AlignedDocuments, Forked, zero_padded
@@ -223,7 +223,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             return port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
                                scale=scale, wide=fused_wide, bound=hooks.inverse_bound,
                                product=product, forked=forked, delta=hooks.delta,
-                               decayed=hooks.decay != 'none', skip=None if hooks.delta else skip)
+                               decayed=hooks.decay != 'none', skip=None if hooks.delta else skip,
+                               rounded=rounded, firsts=firsts)
 
         def run(kernel, query, key, value, g, beta, skip, state, starts, firsts, *walked):
             # Every kernel walks the packed rows, each document from its own memory, its values read once
@@ -251,8 +252,10 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             out = out.astype(work)
             return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
 
-        out, final = _per_product(product_kernel, run, query, key, value, g, beta, skip, state, starts,
-                                  firsts, *(() if forked is None else forked.walked))
+        # The skip's `D` (operand 5) is the call's parameter.
+        out, final = _per_product(GATED_DELTA.bound(product_kernel), run, query, key, value, g, beta, skip,
+                                  state, starts, firsts, *(() if forked is None else forked.walked),
+                                  parameters=(5,))
     # The epilogue in the working precision, and the output rounded once.
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
 
@@ -450,7 +453,8 @@ class Templated(Protocol):
 TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
     Requirement('launch', lambda case: case.call is not None and case.call.eligible('mosaic_gpu'),
                 "the recurrence template's launches take no call of these dtypes or widths, or no config "
-                "fits this device, or no Mosaic bundle claims its instruction family", row='ledger 1294'),
+                "fits this device or holds in its compiles (each spilling, the start's misses name them), "
+                "or no Mosaic bundle claims its instruction family", row='ledger 1294'),
     Requirement('device', lambda case: case.family is not None,
                 "no GPU runs the call: off one, the mainloop runs interpreted where a call names it",
                 row=INHERENT, kind='measured'),
@@ -924,21 +928,22 @@ def _walk(forms, width: int, recomputed: bool, held: int = 0):
 def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segments: int | None = None,
                 scale: float | None = None, wide: bool = False,
                 bound: float | None = None, product: str = 'forward', report: bool = True, delta: bool = True,
-                decayed: bool = True, forked: Forked | None = None, skip=None) -> str:
+                decayed: bool = True, forked: Forked | None = None, skip=None, rounded: bool | None = None,
+                firsts=None) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
     ('forward', 'training'), of the form `delta` and `decayed` state and the chunk inverse's `bound` its form
     proves (`recurrence.Hooks.inverse_bound`; `PortCase`), the template's
     implementations bound to it, its `skip` among them where it takes one (`chunk`: a form without the delta
-    rule's), on the target (`generation`'s, an assumed one's within `assumed`):
+    rule's), on the target (`generation`'s, an assumed one's within `assumed`), at the call's numbers
+    `rounded` (`chunk_rounding`'s where None, read here; a call passes its own, read once at it, so a
+    selection made later, a remat's pullback's under its caller's precision, reads the call's):
     reported as its route, or not where not `report` (`selected`). A kernel a call names
     (`generation.chosen`) insists on it (`selection.KernelRefused`: the port named over varying operands),
     but for a form the rule's kernels do not run, which the portable math takes."""
-    from .templates.recurrence import template
-
-    call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
-                     max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound,
-                     rounded=chunk_rounding(delta, jnp.result_type(query, key, value)),
-                     recomputed=recomputed_memory(), forked=forked, skip=skip)
+    call = template_call(query, key, value, g, beta, state, starts, firsts, skip, forked,
+                         max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound,
+                         rounded=(chunk_rounding(delta, jnp.result_type(query, key, value))
+                                  if rounded is None else rounded))
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1],
@@ -959,7 +964,18 @@ def _read_once(value, work) -> tuple[jax.Array, jax.Array]:
     return wide, wide.astype(value.dtype)
 
 
-def _per_product(kernel_of: Callable[[str], str], run, *operands):
+def _portable_training(kernel_of: Callable[[str], str]) -> bool:
+    """Whether a call's training product is the portable math, asked uncertified at the call (a template's
+    eligibility certifies in reverse mode alone, `Template.holds`, and certification only narrows the
+    portable math's): not where a kernel the call names refuses it, which refuses where a gradient selects
+    it again (`_per_product`'s `training`)."""
+    try:
+        return kernel_of('training') == 'xla'
+    except KernelRefused:
+        return False
+
+
+def _per_product(kernel_of: Callable[[str], str], run, *operands, parameters: tuple[int, ...]):
     """`run(kernel, *operands)` on the kernel a selector gives each product (`kernel_of('forward')`,
     `kernel_of('training')`), differentiated at every order through the portable math (`run('xla', ...)`,
     `generation.linear_tangent`): the forward's kernel where no derivative is taken, the training kernel's
@@ -972,20 +988,24 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
     traced, not a forward alone. Where both products are the portable math's (a CPU's, or a device no
     kernel takes), the call is the portable math itself, whose own derivatives hold every order: traced
     through the products' split it traced the portable math three times over, half of a gated delta net
-    layer's training step's trace on a CPU (row 3142)."""
+    layer's training step's trace on a CPU (row 3142). The operands at `parameters` are the call's
+    parameters (a skip's `D`, a rate, A), whose gradients reverse mode forms with the others' cotangents
+    (`derivatives.with_gradients_formed_at`)."""
     forward = kernel_of('forward')
-    try:
-        trained = kernel_of('training')
-    except KernelRefused as refusal:
-        training = functools.partial(_refusing, refusal)
-    else:
-        if forward == trained == 'xla':
-            return run(forward, *operands)
+    if forward == 'xla' and _portable_training(kernel_of):
+        return run(forward, *operands)
 
-        def training(*operands):
-            # Certified as reverse mode runs it: its forward and pullback (`launch_report.pulled`).
-            with launch_report.pulled():
-                return run(trained, *operands)
+    def training(*operands):
+        # Selected and certified as reverse mode runs it, its forward and pullback (`launch_report.pulled`),
+        # which only a gradient calls, so a trace no gradient reaches (a prefill, a generation) certifies no
+        # training launch (train 934's F4); selected outside it, eligibility certified the forward alone, took
+        # the A100's gated delta net for its training, and raised Exhausted inside the step's trace (train
+        # 929's F1). The call's numbers and named kernel are its own (`kernel_of`'s, read at the call): a
+        # remat's pullback runs here under its caller's precision and choices. A kernel the call names that
+        # refuses it refuses here, where a gradient is traced, not in a forward alone.
+        with launch_report.pulled():
+            return run(kernel_of('training'), *operands)
+
     primal = functools.partial(run, forward)
 
     def portable(*operands):
@@ -994,18 +1014,11 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
 
     def pulled(pullback, operands, cotangent):
         del operands
-        return pullback(cotangent)
+        return with_gradients_formed_at(tuple(pullback(cotangent)), parameters)
 
     return contracted("test_the_chunked_op_holds_every_order")(
         generation.linear_tangent(functools.partial(jax.vjp, training), pulled, portable, primal=primal,
                                   nested=False, kind=KernelGlue()))(*operands)
-
-
-def _refusing(refusal: KernelRefused, *operands):
-    """A product whose kernel refused the call (`_per_product`'s training): raises `refusal` where it is
-    traced."""
-    del operands
-    raise refusal
 
 
 def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, state=None):
@@ -1131,6 +1144,36 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
     table's given memories `state` `[B, S', Hv, Dk, Dv]`, are each shard's rows'."""
     from .templates.recurrence import template
 
+    operands, specs, out_specs, bound = _template_launch(query, key, value, g, beta, state, starts, firsts,
+                                                         skip, forked, **options)
+
+    def local(*given):
+        arguments, keywords = bound(*given)
+        return template.MOSAIC(*arguments, **keywords)
+
+    return manual_map(local, specs, out_specs)(*operands)
+
+
+def template_call(query, key, value, g, beta, state=None, starts=None, firsts=None, skip=None,
+                  forked: Forked | None = None, **options) -> base.Call:
+    """The template's call a selector reads (`port_kernel`, `scan_kernel`), bound as `template_rule` binds
+    its launch on each shard (`_template_launch`): each shard's shapes, its documents' firsts and its
+    forked call's carried tables, so the launch its eligibility certifies (`Template.holds`) is the one the
+    call runs. Bound to the whole batch, without its firsts and with the whole fork, every packed or sharded
+    training step certified a launch it never ran beside the one it did (train 942's F2)."""
+    from .templates.recurrence import template
+
+    operands, specs, _, bound = _template_launch(query, key, value, g, beta, state, starts, firsts, skip,
+                                                 forked, **options)
+    arguments, keywords = bound(*shard_shapes(operands, specs))
+    return base.call((template.MOSAIC,), *arguments, **keywords)
+
+
+def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, forked: Forked | None,
+                     **options) -> tuple:
+    """The template's launch on each shard: `(operands, specs, out_specs, bound)`, its operands in order with
+    their placements (`_shard_specs`), its outputs', and `bound(*local)` the op's arguments and keywords
+    from each shard's operands (`template_rule`'s launch and `template_call`'s bind alike)."""
     four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
     P = jax.sharding.PartitionSpec
     walked = ()
@@ -1145,14 +1188,14 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
     specs = (four, four, four, decays, three, *(spec for x, spec in optional if x is not None),
              *walked)
 
-    def local(query, key, value, g, beta, *given):
+    def bound(query, key, value, g, beta, *given):
         given = iter(given)
         state, starts, firsts, skip = (None if x is None else next(given) for x, _ in optional)
-        return template.MOSAIC(query, key, value, g, beta, state, starts, firsts=firsts, skip=skip,
-                               forked=None if forked is None else forked.carrying(*given),
-                               recomputed=recomputed_memory(), **options)
+        return (query, key, value, g, beta, state, starts), dict(
+            firsts=firsts, skip=skip, forked=None if forked is None else forked.carrying(*given),
+            recomputed=recomputed_memory(), **options)
 
-    return manual_map(local, specs, (four, P(four[0], four[2], None, None)))(*operands)
+    return operands, specs, (four, P(four[0], four[2], None, None)), bound
 
 
 RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())
@@ -1291,7 +1334,7 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     def product_kernel(product: str) -> str:
         return scan_kernel(query, key, value, g, beta, state, starts, chunk_size=chunk_size,
                            max_segments=max_segments, product=product, skip=taken, wide=not narrow,
-                           forked=forked)
+                           forked=forked, rounded=fast, firsts=firsts)
 
     def run(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts, *walked):
         carried = None if forked is None else forked.carrying(*walked)
@@ -1343,8 +1386,9 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
                                   scale=1.0, delta=False, dtype=work, forked=forked)
         return recurrence.skipped(hooks, out, wide, {'skip': skip}, work), final
 
-    return _per_product(product_kernel, run, query, key, value, g, beta, rate, skip, state, starts, firsts,
-                        *(() if forked is None else forked.walked))
+    # The rate and the skip's `D` (operands 5 and 6) are the call's parameters.
+    return _per_product(SCAN.bound(product_kernel), run, query, key, value, g, beta, rate, skip, state,
+                        starts, firsts, *(() if forked is None else forked.walked), parameters=(5, 6))
 
 
 def _scan_widths(width: int) -> int:
@@ -1498,18 +1542,18 @@ def chunk_rounding(delta: bool, dtype) -> bool:
 
 def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_size: int,
                 max_segments: int | None = None, product: str = 'forward', skip=None,
-                wide: bool = True, forked: Forked | None = None) -> str:
+                wide: bool = True, forked: Forked | None = None, rounded: bool | None = None,
+                firsts=None) -> str:
     """The kernel the scan's selector (`SCAN`) gives a rated scan over these operands (`_rated_scan`'s:
     `value` the SSD's `x`, `key` its `B`, `query` its `C`) for `product` ('forward', 'training'), the
     template's implementations bound to it as the run calls it (its fused `skip`, None where added after,
     and its output `wide` or in the operands' dtype), on the target (`generation`'s, an assumed one's within
-    `assumed`), reported as its route."""
-    from .templates.recurrence import template
-
-    call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
-                     max_segments=max_segments, scale=1.0, delta=False, wide=wide,
-                     rounded=fast_rounding(jnp.result_type(query, key, value)),
-                     skip=skip, recomputed=recomputed_memory(), forked=forked)
+    `assumed`), at the call's numbers `rounded` (`fast_rounding`'s where None; `port_kernel`'s rule),
+    reported as its route."""
+    call = template_call(query, key, value, g, beta, state, starts, firsts, skip, forked,
+                         max_segments=max_segments, scale=1.0, delta=False, wide=wide,
+                         rounded=(fast_rounding(jnp.result_type(query, key, value))
+                                  if rounded is None else rounded))
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product,
                      forked=forked is not None)
     return select(SCAN, case).kernel
@@ -1750,5 +1794,6 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, load
         specs = (three, three, P(None, None), three, three, P(None), three, P(rows, None))
         return manual_map(template, specs[:len(operands)], (three, three))(*operands)
 
-    return _per_product(lambda product: selective_kernel(x, A, B, C), run, x, dt, A, B, C, D, state,
-                        *(() if forked is None else forked.walked))
+    # A and D (operands 2 and 5) are the call's parameters.
+    return _per_product(SELECTIVE.bound(lambda product: selective_kernel(x, A, B, C)), run, x, dt, A, B, C, D,
+                        state, *(() if forked is None else forked.walked), parameters=(2, 5))

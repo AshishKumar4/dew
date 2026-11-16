@@ -38,7 +38,7 @@ import torch
 from flax import linen as nn
 from interop_support import fixture_arrays, fixture_ids, transformers_arms, transformers_model
 from jax.sharding import PartitionSpec as P
-from model_support import as_stepped, decode_through
+from model_support import as_stepped, decode_through, kept_by_slot
 from quantized_basis import dequantized_in_own_basis
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
@@ -79,7 +79,8 @@ GENERATOR = load("mla_reference")
 
 SEEDS = {"v3 block": 16, "v3n block": 32, "v32 block": 8, "auto": 64, "decode": 8, "value columns": 8,
          "yarn": 16, "visibility": 16, "mla_v3 int8 latent decode": 8, "mla_v32 int8 latent decode": 8,
-         "mla_v3 float8_e4m3fn latent decode": 8, "mla_v32 float8_e4m3fn latent decode": 8}
+         "mla_v3 float8_e4m3fn latent decode": 8, "mla_v32 float8_e4m3fn latent decode": 8,
+         "paged decode": 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada: the most any of
 a site's cases took."""
 PREFIX_RUN_SEEDS = 32
@@ -359,17 +360,39 @@ def test_decode_matches_prefill(name):
 @pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v32"])
 def test_a_paged_latent_cache_decodes_what_the_compact_cache_decodes(name, quantized):
-    """A latent attention's cache takes the layer's layout: paged, it decodes every step as the compact
-    cache does at the same format, bit for bit, both decoded in one program (ledger 3178), full precision
-    or quantized, over the latents (V3) and over the expanded keys the indexer selects among (V3.2), the
-    quantized keys read back in the basis their queries or their expansion take."""
+    """A latent attention's cache takes the layer's layout: paged, it keeps every slot bit for bit as the
+    compact cache keeps it at the same format, values moved without arithmetic, and decodes each step on
+    par with the compact cache (check 1) from the float64 decode, the two being two computations, which XLA
+    fuses apart (the page gather into the products, ledger 3178); full precision or quantized, over the
+    latents (V3) and over the expanded keys the indexer selects among (V3.2), the quantized keys read back
+    in the basis their queries or their expansion take."""
     settings = CONFIG[SETTINGS[name]]
     variables = block_variables(fixture(name))
-    hidden = block_draw(name)(0)[0]
     paged, compact = (mla_module(settings, kv_cache=layout)
                       for layout in (KVCache(quantized=quantized, page_size=4), KVCache(quantized=quantized)))
-    np.testing.assert_array_equal(*jax.jit(lambda variables, hidden: [
-        decode_loop(module, variables, hidden) for module in (paged, compact)])(variables, hidden))
+    caches = jax.jit(lambda variables, hidden: [
+        decode_through(module, {"params": variables["params"]}, hidden, prefill=1)[2]
+        for module in (paged, compact)])(variables, block_draw(name)(0)[0])
+    held, rows = (kept_by_slot(cache) for cache in caches)
+    assert held.keys() == rows.keys()
+    for path, kept in held.items():
+        np.testing.assert_array_equal(kept, rows[path], err_msg="/".join(path))
+
+    def decoded(module):
+        return jax.jit(lambda hidden: decode_loop(module, variables, hidden))
+
+    def draw(seed):
+        return (block_draw(name)(seed)[0],)
+
+    def truth(hidden):
+        # The float64 decode: each position as the block's whole pass computes it, over the keys a quantized
+        # cache reads back dequantized in their own basis.
+        if quantized is None:
+            return compact.apply(widened(variables), hidden)
+        return uncached_dequantized_steps(compact, widened(variables), hidden, quantized)
+
+    assert_as_exact(decoded(paged), decoded(compact), draw, f"{name} {quantized} paged decode",
+                    seeds=SEEDS["paged decode"], truth_fn=truth)
 
 
 def uncached_dequantized_steps(module, variables, hidden, quantized: str):

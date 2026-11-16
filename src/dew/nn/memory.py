@@ -32,8 +32,10 @@ the network's parameters, a traced carry. Each head's network is this layer's ch
 whose parameters are its W_0, and every application runs that child at its own scope over the weights
 the step holds, read-only (`_substituted`), so the layer composes with a scanned layer stack and remat,
 and a method interceptor the model computes under finds each head's sites at their paths, as at any
-child; the chunk's carry is named (`CARRY`) for a remat policy. The heads run one after another, each
-vectorized over its rows and tokens, and may hold different trees (an adapter on one head alone).
+child; the chunk's carry is named (`CARRY`) for a remat policy, and where the run's rung recomputes the
+chunks (`CHUNK`) it is all the scan keeps of a chunk for its derivative, which recomputes the chunk from it.
+The heads run one after another, each vectorized over its rows and tokens, and may hold different trees
+(an adapter on one head alone).
 
 An adapter on an inner kernel (`dew.lora`) adds its branch, s drop(x) A B, at every application, as it
 does at any Dense, its dropout drawing from each token's key in a forward that carries the dropout
@@ -89,6 +91,7 @@ from dew.nn.dense import Dense
 from dew.nn.documents import within_documents
 from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.kv_cache import ROUNDING_KEYS, Opened, cache_variables, kept, stated
+from dew.nn.linear import as_projected
 from dew.nn.residuals import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
@@ -106,8 +109,10 @@ from .norms import LayerNorm
 from .precision import at_least_fp32, l2norm
 
 CARRY = MEMORY_RESIDUALS[0]
+CHUNK = MEMORY_RESIDUALS[1]
 """The name of the state a chunk hands the next (`checkpoint_name`), for a remat policy to save
-(`dew.nn.residuals.RESIDUALS`)."""
+(`dew.nn.residuals.RESIDUALS`), and of a chunk's own values, which a rung naming it recomputes from that
+state (`recurrence_chunk.RECOMPUTED`: the heaviest rung's, `decoder_block.recomputed_inside`)."""
 
 STATE, MOMENTUM, START, COUNT = "memory_state", "memory_momentum", "memory_start", "memory_count"
 """The decode cache's variables: the network's fast parameters now, the momentum, the parameters at the
@@ -435,7 +440,8 @@ class InContextMemory(LinearProducts):
             read = self._chunked(heads, steps)
         if counted is not None:
             counted()
-        read = read.astype(self.dtype or x.dtype)
+        # An unprojected query is the stream itself, read in the layer's dtype or the stream's.
+        read = as_projected(read, query.dtype if self.project_query else self.dtype or x.dtype)
         if self.output:
             read = Dense(x.shape[-1], use_bias=False, dtype=self.dtype, precision=self.precision,
                          kernel_axes=("attention", "embed"), name="o_proj")(read.reshape(batch, length, -1))
@@ -698,7 +704,14 @@ class InContextMemory(LinearProducts):
         count = laid.real.shape[0]
         rows = tuple(_rows(head.initial, steps.real) for head in heads)
         carry = (rows, jax.tree.map(jnp.zeros_like, rows))
-        _, reads = jax.lax.scan(functools.partial(self._chunk, heads=heads), carry, laid)
+        # Where the run's remat recomputes the chunks (`CHUNK`), each chunk's work is recomputed from the
+        # carry it entered with, the scan stacking that carry alone; elsewhere it stacks every value of a
+        # chunk's gradients and steps, as fast as the step that fits them runs (row 6577: recomputed always, a
+        # Titans step that fit ran 31-41% slower).
+        chunk = functools.partial(self._chunk, heads=heads)
+        if CHUNK in recurrence_chunk.RECOMPUTED.get():
+            chunk = jax.checkpoint(chunk, prevent_cse=False)
+        _, reads = jax.lax.scan(chunk, carry, laid)
         reads = jnp.moveaxis(reads, 0, 1).reshape(batch, count * self.chunk, *reads.shape[3:])[:, :length]
         inverse = jnp.argsort(order, axis=1)
         return jnp.take_along_axis(reads, inverse.reshape(*inverse.shape, 1, 1), axis=1)
@@ -718,7 +731,9 @@ class InContextMemory(LinearProducts):
         laid = [self._chunk_head(head, state[index], momentum[index], step, theta[:, :, index],
                                  matrices[:, :, index], index) for index, head in enumerate(heads)]
         lasts, moments, reads = zip(*laid, strict=True)
-        return (lasts, moments), jnp.stack(reads, axis=2)
+        # The chunk's readouts and next carry named (`CHUNK`): what a rung keeping the chunks' own values
+        # saves (a policy saving them, `RematPolicy.save`), the rest of the chunk's values recomputed beside.
+        return checkpoint_name(((lasts, moments), jnp.stack(reads, axis=2)), CHUNK)
 
     def _chunk_head(self, head: _Head, state: dict, momentum: dict, step: _Steps, theta: jax.Array,
                     matrices: jax.Array, index: int) -> tuple[dict, dict, jax.Array]:

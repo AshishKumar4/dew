@@ -46,6 +46,7 @@ import numpy as np
 from jax import lax
 from jax.extend import core as jcore
 
+from dew import _cache
 from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
@@ -140,15 +141,16 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     if len(shape) != 2:
         raise Refused("a state of rank other than two (keys by values) has no chunk form here")
 
-    decomposed: dict = {}  # the token's affine map by its operands' types, its e-graph saturated once
+    # The token's affine map by its operands' types and what its derivation reads where it runs
+    # (`derive.context`: the mesh, the target, the numerics, the matmul precision its products' parameters
+    # hold), its e-graph saturated once for each, the latest `derive.FORMS_HELD` kept.
+    decomposed: collections.OrderedDict = collections.OrderedDict()
 
     def affine_of(chunk: Mapping):
-        types = tuple((tuple(chunk[name].shape), str(chunk[name].dtype)) for name in names)
-        if types not in decomposed:
-            decomposed[types] = linear_scan.parts(_traced(declaration, declaration.update, names, chunk),
-                                                   _traced(declaration, declaration.readout, names, chunk),
-                                                   saturation)
-        return decomposed[types]
+        key = (tuple((tuple(chunk[name].shape), str(chunk[name].dtype)) for name in names), derive.context())
+        return _cache.holding(decomposed, key, lambda: linear_scan.parts(
+            _traced(declaration, declaration.update, names, chunk),
+            _traced(declaration, declaration.readout, names, chunk), saturation), derive.FORMS_HELD)
 
     def parts(chunk: Mapping):
         affine = affine_of(chunk)
@@ -185,13 +187,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         # target, precision, numerics or mesh is none of this one's.
         key = (derive.context(), affine.base2, corrected, affine.values_read,
                *((value.shape, str(value.dtype)) for value in given))
-        split = splits.get(key)
-        if split is None:
-            split = splits[key] = _split(declaration, names, chunk, affine, form, tuple(held), given,
-                                         jax.ShapeDtypeStruct(shape, carried), extents.tokens, saturation)
-            if len(splits) > splits_held:
-                splits.popitem(last=False)
-        splits.move_to_end(key)
+        split = _cache.holding(splits, key, lambda: _split(
+            declaration, names, chunk, affine, form, tuple(held), given, jax.ShapeDtypeStruct(shape, carried),
+            extents.tokens, saturation), splits_held)
         prepared = Prepared((natural, split.prepare(*given, issue=issue or _issued)), split, corrected,
                             entering=entering, values_read=affine.values_read)
         if not (corrected and transition):

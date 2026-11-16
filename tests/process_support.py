@@ -117,14 +117,15 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
-def device_flags(devices: int) -> str:
-    """This process's XLA flags with `devices` CPU devices, the one way a worker of the suite sets its device
-    count: the lane's other flags kept (`lane_environment`: its CPU collectives' memory-optimized schedule,
-    row 5397, and no excess precision), which a count set alone drops."""
+def device_flags(devices: int, flags: str | None = None) -> str:
+    """XLA's `flags` (this process's where none are given) with `devices` CPU devices, the one way a worker of
+    the suite sets its device count: the lane's other flags kept (`lane_environment`: its CPU collectives'
+    memory-optimized schedule, row 5397, and no excess precision), which a count set alone drops."""
     from lane_environment import without_flags
 
     count = "--xla_force_host_platform_device_count"
-    return f"{without_flags(os.environ.get('XLA_FLAGS', ''), count)} {count}={devices}".strip()
+    given = os.environ.get("XLA_FLAGS", "") if flags is None else flags
+    return f"{without_flags(given, count)} {count}={devices}".strip()
 
 
 def worker_env(devices: int) -> dict[str, str]:

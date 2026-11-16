@@ -1415,11 +1415,14 @@ def test_a_tight_start_compiles_twice_cold_and_once_warm(monkeypatch, tmp_path, 
     trace and compile most often"): cold, the batch whole compiles and misses, and that compile computes
     the split asked next (`MemoryMiss`), XLA's compile the judge of it, until the fewest microbatches that
     fit, those `between` missing at the first and fitting at the second; warm, the plan its cold start
-    recorded (`keep_rung`, beside the compilation cache) is the first candidate, one compile."""
-    fewer, fewest = (needs(monkeypatch, lm(split=split, width=width)) for split in between)
-    assert fewest < fewer, (fewest, fewer)
+    recorded (`keep_rung`, beside the compilation cache) is the first candidate, one compile. The devices'
+    memory lies between the fewest's need and the least of the whole batch's and the first's, so both miss:
+    the whole batch's need, its accumulator absent, is not the most of every split's."""
+    whole, fewer, fewest = (needs(monkeypatch, lm(split=split, width=width)) for split in (1, *between))
+    missing = min(whole, fewer)
+    assert fewest < missing, (fewest, whole, fewer)
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
-    free(monkeypatch, (fewer + fewest) // 2)
+    free(monkeypatch, (missing + fewest) // 2)
     cold_run, warm = lm(width=width), lm(width=width)
     with Compiles("step") as compiles:
         trained(cold_run, steps=0)

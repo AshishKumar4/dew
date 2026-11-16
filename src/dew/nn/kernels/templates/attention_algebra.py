@@ -33,6 +33,7 @@ import numpy as np
 
 from dew.algebra import derive, rewritten
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
+from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.kernels.templates import bodies, layout, product
 from dew.nn.kernels.templates.attention import (
     LN2,
@@ -592,13 +593,84 @@ def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     (`finish`'s `normalized`); a state of no key adds nothing."""
     m = jnp.max(stacked.m, axis=axis)
     weights = carried(spec, stacked.m, jnp.expand_dims(m, axis)) * stacked.total
-    # Each weight over the largest, so their sum is at most the states' count whatever the masses.
+    largest, summed = _normalized(weights, axis)
+    return Partial(_mean(weights, stacked.acc, axis), m, largest * summed)
+
+
+def _normalized(weights: jax.Array, axis: int) -> tuple[jax.Array, jax.Array]:
+    """`weights`' largest on `axis` and their sum over it, each weight over the largest first, so the sum is
+    at most their count whatever the masses (1 where none holds mass)."""
     largest = jnp.max(weights, axis=axis)
-    weights = weights / jnp.expand_dims(jnp.where(largest > 0, largest, 1.0), axis)
-    summed = jnp.sum(weights, axis=axis)
-    shares = weights * jnp.expand_dims(1.0 / jnp.where(summed > 0, summed, 1.0), axis)
-    out = jnp.sum(expand(shares, stacked.acc) * stacked.acc, axis=axis)
-    return Partial(out, m, largest * summed)
+    largest = jnp.where(largest > 0, largest, 1.0)
+    return largest, jnp.sum(weights / jnp.expand_dims(largest, axis), axis=axis)
+
+
+def _mean_value(weights: jax.Array, outputs: jax.Array, axis: int) -> jax.Array:
+    """`outputs` (each state's, `[..., Dv]`) weighed by their states' masses `weights` (`[...]`, each a
+    carried factor times a denominator) over their sum on `axis`: the merge's convex combination
+    (`_convex`). Its derivative is the mean's own (`_mean_tangent`), not its sum's roundings' and holds'."""
+    largest, summed = _normalized(weights, axis)
+    shares = weights / jnp.expand_dims(largest * jnp.where(summed > 0, summed, 1.0), axis)
+    return _convex(expand(shares, outputs), outputs, axis)
+
+
+def _mean_tangent(axis: int, primals: tuple, tangents: tuple) -> tuple[jax.Array, jax.Array]:
+    """The mean's derivative, d out = sum(dw (o - out)) / W + sum(w do) / W, its masses' coefficients
+    (o - out) / W formed from the primals at a scale that passes fp32's largest only where they do: a gap
+    of an output or the mean reaching `HALVED` at half its size, doubled after; the rest exact; each over
+    the largest mass and their normalized sum (`_normalized`), whose product is W, by the one of them at
+    least 1 first, so no quotient on the way passes the coefficient (eight masses of 1/8 under outputs of
+    alternate signs at 2^127: their gaps over 1/8 first reached 2^129 before the sum 8 took them back, row
+    6886). A coefficient as to a mass, never one as to a weight over the largest, which passes fp32 where
+    outputs of both signs are near it ((o - out) over their sum -1.125 times fp32's largest at weights 1 and
+    1/3, a denominator's derivative L/8 returned as inf, row 6827). Each case's operands are selected
+    before its arithmetic; the derivative is linear in its tangents, so a reverse pass forms the same
+    coefficients."""
+    weights, outputs = primals
+    dweights, doutputs = tangents
+    out = _mean(weights, outputs, axis)
+    largest, summed = _normalized(weights, axis)
+    largest, summed = (jnp.expand_dims(x, axis) for x in (largest, jnp.where(summed > 0, summed, 1.0)))
+    mean = jnp.broadcast_to(jnp.expand_dims(out, axis), outputs.shape)
+    large = (jnp.abs(outputs) >= HALVED) | (jnp.abs(mean) >= HALVED)
+    halved = (jnp.where(large, outputs, 0.0) * 0.5 - jnp.where(large, mean, 0.0) * 0.5)
+    exact = jnp.where(large, 0.0, outputs) - jnp.where(large, 0.0, mean)
+    over_largest, over_summed = expand(largest, outputs), expand(summed, outputs)
+    # The summed count is at least 1; the largest mass first only where it is too.
+    first = jnp.where(over_largest >= 1, over_largest, over_summed)
+    second = jnp.where(over_largest >= 1, over_summed, over_largest)
+    coefficients = jnp.where(large, halved / first / second * 2, exact / first / second)
+    shares = weights / (largest * summed)
+    return out, (jnp.sum(expand(dweights, outputs) * coefficients, axis=axis)
+                 + jnp.sum(expand(shares, outputs) * doutputs, axis=axis))
+
+
+_mean = contracted("test_the_finished_merges_mean_holds_every_order")(
+    declared_tangent(Protected(), _mean_value, _mean_tangent, nondiff_argnums=(2,)))
+
+
+def _convex(shares: jax.Array, outputs: jax.Array, axis: int) -> jax.Array:
+    """`outputs` weighed by `shares` (summing to 1 on `axis`, or all 0) and summed: a convex combination,
+    bounded by the outputs of some share. Its sum's roundings may pass that bound, and past fp32's largest
+    where outputs are near it (two slices' outputs at fp32's largest, shares 29/30 and 1/30, summed to inf):
+    the terms of outputs whose magnitude reaches `HALVED` are summed at half their size, exact, apart from
+    the rest, which are summed as they are (a term near fp32's least normal keeps its bits), and the two
+    joined as the half sum twice over the rest, then held at the outputs' bounds by selection, so a rounding
+    passes neither. Each case's operands are selected before its arithmetic."""
+    some = shares > 0
+    high = jnp.max(jnp.where(some, outputs, -jnp.inf), axis=axis)
+    low = jnp.min(jnp.where(some, outputs, jnp.inf), axis=axis)
+    held = jnp.any(some, axis=axis)
+    large = jnp.abs(outputs) >= HALVED
+    half = jnp.sum(shares * jnp.where(large, outputs * 0.5, 0.0), axis=axis)
+    rest = jnp.sum(shares * jnp.where(large, 0.0, outputs), axis=axis)
+    out = half + (half + rest)
+    return jnp.where(held & (out > high), high, jnp.where(held & (out < low), low, out))
+
+
+HALVED = 2.0 ** 126
+"""The magnitude from which a convex combination's terms are summed at half their size (`_convex`): the
+terms of smaller outputs sum below fp32's largest."""
 
 
 def rewalks(spec: Forward, maxima: jax.Array, rows: jax.Array | None = None) -> tuple[jax.Array, Forward]:
@@ -1734,25 +1806,33 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     return _derived_merged(spec, stacked, axis)
 
 
-def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool) -> jax.Array:
+def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool, held: bool = False) -> jax.Array:
     """The weighted values `acc` over their denominator, any leading axes: zero for a query that saw nothing
     where it may (`guarded`: a walk's whose row may see none, or one from a state); a subnormal ratio kept
-    where the arithmetic flushes one (`quotient`)."""
+    where the arithmetic flushes one, and one past the values' largest held there where `held`
+    (`quotient`)."""
     if not guarded:
-        return quotient(lambda held: held / expand(denominator, held), acc, denominator)
+        return quotient(lambda sums: sums / expand(denominator, sums), acc, denominator, held=held)
     safe = jnp.where(denominator > 0, denominator, 1.0)
-    out = quotient(lambda held: held / expand(safe, held), acc, safe)
+    out = quotient(lambda sums: sums / expand(safe, sums), acc, safe, held=held)
     return jnp.where(expand(denominator > 0, acc), out, 0.0)
 
 
-def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax.Array) -> jax.Array:
+def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax.Array, *,
+             held: bool = False) -> jax.Array:
     """`ratio(acc)`, the weighted values `acc` `[..., Dv]` over their rows' `total` `[...]` as its caller
     divides them; where the arithmetic flushes a subnormal result (`bodies.subnormals`: XLA's CPU, per
     primitive, row 4023), each element whose quotient may fall below fp32's least normal divided raised to
     its row's total's binade (`dew.nn.precision.raised_exactly`, from its bits) and taken back in the one
     rounding of the correctly rounded division (`lowered_divide`): a subnormal one kept (row 6302); every
     other element's bits the plain ratio's. Wider sums (a float64 truth's) keep their subnormals as they
-    are."""
+    are. Where `held` (an fp32 call's walk, `MosaicForward.parts`: dropout-free inference), a quotient of
+    finite sums is a mean of finite values, within their dtype's largest, so one past it is the sums'
+    rounding, held there by selection: a scaled row's sums of values at fp32's largest round up an ulp onto
+    2^127 at a total of 1/2, its quotient 2^128 (row 6842); an infinite value's sum stays infinite, its
+    quotient as it is. A dropping call's kept weights take its multiplier past their denominator's, so its
+    quotient may pass the values' largest, as the reference's does; and a 16-bit output casts a quotient held
+    at fp32's largest to inf as it would the unheld one, so no 16-bit walk pays for the hold's registers."""
     def divided(*, flushing: bool) -> jax.Array:
         plain = ratio(acc)
         if not flushing:
@@ -1763,7 +1843,12 @@ def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax
         lifted = raised_exactly(acc, raised)
         return jnp.where(raised > 0, lowered_divide(lifted, divisor, raised), plain)
 
-    return bodies.subnormals(divided, acc.dtype)
+    out = bodies.subnormals(divided, acc.dtype)
+    if not held:
+        return out
+    largest = jnp.finfo(out.dtype).max
+    past = finite(acc) & (jnp.abs(out) > largest)
+    return jnp.where(past, jnp.where(out > 0, largest, -largest).astype(out.dtype), out)
 
 
 def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.Array, jax.Array]:
@@ -1781,19 +1866,21 @@ def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.
 
 
 def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable | None = None,
-           output_params: tuple[jax.Array, ...] = (), normalized: bool = False
+           output_params: tuple[jax.Array, ...] = (), normalized: bool = False, held: bool = False
            ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residual rows
     (`finished_rows`); the output is the derived forms' ratio (`_derived_output`), which a scaled walk's
     rows' scale leaves (both its sums are at it). A `normalized` state's sums are its output already (a
     merge of finished states, `finished_merged`): zero where it holds no mass. Where its arithmetic flushes
-    a subnormal result (XLA's CPU, `bodies.subnormals`), its ratio is `quotient`'s."""
+    a subnormal result (XLA's CPU, `bodies.subnormals`), its ratio is `quotient`'s, held at the values'
+    largest where `held` (an fp32 call's walk, `quotient`)."""
     m, denominator = finished_rows(spec, state, initial=initial)
     if normalized:
         out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
     else:
-        out = quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)), state.acc, state.total)
+        out = quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)), state.acc, state.total,
+                       held=held)
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator

@@ -40,7 +40,7 @@ from jax._src.thunky import thunky
 from jax.extend.mlir import ir
 
 from dew import _cache, communicators
-from dew._devices import deviceless, xla_flag
+from dew._devices import deterministic_ops_requested, deviceless, xla_flag
 from dew.nn.kernels import generation
 
 if TYPE_CHECKING:
@@ -189,6 +189,10 @@ class _Registry:
     passes: collections.deque[float] = dataclasses.field(
         default_factory=lambda: collections.deque(maxlen=RECORDS_HELD))
     """Each program's whole pass, in seconds: its walks of its bodies and windows beside its regions'."""
+    by_launch: dict[str, frozenset] = dataclasses.field(default_factory=dict)
+    """`refusals_of`'s answers by launch identity, each dropped as a refusal of its launch is recorded: read
+    for every config a derivation weighs, each answer gathered from every launch's refusals took 426 of a
+    refusal walk's 685 profiled seconds, 250,267 reads over its 355 derivations (row 6551)."""
 
 
 @dataclasses.dataclass
@@ -426,13 +430,16 @@ def traced(digest: str) -> Launch | None:
     return _LAUNCHES.get(digest)
 
 
-def derivation_inputs(op, arguments: tokamax.BoundArguments, target) -> Hashable:
+def derivation_inputs(op, arguments: tokamax.BoundArguments, target
+                      ) -> tuple[str, Hashable, frozenset[tuple[Hashable, frozenset[str]]], bool]:
     """What a launch's derivation of its config for `arguments` on `target` reads of the launch and its
     compiles: the launch's identity (`_identity`: the op, its arguments' shapes and dtypes, its hooks), the
-    whole target, whose facts price its schedules, and each config this context's compiles refused it
-    (`refused`), so a refusal recorded after a derivation derives it again."""
+    whole target, whose facts price its schedules, each config this context's compiles refused it
+    (`refused`), so a refusal recorded after a derivation derives it again, and whether the run asked XLA for
+    deterministic ops, which a launch's legality reads (a fused attention backward's atomic dQ sums,
+    `attention_mosaic.MosaicBackward`), so a flag flipped within a process derives it again."""
     identity = _identity(op, arguments)
-    return identity, target, refusals_of(identity)
+    return identity, target, refusals_of(identity), deterministic_ops_requested()
 
 
 @generation.traced_fact
@@ -441,8 +448,12 @@ def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[str]]]:
     refused at it: what a launch's derivation and legality read of the refusals, the one way a trace reads
     them (`traced_fact`), so a trace kept past a refusal of another launch holds."""
     with _GUARD:
-        return frozenset((config, kernels) for (launch, config), kernels in _registry().refused.items()
-                         if launch == identity)
+        registry = _registry()
+        if (found := registry.by_launch.get(identity)) is None:
+            found = registry.by_launch[identity] = frozenset(
+                (config, kernels) for (launch, config), kernels in registry.refused.items()
+                if launch == identity)
+        return found
 
 
 def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
@@ -452,13 +463,9 @@ def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
     return bool(refused_at(op, arguments, config))
 
 
-def refused_state() -> frozenset:
-    """Every launch config this context's compiles refused (`refused`), with the kernels refused at it
-    (`Binary.refused`: spilling, or their warpgroup MMAs serialized): what a template's legality reads as it
-    traces, so a trace held by its state (`dew._cache.traced_state`) is traced again once a compile refuses
-    another config."""
-    with _GUARD:
-        return frozenset(_registry().refused.items())
+def refused_any(op, arguments: tokamax.BoundArguments) -> bool:
+    """Whether a compile of this process refused any config of `op`'s launch of `arguments` (`refused`)."""
+    return bool(refusals_of(_identity(op, arguments)))
 
 
 def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable) -> frozenset[str]:
@@ -495,6 +502,8 @@ class Certification:
     round: int
     """The round of certification it was compiled or read in (`certified_together`): configs certified at once
     share one."""
+    device: Hashable
+    """The GPU it was certified on (`_certifying_device`, a `jax.Device`), whose assembler's answer it is."""
 
     @property
     def refused(self) -> tuple["Binary", ...]:
@@ -515,6 +524,11 @@ product: why."""
 
 _PULLED: contextvars.ContextVar = contextvars.ContextVar("certified_pulled", default=False)
 """Whether a launch traced here runs as reverse mode runs it (`pulled`)."""
+
+
+def pulling() -> bool:
+    """Whether a launch traced here runs as reverse mode runs it (`pulled`)."""
+    return _PULLED.get()
 
 
 @contextlib.contextmanager
@@ -549,7 +563,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
     alone before its program is: its kernels' binaries (`binaries`) as the plugin's own compiler makes them
     for the device the process compiles for (`_certifying_device`: its own GPU, or a compile-only one a
     block names), which the program's compile then reuses (Mosaic compiles a module once a process). A
-    launch's derivation refuses a config that spills and takes its next (`tuning`'s `_chosen`), with no
+    launch's derivation refuses a config that spills and takes its next (`tuning.KernelOp.taken`), with no
     program retraced, where a compile's refusal retraces the whole program (`settled`): a B200's 4B step
     stepped its attention forward 19 times that way, 42 minutes, every rewalk a step's trace. None on a
     process compiling for no GPU or an interpreted launch; None, read nowhere, for a launch XLA or the GPU's
@@ -590,7 +604,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
         if stored is not None:
             tuning.store_verdict(device.device_kind, stored, kernels)
     found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None,
-                          next(_ROUNDS) if round is None else round)
+                          next(_ROUNDS) if round is None else round, device)
     with _GUARD:
         _CERTIFIED[key] = found
     return found.refused
@@ -600,15 +614,18 @@ def certified_together(op, arguments: tokamax.BoundArguments, configs: Sequence[
                        ) -> list[tuple["Binary", ...] | None]:
     """Each of `configs` certified (`certified`) in one round, all at once on as many threads, each tracing
     under this thread's states (`dew._cache.carried`: the assumed GPU, the kernel choices, JAX's per-thread
-    settings) in a copy of this context: a search's rungs, which the assembler answers only one yes or no each
-    (`rung_round` bounds a round by the host's cores)."""
+    settings) in a copy of this context, on the device this thread certifies on: a search's rungs, which the
+    assembler answers only one yes or no each (`rung_round` bounds a round by the host's cores)."""
     round = next(_ROUNDS)
-    if len(configs) < 2:
+    # The device this thread certifies on, named to each thread: one read of this thread's mesh, which JAX
+    # holds per thread (`jax.set_mesh`), and no other thread sees (row 6791; train 909's review F4).
+    device = _certifying_device()
+    if len(configs) < 2 or device is None:
         return [certified(op, arguments, config, round=round) for config in configs]
     entered = _cache.carried()
 
     def asked(config: Hashable) -> tuple["Binary", ...] | None:
-        with entered():
+        with entered(), certifying(device):
             return certified(op, arguments, config, round=round)
 
     with ThreadPoolExecutor(len(configs), thread_name_prefix="dew-certify") as pool:
@@ -666,19 +683,25 @@ def missed(op, arguments: tokamax.BoundArguments, config: Hashable, refused: Seq
 
 
 def _certifying_device():
-    """The device a launch is certified on (`certified`): a block's (`certifying`), else this process's GPU
-    where it compiles for that GPU's own generation (`generation.device_target`, whatever `assumed` says: an
-    A100 tracing for an assumed sm90 compiled the sm90 launch on itself, and Mosaic refused its TMA copies,
-    rows 6677 and 6678), else none."""
+    """The device a launch is certified on (`certified`): a block's (`certifying`), else the GPU the trace's
+    program runs on, the concrete mesh's (`jax.set_mesh`: a compile-only GPU's where a run's start compiles
+    ahead for one, `dew.training.ahead`), else this process's own GPU; either where it compiles for that
+    GPU's own generation (`generation.device_target`, whatever `assumed` says: an A100 tracing for an
+    assumed sm90 compiled the sm90 launch on itself, and Mosaic refused its TMA copies, rows 6677 and 6678),
+    else none. A trace under a compile-only GPU's mesh certified on the host's own GPU certified each launch a
+    second time, apart, where the start's compile certified it on the mesh's (row 6791)."""
+    from jax._src import mesh as mesh_lib
+
     named = _CERTIFYING.get()
     if named is not None:
         return named
-    if jax.default_backend() != "gpu":
+    placed = mesh_lib.get_concrete_mesh()
+    devices = jax.local_devices() if placed.empty else [
+        device for device in placed.devices.flat if device.process_index == jax.process_index()]
+    # A device of another generation (a CPU's, an A100's under an assumed sm90) certifies nothing.
+    if not devices or generation.device_target(devices[0]).generation != generation.gpu_target().generation:
         return None
-    device = jax.local_devices()[0]
-    if generation.device_target(device).generation != generation.gpu_target().generation:
-        return None
-    return device
+    return devices[0]
 
 
 def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, device,
@@ -853,13 +876,19 @@ def _add(**records: Iterable) -> None:
 
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
-            kernels: frozenset[str] = frozenset()) -> None:
+            kernels: frozenset[str] = frozenset()) -> bool:
+    """`refusal` and `miss` recorded; whether `miss` is new. A miss is recorded once: a launch's derivation
+    asked again (its route's eligibility, then its call, `tuning.KernelOp.taken`) reads its certification
+    back and finds the same misses."""
     registry = _registry()
     with _GUARD:
         if refusal is not None:
             registry.refused[refusal] = registry.refused.get(refusal, frozenset()) | kernels
-        if miss is not None:
-            _add(missed=(miss,))
+            registry.by_launch.pop(refusal[0], None)
+        if miss is None or miss in registry.missed:
+            return False
+        _add(missed=(miss,))
+        return True
 
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
@@ -1364,9 +1393,9 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
 def _missed_block(kernel: str, launch: Launch, asked: int, *, stepped: bool) -> None:
     """A Triton launch's shared-memory miss recorded and logged (`_unblocked`), under its first kernel's
     name: XLA's refusal names none."""
-    _record(None, Miss(kernel, launch.op, launch.config, None, None, stepped, shared=asked))
-    _log.warning("a program asks %d shared bytes past its block; Triton kernel %s (%s at %s): %s", asked,
-                 kernel, launch.op, launch.config, "its launch steps down" if stepped else "no step-down")
+    if _record(None, Miss(kernel, launch.op, launch.config, None, None, stepped, shared=asked)):
+        _log.warning("a program asks %d shared bytes past its block; Triton kernel %s (%s at %s): %s", asked,
+                     kernel, launch.op, launch.config, "its launch steps down" if stepped else "no step-down")
 
 
 def _misses_of(refused: list["Binary"]
@@ -1388,10 +1417,10 @@ def _recorded(found: list, *, stepped: bool) -> None:
                     None if launch is None else launch.config, report.registers, report.frame,
                     stepped and launch is not None,
                     serialized=tuple(note.code for note in report.notes if note.code in SERIALIZED))
-        _record(None, miss)
-        _log.warning("kernel %s %s at %s registers (%s at %s); %s", miss.kernel, miss.reason,
-                     miss.registers, miss.op, miss.config,
-                     "its launch steps down" if miss.stepped else "no step-down")
+        if _record(None, miss):
+            _log.warning("kernel %s %s at %s registers (%s at %s); %s", miss.kernel, miss.reason,
+                         miss.registers, miss.op, miss.config,
+                         "its launch steps down" if miss.stepped else "no step-down")
 
 
 def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,

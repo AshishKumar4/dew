@@ -1,10 +1,12 @@
-"""Where Dew keeps what it caches on disk, and JAX's persistent compilation cache.
+"""Where Dew keeps what it caches on disk, and JAX's persistent compilation cache; and what a process holds
+of what it decides and derives (`holding`).
 
 Kept apart from the telemetry and the loaders that read it, so the
 interop, config and inference modules take their cache paths without
 importing the FLOP accounting.
 """
 
+import collections
 import contextlib
 import contextvars
 import dataclasses
@@ -24,6 +26,32 @@ from dew._builds import dew_cache_dir
 from dew._devices import cuda_builds, deterministic_ops_requested, xla_flag
 
 _log = logging.getLogger(__name__)
+
+def holding[Key: Hashable, Value](cache: collections.OrderedDict[Key, Value], key: Key,
+                                  made: Callable[[], Value], held: int) -> Value:
+    """`cache`'s entry at `key`, made (`made()`) where it holds none, outside the lock every held value shares
+    (`_HOLDING`: compiles trace on several threads, and a value made may hold another), the least recently
+    read dropped past `held`, each cache's own bound. Two threads missing one key at once each make it, the
+    later kept: a held value is a function of its key, so either is the same. How a process holds what it
+    decides and derives once for what it reads: the algebra's kernel decisions, written programs,
+    recognitions, window derivations and scan forms (`dew.algebra`), a declared walk's forms
+    (`derive.derived`), a launch's derived config (`templates.base`), a module's counted work
+    (`dew.nn.flops`) and a keyed objective's traced work (`objectives.base.traced_update_flops`)."""
+    with _HOLDING:
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key]
+    value = made()
+    with _HOLDING:
+        cache[key] = value
+        cache.move_to_end(key)
+        if len(cache) > held:
+            cache.popitem(last=False)
+    return value
+
+
+_HOLDING = threading.Lock()
+"""Held while a held value's cache is read or written (`holding`)."""
 
 VERSION_FILE = "_version.py"
 """The release's version (`dew._version`), which no code of Dew's computes from: no part of its
@@ -448,22 +476,24 @@ def carried() -> Callable[[], contextlib.AbstractContextManager[None]]:
 
 
 UNTRACED: set[contextvars.ContextVar] = set()
-"""The context variables of Dew's that no trace's program reads (`untraced`), which `traced_state` leaves
-out."""
+"""The context variables of Dew's that no trace's program reads (`untraced`), which the key of a trace kept
+outside the compile point leaves out (`dew.nn.kernels.options.trace_context`)."""
 
 
 def untraced[Variable: contextvars.ContextVar](variable: Variable) -> Variable:
     """`variable`, a context variable a trace records into or that a compile reads around the programs traces
     make (a lowering's records, its executables handed, kept or compiled together), and no trace reads to
-    make its program: registered so `traced_state` leaves it out, as it leaves out `RECORDING`."""
+    make its program: registered so the key of a trace kept outside the compile point leaves it out
+    (`dew.nn.kernels.options.trace_context`), as JAX's trace context leaves out `RECORDING`."""
     UNTRACED.add(variable)
     return variable
 
 
 class Same:
     """A value that hashes by no value of its own, held by itself: equal to its own holder alone, and kept
-    alive while a key holds it, so no other value takes its identity. The one such holder of a trace's keys:
-    `traced_state`'s, and a kernel fact's answer's (`dew.nn.kernels.generation.stated`)."""
+    alive while a key holds it, so no other value takes its identity. The one such holder of a trace's keys
+    (`dew.nn.kernels.generation.stated`, which `dew.nn.kernels.options.trace_context` reads each value by)
+    and of a cache keyed by an object's identity."""
 
     __slots__ = ("value",)
 
@@ -475,42 +505,6 @@ class Same:
 
     def __eq__(self, other) -> bool:
         return isinstance(other, Same) and other.value is self.value
-
-
-def traced_state() -> Hashable:
-    """Everything a trace reads beside its function and its arguments' types, as it stands in this thread:
-    what JAX keys a trace on (its configuration's traced states, its meshes and contexts, and Dew's
-    contexts but those a trace records into, `RECORDING`) and the concrete mesh in place, as
-    `dew.nn.kernels.options.trace_context` keys a program (read as it stands within a trace too, where
-    `jax.sharding.get_mesh` refuses); every context variable set in this context but those no trace reads
-    (`UNTRACED`, and Python's decimal context); the logical axis rules Flax holds; the launch configs this
-    context's compiles refused, which a template's legality reads as it traces
-    (`dew.nn.kernels.templates.report.refused_state`); and the environment's variables of Dew's own. A trace
-    held by it (`dew.algebra.fusion`'s regions) is traced again wherever any of them differs: a value read
-    that this leaves out costs a trace, never a program traced under other state. A value that does not hash
-    is held by itself (`Same`)."""
-    import decimal
-
-    from flax import linen as nn
-    from jax._src import config, mesh as mesh_lib
-
-    from dew.nn.kernels.templates import report
-
-    def held(value) -> Hashable:
-        try:
-            hash(value)
-        except TypeError:
-            return Same(value)
-        return value
-
-    with KERNEL_SEEN(None), KERNEL_ROUTES(()):
-        traced = config.trace_context()
-    variables = sorted(((variable, held(value)) for variable, value in contextvars.copy_context().items()
-                        if variable not in UNTRACED and not isinstance(value, decimal.Context)),
-                       key=lambda pair: (pair[0].name, id(pair[0])))
-    return (traced, mesh_lib.get_concrete_mesh(), tuple(variables), held(nn.get_logical_axis_rules()),
-            report.refused_state(),
-            tuple(sorted((name, value) for name, value in os.environ.items() if name.startswith("DEW_"))))
 
 
 def unintercepted[**Arguments, Result](function: Callable[Arguments, Result]) -> Callable[Arguments, Result]:

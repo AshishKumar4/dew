@@ -434,7 +434,37 @@ def _reverse_held(call: Call, bv: int, *, gates: bool, skips: bool = False) -> H
         + held_tile(given, chunk, bv) * (1 + gates)
         + held_tile(held, call.block, bv) + held_tile(call.memories, call.block, bv)
         + held_tile(_reverse_values(call, gates=gates), chunk, bv)
-        + _reverse_products(call, bv),))
+        + _reverse_products(call, bv),
+        [f32(chunk, bv)] * (2 + gates + skips) + [f32(call.block, bv)] * _reverse_sums(call)))
+
+
+def _reverse_sums(call: Call) -> int:
+    """The fresh sums `_reverse`'s step holds at once beside its two fp32 tiles, its operands staged in shared
+    memory: where its products' operands take three parts (`Issuer.apart`: a write held whole, lightning
+    attention's, its memory's gradient and the decayed output's in fp32's three parts) and a family's
+    products overlap, every key slice's terms of both its products ('values_dv' and 'reads',
+    `algebra.reverse_carried`), each term its own accumulator, as the states and output walks state theirs;
+    else none. Unstated, lightning attention's reverse walk on an H100 (four heads of 128) stated 105
+    registers at a 16-wide value block where its body held 133 at its peak, twelve such sums, under the 128 a
+    thread launches with, so no register moved to its consumers and ptxas spilled 168 bytes at every rung
+    of its ladder; at 32 wide 199 against 255, which ptxas spilled at every rung and a program a
+    multiprocessor (row 6816)."""
+    keyed, held, read = _reverse_operands(call)
+    if not call.family.products_overlap or max(keyed.parts, held.parts, read.parts) <= 2:
+        return 0
+    return (call.width // call.block) * (len(product.terms(keyed.parts, held.parts))
+                                         + len(product.terms(keyed.parts, read.parts)))
+
+
+def _reverse_operands(call: Call) -> tuple[Operand, Operand, Operand]:
+    """`_reverse`'s step's product operands (`algebra.reverse_carried`): the keys (the held memory's rows
+    under a decay a key dimension, the keys as given else), the held memory's gradient, and the output's
+    gradient read (`reads`: the gradient as given under a decay a key dimension, else decayed in fp32 and
+    staged in two parts under a decay a head, a value tile's own parts where it holds more)."""
+    held = dataclasses.replace(call.held, rows=call.rows)
+    if call.per_key:
+        return held, held, call.given
+    return call.given, held, Operand(call.rows, 2 if held.parts == 1 else held.parts, jnp.dtype(jnp.float32))
 
 
 def _reverse_products(call: Call, bv: int) -> list:
@@ -443,10 +473,7 @@ def _reverse_products(call: Call, bv: int) -> list:
     gradient read (`reads`: decayed in fp32 and staged in two parts under a decay a head, a value
     tile's own parts where it holds more, the gradient as given under a decay a key dimension); and with the
     delta rule the weights read transposed against the corrected values' gradient ('weights_dv')."""
-    chunk, held = call.chunk, dataclasses.replace(call.held, rows=call.rows)
-    keyed = held if call.per_key else call.given
-    read = (call.given if call.per_key
-            else Operand(call.rows, 2 if held.parts == 1 else held.parts, jnp.dtype(jnp.float32)))
+    chunk, (keyed, held, read) = call.chunk, _reverse_operands(call)
     return largest_live_set(
         product_fragments(call, (keyed, chunk, call.block), (held, call.block, bv)),
         product_fragments(call, (keyed, call.block, chunk), (read, chunk, bv)),

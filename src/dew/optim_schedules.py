@@ -9,7 +9,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping
-from typing import NamedTuple
+from typing import NamedTuple, TypeGuard
 
 import jax
 import jax.numpy as jnp
@@ -326,6 +326,12 @@ def scheduled_solver(make: Callable[..., optax.GradientTransformation], rate: fl
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
+INJECTED = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
+"""Optax's injected states (`optax.inject_hyperparams`): an optimizer's state beside the hyperparameters
+it is handed at each update (`hyperparams`), control values a schedule or the user sets, not state its
+updates accumulate."""
+
+
 def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     """Return the learning rate stored in `opt_state`, if the optimizer stores one.
 
@@ -334,19 +340,14 @@ def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     wrapper of other hyperparameters is read through to the optimizer it holds. The result is None
     when the optimizer closes over the rate, or when parameter groups hold several rates.
     """
-    injected = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
     rates = []
 
-    def read(tree):
-        for node in jax.tree.leaves(tree, is_leaf=lambda node: isinstance(node, injected)):
-            if not isinstance(node, injected):
-                continue
-            if "learning_rate" in node.hyperparams:
-                rates.append(node.hyperparams["learning_rate"])
-            else:
-                read(node.inner_state)
+    def read(path, node):
+        if "learning_rate" in node.hyperparams:
+            rates.append(node.hyperparams["learning_rate"])
+        return node
 
-    read(opt_state)
+    injected_edited(opt_state, read)
     return rates[0] if len(rates) == 1 else None
 
 
@@ -412,8 +413,10 @@ def with_horizons(opt_state: optax.OptState, horizons: Mapping[str | None, Mappi
     update takes it (Optax's injected `learning_rate`) its schedule's at its update under them
     (`stepped_rate`, `schedules`' for its group, over `steps` updates): a fresh state, built with none,
     reported the schedule as if it ended at once. Solvers are reached as `_rated` reaches them
-    (`_injected`)."""
+    (`injected_edited`)."""
     def stated(path: jax.tree_util.KeyPath, node):
+        if not _rate_solver(node):
+            return node
         held = node.hyperparams_states.get("learning_rate")
         if not isinstance(held, RateState):
             return node
@@ -433,7 +436,7 @@ def with_horizons(opt_state: optax.OptState, horizons: Mapping[str | None, Mappi
         return node._replace(hyperparams_states=states,
                              hyperparams={**node.hyperparams, "learning_rate": placed_like(rate, reported)})
 
-    return _injected(opt_state, stated)
+    return injected_edited(opt_state, stated)
 
 
 def held_rates(opt_state: optax.OptState) -> dict[jax.tree_util.KeyPath, dict[str, float]]:
@@ -484,30 +487,35 @@ def placed_like(value, like, placed=None) -> jax.Array:
                           like.sharding if placed is None else placed)
 
 
-type Injected = optax.InjectStatefulHyperparamsState
+type Injected = optax.InjectHyperparamsState | optax.InjectStatefulHyperparamsState
 """The state Optax's `inject_hyperparams` keeps of an injected solver, its hyperparameters beside it."""
 
 
-def _injected(opt_state: optax.OptState, edit: Callable[[jax.tree_util.KeyPath, Injected], Injected]
-              ) -> optax.OptState:
-    """`opt_state` with each injected solver's state that holds a learning rate (Optax's
-    `InjectStatefulHyperparamsState`) as `edit` gives it for the solver's path; a solver an injected wrapper
-    holds is reached through the wrapper's inner state first."""
-    injected = optax.InjectStatefulHyperparamsState
-
+def injected_edited(opt_state: optax.OptState, edit: Callable[[jax.tree_util.KeyPath, Injected], Injected]
+                    ) -> optax.OptState:
+    """`opt_state` with each injected state (`INJECTED`) as `edit` gives it for its path, a state an
+    injected wrapper holds reached through the wrapper's inner state first: the one walk of Optax's injected
+    states, which the learning rate's readers and editors and a step's numerical view of the state
+    (`dew.training.transaction.checked`) read."""
     def walked(tree, prefix: jax.tree_util.KeyPath):
         def replaced(path: jax.tree_util.KeyPath, node):
-            if not isinstance(node, injected):
+            if not isinstance(node, INJECTED):
                 return node
             full = (*prefix, *path)
             node = node._replace(inner_state=walked(node.inner_state,
                                                     (*full, jax.tree_util.GetAttrKey('inner_state'))))
-            return edit(full, node) if 'learning_rate' in node.hyperparams else node
+            return edit(full, node)
 
         return jax.tree_util.tree_map_with_path(replaced, tree,
-                                                is_leaf=lambda node: isinstance(node, injected))
+                                                is_leaf=lambda node: isinstance(node, INJECTED))
 
     return walked(opt_state, ())
+
+
+def _rate_solver(node: Injected) -> TypeGuard[optax.InjectStatefulHyperparamsState]:
+    """Whether an injected state is a solver holding a learning rate, its schedule's state beside it (Optax's
+    `InjectStatefulHyperparamsState`), which the rate's editors read."""
+    return isinstance(node, optax.InjectStatefulHyperparamsState) and 'learning_rate' in node.hyperparams
 
 
 def group_named(path: jax.tree_util.KeyPath, named: Mapping) -> str | None:
@@ -521,8 +529,10 @@ def _rated(opt_state: optax.OptState, wanted: Wanted) -> optax.OptState:
     path, the rate it holds and its kind: `scheduled`, a schedule's rate-valued fields in its
     `RateState` or `ProgressState`; `constant`, a constant's own value under `CONSTANT`; or `computed`,
     the value Optax computed at the last update from a schedule function, which it computes again at
-    the next. None leaves it as it is (`_injected`). Each keeps the old value's dtype and placement."""
+    the next. None leaves it as it is (`injected_edited`). Each keeps the old value's dtype and placement."""
     def rated(path: jax.tree_util.KeyPath, node):
+        if not _rate_solver(node):
+            return node
         schedule = node.hyperparams_states.get('learning_rate')
         scheduled = isinstance(schedule, RateState | ProgressState)
         held = schedule.rates if scheduled else {CONSTANT: node.hyperparams['learning_rate']}
@@ -537,7 +547,7 @@ def _rated(opt_state: optax.OptState, wanted: Wanted) -> optax.OptState:
         rate = placed_like(given[CONSTANT], node.hyperparams['learning_rate'])
         return node._replace(hyperparams={**node.hyperparams, 'learning_rate': rate})
 
-    return _injected(opt_state, rated)
+    return injected_edited(opt_state, rated)
 
 
 __all__ = ["ScheduleBase"]

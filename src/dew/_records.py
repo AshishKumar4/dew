@@ -21,7 +21,7 @@ import functools
 import math
 import re
 import typing
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from numbers import Real
 from typing import TYPE_CHECKING, overload
 
@@ -94,6 +94,14 @@ def finite(value: object, what: str) -> float:
     ValueError naming `what` and the value."""
     if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
         raise ValueError(f"{what} is a finite number, got {value!r}")
+    return float(value)
+
+
+def real(value: object, key: str) -> float:
+    """One real field as a float, an infinity among them (a bound a field may hold, as a module built in
+    Python holds `math.inf`): a bool is a flag, and it, every non-number and a NaN are refused."""
+    if isinstance(value, bool) or not isinstance(value, Real) or math.isnan(value):
+        raise ValueError(f"{key}={value!r}: this field is a real number")
     return float(value)
 
 
@@ -294,12 +302,30 @@ def moved_paths(value: JSON) -> JSON:
     itself JSON in a string, among its other parts. Readers of saved records translate by it (`earlier_run`,
     `dew.inference.tasks.earlier_shapes`, `dew.data.plan.Plan.check`); a path given today is read as given
     (`dew.registry.imported`)."""
+    return mapped_strings(value, moved_spelling)
+
+
+def strings_of(value: JSON) -> Iterator[str]:
+    """Every string `value` holds at any depth, values and lists walked as `mapped_strings` walks them (a
+    mapping's keys left out)."""
     if isinstance(value, str):
-        return moved_spelling(value)
+        yield value
+    elif isinstance(value, Mapping):
+        for held in value.values():
+            yield from strings_of(held)
+    elif isinstance(value, (list, tuple)):
+        for held in value:
+            yield from strings_of(held)
+
+
+def mapped_strings(value: JSON, rewrite: Callable[[str], str]) -> JSON:
+    """`value` with each string it holds at any depth replaced by `rewrite` of it, its keys as they are."""
+    if isinstance(value, str):
+        return rewrite(value)
     if isinstance(value, dict):
-        return {key: moved_paths(held) for key, held in value.items()}
+        return {key: mapped_strings(held, rewrite) for key, held in value.items()}
     if isinstance(value, list):
-        return [moved_paths(held) for held in value]
+        return [mapped_strings(held, rewrite) for held in value]
     return value
 
 

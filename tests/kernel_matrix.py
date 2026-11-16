@@ -335,11 +335,15 @@ def supported(family: str, combination: tuple[tuple[str, str], ...]) -> bool:
 
 
 def supported_pairs(family: str) -> set[tuple[tuple[str, str], tuple[str, str]]]:
-    """Every pair of axis values (each an axis and its value) that some combination the route serves holds."""
+    """Every pair of axis values (each an axis and its value) that some combination the route serves holds.
+    A combination whose pairs are all held already adds none whatever its route does, so it is not asked
+    (`supported` traces a step): the set is the same, each pair asked of the combinations until one serves
+    it."""
     pairs = set()
     for combination in combinations(AXES[family]):
-        if supported(family, tuple(combination.items())):
-            pairs |= gpu_flow.held(combination, values=False)
+        holds = gpu_flow.held(combination, values=False)
+        if not holds <= pairs and supported(family, tuple(combination.items())):
+            pairs |= holds
     return pairs
 
 

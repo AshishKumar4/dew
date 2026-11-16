@@ -1837,12 +1837,17 @@ def placed(tree, dtype):
 def with_triton_gemms(flow) -> None:
     """Run `flow`, a function of this module, in a fresh process under the lane's flags without the
     one that keeps XLA's Triton GEMM fusion out of a program, deterministic ops (tests/lane_environment.py's
-    `REPEATABLE_GPU_FLAGS`). Its pinned autotuning then gives every GEMM a program leaves to Triton the
-    fusion, as XLA's own autotuner does at small contractions, where it computed int8 dots as two or four
-    times their product (openxla/xla#51016). XLA reads its flags once a process."""
+    `REPEATABLE_GPU_FLAGS`); here, where the lane sets no such flag. Its pinned autotuning then gives every
+    GEMM a program leaves to Triton the fusion, as XLA's own autotuner does at small contractions, where it
+    computed int8 dots as two or four times their product (openxla/xla#51016). XLA reads its flags once a
+    process."""
     pytest.importorskip("qwix")
     here = Path(__file__).resolve().parent
     flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_deterministic_ops")
+    if flags.split() == os.environ.get("XLA_FLAGS", "").split():
+        # A lane with no such flag (the CPU lane's): a fresh process would run under this one's flags.
+        flow()
+        return
     script = f"import {Path(__file__).stem} as tests; tests.{flow.__name__}()"
     # pytest's own path (pyproject's `pythonpath`: the sources and the repository root) and this directory.
     path = os.pathsep.join([str(here.parent / "src"), str(here.parent), str(here)])
@@ -1971,13 +1976,13 @@ def autoguided_image_flow():
 
 
 def test_an_int8_decision_task_answers_as_the_host_does():
-    """`Decide` over a backbone quantized to int8 gives each option the probability the same task
-    gives it on the host. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    """`Decide` over a backbone quantized to int8 gives each option of each request the probability the
+    same task gives it on the host. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
     with_triton_gemms(decision_flow)
 
 
 def decision_flow():
-    from test_decision_objective import INTENT, LAYOUT, SPECIALS, TOKENIZER
+    from test_decision_objective import EXAMPLES, INTENT, LAYOUT, SPECIALS, TOKENIZER
 
     from dew.decision import Decide, DecisionObjective
     from dew.decision.model import DecisionModel
@@ -1992,9 +1997,12 @@ def decision_flow():
         return (nn.unbox(base.init(jax.random.key(seed))),)
 
     def run(dtype, held):
+        # Every example's state asked at once: a decision's few probabilities a request, too few alone for a
+        # GPU's ratio to the host's to resolve within the site's seeds (row 5017).
         model = DecisionModel(spec.apply(backbone.clone(dtype=dtype)), base.model.head.clone(dtype=dtype))
         task = Decide(model, placed(held, dtype), LAYOUT, TOKENIZER, SPECIALS)
-        return task("charged twice!", {"team": INTENT})["team"].probabilities
+        answers = task([(example.state, {"team": INTENT}) for example in EXAMPLES])
+        return jnp.stack([answer["team"].probabilities for answer in answers])
 
     assert_computed_as_on_the_host(run, draw, "an int8 decision task's probabilities")
 

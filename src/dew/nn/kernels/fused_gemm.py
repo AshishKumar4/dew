@@ -177,14 +177,18 @@ def analysis(region, *inputs) -> Analysis:
 @dataclasses.dataclass(frozen=True)
 class Region:
     """A traced region's product and consumers as `priced` reads them: the product's extents (rows, depth,
-    width), its operands' and its result's dtypes, the consumers' elementwise work on the whole product
-    (`_chain`), and the bytes of the arrays they capture and of their outputs."""
+    width), its operands' and its result's dtypes, the precision it declares (`product`'s, which its passes
+    are priced at: a float32 product at HIGHEST takes TF32's three), its operands' bytes as stored (a grouped
+    product's every bank of its matrix), the consumers' elementwise work on the whole product (`_chain`), and
+    the bytes of the arrays they capture and of their outputs."""
 
     rows: int
     depth: int
     width: int
     operands: jnp.dtype
     result: jnp.dtype
+    precision: jax.lax.PrecisionLike
+    operand_bytes: float
     chain: cost.Work
     captured_bytes: float
     output_bytes: float
@@ -203,8 +207,9 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     rates = cost.rates(target, device=True)
     if rates[0] is None:
         return None, None
-    product = algebra_cost.product_work(region.rows, region.depth, region.width, dtype=region.operands)
-    operands = (region.rows + region.width) * region.depth * jnp.dtype(region.operands).itemsize
+    product = algebra_cost.product_work(region.rows, region.depth, region.width, dtype=region.operands,
+                                        precision=region.precision)
+    operands = region.operand_bytes
     written = region.rows * region.width * jnp.dtype(region.result).itemsize
     launch = target.launch_seconds or 0.0
 
@@ -257,7 +262,8 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
         depth = lhs.shape[-1]
         outs = jax.tree.leaves(jax.eval_shape(consumer, values, acc))
         collected.append(Region(
-            lhs.shape[0], depth, width, jnp.dtype(lhs.dtype), jnp.dtype(out_dtype),
+            lhs.shape[0], depth, width, jnp.dtype(lhs.dtype), jnp.dtype(out_dtype), precision,
+            float(sum(operand.size * operand.dtype.itemsize for operand in (lhs, rhs))),
             _chain(consumer, values, acc), float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
             float(sum(math.prod(out.shape) * out.dtype.itemsize for out in outs))))
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))

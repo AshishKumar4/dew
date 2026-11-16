@@ -24,8 +24,8 @@ are evaluated as Dew's (`float32_dot_general`). The decoupling reorders rounding
 
 from __future__ import annotations
 
+import collections
 import dataclasses
-import functools
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -57,6 +57,7 @@ from egglog import (
 )
 from egglog.bindings import EggSmolError
 
+from dew import _cache
 from dew._cache import ALGEBRA, unintercepted
 from dew.algebra import cost, extract, program, rules, terms
 from dew.algebra.cost import Work
@@ -676,9 +677,9 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
     declared = {"exponential": None if declaration.exponential is None else
                 (EXPONENTIALS[declaration.exponent], declaration.exponential),
                 "rescale": declaration.rescale}
-    @functools.lru_cache(maxsize=FORMS_HELD)
-    def derived_at(contexts: tuple, keyed: tuple) -> _Forms:
-        del contexts  # The key alone: the derivation reads them where it runs.
+    held: collections.OrderedDict = collections.OrderedDict()
+
+    def derived_at(keyed: tuple) -> _Forms:
         shapes = {name: (shape, dtype) for name, shape, dtype in keyed}
         made = _derived(declaration, names, walked_axes, shapes, accurate, saturation)
         kernel_report.record_rewrite(made.report)
@@ -686,9 +687,11 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
 
     def forms(shapes: Mapping) -> _Forms:
         # The engine's sets saturate beside the derivation's own (`_derived`), so a set registered after a
-        # shape's forms were derived derives them afresh, as a program's windows do (`program._deriving`).
-        return derived_at((context(), rules.admitted_names(accurate)),
-                          tuple((name, tuple(shapes[name][0]), np.dtype(shapes[name][1])) for name in names))
+        # shape's forms were derived derives them afresh, as a program's windows do (`program._deriving`);
+        # held through `_cache.holding`, the latest FORMS_HELD.
+        keyed = tuple((name, tuple(shapes[name][0]), np.dtype(shapes[name][1])) for name in names)
+        return _cache.holding(held, (context(), rules.admitted_names(accurate), keyed),
+                              lambda: derived_at(keyed), FORMS_HELD)
 
     def shaped(values):
         return {name: (value.shape, value.dtype) for name, value in values.items()}

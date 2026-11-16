@@ -39,7 +39,7 @@ from dew import quantization
 from dew.batch import Variables, leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
-from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent
+from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed_at
 from dew.nn.residuals import Residual
 
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
@@ -977,6 +977,9 @@ def _stored_primal_jvp(run, primals, tangents):
     if not live:
         output = forward()
         return output, SymbolicZero(jax.typeof(output))
+    # Through the rule's dual (`with_tangents_formed_at`, `x` the first, the experts' parameters the rest):
+    # reverse mode returns `x`'s cotangent only with the experts' gradients formed.
+    directions = with_tangents_formed_at(tuple(directions), range(1, len(directions)))
     return jax.jvp(forward, tuple(leaves[index] for index in live),
                    tuple(directions[index] for index in live))
 

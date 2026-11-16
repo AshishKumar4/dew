@@ -750,6 +750,53 @@ def test_two_kernels_of_one_launch_are_two_names_each_certified_on_its_own():
     assert set(alone) == set(names), alone
 
 
+@lowers("sm90")
+def test_a_launch_traced_under_a_compile_only_gpus_mesh_is_certified_on_that_gpu():
+    """A launch traced under a compile-only H100's mesh (`jax.set_mesh`, as a trainer traces its step's
+    programs), no device named to certify on, is certified on that mesh's GPU (`report.certified`), the one a
+    start's compile ahead certifies it on: one certification of the launch, wherever the process runs. Where
+    a host's own GPU of the generation certified it instead, a start compiling ahead on that host certified
+    each launch traced outside its certifying block twice, apart (row 6791: the GH200's recurrent step
+    certified 5 of its 28 programs twice), and a host of no GPU certified none of them."""
+    op = TwoKernels()
+    devices, lowered = _paired_step(op)
+    before = {id(each) for each in report.certifications()}
+    with generation.assumed("sm90"), jax.set_mesh(devices):
+        lowered()
+    [certified] = [each for each in report.certifications()
+                   if id(each) not in before and each.op == type(op).__name__]
+    assert certified.kernels, certified
+
+
+@lowers("sm90")
+def test_a_round_of_rungs_traced_under_a_compile_only_gpus_mesh_is_certified_on_that_gpu():
+    """A round of a launch's configs certified at once (`report.certified_together`, a ladder's rounds past
+    its first rung) under a compile-only H100's mesh, no device named to certify on: each certified on that
+    mesh's GPU (`Certification.device`), which this thread reads and every thread of the round is told, and
+    none on another. JAX holds the mesh per thread (`jax.set_mesh`), so a round's threads that read it
+    themselves found none: on a GPU host they certified on the host's own GPU, the launch certified twice,
+    and on a host of no GPU they certified nothing and answered that each config holds, a config no
+    assembler checked kept (train 909's review F4 of row 6791's fix)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    op = TwoKernels()
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    operands = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
+        ((ROWS, FEATURES), jnp.bfloat16), ((EXPERTS, FEATURES, WIDTH), jnp.bfloat16),
+        ((EXPERTS,), jnp.int32))]
+    before = {id(each) for each in report.certifications()}
+    with generation.assumed("sm90"), jax.set_mesh(devices):
+        bound = op.bind(*operands, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+        first = bound.heuristics_config
+        configs = [first, dataclasses.replace(first, stages=first.stages - 1)]
+        answers = report.certified_together(op, bound, configs)
+    assert all(answer is not None for answer in answers), answers
+    found = [each for each in report.certifications() if id(each) not in before]
+    assert sorted(map(repr, (each.config for each in found))) == sorted(map(repr, configs)), found
+    assert {each.device for each in found} == set(devices.devices.flat) and all(
+        each.kernels for each in found), found
+
+
 def test_two_kernels_of_one_name_and_launch_are_refused_not_read_as_one():
     """Two Mosaic GPU calls of one name and launch whose kernels differ (a kernel whose body reads what its
     name holds not, neither its launch's config nor its form) are refused wherever a kernel's evidence is

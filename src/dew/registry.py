@@ -72,7 +72,7 @@ from jax.typing import DTypeLike
 from typing_extensions import Format, get_annotations, is_protocol
 
 from dew import _records
-from dew._records import JSON
+from dew._records import JSON, boolean, integer, json_value, real, strings_of, text
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -244,7 +244,7 @@ def trust_sources(names: Sequence[str]) -> None:
     _TRUSTED_SOURCES.update(_source_identity(str(name)) for name in names)
 
 
-def import_trusted(record: object, trust: Sequence[str]) -> None:
+def import_trusted(record: JSON | Mapping[str, object], trust: Sequence[str]) -> None:
     """Trust the packages in `trust` for the rest of the process, and import
     every module of theirs that `record` names by an import path, so reading
     the record finds them imported (`imported`) and may construct their
@@ -253,18 +253,11 @@ def import_trusted(record: object, trust: Sequence[str]) -> None:
     load reads it (`trusts_source`)."""
     _TRUSTED.update(trust)
     trust_sources(trust)
-    if isinstance(record, str):
-        module, colon, name = record.partition(":")
+    # Only JSON a record holds (`json_value` refuses any other), its every string read once.
+    for named in strings_of(json_value(record, "record")):
+        module, colon, name = named.partition(":")
         if colon and name and module.split(".")[0] in trust and module.replace(".", "").isidentifier():
             importlib.import_module(module)
-    elif isinstance(record, Mapping):
-        for value in record.values():
-            import_trusted(value, trust)
-    elif isinstance(record, list):
-        for value in record:
-            import_trusted(value, trust)
-    elif record is not None and not isinstance(record, (bool, int, float)):
-        raise ValueError(f"{record!r} is not JSON a record holds")
 
 
 class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
@@ -670,6 +663,13 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     if isinstance(annotation, type) and issubclass(annotation, Enum):
         # An enum's member is recorded as its value, an IntEnum's its int (`to_record`).
         return annotation(value)
+    if (isinstance(annotation, type) and annotation in _SCALARS
+            and not isinstance(value, (np.generic, np.ndarray, jax.Array))):
+        # A field declaring a scalar holds one of its type (`dew._records`' readers), kept as written: a
+        # null, a list or a record (a function's among them) is refused as a mistyped scalar is; a NumPy
+        # or JAX value, which a module built in Python may hold, is the field's as built.
+        _SCALARS[annotation](value, name or annotation.__name__)
+        return configured(value)
     if (isinstance(value, Mapping) and set(value) == {"function"} and isinstance(value["function"], str)
             and _admits_function(annotation)):
         return imported(value["function"])
@@ -734,6 +734,11 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
                    for entry, record in zip(entry_types(annotation, len(value)), value, strict=True)]
         return tuple(rebuilt) if wants_tuple(annotation) else type(value)(rebuilt)
     return configured(value)
+
+
+_SCALARS: Mapping[type, Callable[[object, str], object]] = {
+    bool: boolean, int: integer, float: real, str: text}
+"""The reader of each scalar type a field declares (`_rebuilt`), each refusing a value of another."""
 
 
 def class_record(value: Mapping[str, object] | Mapping[RecordKey, object]

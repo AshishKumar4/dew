@@ -80,6 +80,12 @@ from dew.nn.kernels.templates.gemm import (
 from dew.nn.kernels.templates.gemm.pricing import balanced_tail, family_of, fixes_up, tile_columns, tile_rows
 from dew.nn.kernels.templates.product import SCALE_DEPTH, block_format
 
+GMM = "dew_gmm"
+"""The name of a product's kernel (`gmm`), its producer's registers `Tiles.producers`' by it."""
+
+TGMM = "dew_tgmm"
+"""The name of a kernel gradient's kernel (`tgmm`), its producer's registers `Tiles.producers`' by it."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Tiles:
@@ -102,7 +108,9 @@ class Tiles:
     consumers take alternate tiles whole (`pingpong`, CUTLASS's ping-pong sm90 schedule: each consumer's tile
     its own, their MMA phases alternating, so one's epilogue overlaps the other's products;
     `Family.persist`'s `pingpong`; on a cluster too, its programs multicasting the blocks they read alike)
-    rather than halving each tile's rows."""
+    rather than halving each tile's rows; and the registers its kernel's producer lowers to (`producers`,
+    by kernel, `GMM` or `TGMM`; setmaxnreg's least where unraised), a rung its derivation raises a compile
+    found spilling at, each a certification's (`grouped_matmul._Mosaic.rungs`)."""
     block_m: int
     block_n: int
     block_k: int
@@ -115,6 +123,7 @@ class Tiles:
     splits: int = 1
     swapped: bool = False
     pingpong: bool = False
+    producers: resources.Producers = dataclasses.field(default_factory=resources.Producers)
 
     @property
     def sharing(self) -> int:
@@ -509,9 +518,10 @@ class Allocations:
     matrices, each row tile's the same column block; `tgmm`'s cotangent, each depth tile's the same rows and
     columns."""
     gathered: tuple = ()
-    """The streams a producer gathers (`GATHERED_STREAMS`, `mosaic.Family.streams`' `gathered`): their load
-    barriers its family's own (`gathered.ring`'s 8-byte words at a 1024-byte alignment, which the planner
-    counted as plain barriers: 976 bytes short of a B200's gathered input gradient's, row 5358)."""
+    """The streams a producer gathers (`GATHERED_STREAMS`, a kernel gradient's `_tgmm_rings`;
+    `mosaic.Family.streams`' `gathered`): their load barriers its family's own (`gathered.ring`'s 8-byte
+    words at a 1024-byte alignment, which the planner counted as plain barriers: 976 bytes short of a B200's
+    gathered input gradient's, row 5358, and of its gathered kernel gradients')."""
 
     def scope(self, family: mosaic.Family, tiles: "Tiles", steps: int | None = None,
               rewritten: bool = False) -> resources.Scope:
@@ -625,12 +635,13 @@ SCALE_SWIZZLES = {'row_scales': swizzling.UNSWIZZLED, 'column_scales': swizzling
 def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dtype,
                      prologue_axes: tuple, prologue_dtypes: tuple, out_dtype, k_major: bool = False,
                      step_scaled: bool = False, unstaged: bool = False,
-                     gathered: bool = False) -> Allocations:
+                     gathered: tuple[bool, ...] = (False, False), interpret: bool = False) -> Allocations:
     """Dew: `tgmm`'s allocations at `tiles` (`Allocations`): a ring for the rows, the cotangent and each
     prologue side operand with rows that follows the steps (`_stepped`), each side operand without rows'
     staging, the consumers' meeting where they prepare their stages (not `unstaged`, `rows_unstaged`), and
     its output's share of the tile; a cluster's depth tiles reading the cotangent's blocks alike, which they
-    load once between them (`Allocations.shared`), but where its rows are `gathered` (a table's)."""
+    load once between them (`Allocations.shared`), but where its rows are gathered; the rings a producer
+    gathers compiled (`gathered`: whether the rows' and the cotangent's are a table's, `_tgmm_rings`)."""
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     stepped, _, fixed = _stepped(family, prologue_axes, 'rows')
     extent = {'rows': block_k, 'depth': block_m}
@@ -649,7 +660,7 @@ def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dt
     # (`tile_columns`), each stream's slot a multiprocessor's block.
     return Allocations(blocks, (held['fixed_smems'], held['fixed_barriers'], *meeting),
                        (((tiles.share, tile_columns(tiles, family)), jnp.dtype(out_dtype)),),
-                       () if gathered else ('ring_1',))
+                       () if gathered[1] else ('ring_1',), () if interpret else _tgmm_rings(gathered))
 
 
 def _stepped(family: mosaic.Family, axes_of: tuple, stepping: str) -> tuple[tuple, tuple, tuple]:
@@ -978,7 +989,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=_unrolled(prologue, packed_rows, exact_sums),
                            accumulators=(part,) * accumulators, **_summed(family, tiles, exact_sums),
-                           producer=gmm_producer(family, gather is not None),
+                           producer=tiles.producers.of(GMM),
                            **({'pingpong': True} if tiles.pingpong else {}),
                            **_prologue_rewrite(rewritten, family, prologue, (prologue_axes, prologue_gmems),
                                                (stepped, read, fixed), (fixed_smems, fixed_barriers), g))
@@ -994,9 +1005,9 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     kernel = family.kernel(body, out_type=out_type,
                            grid=(multiprocessors // pair,), grid_names=("programs",),
                            consumers=consumers + rewritten,
-                           interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
+                           interpret=interpret, approx_math=False, name=GMM, cluster=pair,
                            resident=tiles.programs, scalars=0 if dense else 1, registers=registers,
-                           producer=gmm_producer(family, gather is not None), shared=shared, moves=MOVES,
+                           producer=tiles.producers.of(GMM), shared=shared, moves=MOVES,
                            cost=unit_cost.estimate(2 * m * n * k * len(matrices), *operands,
                                                    *prologue_operands, *epilogue_operands, *out_type),
                            **_prefetched(tiles, grid, k // block_k, transpose_rhs, interpret,
@@ -1328,14 +1339,6 @@ def _gathered(gather, tiles: Tiles, dtype, interpret) -> dict:
 
 GATHERED_STREAMS = ('rows',)
 """The streams a gathered product's producer gathers (`gmm`'s `gather`): its rows'."""
-
-def gmm_producer(family: mosaic.Family, gathered: bool) -> int | None:
-    """Dew: the registers a GEMM launch's producer is lowered to where its issue loop holds more than its
-    family's least (`resources.Launch.producer`, `Family.persist`'s `producer`): its family's gathering
-    producer's (`Transport.gathering_producer`) where it gathers rows; None elsewhere
-    (`resources.producer_floor`)."""
-    return family.gathering_producer if gathered else None
-
 
 def _grouped_table(group_sizes: jax.Array, m: int, row_tile: int, first: jax.Array | None,
                    unit: int = TMA_ROWS) -> jax.Array:
@@ -1922,7 +1925,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     unstaged = not k_major and rows_unstaged(dense=dense or whole_steps, prologue=prologue,
                                              tabled=any(table is not None for table in tables))
     _pair_refused(tiles, family, transpose_lhs=False, exact_sums=exact_sums, scaled=step_scales is not None,
-                  parts=(prologue, gather), rewritten=rewrites(family, k_major, tables, unstaged))
+                  parts=(prologue, gather), rewritten=rewrites(family, k_major, unstaged))
     group_sizes = group_sizes.astype(jnp.int32)
     out_dtype = jnp.dtype(out_dtype)
     if tiles.splits > 1:
@@ -2019,13 +2022,15 @@ def prologue_rewritten(family: mosaic.Family, prologue) -> bool:
     return prologue is not None and family.rewrites_in_persist
 
 
-def rewrites(family: mosaic.Family, k_major: bool, tables: tuple, unstaged: bool) -> bool:
+def rewrites(family: mosaic.Family, k_major: bool, unstaged: bool) -> bool:
     """Dew: whether `tgmm`'s stage is rewritten by its family's own role (`mosaic.Family.rewrites_in_persist`,
-    a role beside its consumers): its loads' rows, never rows its tables gather, a k-major launch's whole
-    steps of one group, nor a stage read as loaded (`rows_unstaged`). The one decision: the kernel's role
-    and its planning's (`grouped_matmul._Mosaic.rewritten`)."""
-    return (family.rewrites_in_persist and not k_major and all(table is None for table in tables)
-            and not unstaged)
+    a role beside its consumers): its loads' rows, gathered by its load warp's tables or not
+    (`gathered.Committed`, whose slots hand off as any ring's), never a k-major launch's whole steps of one
+    group, nor a stage read as loaded (`rows_unstaged`); its products' warp reads no tile, so a gathered
+    stage's neighbouring groups' rows are masked there (row 1376: masked in the products' warp, a gathered
+    B200 gradient failed to lower). The one decision: the kernel's role and its planning's
+    (`grouped_matmul._Mosaic.rewritten`)."""
+    return family.rewrites_in_persist and not k_major and not unstaged
 
 
 def _gradient_unrolled(family: mosaic.Family, *, unstaged: bool, exact_sums: bool, scaled: bool) -> bool:
@@ -2102,7 +2107,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     `operands` are padded, then each one's gather table (or None); `groups` `_group_blocks`' (`tgmm`)."""
     lhs, rhs, tables = operands[0], operands[1], tuple(operands[2:])
     family = family_of(tiles, lhs.dtype)
-    rewritten = rewrites(family, k_major, tables, unstaged)
+    rewritten = rewrites(family, k_major, unstaged)
     k, m, n, g = shape
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     consumers, depth_half = tiles.warpgroups, block_m // tiles.warpgroups
@@ -2115,10 +2120,10 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     # from global memory.
     stepped, read, fixed = _stepped(family, prologue_axes, 'rows')
     allocations = tgmm_allocations(tiles, family, lhs_dtype=lhs.dtype, rhs_dtype=rhs.dtype,
-                                   gathered=tables[1] is not None, prologue_axes=prologue_axes,
-                                   prologue_dtypes=_dtypes_of(prologue_operands),
-                                   out_dtype=out_dtype, k_major=k_major, step_scaled=step_scales is not None,
-                                   unstaged=unstaged)
+                                   gathered=tuple(table is not None for table in tables),
+                                   interpret=bool(interpret), prologue_axes=prologue_axes, unstaged=unstaged,
+                                   prologue_dtypes=_dtypes_of(prologue_operands), out_dtype=out_dtype,
+                                   k_major=k_major, step_scaled=step_scales is not None)
     unrolled = _gradient_unrolled(family, unstaged=unstaged, exact_sums=exact_sums,
                                   scaled=step_scales is not None)
 
@@ -2182,7 +2187,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=unrolled, accumulators=(part,),
-                           **_summed(family, tiles, exact_sums),
+                           producer=tiles.producers.of(TGMM), **_summed(family, tiles, exact_sums),
                            **_stage_rewrite(rewritten, family, starts_gmem, ends_gmem, block_k))
 
         family.scoped(scope, *allocations.staged,
@@ -2195,8 +2200,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     kernel = family.kernel(body, out_type=out_type,
                            grid=(1 if interpret else multiprocessors // pair,), grid_names=("programs",),
                            consumers=consumers + rewritten, interpret=interpret, approx_math=False,
-                           name="dew_tgmm", cluster=pair, registers=registers, shared=shared, moves=MOVES,
-                           resident=tiles.programs, scalars=len(groups),
+                           name=TGMM, cluster=pair, registers=registers, producer=tiles.producers.of(TGMM),
+                           shared=shared, moves=MOVES, resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
     return kernel(*groups, lhs, rhs, *(table for table in tables if table is not None), *(step_scales or ()),
                   *prologue_operands, *_workspace(tail, (multiprocessors, 2, consumers, *part), interpret))
@@ -2259,13 +2264,19 @@ def _tgmm_gathered(tables: tuple, blocks: dict, interpret: bool) -> dict:
     """Dew: a gathered kernel gradient's streams (`family.streams`' arguments, `_gathered`'s for `gmm`): each
     gathered operand's ring (`ring_0` the rows', `ring_1` the cotangent's) its producer's gather, or
     interpreted each of a step's rows its copies (`rings.piece_copies`, at no stated swizzle)."""
-    names = tuple(name for name, table in zip(('ring_0', 'ring_1'), tables, strict=True) if table is not None)
+    names = _tgmm_rings(tuple(table is not None for table in tables))
     if not names:
         return {}
     if interpret:
         return {'copies': {name: blocks[name][0][0] * rings.piece_copies(blocks[name][0], blocks[name][1],
                                                                           None, 1) for name in names}}
     return {'gathered': names}
+
+
+def _tgmm_rings(gathered: tuple[bool, ...]) -> tuple[str, ...]:
+    """Dew: a kernel gradient's gathered rings, `ring_0` the rows', `ring_1` the cotangent's, of whether each
+    is a table's."""
+    return tuple(name for name, held in zip(('ring_0', 'ring_1'), gathered, strict=True) if held)
 
 
 def _tgmm_scheduled(index, *, groups: tuple, operands: tuple, tail: tail_of.Tail | None, programs: int,

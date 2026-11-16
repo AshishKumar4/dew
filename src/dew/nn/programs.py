@@ -450,14 +450,16 @@ def _extended(value) -> bool:
 
 
 @contextlib.contextmanager
-def meshless() -> Iterator[None]:
-    """No mesh in context, abstract or concrete, nor its axes bound or checked, under a trace too: a program
-    begun within another's trace (a shard_map's body, whose mesh JAX refuses to resize,
-    `jax.sharding.use_abstract_mesh`, and whose manual axes a checked shard_map binds and asks its values to
-    state their variance over, `check_vma`) takes none of its mesh. `jax.set_mesh(None)` does the mesh's
-    swaps but refuses to run under a trace."""
-    abstract = mesh_lib.abstract_mesh_context_manager.swap_local(mesh_lib.empty_abstract_mesh)
-    concrete = mesh_lib.device_context.swap_local(mesh_lib.empty_concrete_mesh)
+def meshless(mesh: jax.sharding.Mesh | None = None) -> Iterator[None]:
+    """No mesh in context, abstract or concrete, but `mesh` where given, nor its axes bound or checked, under
+    a trace too: a program begun within another's trace (a shard_map's body, whose mesh JAX refuses to
+    resize, `jax.sharding.use_abstract_mesh`, and whose manual axes a checked shard_map binds and asks its
+    values to state their variance over, `check_vma`) takes none of its mesh, `mesh` as a program set on it
+    takes it (`jax.set_mesh`: its jits record it as theirs). `jax.set_mesh` does the mesh's swaps but refuses
+    to run under a trace."""
+    abstract = mesh_lib.abstract_mesh_context_manager.swap_local(
+        mesh_lib.empty_abstract_mesh if mesh is None else mesh.abstract_mesh)
+    concrete = mesh_lib.device_context.swap_local(mesh_lib.empty_concrete_mesh if mesh is None else mesh)
     axes = jax_core.axis_env_state.swap_local(jax_core.top_axis_env)
     try:
         with jax_config._check_vma(new_val=False):

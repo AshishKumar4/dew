@@ -18,13 +18,14 @@ import functools
 import math
 import threading
 from collections.abc import Hashable, Iterable, Iterator, Set
-from typing import ClassVar
+from typing import ClassVar, TypeGuard
 
 import jax
 import jax.numpy as jnp
 import tokamax
 from jax.ad_checkpoint import checkpoint_name
 
+from dew import _cache
 from dew.nn import derivatives
 from dew.nn.kernels import chunked_launch, generation
 from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources
@@ -160,8 +161,13 @@ compile_ahead planned 425 (row 4260's profile), and every plan kept for the proc
 geometry a derivation ever tried (row 4390)."""
 
 _PLANS: collections.OrderedDict = collections.OrderedDict()
-"""`_planned`'s plans by their call, tiles, bundle and target's facts, the most recently read last."""
+"""`_planned`'s plans by their call, tiles, bundle and target's facts, the most recently read last: each the
+call's launches by the depth they were planned at, its trace's at one stage."""
 _PLANNING = threading.Lock()
+
+_SPILLED: collections.OrderedDict = collections.OrderedDict()
+"""`Mosaic._spilled`'s launches by what a derivation reads (`report.derivation_inputs`), the most recently
+made last."""
 
 
 def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target: generation.GpuTarget,
@@ -176,7 +182,9 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
     (`Tiles.stages`) moves only the launches whose ring is the tiles' (`mainloop.Launch.ring`): the call is
     traced once at one stage and those launches planned at the tiles' depth (`Launch.deepened`). Traced at
     each depth, the derivation took 2.0 s of a CPU's time for Kimi Linear's delta attention on sm100, 30
-    traces of 66 ms (jsf-dtime at 0cbc7f8f1d9)."""
+    traces of 66 ms (jsf-dtime at 0cbc7f8f1d9); each depth's launches are kept beside the trace's, as a
+    derivation asks one tiles' plan again for every rule it reads (replanned at each ask, 1.6 million rings
+    deepened over a refusal walk's 296 derivations, 461 of its 842 profiled seconds, row 6551)."""
     facts = (target.generation, target.device_kind, target.shared_limit, target.multiprocessors)
     # A backward's plan holds the training call's forward: one key for it.
     training_forward = training_forward and not backward
@@ -184,19 +192,22 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
     key = (shapes, traced, family, facts, max_segments, delta, backward, training_forward, rounded, wide,
            ranged, skip, forked)
     with _PLANNING:
-        found = _PLANS.get(key)
-        if found is not None:
+        depths = _PLANS.get(key)
+        if depths is not None:
             _PLANS.move_to_end(key)
-    if found is None:
+            if (found := depths.get(tiles.stages)) is not None:
+                return found
+    if depths is None:
         *operands, starts = shapes
-        found = planned(*operands, tiles=traced, family=family, starts=starts, max_segments=max_segments,
-                        delta=delta, backward=backward, training_forward=training_forward, target=target,
-                        rounded=rounded, wide=wide, ranged=ranged, skip=skip, forked=forked)
-        with _PLANNING:
-            _PLANS[key] = found
-            while len(_PLANS) > PLANS_KEPT:
-                _PLANS.popitem(last=False)
-    return tuple(launch.deepened(tiles.stages, target) for launch in found)
+        depths = {1: planned(*operands, tiles=traced, family=family, starts=starts, max_segments=max_segments,
+                             delta=delta, backward=backward, training_forward=training_forward, target=target,
+                             rounded=rounded, wide=wide, ranged=ranged, skip=skip, forked=forked)}
+    found = tuple(launch.deepened(tiles.stages, target) for launch in depths[1])
+    with _PLANNING:
+        _PLANS[key] = {**_PLANS.get(key, depths), tiles.stages: found}
+        while len(_PLANS) > PLANS_KEPT:
+            _PLANS.popitem(last=False)
+    return found
 
 
 def _shaped(forked: chunk_forward.ForkedTable | None) -> chunk_forward.ForkedTable | None:
@@ -310,8 +321,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         # A forked call's given memories' gradient its table's first, its slots' none.
         tabled_grads = None if table is None else dataclasses.replace(table, given=dh0, loads=None,
                                                                        stores=None, entries=dentries)
-        return (*grads, None if state is None else dh0, None, None,
-                None if dskip is None else dskip.astype(skip.dtype), tabled_grads)
+        # The skip's gradient formed in its dtype before the inputs' cotangents leave (row 6027).
+        (grads, dh0, tabled_grads), dskip = derivatives.with_gradients_formed(
+            (grads, dh0, tabled_grads), None if dskip is None else dskip.astype(skip.dtype))
+        return (*grads, None if state is None else dh0, None, None, dskip, tabled_grads)
 
     rule = derivatives.contracted("test_the_template_rule_holds_its_orders")(
         derivatives.declared_derivative(derivatives.KernelGlue(), primal, forward, backward))
@@ -484,11 +497,58 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _refused(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                  ) -> bool:
+        """Whether a compile refused `tiles` past what its derivation's raise answers (`_exhausted`), or a
+        launch it spilled so at other tiles plans at `tiles` as it did there but its grid (`_spilled`): the
+        same kernel at the same registers, shared memory, ring, roles and residency, which a compile spills
+        again. Asked a tiles at a time, lightning attention's reverse walk on an H100 took
+        every rung of its ladder again at each of its tiles' eight ring depths, whose ring it does not read,
+        and its training step raised Unfitted after 3,107 s (row 6816); on an A100 its prefill certified its
+        output walk fifteen times, fourteen spilling 336 bytes at 255 registers stated alike, and the gated
+        delta net's training call its scores' backward 32 times, each 8 bytes at 255 stated alike."""
+        return self._exhausted(ba, tiles, target) or not self._spilled(ba, target).isdisjoint(
+            self._plans(ba, tiles, target).items())
+
+    def _spilled(self, ba: tokamax.BoundArguments, target: generation.GpuTarget
+                 ) -> frozenset[tuple[str, frozenset[tuple[bool, mainloop.Launch]]]]:
+        """Each launch a compile spilled at tiles it refused past what their raise answers (`_exhausted`), by
+        name with its plans there but their grids in each product that runs it (`_plans`): kept by what its
+        derivation reads (`report.derivation_inputs`: the call's identity, the target and its refusals), so a
+        derivation's checks of its tiles read it once a refusal (planned at each, a refusal walk's 355
+        derivations took 148 s)."""
+        key = report.derivation_inputs(self, ba, target)
+        _, _, refusals, _ = key
+
+        def made() -> frozenset[tuple[str, frozenset[tuple[bool, mainloop.Launch]]]]:
+            # A rung's refusal (its producers raised, or its programs fewer) is its own tiles' ladder's.
+            return frozenset(
+                (name, plan) for config, kernels in refusals
+                if _unraised(config) and self._exhausted(ba, config, target)
+                for planned in [self._plans(ba, config, target)]
+                for owned in [_owners(kernels, (launch for plan in planned.values() for _, launch in plan))]
+                for name, plan in planned.items() if name in owned)
+
+        return _cache.holding(_SPILLED, key, made, PLANS_KEPT)
+
+    def _exhausted(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
+                   ) -> bool:
         """Whether a compile refused `tiles` past what its derivation's raise answers: a kernel spilled
         (`report.refused_at`) whose launch's producer can rise no further, or would leave its tiles unheld
         (`_raised`)."""
         spilled = report.refused_at(self, ba, tiles)
         return bool(spilled) and self._raised(ba, tiles, spilled, target) is None
+
+    def _plans(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
+               ) -> dict[str, frozenset[tuple[bool, mainloop.Launch]]]:
+        """Each launch the call runs at `tiles` by name, as planned but its grid (`_ungridded`) in each
+        product that runs it: a training call's, and a forward alone's at its own tiles (`Tiles.forward`). A
+        refusal names a kernel, not the product whose compile spilled it, so a launch is alike where every
+        product's plan of it is."""
+        plans: dict[str, set[tuple[bool, mainloop.Launch]]] = collections.defaultdict(set)
+        for backward in (True, False):
+            for launch in self.launches(ba, tiles if backward else tiles.forward or tiles, target,
+                                        backward=backward):
+                plans[launch.name].add((backward, _ungridded(launch)))
+        return {name: frozenset(plan) for name, plan in plans.items()}
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mainloop.Tiles | None:
         """The call's tiles on `target`, from its shape and the device's and its bundle's facts
@@ -604,10 +664,12 @@ class Mosaic(base.Template[mainloop.Tiles]):
         A spill at the top is the consumers', the producer holding there all it may; a rung below holds
         wherever the producer's need and the consumers' meet. Tiles still spilling at the ladder's foot their
         derivation refuses (`_chunked`). From the foot up, the 4B's reverse walk took eight compiles of a
-        B200's cold start, 95 s, to the 80 registers its producer holds; its top, 128, holds in one."""
+        B200's cold start, 95 s, to the 80 registers its producer holds; its top, 128, holds in one. Past its
+        ladder's foot, a launch takes a program fewer a multiprocessor, its producer at the least and its
+        ladder run again there (`_stepped`)."""
         while (spilled := _refused_kernels(self, ba, tiles)) and (
-                raised := self._raised(ba, tiles, spilled, target)) is not None:
-            tiles = _producing(tiles, raised)
+                stepped := self._stepped(ba, tiles, spilled, target)) is not None:
+            tiles = stepped
         return tiles
 
     def emitted(self, config: Hashable, kernel: str) -> Hashable:
@@ -620,26 +682,56 @@ class Mosaic(base.Template[mainloop.Tiles]):
             return config
 
         def own(tiles: mainloop.Tiles) -> mainloop.Tiles:
-            # The cap its emission reads: its launch's by its name, which the launch passes to `report.named`
-            # and to `Call.producers` alike.
-            cap = tiles.producers.of(kernel)
-            return dataclasses.replace(tiles, producers=resources.Producers(
-                () if cap is None else ((kernel, cap),)))
+            # The caps its emission reads: its launch's by its name, which the launch passes to `report.named`
+            # and to `Call.producers` and `Call.residents` alike.
+            cap, held = tiles.producers.of(kernel), tiles.residents.of(kernel)
+            return dataclasses.replace(
+                tiles, producers=resources.Producers(() if cap is None else ((kernel, cap),)),
+                residents=resources.Residents(() if held is None else ((kernel, held),)))
 
         forward = None if config.forward is None else own(config.forward)
         return dataclasses.replace(own(config), forward=forward)
 
     def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> Iterator[mainloop.Tiles]:
-        """The tiles a refused `config`'s spilling launches' producers step through (`_raised`): each one's
-        top first, then a setmaxnreg step lower a rung, each planned as it is asked for: the ladder `_settled`
-        takes a compile at a time, which certification asks its top alone and then a round at a time
+        """The tiles a refused `config`'s spilling launches step through (`_stepped`): each one's producer's
+        top first, then a setmaxnreg step lower a rung, and past its foot a program fewer a multiprocessor
+        with its producer's ladder run again, each planned as it is asked for: the ladder `_settled` takes a
+        compile at a time, which certification asks its top alone and then a round at a time
         (`tuning.KernelOp._climbed`)."""
         if not self._typed(config):
             return
         target, spilled, rung = generation.gpu_target(), _refused_kernels(self, ba, config), config
-        while spilled and (raised := self._raised(ba, rung, spilled, target)) is not None:
-            rung = _producing(rung, raised)
+        while spilled and (stepped := self._stepped(ba, rung, spilled, target)) is not None:
+            rung = stepped
             yield rung
+
+    def _stepped(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
+                 target: generation.GpuTarget) -> mainloop.Tiles | None:
+        """`joined`'s next rung for its `spilled` launches: their producers a rung down their ladders
+        (`_raised`), or, past a ladder's foot, those launches a program fewer a multiprocessor with their
+        producers at the least again (`_fewer`), whose ladders then run at that residency; None past one
+        program."""
+        if (raised := self._raised(ba, joined, spilled, target)) is not None:
+            return _limited(joined, producers=raised, residents=joined.residents)
+        return self._fewer(ba, joined, spilled, target)
+
+    def _fewer(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
+               target: generation.GpuTarget) -> mainloop.Tiles | None:
+        """`joined` with its `spilled` launches whose producers' ladders ran out (`_moving`: a launch that
+        moves no registers has no ladder, and its tiles are refused as before) a program fewer a
+        multiprocessor than they plan now (`resources.Residents.fewer`), each the fewest its instances plan
+        (the training call's and the forward alone's, each at its own tiles), their producers at the least;
+        None where one plans one program already. Every role of a launch takes a larger share there, where
+        the assembler may hold what no rung of its producer's ladder gave its consumers (row 6718)."""
+        planned: dict[str, int] = {}
+        for launch in self._moving(ba, joined, spilled, target):
+            planned[launch.name] = min(planned.get(launch.name, launch.resident), launch.resident)
+        residents = joined.residents.fewer(planned) if planned else None
+        if residents is None:
+            return None
+        producers = resources.Producers(tuple((name, cap) for name, cap in joined.producers.raised_to
+                                              if name not in planned))
+        return _limited(joined, producers=producers, residents=residents)
 
     def _raised(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                 target: generation.GpuTarget) -> resources.Producers | None:
@@ -653,17 +745,24 @@ class Mosaic(base.Template[mainloop.Tiles]):
         assembler's, a compile that spills them refusing it."""
         family = bundle(target, _dtype(ba))
         assert family is not None
-        launches = (*self.launches(ba, joined, target, backward=True),
-                    *self.launches(ba, joined.forward or joined, target, backward=False))
-        owned = _owners(spilled, launches)
-        # Every instance of a raised launch (a name the training call's backward and the forward alone can
-        # each plan at their own tiles), each judged at its own schedule and residency.
-        moving = [launch for launch in launches if launch.name in owned
-                  and resources.moves_registers(launch.registers, (launch.family or family).warpgroups(
-                      launch.consumers), launch.consumers, launch.resident)]
+        moving = self._moving(ba, joined, spilled, target)
         tops = {launch.name: resources.entry_registers(
             (launch.family or family).warpgroups(launch.consumers), launch.resident) for launch in moving}
         return joined.producers.stepped(tops) if moving else None
+
+    def _moving(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
+                target: generation.GpuTarget) -> list[mainloop.Launch]:
+        """Every instance of `joined`'s `spilled` launches (each kernel's own, `_owners`: a name the training
+        call's backward and the forward alone can each plan at their own tiles) whose program moves registers
+        from its producer (`resources.moves_registers`), each judged at its own schedule and residency."""
+        family = bundle(target, _dtype(ba))
+        assert family is not None
+        launches = (*self.launches(ba, joined, target, backward=True),
+                    *self.launches(ba, joined.forward or joined, target, backward=False))
+        owned = _owners(spilled, launches)
+        return [launch for launch in launches if launch.name in owned
+                and resources.moves_registers(launch.registers, (launch.family or family).warpgroups(
+                    launch.consumers), launch.consumers, launch.resident)]
 
     def _derive(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, chunk: int, *,
                 training: bool, refused: Set[mainloop.Tiles] = frozenset()) -> mainloop.Tiles | None:
@@ -866,8 +965,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
         beside = [self._staged(ba, blocks[index], target, config.chunk) for index in (at - 1, at + 1)
                   if 0 <= index < len(blocks)]
         other = dataclasses.replace(config, stages=config.stages - 1 if config.stages > 1 else 2)
-        # Each at the derived config's producers, raised past its own compiles' spills (`_settled`).
-        return [self._settled(ba, _producing(tiles, config.producers), target)
+        # Each at the derived config's producers and residents, stepped past its own compiles' spills
+        # (`_settled`).
+        return [self._settled(ba, _limited(tiles, producers=config.producers, residents=config.residents),
+                              target)
                 for tiles in (*beside, other) if tiles is not None]
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: mainloop.Tiles,
@@ -881,7 +982,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
         in a 16-bit call or one under the run's fast forms (`mainloop.per_key_refusal`), a
         16-bit delta rule's solve at fp32's range where its form proves no bound (`ranged`), a bundle for the
         target's family, the tensor rate its cost model reads, and a config whose launches the device holds
-        at the call's widths (`fits`: their shared memory and registers). Off a GPU (a CPU's), where the rule
+        at the call's widths (`fits`: their shared memory and registers; for a training call's launch where a
+        device certifies, `holds`, the config its certification takes, none where every config its
+        derivation offers spilled: the gated delta net's
+        scores' backward on an A100 spilled 8 bytes at 255 registers at each, and its training step raised
+        Unfitted from inside the call, row 6816). Off a GPU (a CPU's), where the rule
         runs its bundle interpreted, the target is the interpreted bundle's generation (`launched`)."""
         if generation.backend() == "cpu" and bundle(target) is None:
             target = self.launched()
@@ -893,11 +998,20 @@ class Mosaic(base.Template[mainloop.Tiles]):
                  or mainloop.per_key_refusal(dtype, rounded=arguments.get("rounded", False)) is None)
         if not (taken and bundle(target, dtype) is not None and target.tensor_rate("16bit") is not None):
             return False
+        # A training call's launch, selected as reverse mode runs it (`recurrence_chunk._per_product`), holds
+        # where its certification takes a config (`holds`), as the call's own certification then reads it
+        # back. A forward alone is certified as its call runs it: selected beside a training call's, which a
+        # step runs instead, it asked a compile of a launch no step ran (train 929's F5). A gradient the fast
+        # backward does not take (`trains`) is the route's backward requirement's to refuse
+        # (`recurrence_chunk.TEMPLATE_SUPPORTS`): a certification of its pullback raises in the rule's
+        # gradient (`mosaic_rule`).
+        if report.pulling() and self.trains(ba, target):
+            return self.holds(ba)
         return bool(self.fits(ba, target))
 
-    def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> mainloop.Tiles:
-        # Its derived config on the target it launches for (`Template.estimate` and its ranking are gone).
-        return self.fitting(ba, self.launched())[0]
+    def launch_target(self) -> generation.GpuTarget:
+        # Its configs derived for the target it launches for (`launched`), the interpreted one's off a GPU.
+        return self.launched()
 
 
 
@@ -914,16 +1028,34 @@ def _owner(kernel: str, names: Iterable[str]) -> str | None:
     return next((name for name in sorted(names, key=len, reverse=True) if kernel.startswith(name)), None)
 
 
+def _unraised(config: Hashable) -> TypeGuard[mainloop.Tiles]:
+    """Whether `config` is tiles a derivation proposes (`derived`), no rung of their ladder (`rungs`): no
+    launch's producer raised or programs held fewer, its forward's neither."""
+    return isinstance(config, mainloop.Tiles) and all(
+        not tiles.producers.raised_to and not tiles.residents.held_to
+        for tiles in (config, config.forward) if tiles is not None)
+
+
+def _ungridded(launch: mainloop.Launch) -> mainloop.Launch:
+    """`launch` as planned but its grid (`Launch.programs`), which no thread's registers or shared memory
+    read: what a compile of its kernel spills at."""
+    return dataclasses.replace(launch, programs=0)
+
+
 def _owners(kernels: Iterable[str], launches: Iterable[mainloop.Launch]) -> frozenset[str]:
     """The launches that ran `kernels`, by name (`_owner`)."""
     names = {launch.name for launch in launches}
     return frozenset(owner for kernel in kernels if (owner := _owner(kernel, names)))
 
 
-def _producing(tiles: mainloop.Tiles, producers: resources.Producers) -> mainloop.Tiles:
-    """`tiles`, its forward's too, its launches' producers lowered to `producers`."""
-    forward = None if tiles.forward is None else dataclasses.replace(tiles.forward, producers=producers)
-    return dataclasses.replace(tiles, producers=producers, forward=forward)
+def _limited(tiles: mainloop.Tiles, *, producers: resources.Producers,
+             residents: resources.Residents) -> mainloop.Tiles:
+    """`tiles`, its forward's too, its launches' producers lowered to `producers` and held to `residents`'
+    programs a multiprocessor."""
+    def held(each: mainloop.Tiles) -> mainloop.Tiles:
+        return dataclasses.replace(each, producers=producers, residents=residents)
+
+    return dataclasses.replace(held(tiles), forward=None if tiles.forward is None else held(tiles.forward))
 
 
 MOSAIC = Mosaic()

@@ -127,12 +127,12 @@ def assert_draws_as_declared(counts_of, chances, label: str, *, seeds: int) -> N
         raise ValueError(f"{label}: chances must be finite and positive, a row of outcomes or rows of them, "
                          f"not {chances.tolist()}")
     rows = chances.reshape(-1, chances.shape[-1])
-    # Chances are probabilities: a declaration whose sum is off one by more than its decimals' rounding
-    # is refused, never repaired (0.85, 0.05 and 0.1 add to one in decimal, to 1 + 2^-52 in binary).
+    # Chances are probabilities: a declaration whose exact sum is off one by more than its decimals'
+    # binary rounding (a unit of 2^-52 for each outcome: 0.85, 0.05 and 0.1 add to one in decimal, to
+    # 1 + 2^-52 in binary) is refused, and every one is judged as declared, never repaired.
     sums = np.asarray([math.fsum(row) for row in rows.tolist()])
     if np.any(np.abs(sums - 1.0) > rows.shape[-1] * 2.0 ** -52):
         raise ValueError(f"{label}: each row of chances must sum to one, not {sums.tolist()}")
-    rows = rows / sums[:, None]
     pooled = np.zeros(rows.shape, np.int64)
     for seed in range(seeds):
         counts = np.asarray(counts_of(seed))

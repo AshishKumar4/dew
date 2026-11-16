@@ -36,7 +36,7 @@ from jax._src import core as jax_core
 from jax.extend import core as jcore
 
 from dew import _cache
-from dew.algebra import SATURATION, derive, forms, fusion, normal_form, program, rules, terms
+from dew.algebra import SATURATION, forms, fusion, normal_form, program, rules, terms
 from dew.algebra.forms import aval
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Choice
@@ -87,15 +87,11 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, families: Sequence[Famil
     half of one equation, for no region, 37 of its seconds, row 5556)."""
     if _bound(jaxpr).isdisjoint(family.anchor for family in families):
         return []
-    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families), derive.context(),
-           _cache.KERNEL_CHOICES.value)
-    if key not in _HELD_BODIES:
-        _HELD_BODIES[key] = [_positioned(jaxpr, written)
-                             for written in _recognizing(jaxpr, index, held, families)]
-        if len(_HELD_BODIES) > fusion.DECISIONS_HELD:
-            _HELD_BODIES.popitem(last=False)
-    _HELD_BODIES.move_to_end(key)
-    return [_placed(jaxpr, written) for written in _HELD_BODIES[key]]
+    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families), fusion.choice_context())
+    def recognizing() -> list:
+        return [_positioned(jaxpr, written) for written in _recognizing(jaxpr, index, held, families)]
+    found = _cache.holding(_HELD_BODIES, key, recognizing, fusion.DECISIONS_HELD)
+    return [_placed(jaxpr, written) for written in found]
 
 
 _HELD_BODIES: collections.OrderedDict[Hashable, list] = collections.OrderedDict()
@@ -175,14 +171,12 @@ def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[
         regions.setdefault(places, []).append(candidate)
     for places, members in regions.items():
         key = _region_key(jaxpr, index, places, members[0].outputs, accurate)
-        if key not in _HELD_REGIONS:
+
+        def chose(places=places, members=members):
             # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
             with generation.routes(alone=True):
-                _HELD_REGIONS[key] = _chosen(index, places, members, accurate)
-            if len(_HELD_REGIONS) > fusion.DECISIONS_HELD:
-                _HELD_REGIONS.popitem(last=False)
-        _HELD_REGIONS.move_to_end(key)
-        chosen = _HELD_REGIONS[key]
+                return _chosen(index, places, members, accurate)
+        chosen = _cache.holding(_HELD_REGIONS, key, chose, fusion.DECISIONS_HELD)
         if chosen is not None:
             candidate = members[chosen]
             # Its call's identity: the region's (its structure and its constants' values) and the candidate.
@@ -200,11 +194,11 @@ def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...]
                 outputs: Sequence[jcore.Var], accurate: bool) -> Hashable:
     """What a region's choice reads: its structure (`program.structure`, every value it reads an input), the
     values of the constants among them (`_digest`: a statistic's divisor, an epsilon held as an array), the
-    numerics' forms and the context its kernels are chosen in."""
+    numerics' forms and the context its kernels are chosen in (`fusion.choice_context`)."""
     inputs = fusion.region_inputs(jaxpr, places)
     window = jcore.Jaxpr([], list(inputs), list(outputs), [jaxpr.eqns[place] for place in places])
     held = tuple(_digest(index.consts[var]) if var in index.consts else None for var in inputs)
-    return program.structure(window), held, accurate, derive.context(), _cache.KERNEL_CHOICES.value
+    return program.structure(window), held, accurate, fusion.choice_context()
 
 
 def _digest(value) -> Hashable:
@@ -220,12 +214,15 @@ def _digest(value) -> Hashable:
 def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Candidate],
             accurate: bool) -> int | None:
     """The first of one region's candidates whose call takes a kernel and which the e-graph proves equal to
-    the region (`_equalities`, of the taken ones alone), its place among `members`; None where none is."""
-    taken = [number for number, candidate in enumerate(members) if candidate.taken()]
-    # Each alone first, where its results are its declaration's own values; the e-graph only where none is.
-    for number in taken:
-        if _equalities(index, [(members[number], places)], accurate, saturating=False)[0]:
+    the region (`_equalities`, of the taken ones alone), its place among `members`; None where none is.
+    Each in order, whether its call takes a kernel asked as it is reached (`Candidate.taken`: an attention's
+    48 candidates over 2,048 keys, each asked before any was compared, 17.8 s of one region's recognition,
+    row 6799), and one that does compared alone, where its results are its declaration's own values; the
+    e-graph only where none is, over every candidate that takes one."""
+    for number, candidate in enumerate(members):
+        if candidate.taken() and _equalities(index, [(candidate, places)], accurate, saturating=False)[0]:
             return number
+    taken = [number for number, candidate in enumerate(members) if candidate.taken()]
     if not taken:
         return None
     equal = _equalities(index, [(members[number], places) for number in taken], accurate)
@@ -312,9 +309,12 @@ def _between(index: fusion.Index, operands: Sequence[jcore.Var],
 
 
 BARRIERS = (jcore.primitives.custom_jvp_call_p, jcore.primitives.custom_vjp_call_p,
-            jcore.primitives.custom_vmap_p)
+            jcore.primitives.custom_vmap_p, jcore.primitives.remat_p)
 """The equations a region the compile point writes never holds: a program's own derivative or batching rule,
-which the call written in its place would not keep. A gradient's stop is no barrier but no identity either
+which the call written in its place would not keep, and a checkpoint (`jax.checkpoint`), whose boundary
+decides what a derivative saves, which a call written across it would remove (§6.2: rewriting stays within
+remat boundaries). Its body is searched apart, as every program a call holds is. A gradient's stop is no
+barrier but no identity either
 (`VALUE_IDENTITIES`): it stays its own equation, so a region matches a declaration only where the declaration
 stops the same value, and a stop on a call's operand stays outside the call."""
 
@@ -397,16 +397,14 @@ def _declaration(candidate: Candidate) -> Callable:
     keywords = tuple(sorted((function.__kwdefaults__ or {}).items()))
     key = (function.__code__, _typed(function.__defaults__), _typed(keywords), _typed(cells),
            _typed(tuple(sorted(declared.keywords.items()))), _typed(tuple(candidate.operands)))
-    if key not in _DECLARATIONS:
+
+    def traced() -> Callable:
         # Dew's own choices by the platform read as their default branch (`forms.inlined`): its product under
         # a wide arithmetic is the product a program writes; a program's own choices stay as written.
-        traced = jax.make_jaxpr(lambda *values: jax.tree.leaves(forms.inlined(declared)(*values)))(
+        written = jax.make_jaxpr(lambda *values: jax.tree.leaves(forms.inlined(declared)(*values)))(
             *(_shape(var) for var in candidate.operands))
-        _DECLARATIONS[key] = jcore.jaxpr_as_fun(traced)
-        if len(_DECLARATIONS) > fusion.DECISIONS_HELD:
-            _DECLARATIONS.popitem(last=False)
-    _DECLARATIONS.move_to_end(key)
-    return _DECLARATIONS[key]
+        return jcore.jaxpr_as_fun(written)
+    return _cache.holding(_DECLARATIONS, key, traced, fusion.DECISIONS_HELD)
 
 
 def _typed(value) -> Hashable:
@@ -865,8 +863,9 @@ def _attention_candidates(q: jcore.Var, k: jcore.Var, v: jcore.Var, output: jcor
                 mask=extra_ if boolean else None, bias=None if boolean else extra_).astype(dtype)
 
         operands = (q, k, v, *([extra] if extra is not None else []))
+        options = (causal, softcap, wide, after, fill, window, boolean, dtype)
         yield Candidate(operands, (output,), attend, functools.partial(attend, implementation='reference'),
-                        functools.partial(_attention_taken, attend, operands))
+                        functools.partial(_attention_taken, attend, operands, options))
 
 
 def _selections(index: fusion.Index, operands: Sequence[jcore.Var], places: Sequence[int],
@@ -899,8 +898,12 @@ def _selections(index: fusion.Index, operands: Sequence[jcore.Var], places: Sequ
                 width = _band(held)
                 if width is not None:
                     windows[width] = None
-            elif held.size and jnp.issubdtype(held.dtype, jnp.floating) and np.all(held == held.flat[0]):
-                fills[float(held.flat[0])] = None
+            elif held.size and jnp.issubdtype(held.dtype, jnp.floating):
+                # A fill is one value held everywhere, bit for bit (`terms.compact`: read once, never whole).
+                compacted = terms.compact(held)
+                # A NaN is no fill: an attention's fill is a value, compared as one (`dew.nn.attention`).
+                if compacted.size == 1 and not np.isnan(compacted.flat[0]):
+                    fills[float(compacted.flat[0])] = None
     return list(fills), list(windows)
 
 
@@ -909,24 +912,42 @@ def _band(mask: np.ndarray) -> int | None:
     leading index: key `j` kept for query `i` exactly where `0 <= i - j < w`; None where it keeps another
     pattern, or every key at or before its query (plain causality)."""
     queries, keys = mask.shape[-2:]
+    # One plane for every leading index, or no band (`terms.compact`: the mask the same along each leading
+    # axis), so the band's distances read one plane, never a batch's and heads' copies (a 2048-token causal
+    # mask over a step's heads, 0.73 s a call, row 6799).
+    if terms.compact(mask).shape[:-2] != (1,) * (mask.ndim - 2):
+        return None
+    plane = mask[(0,) * (mask.ndim - 2)]
     distance = np.arange(queries)[:, None] - np.arange(keys)[None, :]
     # The one width a band of these entries can have, one past the farthest key any query keeps, held to
-    # the whole mask once (each width from 1 compared with it cost a square mask its keys' count again).
-    width = int(np.max(np.where(mask, distance, 0), initial=0)) + 1
+    # the plane once (each width from 1 compared with it cost a square mask its keys' count again).
+    width = int(np.max(np.where(plane, distance, 0), initial=0)) + 1
     if not 1 <= width < keys:
         return None
-    band = np.broadcast_to((distance >= 0) & (distance < width), mask.shape)
-    return width if np.array_equal(band, mask) else None
+    return width if np.array_equal((distance >= 0) & (distance < width), plane) else None
 
 
 KEPT = frozenset({"xla", "reference"})
 """The attention routes that are no kernel of Dew's."""
 
 
-def _attention_taken(attend: Callable, operands: Sequence[jcore.Var]) -> bool:
+def _attention_taken(attend: Callable, operands: Sequence[jcore.Var], options: Hashable) -> bool:
     """Whether Dew's selector gives the call a kernel of its own (the template, FlashAttention, cuDNN; none
-    of `KEPT`): the call traced over its operands' shapes, its attention route read (`generation.routes`);
-    not where a kernel a call names refuses it (`KernelRefused`)."""
+    of `KEPT`), asked once by what it reads (`_TAKEN`): its operands' shapes and dtypes, the call's
+    `options` and the context its kernels are chosen in (`fusion.choice_context`)."""
+    key = (tuple((aval(var).shape, aval(var).dtype) for var in operands), options, fusion.choice_context())
+    return _cache.holding(_TAKEN, key, lambda: _traced_taken(attend, operands), fusion.DECISIONS_HELD)
+
+
+_TAKEN: collections.OrderedDict[Hashable, bool] = collections.OrderedDict()
+"""Whether an attention call takes a kernel (`_attention_taken`), the latest `fusion.DECISIONS_HELD` held:
+each shape and option asked of the selector once, however many regions and programs offer it (a Dory step's
+recognition traced the call 832 times for 113 regions, 37 of its 46 s, row 6799)."""
+
+
+def _traced_taken(attend: Callable, operands: Sequence[jcore.Var]) -> bool:
+    """`_attention_taken`'s answer: the call traced over its operands' shapes, its attention route read
+    (`generation.routes`); not where a kernel a call names refuses it (`KernelRefused`)."""
     from dew.nn.kernels.selection import KernelRefused
 
     with generation.routes(alone=True) as found:

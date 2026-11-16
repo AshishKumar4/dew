@@ -45,6 +45,7 @@ from flax import struct
 from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
+from dew import _cache
 from dew._distributions import counter_key
 from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts
@@ -871,16 +872,24 @@ class ProgramModule(NamedTuple):
     more than a tile (`Objective.unfuse_head`)."""
 
 
-def _ruled_tangent(primals, tangents, _value) -> jax.Array:
-    """`_ruled`'s tangent: the value's own, and in `params` the rule's inner product with their tangent."""
+def _ruled_tangent(primals, tangents, value) -> jax.Array:
+    """`_ruled`'s tangent: the value's own, and in `params` the rule's inner product with their tangent; a
+    symbolic zero adds nothing. The value's side is a stopped gradient's, so no input's cotangent leaves
+    beside the rule's gradients for the rule to tie."""
+    from jax.custom_derivatives import SymbolicZero
+
     _, rule, _ = primals
     moved_value, _, moved = tangents
-    return moved_value + sum(accumulated(jnp.vdot, leaf, change) for leaf, change in
-                             zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
+    changes = jax.tree.leaves(moved, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+    total = jnp.zeros_like(value) if isinstance(moved_value, SymbolicZero) else moved_value
+    for leaf, change in zip(jax.tree.leaves(rule), changes, strict=True):
+        if not isinstance(change, SymbolicZero):
+            total = total + accumulated(jnp.vdot, leaf, change)
+    return total
 
 
 _ruled = contracted("test_a_ruled_loss_holds_every_order")(
-    surrogate(lambda value, rule, params: value, _ruled_tangent))
+    surrogate(lambda value, rule, params: value, _ruled_tangent, symbolic_zeros=True))
 """`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`): a surrogate
 (`dew.nn.derivatives.surrogate`), the loss's own derivative replaced by a learning rule's."""
 
@@ -1378,8 +1387,22 @@ class Objective(ABC, Generic[Loss, Effects]):
         (`dew.optim.OptimConfig.fresh_groups`): what the source it trains drew (`Pretrained.fresh`, held
         where `bind_model` holds its tree as the objective's), an objective declaring besides what it
         draws beside the base it holds. One drawn with no parameter, a tied readout, the group leaves out
-        (`dew.config.trained_modules`)."""
+        (`fresh_trained`)."""
         return self._fresh
+
+    def fresh_trained(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Those of `fresh_modules` that hold a parameter this objective trains, as its tree is drawn (its
+        shapes alone), and those that are one (a parameter a loaded module gained, `Pretrained.with_model`):
+        what a fresh group claims (`dew.optim.OptimConfig.claiming`). A tied readout is drawn with none."""
+        modules = self.fresh_modules()
+        if not modules:
+            return (), ()
+        from dew.optim import parameter_name
+
+        names = [parameter_name(path) for path, _ in
+                 jax.tree_util.tree_leaves_with_path(self.drawn_shapes()["params"])]
+        return (tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names)),
+                tuple(module for module in modules if module in names))
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Return `tree`, held or drawn, with what the objective's own modules
@@ -2167,7 +2190,8 @@ _TRACED: weakref.WeakKeyDictionary[object, dict[Hashable, tuple[float, float]]] 
 
 _KEYED_FLOPS: collections.OrderedDict[Hashable, tuple[float, float]] = collections.OrderedDict()
 """`traced_update_flops`' counts of objectives that state their trace (`Objective.trace_key`), by that key
-and the batch's shapes, the `KEYED_FLOPS` latest: a refit's objective, built anew, reads its equal's."""
+and the batch's shapes, the `KEYED_FLOPS` latest (`_cache.holding`): a refit's objective, built anew, reads
+its equal's."""
 
 KEYED_FLOPS = 256
 
@@ -2189,27 +2213,25 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
     shapes = traced_shapes(batch)
     signature = shapes_key(shapes)
     kept = _TRACED.setdefault(objective, {})
-    if (key := stated_trace(objective)) is not None and signature not in kept:
-        counted = _KEYED_FLOPS.get((type(objective), key, signature))
-        if counted is not None:
-            kept[signature] = counted
     if signature not in kept:
-        variables = objective.drawn_shapes()
-        step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
-        rest = {name: value for name, value in variables.items() if name != "params"}
+        def counted() -> tuple[float, float]:
+            variables = objective.drawn_shapes()
+            step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
+            rest = {name: value for name, value in variables.items() if name != "params"}
 
-        def forward(variables: Variables, batch: Batch) -> jax.Array:
-            return objective.scalar_loss(variables, batch, step)[0]
+            def forward(variables: Variables, batch: Batch) -> jax.Array:
+                return objective.scalar_loss(variables, batch, step)[0]
 
-        def gradient(params: Variables, rest: Variables, batch: Batch) -> Variables:
-            return jax.grad(lambda params: forward({**rest, "params": params}, batch))(params)
+            def gradient(params: Variables, rest: Variables, batch: Batch) -> Variables:
+                return jax.grad(lambda params: forward({**rest, "params": params}, batch))(params)
 
-        kept[signature] = (traced_flops(forward, variables, shapes),
-                           traced_flops(gradient, variables["params"], rest, shapes))
-        if key is not None:
-            _KEYED_FLOPS[type(objective), key, signature] = kept[signature]
-            while len(_KEYED_FLOPS) > KEYED_FLOPS:
-                _KEYED_FLOPS.popitem(last=False)
+            return (traced_flops(forward, variables, shapes),
+                    traced_flops(gradient, variables["params"], rest, shapes))
+
+        key = stated_trace(objective)
+        # An objective that states its trace reads its equal's counts (`_cache.holding`).
+        kept[signature] = counted() if key is None else _cache.holding(
+            _KEYED_FLOPS, (type(objective), key, signature), counted, KEYED_FLOPS)
     return kept[signature]
 
 __all__ = [

@@ -20,6 +20,15 @@ class InContextMemoryMixer(MixerBase):
 
     memory: InContextMemory
 
+    def fork_refusal(self) -> str | None:
+        """Why the layer reads no forks (`MixerBase.fork_refusal`): no path of the memory continues a
+        fork's document from its parent. On the shared recurrence (`InContextMemory._recurrence`) that
+        is the recurrence's state through the forks' table (`dew.nn.linear.forked_scan`, as lightning's)
+        and the share of W_0 the parent's tokens kept, which no path carries over a fork yet; on the
+        general path each document's weights step from its own start, its chunks counted per document."""
+        return ("an in-context memory continues no fork's document from its parent: neither its recurrence's "
+                "state and W_0 share nor its general path's weights are carried over forks")
+
     def marks(self) -> tuple[str, ...]:
         """The residuals of every path the memory's configuration can take (`InContextMemory.residuals`):
         the kind cannot see the wrappers a model computes under, which decide whether a linear memory

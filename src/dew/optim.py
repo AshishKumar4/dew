@@ -1713,6 +1713,12 @@ OWN_RATES: dict[Callable[..., optax.GradientTransformation], float] = {gauss_new
 """An optimizer's own rate where it has one other than `DEFAULT_RATE`: Gauss-Newton's whole step."""
 
 
+def _claims(modules: Sequence[str], leaves: Sequence[str]) -> tuple[str, ...]:
+    """The patterns a fresh group claims `modules` (each module's parameters) and `leaves` (each by its own
+    path) by, in their order (`OptimConfig.with_fresh`)."""
+    return (*(f"{glob.escape(module)}/*" for module in modules), *map(glob.escape, leaves))
+
+
 @dataclasses.dataclass(frozen=True)
 class OptimConfig:
     """Holds the optimizer, learning-rate schedule and gradient clipping."""
@@ -1958,6 +1964,20 @@ class OptimConfig:
         at = next((index for index, group in enumerate(named) if "*" in group.patterns), len(named))
         return (*named[:at], fresh, *named[at:])
 
+    def claiming(self, modules: Sequence[str], leaves: Sequence[str] = ()) -> OptimConfig:
+        """This config as a run that draws `modules` and `leaves` fresh beside a loaded base trains in it
+        (`dew.objectives.Objective.fresh_trained`): its groups with the fresh group among them
+        (`fresh_groups`) claiming those parameters (`with_fresh`), or as it is where it draws none, a group
+        that claims them refused. The one place a run's groups take what it draws fresh, which a `Trainer`
+        given this config and a configured run's record (`dew.config.RunConfig.grouped`) both read; a
+        config that has taken them (a group leading with their patterns) is as it is."""
+        claims = _claims(modules, leaves)
+        if claims and any(not group.fresh and group.patterns[:len(claims)] == claims
+                          for group in self.param_groups):
+            return self
+        groups = self.fresh_groups() if claims else self.param_groups
+        return dataclasses.replace(self, param_groups=groups).with_fresh(modules, leaves)
+
     def with_fresh(self, modules: Sequence[str], leaves: Sequence[str] = ()) -> OptimConfig:
         """This config with each group that claims the fresh modules (`ParamGroup.fresh`) matching the
         parameters of `modules`, each a module's path under `params` as a parameter's name begins
@@ -1965,7 +1985,7 @@ class OptimConfig:
         drew fresh (`Pretrained.with_model`), ahead of its own patterns: the groups a run records and trains
         in, what it drew fresh beside a loaded base (`Objective.fresh_modules`). Refused where such a group
         then matches nothing, in a run that draws nothing fresh."""
-        claimed = (*(f"{glob.escape(module)}/*" for module in modules), *map(glob.escape, leaves))
+        claimed = _claims(modules, leaves)
         groups = []
         for group in self.param_groups:
             if group.fresh:

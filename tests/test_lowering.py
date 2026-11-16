@@ -1614,10 +1614,43 @@ def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails
         with report.launching(op, arguments, config):
             return KernelCall("mosaic_gpu", f"{type(op).__name__}", b"", "c", None, report.launch_digest())
 
+    # A Triton kernel states no launch of its call; its name carries the launch that traced it.
+    with report.launching(gemm, dense, tile):
+        named = report.launch_name("gmm_triton", report.launch_digest())
+    triton = KernelCall("triton", named, b"", "c", None)
     calls = ((call(gemm, dense, tile), 3.0), (call(attention, scores, tiles), 1.0),
-             (call(gemm, grouped, tile), 2.0), (KernelCall("triton", "plain", b"", "c", None), 1.0))
+             (call(gemm, grouped, tile), 2.0), (KernelCall("triton", "plain", b"", "c", None), 1.0),
+             (triton, 1.0))
     padded = {entry["name"]: entry["padded"] for entry in KernelReport((), calls).record()["launches"]}
-    assert padded == {"Gmm": None, "MosaicForward": 1 - 100 * 200 / (128 * 256), "plain": None}
+    assert padded == {"Gmm": None, "MosaicForward": 1 - 100 * 200 / (128 * 256), "plain": None,
+                      triton.name: 1 - 200 * 300 / (256 * 512)}
     dense_only = {entry["name"]: entry["padded"]
                   for entry in KernelReport((), calls[:2]).record()["launches"]}
     assert dense_only["Gmm"] == 1 - 200 * 300 / (256 * 512)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_program_begun_meshless_on_a_mesh_traces_on_that_mesh_alone():
+    """Within a shard_map's body over a two-device mesh's manual axis, a program begun under
+    `programs.meshless(mesh)` (certification's launch program on its device's one-device mesh, rows 6791,
+    6593) traces on `mesh` alone: its abstract mesh `mesh`'s, the body's axis unbound in it; begun under
+    `meshless()`, on no mesh."""
+    from jax.sharding import PartitionSpec
+
+    from dew.nn.programs import meshless
+
+    outer = Mesh(np.array(jax.devices()[:2]), ("data",))
+    inner = Mesh(np.array(jax.devices()[:1]), ("launch",))
+    seen = {}
+
+    def body(rows):
+        for name, given in (("on its mesh", inner), ("on none", None)):
+            with meshless(given):
+                seen[name] = jax.sharding.get_abstract_mesh()
+                with pytest.raises(NameError):
+                    jax.lax.axis_size("data")
+        return rows
+
+    jax.jit(jax.shard_map(body, mesh=outer, in_specs=PartitionSpec("data"),
+                          out_specs=PartitionSpec("data"))).trace(jnp.zeros(2))
+    assert seen["on its mesh"] == inner.abstract_mesh and seen["on none"].empty, seen

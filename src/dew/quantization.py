@@ -70,11 +70,12 @@ import numpy as np
 from flax import core, linen as nn
 from flax.core import meta
 from flax.traverse_util import flatten_dict, unflatten_dict
+from jax.custom_derivatives import SymbolicZero
 
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
 from dew.nn.dense import _contractions, _linear_site
-from dew.nn.derivatives import contracted, surrogate
+from dew.nn.derivatives import contracted, surrogate, with_tangents_formed
 from dew.nn.fake_quant import (
     E2M1_MAX,
     E4M3_MAX,
@@ -86,7 +87,13 @@ from dew.nn.fake_quant import (
 )
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import owned_program
-from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide, float32_einsum
+from dew.nn.precision import (
+    accumulated,
+    at_least_fp32,
+    correctly_rounded_divide,
+    float32_einsum,
+    twice_scaled,
+)
 from dew.nn.sharding import abstract
 
 if TYPE_CHECKING:
@@ -629,18 +636,7 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
     product = gemm.gemm(codes, rows, transpose_rhs=True, out_dtype=jnp.float32)
-    return _scaled(product, scales, row_scales.T)
-
-
-def _scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax.Array:
-    """`product` times two scales, each entry in the order whose intermediate is a normal float32: an
-    input's block scale near float32's largest (2**113 for inputs near 2**122) overflows the codes' product
-    the kernel's scale (2**-9) brings back in range, and one near the least normal underflows it the other
-    way (ledger 2715), so no one order holds both ends; the result overflows only where the product does."""
-    tiny = jnp.finfo(product.dtype).tiny
-    once = product * first
-    kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (product == 0))
-    return jnp.where(kept, once * second, product * second * first)
+    return twice_scaled(product, scales, row_scales.T)
 
 
 def _frozen_fp8_value(x: jax.Array, forward: jax.Array, forward_scale: jax.Array, dgrad: jax.Array,
@@ -1310,6 +1306,11 @@ def _grouped_convolution_gradient() -> type:
                 lhs.astype(dtype), rhs.astype(dtype), window_strides, padding, lhs_dilation, rhs_dilation,
                 dimension_numbers, feature_group_count, batch_group_count)
 
+        # The rule's dual (`with_tangents_formed`): the input's cotangent leaves only with the kernel's. An
+        # operand no derivative moves takes zeros past it.
+        tangents = with_tangents_formed(*tangents)
+        tangents = tuple(jnp.zeros_like(operand) if isinstance(tangent, SymbolicZero) else tangent
+                         for operand, tangent in zip(operands, tangents, strict=True))
         return jax.jvp(convolve, tuple(operands), tuple(tangents))[1], jax.jvp(quantize, tuple(primals),
                                                                               tuple(tangents))[1]
 
@@ -1317,7 +1318,7 @@ def _grouped_convolution_gradient() -> type:
     # whose value carries the quantized operands so the forward quantizes once (a static-scale
     # activation's running statistics update once a step).
     quantized_training = contracted("test_a_quantized_convolution_holds_every_order_it_takes")(
-        surrogate(_qt_forward, straight_through, nondiff_argnums=tuple(range(2, 11))))
+        surrogate(_qt_forward, straight_through, nondiff_argnums=tuple(range(2, 11)), symbolic_zeros=True))
 
     class GroupedConvolutionGradient(qwix.QtProvider):
         """Differentiates a quantized grouped convolution, which Qwix's

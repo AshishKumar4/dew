@@ -847,13 +847,13 @@ def _abstract_variables(recorded: _Recorded) -> Mapping[str, object]:
 
 
 def _traced(decoder: CausalTransformer) -> Mapping[str, object]:
-    """The variables `decoder` initializes, abstract (`jax.eval_shape`)."""
+    """The variables `decoder` initializes, abstract: its draw (`drawn.initialized`) traced alone
+    (`jax.eval_shape`)."""
     import jax
-    import jax.numpy as jnp
 
-    # A sequence longer than its prediction depths, which each read a token past the trunk's.
-    tokens = jnp.ones((1, decoder.num_nextn_predict_layers + 2), jnp.int32)
-    return jax.eval_shape(lambda: decoder.init(jax.random.key(0), tokens))
+    from dew.interop.drawn import initialized
+
+    return jax.eval_shape(functools.partial(initialized, decoder), jax.random.key(0))
 
 __all__ = [
     "CROSSING_UNWRITTEN",

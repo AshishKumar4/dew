@@ -317,20 +317,42 @@ def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
     assert not isinstance(refused.value, verify.ProbeUnavailable)
 
 
+def test_a_bidirectional_encoder_offered_as_a_causal_lm_is_refused_by_its_programs_walk(tmp_path):
+    """A BERT encoder saved as a causal LM (`BertLMHeadModel`, `is_decoder` False: each position attends to
+    every other, later ones among them) is refused by `Pretrained.load` before its weights are read, its
+    forward's program reading later positions (`sequence_causality.causality`, tier 3's one judge of
+    causality); its decoder twin, the same model but for the direction its attention reads, loads."""
+    import transformers
+
+    from dew.interop import Pretrained, torchax_fallback, verify
+
+    for decoder in (False, True):
+        transformers.BertLMHeadModel(tiny_config("bert", is_decoder=decoder)).save_pretrained(
+            tmp_path / str(decoder))
+    with pytest.raises(ValueError) as refused:
+        Pretrained.load(tmp_path / "False", dtype="float32")
+    # Refused by its admission, not for a probe that could not run.
+    assert not isinstance(refused.value, verify.ProbeUnavailable)
+    with pytest.warns(torchax_fallback.TransformersTierWarning):
+        Pretrained.load(tmp_path / "True", dtype="float32")
+
+
 def test_tier_three_runs_dews_attention_where_every_layer_asks_the_interface_for_it():
     """Tier 3 observes, on the probe's model, whether every decoder layer asks transformers' attention
     interface for its attention with a mask Dew's visibility reproduces: StableLM's do, though its
     class declares no attention backend, and run on Dew's (a StableLM norming each head's queries and keys
     by a layer norm of its own, which tier 2 does not assemble); GPT-NeoX Japanese's compute their own,
-    and keep it, saying why."""
+    and keep it, saying why and what its causality rests on."""
     from dew.interop.routes import source_route
 
     stablelm = source_route(tiny_config("stablelm", qk_layernorm=True).to_dict()).admitted
     assert stablelm.attends and not stablelm.why
-    # GPT-NeoX Japanese adds the mask it is given to its scores in its own code: the probe's mask is
-    # transformers' eager one, so its attention stays causal and the type is admitted on its own.
+    # GPT-NeoX Japanese adds the mask it is given to its scores in its own code: transformers' eager one,
+    # at float32's lowest, which keeps its attention causal where its scores stay below half an ulp of
+    # float32's largest (`sequence_causality.Pair`), the admission saying so; StableLM's rests on nothing.
     japanese = source_route(tiny_config("gpt_neox_japanese").to_dict()).admitted
     assert not japanese.attends and japanese.why
+    assert "float32" in japanese.assumes and not stablelm.assumes
 
 
 @pytest.mark.parametrize("spelled", ["its own names", "the standard names"])
@@ -448,7 +470,9 @@ def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
     config is tier 1; a type a registered convention computes, verified, is tier 2; an unregistered
     causal LM none computes is tier 3; and each configuration of a type is its own verdict, in either
     order (BERT as a decoder is tier 3, as an encoder refused; Cohere asking for an attention backend
-    transformers has none of is refused), every route counted in the summary."""
+    transformers has none of is refused), every route counted in the summary. One census holds every
+    config in each order, so a verdict a configuration of a type left behind would reach the other's
+    later row in one order or the other."""
     from tool_support import load
 
     census = load("hf_coverage")
@@ -468,16 +492,17 @@ def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
     expected = {"storage": "refused", "gptq": "refused", "custom": "remote code", "llama": "tier 1",
                 "cwm": "tier 2", "cohere": "tier 3", "bert decoder": "tier 3", "bert encoder": "refused",
                 "cohere, no backend": "refused"}
-    for ordered in (list(configs), list(reversed(configs))):
-        rows = [{"id": name, "model_type": configs[name]["model_type"], "downloads": len(configs) - index,
-                 "config": configs[name]} for index, name in enumerate(ordered)]
-        (tmp_path / "census.json").write_text(json.dumps(rows))
-        census.classify(tmp_path)
-        coverage = json.loads((tmp_path / "coverage.json").read_text())
-        assert {model["id"]: model["route"] for model in coverage["models"]} == expected
-        shares = coverage["summary"]["all types"]
-        assert sum(entry["models"] for entry in shares.values()) == len(configs)
-        assert shares["tier 3"]["models"] == 2
+    ordered = [*((name, "") for name in configs), *((name, " reversed") for name in reversed(configs))]
+    rows = [{"id": name + order, "model_type": configs[name]["model_type"], "downloads": len(ordered) - index,
+             "config": configs[name]} for index, (name, order) in enumerate(ordered)]
+    (tmp_path / "census.json").write_text(json.dumps(rows))
+    census.classify(tmp_path)
+    coverage = json.loads((tmp_path / "coverage.json").read_text())
+    assert {model["id"]: model["route"] for model in coverage["models"]} == {
+        name + order: expected[name] for name, order in ordered}
+    shares = coverage["summary"]["all types"]
+    assert sum(entry["models"] for entry in shares.values()) == len(ordered)
+    assert shares["tier 3"]["models"] == 4
 
 
 

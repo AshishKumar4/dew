@@ -45,20 +45,24 @@ identity (`dew.training.identity`)."""
 
 _RECORDINGS: contextvars.ContextVar[tuple[dict[Hashable, tuple[Callable[[], Hashable], Hashable]], ...]] = (
     contextvars.ContextVar("fact_recordings", default=()))
-"""The facts read within each open `recording`, innermost last: what a trace records into, no trace reads, so
-a trace held by its state (`dew._cache.traced_state`) is held in any recording's scope (`recording` registers
-it `dew._cache.untraced` as it first sets it; generation imports no JAX as it loads)."""
+"""The facts read within each open `recording`, innermost last: what a trace records into, no trace reads,
+so a trace held by its state (`dew.nn.kernels.options.trace_context`) is held in any recording's scope
+(`recording` registers it `dew._cache.untraced` as it first sets it; generation imports no JAX as it
+loads)."""
 
 
 def stated(value) -> Hashable:
     """`value` as a fact's answer or question is held and compared: by its contents, equal wherever they
     are however often its holder is built anew (a reader returning a fresh mapping): a hashable value by
     itself, a mapping, sequence or set by its members, a dataclass by its type and fields; an array, which a
-    program reading it closes over, by itself (`_Same`), as an object that states none of these is."""
+    program reading it closes over, by itself (`dew._cache.Same`), as an object that states none of these
+    is."""
     import jax
 
+    from dew import _cache
+
     if isinstance(value, jax.Array):
-        return _Same(value)
+        return _cache.Same(value)
     if isinstance(value, Mapping):
         return tuple(sorted(((key, stated(answer)) for key, answer in value.items()), key=repr))
     if isinstance(value, list | tuple):
@@ -67,23 +71,7 @@ def stated(value) -> Hashable:
         return frozenset(stated(member) for member in value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return type(value), tuple(stated(getattr(value, field.name)) for field in dataclasses.fields(value))
-    return value if isinstance(value, Hashable) else _Same(value)
-
-
-class _Same:
-    """A value held by itself (`stated`): equal to its own holder alone, and kept alive while a key holds
-    it, so no other value takes its identity."""
-
-    __slots__ = ("value",)
-
-    def __init__(self, value) -> None:
-        self.value = value
-
-    def __hash__(self) -> int:
-        return id(self.value)
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, _Same) and other.value is self.value
+    return value if isinstance(value, Hashable) else _cache.Same(value)
 
 
 @contextlib.contextmanager
@@ -283,10 +271,15 @@ def run_precision(policy: Numerics) -> Iterator[None]:
     as it stands), and each op's accurate form where its forms are "accurate", the attention template's
     among them, which reads them here (`numerics`, the one seam of a run's forms). The dtypes are the
     model's and the optimizer's own fields, which the run sets from the numerics: a bf16 operand has
-    lost its bits before any product reads it, whatever its precision."""
+    lost its bits before any product reads it, whatever its precision. A low-precision recipe the projections
+    declare none of (`projections.RECIPES`) is refused here, where a run's numerics take effect."""
     from dew import _cache
+    from dew.nn.kernels.projections import RECIPES
     from dew.nn.precision import configured_precision
 
+    if policy.low_precision is not None and policy.low_precision.recipe not in RECIPES:
+        raise ValueError(f"a low-precision recipe is one of {tuple(RECIPES)}, not "
+                         f"{policy.low_precision.recipe!r}")
     with configured_precision(policy.matmul), _cache.NUMERICS(policy):
         yield
 
@@ -444,14 +437,17 @@ _BLACKWELL = Architecture(('tcgen05', 'mma.sync'), {'16bit': 8192, 'tf32': 4096,
 _BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
                                    Multiprocessor(resident_blocks=24), tma=True, dependent_launch=True)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072) and the scoped VMEM limit at XLA's
-# default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's).
+# default, read from a Mosaic kernel's refusal of a scratch it uses whole (a flag such as
+# --xla_tpu_scoped_vmem_limit_kib moves it): v5e 16 MiB ("limit 16.00M"); v6e 32 MiB ("Scoped allocation with
+# size 32.01M and limit 32.00M", M-EM-37: TPU v6 lite, jax 0.11.2, libtpu 0.0.50, XLA's default flags).
 # v6e: two 256x256 MXUs, 918 TF over its clock -> 524288. T4: 65 TF fp16 summed in fp32 and 8.1 TF fp32
 # over 40 SMs at 1590 MHz -> 1024 and 128.
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
 _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20),
-         'v6e': Architecture(('tpu',), {'16bit': 524288}, None, vmem_bytes=128 * 2 ** 20)}
+         'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
+                             vmem_bytes=128 * 2 ** 20)}
 
 
 def architecture(generation: str) -> Architecture | None:
@@ -862,7 +858,10 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, multiprocessors=1,
               clock_hz=197e12 / 131072, memory_bandwidth=819e9),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
-    GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
+    # One TensorCore a chip, of two 256 x 256 MXUs, 918 TF of bf16 and 1638 GB/s of HBM
+    # (cloud.google.com/tpu/docs/v6e); the clock is 918e12 / 524288, derived from the peak as v5e's.
+    GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}, multiprocessors=1,
+              clock_hz=918e12 / 524288, memory_bandwidth=1638e9),
 )}
 
 

@@ -133,3 +133,58 @@ def test_association_keeps_finite_carried_contraction_products(compiled, overflo
         np.testing.assert_array_equal(expected, jnp.zeros_like(expected))
         actual, = rewritten(h)
         np.testing.assert_array_equal(actual, expected)
+
+
+def state_summed(h, x):
+    """A product with a reduction of the state: its column sums, one row, against an operand."""
+    return (jnp.sum(h, axis=0)[None, :] @ x,)
+
+
+def test_a_product_of_a_reduction_of_the_state_computes_through_the_split():
+    """`sum(h, 0) @ x`: the reduction reads the state as every term of the language over it does
+    (`carry._carrying`, from `terms.LANGUAGE`), and the split computes the function."""
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.standard_normal((3, 4)), jnp.float32),
+                jnp.asarray(rng.standard_normal((4, 2)), jnp.float32))
+
+    assert_as_exact(jax.jit(split_run(state_summed, (0,))), jax.jit(state_summed), draw,
+                    "a reduction of the state's product", seeds=8)
+
+
+def test_a_reduction_of_the_state_reads_it():
+    """A reduction of the state (`sum(h, 0)`) reads it, as every term of the language over it does
+    (`carry.CARRYING`, from `terms.LANGUAGE`), so its product with an operand is priced as carried work,
+    never as a product the split runs in parallel (row 6674)."""
+    from egglog import EGraph, Vec, eq, i64, set_
+
+    from dew.algebra import terms
+
+    state = terms.Term.leaf(i64(0))
+    summed = state.reduce("sum", Vec[i64](i64(0)), i64(0))
+    graph = EGraph()
+    graph.register(summed, set_(carry.reads(state)).to(i64(1)))
+    graph.run(carry.CARRYING.saturate())
+    assert graph.check_bool(eq(carry.reads(summed)).to(i64(1)))
+
+
+def scaled(h, a):
+    """A carry whose state one entrywise product reads: `h * a`."""
+    return (h * a,)
+
+
+def test_a_carrys_state_read_is_priced_a_loop_iteration_at_least():
+    """A carry whose state one entrywise product of four values reads (`scaled`), split on an assumed H100:
+    its report prices its carry (`report.rewrites`' `after`) at no less than the H100's measured loop
+    iteration (`GpuTarget.step_seconds`), whatever little the product computes: a carry is a loop XLA lowers,
+    its state's work a step of it (algebra.md §1.6; the floor of `carry._carry_priced`, train 836's F8),
+    where the product's own work prices a small fraction of it."""
+    from dew.algebra import cost
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import report
+
+    shapes = [jax.ShapeDtypeStruct((2, 2), jnp.float32)] * 2
+    with generation.assumed("sm90"), report.refusals():
+        carry.split(scaled, shapes[0], shapes[1:], (0,), saturation=SATURATION)
+        [made] = report.rewrites()
+        assert made.after >= cost.target().step_seconds

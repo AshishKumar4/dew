@@ -271,6 +271,50 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
     return jnp.moveaxis(out, 0, 1), state
 
 
+def release(hooks: recurrence.Hooks) -> str | None:
+    """The upstream library a form's family has a release of, whose own code is its oracle (testing.md): fla's
+    for the delta rule, mamba_ssm's for the rated scan; None for a write gate without the delta rule, whose
+    oracle is the recurrence a token at a time (`token_by_token`)."""
+    return "fla" if hooks.delta else "mamba_ssm" if hooks.rated else None
+
+
+def oracle(hooks: recurrence.Hooks, dtype) -> str | None:
+    """A cell's independent oracle at `dtype` (testing.md): its form's release (`release`) where the run's
+    declaration admits that release's products for the dtype (`recurrence_chunk.upstream_precision`: fp32's
+    TF32 at no more than the default), else None, the recurrence a token at a time: no run of the release
+    computes the call's numbers there."""
+    found = release(hooks)
+    return found if found is not None and recurrence_chunk.upstream_precision(dtype) else None
+
+
+def against_the_portable_math(label: str, dew_fn, portable_fn, draw, truth_fn, seeds: int) -> str | None:
+    """`dew_fn`'s distance from float64 against Dew's own chunk math's (`portable_fn`, the portable math),
+    each leaf's pooled RMS ratio over the first `seeds` draws (`draw(seed)`, `truth_fn` the float64 truth on
+    them): reported beside a cell's verdict, never judged (testing.md: Dew's own chunk math is no cell's
+    reference). Computed once a site (`map_judge.sharded`'s one unit): by the map task that holds it, the
+    judge reading it back, which draws nothing; None in every other map task."""
+    from map_judge import sharded
+
+    def distance(start: int, stop: int) -> str:
+        del start, stop
+        arms = {"dew": jax.jit(dew_fn), "portable": jax.jit(portable_fn)}
+        errors: dict[str, dict[str, list[float]]] = {}
+        for seed in range(seeds):
+            drawn = draw(seed)
+            with jax.enable_x64(new_val=True):
+                exact = truth_fn(*widened(drawn))
+            for arm, fn in arms.items():
+                for (path, leaf), true in zip(jax.tree_util.tree_flatten_with_path(fn(*drawn))[0],
+                                             jax.tree.leaves(exact), strict=True):
+                    errors.setdefault(jax.tree_util.keystr(path), {}).setdefault(arm, []).append(
+                        float(np.mean((np.asarray(leaf, np.float64) - np.asarray(true, np.float64)) ** 2)))
+        return ", ".join(f"{name} {np.sqrt(sum(arms['dew']) / max(sum(arms['portable']), 1e-300)):.3g}"
+                         for name, arms in errors.items())
+
+    found = sharded(f"{label}, against the portable math", distance, 1, upto=1)
+    return None if found is None else found[0]
+
+
 @pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
 @pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
 def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, packed):
@@ -1060,3 +1104,25 @@ def test_the_derived_rule_runs_in_a_shard_map_that_checks_varying_axes(entering,
         got = jax.jit(jax.value_and_grad(lambda *given: jnp.sum(mapped(*given) * do),
                                          argnums=range(len(operands))))(*operands)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(got))
+
+
+def test_a_call_inside_a_map_holding_an_axis_manual_selects_its_kernel():
+    """The chunked op traced inside a map that holds one mesh axis manual and leaves another automatic (a
+    DiLoCo replica's step, `dew.training.diloco`): its selectors bind the template's call on each shard of the
+    axes its own map holds (`sharding.shard_shapes`), and the trace completes. A sharding over the whole mesh
+    there named the manual axis, a manual subgroup JAX refuses, and the selection raised before any kernel ran
+    (train 942's review of the shared bind)."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    mesh = AbstractMesh((2, 2), ("outer", "data"), axis_types=(AxisType.Auto, AxisType.Auto))
+    hooks = recurrence.Hooks(decay="scalar", delta=True)
+    given = jax.ShapeDtypeStruct((4, 128, 2, 64), jnp.float32)
+    heads = jax.ShapeDtypeStruct((4, 128, 2), jnp.float32)
+
+    def inner(query, key, value, g, beta):
+        return chunk(hooks, Chunk(query, key, value, log_decay=g, beta=beta))[0]
+
+    mapped = jax.shard_map(inner, mesh=mesh, in_specs=P("outer"), out_specs=P("outer"), axis_names={"outer"})
+    with jax.sharding.use_abstract_mesh(mesh):
+        out = jax.eval_shape(mapped, given, given, given, heads, heads)
+    assert out.shape == given.shape

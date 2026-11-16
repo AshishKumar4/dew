@@ -45,7 +45,7 @@ from dew.nn.inspection import (
     probes_of,
     unscaled,
 )
-from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.options import owned_program, program
 from dew.nn.moe import fixed_routers
 from dew.nn.precision import at_least_fp32
 from dew.nn.programs import called, computed
@@ -63,7 +63,8 @@ from dew.objectives.base import (
 )
 from dew.objectives.routing import refuse_fixed_routers
 from dew.optim import clips_qk, post_step_order, stepped
-from dew.state import Accumulation, TokenCount, TrainState, apart, occupancy, together
+from dew.optim_schedules import injected_edited
+from dew.state import Accumulation, ReplicaState, TokenCount, TrainState, apart, occupancy, together
 from dew.training.distributed import microbatch
 from dew.training.inspection import Inspection, Summaries, stacked, summaries
 from dew.training.model_flops import step_counts
@@ -511,11 +512,60 @@ def _descending(gradient: jax.Array, parameter: jax.Array) -> jax.Array:
     return (jnp.conj(gradient) if jnp.iscomplexobj(gradient) else gradient).astype(parameter.dtype)
 
 
+def checked(state: TrainState | ReplicaState) -> dict[str, Variables | optax.OptState | None]:
+    """The trees of `state` (a run's, or DiLoCo's replicas' inner copies) a finite step keeps finite and a
+    save refuses non-finite: the parameters, the optimizer state and the averages. The one statement of
+    them, which the step's acceptance (`finish_attempt`) and a save's refusal
+    (`dew.training.trainer.refuse_non_finite`) read. The optimizer state is read without the
+    hyperparameters injected beside it at any depth (`_numerical`): control values a schedule or the user
+    sets, not written by a step's gradient, and legally infinite (a clip's bound of `math.inf`)."""
+    return {"variables": state.variables, "opt_state": _numerical(state.opt_state), "ema": state.ema}
+
+
+def _numerical(opt_state: optax.OptState) -> optax.OptState:
+    """`opt_state` without the hyperparameters injected beside it at any depth (`injected_edited`): the
+    state a step's gradients write."""
+    return injected_edited(opt_state, lambda _, node: node._replace(hyperparams={}))
+
+
+def _finite(leaf: jax.Array) -> jax.Array:
+    """Whether `leaf` is finite throughout."""
+    return jnp.isfinite(leaf).all()
+
+
 def _all_finite(tree) -> jax.Array:
+    """Whether every leaf of `tree` is finite (`_finite`), within a traced program."""
     finite = jnp.asarray(a=True)
     for leaf in jax.tree.leaves(tree):
-        finite = finite & jnp.all(jnp.isfinite(leaf))
+        finite = finite & _finite(leaf)
     return finite
+
+
+def _finite_each(leaves: list[jax.Array]) -> list[jax.Array]:
+    """Whether each of `leaves` is finite throughout, one program over them."""
+    return [_finite(leaf) for leaf in leaves]
+
+
+def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
+    """Whether each of `leaves`, arrays placed anywhere, is finite throughout (`_finite`), read outside a
+    step: one program for each placement the leaves share (their devices and memory kind), as no one
+    program spans two meshes (a CPU-owned run's host companion and its accelerator); a leaf in host memory
+    (a layout's pinned-host field) brought to its devices' memory one leaf at a time (`fetched`)."""
+    groups: dict[tuple, list[int]] = {}
+    for index, leaf in enumerate(leaves):
+        sharding = leaf.sharding
+        groups.setdefault((frozenset(sharding.device_set), sharding.memory_kind), []).append(index)
+    flags: list[bool] = [True] * len(leaves)
+    for (_, memory), members in groups.items():
+        if memory not in (None, "device"):
+            for index in members:
+                leaf = leaves[index]
+                flags[index] = bool(program(_finite)(fetched(leaf, leaf.sharding)))
+            continue
+        read = jax.device_get(program(_finite_each)([leaves[index] for index in members]))
+        for index, finite in zip(members, read, strict=True):
+            flags[index] = bool(finite)
+    return flags
 
 
 def compact_qk(tree):
@@ -1174,7 +1224,7 @@ class Transaction:
         inspected = {**inspected, **self.watched_summaries(aux, probed)}
         finite = finite & native_finite
         if scale is not None:
-            accepted = finite & _all_finite((numerical.variables, numerical.opt_state, numerical.ema))
+            accepted = finite & _all_finite(checked(numerical))
         if previous is not None:
             numerical = dataclasses.replace(
                 numerical, accumulation=self._retained_window(state, batch, pending, attempt, read))
@@ -1199,6 +1249,13 @@ class Transaction:
             held = TokenCount.add(state.deferred, jnp.where(taken, held, 0).astype(jnp.uint32))
             waiting = jnp.where(due & accepted & ~done, held, jnp.where(counted, 0, state.deferred))
             advanced = dataclasses.replace(advanced, deferred=waiting.astype(jnp.uint32))
+        if self.split == 1:
+            # A step that commits no update, a window still filling or one its optimizer holds back
+            # (`update_applied`), logs its own batch's loss, its window's pooled at one that commits
+            # (training.md, the logged loss); a step read in several parts pools its parts' own
+            # (`whole_step`).
+            own = self.objective.reduce_loss(pending.own)[0].astype(loss.dtype)
+            loss = jnp.where(counted, loss, own)
         return advanced, loss, aux, Committed(
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
             jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted),

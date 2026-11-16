@@ -80,6 +80,7 @@ from ..gemma3n import AltUp, clamped_predictions, rescale_to
 from ..host_memory import on_host
 from ..hyper_connections import Carried, HyperConnections, enter_streams, leave_streams, stream_head
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of
+from ..kernels import projections
 from ..kv_cache import CacheSpec, DecodeCursor, KVCache, put_opened
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
@@ -124,6 +125,7 @@ from .decoder_block import (
     RematPolicy,
     decoder_norm,
     feedforward_factories,
+    recomputed_inside,
     remat_record,
     residual_normed,
 )
@@ -489,7 +491,8 @@ class CausalTransformer(LinearProducts):
                            residual_norms=self.post_residual_norms,
                            layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
                            shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt,
-                           normed_residual=self.normed_residual, stream_multiplier=self.stream_multiplier)
+                           normed_residual=self.normed_residual, stream_multiplier=self.stream_multiplier,
+                           residual_in_fp32=self.residual_in_fp32)
 
     @property
     def init_stds(self) -> tuple[float | None, float | None]:
@@ -2088,7 +2091,8 @@ class CausalTransformer(LinearProducts):
         matrix = self.embed_tokens.embedding if self.tie_embeddings else self.applied_kernel("lm_head")
         projection = None if self.embedding_features is None else Projection(
             self.applied_kernel("project_out"), self.precision, compute=self.dtype,
-            input_quantizer=self._quantizer(self.project_out))
+            input_quantizer=self._quantizer(self.project_out),
+            path=projections.kernel_path(self.project_out))
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
                            self.final_logit_softcap, self.precision, compute=self.dtype,
                            input_quantizer=None if self.tie_embeddings else self._quantizer(self.lm_head),
@@ -2282,11 +2286,13 @@ class CausalTransformer(LinearProducts):
 
         def kept(policy: RematPolicy | None) -> tuple[frozenset[str], ...] | None:
             """What `policy` does with the names these layers mark: None where it recomputes none of
-            them and keeps the rest, as no remat does."""
-            if policy is None or (policy.recompute and not frozenset(policy.recompute) & marked):
+            them and keeps the rest, as no remat does; else what it saves, offloads, and has the layers
+            recompute in their own backwards (`recomputed_inside`, the block's own statement of it: a
+            recompute rung's names, `full`'s in-context memory chunks; train 933 F2, 936 F3)."""
+            inside = frozenset(recomputed_inside(policy)) & marked
+            if policy is None or (policy.recompute and not inside):
                 return None
-            return (frozenset(policy.save) & marked, frozenset(policy.offload) & marked,
-                    frozenset(policy.recompute) & marked)
+            return frozenset(policy.save) & marked, frozenset(policy.offload) & marked, inside
 
         index = DECODER_REMAT.index(self.remat) + 1
         while (index < len(DECODER_REMAT) - 1

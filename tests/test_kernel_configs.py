@@ -336,6 +336,43 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_until_one_fi
 
 
 
+class OnlyItsWidest(Uncounted):
+    """The grouped forward offered its widest paired tile alone (128 x 256, two accumulators of 128
+    registers a thread), which spills in every compile: a launch certification refuses every config of."""
+
+    def candidate(self, ba, config, target):
+        return super().candidate(ba, config, target) and config.block_n == 256
+
+
+@lowers("sm90")
+def test_a_launch_certification_refuses_every_config_of_holds_no_call_and_its_route_moves_on():
+    """A launch whose every offered config spills as a compile-only H100 assembles it, certified there
+    (`report.certifying`): its call's taking finds none (`tuning.KernelOp.taken` None), so its eligibility
+    reads that it holds no call (`Template.holds`) and its route takes another implementation before the
+    call, where the call raised mid-trace (an A100's gated delta net flow, its scores backward
+    spilling 8 bytes at every config). Asked again, as the call asks after its route, it compiles nothing and
+    records each miss once; a call made anyway refuses with `report.Exhausted`."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    forward, shapes = _spilling_forward(OnlyItsWidest(), 4096, devices)
+    x, gate, up, sizes = shapes
+    op = OnlyItsWidest()
+    with (report.refusals(), generation.assumed("sm90"), report.certifying(devices.devices.flat[0]),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        ba = op.bind(x, gate, sizes, paired=up, hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u),
+                     out_dtype="bfloat16", trans_rhs=False, interpret=False)
+        assert op.taken(ba) is None
+        assert not op.holds(ba)
+        misses = report.misses()
+        assert misses and all(not miss.stepped for miss in misses[-1:]), misses
+        certified = len(report.certifications())
+        assert op.taken(ba) is None
+        assert report.misses() == misses and len(report.certifications()) == certified
+        with pytest.raises(report.Exhausted):
+            jax.jit(forward).trace(*shapes)
+
+
 @lowers("sm90")
 def test_programs_compiled_at_once_sharing_a_spilling_launch_keep_what_compiles_in_turn_keep():
     """Two programs sharing a template launch whose first config spills, compiled at once
@@ -732,30 +769,90 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
                for record in found)
 
 
-def test_a_b200s_gathered_input_gradient_fits_its_derived_resources():
-    """The expert down projection's input gradient from the hybrid compile-ahead step (row 5358), its
-    rows gathered by the load warp's TMA gathers, compiles at its derived tile without spilling and in the
-    shared memory its plan sized: its producer lowered to the registers its gathers hold
-    (`Transport.gathering_producer`, tcgen05's 40; at the floor's 24 it spilled 56 bytes), its gathered
-    stream's barriers as its family allocates them (`Allocations.gathered`; planned as plain ones, 976 bytes
-    short)."""
+GATHERED_ON_A_B200 = {
+    "input gradient, its rows gathered": ("gmm", (4096, 1024), (4, 8192, 1024), (4096,)),
+    "kernel gradient, its tokens gathered": ("tgmm", (2048, 1024), (4096, 8192), "tokens"),
+    "kernel gradient, its cotangent gathered": ("tgmm", (4096, 8192), (4096, 1024), "cotangent"),
+}
+"""The expert down projection's gathered launches of a mixture of experts' step on a B200 (tests/test_compile_
+ahead's every-template cell, the hybrid compile-ahead step's: 4 experts of 8192 by 1024), each its operands'
+shapes and what its table gathers."""
+
+
+def _gathered_on_a_b200(name: str):
+    """The launch of `GATHERED_ON_A_B200`'s case `name` and its bound call."""
+    kind, rows, matrix, gathered = GATHERED_ON_A_B200[name]
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    indices = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.int32)
+    if kind == "gmm":
+        launch = grouped_matmul.MosaicGmm()
+        return launch, launch.bind(shaped(rows), shaped(matrix), indices((4,)), gather=indices(gathered),
+                                   out_dtype="bfloat16", trans_rhs=True, interpret=False)
+    launch = grouped_matmul.MosaicTgmm()
+    tables = (indices((4096,)), None) if gathered == "tokens" else (None, indices((4096,)))
+    return launch, launch.bind(shaped(rows), shaped(matrix), indices((4,)), gather=tables,
+                               out_dtype="float32", interpret=False)
+
+
+@lowers("sm100")
+@pytest.mark.parametrize("name", GATHERED_ON_A_B200)
+def test_a_b200s_gathered_launch_certifies_its_tcgen05_tile_at_its_first_compile(name):
+    """Each of the B200's gathered launches, certified on a compile-only B200 as a run takes it
+    (`tuning.KernelOp.taken`), takes its derived tcgen05 128 x 128 tile at one certification, nothing
+    spilling: its producer, which gathers a step's rows, starts at its ladder's top (`producers.started`, the
+    program's entry share). At setmaxnreg's least each spilled its load warp's gathers (row 6783): the
+    kernel gradients stepped to 128 x 64 and then to mma.sync, three certifications each; from the least
+    up the ladder, two each, the input gradient two where a constant 40 had held it at one."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    launch, arguments = _gathered_on_a_b200(name)
+    [device] = compile_only_gpus("sm100", 1)
+    with report.refusals(), generation.assumed("sm100"), report.certifying(device):
+        before = len(report.certifications())
+        tile = launch.taken(arguments)
+        certified = report.certifications()[before:]
+    assert (tile.family.startswith("tcgen05"), tile.block_m, tile.block_n) == (True, 128, 128), tile
+    assert tile.producers.of(launch.KERNEL) is not None, tile
+    assert len(certified) == 1, [(each.config, [b.frame for b in each.refused]) for each in certified]
+    assert not certified[-1].refused
+
+
+@lowers("sm100")
+@pytest.mark.parametrize("name", GATHERED_ON_A_B200)
+def test_a_b200s_gathered_launch_fits_its_derived_resources(name):
+    """Each of the B200's gathered launches compiles at its derived tile as its model plans it
+    (`mosaic_failures`): the shared memory the planner sized, its gathered stream's barriers among it (row
+    5358: planned as plain ones, 976 bytes short), and the producer registers its schedule lowers to."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    launch = grouped_matmul.MosaicGmm()
-    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    arguments = launch.bind(
-        shaped((4096, 1024)), shaped((4, 8192, 1024)), jax.ShapeDtypeStruct((4,), jnp.int32),
-        gather=jax.ShapeDtypeStruct((4096,), jnp.int32),
-        out_dtype="bfloat16", trans_rhs=True, interpret=False)
+    launch, arguments = _gathered_on_a_b200(name)
     with report.refusals(), generation.assumed("sm100"):
         tile = launch.derived(arguments, generation.gpu_target())
         assert tile is not None
-        cases = [support.KernelCase("gathered input gradient",
-                                    lambda: launch.lowering(arguments, tile),
-                                    {"dew_gmm": _model(launch, arguments, tile)})]
-        found = compile_mosaic_kernels(cases, "sm100")
-    failed = failures(found) + mosaic_failures(found)
+        found = compile_mosaic_kernels([support.KernelCase(name, lambda: launch.lowering(arguments, tile),
+                                                           {launch.KERNEL: _model(launch, arguments, tile)})],
+                                       "sm100")
+    failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
+
+
+def test_a_refused_gathering_producer_offers_its_whole_ladder_and_its_refused_tile_is_no_pick():
+    """The B200's gathered input gradient's derived tile, its producer at its ladder's top
+    (`producers.started`), refused as a compile finding its kernel spilling refuses it
+    (`report.refuse_launch`): its rungs (`_Mosaic.rungs`) are its producer's whole ladder below it, a
+    setmaxnreg step lower each down to a step above the least, none waiting on a rung's own refusal, so
+    certification asks them a round at a time (`tuning.KernelOp._climbed`); the refused tile is no pin or
+    stored pick (`pinnable`)."""
+    launch, arguments = _gathered_on_a_b200("input gradient, its rows gathered")
+    with report.refusals(), generation.assumed("sm100"):
+        tile = launch.derived(arguments, generation.gpu_target())
+        steps = resources.facts().raises()
+        report.refuse_launch(launch, arguments, tile, {launch.KERNEL})
+        ladder = [rung.producers.of(launch.KERNEL) for rung in launch.rungs(arguments, tile)]
+        pinnable = launch.pinnable(arguments, tile)
+    top = tile.producers.of(launch.KERNEL)
+    assert ladder == list(range(top - steps.step, steps.lowest, -steps.step)), ladder
+    assert not pinnable
 
 
 def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():
@@ -857,9 +954,8 @@ def libtpu_shared(monkeypatch):
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
 def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
     """The GEMM template's launches on a TPU core (the MXU's bundle: `MosaicGmm` forward and input gradient,
-    `MosaicTgmm`), at the tile each derives from the TPU's facts, compiled by libtpu for a compile-only TPU
-    of the generation on this CPU; a generation whose scoped VMEM no measurement states takes none of them
-    (`MosaicGmm.eligible`)."""
+    `MosaicTgmm`), at the tile each derives from the TPU's facts (its scoped VMEM a measurement's: v5e 16 MiB,
+    v6e 32 MiB, M-EM-37), compiled by libtpu for a compile-only TPU of the generation on this CPU."""
     from kernel_compile import compile_tpu_kernels
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -886,9 +982,6 @@ def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
             taken.add(name)
             cases.append(support.KernelCase(f"{name} {config}",
                                             lambda configured=configured, args=args: (configured, args)))
-    if not cases:
-        assert generation.gpu_target(tpu).scoped_vmem is None
-        pytest.skip(f"no measurement states {tpu}'s scoped VMEM, which the TPU launches fit their blocks to")
     forms = {"forward", "input gradient", "kernel gradient"}
     assert taken == forms
     found = compile_tpu_kernels(cases, tpu)
@@ -1486,15 +1579,15 @@ def test_a_refusal_applies_only_to_the_target_capacities_that_generated_its_kern
 
 
 def test_a_trace_held_by_its_state_is_held_in_any_recordings_scope():
-    """The state a held trace is keyed by (`dew._cache.traced_state`, the algebra's written regions') is the
+    """The state a held trace is keyed by (`options.trace_context`, the algebra's written regions') is the
     same in two fresh recordings (`generation.recording`): a recording is what a trace records into, no
     trace reads it, so identical regions traced in two of them share one trace (row 6668)."""
-    from dew import _cache
+    from dew.nn.kernels import options
 
     with generation.recording():
-        first = _cache.traced_state()
+        first = options.trace_context()
     with generation.recording():
-        second = _cache.traced_state()
+        second = options.trace_context()
     assert first == second
 
 

@@ -11,14 +11,28 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.experimental.xla_metadata import set_xla_metadata
 
+from dew.nn.kernels.templates import outputs
 from dew.nn.sharding import per_shard
 
 
 def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:
     """`jax.experimental.pallas.pallas_call(kernel, name=name, **params)` held per shard (`_held`), named by
-    its `name`, which its profile names it by, its body traced as a launch's (`_traced`)."""
-    return _held(pl.pallas_call(_traced(kernel, params.get("interpret")), name=name, **params), name)
+    its `name`, which its profile names it by, its body traced as a launch's (`_traced`); an `out_shape`
+    stating its outputs as its operands' axes (`outputs.Output`) its shapes, its call declaring their
+    dimensions (`outputs.declared`)."""
+    out_shape = params.get("out_shape")
+    held = _held(pl.pallas_call(_traced(kernel, params.get("interpret")), name=name,
+                                **{**params, "out_shape": outputs.structs(out_shape)}), name)
+    if not outputs.dimensioned(out_shape):
+        return held
+
+    def declaring(*operands):
+        with set_xla_metadata(**outputs.declared(out_shape, operands)):
+            return held(*operands)
+
+    return declaring
 
 
 def kernel(entry: Callable, *, name: str, **params) -> Callable:

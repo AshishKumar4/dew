@@ -26,9 +26,10 @@ from __future__ import annotations
 import dataclasses
 import functools
 import inspect
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 
 import jax
+import jax.numpy as jnp
 from jax.core import Tracer, eval_context
 from jax.custom_derivatives import CustomVJPPrimal, SymbolicZero
 from jax.extend import core as jax_core
@@ -50,8 +51,143 @@ __all__ = [
     "declared_tangent",
     "marked",
     "marked_call_p",
+    "portable_formed",
     "surrogate",
+    "with_cotangent_arrived",
+    "with_gradients_formed",
+    "with_gradients_formed_at",
+    "with_tangents_formed",
+    "with_tangents_formed_at",
 ]
+
+
+def with_gradients_formed[Input, Gradients](d_input: Input, gradients: Gradients
+                                            ) -> tuple[Input, Gradients]:
+    """A reverse mode's input cotangent, returned only with the parameter gradients it forms: `gradients`,
+    each formed in the dtype it is stored in, and `d_input` leave through one `jax.lax.optimization_barrier`
+    (the primitive `jax.checkpoint` binds a layer's recomputation to its incoming cotangent with), so the
+    layer below, which reads `d_input` at once, waits on them and XLA's scheduler puts no parameter gradient,
+    nor the cotangents it reads, off to the step's end. Every reverse mode that forms a parameter gradient
+    calls it (`gemm`'s, the projection XLA's product takes, the conv's, the SSD skip's, the selective scan's).
+
+    Row 6027: a Qwen3.5-4B four-row step, compile-only on a GH200, held 80.50 GB of temporaries without it
+    (XLA's dot of each layer's up and gate kernel gradients put off to the end, every layer's SwiGLU backward
+    pair held to it) and 22.36 GB with it, its schedule 55 GB under the best XLA's List, DFS and post-order
+    memory schedulers built unordered. Bound at a layer's boundary instead, over its variables' cotangents,
+    it held 28.35 GB: there it frees the optimizer's per-parameter update to move into the backward and hold
+    its momenta to the update's stacked Newton-Schulz at the step's end, and leaves each gradient in its
+    accumulation dtype until then. Its guards are tests/step_memory.py's (the step users run over every
+    registered mixer, tests/test_step_memory_*.py), which a reverse mode forming a parameter gradient
+    without it fails, and tests/test_declared_cells_memory.py's stack of every kernel family's products.
+    Only floating arrays enter the barrier: an integer operand's zero cotangent (`float0`) and an unreached
+    one (None) pass through as they are, and where no gradient is a floating array (an unhooked call's, a
+    sinkless attention's) there is nothing to form and the cotangents leave as they are, fusing into their
+    readers."""
+    if not any(_floating(leaf) for leaf in jax.tree.leaves(gradients)):
+        return d_input, gradients
+    return _held(d_input, gradients)
+
+
+def with_cotangent_arrived[Cotangent, Operands](cotangent: Cotangent, operands: Operands
+                                               ) -> tuple[Cotangent, Operands]:
+    """The rule's entry (`with_gradients_formed`'s): a reverse mode reads its operands only once its cotangent
+    has arrived, both through one barrier, so XLA computes nothing of a reverse mode from its operands alone
+    (a projection's kernel transposed for its input gradient) ahead of the cotangent, where it held one of
+    them a layer to the backward's start (a Mamba-2 decoder's in-projection, 0.8 MB a layer: its
+    temporaries' growth from two blocks to four 1.87 MB past what its forward saves, 0.23 MB under it with
+    the entry)."""
+    return _held(cotangent, operands)
+
+
+def _held(first, second):
+    """`first` and `second` through one `jax.lax.optimization_barrier`, their floating arrays alone."""
+    leaves, tree = jax.tree.flatten((first, second))
+    floating = [index for index, leaf in enumerate(leaves) if _floating(leaf)]
+    held = jax.lax.optimization_barrier(tuple(leaves[index] for index in floating))
+    for index, leaf in zip(floating, held, strict=True):
+        leaves[index] = leaf
+    return jax.tree.unflatten(tree, leaves)
+
+
+def with_tangents_formed[Input, Parameters](t_input: Input, t_parameters: Parameters
+                                            ) -> tuple[Input, Parameters]:
+    """The rule's dual (`with_gradients_formed`), for a reverse mode JAX derives by transposing a tangent
+    rule (a `declared_tangent`, a custom JVP, a surrogate's tangent): where both the input and a parameter
+    move, their live tangents enter the rule's linear part through the same barrier, whose transpose returns
+    the input's cotangent only with the parameters' gradients formed; forward mode passes them through
+    unchanged. Where either side moves nothing (a frozen parameter's, an input no derivative reaches: no
+    floating array, its tangent a symbolic zero) there is nothing to tie and the tangents pass as they are,
+    so a tangent rule takes symbolic zeros (`symbolic_zeros=True`): a zero JAX instantiates is a constant
+    beside the tangents, which the barrier's transpose cannot take."""
+    if not (any(_floating(leaf) for leaf in _leaves(t_input))
+            and any(_floating(leaf) for leaf in _leaves(t_parameters))):
+        return t_input, t_parameters
+    return _held(t_input, t_parameters)
+
+
+def with_gradients_formed_at(cotangents: tuple, parameters: Collection[int]) -> tuple:
+    """A reverse mode's cotangents by operand (`cotangents`), those at `parameters` its parameters' (an
+    attention's bias and sinks, a recurrence's skip and rate), through the rule
+    (`with_gradients_formed`): the inputs' leave only with the parameters' formed; where no parameter's
+    cotangent is a floating array (a sinkless, biasless call's) they leave as they are."""
+    inputs, formed = with_gradients_formed(*_apart(cotangents, parameters))
+    return _together(inputs, formed, parameters)
+
+
+def with_tangents_formed_at(tangents: tuple, parameters: Collection[int]) -> tuple:
+    """A tangent rule's tangents by operand, those at `parameters` its parameters', through the rule's dual
+    (`with_tangents_formed`)."""
+    inputs, formed = with_tangents_formed(*_apart(tangents, parameters))
+    return _together(inputs, formed, parameters)
+
+
+def _apart(values: tuple, parameters: Collection[int]) -> tuple[tuple, tuple]:
+    """`values` the rest's and the `parameters` positions', in order."""
+    return (tuple(value for index, value in enumerate(values) if index not in parameters),
+            tuple(value for index, value in enumerate(values) if index in parameters))
+
+
+def _together(inputs: tuple, formed: tuple, parameters: Collection[int]) -> tuple:
+    """`_apart`'s inverse: the values back at their positions."""
+    rest, held = iter(inputs), iter(formed)
+    return tuple(next(held) if index in parameters else next(rest)
+                 for index in range(len(inputs) + len(formed)))
+
+
+def _leaves(tree) -> list:
+    """`tree`'s leaves, a symbolic zero one of them."""
+    from jax.custom_derivatives import SymbolicZero
+
+    return jax.tree.leaves(tree, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+
+
+def _floating(leaf) -> bool:
+    """Whether `leaf` is an array of a floating dtype, which the rule's barrier holds: no symbolic zero (a
+    tangent no derivative moves, `jax.custom_jvp`'s `SymbolicZero`), which carries no value to hold."""
+    from jax.custom_derivatives import SymbolicZero
+
+    dtype = getattr(leaf, "dtype", None)
+    return not isinstance(leaf, SymbolicZero) and dtype is not None and jnp.issubdtype(dtype, jnp.inexact)
+
+
+def portable_formed[Value](portable: Callable[..., Value], /) -> Callable[..., Value]:
+    """`portable`, an XLA program whose last operand is a parameter (a projection's kernel, a norm's weight,
+    an attention's sinks), its value and every derivative XLA's of it (`generation.linear_tangent`), its
+    reverse mode the rule's: it reads its operands only once its cotangent has arrived
+    (`with_cotangent_arrived`) and returns the inputs' cotangents only with the parameter's gradient formed
+    (`with_gradients_formed`). Its forward saves nothing; its backward recomputes `portable` as its VJP
+    reads it."""
+    from dew.nn.kernels.generation import linear_tangent
+
+    def backward(saved, operands, cotangent):
+        del saved
+        cotangent, operands = with_cotangent_arrived(cotangent, operands)
+        *inputs, parameter = jax.vjp(portable, *operands)[1](cotangent)
+        inputs, parameter = with_gradients_formed(tuple(inputs), parameter)
+        return (*inputs, parameter)
+
+    return contracted("test_a_portable_formed_rule_holds_every_order")(linear_tangent(
+        lambda *operands: (portable(*operands), ()), backward, portable, kind=KernelGlue()))
 
 
 def contracted[Function](test: str, /) -> Callable[[Function], Function]:
@@ -64,7 +200,8 @@ def contracted[Function](test: str, /) -> Callable[[Function], Function]:
 
 
 def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Value], *,
-                     nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
+                     nondiff_argnums: Sequence[int] = (), symbolic_zeros: bool = False
+                     ) -> Callable[..., Value]:
     """The function whose value is `forward(*operands)`, exactly, and whose derivative is the declared rule
     `derivative(primals, tangents, value)`: the output's tangent from the differentiable operands, their
     tangents and the value, linear in the tangents, so reverse mode transposes it and a higher order
@@ -74,7 +211,8 @@ def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Va
 
     The value a derivative reads is the surrogate's own, so a derivative of a derivative meets the
     declared rule again wherever it differentiates the value (a straight-through rounding's tangent is
-    never rounded at a second order)."""
+    never rounded at a second order). With `symbolic_zeros`, an operand no derivative moves takes a
+    `SymbolicZero` tangent, as `jax.custom_jvp.defjvp` passes it."""
     declared = tuple(nondiff_argnums)
     rule = contracted("test_a_surrogate_holds_every_order")(
         jax.custom_jvp(bound_span(Surrogate(), forward, static=declared), nondiff_argnums=declared))
@@ -87,7 +225,7 @@ def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Va
         value = rule(*operands)
         return value, derivative(*fixed, primals, tangents, value)
 
-    rule.defjvp(bound_span(Surrogate(), tangent, static=range(len(declared))))
+    rule.defjvp(bound_span(Surrogate(), tangent, static=range(len(declared))), symbolic_zeros=symbolic_zeros)
     return rule
 
 

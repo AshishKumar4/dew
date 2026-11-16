@@ -14,7 +14,9 @@ import enum
 import functools
 import hashlib
 import math
+import threading
 import types
+import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import Literal, NamedTuple, overload
 
@@ -35,7 +37,13 @@ from egglog import (
     i64Like,
     method,
 )
-from egglog.declarations import Declarations, HasDeclarations
+from egglog.declarations import (
+    Declarations,
+    FunctionSignature,
+    HasDeclarations,
+    TypeOrVarRef,
+    TypeRefWithVars,
+)
 from egglog.runtime import RuntimeExpr
 from jax._src import core as jax_core
 from jax._src.literals import TypedNdArray
@@ -205,48 +213,78 @@ class Term(Expr):
     def finished(self) -> Term: ...
 
 
-@dataclasses.dataclass(frozen=True)
 class Skeleton:
-    """A term's structure without its egglog expression: `Term`'s constructors over plain tuples, equal
-    exactly where the terms are (`region`'s `forms`). What the pass reads of a window to decide whether a rule
-    may fire in it (`rules.reorderable`), at a fraction of its terms' cost: a Dory-4B training step's 1018
-    windows, every one refused, spent most of the pass building their terms (FS-OVERHEAD-DORY-ON-P3)."""
+    """A term's structure without its egglog expression: `Term`'s constructors over plain tuples (`form`: its
+    constructor's name, its operands' skeletons and its other arguments), equal exactly where the terms are
+    (`region`'s `forms`). What the pass reads of a window to decide whether a rule may fire in it
+    (`rules.reorderable`), and of a whole program to bound its windows' inputs (`dew.algebra.program._held`),
+    at a fraction of its terms' cost: a Dory-4B training step's 1018 windows, every one refused, spent most of
+    the pass building their terms (FS-OVERHEAD-DORY-ON-P3).
 
-    form: tuple
+    Hash-consed: a skeleton is made once for its form (`made`, the process's table of the skeletons alive), so
+    two equal skeletons are one object, compared by identity and hashed by it, in constant time. A program's
+    value read by many others is one skeleton many forms hold, and equal values traced apart (a computation
+    traced twice over the same inputs, which JAX does not merge) one skeleton too: compared as plain nested
+    tuples, each comparison walked every path through that sharing, 2**depth of them (a LAMB step's whole
+    program never finished; train 902 F1)."""
+
+    __slots__ = ("__weakref__", "form")
+
+    def __init__(self, form: tuple) -> None:
+        self.form = form
+
+    def __repr__(self) -> str:
+        return f"Skeleton{self.form!r}"
+
+    @classmethod
+    def made(cls, form: tuple) -> Skeleton:
+        """The one skeleton of `form` (its operands' skeletons in it, each already one): the live one where
+        the process holds it, else a new one, held while it lives."""
+        with _MAKING:
+            held = _MADE.get(form)
+            if held is None:
+                held = _MADE[form] = cls(form)
+            return held
 
     @classmethod
     def leaf(cls, index: int) -> Skeleton:
-        return cls(("leaf", index))
+        return cls.made(("leaf", index))
 
     @classmethod
     def literal(cls, index: int) -> Skeleton:
-        return cls(("literal", index))
+        return cls.made(("literal", index))
 
     def binary(self, name: str, other: Skeleton, params: int) -> Skeleton:
-        return Skeleton(("binary", self.form, name, other.form, params))
+        return Skeleton.made(("binary", self, name, other, params))
 
     def compare(self, name: str, other: Skeleton, params: int) -> Skeleton:
-        return Skeleton(("compare", self.form, name, other.form, params))
+        return Skeleton.made(("compare", self, name, other, params))
 
     def unary(self, name: str, params: int) -> Skeleton:
-        return Skeleton(("unary", self.form, name, params))
+        return Skeleton.made(("unary", self, name, params))
 
     def select(self, false: Skeleton, true: Skeleton) -> Skeleton:
-        return Skeleton(("select", self.form, false.form, true.form))
+        return Skeleton.made(("select", self, false, true))
 
     def convert(self, params: int) -> Skeleton:
-        return Skeleton(("convert", self.form, params))
+        return Skeleton.made(("convert", self, params))
 
     def shaped(self, name: str, params: int) -> Skeleton:
-        return Skeleton(("shaped", self.form, name, params))
+        return Skeleton.made(("shaped", self, name, params))
 
     def reduce(self, monoid: str, axes: Vec[i64], params: int) -> Skeleton:
         # The reduced axes are among the parameters `params` indexes.
         del axes
-        return Skeleton(("reduce", self.form, monoid, params))
+        return Skeleton.made(("reduce", self, monoid, params))
 
     def dot(self, other: Skeleton, params: int) -> Skeleton:
-        return Skeleton(("dot", self.form, other.form, params))
+        return Skeleton.made(("dot", self, other, params))
+
+
+_MADE: weakref.WeakValueDictionary[tuple, Skeleton] = weakref.WeakValueDictionary()
+"""Each live skeleton by its form (`Skeleton.made`): a form's operands are skeletons, hashed and compared by
+identity, so a form's hash and its comparison take its own arguments alone."""
+_MAKING = threading.Lock()
 
 
 def reduce_of(term: Term | Skeleton) -> tuple[str, Hashable] | None:
@@ -310,6 +348,9 @@ class Region[Node: (Term, Skeleton)]:
     """Each literal's term's key (`literals`' terms)."""
     indexed: dict[Hashable, int] = dataclasses.field(default_factory=dict)
     """Each interned entry of `params` by what makes two entries one (`interned`)."""
+    held: dict[jcore.Var, Magnitude | None] = dataclasses.field(default_factory=dict)
+    """Each value's magnitude (`magnitudes`') by the jaxpr's variable that names it: what a window cut from
+    the jaxpr declares of its inputs (`dew.algebra.program._windowed`)."""
     extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
@@ -346,9 +387,9 @@ class Region[Node: (Term, Skeleton)]:
 def key(term: BaseExpr | Skeleton) -> Hashable:
     """`term` as a dictionary's key: its declaration, which egglog builds it from, equal wherever two terms
     are (its text is black's formatting of it, about a millisecond a term: a third of a gemma3n training
-    step's pass); a skeleton's form (`Skeleton`)."""
+    step's pass); a skeleton itself, one object for its form (`Skeleton`)."""
     if isinstance(term, Skeleton):
-        return term.form
+        return term
     if not isinstance(term, RuntimeExpr):
         raise TypeError(f"{term!r} is no egglog term")
     return term.__egg_typed_expr__
@@ -373,6 +414,25 @@ def parameters_key(primitive: jcore.Primitive, values: Mapping) -> tuple[jcore.P
     """An equation's primitive and parameters as a region holds them: two equations of one primitive whose
     parameters are one (`parameter_key`) share one entry of its table (`Region.params`), the first's."""
     return primitive, tuple((name, parameter_key(value)) for name, value in sorted(values.items()))
+
+
+@functools.lru_cache(maxsize=1 << 16)
+def _abstract_key(value: ShapedArray) -> Hashable:
+    """An abstract value's key (`parameter_key`'s): its shape, dtype, weak type, placement, memory space,
+    layout and manual axes, kept for each abstract value (JAX's own value equality and hash), which every
+    window's structure reads of its every equation's outputs: a program's few distinct types, keyed once each,
+    where each read built the key anew (2.27 million keys of a Qwen3.5-4B start's 40 passes, row 6782). Its
+    placement by its partitions and its mesh's axes and memory, not the kind of device the mesh was made of,
+    which a step compiled ahead for a GPU and the run on that GPU share no name of."""
+    sharding, manual = value.sharding, value.manual_axis_type
+    mesh = sharding.mesh
+    placement = (parameter_key(sharding.spec), parameter_key(mesh.axis_sizes),
+                 parameter_key(mesh.axis_names), parameter_key(mesh.axis_types),
+                 parameter_key(sharding.memory_kind))
+    # Its dtype by its name, a PRNG key's extended one's too (`key<fry>`).
+    return ("abstract", parameter_key(value.shape), ("dtype", value.dtype.name), value.weak_type,
+            placement, parameter_key(value.memory_space), parameter_key(value.layout),
+            parameter_key((manual.varying, manual.unreduced, manual.reduced, manual.unreduced_kind)))
 
 
 def parameter_key(value) -> Hashable:
@@ -410,17 +470,7 @@ def parameter_key(value) -> Hashable:
         return ("array", str(value.dtype), array.shape, str(array.dtype),
                 hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
     if isinstance(value, ShapedArray):
-        # Its placement by its partitions and its mesh's axes and memory, not the kind of device the mesh was
-        # made of, which a step compiled ahead for a GPU and the run on that GPU share no name of.
-        sharding, manual = value.sharding, value.manual_axis_type
-        mesh = sharding.mesh
-        placement = (parameter_key(sharding.spec), parameter_key(mesh.axis_sizes),
-                     parameter_key(mesh.axis_names), parameter_key(mesh.axis_types),
-                     parameter_key(sharding.memory_kind))
-        # Its dtype by its name, a PRNG key's extended one's too (`key<fry>`).
-        return ("abstract", parameter_key(value.shape), ("dtype", value.dtype.name), value.weak_type,
-                placement, parameter_key(value.memory_space), parameter_key(value.layout),
-                parameter_key((manual.varying, manual.unreduced, manual.reduced, manual.unreduced_kind)))
+        return _abstract_key(value)
     if value is Layout.AUTO:
         # The layout XLA chooses, one singleton.
         return "layout", "auto"
@@ -658,7 +708,8 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     stock = {name: param(primitive, values) for name, (primitive, values) in stocked().items()}
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
                   max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products,
-                  frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed)
+                  frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed,
+                  {var: magnitudes.get(key(node)) for var, node in env.items()})
 
 
 BOUNDED = _symbols(lambda operation: operation.bounded)
@@ -1312,9 +1363,34 @@ def _literals[Node: (Term, Skeleton)](forms: type[Node], literals: list, shapes:
 def literal_key(atom: jcore.Literal) -> Hashable:
     """A literal's identity in a region: its dtype, shape and bits, so two literals are one term where they
     are the same constant, and never where they round apart. Its weak type is no part of it: an equation's
-    types are settled where it is traced, so a weak and a strong literal of one dtype compute alike."""
+    types are settled where it is traced, so a weak and a strong literal of one dtype compute alike. A
+    constant held as a broadcast (`normal_form.compact`: the recognition's folded masks and fills) is read
+    by its values once, with the axes it is broadcast along, never its every entry's bytes."""
     dtype, array = held_bits(atom.val)
-    return dtype, array.shape, array.tobytes()
+    held = compact(array)
+    return dtype, array.shape, held.shape, np.ascontiguousarray(held).tobytes()
+
+
+def compact(value: np.ndarray) -> np.ndarray:
+    """`value` with each axis along which every entry holds the same bits one element long: the values it
+    holds, each once, in its rank, which with its shape is the value (a broadcast of it). One form whatever
+    holds the value, a broadcast's view or every entry written (`dew.algebra.normal_form`'s folded masks and
+    fills): what a literal is keyed by (`literal_key`) and folded arithmetic computes over. The axes a view
+    repeats are read off its strides; every other is compared, bit for bit, over what is left."""
+    value = np.asarray(value)
+
+    def first(held: np.ndarray, axis: int) -> np.ndarray:
+        return held[(slice(None),) * axis + (slice(0, 1),)]
+
+    for axis, (stride, size) in enumerate(zip(value.strides, value.shape, strict=True)):
+        if stride == 0 and size > 1:
+            value = first(value, axis)
+    for axis, size in enumerate(value.shape):
+        if size > 1:
+            bits = np.ascontiguousarray(value).view(f"V{value.dtype.itemsize}")
+            if bool(np.all(bits == first(bits, axis))):
+                value = first(value, axis)
+    return value
 
 
 def typed_key(value) -> bool:
@@ -1425,9 +1501,44 @@ def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, le
     raise ValueError(f"a term of no known constructor: {term}")
 
 
-LANGUAGE = (Term.binary, Term.compare, Term.unary, Term.convert, Term.shaped, Term.reduce, Term.dot,
-            Term.select)
-"""The language's constructors that read terms, a leaf's and a literal's none."""
+def _sort(declared: TypeOrVarRef) -> type[BaseExpr]:
+    """The sort an argument is declared of (egglog's type reference): its class by its module and name, a
+    parameterized one (`Vec[i64]`) given its parameters."""
+    import importlib
+
+    if not isinstance(declared, TypeRefWithVars):
+        raise TypeError(f"{declared} is a type variable, no sort a term's argument takes")
+    sort = getattr(importlib.import_module(declared.ident.module or "egglog"), declared.ident.name)
+    parameters = tuple(map(_sort, declared.args))
+    return sort[parameters[0] if len(parameters) == 1 else parameters] if parameters else sort
+
+
+def _arguments(constructor) -> tuple[type[BaseExpr], ...]:
+    """The sorts of the arguments `constructor` takes after the term it is called on, as `Term` declares its
+    method (egglog's signature of it)."""
+    signature = declarations(Term).get_callable_decl(constructor.__egg_ref__).signature
+    if not isinstance(signature, FunctionSignature):
+        raise TypeError(f"{constructor} is declared by {signature!r}, no signature of its arguments")
+    return tuple(map(_sort, signature.arg_types[1:]))
+
+
+LANGUAGE: Mapping = {constructor: _arguments(constructor)
+                     for constructor in (getattr(Term, written.constructor) for written in WRITTEN.values())}
+"""The language's constructors that read terms (a leaf's and a literal's none: each kind's, `WRITTEN`), each
+by the sorts of the arguments it takes after the term it is called on, as `Term` declares them: the one
+inventory every reader of the language walks (`subterms`, `pattern`)."""
+
+
+def pattern(constructor, name: str) -> tuple[Term, tuple[Term, ...]]:
+    """`constructor` (a `LANGUAGE` entry) over fresh variables named from `name`: the pattern, and the terms
+    it reads, the one it is called on first."""
+    from egglog import var
+
+    called = var(f"{name}_called", Term)
+    kinds = LANGUAGE[constructor]
+    arguments = [var(f"{name}_{index}", kind) for index, kind in enumerate(kinds)]
+    read = tuple(argument for argument, kind in zip(arguments, kinds, strict=True) if kind is Term)
+    return constructor(called, *arguments), (called, *read)
 
 
 def subterms(form: Term) -> Iterator[Term]:

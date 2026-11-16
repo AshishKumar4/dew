@@ -67,6 +67,7 @@ from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
 from dew._devices import COMPILE_ONLY_MEMORY, device_memory
 from dew._records import JSON, boolean, record
+from dew._stated import Unestablished
 from dew.batch import Batch
 from dew.nn.kernels import options
 from dew.nn.kernels.generation import (
@@ -325,6 +326,11 @@ class AheadOfTime:
     step traces with these in place of its own (`Trainer`'s `ahead`), which could spread a projection
     the step does not and lower another program, and its checkpoints record their bandwidths
     (`link_figures`)."""
+    live_bytes: int | None = None
+    """The most one device's buffers hold at once over the step, as XLA's heap simulation states it
+    (`CompiledMemory.live`): where a value held too long shows, apart from the room the temporaries'
+    packing takes (`temp_bytes`, the one allocation the fit check places). None where the backend states
+    none."""
     target: GpuTarget | None = None
     """The facts of the GPU its kernels' launches were derived for (`gpu_target` within `assumed`), which a
     run handed the step reproduces it under (`handed`, `derived_for`): another SKU of the generation, its
@@ -734,7 +740,7 @@ class Keeping:
         try:
             call = identity.call_identity(program, key)
             serialized = Executable.of(executable)
-        except identity.Unestablished as refusal:
+        except Unestablished as refusal:
             self.refused[named] = str(refusal)
             return
         except (NotImplementedError, ValueError) as refusal:
@@ -816,7 +822,7 @@ def kept(path: str | Path, *, verify: bool = False) -> Iterator[AheadPrograms]:
     def give(program: OuterProgram, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled | None:
         try:
             found = programs.kept.get(identity.digest(identity.call_identity(program, key)))
-        except identity.Unestablished as refusal:
+        except Unestablished as refusal:
             _log.info("a call with no stated identity is handed no kept program, and compiles: %s", refusal)
             return None
         if found is None:
@@ -1396,8 +1402,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
             from dew.training.distributed import start_compiling
 
             begun = None if start.resume is not None or trainer.host_master else start_compiling(
-                start.build, start.initializer, jax.ShapeDtypeStruct(start.key.shape, start.key.dtype),
-                start.abstract, start.shardings, start.through, trainer.device_mesh)
+                start.placing, start.initializer, shapes_of(start.key),
+                start.abstract, start.shardings, trainer.device_mesh)
             planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, frontier)
             with attempting(begun):
                 starts = started(trainer, start, planned, plan)
@@ -1415,7 +1421,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         Executable.of(compiled),
         flops=step_flops(compiled),
         argument_bytes=memory.argument, output_bytes=memory.output, alias_bytes=memory.alias,
-        temp_bytes=memory.temp, code_bytes=memory.generated_code, plan=trainer.plan, planned_seconds=seconds,
+        temp_bytes=memory.temp, code_bytes=memory.generated_code, live_bytes=memory.live, plan=trainer.plan,
+        planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices), capacity, topology=topology),
         refusals=report.refused_launches(), sampled=sampled, starts=starts)
@@ -1439,9 +1446,9 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
     candidate = planned.candidate
     with collecting() as collected:
         if start.resume is None and not trainer.host_master:
-            start_compiled(start.build, start.initializer,
-                           jax.ShapeDtypeStruct(start.key.shape, start.key.dtype), start.abstract,
-                           start.shardings, start.through, trainer.device_mesh)
+            start_compiled(start.placing, start.initializer,
+                           shapes_of(start.key), start.abstract,
+                           start.shardings, trainer.device_mesh)
         if candidate.copies:
             # The variables as the run's first step holds them, placed as its start placed them.
             variables = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,

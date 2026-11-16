@@ -7,8 +7,10 @@ decay's bound, aligned keys with the write gate near one, resets on chunks' edge
 long and fading memories, steep then mild decays), held as test_recurrence_stability holds the portable math:
 
 - finite wherever the recurrence a token at a time in float64 is;
-- check 1 (`assert_as_exact`): on par from float64 with its reference arm, the fla port where it runs the
-  form (the delta rule with a decay), else the portable math, in the call's 16-bit dtype. Mamba2's rated
+- check 1 (`assert_as_exact`): on par from float64 with its reference arm in the call's 16-bit dtype, its
+  family's independent oracle (docs/design/testing.md): the fla port where it runs the form (the delta rule
+  with a decay), the recurrence a token at a time where the form's family has no release (a write gate
+  without the delta rule), its distance from the portable math reported beside the verdict. Mamba2's rated
   decay runs under both forms (`forms_of`): the accurate ones held to the portable math, the fast ones, its
   16-bit numbers mamba_ssm's (`chunk_forward.prepared`), to the port of mamba_ssm's kernels, as recorded
   mamba_ssm holds them at the same inputs (test_mamba_ssd).
@@ -31,7 +33,7 @@ from fla_sites import LEAVES, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU
 from map_judge import sharded
 from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
-from test_recurrence_chunk import chunk_on, token_by_token
+from test_recurrence_chunk import against_the_portable_math, chunk_on, oracle, token_by_token
 from test_recurrence_mosaic import REFUSED, refuses_its_gradient, taken, template_call
 from test_recurrence_stability import (
     GRADIENT_SEEDS,
@@ -101,14 +103,21 @@ def assert_finite(fn, truth, operands, regime: str) -> None:
             f'{regime}: not finite where float64 is')
 
 
-def reference_arm(hooks, forms: str | None):
-    """The arm the template is held against for a form under `forms`, each in the call's dtype, where it runs
-    here: the fla port for the gated delta net's formed gates, the port of mamba_ssm's kernels for the rated
-    scan under the fast forms (its numbers mamba_ssm's), else the portable math. The delta rule with a decay
-    on its operands as given is held to recorded fla-core (`fla_recorded`)."""
-    if hooks.delta and hooks.decay != 'none':
-        return functools.partial(chunk_on, 'fla', hooks)
-    return functools.partial(chunk_on, 'pallas' if hooks.rated and forms == 'fast' else 'xla', hooks)
+def reference_arm(hooks, forms: str | None, **bound):
+    """The arm the template is held against for a form under `forms`, each in the call's 16-bit dtype, its
+    family's oracle under the run's numerics (`oracle`): the fla port for the delta rule (the gated delta
+    net's formed gates; with a decay on its operands as given, recorded fla-core, `fla_recorded`); for the
+    rated scan the port of mamba_ssm's kernels under the fast forms (its numbers mamba_ssm's) and the
+    portable math under the accurate ones (row 6781: recorded mamba_ssm, which waits on the fixture store);
+    the recurrence a token at a time, in fp32 with its output in the call's dtype, where no release computes
+    the call's numbers. `bound` is a chunked arm's (`bounded`): the recurrence reads its documents' starts a
+    token at a time."""
+    upstream = oracle(hooks, jnp.bfloat16)
+    if upstream is None:
+        return functools.partial(token_by_token, hooks)
+    if upstream == 'fla':
+        return functools.partial(chunk_on, 'fla', hooks, **bound)
+    return functools.partial(chunk_on, 'pallas' if forms == 'fast' else 'xla', hooks, **bound)
 
 
 def fla_recorded(hooks) -> bool:
@@ -166,14 +175,15 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
             return bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
 
     operands = restarting(lambda given: given, regime)(draws(0)[0])
-    mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks, **bounded(regime))
-    reference = functools.partial(reference_arm(hooks, forms), **bounded(regime))
+    mosaic, portable = (functools.partial(chunk_on, kernel, hooks, **bounded(regime))
+                        for kernel in ('mosaic_gpu', 'xla'))
     exact = functools.partial(token_by_token, hooks)
-    if product == 'forward':
-        dew, truth = mosaic, exact
-    else:
-        dew, reference, truth = (with_gradients(restarting(fn, regime)) for fn in (mosaic, reference, exact))
     with under(forms):
+        reference = reference_arm(hooks, forms, **bounded(regime))
+        dew, truth = mosaic, exact
+        if product == 'gradient':
+            dew, reference, truth, portable = (with_gradients(restarting(fn, regime))
+                                               for fn in (mosaic, reference, exact, portable))
         if not runs(dew, hooks, operands, draws(0), product):
             pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
         label = f'the template, {name} under {regime}, its {product}'
@@ -190,6 +200,9 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
             the_template_is_as_exact_as_fla(mosaic, f"stability/{name}/{regime}/{product}",
                                             ('out', 'final') if product == 'forward' else LEAVES, label)
             return
+        if oracle(hooks, jnp.bfloat16) is None and (distance := against_the_portable_math(
+                label, dew, portable, draws, truth, FEWEST_SEEDS)) is not None:
+            print(f"{label}: its distance against the portable math's: {distance}", flush=True)
         assert_as_exact(dew, reference, draws, label, seeds=seeds, truth_fn=truth)
 
 

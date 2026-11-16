@@ -8,7 +8,6 @@ import dataclasses
 import hashlib
 import importlib
 import json
-import os
 import shutil
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -18,8 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from lane_environment import without_flags
-from process_support import fresh
+from process_support import device_flags, fresh
 
 from dew._cache import enable_compilation_cache
 from dew.checkpoints import Checkpoints
@@ -84,16 +82,17 @@ def covering(axes: Mapping[str, Sequence]) -> list[dict]:
 
 # --- a scenario's runs, each in a fresh process ------------------------------------------------------------
 
-DEVICES = "--xla_force_host_platform_device_count"
-
-
 def in_fresh_process(module: str, devices: int, function: str, *arguments):
     """`module`'s `function` called on `arguments` (JSON's values) in a fresh process that sees `devices` CPU
-    devices: what it returns (JSON's). A run's device count is its process's, fixed as its backend opens."""
-    flags = f"{without_flags(os.environ.get('XLA_FLAGS', ''), DEVICES)} {DEVICES}={devices}".strip()
-    script = (f"import json, sys\nimport {module}\n"
+    devices (`process_support.device_flags`, the one way a worker of the suite sets its count): what it
+    returns (JSON's). A run's device count is its process's, fixed as its backend opens. Dew is imported
+    first, as `dew train` imports it, so a run whose record asks XLA for flags this process lacks runs the
+    process again with them before jaxlib loads (`_devices.hold_xla_flags`); faulthandler prints a native
+    crash's Python stacks, as the suite's other workers do (`process_support.worker_env`)."""
+    script = (f"import json, sys\nimport dew\nimport {module}\n"
               f"print(json.dumps(getattr({module}, sys.argv[1])(*json.loads(sys.argv[2]))))")
-    return fresh(script, function, json.dumps(arguments), flags=flags, platforms="cpu")
+    return fresh(script, function, json.dumps(arguments), flags=device_flags(devices), platforms="cpu",
+                 variables={"PYTHONFAULTHANDLER": "1"})
 
 
 PAUSE = 1 / 3
@@ -147,8 +146,8 @@ def resumption(root: Path) -> tuple[Phase, Phase, Phase]:
 @dataclass(frozen=True)
 class Recorded:
     """A scenario cell's run as `dew train` replays it in a fresh process that sees `devices` CPU devices
-    (`run_kinds.trained_record`): its saved record, the settings its command line sets (`--set`,
-    `run_kinds.cli_settings`), and the packages outside Dew its record imports, which it trusts."""
+    (`run_kinds.trained_record`, `recorded_run`): its saved record, the settings its command line sets
+    (`--set`, `run_kinds.cli_settings`), and the packages outside Dew its record imports, which it trusts."""
 
     record: Path
     settings: Mapping[str, str]
@@ -156,15 +155,23 @@ class Recorded:
     trust: tuple[str, ...] = ()
 
     def trained(self, phase: Phase = CELL) -> tuple[Path, dict[str, float]]:
-        """The run trained in `phase`: its run directory, and the persistent-cache counts its last logged step
-        reports (`compilation_cache_counts`, every program its process compiled until then)."""
-        from run_kinds import scalars, trained_record
+        """The run trained in `phase`: its run directory, and the persistent-cache counts of its process once
+        it has ended (`recorded_run`): every program it compiled, a final validation's and a checkpoint's
+        after its last logged step among them, as a `Called` run's are."""
+        ran = in_fresh_process("scenario_contract", self.devices, "recorded_run", str(self.record),
+                               {**self.settings, **phase.settings()}, list(self.trust))
+        return Path(ran["run"]), ran["counts"]
 
-        run = trained_record(self.record, {**self.settings, **phase.settings()}, devices=self.devices,
-                             trust=self.trust)
-        logged = scalars(run)
-        return run, {name: value for name, value in logged[max(logged)].items()
-                     if name.startswith("train/cache_")}
+
+def recorded_run(record: str, settings: Mapping[str, str], trust: Sequence[str]) -> dict:
+    """The run `dew train` replays from `record` with `settings` set and `trust` trusted, in this process
+    (`run_kinds.trained_record`; a fresh one, `Recorded.trained`): its run directory, and this process's
+    persistent-cache counts once it has ended (`compilation_cache_counts`)."""
+    from run_kinds import trained_record
+
+    count_compilation_cache()
+    run = trained_record(Path(record), settings, trust=tuple(trust))
+    return {"run": str(run), "counts": compilation_cache_counts()}
 
 
 @dataclass(frozen=True)
@@ -215,9 +222,10 @@ def assert_resumes_onto_its_uninterrupted_run(prepared: Recorded | Called, root:
     (`checkpointed`), bit for bit; and its process, to its end (its final validation and checkpoint too),
     compiles no program the runs before it did not: it writes nothing to the cache (`written`), and found
     programs there. A checkpoint that holds an average (`TrainState.ema`) restores it from its difference to
-    the weights, one program a leaf signature (`dew.checkpoints`' delta planes) that no run before the first
-    resume ran: there, the run resumed again from the same pause, in a fresh process, is held to compile
-    nothing, and to end where the first resume and the uninterrupted run end."""
+    the weights, a program the save that wrote it compiles (`dew.checkpoints._state_trees.decoded_ahead`):
+    the run resumed a second time from the same pause, its own copy of the paused run in a fresh process
+    beside the first, is held alike, both against the cache the runs before them left, and each ends where
+    the uninterrupted run ends."""
     whole_phase, paused_phase, resumed_phase = resumption(root)
     cache = Path(str(resumed_phase.cache))
     # Two processes of their own, run side by side: each its own run directory, one cache, compiling alike.
@@ -225,23 +233,29 @@ def assert_resumes_onto_its_uninterrupted_run(prepared: Recorded | Called, root:
         (whole, _), (paused, _) = pool.map(prepared.trained, (whole_phase, paused_phase))
     end = Checkpoints(str(whole)).latest
     assert end is not None and 0 < Checkpoints(str(paused)).latest < end
-    averaged = Checkpoints(str(paused)).stored().get("ema") is not None
+    resumes = [resumed_phase]
+    if Checkpoints(str(paused)).stored().get("ema") is not None:
+        again = dataclasses.replace(resumed_phase, name=f"{resumed_phase.name}-again")
+        shutil.copytree(paused, paused.with_name(again.name))
+        resumes.append(again)
     held = checkpointed(whole)
-    kept = paused.with_name(f"{paused.name}-paused")
-    shutil.copytree(paused, kept)
-    for resume in range(2 if averaged else 1):
-        if resume:
-            shutil.rmtree(paused)
-            shutil.copytree(kept, paused)
-        before = written(cache)
-        resumed, counts = prepared.trained(resumed_phase)
-        assert Checkpoints(str(resumed)).latest == end
+    before = written(cache)
+    # Side by side, as the uninterrupted and paused runs are: each its own copy of the paused run.
+    with concurrent.futures.ThreadPoolExecutor(len(resumes)) as pool:
+        finished = list(pool.map(prepared.trained, resumes))
+    compiled = written(cache) - before
+    for phase, (resumed, counts) in zip(resumes, finished, strict=True):
+        assert Checkpoints(str(resumed)).latest == end, phase.name
         ran = checkpointed(resumed)
         assert held.keys() == ran.keys(), set(held) ^ set(ran)
         off = [path for path, value in held.items() if value != ran[path]]
-        assert not off, f"the resumed run's leaves off the uninterrupted run's: {off}"
-    compiled = written(cache) - before
-    assert not compiled and counts["train/cache_hits"] > 0, (sorted(compiled), counts)
+        assert not off, f"{phase.name}: the resumed run's leaves off the uninterrupted run's: {off}"
+        # Every program read from the cache, none compiled again: a program compiled anew over an entry the
+        # cache holds writes no new file (its LRU leaves the key as it is) but counts a miss.
+        missed, hit = counts["train/cache_misses"], counts["train/cache_hits"]
+        assert missed == 0 and hit > 0, (phase.name, counts)
+    # Nothing written after the last logged step either, which its counts do not reach.
+    assert not compiled, sorted(compiled)
 
 
 def cached(cache: str, module: str, function: str, *arguments) -> dict:

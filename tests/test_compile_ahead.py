@@ -350,26 +350,112 @@ import jax.numpy as jnp
 from dew.nn.kernels import options
 from dew.nn.kernels.templates import report
 
-# A start whose compile never ends.
-report.attempted = lambda lowered, options: threading.Event().wait()
-options.compiling(jax.jit(lambda x: x + 1), jnp.ones(2))
-# Refused before its start was taken, with an exit status of its own.
-raise SystemExit(3)
+# A start's compile, XLA's own, of a program long enough to compile that it is in flight when the run is
+# refused: its thread is shown to have entered XLA's compile, and not to have left it.
+begun, ended = threading.Event(), threading.Event()
+compiled = report.attempted
+
+
+def attempted(lowered, held):
+    begun.set()
+    try:
+        return compiled(lowered, held)
+    finally:
+        ended.set()
+
+
+report.attempted = attempted
+
+
+def long(x):
+    for index in range(20000):
+        x = jnp.sin(x) * (index % 7 + 1)
+    return x
+
+
+options.compiling(jax.jit(long), jnp.ones(2))
+begun.wait()
+# Refused before its start was taken, with an exit status of its own, its compile still running (else the
+# exit's timing says nothing of it, and the run says so by another status).
+raise SystemExit(4 if ended.wait(0.5) else 3)
 """
 """A run that begins its start's compile beside its planning and is refused before it takes the start."""
 
 
-def test_a_run_refused_before_its_start_is_taken_exits_without_waiting_for_its_compile():
+@pytest.mark.parametrize("run", range(8))
+def test_a_run_refused_before_its_start_is_taken_exits_with_its_refusal_while_its_compile_runs(run):
     """A run whose start's compile is begun beside its planning (`options.compiling`) and which is refused
-    before it takes the start exits at its refusal, with its refusal, not when the compile no one reads
-    ends (row 5966: a 4B start's held the exit 97 s), here a compile that never ends."""
+    before it takes the start, its compile still running, exits with its refusal's status once that compile
+    ends (`_exit_waits`): JAX's exit cleanup and the C runtime's exit tore XLA down under it, and 12 of 48
+    such exits ended by a segmentation fault (row 6837). A status of 4 says the compile ended before the
+    refusal, and the cell then proves nothing."""
     import process_support
 
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(process_support.REPO_ROOT / "src"),
-                                                                str(process_support.REPO_ROOT / "tests")))}
-    run = subprocess.run([sys.executable, "-c", ORPHANED_START], env=environment, capture_output=True,
-                         text=True, timeout=300, check=False)
-    assert run.returncode == 3, run.stderr[-3000:]
+                                                                str(process_support.REPO_ROOT / "tests"))),
+                   "JAX_ENABLE_COMPILATION_CACHE": "false"}
+    exited = subprocess.run([sys.executable, "-c", ORPHANED_START], env=environment, capture_output=True,
+                            text=True, timeout=300, check=False)
+    assert exited.returncode == 3, (exited.returncode, exited.stderr[-3000:])
+
+
+def _begun(case: str) -> tuple:
+    """`case`'s program, the input it compiles over, what its compile is begun over, and an input of
+    another abstract value: arrays, begun over themselves; a fresh `jax.random.key`, no one committed to
+    its devices, begun over its shape (`shapes_of`, as a fresh fit begins its start), the other a key
+    committed to a device."""
+    if case == "arrays":
+        return lambda x: x * 2, jnp.ones(4), jnp.ones(4), jnp.ones(8)
+    from dew.nn.kernels.options import shapes_of
+
+    key = jax.random.key(0)
+    return (lambda key: jax.random.normal(key, (4,)), key, shapes_of(key),
+            jax.device_put(jax.random.key(1), jax.devices()[0]))
+
+
+@pytest.mark.parametrize("case", ["arrays", "a fresh key's shape"])
+def test_a_program_whose_compile_was_begun_passes_once_where_it_compiles_over_the_same(case):
+    """A program whose first compile was begun in a thread of its own (`options.compiling`) and which then
+    compiles within `attempting` that compile over the same abstract inputs takes the begun lowering: its
+    algebra pass runs once (`report.passes`), not again only to match the begun compile (a DiT start's
+    1.66 s of 11.5 s of passes, simple-dit-b). A fresh key's call matches its begun shape, as a fresh fit's
+    start placed with its key matches the start begun over the key's shape: an uncommitted array lowers as
+    an unplaced shape (train 912's F5, train 914's F2). Over another abstract value it lowers, passes and
+    compiles its own."""
+    from dew.nn.kernels.options import attempting, compiling, owned_program
+    from dew.nn.kernels.templates import report
+
+    function, given, begun_over, other = _begun(case)
+    program = owned_program(function)
+    with report.recording() as begun_passes:
+        begun = compiling(program, begun_over)
+    with attempting(begun):
+        with report.recording() as same:
+            program.compiled(given)
+        with report.recording() as elsewhere:
+            program.compiled(other)
+    assert len(begun_passes.passes) == 1 and not same.passes and len(elsewhere.passes) == 1
+
+
+def test_a_begun_compile_is_not_taken_by_a_call_over_another_layout():
+    """A program whose compile was begun over a committed array of its devices' default layout, called within
+    `attempting` over a committed array of another layout on the same sharding, lowers and compiles its own
+    and computes what the program does: the begun lowering's layout is not the call's, which JAX's
+    dispatcher holds a program to (the morning audit of 2026-11-16: the begun executable taken, the call
+    refused with a ValueError)."""
+    from jax.experimental.layout import Format, Layout
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.options import attempting, compiling, owned_program
+
+    sharding = NamedSharding(Mesh(jax.devices()[:1], ("x",)), PartitionSpec())
+    values = np.arange(6, dtype=np.float32).reshape(2, 3)
+    default, other = (jax.device_put(values, Format(Layout(major_to_minor=order), sharding))
+                      for order in ((0, 1), (1, 0)))
+    program = owned_program(lambda x: x * 2)
+    begun = compiling(program, default)
+    with attempting(begun):
+        np.testing.assert_array_equal(np.asarray(program(other)), values * 2)
 
 
 def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):
@@ -713,17 +799,49 @@ def at_its_plan(plan, probes) -> None:
     assert not any(probe["split"] < plan["split"] and probe["fits"] is True for probe in own), own
 
 
-NEEDING_MICROBATCHES = 600_000
-"""Bytes a compile-only GPU states for `fine_tune`'s step to need several microbatches: four, with a rung
-above it at two (a sweep at base/kernels e4d702a55 with the split computed from the compile that missed,
-2cb8d0bb4: from 500 kB to 600 kB the plan takes four or eight, at 650 kB and 700 kB two, at 800 kB one)."""
+ROOMY = 2**36
+"""The bytes a compile-only GPU states (`gpus`' default) where a step's need is measured: room for any of
+`fine_tune`'s compiles, so its need does not depend on it (`memory.step_fits`)."""
+
+
+def _need(split: int, *, up: bool = False) -> int:
+    """What `fine_tune`'s step needs beside what a device holds, as its plan's search reads it (`limit -
+    headroom`, `memory.step_fits`): compiled ahead at `split` microbatches on its own rung, or with `up` the
+    rung above it, its search's first climb (`memory.recompute_more`: the head's tile, before any remat),
+    under `ROOMY`."""
+    from dew.training.ahead import compile_ahead
+    from dew.training.memory import recompute_more
+
+    trainer = fine_tune(MeshSpec().build(gpus("sm90")), split=split)
+    if up:
+        assert recompute_more(trainer.objective)
+    plan = record(compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1)).plan, "plan")
+    return ROOMY - listed(plan["probes"], "probes", read=record, what="probes")[0]["headroom"]
 
 
 @pytest.fixture(scope="module")
-def admitted(tmp_path_factory):
-    """`fine_tune`'s step compiled ahead on GPUs of `NEEDING_MICROBATCHES`, its plan kept beside the
+def needing_microbatches(tmp_path_factory) -> int:
+    """Bytes a compile-only GPU states for `fine_tune`'s step to need several microbatches at its own rung
+    with a rung above it fitting at fewer, read from the step's own compiles (`_need`): the larger of its
+    own rung's need at two microbatches and the rung above's whole, where its own rung's need whole is more
+    (the scenario's condition, which the step's figures state or the cell says they do not). The needs are
+    measured under `ROOMY`, where XLA's scheduler, which reads the memory a target states, may need more
+    than under the limit; the admitted search under the limit is the judge (`plan["split"] > 1`, a frontier),
+    and where it goes red the three needs are measured again under the limit, never a margin added."""
+    with pytest.MonkeyPatch.context() as patch:
+        lane_environment.per_test_settings(patch, tmp_path_factory.mktemp)
+        patch.setenv("DEW_RUNG_RECORDS", str(tmp_path_factory.mktemp("needs")))
+        whole, halves, above = _need(1), _need(2), _need(1, up=True)
+    limit = max(halves, above)
+    assert whole > limit, (whole, halves, above)
+    return limit
+
+
+@pytest.fixture(scope="module")
+def admitted(tmp_path_factory, needing_microbatches):
+    """`fine_tune`'s step compiled ahead on GPUs of `needing_microbatches`, its plan kept beside the
     compilation cache as every search keeps its own (`DEW_RUNG_RECORDS`): the records' directory, the
-    trainer and its `AheadOfTime`, admitted once for the module."""
+    trainer and its `AheadOfTime`, admitted once for the module, and the limit."""
     from dew.training.ahead import compile_ahead
 
     records = tmp_path_factory.mktemp("rungs")
@@ -731,9 +849,9 @@ def admitted(tmp_path_factory):
         # The module's own data and Hub caches, as each test's (`own_settings`), its rung records `records`.
         lane_environment.per_test_settings(patch, tmp_path_factory.mktemp)
         patch.setenv("DEW_RUNG_RECORDS", str(records))
-        trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=NEEDING_MICROBATCHES)), split=None)
+        trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=needing_microbatches)), split=None)
         ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
-    return records, trainer, ahead
+    return records, trainer, ahead, needing_microbatches
 
 
 def cache_key_of(lowered: jax.stages.Lowered, device, overrides: dict | None = None) -> str:
@@ -851,7 +969,7 @@ def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admit
     from dew._devices import pool_share
     from dew.training.memory import recompute_record
 
-    _, trainer, ahead = admitted
+    _, trainer, ahead, limit = admitted
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")
     assert plan["split"] > 1
@@ -859,7 +977,7 @@ def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admit
     assert trainer.plan == ahead.plan and recompute_record(trainer.objective) == plan["remat"]
     pool = record(plan["pool"], "pool")
     assert pool["source"] == "compile_only" and pool["share"] == pool_share()
-    assert pool["limit"] == NEEDING_MICROBATCHES
+    assert pool["limit"] == limit
     assert not ahead.tuned and plan["autotuned"] is False
 
 
@@ -876,9 +994,9 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     from dew.training.ahead import compile_ahead
     from dew.training.memory import recompute_record
 
-    records, _, earlier = admitted
+    records, _, earlier, limit = admitted
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
-    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=NEEDING_MICROBATCHES)), split=None)
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=limit)), split=None)
     ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")

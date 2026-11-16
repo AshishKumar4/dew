@@ -135,7 +135,9 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "a logit near fp32's largest at scale 1/4": 8, "values near fp32's largest over 2 equal keys": 8,
          "values near fp32's largest over 64 equal keys": 8,
          "values near fp32's largest over 256 equal keys": 8,
-         "values near fp32's largest over 2 equal keys, bfloat16": 8, "one key": 8, "a sink and one key": 64,
+         "values near fp32's largest over 2 equal keys, bfloat16": 8,
+         "values at fp32's largest over 2 equal keys": 8, "values at fp32's largest over 256 equal keys": 8,
+         "one key": 8, "a sink and one key": 64,
          "a sink near fp32's largest and one key": 8, "a sink and one key, its logit near fp32's largest": 8,
          "a sink near fp32's largest at scale 1/4": 8, "logits near 1e4": 32, "logits near 1e30": 8,
          "a small weight on a large value, float32": 128, "a small weight on a large value, bfloat16": 256,
@@ -153,7 +155,9 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "a subnormal share of an overflowing row, bfloat16": 32,
          "a subnormal share beside 255 equal weights, bfloat16": 32, "a row of no keys": 8,
          "causal queries before every key": 8, "a row that overflows beside one that does not": 8,
-         "two finite slices whose merge overflows": 8, "a resumed state of a large denominator": 64,
+         "two finite slices whose merge overflows": 8,
+         "values at fp32's largest across a split decode's slices": 8,
+         "a resumed state of a large denominator": 64,
          "a resumed state beside an overflowing column": 32,
          "a resumed state of a denominator near fp32's largest beside an overflowing column": 8,
          "fp16 values near their largest beside a state near fp32's largest": 32,
@@ -441,17 +445,30 @@ def _near_max_logit(width: int):
     return draw
 
 
-def _large_values(keys: int, top: float = 3.4e38):
-    # Equal logits over values drawn within a few percent of fp32's largest (to `top`, bf16's below its
-    # largest), one sign: the sum of the weighted values passes fp32's largest where the reference's
-    # normalized one does not. The cotangent is drawn times 2^-8, so the cotangent's product with the
-    # values stays finite in the reference's backward too.
+def _large_values(keys: int, top: float = 3.4e38, bottom: float | None = None, *, at_limit: bool = False):
+    # Equal logits over values drawn within a few percent of fp32's largest (from `bottom` to `top`, bf16's
+    # below its largest), one sign: the sum of the weighted values passes fp32's largest where the
+    # reference's normalized one does not. `at_limit` draws fp32's largest and the float below it into every
+    # row's first two columns, their output a value there (row 6842: a walk forming its operands' parts or
+    # its sums largest first passed it). The cotangent is drawn times 2^-8, so the cotangent's product with
+    # the values stays finite in the reference's backward too.
+    low = 3.0e38 * top / 3.4e38 if bottom is None else bottom
+
     def draw(seed):
-        value = _uniform(seed, 3.0e38 * top / 3.4e38, top, (ROWS, keys, 1, 16))
+        value = _uniform(seed, low, top, (ROWS, keys, 1, 16))
+        if at_limit:
+            value = value.copy()
+            value[:, :, 0, 0] = np.finfo(np.float32).max
+            value[:, :, 0, 1] = np.nextafter(np.finfo(np.float32).max, np.float32(0))
         (dout,) = _normal(seed + 1, (ROWS, 1, 1, 16))
         return (np.zeros((ROWS, 1, 1, 16), np.float32), np.zeros((ROWS, keys, 1, 16), np.float32), value,
                 None, dout * np.float32(2.0 ** -8))
     return draw
+
+
+def _at_the_limit(keys: int):
+    # Values in fp32's top binade's last 0.08%, [3.4e38, its largest], and the limit itself (`_large_values`).
+    return _large_values(keys, float(np.finfo(np.float32).max), 3.4e38, at_limit=True)
 
 
 def _drawn(queries, keys, width=16, rows=ROWS, size=1.0, heads=2):
@@ -508,6 +525,32 @@ def _slices(seed):
     (dout,) = _normal(seed + 1, (ROWS, 1, 1, 16))
     return (np.zeros((ROWS, 1, 1, 16), np.float32), np.zeros((ROWS, 64, 1, 16), np.float32), value, None,
             dout * np.float32(2.0 ** -8))
+
+
+SPLIT_KEYS = 1024
+"""A split decode step's keys: enough key tiles for its plan to cut its row into slices, each twice its
+ring's stages of them (`attention_decode.plan`)."""
+
+
+def _split_at_the_limit(seed):
+    # Two rows of one query over `SPLIT_KEYS` keys, a decode step whose plan cuts each row into slices: key 0
+    # at logit 0 and the last key at a logit near -ln 29, their values in fp32's top binade's last 0.08%
+    # ([3.4e38, its largest]), every other key's logit far below and its value 0. Each slice's output is
+    # near fp32's largest at a total near 1, their shares near 29/30 and 1/30, whose sum a merge passed
+    # fp32's largest with (row 6826).
+    width = 64
+    query = np.zeros((2, 1, 1, width), np.float32)
+    query[..., 0] = 1.0
+    logits = np.full((2, SPLIT_KEYS), -1000.0, np.float32)
+    logits[:, 0] = 0.0
+    logits[:, -1] = -np.log(29.0) * _uniform(seed, 0.9, 1.1, (2,))
+    key = np.zeros((2, SPLIT_KEYS, 1, width), np.float32)
+    key[:, :, 0, 0] = logits * np.float32(np.sqrt(width))
+    value = np.zeros((2, SPLIT_KEYS, 1, width), np.float32)
+    largest = float(np.finfo(np.float32).max)
+    value[:, [0, SPLIT_KEYS - 1]] = _uniform(seed + 1, 3.4e38, largest, (2, 2, 1, width))
+    (dout,) = _normal(seed + 2, (2, 1, 1, width))
+    return query, key, value, None, dout * np.float32(2.0 ** -8)
 
 
 def _resumed(seed):
@@ -657,17 +700,6 @@ def _families() -> dict[str, Family]:
         # Folded at scale 1/4, the backward takes the base-2 maximum back to natural units, which near fp32's
         # largest rounds the key's own weight away from 1, as at logits near 1e30.
         "a logit near fp32's largest at scale 1/4": Family(_near_max_logit(16), _kept(1, 1), folded=False),
-        "values near fp32's largest over 2 equal keys": Family(_large_values(2), _kept(1, 2), folded=False,
-                                                               overflows=True),
-        "values near fp32's largest over 64 equal keys": Family(_large_values(64), _kept(1, 64),
-                                                                folded=False, overflows=True),
-        # Eight key tiles of 32 (`PINS`, a decode step's `BLOCK`): a walk's chain of its tiles' sums errs past
-        # the reference's, which sums a row whole, unless the walk keeps their additions' roundings
-        # (`algebra.compensates`).
-        "values near fp32's largest over 256 equal keys": Family(_large_values(256), _kept(1, 256),
-                                                                 folded=False, overflows=True),
-        "values near fp32's largest over 2 equal keys, bfloat16": Family(
-            _large_values(2, top=3.3e38), _kept(1, 2), folded=False, overflows=True, dtype="bfloat16"),
         # A key at its row's maximum weighs 1 exactly in the accurate form; the fold's contracted weight is
         # 1 within an ulp of its logit's exponent.
         "one key": Family(_drawn(4, 1), _kept(4, 1), folded=False),
@@ -752,7 +784,29 @@ def _families() -> dict[str, Family]:
             dtype=dtype, drawn_in=lambda dtype: functools.partial(_separated_rows, dtype=dtype))
            for dtype in ("float32", "bfloat16")},
     }
-    return {**families, **_structured_families()}
+    return {**families, **_large_value_families(), **_structured_families()}
+
+
+def _large_value_families() -> dict[str, Family]:
+    """The families of equal logits over values near fp32's largest (`_families`'), whose weighted sums pass
+    it where the reference's normalized mean does not: to 3.4e38, and at fp32's limit itself."""
+    return {
+        "values near fp32's largest over 2 equal keys": Family(_large_values(2), _kept(1, 2), folded=False,
+                                                               overflows=True),
+        "values near fp32's largest over 64 equal keys": Family(_large_values(64), _kept(1, 64),
+                                                                folded=False, overflows=True),
+        # Eight key tiles of 32 (`PINS`, a decode step's `BLOCK`): a walk's chain of its tiles' sums errs past
+        # the reference's, which sums a row whole, unless the walk keeps their additions' roundings
+        # (`algebra.compensates`).
+        "values near fp32's largest over 256 equal keys": Family(_large_values(256), _kept(1, 256),
+                                                                 folded=False, overflows=True),
+        "values near fp32's largest over 2 equal keys, bfloat16": Family(
+            _large_values(2, top=3.3e38), _kept(1, 2), folded=False, overflows=True, dtype="bfloat16"),
+        "values at fp32's largest over 2 equal keys": Family(_at_the_limit(2), _kept(1, 2), folded=False,
+                                                             overflows=True),
+        "values at fp32's largest over 256 equal keys": Family(_at_the_limit(256), _kept(1, 256),
+                                                               folded=False, overflows=True),
+    }
 
 
 def _structured_families() -> dict[str, Family]:
@@ -775,6 +829,8 @@ def _structured_families() -> dict[str, Family]:
 
     families["two finite slices whose merge overflows"] = Family(_slices, _kept(1, 64), splits=2,
                                                                  folded=False, overflows=True)
+    families["values at fp32's largest across a split decode's slices"] = Family(
+        _split_at_the_limit, _kept(1, SPLIT_KEYS, rows=2), splits=4, overflows=True, decode_only=True)
 
     families["a resumed state of a large denominator"] = Family(_resumed, np.ones((RESUMED, 1, 1, 2), bool),
                                                                 folded=False)
@@ -1096,6 +1152,26 @@ def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
     default_is_finite(family, "portable")
 
 
+@pytest.mark.skipif(not INTERPRETED, reason="an H100 runs these families in `_mainloops`' Mosaic arms")
+@pytest.mark.parametrize("family", ["values at fp32's largest over 2 equal keys",
+                                    "values at fp32's largest over 256 equal keys"])
+def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_reference_interpreted(family):
+    """The Mosaic forward in fp32, interpreted on a CPU as an H100 runs it, over values at fp32's limit: check
+    1 over the family's draws, where it summed its operands' bf16 parts and its products' pairs largest first
+    and passed fp32's largest before the smaller terms took it back (inf over 2 keys already, row 6842). A
+    GPU runs it in `_mainloops`' Mosaic arms."""
+    seeds, family = SEEDS[family], FAMILIES[family]
+
+    def forward(query, key, value, extra):
+        with generation.assumed("sm90"):
+            spans = _spans(family, query, key)
+            return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
+
+    assert_as_exact(jax.jit(forward), as_given(jax.jit(_reference(family, anchored=False))),
+                    lambda seed: _cast(family, family.draw)(seed)[:4], "mosaic forward at fp32's limit",
+                    seeds=seeds, truth_fn=_reference(family, anchored=True))
+
+
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 def test_an_unseen_keys_value_past_fp32s_largest_takes_no_part_in_a_gradient(dtype):
     """A row's unseen keys whose values pass fp32's largest in their first column under a cotangent on every
@@ -1401,11 +1477,12 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
 
 
 TEMPLATE_DECODED = list(dict.fromkeys(family for family, _ in DECODED
-                                     if jnp.dtype(FAMILIES[family].dtype).itemsize == 2
-                                     and not FAMILIES[family].decode_only))
+                                     if not FAMILIES[family].decode_only or FAMILIES[family].splits > 1))
 """The decode steps the template's decode takes (`attention_decode.attend`), in its one form, the raw fold
-(no fold's reach, as the decode kernel's): 16-bit operands; a decode step's alone (`Family.decode_only`) too
-long for its interpreted mainloop."""
+(no fold's reach, as the decode kernel's): 16-bit and fp32 operands (an fp32 step's operands as their bf16
+parts, `MosaicForward.parts`); a decode step's alone (`Family.decode_only`) where it is a split one
+(`Family.splits`), whose merge the template's plan reaches over its keys, else too long for its interpreted
+mainloop."""
 
 
 @pytest.mark.skipif(not INTERPRETED and generation.device_generation() != "sm90",

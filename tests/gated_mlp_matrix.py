@@ -15,6 +15,8 @@ What the route serves is read from the fused MLP's own selector: the layer trace
 generation with it named, the route its choice reports the `fused` kernel.
 """
 
+import contextlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -65,6 +67,17 @@ def supported(case: dict[str, str]) -> bool:
     return [route.kernel for route in routes if route.choice == "gated_mlp"] == ["fused"]
 
 
+def _drawing(layer: GatedMLP, dtype):
+    """A draw of `layer`'s step by seed: its parameters (drawn once), an input and its output's cotangent."""
+    params = layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype))
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed))
+        return (params, *(jax.random.normal(drawn, (*ROWS, FEATURES)).astype(dtype) for drawn in keys))
+
+    return draw
+
+
 CASES = (
     ('sm90', 'swiglu', 'none', 'bfloat16'),
     ('sm90', 'geglu', 'clamped', 'float16'),
@@ -88,11 +101,7 @@ def a_fused_mlps_training_step_is_on_par(case: tuple[str, ...]) -> None:
     combination = dict(zip(AXES["gated_mlp"], case, strict=True))
     layer = _layer(combination)
     dtype = jnp.dtype(combination["dtype"])
-    params = layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype))
-
-    def draw(seed):
-        keys = jax.random.split(jax.random.key(seed))
-        return (params, *(jax.random.normal(drawn, (*ROWS, FEATURES)).astype(dtype) for drawn in keys))
+    draw = _drawing(layer, dtype)
 
     def under(kernel, run):
         def arm(*operands):
@@ -105,3 +114,40 @@ def a_fused_mlps_training_step_is_on_par(case: tuple[str, ...]) -> None:
         assert_as_exact(under("fused", run), under("apart", run), draw, "-".join(case), seeds=SEEDS,
                         truth_fn=truth)
     assert ("gated_mlp", "fused") in {(found.choice, found.kernel) for found in routes}
+
+
+def per_shard(choice: str, kernel: str) -> dict:
+    """`kernel`'s per-shard cells (`sharded.Shard`, tests/test_per_shard.py): the layer of the first case its
+    generation runs interpreted (`CASES`, an sm90's) over rows a two-device data axis splits, its parameters
+    whole, its three products fused (`kernel`, interpreted on the CPU's devices), its other choices as every
+    cell names them (`NAMED`): the output and every gradient on par with one device's from the layer in
+    float64."""
+    from flax import linen as nn
+    from jax.sharding import PartitionSpec
+    from sharded import Shard
+
+    from dew.distributed.placement import Layout
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.sharding import placing
+
+    del choice, kernel
+    case = dict(zip(AXES["gated_mlp"], next(case for case in CASES if case[0] == "sm90"), strict=True))
+    layer = _layer(case)
+    draw = _drawing(layer, jnp.dtype(case["dtype"]))
+
+    def truth(*operands):
+        # The layer apart in float64 through XLA's products, which a float64 product runs on.
+        with generation.chosen(grouped_matmul="xla", gated_mlp="apart"):
+            return with_gradients(layer.clone(dtype=jnp.float64).apply)(*operands)
+
+    def scope():
+        # The trainer's step traces under its layout (`placing`), which a product's map reads.
+        stack = contextlib.ExitStack()
+        for context in (generation.chosen(**NAMED), nn.logical_axis_rules(DEFAULT_RULES),
+                        placing(Layout(min_shard=1))):
+            stack.enter_context(context)
+        return stack
+
+    return {"data": Shard(with_gradients(layer.apply), draw,
+                          lambda mesh: [PartitionSpec(), PartitionSpec("data"), PartitionSpec("data")],
+                          truth, SEEDS, "data", context=scope)}

@@ -20,7 +20,7 @@ from typing import Literal, overload
 import jax
 import jax.numpy as jnp
 
-from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
+from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import generation, selection
 from dew.nn.kernels.templates import attention_decode, attention_mosaic, attention_portable, attention_triton
 from dew.nn.kernels.templates.attention import (
@@ -284,8 +284,10 @@ def _attend_backward(config: _Config, saved: tuple, dout: jax.Array) -> tuple:
     narrow_query, narrow_key, _ = config.narrowed(query, key, value)
     dquery, query_params = _pulled(narrow_query, hooks.query_mod, hooks.query_params, grads.query)
     dkey, key_params = _pulled(narrow_key, hooks.key_mod, hooks.key_params, grads.key)
-    return (dquery.astype(query.dtype), dkey.astype(key.dtype), grads.value.astype(value.dtype),
-            None, _hooks_cotangent(hooks, grads, query_params, key_params))
+    inputs, hooked = with_gradients_formed(
+        (dquery.astype(query.dtype), dkey.astype(key.dtype), grads.value.astype(value.dtype)),
+        _hooks_cotangent(hooks, grads, query_params, key_params))
+    return (*inputs, None, hooked)
 
 
 def _pulled(operand: jax.Array, mod, params: tuple[Param, ...], cotangent: jax.Array

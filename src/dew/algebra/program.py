@@ -12,7 +12,6 @@ import contextlib
 import dataclasses
 import functools
 import math
-import threading
 import time
 import weakref
 from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping
@@ -22,9 +21,11 @@ import jax.numpy as jnp
 import numpy as np
 from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, set_
 from jax._src import api_util, config as jax_config
+from jax._src.interpreters import partial_eval
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
 
+from dew import _cache
 from dew._cache import ALGEBRA, KERNEL_CHOICES
 from dew.algebra import cost, extract, fusion, rules, terms
 from dew.algebra.extract import Linear
@@ -238,9 +239,10 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jco
     spliced: dict[int, list[jcore.JaxprEqn]] = {}
     windows = _windows(jaxpr)
     deriving = _deriving(accurate, saturation) if windows else None
+    held = _held(jaxpr) if windows else {}
     for window, yielded in windows:
         began = time.perf_counter()
-        done, reused = _derived(window, accurate, saturation, deriving)
+        done, reused = _derived(window, accurate, saturation, deriving, _declared(window, held))
         seconds = time.perf_counter() - began
         landed = _splices(window, yielded, done, made_by, spliced) if done.picked else {}
         spliced.update(landed)
@@ -260,10 +262,8 @@ distinct windows of the steps it compiles (161 of the 2,799 a UNet's planner tra
 33 ms on average to derive again; row 3764)."""
 
 _DERIVED: collections.OrderedDict[Hashable, Rewrite] = collections.OrderedDict()
-"""Each window's rewrite by what derived it (`_derived`), the least recently read first."""
-
-_HOLDING = threading.Lock()
-"""Held while `_DERIVED` is read or written: compiles trace on several threads."""
+"""Each window's rewrite by what derived it (`_derived`, held through `_cache.holding`), the least recently
+read first."""
 
 
 def structure(window: jcore.Jaxpr) -> Hashable:
@@ -304,24 +304,40 @@ def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
             rules.admitted_names(accurate))
 
 
-def _derived(window: jcore.Jaxpr, accurate: bool, saturation: Saturation,
-             deriving: Hashable) -> tuple[Rewrite, bool]:
-    """`window`'s rewrite (`_region`) and whether an earlier window derived it: one derivation for each
-    structure (`structure`) and what else it reads (`deriving`, `_deriving`), the process's latest
-    `WINDOWS_HELD` kept. The planner's candidates and a resumed run's relowering trace one step's program
-    again and again, each window of it as the last trace's."""
-    key = (structure(window), deriving)
-    with _HOLDING:
-        done = _DERIVED.get(key)
-        if done is not None:
-            _DERIVED.move_to_end(key)
-            return done, True
-    done = _region(window, accurate=accurate, saturation=saturation)
-    with _HOLDING:
-        _DERIVED[key] = done
-        if len(_DERIVED) > WINDOWS_HELD:
-            _DERIVED.popitem(last=False)
-    return done, False
+def _held(jaxpr: jcore.Jaxpr) -> dict[jcore.Var, terms.Magnitude | None]:
+    """Each value's magnitude `jaxpr` proves (`terms.Region.held`, its structure's alone, `terms.Skeleton`),
+    its constants taken as inputs: what its windows read of the values they take from outside them."""
+    opened = jaxpr.replace(constvars=[], invars=[*jaxpr.constvars, *jaxpr.invars])
+    return terms.region(opened, forms=terms.Skeleton).held
+
+
+def _declared(window: jcore.Jaxpr, held: Mapping[jcore.Var, terms.Magnitude | None]) -> dict[int, float]:
+    """The ranges `window`'s inputs hold (`terms.Ranges`, by input index): each one's magnitude the program
+    proves where it bounds one (`_held`), as its power of two, so a bound a window cuts its equations below
+    holds within it: a rule's operand made outside a window is bounded as the program bounds it (a scale's
+    under a broadcast, three equations below the sum that reads it), where it would read no bound at all."""
+    declared = {}
+    for index, var in enumerate(window.invars):
+        bound = held.get(var)
+        if bound is not None and bound < 1024:
+            declared[index] = 0.0 if bound == terms.NOTHING else math.ldexp(1.0, bound)
+    return declared
+
+
+def _derived(window: jcore.Jaxpr, accurate: bool, saturation: Saturation, deriving: Hashable,
+             ranges: Mapping[int, float]) -> tuple[Rewrite, bool]:
+    """`window`'s rewrite (`_region`, its inputs' `ranges`) and whether an earlier window derived it: one
+    derivation for each structure (`structure`), its inputs' ranges and what else it reads (`deriving`,
+    `_deriving`), the process's latest `WINDOWS_HELD` kept. The planner's candidates and a resumed run's
+    relowering trace one step's program again and again, each window of it as the last trace's."""
+    key = (structure(window), tuple(sorted(ranges.items())), deriving)
+    derived = []
+
+    def deriving_once() -> Rewrite:
+        derived.append(True)
+        return _region(window, accurate=accurate, saturation=saturation, ranges=ranges)
+    done = _cache.holding(_DERIVED, key, deriving_once, WINDOWS_HELD)
+    return done, not derived
 
 
 def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
@@ -430,7 +446,8 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
     return windows
 
 
-def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> Rewrite:
+def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation,
+            ranges: terms.Ranges = None) -> Rewrite:
     """`closed`'s roots' forms, its bodies already rewritten, chosen together from its terms saturated under
     the admitted rule sets where they are cheaper than the region as traced (`cost.cheaper`), and the report
     of the rewrite. A region no admitted set may change (`rules.firing`: one no reordering may touch, where
@@ -441,7 +458,7 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
     began = time.perf_counter()
     admitted = rules.admitted(accurate)
     # A window's structure decides first, its egglog terms built only where a rule may fire.
-    skeleton = terms.region(closed, forms=terms.Skeleton)
+    skeleton = terms.region(closed, ranges, forms=terms.Skeleton)
     firing = rules.firing(admitted, skeleton)
     if not firing:
         fired = dict.fromkeys((sets.name for sets in admitted), 0)
@@ -449,7 +466,7 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
                                iterations=0, nodes=0, limited=False, before=None, after=None,
                                seconds=time.perf_counter() - began)
         return Rewrite(skeleton, {}, report)
-    region = terms.region(closed)
+    region = terms.region(closed, ranges)
     priced = cost.model(region, cost.fused(cost.target()))
     graph, bundle, roots = graphed(region)
     graph.push()
@@ -724,13 +741,28 @@ def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kern
     consumers where the GEMM template takes them and its attention and norms written as Dew's where a kernel
     of Dew's takes them (`fusion.fused_program`), whatever the numerics admit: accurate forms limit
     reassociation alone (row 4730). The program with its spans kept as traced where no window's form lands
-    (`closed` itself where nothing changed)."""
-    made = _within(closed, accurate, saturation, kernels)
+    (`closed` itself where nothing changed). The pass reads the program without its unread work (`_read`),
+    so nothing it discards is derived, written as a kernel, certified or built."""
+    read = _read(closed)
+    made = _within(read, accurate, saturation, kernels)
     if _saturating(accurate):
         opened = _opened(made)
         windowed = _windowed(opened, accurate, saturation)
         made = made if windowed is opened else windowed
-    return fusion.fused_program(made) if kernels else made
+    made = fusion.fused_program(made) if kernels else made
+    return closed if made is read else made
+
+
+def _read(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`jaxpr`'s equations without the work none of its outputs reads, its binders as its callers bind them:
+    JAX's dead-code elimination (`partial_eval.dce_jaxpr`), whose rules enter every region, a call, a marked
+    span (`create_call_primitive`'s), a checkpoint, a custom derivative, a loop, and keep of it what is read
+    and every effect. A start's model forward is such work: flax makes the parameters inside it, so a block's
+    region both makes what the start keeps and computes what it never reads, which a walk of the program's
+    own equations alone keeps whole (row 6783: lm-moe's start certified and built two grouped launches of
+    its forward, 7.9 s of its compile, which XLA then dropped)."""
+    kept, _ = partial_eval.dce_jaxpr(jaxpr, used_outputs=True, instantiate=True)
+    return jaxpr.replace(eqns=kept.eqns)
 
 
 def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:

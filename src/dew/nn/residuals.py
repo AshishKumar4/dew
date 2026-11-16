@@ -21,7 +21,9 @@ class Residual(enum.StrEnum):
     and memory (with `w` and the corrected values) the port saves for its
     backward (`dew.nn.kernels.fla_gdn`), `memory_carry` an in-context memory's
     network and momentum as each chunk of its scan hands them on
-    (`dew.nn.memory.CARRY`), and the MLP names cover the dense MLP
+    (`dew.nn.memory.CARRY`), `memory_chunk` the values a chunk of its scan
+    computes for its backward (each token's inner gradients and steps), which a
+    rung recomputing it has the chunk recompute from its carry, and the MLP names cover the dense MLP
     and the routed experts alike. A remat policy picks from these; a
     name off the list is a typo that would otherwise recompute silently."""
 
@@ -39,6 +41,7 @@ class Residual(enum.StrEnum):
     DELTA_INVERSE = 'delta_inverse'
     DELTA_MEMORY = 'delta_memory'
     MEMORY_CARRY = 'memory_carry'
+    MEMORY_CHUNK = 'memory_chunk'
     GATE_PROJ = 'gate_proj'
     UP_PROJ = 'up_proj'
     DOWN_PROJ = 'down_proj'
@@ -52,8 +55,8 @@ MLP_RESIDUALS = (Residual.GATE_PROJ, Residual.UP_PROJ, Residual.DOWN_PROJ)
 """A feed-forward's names, the dense MLP's and the routed experts' alike."""
 DELTA_RESIDUALS = (Residual.DELTA_DECAY, Residual.DELTA_INVERSE, Residual.DELTA_MEMORY)
 """A delta rule's saved names (`dew.nn.kernels.fla_gdn`)."""
-MEMORY_RESIDUALS = (Residual.MEMORY_CARRY,)
-"""An in-context memory's carry (`dew.nn.memory.CARRY`)."""
+MEMORY_RESIDUALS = (Residual.MEMORY_CARRY, Residual.MEMORY_CHUNK)
+"""An in-context memory's carry (`dew.nn.memory.CARRY`) and its chunks' own values (`dew.nn.memory.CHUNK`)."""
 RESIDUALS = tuple(Residual)
 """Every name a block marks (`Residual`): a remat policy picks from these, a name off them a typo that would
 otherwise recompute silently."""

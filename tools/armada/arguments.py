@@ -69,7 +69,7 @@ def parser(pythons: Sequence[str], deadline: float) -> argparse.ArgumentParser:
     itemizing.add_argument("--target", type=float, required=True)
     itemizing.add_argument("--timings", type=Path, required=True)
     itemizing.add_argument("--scenarios", action="store_true",
-                           help="the scenario suite's tasks alone (ci.py SCENARIO_SUITE)")
+                           help="the scenario suite's tasks alone (coverage_report.py SCENARIO_SUITE)")
     reporting = stages.add_parser("report")
     reporting.add_argument("directory", type=Path)
     tier_arguments(operations.add_parser("gpu-tier"))

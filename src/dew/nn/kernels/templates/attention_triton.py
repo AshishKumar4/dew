@@ -27,6 +27,7 @@ from dew.nn.kernels.templates import (
     attention_gradient as gradient,
     attention_program as program,
     axes,
+    outputs,
     report,
     resources,
 )
@@ -60,7 +61,7 @@ from dew.nn.kernels.templates.attention import (
     scored,
     within,
 )
-from dew.nn.kernels.templates.base import Template, Unfitted
+from dew.nn.kernels.templates.base import Template
 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 """The operand dtypes the kernels take, one on queries, keys and values alike."""
@@ -184,7 +185,11 @@ def unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     another mainloop rather than a launch that cannot run; the backward's own launches hold the same tiles'
     operands."""
     op, args, _ = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
-    for each in op.launched_ops(value.dtype) if certified else (op,):
+    # A scaled op before the common op whose walk launches it (`_fwd`'s `rare`), whatever order
+    # `launched_ops` lists them in: certifying the common op traces the scaled op's call, which raised
+    # Exhausted where every config of it spilled, before its own refusal was read (train 934's F2).
+    ops = sorted(op.launched_ops(value.dtype), key=lambda each: not each.scaled)
+    for each in ops if certified else (op,):
         refused = _holding(each, each.bind(*args, residuals=_kept(residuals), interpret=False), "forward",
                            certified=certified)
         if refused is not None:
@@ -200,12 +205,11 @@ def _holding(op: Template, ba: tokamax.BoundArguments, launch: str, *, certified
     if not op.fits(ba, target):
         return Refusal('resources', f"no config of the Triton mainloop's {launch} fits the GPU's block and "
                        "registers")
-    if certified:
-        try:
-            op._certified(ba, op.derived(ba, target))
-        except Unfitted:
-            return Refusal('resources', f"every config of the Triton mainloop's {launch} spills as "
-                           f"{target.generation}'s assembler builds it")
+    # The launch's certified answer (`Template.holds`: its call's own taking, none where every config spills),
+    # the one decision its call reads back.
+    if certified and not op.holds(ba):
+        return Refusal('resources', f"every config of the Triton mainloop's {launch} spills as "
+                       f"{target.generation}'s assembler builds it")
     return None
 
 
@@ -407,16 +411,19 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             in_specs += [pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))] * 2
             in_specs.append(pl.BlockSpec((None, None, block_q, value_width), lambda i, b, h: (b, h, i, 0)))
             arrays += [m0, total0, acc0]
-        out_shape = [jax.ShapeDtypeStruct((batch, queries, heads, value_width), query.dtype)]
+        # Its outputs as its query's and value's axes (`outputs.Output`).
+        rows, positions, heads_of = (outputs.axis(query, index) for index in range(3))
+        columns = outputs.axis(value, -1)
+        out_shape = [outputs.output(query.dtype, rows, positions, heads_of, columns)]
         out_specs = [pl.BlockSpec((None, block_q, None, value_width), lambda i, b, h: (b, i, h, 0))]
         per_row = pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))
         if residuals is not Kept.NONE:
-            out_shape += [jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 2
+            out_shape += [outputs.output(jnp.float32, rows, heads_of, positions)] * 2
             out_specs += [per_row, per_row]
         if residuals is Kept.SPLIT:
-            out_shape += [jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32),
-                          jax.ShapeDtypeStruct((batch, heads, queries, value_width), jnp.float32),
-                          *[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 3]
+            out_shape += [outputs.output(jnp.int32, rows, heads_of, positions),
+                          outputs.output(jnp.float32, rows, heads_of, positions, columns),
+                          *[outputs.output(jnp.float32, rows, heads_of, positions)] * 3]
             per_value = pl.BlockSpec((None, None, block_q, value_width), lambda i, b, h: (b, h, i, 0))
             out_specs += [per_row, per_value, per_row, per_row, per_row]
         # A call's own key count, none included; an op built without one counts its launch's keys. A scaled
@@ -432,7 +439,7 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         launch = functools.partial(
             launches.pallas_call, grid=(queries // block_q, batch, heads), interpret=interpret,
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages))
-        rowed = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
+        rowed = outputs.output(jnp.float32, rows, heads_of, positions)
         def named(form: algebra.Forward) -> str:
             # Each form's launch named apart, as the Mosaic mainloop's are: the fold's natural rewalk
             # (`algebra.unfolded`) beside the call's own form, and a scaled walk beside its unscaled form
@@ -1100,6 +1107,11 @@ def _backward_registers(ba: tokamax.BoundArguments, config: BackwardTiles, *, dq
     return (config.block_k * (width + value_width) + tile) // (32 * config.dkv_warps)
 
 
+def _like(param: jax.Array) -> outputs.Output:
+    """A score hook parameter's gradient, fp32, as the parameter's own axes (`outputs.Output`)."""
+    return outputs.output(jnp.float32, *(outputs.axis(param, index) for index in range(param.ndim)))
+
+
 def _geometry(query, key, value, start, end, query_ids, key_ids, block_q: int, block_k: int):
     """A backward launch's sizes (rows, padded queries, query heads, widths, padded keys, a key head's
     group) and the spans' block map at its tiles."""
@@ -1152,18 +1164,20 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
     for param, kind in zip(score_params, score_kinds, strict=True):
         in_specs.append(_param_spec(kind, param, block_q, keys))
         arrays.append(param)
-    out_shape = [jax.ShapeDtypeStruct(query.shape, jnp.float32),
-                 *[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 6,
-                 jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32)]
+    # Its outputs as its query's and parameters' axes (`outputs.Output`).
+    rows, positions, heads_of, depth = (outputs.axis(query, index) for index in range(4))
+    out_shape = [outputs.output(jnp.float32, rows, positions, heads_of, depth),
+                 *[outputs.output(jnp.float32, rows, heads_of, positions)] * 6,
+                 outputs.output(jnp.int32, rows, heads_of, positions)]
     out_specs = [pl.BlockSpec((None, block_q, None, width), lambda i, b, h: (b, i, h, 0)),
                  *[per_head] * 7]
     for param, kind in zip(score_params, score_kinds, strict=True):
         match kind:
             case Kind.HEAD:
-                out_shape.append(jax.ShapeDtypeStruct((queries // block_q, batch, heads, 1), jnp.float32))
+                out_shape.append(outputs.output(jnp.float32, positions // block_q, rows, heads_of, 1))
                 out_specs.append(pl.BlockSpec((None, None, None, 1), lambda i, b, h: (i, b, h, 0)))
             case Kind.QUERY:
-                out_shape.append(jax.ShapeDtypeStruct(param.shape, jnp.float32))
+                out_shape.append(_like(param))
                 out_specs.append(per_head)
     kernel = functools.partial(_dq_kernel, ids=ids, score_kinds=score_kinds,
                                score_mod=score_mod, scale=scale, prescale=prescale, grad_scale=grad_scale,
@@ -1209,14 +1223,16 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     for param, kind in zip(score_params, score_kinds, strict=True):
         in_specs.append(_key_param_spec(kind, param, queries, block_k))
         arrays.append(param)
-    out_shape = [jax.ShapeDtypeStruct((batch, keys, heads, width), jnp.float32),
-                 jax.ShapeDtypeStruct((batch, keys, heads, value_width), jnp.float32)]
+    # Its outputs as its operands' axes (`outputs.Output`): each query head's dK and dV over the keys.
+    rows, heads_of, padded = outputs.axis(query, 0), outputs.axis(query, 2), outputs.axis(key, 1)
+    out_shape = [outputs.output(jnp.float32, rows, padded, heads_of, outputs.axis(query, 3)),
+                 outputs.output(jnp.float32, rows, padded, heads_of, outputs.axis(value, 3))]
     out_specs = [pl.BlockSpec((None, block_k, None, width), lambda j, b, h: (b, j, h, 0)),
                  pl.BlockSpec((None, block_k, None, value_width), lambda j, b, h: (b, j, h, 0))]
     aliases = {}
     for param, kind in zip(score_params, score_kinds, strict=True):
         if kind == Kind.KEY:
-            out_shape.append(jax.ShapeDtypeStruct(param.shape, jnp.float32))
+            out_shape.append(_like(param))
             out_specs.append(pl.BlockSpec((None, None, block_k), lambda j, b, h: (b, h, j)))
         elif kind == Kind.TILE:
             # Entries no program visits keep their zeros: the output aliases a zero input.
@@ -1224,7 +1240,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             aliases[len(arrays)] = len(out_shape)
             in_specs.append(columns)
             arrays.append(launches.filled(param.shape, jnp.float32, query, dout))
-            out_shape.append(jax.ShapeDtypeStruct(param.shape, jnp.float32))
+            out_shape.append(_like(param))
             out_specs.append(columns)
     kernel = functools.partial(_dkv_kernel, ids=ids, score_kinds=score_kinds,
                                score_mod=score_mod, scale=scale, prescale=prescale, grad_scale=grad_scale,

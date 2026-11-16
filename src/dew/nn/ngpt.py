@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
-from dew.nn.derivatives import Algebra, contracted
+from dew.nn.derivatives import Algebra, contracted, with_gradients_formed
 from dew.nn.kernels.generation import linear_tangent, unbroadcast
 from dew.nn.precision import L2NORM_EPS, at_least_fp32, l2_squares, l2_unit
 
@@ -139,8 +139,11 @@ def _stepped_backward(scale: float, saved, operands, cotangent) -> tuple[jax.Arr
     # pulls them back: its derivative at zero and its sums over each broadcast axis.
     _, rated = jax.vjp(lambda alpha: jnp.broadcast_to(jnp.abs(alpha.astype(wide) * scale), step.shape), alpha)
     (d_alpha,) = rated(d_joined * (end - start))
-    return (unbroadcast(d_residual, residual.shape).astype(residual.dtype),
-            unbroadcast(d_branch, branch.shape).astype(branch.dtype), d_alpha.astype(alpha.dtype))
+    # The rows' cotangents leave only with the rate's gradient formed (`with_gradients_formed`).
+    rows_out, d_alpha = with_gradients_formed(
+        (unbroadcast(d_residual, residual.shape).astype(residual.dtype),
+         unbroadcast(d_branch, branch.shape).astype(branch.dtype)), d_alpha.astype(alpha.dtype))
+    return (*rows_out, d_alpha)
 
 
 def normed_hidden(gate: jax.Array, up: jax.Array, gate_gain: jax.Array, up_gain: jax.Array, factor: float,
@@ -194,9 +197,12 @@ def _hidden_backward(factor: float, product, saved, operands, cotangent):
     d_gated = d_gated.astype(gate.dtype).astype(gated.dtype)
     d_upped = d_upped.astype(up.dtype).astype(gated.dtype)
     leading = tuple(range(gate.ndim - 1))
-    return ((d_gated * gains[0]).astype(gate.dtype), (d_upped * gains[1]).astype(up.dtype),
-            (jnp.sum(d_gated * gate.astype(gated.dtype), axis=leading) * factor).astype(gate_gain.dtype),
-            (jnp.sum(d_upped * up.astype(gated.dtype), axis=leading) * factor).astype(up_gain.dtype))
+    # The rows' cotangents leave only with the gains' gradients formed (`with_gradients_formed`).
+    rows_out, gains_out = with_gradients_formed(
+        ((d_gated * gains[0]).astype(gate.dtype), (d_upped * gains[1]).astype(up.dtype)),
+        ((jnp.sum(d_gated * gate.astype(gated.dtype), axis=leading) * factor).astype(gate_gain.dtype),
+         (jnp.sum(d_upped * up.astype(gated.dtype), axis=leading) * factor).astype(up_gain.dtype)))
+    return (*rows_out, *gains_out)
 
 
 def gain(scale: jax.Array, factor: float, dtype: DTypeLike | None) -> jax.Array:

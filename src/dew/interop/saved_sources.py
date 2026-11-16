@@ -31,9 +31,9 @@ from dew._builds import dew_cache_dir
 from dew._cache import package_digest
 from dew._coordination import agreed_same, from_every_process, reading_home, seen_by_every_process
 from dew._files import staged, write_atomically
-from dew._records import JSON, json_value
+from dew._records import JSON, json_value, mapped_strings, strings_of
 from dew.checkpoints import RUN_FILE
-from dew.registry import trust_sources, trusts_source
+from dew.registry import from_record, to_record, trust_sources, trusts_source
 
 if TYPE_CHECKING:
     from flax import linen as nn
@@ -239,7 +239,6 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
     from dew.inference.images import ImageSettings, TextToImage, restored_tree
     from dew.inference.tasks import saved_settings
     from dew.objectives.diffusion.objective import without_loss_heads
-    from dew.registry import from_record
 
     if not samples_images(run):
         raise ValueError(f"{checkpoint} is a {run.objective.__name__} run, which Pretrained.load reads; a "
@@ -327,16 +326,13 @@ class Held:
 
     @classmethod
     def read(cls, value: JSON) -> Held:
-        """A release's record `value` (`record`), refused where it is not one."""
-        match value:
-            case {"run": str(run), "step": int(step), "ema": bool() | None as ema}:
-                return cls(run, step, ema)
-            case _:
-                raise ValueError(f"{value!r} is no record of the saved run a release holds")
+        """A release's record `value` (`record`), read by its fields' declarations (`registry.from_record`,
+        each scalar of its declared type), refused where it is not one."""
+        return from_record(cls, value)
 
-    def record(self) -> dict[str, JSON]:
-        """This as a release's record (`read`)."""
-        return {"run": self.run, "step": self.step, "ema": self.ema}
+    def record(self) -> JSON:
+        """This as a release's record (`registry.to_record`, which `read` reads)."""
+        return to_record(self, Held)
 
 
 def _write_held(release: Path, run: SavedRun, ema: bool | None) -> None:
@@ -353,7 +349,7 @@ def release_sources(record: Mapping[str, object]) -> dict[str, JSON]:
     cache = Path(dew_cache_dir()) / RELEASES
     sources: dict[str, JSON] = {}
     named = {key: json_value(field, key) for key, field in record.items() if key != RELEASE_SOURCES}
-    for name in _strings(named):
+    for name in strings_of(named):
         path = Path(name)
         if not path.is_absolute() or not path.is_relative_to(cache) or path == cache:
             continue
@@ -399,7 +395,7 @@ def releases_here(record: Mapping[str, object], *, mesh: MeshSpec | Mesh | None 
             f"this step reads the releases of saved runs that this host lacks, and the runs as well "
             f"({missing or 'on another process of the pool'}): place each run where its record names it")
     fields = {key: json_value(field, key) for key, field in record.items() if key != RELEASE_SOURCES}
-    names = _strings(fields)
+    names = list(strings_of(fields))
     renamed: dict[str, str] = {}
     sources = {root: json_value(source, root) for root, source in listed.items() if root not in held}
     for root, source in held.items():
@@ -414,33 +410,11 @@ def releases_here(record: Mapping[str, object], *, mesh: MeshSpec | Mesh | None 
         if str(here) != root:
             renamed.update({name: str(here / Path(name).relative_to(root)) for name in names
                             if Path(name).is_relative_to(root)})
-    return {**{key: _renamed(field, renamed) for key, field in fields.items()}, RELEASE_SOURCES: sources}
+    def here_named(text: str) -> str:
+        return renamed.get(text, text)
 
-
-def _strings(record: JSON) -> list[str]:
-    """Every string `record` holds at any depth."""
-    match record:
-        case str():
-            return [record]
-        case dict():
-            return [held for field in record.values() for held in _strings(field)]
-        case list():
-            return [held for element in record for held in _strings(element)]
-        case _:
-            return []
-
-
-def _renamed(record: JSON, names: Mapping[str, str]) -> JSON:
-    """`record` with each string `names` holds at any depth replaced by its new name."""
-    match record:
-        case str():
-            return names.get(record, record)
-        case dict():
-            return {key: _renamed(field, names) for key, field in record.items()}
-        case list():
-            return [_renamed(element, names) for element in record]
-        case _:
-            return record
+    return {**{key: mapped_strings(field, here_named) for key, field in fields.items()},
+            RELEASE_SOURCES: sources}
 
 
 def pooled_export(run: SavedRun, destination: Path, *, ema: bool | None = None,
@@ -500,7 +474,7 @@ def native_source[Loaded: Pretrained](kind: type[Loaded], source: str | Path, *,
     from dew.inference.tasks import cache_sized, saved_model
     from dew.interop.pretrained import Pretrained
     from dew.objectives.base import ReleasedTask
-    from dew.registry import ModelConfig, to_record
+    from dew.registry import ModelConfig
 
     built = [name for name, value in building.items() if value is not None and value is not False]
     if built:

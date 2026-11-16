@@ -50,6 +50,8 @@ from dew.nn.derivatives import (
     declared_derivative,
     declared_tangent,
     surrogate,
+    with_gradients_formed_at,
+    with_tangents_formed,
 )
 from dew.nn.nested import nested
 from dew.nn.programs import UNROUNDED, equations
@@ -61,9 +63,10 @@ __all__ = [
     "FP8",
     "FP32_SUMS",
     "L2NORM_EPS",
-    "LOW_PRECISION_RECIPES",
     "MATMUL_PRECISIONS",
+    "MXFP8",
     "NUMERICS_PRESETS",
+    "NVFP4",
     "PROJECTION_ROLES",
     "ROUNDING_STREAM",
     "WIDE_CPU_ARITHMETIC",
@@ -128,6 +131,7 @@ __all__ = [
     "spread",
     "sqrt_or_zero",
     "stochastic_bf16",
+    "twice_scaled",
     "two_product",
     "two_sum",
     "weighted_total",
@@ -242,14 +246,49 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
     at fp32, the gradient sums at fp32 and rounds once into the bias. A CPU running Dew's wide
     arithmetic (`WIDE_CPU_ARITHMETIC`) sums it in float64, as it sums a float32 product (`spread`).
-    """
+
+    Its reverse mode returns the product's cotangent only with the bias's gradient formed (the rule's
+    dual, `with_tangents_formed`): XLA's sum of a bias's gradient, a reduction over every row of the
+    cotangent, was put off to a step's end, each layer's cotangent held to it (a biased attention decoder's
+    temporaries grew 27 MB a layer, tests/test_declared_cells_memory.py)."""
+    return _biased(product, bias)
+
+
+def _biased_value(product: jax.Array, bias: jax.Array) -> jax.Array:
+    """`biased`'s value: `product` plus `bias` spread at fp32 (`broadcast_summed`) over the product's
+    trailing axes, as flax's layers reshape it, so no rank is promoted implicitly; rounded back, it adds as
+    flax adds it (XLA folds the round trip, so the product and bias fuse as before)."""
     dtype = jnp.result_type(product, bias)
-    # The bias over the product's trailing axes, as flax's layers reshape it, so no rank is promoted
-    # implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds the round trip,
-    # so the product and bias fuse as before) and its gradient sums at fp32 (`broadcast_summed`).
     leading = product.ndim - bias.ndim
     spread_bias = broadcast_summed(bias, product.shape, tuple(range(leading, product.ndim)), dtype=dtype)
     return product.astype(dtype) + spread_bias
+
+
+def _biased_tangent(primals, tangents):
+    """`biased`'s tangent: the product's and the bias's directions added as the value adds them, both
+    through the rule's dual where both move, so reverse mode, its transpose, sums the bias's gradient at fp32
+    (`broadcast_summed`) and returns the product's cotangent only with it."""
+    from jax.custom_derivatives import SymbolicZero
+
+    from dew._cache import unintercepted
+
+    product, bias = primals
+    d_product, d_bias = tangents
+    d_product, d_bias = with_tangents_formed(d_product, d_bias)
+    value = _biased_value(product, bias)
+    dtype = value.dtype
+    leading = product.ndim - bias.ndim
+    terms = ([] if isinstance(d_product, SymbolicZero) else [d_product.astype(dtype)]) + (
+        [] if isinstance(d_bias, SymbolicZero)
+        # The spread is Dew's own arithmetic, no model's product for a quantization rule to take: its
+        # transpose, reverse mode's, has no custom VJP to meet (`unintercepted`).
+        else [unintercepted(broadcast_summed)(d_bias, product.shape, tuple(range(leading, product.ndim)),
+                                              dtype=dtype)])
+    return value, sum(terms[1:], terms[0]) if terms else jnp.zeros_like(value)
+
+
+_biased = contracted("test_a_biased_sum_holds_every_order")(
+    declared_tangent(Protected(), _biased_value, _biased_tangent, symbolic_zeros=True))
 
 
 def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...], *,
@@ -710,6 +749,8 @@ def _summed_wide(product: Callable, preferred_element_type, *operands, counts: i
                 (gradient,) = jax.linear_transpose(alone, wide[index])(wide_cotangent)
                 return gradient.astype(operands[index].dtype)
 
+            # No barrier here: which operand is a parameter is the caller's to know, and a projection's
+            # own reverse mode, over this product, ties its kernel's gradient (`projections.dot_general`).
             return tuple(transposed(index) for index in live)
 
     # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
@@ -859,25 +900,19 @@ token mixer's (attention's queries, keys, values and output, a linear mixer's), 
 routed experts', a router's scores, a shared expert's gate. A projection that plays none of them, a head's
 or an embedding's, keeps the run's dtypes under every recipe."""
 
-LOW_PRECISION_RECIPES = ("blockwise_fp8",)
-"""The low-precision recipes a run's projections train in: DeepSeek-V3's blockwise FP8, each product's
-operands E4M3 by 1 x 128 activation tiles and 128 x 128 weight blocks, power-of-two scales, fp32 sums, and
-its gradients FP8 products of requantized operands (`dew.nn.kernels.projections.blockwise_fp8_projection`)."""
-
-
 @dataclasses.dataclass(frozen=True)
 class LowPrecision:
-    """A low-precision training recipe for a run's projections by role (row 2513): `recipe`
-    (`LOW_PRECISION_RECIPES`) multiplies the projections whose role is among `roles` (`PROJECTION_ROLES`),
-    each where its widths take the recipe's blocks; every other product keeps the run's dtypes, the routers,
-    norms, embeddings and heads among them, as every published low-precision recipe keeps them."""
+    """A low-precision training recipe for a run's projections by role (row 2513): `recipe`, one of
+    `dew.nn.kernels.projections.RECIPES` (the one declaration of the recipes: their projections, blocks and
+    routes), which a run's numerics check where they take effect (`generation.run_precision`), multiplies
+    the projections whose role is among `roles` (`PROJECTION_ROLES`), each where its widths take the
+    recipe's blocks; every other product keeps the run's dtypes, the routers, norms, embeddings and heads
+    among them, as every published low-precision recipe keeps them."""
 
     recipe: str = "blockwise_fp8"
     roles: tuple[str, ...] = ("mixer", "mlp", "experts")
 
     def __post_init__(self):
-        if self.recipe not in LOW_PRECISION_RECIPES:
-            raise ValueError(f"a low-precision recipe is one of {LOW_PRECISION_RECIPES}, not {self.recipe!r}")
         object.__setattr__(self, "roles", tuple(self.roles))
         unknown = sorted(set(self.roles) - set(PROJECTION_ROLES))
         if unknown:
@@ -968,7 +1003,15 @@ FP8 = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision())
 experts' projections in blockwise FP8 (`LowPrecision`), the routers, norms, embeddings and head in the run's
 dtypes."""
 
-NUMERICS_PRESETS = {"accurate": ACCURATE, "fp8": FP8}
+MXFP8 = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision(recipe="mxfp8"))
+"""MXFP8 training (OCP MX): bf16-mixed, the token mixers', dense feed-forwards' and routed experts'
+projections in MXFP8 (`LowPrecision`), the routers, norms, embeddings and head in the run's dtypes."""
+
+NVFP4 = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision(recipe="nvfp4"))
+"""NVFP4 training: bf16-mixed, the token mixers', dense feed-forwards' and routed experts' projections in
+NVFP4 (`LowPrecision`), the routers, norms, embeddings and head in the run's dtypes."""
+
+NUMERICS_PRESETS = {"accurate": ACCURATE, "fp8": FP8, "mxfp8": MXFP8, "nvfp4": NVFP4}
 """The named run numerics beside the default (`Numerics()`)."""
 
 
@@ -1419,6 +1462,18 @@ def vanishing(dtype, base2: bool = False) -> float:
     return math.floor(least / (math.log(2.0) if base2 else 1.0)) - 1
 
 
+def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax.Array:
+    """`product` times two scales, each entry in the order whose intermediate is a normal float32: an
+    input's block scale near float32's largest (2**113 for inputs near 2**122) overflows the codes' product
+    the kernel's scale (2**-9) brings back in range, and one near the least normal underflows it the other
+    way (ledger 2715), as two tensor scales near 2**-76 do multiplied first (an NVFP4 product of operands
+    near 2**-65), so no one order holds both ends; the result overflows only where the product does."""
+    tiny = jnp.finfo(product.dtype).tiny
+    once = product * first
+    kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (product == 0))
+    return jnp.where(kept, once * second, product * second * first)
+
+
 @_protected
 def compensated_add(left, right):
     """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
@@ -1708,7 +1763,13 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
                                           default=native)
 
     def pulled(saved, operands, cotangent):
-        """Each operand's cotangent: the product's transpose to it over the cotangent rounded to bf16."""
+        """Each operand's cotangent: the product's transpose to it over the cotangent rounded to bf16. No
+        barrier: which operand is a parameter is its caller's to know, a projection's own reverse mode over
+        it tying its kernel's gradient (`projections.dot_general`). A vocabulary head's (`head_product`,
+        `head_dot_general`) takes none: XLA forms its table's gradient beside the states' with nothing put
+        off (a stack under a bf16 head, compile-only H100: its temporaries trained are its held ones plus the
+        gradient, 272 against 256 + 16 MiB), and the rule's portable reverse mode (`portable_formed`) would
+        recompute the logits through their rounding's barrier, 768 MiB (train 911 F3)."""
         del saved
         rounded = cotangent.astype(jnp.bfloat16)
         return tuple(_transposed(rounded, operands, numbers, side, typed).astype(operands[side].dtype)
@@ -1762,7 +1823,7 @@ def _bf16_product(lhs: jax.Array, rhs: jax.Array, dimension_numbers, precision=N
     return product if out_sharding is None else jax.sharding.reshard(product, out_sharding)
 
 
-def at_precision[Output](precision: jax.lax.PrecisionLike
+def at_precision[Output](precision: jax.lax.PrecisionLike, parameters: tuple[int, ...] = ()
                          ) -> Callable[[Callable[..., Output]], Callable[..., Output]]:
     """`fn` traced, forward and backward, at `precision`, the default included: a product that takes no
     precision of its own (a Pallas dot, jax.nn's xla attention) reads it from the configuration at trace
@@ -1774,7 +1835,9 @@ def at_precision[Output](precision: jax.lax.PrecisionLike
     A fused attention route under a call's stated precision (`attention._attention_kernel`), and Mosaic's
     TPU kernels at the default: they refuse a 16-bit matmul at HIGHEST ("Bad lhs type"); 16-bit dots are
     exact at any precision, and an fp32 dot takes one bf16 pass on a TPU, so splash's P·V rounds P to
-    bf16 as every default-precision run does (`attention_tpu`)."""
+    bf16 as every default-precision run does (`attention_tpu`). The arguments at `parameters` are the
+    call's parameters (an attention's bias and sinks), whose gradients its backward forms with the others'
+    cotangents (`derivatives.with_gradients_formed_at`)."""
     name = _configured_name(precision)
 
     def held(fn: Callable[..., Output]) -> Callable[..., Output]:
@@ -1787,7 +1850,7 @@ def at_precision[Output](precision: jax.lax.PrecisionLike
 
         def backward(pullback, cotangent):
             with jax.default_matmul_precision(name):
-                return pullback(cotangent)
+                return with_gradients_formed_at(tuple(pullback(cotangent)), parameters)
 
         # A protected span: the precision it holds is the kernels' own, which no rewrite may change.
         @contracted("test_a_default_precision_call_holds_every_order_it_takes")

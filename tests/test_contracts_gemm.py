@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from contract_support import EDGES, FORWARD_ORDERS, assert_contract, normal_draw
-from reference_error import assert_as_exact
+from reference_error import Followed, Rounded, as_given, assert_as_exact, widened
 
 from dew.nn import precision
 from dew.nn.blocks import table_rows
@@ -165,6 +165,21 @@ def test_a_once_rounded_biased_layer_holds_every_order(edge):
 
     assert_contract(dense, primals, direction, cotangent, f"a once-rounded biased layer {edge}",
                     plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_biased_sum_holds_every_order(edge):
+    """A product plus its bias as a biased layer adds them (`precision.biased`: the bias spread at fp32, its
+    reverse mode through the rule's dual): every order, in the product and the bias, finite wherever float64
+    is a normal float32 and wherever the plain sum is, at values near float32's ends."""
+    primals = normal_draw(6471, (8, 16), (16,), scale=EDGES[edge])
+    direction = normal_draw(6472, (8, 16), (16,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(6473, (8, 16))
+
+    def plain(product, bias):
+        return product + bias
+
+    assert_contract(precision.biased, primals, direction, cotangent, f"a biased sum {edge}", plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -493,16 +508,56 @@ def test_a_frozen_fp8_product_holds_every_order(edge):
                     plain_fn=plain)
 
 
-def int8_round_trip(values, kept: int):
+def int8_round_trip(values, kept: int, codes=None, met: "Int8Roundings | None" = None):
     """`values` quantized to int8 and back as Qwix's absmax calibration has it: one scale per index of axis
     `kept` (an activation's example, a kernel's output feature), the absolute maximum over the rest over
     127.5, 1 where that is below the root of its dtype's least normal (Qwix's guard), the codes rounded and
-    clipped to int8's. The codes take no derivative and the scale its own, as Qwix computes them: neither
-    holds the scale from differentiation."""
+    clipped to int8's, or `codes` given (a followed truth's: an arm's decisions); the quotients rounded and
+    the codes made, met (`met`) where given. The codes take no derivative and the scale its own, as Qwix
+    computes them: neither holds the scale from differentiation."""
     over = tuple(axis for axis in range(values.ndim) if axis != kept)
     scale = jnp.max(jnp.abs(values), axis=over, keepdims=True) / 127.5
     scale = jnp.where(scale < jnp.sqrt(jnp.finfo(scale.dtype).tiny), 1, scale)
-    return jax.lax.stop_gradient(jnp.clip(jnp.round(values / scale), -128, 127)) * scale
+    if codes is None:
+        quotients = values / scale
+        codes = jnp.clip(jnp.round(quotients), -128, 127).astype(jnp.int8)
+        if met is not None:
+            met.met(quotients, codes)
+    return jax.lax.stop_gradient(jnp.asarray(codes).astype(values.dtype)) * scale
+
+
+class Int8Roundings:
+    """The int8 roundings a run executed, each its quotients and codes as its program computed them, met on
+    the host (`jax.debug.callback`) in execution order: an arm's rounding inputs and decisions at a site of
+    followed roundings (`assert_as_exact`'s `followed`)."""
+
+    def __init__(self):
+        self.calls: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def met(self, quotients, codes) -> None:
+        jax.debug.callback(lambda q, c: self.calls.append((np.asarray(q), np.asarray(c))), quotients, codes)
+
+    def rounded(self, result, operands: dict) -> Rounded:
+        """`result` beside each operand's rounding (`operands`, by name, its shape): the quotients it rounded
+        a judged leaf (`rounded/<name>`), its codes a decision; an operand rounded more than once a run
+        rounded alike each time, one decision of it."""
+        judged, decided = {}, {}
+        for name, shape in operands.items():
+            calls = [(q, c) for q, c in self.calls if q.shape == tuple(shape)]
+            for _, codes in calls[1:]:
+                np.testing.assert_array_equal(codes, calls[0][1], err_msg=f"{name}'s {len(calls)} roundings")
+            judged[f"rounded/{name}"], decided[name] = calls[0]
+        self.calls.clear()
+        return Rounded({"output": np.asarray(result), **judged}, decided)
+
+
+def int8_rounds(judged: dict) -> dict:
+    """A quantized convolution's int8 roundings of the quotients an arm rounded (its judged `rounded/<name>`
+    leaves), Qwix's own (`numerics.convert_to`): round half to even, then int8's."""
+    from qwix._src.core import numerics
+
+    return {name.removeprefix("rounded/"): np.asarray(numerics.convert_to(jnp.asarray(value), jnp.int8))
+            for name, value in judged.items() if name.startswith("rounded/")}
 
 
 def convolved(x, kernel, groups: int):
@@ -511,22 +566,30 @@ def convolved(x, kernel, groups: int):
                                         feature_group_count=groups)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(2,))
-def quantized_convolution(x, kernel, groups: int):
+def quantized_convolution(x, kernel, groups: int, codes: tuple | None = None, met=None):
     """The convolution of `x` and `kernel` quantized to int8 and back (`int8_round_trip`: each example's
     scale, each output feature's), its tangent `conv(dx, Q(kernel)) + conv(Q(x), dkernel)`: the float
     convolution's at the dequantized operands, so its reverse mode is the transpose there, and a derivative of
     that goes through the operands' quantization, the scales' derivatives included, as the seam's backward
-    reads the quantized operands its forward made."""
-    return convolved(int8_round_trip(x, 0), int8_round_trip(kernel, 3), groups)
+    reads the quantized operands its forward made. `codes` (the input's and the kernel's), where given, are
+    the int8 codes it takes for its own (a followed truth's); `met` meets the roundings it makes."""
+    given = (None, None) if codes is None else codes
 
+    def held(x, kernel):
+        return int8_round_trip(x, 0, given[0], met), int8_round_trip(kernel, 3, given[1], met)
 
-@quantized_convolution.defjvp
-def _quantized_convolution_jvp(groups, primals, tangents):
-    (x, kernel), (along_x, along_kernel) = primals, tangents
-    held = (int8_round_trip(x, 0), int8_round_trip(kernel, 3))
-    return (convolved(*held, groups),
-            convolved(along_x, held[1], groups) + convolved(held[0], along_kernel, groups))
+    @jax.custom_jvp
+    def convolution(x, kernel):
+        return convolved(*held(x, kernel), groups)
+
+    @convolution.defjvp
+    def _(primals, tangents):
+        (x, kernel), (along_x, along_kernel) = primals, tangents
+        operands = held(x, kernel)
+        return (convolved(*operands, groups),
+                convolved(along_x, operands[1], groups) + convolved(operands[0], along_kernel, groups))
+
+    return convolution(x, kernel)
 
 
 def group_peaks(x, groups: int, features: int):
@@ -570,15 +633,30 @@ def test_a_quantized_convolution_holds_every_order_it_takes(groups, edge):
                     truth_fn=plain, plain_fn=plain)
 
 
-def test_a_quantized_convolutions_second_derivative_reads_its_scales():
+def test_a_quantized_convolutions_second_derivative_reads_its_scales(monkeypatch):
     """The quantized convolution's gradient in its kernel, differentiated in its input (a mixed second
     derivative): the gradient reads the input quantized, whose scale (each example's absolute maximum)
     moves with the input, so the derivative goes through it, as the independent oracle's does
-    (`quantized_convolution`): on par with the oracle against its float64 truth (check 1)."""
+    (`quantized_convolution`): on par with the oracle (check 1), each against the float64 oracle that
+    rounds where it rounded (`followed`: two programs' quotients a rounding apart near a code's midpoint
+    choose its two codes, which no truth that rounds for itself holds both to; row 6939). Dew's roundings
+    are Qwix's own (`numerics.convert_to`), each met as its program computed it."""
+    from qwix._src.core import numerics
+
     from dew.nn.conv import Conv
     from dew.quantization import Quantization
 
     quantized = Quantization().apply(Conv(features=8, kernel_size=(3, 3), padding="SAME", use_bias=False))
+    roundings = {"dew": Int8Roundings(), "oracle": Int8Roundings()}
+    qwix_rounding = numerics.convert_to
+
+    def met_rounding(x, qtype, noise_fn=None):
+        codes = qwix_rounding(x, qtype, noise_fn)
+        if codes.dtype == jnp.int8:
+            roundings["dew"].met(x, codes)
+        return codes
+
+    monkeypatch.setattr(numerics, "convert_to", met_rounding)
 
     def mixed(convolution):
         def run(x, kernel, along_x, cotangent):
@@ -590,14 +668,38 @@ def test_a_quantized_convolutions_second_derivative_reads_its_scales():
     def dew_convolution(x, kernel):
         return quantized.apply({"params": {"kernel": kernel}}, x)
 
-    def oracle(x, kernel):
-        return quantized_convolution(x, kernel, 1)
+    def arm(name, convolution):
+        program = jax.jit(mixed(convolution))
+
+        @as_given
+        def run(x, kernel, along_x, cotangent):
+            jax.effects_barrier()  # every earlier run's roundings met before this run's are
+            roundings[name].calls.clear()
+            result = jax.block_until_ready(program(x, kernel, along_x, cotangent))
+            jax.effects_barrier()
+            return roundings[name].rounded(result, {"x": x.shape, "kernel": kernel.shape})
+        return run
+
+    @as_given
+    def truth(decisions, x, kernel, along_x, cotangent):
+        with jax.enable_x64(new_val=True):
+            held = (decisions["x"], decisions["kernel"])
+            wide = widened((x, kernel, along_x, cotangent))
+            scaled = {name: values / jnp.where(scale < jnp.sqrt(jnp.finfo(scale.dtype).tiny), 1, scale)
+                      for name, values, scale in
+                      (("x", wide[0], jnp.max(jnp.abs(wide[0]), axis=(1, 2, 3), keepdims=True) / 127.5),
+                       ("kernel", wide[1], jnp.max(jnp.abs(wide[1]), axis=(0, 1, 2), keepdims=True) / 127.5))}
+            output = mixed(lambda x, k: quantized_convolution(x, k, 1, held))(*wide)
+            return {"output": np.asarray(output), **{f"rounded/{name}": np.asarray(value)
+                                                      for name, value in scaled.items()}}
 
     def draw(seed):
         return tuple(normal_draw(2000 + seed, (1, 6, 6, 4), (3, 3, 4, 8), (1, 6, 6, 4), (1, 6, 6, 8)))
 
-    assert_as_exact(jax.jit(mixed(dew_convolution)), jax.jit(mixed(oracle)), draw,
-                    "a quantized convolution's mixed second derivative", seeds=8)
+    oracle = arm("oracle", lambda x, k: quantized_convolution(x, k, 1, met=roundings["oracle"]))
+    assert_as_exact(arm("dew", dew_convolution), oracle, draw,
+                    "a quantized convolution's mixed second derivative", seeds=8,
+                    followed=Followed(truth, int8_rounds))
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -644,15 +746,43 @@ def test_a_broadcast_sums_its_gradient_wide_at_every_order(dtype):
 
 
 @pytest.mark.parametrize("edge", EDGES)
-def test_an_xla_projection_in_its_layer_holds_every_order(edge):
+def test_a_portable_formed_rule_holds_every_order(edge):
+    """An XLA program whose last operand is a parameter through the rule (`derivatives.portable_formed`:
+    its value and every derivative XLA's of it, its reverse mode's cotangents leaving together): every order,
+    forward and reverse, under a nested jit and a scan, in the rows and the parameter, finite wherever
+    float64 is a normal float32 and wherever the program itself (its float64 run the truth) is, at values
+    near float32's ends."""
+    from dew.nn.derivatives import portable_formed
+
+    primals = normal_draw(6471, (4, 32, 64), (64,), scale=EDGES[edge])
+    direction = normal_draw(6472, (4, 32, 64), (64,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(6473, (4, 32, 64))
+
+    def plain(rows, weight):
+        return jnp.tanh(rows) * weight + rows * rows
+
+    assert_contract(portable_formed(plain), primals, direction, cotangent, f"a portable formed rule {edge}",
+                    plain_fn=plain)
+
+
+# A projection's forms: a dense one's rows against a matrix, a batched one's (DeepSeek V4's grouped
+# `o_a_proj`) each batch member's rows against its own matrix.
+XLA_FORMS = {"dense": ((4, 32, 64), (64, 48), (4, 32, 48), (((2,), (0,)), ((), ()))),
+             "batched": ((4, 32, 64), (4, 64, 48), (4, 32, 48), (((2,), (1,)), ((0,), (0,))))}
+
+
+@pytest.mark.parametrize("form", XLA_FORMS)
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_xla_projection_in_its_layer_holds_every_order(edge, form):
     """A projection's product no launch takes (`projections._in_layer_product`: XLA's own dot, its reverse
-    mode's cotangents leaving together, `gemm.in_layer`): every order, forward and reverse, under a nested
-    jit and a scan, in the rows and the matrix, finite wherever float64 is a normal float32 and wherever the
-    plain dot (its float64 run the truth) is, at values whose products near float32's ends."""
-    primals = normal_draw(6027, (4, 32, 64), (64, 48), scale=EDGES[edge])
-    direction = normal_draw(6028, (4, 32, 64), (64, 48), scale=EDGES[edge])
-    (cotangent,) = normal_draw(6029, (4, 32, 48))
-    dimensions = (((2,), (0,)), ((), ()))
+    mode's cotangents leaving together, `derivatives.with_gradients_formed`), dense or batched: every order,
+    forward and reverse, under a nested jit and a scan, in the rows and the matrix, finite wherever float64
+    is a normal float32 and wherever the plain dot (its float64 run the truth) is, at values whose products
+    near float32's ends."""
+    rows, matrix, out, dimensions = XLA_FORMS[form]
+    primals = normal_draw(6027, rows, matrix, scale=EDGES[edge])
+    direction = normal_draw(6028, rows, matrix, scale=EDGES[edge])
+    (cotangent,) = normal_draw(6029, out)
     product = projections._in_layer_product(jax.lax.dot_general, dimensions, None, None)
 
     def plain(rows, matrix):

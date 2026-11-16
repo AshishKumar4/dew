@@ -67,7 +67,7 @@ from dew.held_updates import waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
-from dew.nn.kernels.options import Compiling, attempting, owned_program
+from dew.nn.kernels.options import Compiling, attempting, owned_program, shapes_of
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, tracing
 from dew.objectives.base import (
@@ -188,7 +188,9 @@ from dew.training.transaction import (
     PassesProgress,
     Transaction,
     batch_statistics_shapes,
+    checked,
     compact_qk,
+    finite_flags,
     loss_scale,
     pooled_by_mean,
     refuse_unpassed_progress,
@@ -214,6 +216,26 @@ Effects = DefaultTypeVar("Effects", default=None)
 _DEFAULT_MESH = MeshSpec()
 _DEFAULT_LAYOUT = Layout()
 
+
+def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | None]) -> None:
+    """Refuse to save a `state` whose checked trees (`transaction.checked`: the parameters, optimizer state
+    and averages, and under DiLoCo each replica's inner copy of them, which the next meeting averages into
+    the outer model) hold a non-finite value, on any tier: no checkpoint is written and none rotated out,
+    and the run stops, naming the step and the first such leaf, so the checkpoint a resume finds is the
+    last finite one (`latest`, read only to say so). Read wherever the leaves are placed
+    (`transaction.finite_flags`), the same on every process (training.md, checkpoints and resume)."""
+    trees = {**checked(state), **({} if state.inner is None else
+                                  {f"inner.{name}": tree for name, tree in checked(state.inner).items()})}
+    leaves = [(f"{name}{jax.tree_util.keystr(path)}", leaf) for name, tree in trees.items()
+              for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
+              if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)]
+    finite = finite_flags([leaf for _, leaf in leaves])
+    first = next((path for (path, _), held in zip(leaves, finite, strict=True) if not held), None)
+    if first is not None:
+        kept = latest()
+        said = "no checkpoint" if kept is None else f"the latest checkpoint, step {kept}"
+        raise RuntimeError(f"step {step}'s state holds a non-finite value at {first}, so no checkpoint of it "
+                           f"is written and {said} is the one a resume finds")
 
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
@@ -285,8 +307,9 @@ class Trainer(Generic[Loss, Effects]):
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
+        # A config's groups take what the objective draws fresh, as a run's do (`OptimConfig.claiming`).
         self._config, self._optimizer = ((None, declaring(objective.optimizer(optimizer), self._boxed_axes))
-                                         if built else (optimizer, None))
+                                         if built else (optimizer.claiming(*objective.fresh_trained()), None))
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
@@ -740,8 +763,8 @@ class Trainer(Generic[Loss, Effects]):
                 from dew.training.execution import placed_host
                 return (placed_host(self.objective, lambda: self._staged_start(initializer, key),
                                     self.state_mesh, self.device_mesh, shardings), shardings, None)
-            return (placed_start(start.build, initializer, key, abstract, shardings, start.through,
-                                 self.device_mesh), shardings, None)
+            return (placed_start(start.placing, initializer, key, abstract, shardings, self.device_mesh),
+                    shardings, None)
         if self.host_master:
             from dew.training.execution import banked_frozen
             abstract = dataclasses.replace(abstract, variables=banked_frozen(
@@ -1518,6 +1541,8 @@ class Trainer(Generic[Loss, Effects]):
         checkpoint at its last step having been written, so there is nothing to do."""
         mesh, checkpoints, steps = self.device_mesh, self.checkpoints, plan.steps
         begun: Compiling | None = None
+        # Whether the run's cooldown branches were checked before its state was placed.
+        branched = False
         if steps is not None and current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
         bound = self._shape.examples
@@ -1570,6 +1595,11 @@ class Trainer(Generic[Loss, Effects]):
                     # a compile refuses it, before the state it would check is traced from that batch.
                     agreed_same("training batch layout", lambda: batch_layout(split_fields(placed_first)[0]))
                     self._fitting(abstract, placed_first)
+                    # Refused before the start's program begins to compile, as every refusal that needs
+                    # nothing the planning beside it finds: its state's structure states what branches read.
+                    check_branches(bool(plan.branches) or pending, plan.suites,
+                                   settable=settable_rates(rated(abstract)))
+                    branched = True
                     if fresh is not None:
                         begun = self._compiled_fresh(run, fresh, first, placed_first)
             elif position is not None:
@@ -1577,9 +1607,12 @@ class Trainer(Generic[Loss, Effects]):
                 # (`_prefetched`), which the run reports as it starts (`DataRestarted`).
                 waited_read(run, interval, agree=True, peek=True)
         state, shardings = placed(begun)
+        if begun is not None:
+            run.startup.overlapped = begun.taken.is_set()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
-        check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(rated(state)))
+        if not branched:
+            check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(rated(state)))
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
@@ -1618,12 +1651,15 @@ class Trainer(Generic[Loss, Effects]):
         program begun beside it in a thread of its own (`start_compiling`), the key lowered unplaced as the
         start compiled ahead takes it: both once the whole state is checked, so a refused run compiles
         neither. None where the step is not compiled here (one compiled ahead, a host-master's, a profile
-        guided run's), the start then compiling as it is placed."""
+        guided run's), the start then compiling as it is placed. The one refusal that can come while the
+        start's program compiles is its step's planning's (`PlanRefused`, a compile that fails), which runs
+        beside it, the overlap the start is begun for; the process's exit then waits for the start's compile
+        to end (`options.compiling`)."""
         if self._compiler.ahead is not None or self.host_master or pgle_runs():
             return None
-        key = jax.ShapeDtypeStruct(fresh.key.shape, fresh.key.dtype)
-        begun = start_compiling(fresh.build, fresh.initializer, key, fresh.abstract, fresh.shardings,
-                                fresh.through, self.device_mesh)
+        key = shapes_of(fresh.key)
+        begun = start_compiling(fresh.placing, fresh.initializer, key, fresh.abstract, fresh.shardings,
+                                self.device_mesh)
         self.phase_passes.at(first)
         with run.startup.phase("compile", "compiling the step"), run.held():
             # As the loop hands its step the batch (`read_batch`): on the examples clock, marked whether
@@ -2199,6 +2235,10 @@ class Trainer(Generic[Loss, Effects]):
                              *, weights_only: bool = False) -> Envelope:
         """What a checkpoint of `state` holds on every tier, each tier's save adding its own metadata: one
         envelope a persistent and a local save submit (row 4126)."""
+        # No tier writes a non-finite state (`refuse_non_finite`): a local copy is the one a restarted node
+        # reads first, its step the latest of both tiers.
+        refuse_non_finite(state, int(run.current), lambda: None if self.checkpoints is None
+                          else self.checkpoints.latest)
         control, share = {**run.stop_control, **interval.token_control}, DataPartition.of(self.device_mesh)
         return {"state": self._staging.saved(state), "saved": position, "share": share, "control": control,
                 "rung": self._compiler.checkpoint_rung(), "artifact": self._artifact(),

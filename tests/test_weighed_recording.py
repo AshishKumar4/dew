@@ -27,50 +27,72 @@ def inputs_of(seed: int) -> dict:
     return dict(zip(NAMES, draw(seed), strict=True))
 
 
-def leafed(fn):
-    """`fn`'s output as a site's one leaf."""
-    return lambda *operands: {"y": fn(*operands)}
+LAYOUTS = {"rows": lambda made: made, "one row": lambda made: made[0]}
+"""The site's leaf as the operation makes it, its rows, or its first row alone, a vector (one row, testing.md:
+a leaf's rows run along its last axis)."""
 
 
-def at(narrow):
+def leafed(fn, layout: str):
+    """`fn`'s output as a site's one leaf, laid as `layout` (`LAYOUTS`)."""
+    return lambda *operands: {"y": LAYOUTS[layout](fn(*operands))}
+
+
+def at(narrow, layout: str):
     """A recorded site's `dew(dtype, inputs)` whose float32 arithmetic is `narrow`'s and whose float64 path
     is the reference's own, the truth a summary holds it to: the amplified element is not exact in float64
     either (a small value beside 2^24 passes its 53 bits), so another formulation's float64 run is not the
     recorded truth within float64's own rounding, and a summary would refuse it."""
     def dew(dtype, inputs):
         fn = narrow if jnp.dtype(dtype) == jnp.float32 else reference
-        return leafed(fn)(*(jnp.asarray(inputs[name], dtype) for name in NAMES))
+        return leafed(fn, layout)(*(jnp.asarray(inputs[name], dtype) for name in NAMES))
     return dew
 
 
-RAN = jax.jit(leafed(reference))
-"""The reference compiled, once a precision: a recording asks it of thousands of draws."""
+LEAFED = {layout: leafed(reference, layout) for layout in LAYOUTS}
+"""The reference as the site's leaf, one function a layout: its rounding scale's program is compiled once for
+it (`rounding_bound.SCALES`, keyed by the function), where a function made anew each draw compiled each draw's
+(7,168 of them, 267 of the run's 302 s)."""
+
+RAN = {layout: jax.jit(LEAFED[layout]) for layout in LAYOUTS}
+"""The reference compiled, once a precision and a layout: a recording asks it of thousands of draws."""
 
 
-def evaluate(inputs):
+def evaluated(layout: str):
     """The reference's float32 outputs beside their float64 truth, as a recording's worker answers."""
-    operands = [inputs[name] for name in NAMES]
-    with jax.enable_x64(new_val=False):
-        ran = jax.tree.map(np.asarray, RAN(*operands))
-    with jax.enable_x64(new_val=True):
-        return ran, jax.tree.map(np.asarray, RAN(*(np.asarray(operand, np.float64) for operand in operands)))
+    def evaluate(inputs):
+        operands = [inputs[name] for name in NAMES]
+        with jax.enable_x64(new_val=False):
+            ran = jax.tree.map(np.asarray, RAN[layout](*operands))
+        with jax.enable_x64(new_val=True):
+            return ran, jax.tree.map(np.asarray,
+                                     RAN[layout](*(np.asarray(operand, np.float64) for operand in operands)))
+    return evaluate
 
 
-def scale(inputs, seed):
-    """The reference program's rounding scale at a draw (tests/rounding_bound.py), its recorder's own."""
-    return rounding_scale(leafed(reference), *(inputs[name] for name in NAMES), seed=seed)[1]
+def scaled(layout: str):
+    """The reference program's rounding scale at a draw (tests/rounding_bound.py), its recorder's own, each
+    seed's once: the two recordings of a layout are of the same draws (`inputs_of(seed)`), so the second
+    reads the first's."""
+    held = {}
+
+    def scale(inputs, seed):
+        if seed not in held:
+            held[seed] = rounding_scale(LEAFED[layout], *(inputs[name] for name in NAMES), seed=seed)[1]
+        return held[seed]
+    return scale
 
 
-@pytest.fixture(scope="module")
-def recordings(tmp_path_factory):
-    """The site recorded twice over the same draws, its outputs whole and its evidence alone, each saved
-    as a fixture's file, with its declared seeds."""
+@pytest.fixture(scope="module", params=list(LAYOUTS))
+def recordings(request, tmp_path_factory):
+    """The site, laid as the run's layout (`LAYOUTS`), recorded twice over the same draws, its outputs
+    whole and its evidence alone, each saved as a fixture's file, with its declared seeds."""
+    layout = request.param
     recorder, directory = load("recorded_references"), tmp_path_factory.mktemp("weighed")
-    dew = jax.jit(lambda inputs: at(reformulated)(jnp.float32, inputs))
-    saved = {}
+    dew = jax.jit(lambda inputs: at(reformulated, layout)(jnp.float32, inputs))
+    saved, scale = {"layout": layout}, scaled(layout)
     with jax.enable_x64(new_val=True):
         for name, options in (("whole", {}), ("summary", {"summary": True})):
-            recorded = recorder.record_case("site", inputs_of, evaluate, dew=dew, scale=scale,
+            recorded = recorder.record_case("site", inputs_of, evaluated(layout), dew=dew, scale=scale,
                                             store_inputs=False, **options)
             np.savez(directory / f"{name}.npz", **recorded)
             saved[name] = (directory / f"{name}.npz", recorded)
@@ -83,14 +105,17 @@ def judged(recordings, name: str, fn, label: str) -> None:
     check is the one that decides, over the recording's own declared seeds of it; at the recording's
     declared unweighted seeds, the cap, the amplified element's pooled ratio resolves by itself."""
     path, _ = recordings[name]
-    assert_as_exact_as_recorded(path, "site", WEIGHED_SEEDS, inputs_of, at(fn), label, weighed=True)
+    assert_as_exact_as_recorded(path, "site", WEIGHED_SEEDS, inputs_of, at(fn, recordings["layout"]), label,
+                                weighed=True)
 
 
 def test_a_weighed_site_is_judged_from_its_evidence_alone_as_from_its_outputs(recordings):
     """The reference's own math reformulated in float32 passes the weighed check from either recording; and
     an arm whose float32 products are eight units of their rounding off fails it decided from either, at
     the same leaves by the same rules: its light class, where the unweighted check's amplified element hid
-    it. The summary holds no output and no truth of the reference's."""
+    it. The summary holds no output and no truth of the reference's. Whether the leaf is rows or one row (a
+    vector, whose summary's row is read from its recorded error and sized as Dew's arm's is: train 917's
+    F1)."""
     found = {}
     for name in ("whole", "summary"):
         judged(recordings, name, reformulated, f"the reformulation, from the {name} recording")
