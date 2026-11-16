@@ -1718,6 +1718,27 @@ def test_an_h100_training_steps_start_certifies_each_kernel_at_most_twice():
 
 
 @lowers('sm90')
+def test_a_write_gated_training_calls_start_certifies_its_consumers_spill_three_times_at_most():
+    """The unrounded write gate's forked training call (`forked_case`, no delta rule) at its derived tiles on
+    a compile-only H100, certified as reverse mode runs it (`tuning.KernelOp._certified`): its scores'
+    backward, which spills 16 bytes in its consumers' code at its producer's least, is certified there, at
+    its consumers' statement's share, and at a program fewer, which holds; every other kernel once, none
+    kept spilled. From its producer's top down, every rung spilled more in its consumers, and the ladder
+    compiled about a hundred rounds of the launch before the program fewer (row 6744)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    _, bound, tiles, _ = forked_case('sm90', 'a write gate', training=True)
+    before = {id(certified) for certified in report.certifications()}
+    with (report.refusals(), generation.assumed('sm90'), report.certifying(compile_only_gpus('sm90')[0]),
+          report.pulled()):
+        template.MOSAIC._certified(bound, tiles)
+    bodies = _certified_bodies([each for each in report.certifications() if id(each) not in before])
+    spilling = bodies.pop('recurrence_scores_back')
+    assert len(spilling) <= 3 and not spilling[-1].refused, spilling
+    assert bodies and all(len(found) == 1 and not found[-1].refused for found in bodies.values()), bodies
+
+
+@lowers('sm90')
 def test_a_launch_past_its_ladders_foot_is_certified_at_a_program_fewer():
     """Mamba-2's chunked recurrence at a small decoder's widths (8 heads of 32, a state of 32, 4 groups, bf16,
     its skip; tests/test_declared_cells_memory.py's guard's), its training gradient lowered for a compile-only
