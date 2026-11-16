@@ -733,12 +733,17 @@ class Issuer[Accumulator](abc.ABC):
         del tile
         return self
 
+    scalars_whole: bool = False
+    """Whether `scalar_registers` is a measured whole of a consumer thread's scalars, its addresses, indices
+    and a select's predicates among them, which a launch's own scalar terms do not add to (mma.sync's)."""
+
     def scalar_registers(self, addressed=()) -> int:
         """The registers a consumer thread holds beside its tiles that its launch states: its addresses into
         the shared tiles it reads and writes through registers (`addressed`, each `(shape, dtype)`,
         `resources.addresses`). Its other scalars (indices, the walk's carry, a select's predicates) no
-        constant states: a measured whole of them missed ptxas by up to a hundred registers either way
-        within the model's error (row 7095), and certification judges every config the model proposes."""
+        constant states where its products read shared memory (warpgroup MMA's, tcgen05's): the derivations
+        hold without one (a 4B start's certifications on sm90 and sm100, the gate's GEMM picks), and the
+        model they sit in misses ptxas by up to a hundred registers either way (row 7095)."""
         return resources.addresses(addressed)
 
     operands_in_registers: bool
