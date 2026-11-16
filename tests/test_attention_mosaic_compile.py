@@ -8,7 +8,6 @@ score hook's lowering. The mainloop's values are tests/test_attention_mosaic.py'
 
 import dataclasses
 import functools
-import json
 
 import jax
 import jax.numpy as jnp
