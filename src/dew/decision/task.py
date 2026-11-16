@@ -50,8 +50,8 @@ from dew.decision.layout import (
     Encoded,
     Laid,
     Layout,
-    QuestionLayout,
     Specials,
+    per_question,
     render,
     with_context,
 )
@@ -375,18 +375,18 @@ class Decide(SavedRunTask, InItsForm):
     which a release of it names again; None for a task read from none."""
     derives_sharing: bool = field(default=True, repr=False, compare=False)
     """Whether the task states how a request's questions share a state where its layout states none
-    (`QuestionLayout.shared_for`), as a task built in code does; one read from a release or a run lays its
+    (`SegmentLayout.shared_for`), as a task built in code does; one read from a release or a run lays its
     rows out as they were declared (`released`, `_recorded`), a layout that states none a question a row."""
 
     sharing: tuple[int | None, int | None] | None = field(default=None, repr=False, compare=False)
-    """The sharing (`QuestionLayout.shared_state`) the layout the task was given states, and the sharing the
+    """The sharing (`SegmentLayout.shared_state`) the layout the task was given states, and the sharing the
     task states for it (`layout`), carried by a task that replaces its layout but not its sharing
     (`dataclasses.replace`); None until the task reads its layout."""
 
     def __post_init__(self) -> None:
         # A request's questions are scored over one copy of its state where the backbone and head read each
-        # question as its own row (`QuestionLayout.shared_for`).
-        if isinstance(self.layout, QuestionLayout) and self.derives_sharing:
+        # question as its own row (`SegmentLayout.shared_for`).
+        if per_question(self.layout) and self.derives_sharing:
             from dew.decision.shared_state import shared_for
 
             given = self.layout.shared_state
@@ -403,7 +403,7 @@ class Decide(SavedRunTask, InItsForm):
         """The layout as the task was given it, its sharing as stated (`sharing`): what a run trained from
         the task lays its rows out by under a data plan before they shared a state
         (`DecisionObjective.stated`)."""
-        if not isinstance(self.layout, QuestionLayout) or self.sharing is None:
+        if not per_question(self.layout) or self.sharing is None:
             return self.layout
         return replace(self.layout, shared_state=self.sharing[0])
 
@@ -482,7 +482,7 @@ class Decide(SavedRunTask, InItsForm):
         # Its rows laid out as the run recorded them: a layout that states no sharing, from a run saved
         # before rows shared a state (data plan version 12), a question a row as it trained. One
         # that states its sharing, saved under such a plan, trained its rows in streams
-        # (`QuestionLayout.streamed`, which the plan's version states and no record holds) and is laid
+        # (`SegmentLayout.streamed`, which the plan's version states and no record holds) and is laid
         # here as documents continuing the shared part: the same tokens at the same positions, each
         # question reading the shared part and itself (with siblings, the questions before it), so the
         # same function, each held to its questions' own rows (tests/test_decision_state_once.py).
@@ -1758,7 +1758,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
     holding at most the rows its read declares (`tokens_bound`, `SegmentBound`: the most a window
     of the read holds, which it measured), else `max_segments` (the objective's bound), the questions'
     spans in each row's context where
-    `spans_in_context` (`JointLayout.spans_in_context`), each row's block the whole row where
+    `spans_in_context` (`SegmentLayout.spans_in_context`), each row's block the whole row where
     `whole_blocks` (`whole_blocks_of`), its rows read in their streams as their layout's `attention`
     says (`Layout.attention`), its documents' chains at most `fork_depth` long and each row's read
     together where `joint_forks` (`dew.decision.shared_state.fork_depth`, `Forks.joint`)."""
@@ -1787,8 +1787,8 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
 
 
 def whole_blocks_of(layout: Layout) -> bool:
-    """Whether `layout`'s rows are each one block of the whole row (`QuestionLayout.split` 'whole')."""
-    return isinstance(layout, QuestionLayout) and layout.blocks and layout.split == "whole"
+    """Whether `layout`'s rows are each one block of the whole row (`SegmentLayout.split` 'whole')."""
+    return per_question(layout) and layout.blocks and layout.split == "whole"
 
 
 def _near_equal(options: Sequence[str], group: int) -> list[list[str]]:

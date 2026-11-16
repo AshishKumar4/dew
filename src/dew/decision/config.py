@@ -7,7 +7,7 @@ and head. `pretrained` names another: a Laya-style repository (one with an
 fresh, with `lora` to train an adapter in place of the whole model. A fresh
 head is Laya's, reading the layout the backbone's order asks for, or with
 `head` the joint schema head, reading every question of an example in one
-row (`JointLayout`). Its data is a chain through `decisions` over a table, or `mixture`'s over a
+row (`SegmentLayout.joint_row`). Its data is a chain through `decisions` over a table, or `mixture`'s over a
 mixture manifest whose sets contribute their recorded shares, and its validation the rows a
 `holdout` keeps or a store's own split; validation scores them, and after training they fit the
 temperatures the
@@ -34,16 +34,16 @@ from dew.decision.laya import LAYA
 from dew.decision.layout import (
     Framing,
     Instructions,
-    JointLayout,
     Labels,
     Layout,
-    QuestionLayout,
     Reads,
     RowOrder,
     RowSegment,
     Schema,
+    SegmentLayout,
     default_layout,
     layout_writing,
+    per_question,
 )
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
@@ -143,7 +143,7 @@ class DecisionRunConfig(DecoderRunConfig):
     set for it without lengthening every other row's state. None lets the
     state fill the row."""
     option_text: Literal["named", "described"] | None = None
-    """How a question row writes a choice's option (`QuestionLayout.option_text`): its key and
+    """How a question row writes a choice's option (`SegmentLayout.option_text`): its key and
     description (`named`, as Laya's release reads its rows), or its description alone (`described`).
     None keeps the layout's own, a release's named and a fresh head's described, which its record holds
     as the build resolved it (`layout_writing`); a run that leaves it None and resumes takes the saved
@@ -154,36 +154,36 @@ class DecisionRunConfig(DecoderRunConfig):
     other."""
     segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
     """The row's parts in order, as its layout reads them. A joint row's user turn
-    (`JointLayout.segments`): the schema first, or read as the row's context through
+    (`SegmentLayout.segments`): the schema first, or read as the row's context through
     `context_layers` (`Schema(stream="context")`), its `context_length` holding the whole schema. A
-    question row's text (`QuestionLayout.segments`): its instructions, option lines and answer cue
+    question row's text (`SegmentLayout.segments`): its instructions, option lines and answer cue
     beside the state, the question first or the state first, its blocks following that order
-    (`QuestionLayout.blocks`). None keeps the layout's own, the release's turn."""
+    (`SegmentLayout.blocks`). None keeps the layout's own, the release's turn."""
     reads: Annotated[Reads, record_argument(Reads)] | None = None
     """Which of the row's streams each reads (`Reads`), where its `segments` name a stream of the row's
     own (`Schema(stream=...)`, `Instructions(stream=...)`): two streams in one pass, the state reading
     the schema and the schema itself alone, are its table. None reads the row in order."""
     parallel: bool | None = None
     """Whether a question row reads its options in parallel, each at positions of its own after the
-    question (`QuestionLayout.parallel`), which a head that reads option slots needs. None keeps the
+    question (`SegmentLayout.parallel`), which a head that reads option slots needs. None keeps the
     layout's own."""
     shared_state: int | None = None
     """The most questions a row asks over one copy of their request's state, each read as its own row reads
-    it (`QuestionLayout.shared_state`), 1 a row a question. None keeps the layout's own: as many as a row
+    it (`SegmentLayout.shared_state`), 1 a row a question. None keeps the layout's own: as many as a row
     holds, where the backbone and head read each question as its own row."""
     siblings: bool | None = None
     """Whether a question of a row over one state also reads the questions before it in the row, whole
-    (`QuestionLayout.siblings`). None keeps the layout's own, each reading the state and itself."""
+    (`SegmentLayout.siblings`). None keeps the layout's own, each reading the state and itself."""
     unit: Unit | None = None
     """How a question row's `segments` encode their text, piece by piece or whole
-    (`QuestionLayout.unit`). None keeps the layout's own, piece by piece."""
+    (`SegmentLayout.unit`). None keeps the layout's own, piece by piece."""
     order: RowOrder | None = None
-    """The order a question row's own text writes its parts in (`QuestionLayout.order`): the state
+    """The order a question row's own text writes its parts in (`SegmentLayout.order`): the state
     first, the question first, or the state, the question and the state again (`re_read`), each part as
     the built-in row writes it. None keeps the layout's own, a causal backbone's state first."""
     split: Literal["part", "question", "whole"] | None = None
     """Where a question row splits into its blocks, where its backbone reads blocks (a
-    block_bidirectional `--source.attention`, `QuestionLayout.split`): at its second part, a
+    block_bidirectional `--source.attention`, `SegmentLayout.split`): at its second part, a
     question-first row's state; at its question; or nowhere, the whole row one block its backbone
     reads both ways (`whole`). None keeps the layout's own law."""
     framing: Framing | None = None
@@ -423,7 +423,7 @@ class DecisionRunConfig(DecoderRunConfig):
         found: dict[str, dict[str, object]] = {"window": {
             "tokens": layout.max_len,
             "from": "stated" if self.max_len is not None else "release" if release else "default"}}
-        if isinstance(layout, QuestionLayout):
+        if per_question(layout):
             for capacity, name in (("question", "head_max_len"), ("option", "option_tokens")):
                 held = getattr(layout, name)
                 origin = ("stated" if getattr(self, name) is not None else "whole" if held is None
@@ -433,7 +433,7 @@ class DecisionRunConfig(DecoderRunConfig):
             stated = self.context_length != type(self).context_length
             found["context"] = {"tokens": self.context_length, "from": "stated" if stated else "default"}
         # A lettered layout's labels are named by now, as its head reads them (`Head.labelled`).
-        labels = layout.labels if isinstance(layout, QuestionLayout) else None
+        labels = layout.labels if per_question(layout) else None
         named = None if labels is None else labels.names
         if isinstance(self.head, Letters) and named is not None:
             origin = ("stated" if self.head.count is not None else "data" if self._options() is not None
@@ -471,11 +471,11 @@ type Budgets = dict[str, int | bool | str | Framing | Labels | tuple[RowSegment,
 """A run's fields of a row's layout, by the layout's field names (`_budgeted`)."""
 
 ROW_FIELDS = tuple(sorted(
-    {entry.name for layout in (QuestionLayout, JointLayout) for entry in dataclasses.fields(layout)}
+    {entry.name for entry in dataclasses.fields(SegmentLayout)}
     & {entry.name for entry in dataclasses.fields(DecisionRunConfig)}))
-"""The run's fields that lay out its rows: each a field of a decision layout (`QuestionLayout`,
-`JointLayout`) the run declares by the same name, so a layout field the run states reaches its layout
-(`_budgeted`) without a list of its own to keep."""
+"""The run's fields that lay out its rows: each a field of the decision layout (`SegmentLayout`) the run
+declares by the same name, so a layout field the run states reaches its layout (`_budgeted`) without a list
+of its own to keep."""
 
 
 def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets, blocked: bool = False,
@@ -488,7 +488,7 @@ def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets, blocked: b
     joint row of every question, is refused."""
     layout = default_layout(causal, one_question)
     stated = {**({"blocks": True} if blocked else {}), **({} if labels is None else {"labels": labels})}
-    if stated and not isinstance(layout, QuestionLayout):
+    if stated and not per_question(layout):
         raise ValueError(f"{type(layout).__name__} lays every question in one row, which lies in no blocks "
                          "and carries no labels; a block_bidirectional --source.attention and the letter "
                          "readout read a question to a row")
@@ -500,12 +500,12 @@ def _budgeted(layout: Layout, budgets: Budgets) -> Layout:
     layout's own; zero is a budget too (a joint row of no state). A budget the layout has no
     field for is refused: a joint row has no question budget, and a row per question no state
     budget, its state taking what is left. A joint row's schema writes each option named, by its key
-    beside its description (`JointLayout.options`), so it takes `named` option text as its own and
+    beside its description (`SegmentLayout.options`), so it takes `named` option text as its own and
     refuses `described`."""
     stated = {name: value for name, value in budgets.items() if value is not None}
-    if isinstance(layout, JointLayout) and stated.get("option_text") == "named":
+    if (isinstance(layout, SegmentLayout) and layout.joint) and stated.get("option_text") == "named":
         del stated["option_text"]
-    if isinstance(layout, QuestionLayout) and "framing" in stated and (
+    if per_question(layout) and "framing" in stated and (
             stated.get("segments", layout.segments) is None):
         raise ValueError("--framing frames a joint row or a question row of --segments; a question layout's "
                          "own row is written as its release writes it, unframed")

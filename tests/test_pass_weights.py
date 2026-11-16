@@ -17,7 +17,8 @@ from reference_error import assert_as_exact
 from dew.batch import PHASE, VALID_ROWS, Phase
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
-from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
+from dew.decision import Choice, DecisionObjective, Example, Specials
+from dew.decision.layout import SegmentLayout
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.protocols import EXITS
@@ -116,7 +117,7 @@ SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=
 
 def decision_objective(model, weights):
     """A decision objective over the looped `model` with `weights`, its rows the eight intents'."""
-    layout = StateFirstLayout(max_len=96, head_max_len=48, option_tokens=8)
+    layout = SegmentLayout.state_first_row(max_len=96, head_max_len=48, option_tokens=8)
     return DecisionObjective(model, tokenizer=ByteTokenizer(), specials=SPECIALS, layout=layout,
                              shuffle_options=False, pass_weights=weights)
 

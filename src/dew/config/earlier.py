@@ -36,14 +36,18 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     `earlier_dynamics_positions`); its data plan version
     as the one it read by (`earlier_data_plan`); a chain's store under the fields its class renamed since,
     by today's names (`dew.data.records.earlier_chains`); an encoder or conditioner by the import path it
-    has now (`dew._records.moved_paths`, row 5996).
+    has now (`dew._records.moved_paths`, row 5996); a decision layout by the one class the three it was
+    one of are now (`dew.decision.layout.earlier_layouts`, row 6140).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
     moved = _records.moved_record(record)
     earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(moved))))
+    from dew.decision.layout import earlier_layouts
+
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
-    return records.earlier_chains(earlier_data_plan(earlier), _chains())
+    laid = {name: earlier_layouts(_records.json_value(value, name)) for name, value in earlier.items()}
+    return records.earlier_chains(earlier_data_plan(laid), _chains())
 
 
 def earlier_data_plan(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -63,7 +67,7 @@ def earlier_data_plan(record: Mapping[str, object]) -> Mapping[str, object]:
 def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record of a class that states how its rows write a choice's option (`option_text`,
     `dew.decision.DecisionRunConfig`) where it states none: its rows wrote each option's key beside its
-    description, as every layout did before the field (`QuestionLayout.option_text`), so it reads
+    description, as every layout did before the field (`SegmentLayout.option_text`), so it reads
     `named`. Carried to 1.0 (ledger 1552)."""
     named = registry.class_record(record)
     if named is None or named[0] not in registry.runs or "option_text" in named[1]:

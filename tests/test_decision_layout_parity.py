@@ -1,6 +1,7 @@
 """Byte parity of the decision layouts (decision-inputs.md §1): every row each of the three layouts writes
-(`MarkerLayout`, `StateFirstLayout`, `JointLayout`) over a grid of their configurations, states and questions,
-its tokens, spans, positions, option slots, parallel positions and cuts and its refusal, digested and held
+(`SegmentLayout.marker_row`, `state_first_row`, `joint_row`) over a grid of their configurations, states and
+questions, its tokens, spans, positions, option slots, parallel positions and cuts and its refusal, digested
+and held
 against the digests main's renderers wrote (decision_layout_parity.json), so one segment layout configured
 as each of them writes the same bytes."""
 
@@ -14,8 +15,8 @@ import pytest
 
 from dew._records import JSON
 from dew.data.text import ByteTokenizer
-from dew.decision import Choice, JointLayout, Media, Noul, Schema, State, Text
-from dew.decision.layout import Labels, MarkerLayout, Specials, StateFirstLayout
+from dew.decision import Choice, Media, Noul, Schema, State, Text
+from dew.decision.layout import Labels, SegmentLayout, Specials
 
 TOKENIZER = ByteTokenizer()
 SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
@@ -38,10 +39,11 @@ QUESTIONS = {
 LABELS = Labels(names=("A", "B", "C", "D", "E", "F", "G", "H", "I"), variants=("{}",))
 
 
-def per_question() -> dict[str, object]:
+def question_rows() -> dict[str, object]:
     """Each per-question layout configuration the grid writes, by name."""
     configured: dict[str, object] = {}
-    for kind, layout in (("marker", MarkerLayout), ("state_first", StateFirstLayout)):
+    for kind, layout in (("marker", SegmentLayout.marker_row), ("state_first",
+                                                                SegmentLayout.state_first_row)):
         for max_len, parallel, labels, unit in itertools.product((512, 72), (False, True), (None, LABELS),
                                                                 ("pieces", "whole")):
             name = (f"{kind} {max_len} {'parallel' if parallel else 'sequential'} "
@@ -60,7 +62,7 @@ def joint() -> dict[str, object]:
     """Each joint layout configuration the grid writes, by name."""
     schema_first = (Schema(), Text("\n\nSTATE:\n"), Media(), State(), Text("\n"))
     return {f"joint {max_len} {name}{' state ' + str(cap) if cap else ''}": (
-        JointLayout, {"max_len": max_len, **({} if segments is None else {"segments": segments}),
+        SegmentLayout.joint_row, {"max_len": max_len, **({} if segments is None else {"segments": segments}),
                       "max_state_tokens": cap})
             for max_len, (name, segments), cap in itertools.product(
                 (16384, 220), (("release", None), ("schema first", schema_first)), (None, 24))}
@@ -85,11 +87,11 @@ def digest(layout_type, settings: dict) -> str:
 
 def written() -> dict[str, str]:
     """The grid's digests, by configuration."""
-    return {name: digest(*configured) for name, configured in {**per_question(), **joint()}.items()}
+    return {name: digest(*configured) for name, configured in {**question_rows(), **joint()}.items()}
 
 
-@pytest.mark.parametrize("name", sorted({**per_question(), **joint()}))
+@pytest.mark.parametrize("name", sorted({**question_rows(), **joint()}))
 def test_each_layout_writes_the_bytes_mains_renderers_wrote(name):
     """Each configuration's rows, over every state and question set, digest as main's renderers' did."""
-    configured = {**per_question(), **joint()}[name]
+    configured = {**question_rows(), **joint()}[name]
     assert digest(*configured) == json.loads(DIGESTS.read_text())[name]

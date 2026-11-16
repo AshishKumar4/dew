@@ -16,7 +16,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from dew.decision.calibration import Calibration
-from dew.decision.layout import Layout
+from dew.decision.layout import Layout, SegmentLayout, earlier_layouts
 from dew.interop.release import ReleaseDtypes, ReleaseTask
 from dew.interop.release_record import Release
 from dew.nn.precision import Numerics
@@ -39,17 +39,18 @@ def decision_envelope(held: Release, layout: Layout | None = None, calibration: 
     return replace(held, task=task, layout=stated, max_length=max_length, calibration=calibrated)
 
 
-def released_decision[L: Layout](directory: Path, layout: L, calibration: Calibration, *,
-                                 kind: type[L]) -> tuple[L, Calibration]:
+def released_decision(directory: Path, layout: SegmentLayout, calibration: Calibration, *,
+                      joint: bool) -> tuple[SegmentLayout, Calibration]:
     """`layout` and `calibration`, the ones a decision format derives of its own files, as the release beside
-    them states them over those (`decision_envelope`), the layout as a `kind` (a Laya head reads rows a
-    `QuestionLayout` lays out, the joint head's a `JointLayout`'s)."""
+    them states them over those (`decision_envelope`), the layout's rows `joint` or a question's (a Laya
+    head reads rows a question, the joint head's the joint row), its record read as one an earlier Dew
+    wrote is (`earlier_layouts`)."""
     release = _loaded(directory)
     if release is not None and release.layout is not None:
-        stated = from_record(Layout, release.layout, dtypes=False)
-        if not isinstance(stated, kind):
-            raise ValueError(f"the release in {directory} states a {type(stated).__name__} layout, and its "
-                             f"format reads rows a {kind.__name__} lays out")
+        stated = from_record(Layout, earlier_layouts(release.layout), dtypes=False)
+        if not isinstance(stated, SegmentLayout) or stated.joint != joint:
+            raise ValueError(f"the release in {directory} states the layout {stated!r}, and its format reads "
+                             f"{'the joint row' if joint else 'a row a question'}")
         layout = stated
     if release is not None and release.calibration is not None:
         calibration = from_record(Calibration, release.calibration, dtypes=False)

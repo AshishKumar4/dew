@@ -318,7 +318,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   mixer (gated delta net, Kimi delta attention, Mamba, Mamba-2, the short conv) the state and conv history
   they leave, each token at its own row's place. `dew.data.forked_rows.ForkedRows` packs rows that begin
   alike over one copy of their prefix and maps each row's outputs back. A decision layout asks a request's
-  questions over one copy of its state by default (`QuestionLayout.shared_state` None: as many as a row
+  questions over one copy of its state by default (`SegmentLayout.shared_state` None: as many as a row
   holds; 1, a row a question), on hybrids too; `label_scores`, the lm-eval adapter and a GRPO pack
   (`share`) lay their prompts once; a flow rollout encodes each prompt once for its group. A tree verify
   states its tree as forks, so a hybrid verifies trees. `siblings`, `attention_tree`, `chain_lengths` and
@@ -395,7 +395,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `rl_agent_config.json` takes a number for `temperature` beside its per-type list, and a release record's
   calibration states it for formats whose files hold none.
 - A decision run's question rows can ask a request's questions over one copy of its state (`--shared-state n`,
-  `QuestionLayout.shared_state`): a row holds the state once and up to `n` questions after it, each read as
+  `SegmentLayout.shared_state`): a row holds the state once and up to `n` questions after it, each read as
   its own row reads it, at its own row's positions, so a request of `q` questions reads its state once a row
   rather than `q` times. `--siblings` lets each question also read the questions before it in its row. A
   request that outgrows a row takes several, each repeating the state.
@@ -444,7 +444,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   joins a scheduler's pool without `dew launch`, a scheduler of your own among them; `dew launch` reads the same
   environments, through public `jax.distributed.initialize` alone.
 - A decision run's question rows can ask a request's questions over one copy of its state (`--shared-state n`,
-  `QuestionLayout.shared_state`): a row holds the state once and up to `n` questions after it, each read as
+  `SegmentLayout.shared_state`): a row holds the state once and up to `n` questions after it, each read as
   its own row reads it, at its own row's positions, so a request of `q` questions reads its state once a row
   rather than `q` times. `--siblings` lets each question also read the questions before it in its row. A
   request that outgrows a row takes several, each repeating the state.
@@ -1270,7 +1270,7 @@ pointer from now on: its 0.1.1 installs nothing and names the index.
   rounds Optax's `p - 1` to 0 keeps its derivative, each row's derivative sums to
   zero, and a divergence from logits equal to its reference has derivative
   exactly zero. Their values are unchanged.
-- A joint decision row's user turn is composed of segments, `JointLayout.segments`, a tuple of
+- A joint decision row's user turn is composed of segments, `SegmentLayout.segments`, a tuple of
   `Text`, `Media`, `State` and `Schema` in the order the row writes them: the default is the Laya
   joint release's turn, and another writes the schema before the state, or text of its own
   between the parts. A run records its layout and head by import path through `dew.registry`,

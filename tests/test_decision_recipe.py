@@ -15,6 +15,7 @@ from dew.config import RunConfig
 from dew.data import Files, Loading, Memory
 from dew.decision import Choice, Decide, decisions, mixture
 from dew.decision.config import DecisionRunConfig
+from dew.decision.layout import SegmentLayout, per_question
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
 from dew.scores import Summary
@@ -118,7 +119,6 @@ def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_p
 
     from dew.batch import FROZEN
     from dew.checkpoints import Checkpoints
-    from dew.decision.layout import QuestionLayout
     from dew.lora import LoRA
     from dew.training import Trainer
 
@@ -133,7 +133,7 @@ def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_p
                                                                           compilation_cache_dir=None))
     objective, dataset = config.prepare().train("adapted")
     assert objective.layout.max_len == 512
-    assert isinstance(objective.layout, QuestionLayout)
+    assert per_question(objective.layout)
     head = objective.held_variables()["params"]["head"]
     for native, name in (("slots", "slot"), ("q", "q.weight"), ("k", "k.weight")):
         np.testing.assert_array_equal(np.asarray(head[native]), stored[name])
@@ -651,12 +651,11 @@ def test_a_tables_own_integer_labels_name_their_options_by_value():
     from dew.data.dataset import DataPartition
     from dew.data.text import ByteTokenizer
     from dew.decision import Specials
-    from dew.decision.layout import StateFirstLayout
     from dew.decision.objective import DecisionObjective
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
     rows = [{"text": f"row {index}", "label": 10 if index < 3 else 2} for index in range(8)]
-    layout = StateFirstLayout(max_len=64, head_max_len=32, option_tokens=4)
+    layout = SegmentLayout.state_first_row(max_len=64, head_max_len=32, option_tokens=4)
     objective = DecisionObjective(
         CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                           max_seq_len=layout.max_len),
@@ -921,7 +920,6 @@ def test_a_backbone_reading_its_own_media_in_blocks_keeps_a_joint_layout():
     question, as a run that asks for no block-bidirectional attention. A loader check of the source the
     run derives its layout from: a run of it trains past a CPU task's memory (11.5 GiB, armada mc-cuts3)."""
     from dew.decision.config import JointShape
-    from dew.decision.layout import JointLayout
 
     default = Fitted(data=TICKETS)
     trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
@@ -929,7 +927,7 @@ def test_a_backbone_reading_its_own_media_in_blocks_keeps_a_joint_layout():
                                                        "gemma4-unified-native-tiny"),
                               trainer=trainer, head=JointShape(), max_len=128)
     objective, _ = run.prepare().train("x")
-    assert isinstance(objective.layout, JointLayout)
+    assert (isinstance(objective.layout, SegmentLayout) and objective.layout.joint)
 
 
 def test_a_checkpoint_declaring_block_attention_trains_and_serves_a_fresh_heads_rows_in_blocks(tmp_path):
