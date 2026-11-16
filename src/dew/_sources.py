@@ -217,8 +217,9 @@ MISSING = dataclasses.MISSING
 
 class GeneratedField(NamedTuple):
     """A field a class generator (`dataclasses`, attrs) recorded on a class: its name, its default and its
-    default factory, each `MISSING` where it has none, and for an attrs field the rest of what attrs
-    recorded of it (`parts`, `generated_fields`), each by its name; none for a dataclass's."""
+    default factory, each `MISSING` where it has none, and the rest of what its generator recorded of it
+    (`parts`), each by its name: an attrs field's every part (`generated_fields`), a dataclass field's flags
+    where they depart from `FIELD_FLAGS` (compare, hash, init, repr, metadata)."""
 
     name: str
     default: Any
@@ -236,6 +237,11 @@ def generated(held: type) -> bool:
     """Whether a class generator made `held`: a dataclass (one it derives from among them) or a class attrs
     made itself."""
     return dataclasses.is_dataclass(held) or attrs_made(held)
+
+
+def generated_instance(value) -> bool:
+    """Whether `value` is an instance of a class a generator made (`generated`), which its fields state."""
+    return not isinstance(value, type) and generated(type(value))
 
 
 def field_names(held: type) -> list[str]:
@@ -266,6 +272,45 @@ def _setattr_hooks(held: type) -> Mapping[str, Callable]:
     return {}
 
 
+DATACLASS_OPTIONS = {name: parameter.default for name, parameter
+                     in inspect.signature(dataclasses.dataclass).parameters.items() if name != "cls"}
+"""What `dataclasses.dataclass` makes a class with unless told otherwise (eq, order, frozen, ...), read from
+its signature: a class's departures from it are part of what it is (`generation_options`)."""
+
+FIELD_FLAGS = {name: parameter.default
+               for name, parameter in inspect.signature(dataclasses.field).parameters.items()
+               if name not in ("default", "default_factory", "kw_only")}
+"""What `dataclasses.field` gives a field unless told otherwise (compare, hash, init, repr, metadata), read
+from its signature: a field's departures from it are its parts (`GeneratedField.parts`). Its keyword-only
+flag is its class's unless set, and names only how `__init__` is called."""
+
+ATTRS_COMPARISONS = {"eq": "__eq__", "order": "__lt__"}
+"""An attrs class's comparison options by the method each writes into it, and so whether it was given each:
+attrs makes a class with equality and without ordering unless told otherwise (`attrs.define`'s eq=True,
+order=False)."""
+
+ATTRS_DEFAULTS = {"eq": True, "order": False}
+"""What `attrs.define` makes a class with unless told otherwise, of `ATTRS_COMPARISONS`."""
+
+
+def generation_options(held: type) -> tuple[tuple[str, bool], ...]:
+    """How a class generator made `held` itself where that departs from its defaults, each by its name: a
+    dataclass's options apart from `DATACLASS_OPTIONS` (eq, order, frozen, unsafe_hash, ...); an attrs
+    class's equality and ordering by the methods it holds (`ATTRS_COMPARISONS`) apart from `ATTRS_DEFAULTS`.
+    Empty for a
+    class made as its generator makes one by default, or by none, so its statement is what it was (base
+    review of 67fd128db: an eq=False went unstated, and a step comparing its instances read other rows; train
+    963's review: every attrs class stated its comparisons, a class made by default among them)."""
+    params = vars(held).get("__dataclass_params__")
+    if params is not None:
+        return tuple((name, getattr(params, name)) for name, default in DATACLASS_OPTIONS.items()
+                     if getattr(params, name) != default)
+    if "__attrs_attrs__" in vars(held):
+        given = {name: vars(held).get(method) is not None for name, method in ATTRS_COMPARISONS.items()}
+        return tuple((name, value) for name, value in given.items() if value != ATTRS_DEFAULTS[name])
+    return ()
+
+
 def generated_fields(held: type) -> list[GeneratedField]:
     """The fields a class generator recorded on `held` itself, in order, its bases' among them and an
     override's default its own: a dataclass's (`dataclasses.fields`, its class and init variables, which
@@ -273,12 +318,16 @@ def generated_fields(held: type) -> list[GeneratedField]:
     factory, the rest of what attrs recorded of it its parts). Empty for a class no generator made
     itself."""
     if "__dataclass_fields__" in vars(held):
-        return [GeneratedField(field.name, field.default, field.default_factory)
+        # Each field's flags that depart from `FIELD_FLAGS` (an empty metadata is the default's none).
+        return [GeneratedField(field.name, field.default, field.default_factory,
+                               tuple((name, getattr(field, name)) for name, default in FIELD_FLAGS.items()
+                                     if not (name == "metadata" and not field.metadata)
+                                     and getattr(field, name) != default))
                 for field in dataclasses.fields(held)]
     if attrs_made(held):
         # attrs is loaded where a class of it exists; its sentinel and factory type are its own.
         attr = sys.modules["attr"]
-        converter_type, hooks = vars(attr).get("Converter"), _setattr_hooks(held)
+        hooks = _setattr_hooks(held)
         found = []
         for field in vars(held)["__attrs_attrs__"]:
             default, factory = field.default, MISSING
@@ -286,17 +335,13 @@ def generated_fields(held: type) -> list[GeneratedField]:
                 default, factory = MISSING, default.factory
             # Every other slot of its `Attribute` (converter, validator, eq and order flags and keys, hash,
             # init, repr, metadata, keyword-only, alias, whatever this attrs records) but `ATTRS_UNSTATED`,
-            # an `attrs.Converter` as its converter and how it is called (where this attrs has one), and the
-            # hook the class's generated `__setattr__` runs on it, the class's own where the field sets none
-            # (train 955's review: a class-level hook and an `eq=False` went unstated).
+            # and the hook the class's generated `__setattr__` runs on it, the class's own where the field
+            # sets none (train 955's review: a class-level hook and an `eq=False` went unstated).
             parts = []
             for name in vars(type(field))["__slots__"]:
                 if name in ATTRS_UNSTATED:
                     continue
-                value = getattr(field, name)
-                if converter_type is not None and isinstance(value, converter_type):
-                    value = (value.converter, value.takes_self, value.takes_field)
-                parts.append((name, value))
+                parts.append((name, getattr(field, name)))
             if (hook := hooks.get(field.name)) is not None:
                 parts.append(("on_setattr", hook))
             found.append(GeneratedField(field.name, MISSING if default is attr.NOTHING else default, factory,

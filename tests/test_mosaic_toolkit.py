@@ -5,8 +5,6 @@ here, and runs on one in the GPU gate."""
 
 import dataclasses
 import functools
-import json
-import re
 
 import jax
 import jax.numpy as jnp
@@ -16,7 +14,7 @@ from generation_support import INTERPRETS
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
-from kernel_compile import gate_generations
+from kernel_compile import gate_generations, stated_outputs
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import across, handoffs, mosaic, outputs, rings, stores, swizzling
@@ -804,13 +802,6 @@ def _persisted_operands(rows: int):
     return x, w
 
 
-def _stated_dims(lowered) -> list:
-    """Each kernel call's output dimensions as the lowered program states them to XLA, its frontend attribute
-    (`outputs.OUTPUT_DIMS`), which the compiler's live buffers read."""
-    found = re.findall(rf'{outputs.OUTPUT_DIMS} = "([^"]*)"', lowered.as_text())
-    return [json.loads(stated) for stated in found]
-
-
 def test_a_kernels_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
     """A kernel whose output its operands' axes state (`outputs.output`: `x`'s rows by `w`'s columns),
     lowered for a B200 on any host: its shape is theirs, and its call states the dimensions each output
@@ -825,7 +816,7 @@ def test_a_kernels_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
         lowered = jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(
             x, w).lower(lowering_platforms=("cuda",))
     assert lowered.out_info.shape == (x.shape[0], w.shape[1])
-    assert _stated_dims(lowered) == [[[[[0, 0]], [[1, 1]]]]]
+    assert [dims for _, dims in stated_outputs(lowered) if dims is not None] == [[[[[0, 0]], [[1, 1]]]]]
 
 
 def test_a_pallas_calls_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
@@ -846,7 +837,7 @@ def test_a_pallas_calls_outputs_stated_as_its_operands_axes_are_stated_on_its_ca
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(copied).trace(x).lower(lowering_platforms=("cuda",))
     assert lowered.out_info.shape == (32, 16)
-    assert _stated_dims(lowered) == [[[[[0, 1]], [[0, 0]]]]]
+    assert [dims for _, dims in stated_outputs(lowered) if dims is not None] == [[[[[0, 1]], [[0, 0]]]]]
 
 
 @INTERPRETS

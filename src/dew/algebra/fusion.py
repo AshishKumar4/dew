@@ -97,10 +97,17 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     index = Index(jaxpr)
     attention = recognize.recognized(jaxpr, index, recognize.ATTENTION)
     held = {place for region in attention for place in region.places}
-    identities = {region: _identity(jaxpr, region) for region in _regions(index)
-                  if not held & set(region.places)}
-    products = [region for region, identity in identities.items()
-                if _decided(identity, lambda region=region: _takes(fused_gemm, jaxpr, region))]
+    identities = {}
+    for found in _regions(index):
+        if held & set(found.places):
+            continue
+        # A region its prologue keeps from fusing is weighed without it: its product and its epilogue.
+        for region in (found, _bare(jaxpr, found)) if found.prologue else (found,):
+            identities[region] = _identity(jaxpr, region)
+            if _decided(identities[region], lambda region=region: _takes(fused_gemm, jaxpr, region)):
+                break
+            del identities[region]
+    products = list(identities)
     # A norm a product's prologue replays is the product's (`_prologue`), as an epilogue's norm is.
     held |= {place for region in products for place in region.replayed}
     written = attention + recognize.recognized(jaxpr, index, recognize.NORMS, frozenset(held))
@@ -110,6 +117,12 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
                         _fusing(_replayed(jaxpr, region, fused_gemm), fused_gemm),
                         ("product", identities[region])) for region in products]
     return _spliced(jaxpr, written)
+
+
+def _bare(jaxpr: jcore.Jaxpr, region: Region) -> Region:
+    """`region` without its prologue: its product and its epilogue, reading the product's rows as given."""
+    places = tuple(place for place in region.places if place not in region.prologue)
+    return Region(places, region_inputs(jaxpr, places), region.outputs, region.at)
 
 
 def region_inputs(jaxpr: jcore.Jaxpr, places: Sequence[int]) -> tuple[jcore.Var, ...]:
@@ -227,6 +240,27 @@ def _elementwise(equation: jcore.JaxprEqn, shape: tuple[int, ...]) -> bool:
             and all(_follows(_shape(var), shape) for var in equation.invars))
 
 
+def _captured(index: Index, scanned: Sequence[int], members: set[int], claimed: set[int]) -> set[int]:
+    """The layout equations of the captured operands of the equations at `scanned` that only `members` read
+    (`CAPTURED`: a bias's broadcast, a row statistic's over the depth), no other region holds (`claimed`)
+    and none escaping the program: a product's epilogue's (`scanned` its consumers, `members` them and the
+    product) and its prologue's (`_prologue`)."""
+    jaxpr, producer = index.jaxpr, index.producer
+    # Each layout equation taken joins the members its later readers are checked against.
+    held, found = set(members), set()
+    for place in scanned:
+        for var in jaxpr.eqns[place].invars:
+            if not isinstance(var, jcore.Var):
+                continue
+            source = producer.get(var)
+            if (source is not None and source not in held and source not in claimed
+                    and jaxpr.eqns[source].primitive in CAPTURED and index.readers[var] <= held
+                    and var not in index.escaping):
+                held.add(source)
+                found.add(source)
+    return found
+
+
 def _prologue(index: Index, start: int, claimed: set[int]) -> tuple[int, ...]:
     """The places of the product at `start`'s prologue (`_regions`): the elementwise equations of its left
     operand's shape (`_elementwise`) that make it, walked back from it to a value of another shape or kind or
@@ -246,14 +280,7 @@ def _prologue(index: Index, start: int, claimed: set[int]) -> tuple[int, ...]:
             continue
         members.add(place)
         frontier.extend(var for var in jaxpr.eqns[place].invars if isinstance(var, jcore.Var))
-    for place in list(members):
-        for var in jaxpr.eqns[place].invars:
-            source = producer.get(var) if isinstance(var, jcore.Var) else None
-            if (source is not None and source not in members and source not in claimed
-                    and jaxpr.eqns[source].primitive in CAPTURED and index.readers[var] <= members
-                    and var not in index.escaping):
-                members.add(source)
-    return tuple(sorted(members))
+    return tuple(sorted(members | _captured(index, sorted(members), members, claimed)))
 
 
 def _regions(index: Index) -> list[Region]:
@@ -281,18 +308,9 @@ def _regions(index: Index) -> list[Region]:
                 break
             places.append(place)
             made.update(later.outvars)
-        members = set(places)
-        for place in list(places[1:]):
-            for var in jaxpr.eqns[place].invars:
-                if not isinstance(var, jcore.Var):
-                    continue
-                source = producer.get(var)
-                if (source is not None and source not in members and source not in claimed
-                        and jaxpr.eqns[source].primitive in CAPTURED
-                        and readers[var] <= members and var not in escaping):
-                    members.add(source)
-                    made.update(jaxpr.eqns[source].outvars)
-        places = sorted(members)
+        captured = _captured(index, places[1:], set(places), claimed)
+        made.update(var for place in captured for var in jaxpr.eqns[place].outvars)
+        places = sorted({*places, *captured})
         read_after = {var for later in jaxpr.eqns[places[-1] + 1:] for var in later.invars
                       if isinstance(var, jcore.Var)} | escaping
         outputs = tuple(var for place in places for var in jaxpr.eqns[place].outvars if var in read_after)
@@ -405,9 +423,9 @@ def _decided(identity: Hashable, decide: Callable[[], bool]) -> bool:
 
 def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
     """Whether the region is fused (`fused_gemm.analysis`): its product's launch the template's (its
-    selector's choice, or a call's, `generation.chosen`), its epilogue the kernel's, nothing refused, and
-    its fused seconds less than its unfused ones. The prices are a roofline on the part's rates (each
-    stage's units overlapped, plus the fixed launch), not the derived tile's walk: on a cell where the
+    selector's choice, or a call's, `generation.chosen`), its prologue and epilogue the kernel's, nothing
+    refused, and its fused seconds less than its unfused ones. The prices are a roofline on the part's rates
+    (each stage's units overlapped, plus the fixed launch), not the derived tile's walk: on a cell where the
     launch measured slower than XLA's dot (`grouped_matmul.DECLARED`, every dense cell: DENSE1, 1.05 to 2.9
     times XLA's) they favour fusion more than measurement does, so a region whose launch the selector gives
     XLA is never fused by price alone; a call naming the template (an A/B's arm) fuses it."""
@@ -417,24 +435,31 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
     wide = any(shape.dtype.itemsize == 8 for shape in (*inputs, *_shapes(region.outputs)))
     with jax.enable_x64(new_val=wide):
         found = fused_gemm.analysis(_replayed(jaxpr, region, fused_gemm), *inputs)
-    if found.epilogue is None:
-        # No epilogue to weigh (a bare product, a kernel gradient's): its launch's selector decides alone.
-        return found.launch is not None and found.launch.refusal is None and found.launch.kernel != "xla"
-    taken = all(route is not None and route.refusal is None and route.kernel != "xla"
-                for route in (found.launch, found.epilogue))
+    routes = [found.launch, *([found.prologue] if region.prologue else [])]
+    if found.epilogue is None and not region.prologue:
+        # No stage to weigh (a bare product, a kernel gradient's): its launch's selector decides alone.
+        return all(route is not None and route.refusal is None and route.kernel != "xla" for route in routes)
+    # A prologue the template refuses (a row normalized from float32 to bfloat16, `dtype_changes`) is no
+    # region's: the region without it is weighed instead (`fused_program`). Each stage it holds is weighed by
+    # price, a prologue's as an epilogue's (`fused_gemm.priced`: the operand formed in the launch, not
+    # written whole and read back).
+    stages = (*routes, *([found.epilogue] if found.epilogue is not None else []))
+    taken = all(route is not None and route.refusal is None and route.kernel != "xla" for route in stages)
     return (taken and found.fused_seconds is not None and found.unfused_seconds is not None
             and found.fused_seconds < found.unfused_seconds)
 
 
 class _Trace(NamedTuple):
-    """A region's written program (`_traced`): its one equation, the inputs it reads them by, and the routes
-    and launches (each its op and keyed arguments, and the config it took, `tuning.Seen.held`) its trace
-    reported, which each program it is written into reports."""
+    """A region's written program (`_traced`): its one equation, the inputs it reads them by, the routes and
+    launches (each its op and keyed arguments, and the config it took, `tuning.Seen.held`) its trace
+    reported, which each program it is written into reports, and the facts its trace read
+    (`generation.recording`), which each program it is written into reads again (`generation.replay`)."""
 
     equation: jcore.JaxprEqn
     invars: tuple[jcore.Var, ...]
     routes: tuple
     launches: tuning.Seen
+    reads: dict
 
 
 _traces: collections.OrderedDict[Hashable, _Trace] = collections.OrderedDict()
@@ -443,20 +468,24 @@ _traces: collections.OrderedDict[Hashable, _Trace] = collections.OrderedDict()
 def _traced(region: Written) -> _Trace:
     """`region`'s call traced as one nested program over its inputs' types (`nested`), once a process for
     its identity (`Written.key`) in the context a kernel is chosen in (`choice_context`), held
-    (`_cache.holding`);
-    its routes and launches reported where it is written, as its trace reported them
-    (`generation.reported`, `tuning.noted`)."""
+    (`_cache.holding`) while each fact its trace read answers alike (`generation.still`); its routes and
+    launches reported where it is written, as its trace reported them (`generation.reported`,
+    `tuning.noted`), and the facts it read read again there (`generation.replay`), so a recording around the
+    program that writes it holds them as one around its trace did (row 6708)."""
     from dew.nn.kernels import tuning
 
     def traced_once() -> _Trace:
-        with generation.routes(alone=True) as routes, tuning.seen() as seen:
+        with (generation.routes(alone=True) as routes, tuning.seen() as seen,
+              generation.recording() as reads):
             traced = jax.make_jaxpr(nested(region.call))(*_shapes(region.inputs))
         (equation,) = traced.jaxpr.eqns
-        return _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), seen.held())
+        return _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), seen.held(), reads)
 
-    held = _cache.holding(_traces, (region.key, choice_context()), traced_once, DECISIONS_HELD)
+    held = _cache.holding(_traces, (region.key, choice_context()), traced_once, DECISIONS_HELD,
+                          still=lambda trace: generation.still(trace.reads))
     generation.reported(held.routes)
     tuning.noted(held.launches)
+    generation.replay(held.reads)
     return held
 
 

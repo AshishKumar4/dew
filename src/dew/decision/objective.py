@@ -869,7 +869,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         reloads that source's processor files and derives its media geometry
         from the source config; the decision record owns neither format.
         """
-        from dew.inference.tasks import recorded_tokenizer
+        from dew.inference.tasks import recorded_files, recorded_tokenizer
 
         return DecideSettings(
             self.model.head.record(),
@@ -879,7 +879,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             None if self.image_processor is None or self.image_processor.directory is None
             else self.image_processor.source,
             self.model.context_encoder,
-            self.options)
+            self.options,
+            recorded_files(RunProcessor(self.tokenizer)))
 
     def recorded_model(self) -> nn.Module:
         """The backbone; the head is a task setting of its own."""

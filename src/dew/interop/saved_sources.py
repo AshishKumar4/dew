@@ -131,16 +131,24 @@ def step_records(artifact: dict[str, JSON] | list[JSON] | str | int | float | bo
                  step: int) -> tuple[epath.Path, ...]:
     """The files the task of the objective `artifact`, a step's inference declaration
     (`Checkpoints.artifact`), names keeps by the `step` of the run in `directory`
-    (`SavedRunTask.step_records`); none for a step that declares no objective, an objective that names no
-    task, or a task that keeps none."""
+    (`SavedRunTask.step_records`), and the tokenizer the run holds (`dew.data.text.held_place`), which
+    a release carries at the same place; none for a step that declares no objective, an objective that
+    names no task, or a task that keeps none."""
+    from dew.data.text import HELD_FILES, held_place
     from dew.inference.tasks import SavedRunTask, declared_objective
 
     if not isinstance(artifact, dict) or "objective" not in artifact:
         return ()
+    held: tuple[epath.Path, ...] = ()
+    files = artifact.get("tokenizer_files")
+    hashed = {str(path): str(digest) for path, digest in files.items()} if isinstance(files, dict) else {}
+    if hashed and (held_place(directory, hashed) / HELD_FILES).exists():
+        place = held_place(directory, hashed)
+        held = (*(place / path for path in hashed), place / HELD_FILES)
     task = declared_objective(artifact).saved_task
     if task is None or not issubclass(task, SavedRunTask):
-        return ()
-    return task.step_records(directory, step)
+        return held
+    return (*task.step_records(directory, step), *held)
 
 
 def _fingerprint(run: SavedRun, ema: bool | None) -> str:

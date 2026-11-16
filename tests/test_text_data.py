@@ -6,10 +6,12 @@ run when a cached copy of the hub is reachable, matching the repo's policy
 that no test needs the network.
 """
 
+import hashlib
 import itertools
 import json
 import os
 import shutil
+import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
@@ -990,3 +992,57 @@ def test_tokenize_reads_a_records_text_under_any_conventional_field(field):
     (tokens,) = iterate(Memory([{field: "hi", "tag": 7}]).map(tokenize("byte", eos=False)))
     assert tokens["text"].tolist() == list(b"hi") and int(tokens["tag"]) == 7
     assert field == "text" or field not in tokens
+
+
+EARLIER_RUN = """
+import json, sys
+from dew.data.text import tokenizer_for
+from dew.inference.tasks import earlier_shapes, hold_tokenizer, recorded_files, RunProcessor
+read = earlier_shapes({"tokenizer": sys.argv[1]})
+found = tokenizer_for(read["tokenizer"])
+files = recorded_files(RunProcessor(found))
+hold_tokenizer({"tokenizer": read["tokenizer"], "tokenizer_files": files}, sys.argv[2])
+print(json.dumps({"tokenizer": read["tokenizer"], "files": files}))
+"""
+
+HELD_RUN = """
+import json, sys
+from dew.data.text import tokenizer_for
+files = json.loads(sys.argv[3])
+found = tokenizer_for(sys.argv[1], files=files, held=sys.argv[2])
+print(json.dumps({"directory": found.pinned.directory, "files": found.pinned.files}))
+"""
+
+
+def test_an_earlier_runs_snapshot_tokenizer_is_resolved_by_its_commit_and_held_from_its_next_save(tmp_path):
+    """A run saved before runs held their own tokenizer, whose record names the hub cache snapshot
+    directory of the host that trained it and no hashes, read on a host whose hub cache holds no snapshot of
+    it: its tokenizer is named by its repo and commit, which the pinned resolver fetches from the hub, and
+    its files hashed; the run's next save holds them, and read again with the hub gone and a fresh cache,
+    the run hands back its own copy, the same files. That first resolution trusts the hub's files at that
+    commit, which no recorded hash can check. A record of the training host's directory was handed the hub
+    as a repo id and failed on any other host."""
+    from local_hub import LocalHub, hub_environment
+
+    fixture = Path(__file__).parent / "fixtures" / "laya" / "tiny" / "tokenizer"
+    files = {path.name: path for path in fixture.iterdir() if path.is_file()}
+    run = tmp_path / "run"
+    run.mkdir()
+    with LocalHub({"org/tiny": files}) as hub:
+        recorded = f"/training-host/hub/models--org--tiny/snapshots/{hub.commit('org/tiny')}"
+        first = subprocess.run([sys.executable, "-c", EARLIER_RUN, recorded, str(run)],
+                               env=hub_environment(hub, tmp_path / "receiving"), capture_output=True,
+                               text=True, check=False)
+    assert first.returncode == 0, first.stderr[-3000:]
+    resolved = json.loads(first.stdout.strip().splitlines()[-1])
+    assert resolved["tokenizer"] == f"org/tiny@{hub.commit('org/tiny')}"
+    expected = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in files.items()}
+    assert {name: digest for name, digest in resolved["files"].items() if name in expected} == expected
+    again = subprocess.run([sys.executable, "-c", HELD_RUN, resolved["tokenizer"], str(run),
+                            json.dumps(resolved["files"])],
+                           env=hub_environment(None, tmp_path / "fresh", offline=True), capture_output=True,
+                           text=True, check=False)
+    assert again.returncode == 0, again.stderr[-3000:]
+    held = json.loads(again.stdout.strip().splitlines()[-1])
+    assert held["files"] == resolved["files"]
+    assert held["directory"].startswith(str(tmp_path / "fresh"))

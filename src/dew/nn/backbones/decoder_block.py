@@ -119,12 +119,11 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float 
     `specs` changes it there, a gated one (`NormSpec.gate_rank`) gated where
     `norm_gated` says: a layer's on the layers it names, the `routed` layer's
     among them or not, and a norm outside the layers (`routed` None) wherever
-    it runs, its gate's maps at the model's `precision`. 'layer' keeps torch's
-    exact variance, every torch LayerNorm's (`dew.nn.norms.LayerNorm`'s);
-    'fast_layer' is flax's E[x^2] - E[x]^2 (`use_fast_variance`), whose mean
-    and square reduce in one pass, for a model that states it: it cancels in
-    fp32 wherever a row's mean dwarfs its spread, so no port of a torch norm
-    takes it. An `epsilon` of None is an RMS norm's input dtype's
+    it runs, its gate's maps at the model's `precision`. 'layer' and
+    'fast_layer' (the name a model stating flax's one-pass form gives it) are
+    each `dew.nn.norms.LayerNorm`, its rows shifted by their mean before their
+    mean and mean square reduce in one pass, as near float64 as torch's exact
+    variance. An `epsilon` of None is an RMS norm's input dtype's
     (`RMSNorm.epsilon`); a layer norm states its own. `weight_dtype_reads` gives an RMS norm's output its
     weight's dtype where no `dtype` is set (`RMSNorm.weight_dtype_reads`)."""
 
@@ -152,8 +151,7 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float 
                              f"weight offset from one only as a scaled 'layer' norm, not {spec}")
         if kind == 'layer' and offset:
             return OffsetLayerNorm(epsilon=eps, use_bias=bias, dtype=dtype, name=name)
-        return LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale,
-                         use_fast_variance=kind == 'fast_layer', dtype=dtype, name=name)
+        return LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, dtype=dtype, name=name)
 
     return build
 
