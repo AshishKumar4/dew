@@ -7,6 +7,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A data step built of a dataclass or an attrs class is now stated by every part of each field (its
+  annotation, keyword-only flag, comparison flags, factory's `takes_self`, converter, alias, ...) and by the
+  methods the class generator wrote, so editing any of them refuses an exact resume. This changes the
+  statement of every such step once: a data position saved before this release under a pipeline that holds
+  a dataclass or attrs step no longer resumes exactly. Resumed with `data_resume="relaxed"` it reads on,
+  naming the step; resumed exactly it is refused, naming it. Positions of pipelines without such steps are
+  unaffected.
 - `dew.training.ahead.kept(path)` verifies by default: each handed call's own program is lowered and held to
   the kept one's digest before the kept executable runs, so a kept program its call no longer lowers to is
   refused (`NotTheKeptProgram`), never run; it still compiles nothing. `kept(path, verify=False)` is the
