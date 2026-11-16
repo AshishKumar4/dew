@@ -244,7 +244,7 @@ def trust_sources(names: Sequence[str]) -> None:
     _TRUSTED_SOURCES.update(_source_identity(str(name)) for name in names)
 
 
-def import_trusted(record: object, trust: Sequence[str]) -> None:
+def import_trusted(record: JSON | Mapping[str, object], trust: Sequence[str]) -> None:
     """Trust the packages in `trust` for the rest of the process, and import
     every module of theirs that `record` names by an import path, so reading
     the record finds them imported (`imported`) and may construct their

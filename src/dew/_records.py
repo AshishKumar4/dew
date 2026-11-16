@@ -305,7 +305,7 @@ def moved_paths(value: JSON) -> JSON:
     return mapped_strings(value, moved_spelling)
 
 
-def strings_of(value: object) -> Iterator[str]:
+def strings_of(value: JSON) -> Iterator[str]:
     """Every string `value` holds at any depth, values and lists walked as `mapped_strings` walks them (a
     mapping's keys left out)."""
     if isinstance(value, str):
