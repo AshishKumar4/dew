@@ -808,6 +808,7 @@ class Trainer(Generic[Loss, Effects]):
         `__main__` or a function, or holding what no record carries) still checkpoints: the record says
         why, a loader raises that, and the first checkpoint warns it. Any other error is the record's own
         bug, and raises."""
+        from dew.inference.tasks import hold_tokenizer
         from dew.interop.saved_sources import with_release_sources
 
         artifact: JSON
@@ -816,6 +817,9 @@ class Trainer(Generic[Loss, Effects]):
             # The releases of saved runs its paths lie within, each mapped to the saved run it holds, so a
             # host lacking one writes its own (`dew.interop.saved_sources.with_release_sources`).
             artifact = with_release_sources(self.objective.inference_record())
+            if self.checkpoints is not None:
+                # Its tokenizer's files held in the run itself, which a load reads on any host.
+                hold_tokenizer(artifact, self.checkpoints.directory)
         except Unrecordable as error:
             reason = f"{type(self.objective).__name__}: {error}"
             artifact = {'unrecorded': reason}
