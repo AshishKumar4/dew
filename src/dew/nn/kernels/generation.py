@@ -271,10 +271,15 @@ def run_precision(policy: Numerics) -> Iterator[None]:
     as it stands), and each op's accurate form where its forms are "accurate", the attention template's
     among them, which reads them here (`numerics`, the one seam of a run's forms). The dtypes are the
     model's and the optimizer's own fields, which the run sets from the numerics: a bf16 operand has
-    lost its bits before any product reads it, whatever its precision."""
+    lost its bits before any product reads it, whatever its precision. A low-precision recipe the projections
+    declare none of (`projections.RECIPES`) is refused here, where a run's numerics take effect."""
     from dew import _cache
+    from dew.nn.kernels.projections import RECIPES
     from dew.nn.precision import configured_precision
 
+    if policy.low_precision is not None and policy.low_precision.recipe not in RECIPES:
+        raise ValueError(f"a low-precision recipe is one of {tuple(RECIPES)}, not "
+                         f"{policy.low_precision.recipe!r}")
     with configured_precision(policy.matmul), _cache.NUMERICS(policy):
         yield
 

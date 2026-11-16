@@ -191,12 +191,17 @@ class MxFp8:
     def decoded(self, dtype=jnp.float32) -> jax.Array:
         """Its values, exactly, in `dtype` (`[..., depth]`, float32 or a float64 truth's): each code times
         its block's scale."""
-        return _block_values(self.codes, self.scales, formats_of.MXFP8.depth, dtype)
+        exponents = jax.lax.bitcast_convert_type(self.scales, jnp.uint8).astype(jnp.int32) - 127
+        # Each E8M0 scale applied as its exponent (`jnp.ldexp`, in two normal steps): a scale below
+        # float32's least normal (2**-128 for inputs near 2**-120) would read as zero where a device
+        # flushes subnormals, though the value it scales to is normal.
+        return jnp.ldexp(self.codes.astype(dtype),
+                         jnp.repeat(exponents, formats_of.MXFP8.depth, axis=-1))
 
 
 def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:
     """Block-scaled codes' values in `dtype`: each code times its `block` depths' scale, exact in float32
-    (a code's 4 bits times a power of two, or an E2M1 code times an E4M3 scale: 6 bits)."""
+    (an E2M1 code times an E4M3 scale: 6 bits)."""
     return codes.astype(dtype) * jnp.repeat(scales.astype(dtype), block, axis=-1)
 
 

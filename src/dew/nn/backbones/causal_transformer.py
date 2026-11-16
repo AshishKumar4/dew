@@ -80,6 +80,7 @@ from ..gemma3n import AltUp, clamped_predictions, rescale_to
 from ..host_memory import on_host
 from ..hyper_connections import Carried, HyperConnections, enter_streams, leave_streams, stream_head
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of
+from ..kernels import projections
 from ..kv_cache import CacheSpec, DecodeCursor, KVCache, put_opened
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
@@ -2088,7 +2089,8 @@ class CausalTransformer(LinearProducts):
         matrix = self.embed_tokens.embedding if self.tie_embeddings else self.applied_kernel("lm_head")
         projection = None if self.embedding_features is None else Projection(
             self.applied_kernel("project_out"), self.precision, compute=self.dtype,
-            input_quantizer=self._quantizer(self.project_out))
+            input_quantizer=self._quantizer(self.project_out),
+            path=projections.kernel_path(self.project_out))
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
                            self.final_logit_softcap, self.precision, compute=self.dtype,
                            input_quantizer=None if self.tie_embeddings else self._quantizer(self.lm_head),
