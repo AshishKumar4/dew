@@ -63,7 +63,7 @@ from dew.objectives.base import (
 )
 from dew.objectives.routing import refuse_fixed_routers
 from dew.optim import clips_qk, post_step_order, stepped
-from dew.optim_schedules import INJECTED
+from dew.optim_schedules import injected_edited
 from dew.state import Accumulation, ReplicaState, TokenCount, TrainState, apart, occupancy, together
 from dew.training.distributed import microbatch
 from dew.training.inspection import Inspection, Summaries, stacked, summaries
@@ -517,21 +517,15 @@ def checked(state: TrainState | ReplicaState) -> dict[str, Variables | optax.Opt
     save refuses non-finite: the parameters, the optimizer state and the averages. The one statement of
     them, which the step's acceptance (`finish_attempt`) and a save's refusal
     (`dew.training.trainer.refuse_non_finite`) read. The optimizer state is read without the
-    hyperparameters injected beside it (`dew.optim_schedules.INJECTED`): control values a schedule or the
-    user sets, not written by a step's gradient, and legally infinite (a clip's bound of `math.inf`)."""
+    hyperparameters injected beside it at any depth (`_numerical`): control values a schedule or the user
+    sets, not written by a step's gradient, and legally infinite (a clip's bound of `math.inf`)."""
     return {"variables": state.variables, "opt_state": _numerical(state.opt_state), "ema": state.ema}
 
 
 def _numerical(opt_state: optax.OptState) -> optax.OptState:
-    """`opt_state` without the hyperparameters injected beside it at any depth
-    (`dew.optim_schedules.INJECTED`; an injected state's inner state holds injected states in turn): the
+    """`opt_state` without the hyperparameters injected beside it at any depth (`injected_edited`): the
     state a step's gradients write."""
-    def numerical(node):
-        if not isinstance(node, INJECTED):
-            return node
-        return node._replace(hyperparams={}, inner_state=_numerical(node.inner_state))
-
-    return jax.tree.map(numerical, opt_state, is_leaf=lambda node: isinstance(node, INJECTED))
+    return injected_edited(opt_state, lambda _, node: node._replace(hyperparams={}))
 
 
 def _finite(leaf: jax.Array) -> jax.Array:
