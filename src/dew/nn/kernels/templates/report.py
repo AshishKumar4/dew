@@ -480,11 +480,11 @@ def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable) -> froze
     """The names of `op`'s kernels a compile of this process refused at `config` for `arguments`
     (`Binary.refused`: spilling, or their warpgroup MMAs serialized): a launch of several kernels (a
     recurrence's forward and backward walks) steps the one refused."""
-    return _names(dict(refusals_of(_identity(op, arguments))).get(config, ()))
+    return names(dict(refusals_of(_identity(op, arguments))).get(config, ()))
 
 
-def _names(kernels: Iterable[Refused]) -> frozenset[str]:
-    """The names of refused `kernels` (`Refused`)."""
+def names(kernels: Iterable[Refused]) -> frozenset[str]:
+    """The names of refused `kernels` (`Refused`): what a refusal's readers step by, its roles aside."""
     return frozenset(kernel for kernel, _ in kernels)
 
 
@@ -1174,7 +1174,7 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
         # Each step refuses a config no step refused before, of the finitely many its launches derive.
         held = _registry().refused
         refusals = [(refusal, (report.kernel, report.spilled_in)) for refusal, report, _ in found
-                    if refusal is not None and report.kernel not in _names(held.get(refusal, ()))]
+                    if refusal is not None and report.kernel not in names(held.get(refusal, ()))]
         if not refusals:
             break
         try:
@@ -1336,7 +1336,7 @@ def _stepped_alone(relower: Callable[[], jax.stages.Lowered], options: jax.stage
         found = [(refusal, report, launch)
                  for refusal, report, launch in _misses_of([binary for each in alone.values()
                                                             for binary in each.binaries if binary.refused])
-                 if refusal is not None and report.kernel not in _names(held.get(refusal, ()))]
+                 if refusal is not None and report.kernel not in names(held.get(refusal, ()))]
         if not found:
             return program, missed
         for refusal, report, _ in found:
@@ -1411,7 +1411,7 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
             tried.setdefault((launch.identity, launch.config), (kernel, launch))
     asked_by = {kernel_of(name)[0]: bytes_asked for name, bytes_asked in alone.items()}
     try:
-        with _proposing([(refusal, kernel) for refusal, (kernel, _) in tried.items()]) as proposal:
+        with _proposing([(refusal, (kernel, None)) for refusal, (kernel, _) in tried.items()]) as proposal:
             replacement, spilling = _compiled_reported(relower(), options)
     except (Exhausted, jax.errors.JaxRuntimeError) as again:
         if isinstance(again, jax.errors.JaxRuntimeError) and shared_asked(again) is None:
