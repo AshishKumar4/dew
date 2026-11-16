@@ -57,7 +57,7 @@ class InBackward:
     layer `index` of the run at `path` (the run's module path in the model), its `gradient` and
     `weights` (the masters where the step keeps narrow copies), and its `moments` by collection; it returns
     the moved weights and moments, and whether the update formed (its learning rates finite, and the moved
-    weights where the step reads its formed update, `dew.optim.OptimConfig.checks_updates`), the weights
+    weights where the step reads its formed update, `dew.optim.reads_updates`), the weights
     kept where it did not. `moments` names the collections of the optimizer's moments the step
     added. `handled` records each run's path as the model traces it in the plan, so the step reads those
     runs' state off the backward."""

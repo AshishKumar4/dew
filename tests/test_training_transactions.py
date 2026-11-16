@@ -773,7 +773,7 @@ def _configured_steps(config: OptimConfig, values: list[float]):
 
 def test_an_update_its_bound_cannot_cover_is_skipped_only_where_it_is_not_finite():
     """Adam with b2 under b1 squared and a guard of 1e-21, whose bound cannot cover a bounded gradient, so its
-    step reads its formed update (`OptimConfig.checks_updates`): its first step over a gradient of 1e18,
+    step reads its formed update (`dew.optim.reads_updates`): its first step over a gradient of 1e18,
     whose update is 1, is taken, the weight moved by the rate; with b2 of zero and a guard of 1e-20, a
     gradient of 1e19 then one of zero divides a first moment of 4.7e18 by the guard, past float32, and that
     step alone is skipped, its weight as the first left it and reported not finite. The bound refused the
@@ -788,6 +788,16 @@ def test_an_update_its_bound_cannot_cover_is_skipped_only_where_it_is_not_finite
         OptimConfig(optimizer="adam", learning_rate=1.0, b2=0.0, optimizer_opts={"eps": 1e-20}), [1e19, 0.0])
     assert first_finite and not second_finite and np.all(np.isfinite(first))
     np.testing.assert_array_equal(second, first)
+
+
+def test_an_update_of_a_transformation_dew_did_not_build_is_read():
+    """A transformation Dew did not build (`optax.scale(-1e30)`), whose bound Dew cannot read, has its every
+    update read finite: a finite gradient of 1e10, within the magnitude bound, forms an update of -1e40,
+    which is not finite, and the step is skipped, its weight as it was. Taken unread, it wrote infinite
+    weights, which only a later save refused (Main, theme-15's F6)."""
+    before, (advanced, _, _, finite, _, _) = _pushed_step(1e10, optax.scale(-1e30))
+    assert not bool(finite) and int(advanced.updates) == 0
+    np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), before[0]["params"]["w"])
 
 
 def test_a_window_summing_bounded_gradients_past_the_bound_is_rejected_whole():

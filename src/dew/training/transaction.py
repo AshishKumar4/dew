@@ -63,7 +63,7 @@ from dew.objectives.base import (
     with_projected,
 )
 from dew.objectives.routing import refuse_fixed_routers
-from dew.optim import clips_qk, post_step_order, stepped
+from dew.optim import clips_qk, post_step_order, reads_updates, stepped
 from dew.optim_schedules import injected_edited, learning_rates
 from dew.state import Accumulation, ReplicaState, TokenCount, TrainState, apart, occupancy, together
 from dew.training.distributed import microbatch
@@ -832,7 +832,7 @@ class Transaction:
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
                  record: bool = False, resting: Mapping[str, object] | None = None,
                  inspection: Inspection | None = None, examples: int | None = None, placed=None,
-                 checks_updates: bool = True):
+                 reads_all: bool = True):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -859,8 +859,8 @@ class Transaction:
         """
         self.resting = dict(resting or {})
         self.placed = placed
-        # Whether a step reads its formed update finite (`dew.optim.OptimConfig.checks_updates`).
-        self.checks_updates = checks_updates
+        # Whether every update is read finite (`_reads`): an optimizer Dew did not build (`optim.Bounded`).
+        self.reads_all = reads_all
         self.record = record
         # What a sampled step summarizes at its commit (`Committed.inspected`); None in every other step.
         self.inspection = inspection
@@ -1096,17 +1096,32 @@ class Transaction:
                              "(TrainState.deferred): build it with Trainer.initial_state, or restore it "
                              "through the trainer, which gives one written before them none waiting")
 
-    def _formed(self, current, opt_state, update, applied: Applied | None) -> jax.Array:
+    def _reads(self, opt_state) -> bool:
+        """Whether a step under `opt_state` reads its update finite: its optimizer's bound cannot cover a
+        bounded gradient, as its state says (`dew.optim.reads_updates`), or Dew cannot read its bound."""
+        return self.reads_all or reads_updates(opt_state)
+
+    def _read_ahead(self, inputs: tuple, qk, statistics, progress, applied: Applied | None) -> tuple:
+        """Whether the update a step's `inputs` (its gradient, its optimizer's state and the parameters) form
+        is finite, read in a pass of its own that forms it and reduces it leaf by leaf, keeping no tree, and
+        the inputs after that read (an optimization barrier), which the commit forms its update from again:
+        the update is never held whole beside the state it moves, as a read of the commit's own update holds
+        it. The runs that updated in their backward read their own (`planned`); their part is read by
+        nothing."""
+        gradient, opt_state, params = inputs
+        update, _ = optimizer_update(self.optimizer, gradient, opt_state, params, qk=qk,
+                                     statistics=statistics, progress=progress)
+        read = all_finite(update if applied is None else _without(update, applied.params))
+        *inputs, read = jax.lax.optimization_barrier((*inputs, read))
+        return read, tuple(inputs)
+
+    def _formed(self, current, opt_state, update, read: jax.Array) -> jax.Array:
         """Whether a gated step's `update`, formed from bounded inputs, is one it takes: its learning rates
-        finite (one scalar each), and the update read finite where the optimizer's bound cannot cover a
-        bounded gradient (`checks_updates`) or it solves a system (`solves_equations`), whose conditioning
-        no input bounds. The runs that updated in their backward read their own (`planned`); their part of
-        `update` is read by nothing."""
-        formed = functools.reduce(jnp.logical_and, map(jnp.isfinite, learning_rates(opt_state)),
-                                  jnp.asarray(a=True))
-        if self.checks_updates or solves_equations(current.opt_state):
-            formed = formed & all_finite(update if applied is None else _without(update, applied.params))
-        return formed
+        finite (one scalar each), its update `read` finite where it is read (`_read_ahead`), and a solve's
+        update (`solves_equations`) finite, whose system's conditioning no input bounds, read as it is
+        formed over the few weights such a solve has."""
+        formed = functools.reduce(jnp.logical_and, map(jnp.isfinite, learning_rates(opt_state)), read)
+        return formed & all_finite(update) if solves_equations(current.opt_state) else formed
 
     def commit(self, current, gradient, effects, qk, statistics, applied: Applied | None = None,
                attempted: jax.Array | None = None):
@@ -1157,14 +1172,19 @@ class Transaction:
             # The update applies to the parameters the model's constraint projects
             # (`Objective.projected`), and the step stores them projected again.
             stored = self.objective.projected(current.variables["params"], updated=False)
-            update, opt_state = optimizer_update(
-                self.optimizer, native, current.opt_state, stored, qk=qk, statistics=statistics,
-                progress=None if self.bound is None else self.progress(current))
+            progress = None if self.bound is None else self.progress(current)
+            read, (gradient, before, stored) = jnp.asarray(a=True), (native, current.opt_state, stored)
+            # A solve's update is read as it is formed instead (`_formed`), its solve not run twice.
+            if gated and self._reads(current.opt_state) and not solves_equations(current.opt_state):
+                read, (gradient, before, stored) = self._read_ahead(
+                    (gradient, before, stored), qk, statistics, progress, applied)
+            update, opt_state = optimizer_update(self.optimizer, gradient, before, stored, qk=qk,
+                                                 statistics=statistics, progress=progress)
             # What bounded inputs leave open, read where it is formed: the step's learning rates, a scalar
             # each (an injected rate a user set infinite), and a Gauss-Newton solve's direction, its
             # system's (`statistics`) conditioning no input bounds, over the few weights such a solve has.
             # A scaled step's acceptance reads its whole new state instead (`finish_attempt`).
-            formed = self._formed(current, opt_state, update, applied) if gated else jnp.asarray(a=True)
+            formed = self._formed(current, opt_state, update, read) if gated else jnp.asarray(a=True)
             update = zeroed_unless(native_finite & formed, update) if gated else update
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
             # rescale, a bounded group's clamp) acts on them (`stepped`).
@@ -1436,7 +1456,7 @@ class Transaction:
             formed = functools.reduce(jnp.logical_and, map(jnp.isfinite, learning_rates(after)),
                                       jnp.asarray(a=True))
             stepped_held = stepped(held, moved, before, after, post_step_order(self.optimizer, held))
-            formed = formed & all_finite(stepped_held) if self.checks_updates else formed
+            formed = formed & all_finite(stepped_held) if self._reads(state.opt_state) else formed
             # Each copy's new value where the update leaves it in the state it read, which the update keeps
             # laid out as it was: a group with no parameter in this run holds placeholders alone there.
             laid = _laid_as(held)

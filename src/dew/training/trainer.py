@@ -82,7 +82,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import STACKED_OPTIMIZERS, declaring, with_bounds
+from dew.optim import STACKED_OPTIMIZERS, Bounded, declaring, with_bounds
 from dew.optim_schedules import (
     ScheduleBase,
     held_rates,
@@ -333,10 +333,7 @@ class Trainer(Generic[Loss, Effects]):
         layout = objective.placement(layout)  # as its models place their trees (a tier-3 plan, ledger 2777)
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
-        built = isinstance(optimizer, optax.GradientTransformation)
-        # A config's groups take what the objective draws fresh, as a run's do (`OptimConfig.claiming`).
-        self._config, self._optimizer = ((None, declaring(objective.optimizer(optimizer), self._boxed_axes))
-                                         if built else (optimizer.claiming(*objective.fresh_trained()), None))
+        self._config, self._optimizer, self._reads_all = self._taken(objective, optimizer)
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
@@ -402,8 +399,7 @@ class Trainer(Generic[Loss, Effects]):
         return StepSettings(self.objective if objective is None else objective, self._optimizer, self.layout,
                             self.device_mesh, self.accumulation,
                             self.step, self.dynamic_scale, self.diloco, self.tune_kernels, self.inspection,
-                            self.microbatches, self.record, self.lower_for, self.state_mesh,
-                            self._config is None or self._config.checks_updates())
+                            self.microbatches, self.record, self.lower_for, self.state_mesh, self._reads_all)
 
     # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
@@ -1023,7 +1019,7 @@ class Trainer(Generic[Loss, Effects]):
                                split=split, record=self.record, resting=resting,
                                examples=self._shape.examples,
                                inspection=self.inspection if sampled else None, placed=placed,
-                               checks_updates=self._settings().checks_updates).step()
+                               reads_all=self._reads_all).step()
         # A custom step need not run the objective's loss, which passes a model the run's progress.
         refuse_unpassed_progress(objective, passes=isinstance(self.step, PassesProgress))
         custom = self.step(objective, self.optimizer)
@@ -1314,6 +1310,19 @@ class Trainer(Generic[Loss, Effects]):
                 steps, tokens, self.accumulation, self._shape.examples),
         )
 
+    def _taken(self, objective: Objective[Loss, Effects],
+               optimizer: optax.GradientTransformation | OptimConfig
+               ) -> tuple[OptimConfig | None, optax.GradientTransformation | None, bool]:
+        """What a trainer holds of the optimizer it is given: a config, its groups taking what the objective
+        draws fresh as a run's do (`OptimConfig.claiming`), built over the run's length (`scheduled`); or a
+        transformation, made the objective's (`Objective.optimizer`). And whether its steps read every
+        update (`Transaction.reads_all`): a transformation's that Dew did not build (`dew.optim.Bounded`),
+        whose bound it cannot read, and a config's until it is built."""
+        if isinstance(optimizer, optax.GradientTransformation):
+            return (None, declaring(objective.optimizer(optimizer), self._boxed_axes),
+                    not isinstance(optimizer, Bounded))
+        return optimizer.claiming(*objective.fresh_trained()), None, True
+
     def scheduled(self, updates: int | None) -> None:
         """Build the configured optimizer (an `OptimConfig`) for `updates` updates, as `fit` and
         `validate` do for their run's length; its state holds the rate it logs. A trainer given an Optax
@@ -1321,6 +1330,7 @@ class Trainer(Generic[Loss, Effects]):
         if self._config is None:
             return
         built = self._config.build(updates, clocked=self._shape.examples is not None, stated=True)
+        self._reads_all = not isinstance(built, Bounded)
         self._shape = dataclasses.replace(self._shape, updates=updates)
         self._optimizer = declaring(self.objective.optimizer(built), self._boxed_axes)
 
