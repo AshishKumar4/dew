@@ -503,7 +503,7 @@ def _budgeted(layout: Layout, budgets: Budgets) -> Layout:
     beside its description (`SegmentLayout.options`), so it takes `named` option text as its own and
     refuses `described`."""
     stated = {name: value for name, value in budgets.items() if value is not None}
-    if (isinstance(layout, SegmentLayout) and layout.joint) and stated.get("option_text") == "named":
+    if layout.joint and stated.get("option_text") == "named":
         del stated["option_text"]
     if per_question(layout) and "framing" in stated and (
             stated.get("segments", layout.segments) is None):

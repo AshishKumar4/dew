@@ -662,11 +662,9 @@ class _Unread:
 _UNREAD = _Unread()
 
 
-_QUESTION_ROW: Mapping[str, object] = {
-    "head_max_len": None, "option_tokens": None, "parallel": False, "labels": None, "unit": "pieces",
-    "blocks": False, "split": None, "order": None, "shared_state": None, "siblings": False, "streamed": False,
-    "option_text": "named"}
-"""The fields only a row a question reads, each at the value a joint row holds (`SegmentLayout.joint_row`)."""
+QUESTION_ROW = "question row"
+"""The metadata mark of a `SegmentLayout` field only a row a question reads, which a joint row holds at its
+default (`SegmentLayout.joint_row`)."""
 
 type Form = Literal["marker", "state_first", "joint"]
 """The row a `SegmentLayout` writes: Laya's marker row (the question, a marker before each option, then the
@@ -707,26 +705,27 @@ class SegmentLayout(Layout):
     max_state_tokens: int | None = None
     """The most tokens the joint row's state keeps (`joint`), or None for what the row's other parts leave
     of `max_len`; a row a question holds no cap of its own."""
-    head_max_len: int | None = None
+    head_max_len: int | None = dataclasses.field(default=None, metadata={QUESTION_ROW: True})
     """The tokens the question, its instructions and its options, may take, as a release declares it
     (Laya's 192), or None to keep the question whole."""
-    option_tokens: int | None = None
+    option_tokens: int | None = dataclasses.field(default=None, metadata={QUESTION_ROW: True})
     """The most tokens one option keeps, as a release declares it (Laya's 48), or None to keep each
     whole."""
-    parallel: bool = False
-    labels: Labels | None = dataclasses.field(default=None, metadata={"derived": "head"})
+    parallel: bool = dataclasses.field(default=False, metadata={QUESTION_ROW: True})
+    labels: Labels | None = dataclasses.field(default=None, metadata={QUESTION_ROW: True, "derived": "head"})
     """Options rendered as lettered lines and read at an answer cue (`Labels`), or None for a marker
     after each option, read at the marker."""
     segments: "tuple[RowSegment, ...] | None" = None
     """A row's text as segments of its own (`dew.decision.renderer`): a question row's, read at its labels'
     readout at the row's last token, or None for the layout's own text; the joint row's user turn
     (`JOINT_SEGMENTS` by default)."""
-    unit: Unit = "pieces"
+    unit: Unit = dataclasses.field(default="pieces", metadata={QUESTION_ROW: True})
     """How `segments`' text is encoded: piece by piece, or whole (`dew.decision.renderer`)."""
     framing: "Framing | None" = None
     """The conversation `segments`' text is the user's turn of, or None for none (a joint row's turn is
     always one: `Framing()` by default)."""
-    blocks: bool = dataclasses.field(default=False, metadata={"derived": "source attention"})
+    blocks: bool = dataclasses.field(default=False,
+                                     metadata={QUESTION_ROW: True, "derived": "source attention"})
     """Whether each row splits into two blocks (`Encoded.blocks`), its parts as `segments` order them:
     a state-first row's state, and its question from its header to the row's end, a published slot
     release's prefix and suffix (serve.patch `block_ids`); a question-first row's question, and its
@@ -734,14 +733,15 @@ class SegmentLayout(Layout):
     follows). A backbone that reads blocks attends to each whole, and the second to the first in
     order. Off, every row is read in order."""
 
-    split: Literal["part", "question", "whole"] | None = None
+    split: Literal["part", "question", "whole"] | None = dataclasses.field(default=None,
+                                                                          metadata={QUESTION_ROW: True})
     """Where a row in `blocks` splits: at its second part (`part`, a row of segments' own law: a
     state-first row's question from its header on, a question-first row's state from its first token
     on), at its question's first token (`question`, the built-in rows'), or nowhere, the whole row one
     block its backbone reads both ways (`whole`); None takes the layout's own law. A row read in order
     (`blocks` off) splits nowhere, so it states none."""
 
-    order: "RowOrder | None" = None
+    order: "RowOrder | None" = dataclasses.field(default=None, metadata={QUESTION_ROW: True})
     """The order the layout's own row writes its parts in (`built_in`), each part as the built-in row
     writes it, its begin token, separators, header, budgets and a conversation's kept end alike: the
     state first, the question first, or the state, the question and the state again (`re_read`, each
@@ -752,21 +752,24 @@ class SegmentLayout(Layout):
     """Which of the row's streams each reads (`Reads`), where its question's segments stand in a stream
     of the row's own (`Instructions.stream`); None for a row read in order."""
 
-    option_text: Literal["named", "described"] = dataclasses.field(default="named", repr=False,
-                                                                    metadata={_records.ADDED: True})
+    option_text: Literal["named", "described"] = dataclasses.field(
+        default="named", repr=False, metadata={QUESTION_ROW: True, _records.ADDED: True})
     """How a choice's option is written (`options`): `named`, its key and its description
     (`key: description`), as Laya's release reads its rows; or `described`, its description alone, the
     option's text, which a fresh head reads (`default_layout`), so a key that only identifies the
     option (`option_0`) writes nothing the row reads. An option with no description is its key."""
 
-    shared_state: int | None = dataclasses.field(default=None, repr=False, metadata={_records.ADDED: True})
+    shared_state: int | None = dataclasses.field(default=None, repr=False,
+                                                 metadata={QUESTION_ROW: True, _records.ADDED: True})
     """The most questions a row asks over one copy of their request's state (`dew.decision.shared_state`):
     one at 1, and where None, unstated, one too, as before rows shared a state, until what reads its rows
     states it (`shared_for`)."""
-    siblings: bool = dataclasses.field(default=False, repr=False, metadata={_records.ADDED: True})
+    siblings: bool = dataclasses.field(default=False, repr=False,
+                                       metadata={QUESTION_ROW: True, _records.ADDED: True})
     """Whether a question of a row of several (`shared_state`) also reads the ones before it in its row,
     whole (`dew.decision.shared_state.fork_depth`); off, each reads the shared part and itself."""
-    streamed: bool = dataclasses.field(default=False, repr=False, metadata={"record": False})
+    streamed: bool = dataclasses.field(default=False, repr=False,
+                                       metadata={QUESTION_ROW: True, "record": False})
     """Whether its rows over one state stand in streams, as a data plan before 12 laid them, where they
     now stand as documents continuing the shared part; the plan's version states which, no record of the
     layout does (`dew.decision.shared_state`)."""
@@ -1385,7 +1388,8 @@ class SegmentLayout(Layout):
     def _joint_post_init(self) -> None:
         """The joint row's own checks (`joint_row`): its question-row fields refused, its turn's segments and
         framing given where it states none."""
-        asked = {name for name, default in _QUESTION_ROW.items() if vars(self)[name] != default}
+        asked = {field.name for field in dataclasses.fields(self)
+                 if field.metadata.get(QUESTION_ROW) and vars(self)[field.name] != field.default}
         if asked:
             raise ValueError(f"{sorted(asked)} lay out a row a question; the joint row of every question "
                              "takes none of them")
@@ -2311,7 +2315,7 @@ def per_question(layout: Layout | None) -> TypeGuard[SegmentLayout]:
 def layout_writing(layout: Layout) -> Literal["named", "described"]:
     """How `layout`'s rows write a choice's option (`SegmentLayout.option_text`): a question row's own
     writing, and a joint row's `named`, its schema naming each option by its key beside its description."""
-    return layout.option_text if isinstance(layout, SegmentLayout) and not layout.joint else "named"
+    return layout.option_text if per_question(layout) else "named"
 
 
 def default_layout(causal: bool, one_question: bool) -> Layout:

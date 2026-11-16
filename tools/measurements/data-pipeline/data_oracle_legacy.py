@@ -22,8 +22,6 @@ from pathlib import Path
 
 import numpy as np
 
-from dew.decision.layout import SegmentLayout
-
 
 def memory_images(pixels, loading):
     from dew.data import ImageDataset
@@ -213,7 +211,7 @@ def image_records(root: Path, pixels, pack: Callable[[dict[str, bytes]], bytes])
 def fixture_inputs(root: Path):
     from dew.data.images import pack_dict_of_byte_arrays
     from dew.data.text import ByteTokenizer
-    from dew.decision import Choice, DecisionObjective, Example, Specials
+    from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
     tokens = token_store(root, "tokens", 0)
@@ -286,7 +284,7 @@ def fixture_inputs(root: Path):
         backbone,
         tokenizer=ByteTokenizer(),
         specials=Specials(0, 1, 2, "<mark>", 3),
-        layout=SegmentLayout.state_first_row(max_len=128),
+        layout=StateFirstLayout(max_len=128),
         shuffle_options=True,
     )
     examples = [
