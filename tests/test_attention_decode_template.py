@@ -666,7 +666,8 @@ def test_a_decode_step_launches_only_kernels_its_certification_held():
 
     with generation.assumed("sm90"):
         assert attention_decode.serves(query, key, None, natural=False, target=generation.gpu_target())
-        found = compile_mosaic_kernels([KernelCase("decode", lambda: (decode, (query, key, key)))], "sm90")
+        case = KernelCase("decode", lambda: (decode, (query, key, key)))
+        found = compile_mosaic_kernels([case], "sm90")
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
     (record,) = found
     assert record["modules"] and record["modules"].items() <= record["certified"].items(), record
