@@ -362,7 +362,9 @@ class SavedRun:
                mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> SavedRun:
         """The selected checkpoint of the run in `directory` (`selected`), so every reader of a run (a task,
         `dew.pipeline`, `dew export`) pins the one step, with its record's paths named where this host
-        holds them (`here`, its releases written where a loader places the weights, `mesh` and `layout`).
+        holds them, as a reader that opens them needs (`here`, its releases written where a loader places
+        the weights, `mesh` and `layout`); a reader of the weights and the model record alone pins
+        `selected`.
         A task loaded from it compiles into the persistent cache (`persist_compilations`). `trust` names
         the packages outside Dew whose modules the record may import (`dew.registry.imported`)."""
         return cls.selected(directory, step, trust).here(mesh=mesh, layout=layout, trust=trust)
@@ -372,31 +374,27 @@ class SavedRun:
         """The checkpoint of the run in `directory` a reader pins (`pinned`), read as its record states it:
         `step`, or where none is asked the step its task loads by default (`SavedRunTask.default_step`),
         its latest unless the task names another; what a pool agrees on before any process writes what its
-        record reads (`saved_sources.pinned_run`)."""
-        run = cls._read(directory, step, trust)
+        record reads (`saved_sources.pinned_run`), and what a reader of its weights and model record alone
+        pins (`dew.lora.Adapter.from_run`)."""
+        run = cls.at(directory, step, trust)
         task = run.objective.saved_task
         chosen = (task.default_step(directory) if step is None and task is not None
                   and issubclass(task, SavedRunTask) else None)
         if chosen is None:
             return run
-        again = cls._read(directory, chosen, trust)
+        again = cls.at(directory, chosen, trust)
         if again.objective.saved_task is not task:
             raise ValueError(f"step {chosen} of {directory}, which its task loads by default, was written by "
                              f"{again.objective.__name__}, whose task is another; load a step with `step`")
         return again
 
     @classmethod
-    def at(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = (), *,
-           mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> SavedRun:
+    def at(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
         """The checkpoint of the run in `directory` at `step`, its latest where None, whatever step its task
-        loads by default (`pinned`): the step an average of runs reads (`dew.checkpoints.averaged`), its
-        record's paths named where this host holds them (`here`)."""
-        return cls._read(directory, step, trust).here(mesh=mesh, layout=layout, trust=trust)
-
-    @classmethod
-    def _read(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
-        """The checkpoint of the run in `directory` at `step`, its latest where None, its record as its
-        checkpoint states it (`at` names its paths where this host holds them)."""
+        loads by default (`pinned`), its record as its checkpoint states it: the step an average of runs reads
+        (`dew.checkpoints.averaged`), whose weights and model record no path of this host's holds. A reader
+        that opens the record's paths (a processor's, a tokenizer's) names them where this host holds them
+        (`here`)."""
         from dew.checkpoints import Checkpoints
         from dew.registry import import_trusted
         persist_compilations()

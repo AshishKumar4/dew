@@ -474,7 +474,8 @@ def _typical_status(mine: np.ndarray, theirs: np.ndarray,
 def _sized(mine: np.ndarray, theirs: np.ndarray, typical: bool = False,
            examples: list[np.ndarray] | None = None, scalar: bool = False) -> bool:
     """Whether a paired sizing takes a leaf as sized by these draws, Dew's squared errors `mine` against
-    the reference's `theirs`: its pooled ratio's interval resolved (no wider than PARITY), or, with
+    the reference's `theirs` (each seed's log, `log_errors`: -inf where exact): its pooled ratio's interval
+    resolved (no wider than PARITY), or, with
     `typical` (a leaf the pooled ratio does not size within MOST_SEEDS, `seeds_for`), its typical draw's
     interval resolved and its draws qualifying as `_typical_status` asks (`examples` as it reads them)."""
     low, high = _interval(mine, theirs)
@@ -676,7 +677,8 @@ def _rows_rms(values, width: int) -> np.ndarray:
 
 
 def _row_sizes(truth, terms=None, *, xp=np) -> tuple:
-    """A float64 truth leaf's rows, of rank two or more: each row's own RMS (`_scaled_rms`), and its size,
+    """A float64 truth leaf's rows, of rank one or more (a vector one row, `_width`): each row's own RMS
+    (`_scaled_rms`), and its size,
     the RMS or, with the leaf's float64 `terms` (`float64_terms`), the larger of it and its terms' RMS,
     where that is past RESOLUTION of the leaf's size, else zero. The leaf's size is taken as its rows' are:
     its RMS, or with terms the larger of it and its terms' RMS, so a row sized by what it sums is held
@@ -772,17 +774,18 @@ def leaf_summaries(references, truths, terms=None) -> list[RecordedLeaf]:
             if summary is not None]
 
 
-def rows_summary(rows, truth, *, finite: bool, dtype: str,
-                 log_mse: float | None = None) -> RecordedLeaf:
+def rows_summary(rows, truth, *, finite: bool, dtype: str, log_mse: float | None = None,
+                 terms=None) -> RecordedLeaf:
     """`leaf_summary` of a leaf from each row's RMS distance from its float64 truth `rows` alone, where the
     reference ran apart and kept those (a recorder whose outputs are too large to keep, its rows its
     leaf's every axis but the last, in C order): its mean squared error the rows' mean square, every row
     one width (its log), unless `log_mse` gives it; `finite` whether the reference's leaf was, and `dtype`
-    its dtype. The truth's rows are read as `_summaries` reads them (`_LaidTruths`), and an empty leaf is
+    its dtype. The truth's rows are read as `_summaries` reads them (`_LaidTruths`), each sized by the larger
+    of it and its float64 `terms` where given (`float64_terms`, a weighed site's), and an empty leaf is
     exact, as `leaf_summary` reads one."""
     if not np.size(truth):
         return RecordedLeaf(-np.inf, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=finite, dtype=dtype)
-    held, rows = _LaidTruths.of([truth]), np.asarray(rows, np.float64)
+    held, rows = _LaidTruths.of([truth], None if terms is None else [terms]), np.asarray(rows, np.float64)
     sized = held.sizes > 0
     logged = float(np.max(log_over(rows[sized], held.sizes[sized]))) if sized.any() else LOG_ZERO
     return RecordedLeaf(float(log_mean_square(rows)) if log_mse is None else log_mse,
@@ -816,19 +819,22 @@ def _compiled(statistics):
 
 
 def _width(leaf) -> int:
-    """A leaf's row width: its last axis's, 0 for a leaf of rank under two, which has no rows."""
-    return np.shape(leaf)[-1] if np.ndim(leaf) >= 2 else 0
+    """A leaf's row width: its last axis's, a vector's its own (one row), 0 for a scalar, which has no
+    rows."""
+    return np.shape(leaf)[-1] if np.ndim(leaf) >= 1 else 0
 
 
 def _laid(leaf, xp):
     """`leaf` in float64, in C order: its sums run alike whatever layout it came in (numpy's follow
     memory order; a compiled program's leaves are C-ordered)."""
-    return np.ascontiguousarray(leaf, np.float64) if xp is np else jnp.asarray(leaf, jnp.float64)
+    # Its own shape kept: numpy lays a scalar out as one value of rank one, which has a row a scalar has not.
+    return (np.ascontiguousarray(leaf, np.float64).reshape(np.shape(leaf)) if xp is np
+            else jnp.asarray(leaf, jnp.float64))
 
 
 def _truth_rows(truths, terms, *, xp):
     """Each truth leaf's rows' own RMS and size (`_row_sizes`, with the leaf's float64 terms where `terms`
-    holds them), and whether its every value is finite. A leaf of rank under two has no rows."""
+    holds them), and whether its every value is finite. A scalar leaf has no rows (`_width`)."""
     found = []
     for truth, term in zip(truths, terms, strict=True):
         truth = _laid(truth, xp)
@@ -881,7 +887,7 @@ def _largest_share(rows, xp=np):
 @dataclasses.dataclass(frozen=True)
 class _LaidTruths:
     """A draw's truth leaves read once for both arms (`_summaries`), every leaf that is not empty in its
-    order, its rows in C order (its last axis's, none for a leaf of rank under two). Each row has its own
+    order, its rows in C order (its last axis's, none for a scalar). Each row has its own
     RMS (`_scaled_rms`) and its size, the RMS where it is past RESOLUTION of its leaf, else zero
     (`row_errors`'), computed where the leaves live in one program a draw (`_truth_rows`): only these
     rows' statistics leave the device. `truths` is every leaf as given, `laid` the leaves that are not
@@ -978,7 +984,8 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
 
 @dataclasses.dataclass
 class _Draws:
-    """Each leaf's errors over a run of seeds: Dew's and the reference's mean squared error from
+    """Each leaf's errors over a run of seeds: Dew's and the reference's mean squared error's log
+    (`log_errors`: -inf where exact; `mine` and `theirs`, never the errors themselves) from
     float64 (seed by leaf), the log of each seed's worst sized row over its size (Dew's, the
     reference's; `log_over`), each
     seed's rows of float64 zero with Dew's and the reference's errors on them (`ZeroRows`, seed by leaf;
@@ -1190,6 +1197,8 @@ class _Prepared:
     truths: list
     held: _LaidTruths
     mine: list
+    terms: list | None
+    """The truth's float64 terms, a leaf each (`_term_leaves`), its rows sized by; None for a site of none."""
 
 
 def _term_leaves(terms, truth):
@@ -1212,8 +1221,9 @@ def _prepared(dew, truth, terms=None) -> _Prepared:
     for path, leaf, true in zip(paths, leaves, truths, strict=True):
         if np.shape(leaf) != np.shape(true):
             raise AssertionError(f"{path}: dew's shape is {np.shape(leaf)}, the truth's {np.shape(true)}")
-    held = _LaidTruths.of(truths, _term_leaves(terms, truth))
-    return _Prepared(truth, paths, leaves, truths, held, _summaries(leaves, held))
+    term_leaves = _term_leaves(terms, truth)
+    held = _LaidTruths.of(truths, term_leaves)
+    return _Prepared(truth, paths, leaves, truths, held, _summaries(leaves, held), term_leaves)
 
 
 def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, their_terms=None,
@@ -1241,13 +1251,15 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
                 raise AssertionError(f"{path}: {name}'s shape is {shape}, the truth's {np.shape(true)}")
     # The truths' rows are read once a draw, for both arms where the two truths are the same values.
     same = all(their_true is true for their_true, true in zip(their_truths, truths, strict=True))
+    # The reference's truth's terms, a leaf each, its rows sized by: Dew's where the truths are one.
+    their_term_leaves = prepared.terms if same else _term_leaves(their_terms, their_truth)
     theirs = _summaries([None if was else leaf for leaf, was in zip(references, recorded, strict=True)],
-                        prepared.held if same else _LaidTruths.of(their_truths,
-                                                                   _term_leaves(their_terms, their_truth)))
+                        prepared.held if same else _LaidTruths.of(their_truths, their_term_leaves))
     row = []
-    for path, leaf, their_leaf, true, their_true, was, summary, their_summary in zip(
-            paths, leaves, references, truths, their_truths, recorded, prepared.mine, theirs, strict=True):
-        their = their_leaf if was else their_summary
+    for at, (path, leaf, their_leaf, true, their_true, was, summary, their_summary) in enumerate(zip(
+            paths, leaves, references, truths, their_truths, recorded, prepared.mine, theirs, strict=True)):
+        term = None if their_term_leaves is None else their_term_leaves[at]
+        their = _one_row(their_leaf, their_true, term) if was else their_summary
         if np.size(leaf) == 0:
             # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
             # reference's dtype (its shape is held above; the truth's dtype, float64, is its own), it
@@ -1260,6 +1272,20 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
         paired = (was and not own) or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
         row.append(_paired(path, summary, their, paired=paired))
     return row
+
+
+def _one_row(recorded: RecordedLeaf, truth, terms=None) -> RecordedLeaf:
+    """A recorded reference's evidence on a vector leaf, which is one row (`_width`): that row's RMS error is
+    the leaf's, the root of its recorded mean squared error, sized by its truth (`rows_summary`) and, at a
+    weighed site, its truth's float64 `terms` as Dew's arm and a live reference are, so the row
+    the gate reads is the one the recording measured, whatever row evidence the recording kept (a recording
+    made while a vector had no row kept none). Its example evidence as recorded, and its row's element
+    share unknown, as a recording of row distances keeps none; any other leaf's as recorded."""
+    if np.ndim(truth) != 1:
+        return recorded
+    row = rows_summary(np.exp([recorded.log_mse / 2]), truth, finite=recorded.finite, dtype=recorded.dtype,
+                       log_mse=recorded.log_mse, terms=terms)
+    return dataclasses.replace(row, example_mse=recorded.example_mse, example_worst=recorded.example_worst)
 
 
 def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool = True) -> tuple:
@@ -1509,7 +1535,8 @@ class Weighed:
         each floating leaf with heavy elements (`heavy`) split into its classes, each class's rows compacted
         by the count of its values a row: `{"heavy": {k: [rows of k heavy values, k]}, "light": {...}}`,
         so each class is judged as its own leaves, every row at its own width (`row_factor`) and its RMS
-        over its own values; a leaf of rank one splits into its classes' values, of no rows."""
+        over its own values; a leaf of rank one splits into its classes' values, each class one row
+        (`_width`)."""
         if self.heavy is None:
             return tree
         structure = jax.tree.structure(self.truth)
@@ -1684,7 +1711,7 @@ def _judged_leaves(dew, weighing) -> tuple[list[str], tuple[int, ...]]:
     `weighing` each floating leaf's classes, each compacted by its values a row (`Weighed.classed`)."""
     judged = dew if weighing is None else weighing.classed(jax.device_get(dew))
     return ([jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(judged)],
-            tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0 for leaf in jax.tree.leaves(judged)))
+            tuple(int(_width(leaf)) for leaf in jax.tree.leaves(judged)))
 
 
 def _drawn_from(names: list[str], widths: tuple[int, ...], evidence: list[list[tuple]], examples=None,

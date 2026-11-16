@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
-from collections.abc import Hashable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from typing import NamedTuple
 
 import jax
@@ -47,10 +47,20 @@ def canonical(closed: jcore.Jaxpr) -> jcore.Jaxpr:
         return local.get(atom, atom) if isinstance(atom, jcore.Var) else atom
 
     seen: dict[Hashable, list] = {}
+    # Each literal's key once (its value's bytes, `terms.literal_key`), by the value's identity, which the
+    # literals above hold for the call: a folded mask a region's every select reads hashed once, where each
+    # equation that read it hashed its megabytes again (1,070 hashes, 6.5 s of a start's pass, row 6799).
+    literal_keys: dict[int, Hashable] = {}
+
+    def keyed(atom: jcore.Literal) -> Hashable:
+        if (found := literal_keys.get(id(atom.val))) is None:
+            found = literal_keys[id(atom.val)] = terms.literal_key(atom)
+        return found
+
     equations = []
     for equation in jaxpr.eqns:
         equation = equation.replace(invars=[read(atom) for atom in equation.invars])
-        named = _equation_key(equation)
+        named = _equation_key(equation, keyed)
         if named is not None and named in seen:
             local.update(zip(equation.outvars, seen[named], strict=True))
             continue
@@ -125,8 +135,7 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | No
             # mesh, which binds as traced. An equation over a traced value stays traced; the constants its
             # normal form builds beside it (a broadcast divisor) are computed.
             traced = any(isinstance(value, jax_core.Tracer) for value in operands)
-            folded = None if traced or equation.primitive not in FOLDED else host_evaluated(
-                equation.primitive, operands, equation.params)
+            folded = None if traced or equation.primitive not in FOLDED else _folded(equation, operands)
             if folded is not None:
                 outputs = folded
             else:
@@ -148,6 +157,38 @@ FOLDED = frozenset({jax.lax.iota_p, jax.lax.broadcast_in_dim_p, jax.lax.reshape_
 """The equations `_evaluated` computes where their operands are constants: those a mask, a divisor or a table
 is built from. Any other binds as traced, a collective or a program placed on a mesh among them, whose
 eager run needs devices a trace has not."""
+
+
+def _folded(equation: jcore.JaxprEqn, operands: list) -> list | None:
+    """A constant equation's outputs (`FOLDED`) as this host computes them (`host_evaluated`), a broadcast
+    kept a view of its operand and an entrywise equation over broadcast operands computed over their
+    compact forms (`terms.compact`) and broadcast back: a mask laid over a batch's heads holds its plane's
+    bytes once, where computed whole each of a 2,048-key causal mask's equations made 67 MB, and its fill
+    268 MB (row 6799). The values are the same, entry for entry; only their layout in this host's memory
+    differs."""
+    primitive = equation.primitive
+    if len(equation.outvars) != 1 or any(terms.typed_key(value) for value in operands):
+        return host_evaluated(primitive, operands, equation.params)
+    out = aval(equation.outvars[0])
+    shape = out.shape
+    if primitive is jax.lax.broadcast_in_dim_p:
+        # In the result's dtype, which a weak operand (a Python number) takes where it is broadcast.
+        operand = np.asarray(operands[0], out.dtype)
+        dimensions = equation.params["broadcast_dimensions"]
+        placed = operand[tuple(slice(None) if axis in dimensions else np.newaxis
+                               for axis in range(len(shape)))]
+        return [np.broadcast_to(placed, shape)]
+    if not entrywise(primitive):
+        return host_evaluated(primitive, operands, equation.params)
+    # A scalar operand as it is (a weak one keeps its weak type, which the bind reads).
+    compacts = [terms.compact(np.asarray(value)) if np.ndim(value) else value for value in operands]
+    # Broadcast as the operands broadcast, an axis of none beside one of one element keeping none.
+    common = np.broadcast_shapes(*(np.shape(value) for value in compacts if np.ndim(value)))
+    if np.prod(common, dtype=np.int64) == np.prod(shape, dtype=np.int64):
+        return host_evaluated(primitive, operands, equation.params)
+    inner = [np.broadcast_to(value, common) if np.ndim(value) else value for value in compacts]
+    made = host_evaluated(primitive, inner, equation.params)
+    return None if made is None else [np.broadcast_to(np.asarray(made[0]), shape)]
 
 
 VALUE_IDENTITIES = (primitives.name_p,)
@@ -382,14 +423,10 @@ def _unsqueezed(core, shape: tuple[int, ...], squeezed: _Made):
 
 def _uniform(value) -> bool:
     """Whether `value` is a constant (computed, `_evaluated`) of more than one element, all one value bit for
-    bit (a zero's sign among its bits)."""
-    if isinstance(value, jax_core.Tracer) or jnp.ndim(value) == 0:
+    bit (a zero's sign among its bits): its compact form one element (`terms.compact`)."""
+    if isinstance(value, jax_core.Tracer) or jnp.ndim(value) == 0 or not np.size(value):
         return False
-    held = np.ascontiguousarray(value)
-    if not held.size:
-        return False
-    bits = held.view(f"V{held.dtype.itemsize}")
-    return bool(np.all(bits == bits.flat[0]))
+    return terms.compact(np.asarray(value)).size == 1
 
 
 def _scalar(value) -> np.ndarray:
@@ -404,7 +441,7 @@ def _one(value) -> bool:
     `(inf + 2j) * 1` has a NaN part."""
     if isinstance(value, jax_core.Tracer):
         return False
-    held = np.asarray(value)
+    held = terms.compact(np.asarray(value))
     return not np.iscomplexobj(held) and bool(np.all(held == 1))
 
 
@@ -414,8 +451,8 @@ def _zero(value) -> bool:
     its two parts, which a complex difference subtracts apart."""
     if isinstance(value, jax_core.Tracer):
         return False
-    held = np.asarray(value)
-    parts = (held.real, held.imag) if np.iscomplexobj(held) else (held,)
+    held = terms.compact(np.asarray(value))
+    parts = (np.real(held), np.imag(held)) if np.iscomplexobj(held) else (held,)
     return not np.any(held) and not any(np.any(np.signbit(part)) for part in parts)
 
 
@@ -486,11 +523,13 @@ def _converted(value, dtype, widened: _Made):
     return cast
 
 
-def _equation_key(equation: jcore.JaxprEqn) -> Hashable | None:
+def _equation_key(equation: jcore.JaxprEqn,
+                  literal_key: Callable[[jcore.Literal], Hashable]) -> Hashable | None:
     """An equation's identity as its value's (`canonical`): its primitive, parameters and operands, each
-    literal by its value; None for one holding an effect, whose repetition is not its value's."""
+    literal by its value (`literal_key`, `terms.literal_key` held once a value); None for one holding an
+    effect, whose repetition is not its value's."""
     if equation.effects:
         return None
-    operands = tuple(terms.literal_key(atom) if isinstance(atom, jcore.Literal) else atom
+    operands = tuple(literal_key(atom) if isinstance(atom, jcore.Literal) else atom
                      for atom in equation.invars)
     return (*terms.parameters_key(equation.primitive, equation.params), operands)

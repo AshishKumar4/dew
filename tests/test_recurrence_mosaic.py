@@ -1065,9 +1065,13 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
         bound = template.MOSAIC.bind(*operands, None, None, firsts=None, skip=None, recomputed=True,
                                      **options)
         assert report._identity(template.MOSAIC, bound) == identity
+        # Each derived tiles refused with every rung of its ladder at once (`Mosaic.rungs`): refused a rung a
+        # derivation, the walk derived 355 times, 281 s (row 6551), 598 s once a ladder's foot took a program
+        # fewer (row 6855).
         while (tiles := template.MOSAIC.derived(bound, target)) is not None:
             names = {launch.name for launch in template.MOSAIC.launches(bound, tiles, target, backward=True)}
             report.refuse([(identity, tiles, names)])
+            report.refuse([(identity, rung, names) for rung in template.MOSAIC.rungs(bound, tiles)])
         with pytest.raises(KernelRefused) as refused:
             named()
         assert refused.value.refusals[0].code == 'launch'
@@ -1704,6 +1708,41 @@ def test_a_launch_past_its_ladders_foot_is_certified_at_a_program_fewer():
     # A round certifies its rungs together: one after the rung that holds is certified, and not taken.
     held = [each.config.residents.of('recurrence_query_key') for each in walked if not each.refused]
     assert held == [2], walked
+
+
+@lowers('sm90')
+def test_lightning_attentions_training_step_starts_unspilled_asking_each_rung_once():
+    """Lightning attention's training step at its GPU flow's widths (tests/model_flows.py's `LIGHTNING`: 4
+    heads of 128, 2 rows of 256 tokens, bf16, chunk 64), lowered for a compile-only H100 through the call's
+    route and certified as a run's step certifies it: it lowers, each kernel held unspilled at a body, and no
+    spilling body certified twice (a rung that moved nothing its kernel reads). Its
+    reverse walk's statement left out its products' three-part sums (`Issuer.apart`): admitted where ptxas
+    spilled it at every rung and a program a multiprocessor, each spill took the tiles' ring a stage
+    shallower, which the walk does not read, its ladder asked again at each of eight, and the flow's step
+    raised Unfitted after 3,107 s of certification (row 6816)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    shape = jax.ShapeDtypeStruct
+    hooks = recurrence.Hooks(decay='scalar', delta=False)
+    given = shape((2, 256, 4, 128), jnp.bfloat16)
+    operands = Chunk(given, given, given, log_decay=shape((2, 256, 4), jnp.float32))
+    before = {id(certified) for certified in report.certifications()}
+    with (report.refusals(), generation.assumed('sm90'), report.certifying(compile_only_gpus('sm90')[0]),
+          report.pulled()):
+        jax.jit(jax.grad(lambda given: jnp.sum(chunk(hooks, given, chunk_size=64)[0].astype(jnp.float32)))
+                ).trace(operands).lower(lowering_platforms=('cuda',))
+    certified = [each for each in report.certifications() if id(each) not in before]
+    # Each spilling body by its module (the kernel hash its certification compiled): asked again where its
+    # kernel's next rung reads nothing that moved. A rung's kernels that did not move keep their modules.
+    spilled = [(each.pulled, module) for each in certified for module, binary in each.kernels.values()
+               if binary.refused]
+    # A round certifies its rungs together: one after the rung a kernel holds at is certified, and not taken.
+    held: dict[str, bool] = collections.defaultdict(bool)
+    for each in certified:
+        for _, binary in each.kernels.values():
+            held[binary.kernel] |= not binary.refused
+    assert held and all(held.values()), held
+    assert len(set(spilled)) == len(spilled), certified
 
 
 TOP_RUNG_LOWERED = """

@@ -105,6 +105,25 @@ def test_a_decision_run_starts_from_a_saved_run_whose_export_is_its_native_relea
     assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
 
 
+@pytest.mark.parametrize("record", [
+    {"run": "/runs/first", "step": "latest", "ema": None},
+    {"run": "/runs/first", "step": True, "ema": None},
+    {"run": "/runs/first", "step": 3, "ema": "false"},
+    {"run": "/runs/first", "step": 3},
+])
+def test_a_release_record_of_another_shape_is_refused(record):
+    """A cache release's record of the saved run it holds (`Held`) is a run's directory, a step (never a
+    moving selection) and an EMA choice (a boolean or none): any other is refused, as a record its own
+    write never makes; one of its shape reads back as written."""
+    from dew.interop.saved_sources import Held
+
+    with pytest.raises(ValueError):
+        Held.read(record)
+    held = Held("/runs/first", 3, None)
+    assert held.record() == {"run": "/runs/first", "step": 3, "ema": None}
+    assert Held.read(held.record()) == held
+
+
 def test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches_lack_its_releases(
         tmp_path, monkeypatch):
     """A decision run started from a saved decision run (`--pretrained <run>`) reads its tokenizer within its
@@ -113,8 +132,10 @@ def test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches
     whose cache lacks it, the run trains on, reading its own release of the source, and every step serves on
     a third host lacking both, by each reader of a run (`Decide.from_run`, `dew.pipeline`), as it served
     where it trained: the pin they share writes this host's release of the same saved run
-    (`SavedRun.at`, `releases_here`), where the record's paths raised Hugging Face's repo-id error. A step
-    whose source this host lacks too is refused, naming the saved run."""
+    (`SavedRun.pinned`, `releases_here`), where the record's paths raised Hugging Face's repo-id error. On a
+    host that lacks the saved run too, a reader of the weights alone (`dew.checkpoints.averaged`) reads them,
+    and a reader that opens the record's paths is refused, naming the saved run."""
+    from dew.checkpoints import averaged
     from dew.decision import Choice, Decide
     from dew.inference.loading import pipeline
     from dew.interop.saved_sources import HELD_FILE, RELEASE_SOURCES, RELEASES
@@ -151,9 +172,14 @@ def test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches
     cache("serving_host")
     np.testing.assert_array_equal(answered(Decide.from_run(second, step=1)), served)
     np.testing.assert_array_equal(answered(pipeline(second, step=2)), stepped)
-    # A host lacking the saved run too.
+    # A host lacking the saved run too: a reader of the weights alone reads them, and one that opens the
+    # record's paths is refused, naming the saved run.
     shutil.move(source, tmp_path / "moved")
     cache("bare_host")
+    # The run averaged with itself: its weights in fp32.
+    soup = averaged([second, second], step=1)
+    leaves_alike(soup.variables["params"], jax.tree.map(lambda leaf: np.asarray(leaf, np.float32),
+                                                        SavedRun.at(second, 1).variables(ema=None)["params"]))
     with pytest.raises(FileNotFoundError) as refused:
         Decide.from_run(second, step=1)
     assert str(source) in str(refused.value)

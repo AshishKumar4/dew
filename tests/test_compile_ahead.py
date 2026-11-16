@@ -350,26 +350,53 @@ import jax.numpy as jnp
 from dew.nn.kernels import options
 from dew.nn.kernels.templates import report
 
-# A start whose compile never ends.
-report.attempted = lambda lowered, options: threading.Event().wait()
-options.compiling(jax.jit(lambda x: x + 1), jnp.ones(2))
-# Refused before its start was taken, with an exit status of its own.
-raise SystemExit(3)
+# A start's compile, XLA's own, of a program long enough to compile that it is in flight when the run is
+# refused: its thread is shown to have entered XLA's compile, and not to have left it.
+begun, ended = threading.Event(), threading.Event()
+compiled = report.attempted
+
+
+def attempted(lowered, held):
+    begun.set()
+    try:
+        return compiled(lowered, held)
+    finally:
+        ended.set()
+
+
+report.attempted = attempted
+
+
+def long(x):
+    for index in range(20000):
+        x = jnp.sin(x) * (index % 7 + 1)
+    return x
+
+
+options.compiling(jax.jit(long), jnp.ones(2))
+begun.wait()
+# Refused before its start was taken, with an exit status of its own, its compile still running (else the
+# exit's timing says nothing of it, and the run says so by another status).
+raise SystemExit(4 if ended.wait(0.5) else 3)
 """
 """A run that begins its start's compile beside its planning and is refused before it takes the start."""
 
 
-def test_a_run_refused_before_its_start_is_taken_exits_without_waiting_for_its_compile():
+@pytest.mark.parametrize("run", range(8))
+def test_a_run_refused_before_its_start_is_taken_exits_with_its_refusal_while_its_compile_runs(run):
     """A run whose start's compile is begun beside its planning (`options.compiling`) and which is refused
-    before it takes the start exits at its refusal, with its refusal, not when the compile no one reads
-    ends (row 5966: a 4B start's held the exit 97 s), here a compile that never ends."""
+    before it takes the start, its compile still running, exits with its refusal's status once that compile
+    ends (`_exit_waits`): JAX's exit cleanup and the C runtime's exit tore XLA down under it, and 12 of 48
+    such exits ended by a segmentation fault (row 6837). A status of 4 says the compile ended before the
+    refusal, and the cell then proves nothing."""
     import process_support
 
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(process_support.REPO_ROOT / "src"),
-                                                                str(process_support.REPO_ROOT / "tests")))}
-    run = subprocess.run([sys.executable, "-c", ORPHANED_START], env=environment, capture_output=True,
-                         text=True, timeout=300, check=False)
-    assert run.returncode == 3, run.stderr[-3000:]
+                                                                str(process_support.REPO_ROOT / "tests"))),
+                   "JAX_ENABLE_COMPILATION_CACHE": "false"}
+    exited = subprocess.run([sys.executable, "-c", ORPHANED_START], env=environment, capture_output=True,
+                            text=True, timeout=300, check=False)
+    assert exited.returncode == 3, (exited.returncode, exited.stderr[-3000:])
 
 
 def test_a_program_whose_compile_was_begun_passes_once_where_it_compiles_over_the_same():

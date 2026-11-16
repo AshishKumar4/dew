@@ -1600,6 +1600,8 @@ class Trainer(Generic[Loss, Effects]):
         checkpoint at its last step having been written, so there is nothing to do."""
         mesh, checkpoints, steps = self.device_mesh, self.checkpoints, plan.steps
         begun: Compiling | None = None
+        # Whether the run's cooldown branches were checked before its state was placed.
+        branched = False
         if steps is not None and current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
         bound = self._shape.examples
@@ -1653,6 +1655,11 @@ class Trainer(Generic[Loss, Effects]):
                     # a compile refuses it, before the state it would check is traced from that batch.
                     agreed_same("training batch layout", lambda: batch_layout(split_fields(placed_first)[0]))
                     self._fitting(abstract, placed_first)
+                    # Refused before the start's program begins to compile, as every refusal that needs
+                    # nothing the planning beside it finds: its state's structure states what branches read.
+                    check_branches(bool(plan.branches) or pending, plan.suites,
+                                   settable=settable_rates(rated(abstract)))
+                    branched = True
                     if fresh is not None:
                         begun = self._compiled_fresh(run, fresh, first, placed_first)
             elif position is not None:
@@ -1662,7 +1669,8 @@ class Trainer(Generic[Loss, Effects]):
         state, shardings = placed(begun)
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
-        check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(rated(state)))
+        if not branched:
+            check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(rated(state)))
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
@@ -1701,7 +1709,10 @@ class Trainer(Generic[Loss, Effects]):
         program begun beside it in a thread of its own (`start_compiling`), the key lowered unplaced as the
         start compiled ahead takes it: both once the whole state is checked, so a refused run compiles
         neither. None where the step is not compiled here (one compiled ahead, a host-master's, a profile
-        guided run's), the start then compiling as it is placed."""
+        guided run's), the start then compiling as it is placed. The one refusal that can come while the
+        start's program compiles is its step's planning's (`PlanRefused`, a compile that fails), which runs
+        beside it, the overlap the start is begun for; the process's exit then waits for the start's compile
+        to end (`options.compiling`)."""
         if self._compiler.ahead is not None or self.host_master or pgle_runs():
             return None
         key = jax.ShapeDtypeStruct(fresh.key.shape, fresh.key.dtype)

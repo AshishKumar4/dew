@@ -166,3 +166,25 @@ def test_a_reduction_of_the_state_reads_it():
     graph.register(summed, set_(carry.reads(state)).to(i64(1)))
     graph.run(carry.CARRYING.saturate())
     assert graph.check_bool(eq(carry.reads(summed)).to(i64(1)))
+
+
+def scaled(h, a):
+    """A carry whose state one entrywise product reads: `h * a`."""
+    return (h * a,)
+
+
+def test_a_carrys_state_read_is_priced_a_loop_iteration_at_least():
+    """A carry whose state one entrywise product of four values reads (`scaled`), split on an assumed H100:
+    its report prices its carry (`report.rewrites`' `after`) at no less than the H100's measured loop
+    iteration (`GpuTarget.step_seconds`), whatever little the product computes: a carry is a loop XLA lowers,
+    its state's work a step of it (algebra.md §1.6; the floor of `carry._carry_priced`, train 836's F8),
+    where the product's own work prices a small fraction of it."""
+    from dew.algebra import cost
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import report
+
+    shapes = [jax.ShapeDtypeStruct((2, 2), jnp.float32)] * 2
+    with generation.assumed("sm90"), report.refusals():
+        carry.split(scaled, shapes[0], shapes[1:], (0,), saturation=SATURATION)
+        [made] = report.rewrites()
+        assert made.after >= cost.target().step_seconds

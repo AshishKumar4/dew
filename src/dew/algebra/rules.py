@@ -686,13 +686,20 @@ def register(rules: Rules) -> None:
         _HEADS.setdefault(root, set()).add(made)
 
 
-register(Rules.declared("identities", "exact", _identities(), "docs/design/algebra.md §1", aid=True))
+_MEASURED = ("measured M-DC-1 (four diffusion training steps, GH200) and M-DC-3 (six GPU flows' training and "
+             "decode programs, a DPO step, GH200 and A100): within each cell's A/A")
+"""The arms that measured the engine's registered sets (records/measurements.md), with each and without it."""
+register(Rules.declared("identities", "exact", _identities(), f"docs/design/algebra.md §1; {_MEASURED}",
+                        aid=True))
 register(Rules.declared("contracted", "exact", _contracted(),
-                        "docs/design/algebra.md §6.5; the scaled softmax's maximum, ledger 3721", aid=True))
+                        f"docs/design/algebra.md §6.5; the scaled softmax's maximum, ledger 3721; "
+                        f"{_MEASURED}", aid=True))
 register(Rules.declared("stable", "bounded", _stable(),
                         "docs/design/algebra.md §1.5; the log-sum-exp fold, feat/attention-derived 12f9398ba",
                         dev=True))
-register(Rules.declared("linear", "reorders", _linear(), "docs/design/algebra.md §1; ledger 1308"))
+register(Rules.declared("linear", "reorders", _linear(),
+                        "docs/design/algebra.md §1; ledger 1308; measured M-DC-3 (six GPU flows' training "
+                        "and decode programs, GH200 and A100): within each cell's A/A"))
 register(Rules.declared("joined", "reorders", _joined(),
                         "docs/design/algebra.md §1; ledger 1308; the rule-set survey of 2026-11-14: it "
                         "changes no shipped program, and the pass runs 12% slower without it (13,604 "
