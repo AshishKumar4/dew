@@ -337,21 +337,32 @@ def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
 
     An OptimConfig's solver holds the rate it stepped at last (`scheduled_solver`), and an Optax
     optimizer can inject `learning_rate` itself (`optax.inject_hyperparams`); an injected
-    wrapper of other hyperparameters is read through to the optimizer it holds. The result is None
-    when the optimizer closes over the rate, or when parameter groups hold several rates.
+    wrapper of other hyperparameters is read through to the optimizer it holds, and a rate injected inside
+    an injected wrapper of the rate is that wrapper's (the outermost on its path). The result is None when
+    the optimizer closes over the rate, or when parameter groups hold several rates.
     """
-    rates = learning_rates(opt_state)
+    rated = _rated_paths(opt_state)
+    rates = [rate for path, rate in rated if not any(other != path and path[:len(other)] == other
+                                                     for other, _ in rated)]
     return rates[0] if len(rates) == 1 else None
 
 
 def learning_rates(opt_state: optax.OptState) -> list[jax.typing.ArrayLike]:
     """Every learning rate injected in `opt_state` (`injected_edited`), each group's where parameter groups
-    hold several, in the state's order: what a step reads to refuse a rate that is not finite."""
+    hold several and an injected solver's inside an injected factory's beside the factory's, in the state's
+    order: what a step reads to refuse a rate that is not finite."""
+    return [rate for _, rate in _rated_paths(opt_state)]
+
+
+def _rated_paths(opt_state: optax.OptState) -> list[tuple[jax.tree_util.KeyPath, jax.typing.ArrayLike]]:
+    """Each injected state of `opt_state` holding a learning rate, by its path, with its rate; a state inside
+    another reached past it (`injected_edited`). `learning_rate` reads the outermost of each path, as the
+    rate an injected factory hands the solver it holds."""
     rates = []
 
     def read(path, node):
         if "learning_rate" in node.hyperparams:
-            rates.append(node.hyperparams["learning_rate"])
+            rates.append((path, node.hyperparams["learning_rate"]))
         return node
 
     injected_edited(opt_state, read)

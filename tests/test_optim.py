@@ -1937,3 +1937,18 @@ def test_lambs_trust_ratio_is_finite_where_the_update_is_tiny_beside_the_paramet
     kept = float(layer_norms(updates["w"], 0, 0.0).max()) == 0.0
     expected = np.full((4,), 1e-22 if kept else 5e18)
     np.testing.assert_allclose(np.asarray(scaled["w"]), expected, rtol=1e-5)
+
+
+def test_a_rate_injected_inside_an_injected_factory_reports_the_factorys():
+    """An injected factory of a rate (`inject_hyperparams(f)(learning_rate=s)`) whose chain injects its
+    solver's rate in turn holds two equal rates on one path: the reported rate is the factory's, the
+    outermost, as main read it, where two were read and none was reported (train 936's review, F2)."""
+    def factory(learning_rate):
+        return optax.chain(optax.inject_hyperparams(optax.adamw)(learning_rate=learning_rate))
+
+    wrapped = optax.inject_hyperparams(factory)(learning_rate=optax.linear_schedule(1e-2, 1e-3, 10))
+    params = {"w": jnp.ones(3)}
+    state = wrapped.init(params)
+    for _ in range(2):
+        _, state = wrapped.update({"w": jnp.ones(3)}, state, params)
+    np.testing.assert_allclose(np.asarray(learning_rate(state)), 1e-2 + 2 * (1e-3 - 1e-2) / 10, rtol=1e-6)
