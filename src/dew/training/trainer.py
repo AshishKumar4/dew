@@ -2099,15 +2099,12 @@ class Trainer(Generic[Loss, Effects]):
         checkpoints its state in a pool (`_rollout_admitted`), and a pipeline's batch, whose placement could
         take minutes or run out of memory before the error. Every other mesh's batch is checked with its
         stream (`check_stream`), a ramp's at each of its stages. The checkpoints learn why no record rebuilds
-        a run of this trainer on the data it was `stated` (`Checkpoints.python_run`), and the tokenizer
-        its checkpoints hold (`Checkpoints.save`) resolves, so a host that cannot resolve it refuses before
-        step 0, naming it, not at the first checkpoint."""
+        a run of this trainer on the data it was `stated` (`Checkpoints.python_run`), and its checkpoints'
+        declaration is built (`_artifact`), resolving the tokenizer whose files it states and the checkpoints
+        hold (`Checkpoints.save`): a host that cannot resolve it refuses before step 0, naming it, not at the
+        first checkpoint (train 972's review)."""
         if self.checkpoints is not None:
-            from dew.data.text import HFTokenizer
-
-            tokenizer = self.objective.run_tokenizer()
-            if isinstance(tokenizer, HFTokenizer):
-                tokenizer.dependencies()
+            self._artifact()
             given = {"a rollout (rollout=)": _rollout_admitted(self.rollout),
                      "a custom step (step=)": self.step, "a tracker (tracker=)": self.tracker,
                      "recording each step's draws (record=True)": self.record or None}

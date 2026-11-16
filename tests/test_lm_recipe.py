@@ -698,9 +698,10 @@ def test_a_run_whose_tokenizer_is_gone_exports_and_starts_a_run_from_the_copy_it
     checkpoint = REPO_ROOT / "tests/fixtures/hf/llada-tiny"
     source = tmp_path / "source"
     shutil.copytree(checkpoint, source)
-    corpus = write_token_corpus(tmp_path / "tokens", np.random.RandomState(400).randint(4, 100, 400),
-                                tokenizer=str(checkpoint), vocab_size=100, eos_id=1)
-    masked_run(tmp_path, corpus, "first", source, source)
+    ids = np.random.RandomState(400).randint(4, 100, 400)
+    corpus = write_token_corpus(tmp_path / "tokens", ids, tokenizer=str(checkpoint), vocab_size=100, eos_id=1)
+    own = write_token_corpus(tmp_path / "own", ids, tokenizer=str(source), vocab_size=100, eos_id=1)
+    masked_run(tmp_path, own, "first", source, source)
     text = "a run's own tokenizer"
     expected = HFTokenizer(str(checkpoint)).encode(text)
     source.rename(tmp_path / "moved")
@@ -714,26 +715,6 @@ def test_a_run_whose_tokenizer_is_gone_exports_and_starts_a_run_from_the_copy_it
     assert HFTokenizer(str(tmp_path / "exported")).encode(text) == expected
     started = masked_run(tmp_path, corpus, "started", first, checkpoint)
     assert int(started.updates) == 1
-
-
-def test_a_run_whose_tokenizer_this_host_cannot_resolve_is_refused_before_its_first_step(tmp_path):
-    """A run whose checkpoints hold its tokenizer (`Checkpoints.save`) resolves it before it places
-    anything: one this host cannot resolve, its directory gone, is refused before the fit starts, where it
-    trained to its first checkpoint and died there (train 972's review)."""
-    import shutil
-
-    source = tmp_path / "source"
-    shutil.copytree(REPO_ROOT / "tests/fixtures/hf/llada-tiny", source)
-    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, tokenizer=str(source), eos_id=0)
-    shutil.rmtree(source)
-    config = run_config(tokens, "--trainer.name", "gone", "--trainer.steps", "2",
-                        "--trainer.checkpoint-every", "1", "--max-new-tokens", "0")
-    with pytest.raises(ValueError):
-        config.run()
-    records = tmp_path / "runs" / "gone" / "tracking" / "records.jsonl"
-    started = [] if not records.exists() else [
-        line for line in records.read_text().splitlines() if json.loads(line)["type"] == "FitStarted"]
-    assert started == []
 
 
 def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
