@@ -654,6 +654,10 @@ class _Unread:
 _UNREAD = _Unread()
 
 
+JOINT_ROW = "joint row"
+"""The metadata mark of a `SegmentLayout` field only the joint row reads (`SegmentLayout.joint_row`), which a
+row a question holds at its default."""
+
 QUESTION_ROW = "question row"
 """The metadata mark of a `SegmentLayout` field only a row a question reads, which a joint row holds at its
 default (`SegmentLayout.joint_row`)."""
@@ -694,7 +698,7 @@ class SegmentLayout(Layout):
     """Which of the three rows it writes (`Form`): Laya's marker row, a state-first row, each a row a
     question, or the joint row of every question; built by its constructor (`marker`, `state_first`,
     `joint`), which gives each its own defaults."""
-    max_state_tokens: int | None = None
+    max_state_tokens: int | None = dataclasses.field(default=None, metadata={JOINT_ROW: True})
     """The most tokens the joint row's state keeps (`joint`), or None for what the row's other parts leave
     of `max_len`; a row a question holds no cap of its own."""
     head_max_len: int | None = dataclasses.field(default=None, metadata={QUESTION_ROW: True})

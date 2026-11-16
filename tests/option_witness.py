@@ -36,7 +36,7 @@ from dew import registry
 from dew._cli.main import main
 from dew._records import annotations_of
 from dew.config import RunConfig
-from dew.decision.layout import Reads, RowSegment, built_in
+from dew.decision.layout import JOINT_ROW, QUESTION_ROW, Reads, RowSegment, SegmentLayout, built_in
 from dew.registry import objectives
 
 
@@ -358,8 +358,12 @@ def witnessed(settings: type, base=None) -> dict[str, list[object]]:
     hints = annotations_of(settings)
     # A field its class's record holds none of (`metadata={"record": False}`) is no option a saved task
     # is built with: no save states it (a question layout's reading under an earlier data plan).
+    # A segment layout's field only another form's row reads (`JOINT_ROW`, `QUESTION_ROW`) is none of the
+    # options a saved task of this form is built with: it holds its default, the form refusing any other.
+    other = (QUESTION_ROW if base.joint else JOINT_ROW) if isinstance(base, SegmentLayout) else None
     declared = {field.name: alternatives(hints[field.name], getattr(base, field.name, None))
-                for field in dataclasses.fields(settings) if field.metadata.get("record", True)}
+                for field in dataclasses.fields(settings)
+                if field.metadata.get("record", True) and not (other and field.metadata.get(other))}
     return {name: values for name, values in declared.items() if len(values) > 1}
 
 
