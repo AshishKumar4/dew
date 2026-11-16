@@ -75,7 +75,7 @@ def _read_saved(saved: Mapping[str, object]) -> Mapping[str, object]:
     (`EARLIER_DESCRIPTIONS`, row 6140)."""
     read = record(moved_paths(json_value(saved, "saved data plan")), "saved data plan")
     for earlier in EARLIER_DESCRIPTIONS:
-        read = record(earlier(read), "saved data plan")
+        read = record(earlier(json_value(read, "saved data plan")), "saved data plan")
     return read
 
 
