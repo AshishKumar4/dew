@@ -606,11 +606,13 @@ def pool_record(devices: Sequence) -> dict[str, JSON]:
     return {"limit": min(limits, default=None), **stated}
 
 
-def refusal_record(identity: str, config: Hashable, names: frozenset[str]) -> dict[str, JSON]:
+def refusal_record(identity: str, config: Hashable, refused: frozenset[report.Refused]) -> dict[str, JSON]:
     """A launch config refused for its kernels' spills (`report.refused_launches`), the config by its
-    text."""
-    kernels: list[JSON] = [*sorted(names)]
-    return {"launch": identity, "config": repr(config), "kernels": kernels}
+    text, each kernel by its name and the roles it spilled in where its compile read them."""
+    kernels: list[JSON] = sorted({kernel for kernel, _ in refused})
+    roles: dict[str, JSON] = {kernel: list(spilled) for kernel, spilled in sorted(refused, key=repr)
+                              if spilled is not None}
+    return {"launch": identity, "config": repr(config), "kernels": kernels, "roles": roles}
 
 
 def rewrite_record(made) -> dict[str, JSON]:
