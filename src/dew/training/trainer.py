@@ -2181,8 +2181,8 @@ class Trainer(Generic[Loss, Effects]):
                 # Its empty window binds no split: the new step's window is built over it.
                 self._compiler.afresh = True
             if self._later is not None:
-                # What the phase's plan off the loop compiled, which its plan here takes (`LaterPlans`).
-                self._compiler.taken_executables(self._later.taken(self.phase_passes.current))
+                # The phase's plan off the loop waited for, its executables the process's (`LaterPlans`).
+                self._later.waited(self.phase_passes.current)
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
         trials = Trials(state, batch)
         if signature not in compiled:
