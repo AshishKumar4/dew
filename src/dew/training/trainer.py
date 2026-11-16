@@ -267,9 +267,10 @@ def _closed(stream: Iterator[Batch]) -> None:
         close()
 
 
-def program_digest(signature: Hashable) -> str:
+def signature_digest(signature: Hashable) -> str:
     """The digest of a step's batch signature (`batch_signature`, keyed by its phase's passes), which names
-    the program compiled for it in a run's records (`StepCompiled.program`, `ProfileTraced.program`)."""
+    the step compiled for it in a run's records (`StepCompiled.signature`, `ProfileTraced.signature`),
+    computed once a compile."""
     return hashlib.sha256(repr(signature).encode()).hexdigest()[:16]
 
 
@@ -2250,12 +2251,13 @@ class Trainer(Generic[Loss, Effects]):
             gc.collect()
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
+            run.signatures[signature] = signature_digest(signature)
             self._report(StepCompiled(seconds, recompute_record(self.objective), links, self.memory,
-                                      self.plan, program_digest(signature)),
+                                      self.plan, run.signatures[signature]),
                          int(trials.state.step) if reported is None else reported)
             self._unproven = True
-        # The program this step runs, which a profile window that stops after it names (`ProfileTraced`).
-        run.program = program_digest(signature)
+        # The step compiled for this batch's signature, which a profile window that stops after it names.
+        run.signature = run.signatures.get(signature)
         return (*compiled[signature], trials.state)
 
     def _saved_checkpoint(

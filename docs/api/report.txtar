@@ -1288,7 +1288,7 @@ dew.telemetry.records.StepCompiled
   links: Mapping[str, AxisLink]
   memory: JSON = None
   plan: JSON = None
-  program: str | None = None
+  signature: str | None = None
 dew.telemetry.records.CheckpointRequested
   directory: str
   local: bool = False
@@ -1298,7 +1298,7 @@ dew.telemetry.records.DataRestarted
 dew.telemetry.records.ProfileTraced
   directory: str
   steps: int
-  program: str | None = None
+  signature: str | None = None
 dew.telemetry.records.FitEnded
   status: Literal['completed', 'preempted', 'failed', 'interrupted', 'lowered']
   seconds: float

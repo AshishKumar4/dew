@@ -172,9 +172,9 @@ class StepCompiled:
     links: Mapping[str, AxisLink]
     memory: JSON = None
     plan: JSON = None
-    program: str | None = None
-    """The digest of the batch signature it was compiled for (`dew.training.trainer.program_digest`), by
-    which a profile window that ran it names it (`ProfileTraced.program`)."""
+    signature: str | None = None
+    """The digest of the batch signature it was compiled for (`dew.training.trainer.signature_digest`), by
+    which a profile window that ran it names it (`ProfileTraced.signature`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -196,10 +196,11 @@ class DataRestarted:
 @dataclasses.dataclass(frozen=True)
 class ProfileTraced:
     """The directory a fit's profile window (`dew.training.ProfileWindow`) wrote and the steps it traced, and
-    the program its last step ran (`StepCompiled.program`), compiled for it or earlier."""
+    the step its last step ran, by the signature it was compiled for (`StepCompiled.signature`), compiled
+    for it or earlier."""
     directory: str
     steps: int
-    program: str | None = None
+    signature: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)

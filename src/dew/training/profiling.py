@@ -346,13 +346,13 @@ class ProfileReport:
         compiled = [entry for entry in entries if entry["type"] == "StepCompiled"]
         compiles = [entry["value"]["seconds"] for entry in compiled]
         # The program the window ran: the one its last step ran, by its batch signature's digest
-        # (`ProfileTraced.program`), compiled then or earlier, a signature read again after another's
+        # (`ProfileTraced.signature`), compiled then or earlier, a signature read again after another's
         # reusing its program (row 6822).
         traced_window = next((entry["value"] for entry in reversed(entries)
                               if entry["type"] == "ProfileTraced"), {})
-        program = traced_window.get("program")
+        program = traced_window.get("signature")
         ran = [entry["value"] for entry in compiled
-               if program is not None and entry["value"].get("program") == program]
+               if program is not None and entry["value"].get("signature") == program]
         plan = ran[-1].get("plan") if ran else None
         kernels = plan.get("kernels") if isinstance(plan, dict) else None
         manifest = json.loads((capture / "manifest.json").read_text())

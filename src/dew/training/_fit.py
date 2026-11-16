@@ -416,9 +416,11 @@ class FitRun:
     """The stream the start read its first batch from to declare its input (`Trainer._primed_first`): the
     share it reads, the stream, the batch and the stream's position after it, which a fresh start's
     prefetcher takes over (`Trainer._opened`) and any other start closes."""
-    program: str | None = None
-    """The program the run's latest step ran, by its batch signature's digest
-    (`dew.training.trainer.program_digest`)."""
+    signatures: dict[Hashable, str] = dataclasses.field(default_factory=dict)
+    """Each batch signature's digest the run compiled a step for (`dew.training.trainer.signature_digest`),
+    computed as it compiled."""
+    signature: str | None = None
+    """The digest of the signature the run's latest step was compiled for (`signatures`)."""
     best: HeldBest = dataclasses.field(default_factory=HeldBest)
     """The log taken at the latest logging step and not yet read."""
     stepped: tuple[jax.Array, dict[str, jax.Array], jax.Array] | None = None
@@ -473,7 +475,7 @@ class FitRun:
         if not self.window_paused:
             stop_capture(profiler, self.loss, wait=self.window_waits)
         self.window, self.window_paused = None, False
-        self.profiled = (self.traced, self.current, str(profiler.directory), self.program)
+        self.profiled = (self.traced, self.current, str(profiler.directory), self.signature)
 
     def committed_examples(self, interval: Interval, points: Sequence[int], state: TrainState,
                            window: int) -> tuple[int, int]:
