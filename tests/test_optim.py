@@ -1935,4 +1935,5 @@ def test_lambs_trust_ratio_is_finite_where_the_update_is_tiny_beside_the_paramet
     updates = {"w": jnp.full((4,), 1e-22, jnp.float32)}
     scaled, _ = scale_by_trust_ratio().update(updates, scale_by_trust_ratio().init(params), params)
     kept = float(layer_norms(updates["w"], 0, 0.0).max()) == 0.0
-    np.testing.assert_allclose(np.asarray(scaled["w"]), np.full((4,), 1e-22 if kept else 5e18), rtol=1e-5)
+    expected = np.full((4,), 1e-22 if kept else 5e18)
+    np.testing.assert_allclose(np.asarray(scaled["w"]), expected, rtol=1e-5)
