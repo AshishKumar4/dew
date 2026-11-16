@@ -62,7 +62,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
-- CROSS-05 (audit 2026-11-15 pm, validated). [6779]
 
 ## Training and parallelism
 
@@ -85,11 +84,9 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - Training and serving efficiency. [3330, 1880, 5292]
-- DeepSeek V4's attention declares its kv_proj kernels. [6654]
 - Dory: the release qualified and its tests' oracles. [596]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
 - A decoder computing in no dtype of its own. [6215]
-- CROSS-02 (audit 2026-11-15 pm, validated). [6778]
 
 ## Algebra
 
