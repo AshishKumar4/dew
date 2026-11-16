@@ -138,7 +138,7 @@ def block_of(family: mosaic.Family) -> int:
 
 
 
-@dataclasses.dataclass(frozen=True, repr=False)
+@dataclasses.dataclass(frozen=True)
 class Tiles:
     """A forward's tiles, the recurrence template's config, derived from the call's shape and the device's
     and its bundle's facts (`templates.recurrence.template.Mosaic.derived`): the value block the states
@@ -163,14 +163,6 @@ class Tiles:
     """The most programs a multiprocessor holds of its launches where a compile found them spilling with
     their producers' ladders run out (`template.Mosaic._fewer`), every other launch's as many as its plan
     holds."""
-
-    def __repr__(self) -> str:
-        # Its fields as a dataclass names them, its residents only where a rung set them: a config's repr is
-        # its identity in every store (its certification's program, `report._compiled_launch`; the kernels'
-        # names, `report.named`), which a config without them keeps as it was before they were a field.
-        fields = [field for field in dataclasses.fields(self)
-                  if field.name != "residents" or self.residents.held_to]
-        return f"{type(self).__name__}({', '.join(f'{f.name}={getattr(self, f.name)!r}' for f in fields)})"
 
     @property
     def output_block(self) -> int:
@@ -2044,12 +2036,13 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
             tile = stream_tile(slots, "values", values, columns=pl.ds(role * bv, bv))
             # The chunk's own pairs' scores staged for its local product (`output_launch`'s first step's).
             scores = algebra.chunk_scores(queries.__getitem__, keyed.__getitem__, slices, gate, low,
-                                          held.dtype, Issuer(call), laid=laid, column_scale=column_scale)
+                                          held.dtype, Issuer(call).summed, laid=laid,
+                                          column_scale=column_scale)
             operands.staged(family, scores, scored)
             corrected = _scan_corrected(call, slots, tile, bv, state, (gate, low), betas, issue)
             # The memory the chunk enters, in its registers, staged as the memories' form for its product.
             out = algebra.chunk_output(queries.__getitem__, state.__getitem__, slices, gate, low,
-                                       Parts(scored, held.dtype), corrected, scale, issue)
+                                       Parts(scored, held.dtype), corrected, scale, issue.summed)
             if skip_ref:
                 out = out + skip_ref[0][h] * tile.value().astype(jnp.float32)
             before_store()

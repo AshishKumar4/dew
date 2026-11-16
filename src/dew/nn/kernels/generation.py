@@ -300,6 +300,11 @@ class RegisterRaises:
     highest: int
     step: int
 
+    def below(self, registers: int) -> int:
+        """The most a `setmaxnreg` moves a thread to at or below `registers`: a program's entry share, a
+        thread's 255 at two warpgroups, is no step (row 6783)."""
+        return min(registers, self.highest) // self.step * self.step
+
 
 SETMAXNREG = RegisterRaises(24, 256, 8)
 """`setmaxnreg`'s range on every architecture that takes it (PTX ISA, "setmaxnreg")."""

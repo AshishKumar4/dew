@@ -15,8 +15,11 @@ the stability suite holds the mainloop under its regimes there (tests/test_recur
 import collections
 import dataclasses
 import functools
+import json
+import math
 import types
 from collections.abc import Callable
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -370,10 +373,12 @@ def test_the_mosaic_forward_over_a_ragged_length_is_as_exact_as_its_reference():
     """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over a ragged length."""
 
 
-@pytest.mark.check1_shards(seeds=256, per_task=16)
+@pytest.mark.check1_shards(seeds=256, per_task=6)
 @drawn_forward('packed documents', 'bf16')
 def test_the_mosaic_forward_over_packed_documents_is_as_exact_as_its_reference():
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over packed documents."""
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over packed documents: six draws a
+    task, a draw interpreted on sm100 15 to 17 s (sixteen took 236 to 272 s a shard, two of test_recurrence_
+    mosaic's groups past the task deadline, row 6745)."""
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=8)
@@ -844,12 +849,18 @@ def test_the_rated_hook_over_packed_documents_is_as_exact_as_the_recurrence_inte
 
 RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True),
                    'nemotron-h-4b-ssd': (8, 96, 128, 80, False),
+                   'minimax-text-01-lightning': (64, 64, 128, 128, False),
                    'a write gate': (2, 2, 64, 64, False),
                    'a 192-wide value head': (16, 16, 128, 192, False)}
-"""The scoreboard's geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`), an unrounded
-write gate, and a gated delta rule's value head 192 wide, whose training launches take whole staged blocks (a
-bf16 output gradient's 64-column swizzle; 96 columns cut one): key heads, value heads, key and value widths,
-and whether the decay is a key dimension's."""
+"""The scoreboard's geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`,
+MiniMax-Text-01's lightning layer among them), an unrounded write gate, and a gated delta rule's value head
+192 wide, whose training launches take whole staged blocks (a bf16 output gradient's 64-column swizzle; 96
+columns cut one): key heads, value heads, key and value widths, and whether the decay is a key dimension's."""
+
+WHOLE = frozenset({'minimax-text-01-lightning', 'a write gate'})
+"""The gate's forms without the delta rule whose numbers the run's fast forms leave whole
+(`recurrence_chunk.chunk_rounding`): lightning attention's and a write gate's, their intermediates in fp32's
+three parts."""
 
 RATED = frozenset({'nemotron-h-4b-ssd'})
 """The gate's rated scans (Mamba2's SSD): no delta rule, its 16-bit call `rounded` (the fast forms), its
@@ -1163,15 +1174,16 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                                                            ('qwen3.5-27b-gdn', jnp.float32),
                                                            ('kimi-linear-kda', jnp.bfloat16),
                                                            ('nemotron-h-4b-ssd', jnp.bfloat16),
+                                                           ('minimax-text-01-lightning', jnp.bfloat16),
                                                            ('a write gate', jnp.bfloat16),
                                                            ('a 192-wide value head', jnp.bfloat16)})
                and not (variant == TWO_ROLES and not (training and not packed))
                and not (isinstance(variant, int) and (training or packed or dtype == jnp.float32))]
 """The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group: every
 geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the training pass of the
-gated delta rule in both and of Kimi delta attention, the SSD and the write gate in 16 bits (Kimi's keys, 128
-wide, past what an fp32 call takes under a decay a key dimension; the write gate's intermediates in fp32's
-three parts), and the 192-wide value head's 16-bit training pass alone;
+gated delta rule in both and of Kimi delta attention, the SSD, lightning attention and the write gate in 16
+bits (Kimi's keys, 128 wide, past what an fp32 call takes under a decay a key dimension; lightning's and the
+write gate's intermediates in fp32's three parts), and the 192-wide value head's 16-bit training pass alone;
 one row's 16-bit forward at its derived tiles apart from
 each of its variants (`variant`, a test each: an fp32 forward, which every family refuses, has none), and one
 row's training pass at its derived tiles apart from its walks at two roles (`TWO_ROLES`). One test
@@ -1185,7 +1197,7 @@ def _form(name: str, dtype) -> dict:
     """A resource case's call form beside its operands under the run's fast forms (`rounded`, `fast_rounding`,
     an fp32 call's operands in two parts), as its route gives it: a rated scan's without the delta rule and
     wide, as Mamba-2's mixer reads its output (`chunk`'s fp32 `dtype`)."""
-    if name == 'a write gate':
+    if name in WHOLE:
         return {'delta': False}
     return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
 
@@ -1635,8 +1647,12 @@ def test_a_forked_calls_walks_keep_its_table_spilling_none(target, name, trainin
         if not spilling or tiles in stepped:
             break
         stepped.add(tiles)
+        # The roles each spill stood in, as a run's certification states them, which its ladder steps by.
+        spilled_in = {binary["kernel"]: None if binary["spilled_in"] is None else tuple(binary["spilled_in"])
+                      for record in found for binary in record.get("binaries", ())
+                      if binary["kernel"] in spilling}
         with generation.assumed(facts):
-            report.refuse_launch(template.MOSAIC, bound, tiles, spilling)
+            report.refuse_launch(template.MOSAIC, bound, tiles, spilling, spilled_in)
     assert mosaic_failures(found) == []
 
 
@@ -1672,22 +1688,24 @@ def test_a_training_launchs_backward_kernels_carry_its_launch():
 
 
 
-def _reverse_walk_certified(op=None) -> list:
-    """Qwen3.5-4B's gated delta net over its 12,288-token row lowered for a compile-only B200 as a training
-    step runs it (its gradient, certified as reverse mode runs it, `report.pulled`), through `op`'s
-    certification where given (`tuning.KernelOp._certified` of its derived tiles), else through the call's
-    route: the template's certifications it made and the configs it refused."""
+def _step_certified(target: str, rows: int, *, packed: bool, op=None) -> list:
+    """Qwen3.5-4B's gated delta net over `rows` rows of 12,288 tokens (`packed`: 17 documents a row) lowered
+    for a compile-only `target` as a training step runs it (its gradient, certified as reverse mode runs it,
+    `report.pulled`), through `op`'s certification where given (`tuning.KernelOp._certified` of its derived
+    tiles), else through the call's route: the template's certifications it made and the configs it
+    refused."""
     from dew.nn.kernels.generation import compile_only_gpus
 
     # Qwen3.5-4B's linear attention: 16 key heads and 32 value heads, each 128 wide.
     operands = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
-        ((1, 12288, 16, 128), jnp.bfloat16), ((1, 12288, 16, 128), jnp.bfloat16),
-        ((1, 12288, 32, 128), jnp.bfloat16), ((1, 12288, 32), jnp.float32), ((1, 12288, 32), jnp.bfloat16))]
-    options = {'max_segments': None, 'scale': None, 'delta': True, 'wide': False, 'bound': 1.0,
-               'rounded': True}
+        ((rows, 12288, 16, 128), jnp.bfloat16), ((rows, 12288, 16, 128), jnp.bfloat16),
+        ((rows, 12288, 32, 128), jnp.bfloat16), ((rows, 12288, 32), jnp.float32),
+        ((rows, 12288, 32), jnp.bfloat16))]
+    options = {'max_segments': 17 if packed else None, 'scale': None, 'delta': True, 'wide': False,
+               'bound': 1.0, 'rounded': True}
     before = {id(certified) for certified in report.certifications()}
-    with (report.refusals(), generation.assumed('sm100'), generation.chosen(gated_delta_rule='mosaic_gpu'),
-          report.certifying(compile_only_gpus('sm100')[0])):
+    with (report.refusals(), generation.assumed(target), generation.chosen(gated_delta_rule='mosaic_gpu'),
+          report.certifying(compile_only_gpus(target)[0])):
         # The template's rule called as the route's training product calls it, under reverse mode's
         # certification (`recurrence_chunk._per_product`'s `training`): `_route_loss` takes the rule itself.
         with report.pulled():
@@ -1702,18 +1720,67 @@ def _reverse_walk_certified(op=None) -> list:
             if id(each) not in before and each.op == type(op or template.MOSAIC).__name__], refused
 
 
-@lowers('sm100')
-def test_a_launch_whose_producer_must_rise_is_certified_at_its_ladders_top_in_one_compile():
-    """A training call whose reverse walk spills at setmaxnreg's least producer on a compile-only B200
-    (`_reverse_walk_certified`) is certified at its producer's top, its program's entry share (two
-    warpgroups, two programs a multiprocessor: 128), in one compile: every role holds the entry share and
-    no register moves. From the ladder's foot up, the walk's producer rose 24 to 80 over eight
-    certification compiles, 95 s of the 4B's cold start."""
-    from dew.nn.kernels.templates import resources
+def _reverse_walk_certified(op=None) -> list:
+    """The 4B training step over its one 12,288-token row on a compile-only B200 (`_step_certified`)."""
+    return _step_certified('sm100', 1, packed=False, op=op)
 
-    certified, _ = _reverse_walk_certified()
-    raised = [each.config.producers.of('recurrence_reverse') for each in certified]
-    assert [cap for cap in raised if cap is not None] == [resources.entry_registers(2, 2)], raised
+
+def _certified_bodies(certified: list) -> dict[str, list]:
+    """Each kernel's bodies `certified` compiled (each distinct module once, in order) with the binary its
+    certification read of each, by the kernel's name."""
+    found: dict[str, dict[str, object]] = collections.defaultdict(dict)
+    for each in certified:
+        for module, binary in each.kernels.values():
+            found[binary.kernel].setdefault(module, binary)
+    return {kernel: list(bodies.values()) for kernel, bodies in found.items()}
+
+
+def assert_a_start_certifies_each_kernel_at_most_twice(certified: list) -> None:
+    """Every kernel of a training step's start certified at most twice, the body it keeps unspilled: a
+    launch spilling at its producer's least takes its consumers' statement's share next
+    (`resources.stated_producer`), and a rung asked once is never asked again
+    (`resources.Producers.stepped`)."""
+    bodies = _certified_bodies(certified)
+    assert bodies and all(len(found) <= 2 and not found[-1].refused for found in bodies.values()), bodies
+
+
+@lowers('sm100')
+def test_a_b200_training_steps_start_certifies_each_kernel_at_most_twice():
+    """The 4B training step on a compile-only B200 (`_reverse_walk_certified`): every kernel certified at most
+    twice, none kept spilled. Its reverse walk spills 40 bytes at its producer's least and holds at its
+    consumers' statement's share; from the ladder's foot up it took eight, 95 s of the 4B's cold start."""
+    assert_a_start_certifies_each_kernel_at_most_twice(_reverse_walk_certified()[0])
+
+
+@lowers('sm90')
+def test_an_h100_training_steps_start_certifies_each_kernel_at_most_twice():
+    """The 4B training step over four packed rows on a compile-only H100 (`_step_certified`): every kernel
+    certified at most twice, none kept spilled. With its consumers raised to the whole pool beside the least
+    producer, ptxas spilled the output walk's tile index around the scores' warpgroup MMAs, which their
+    statement's share holds; from the top down that start took ten certifications in three rounds (row 6743).
+    Proposed first, the statements' shares traded the output walk's ladder for the scores' backward's."""
+    assert_a_start_certifies_each_kernel_at_most_twice(_step_certified('sm90', 4, packed=True)[0])
+
+
+@lowers('sm90')
+def test_a_write_gated_training_calls_start_certifies_its_consumers_spill_three_times_at_most():
+    """The unrounded write gate's forked training call (`forked_case`, no delta rule) at its derived tiles on
+    a compile-only H100, certified as reverse mode runs it (`tuning.KernelOp._certified`): its scores'
+    backward, which spills 16 bytes in its consumers' code at its producer's least, is certified there, at
+    its consumers' statement's share, and at a program fewer, which holds; every other kernel once, none
+    kept spilled. From its producer's top down, every rung spilled more in its consumers, and the ladder
+    compiled about a hundred rounds of the launch before the program fewer (row 6744)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    _, bound, tiles, _ = forked_case('sm90', 'a write gate', training=True)
+    before = {id(certified) for certified in report.certifications()}
+    with (report.refusals(), generation.assumed('sm90'), report.certifying(compile_only_gpus('sm90')[0]),
+          report.pulled()):
+        template.MOSAIC._certified(bound, tiles)
+    bodies = _certified_bodies([each for each in report.certifications() if id(each) not in before])
+    spilling = bodies.pop('recurrence_scores_back')
+    assert len(spilling) <= 3 and not spilling[-1].refused, spilling
+    assert bodies and all(len(found) == 1 and not found[-1].refused for found in bodies.values()), bodies
 
 
 @lowers('sm90')
@@ -1879,7 +1946,7 @@ def test_a_training_step_the_fast_backward_does_not_take_certifies_no_gradient()
                 if id(each) not in before and each.op == type(template.MOSAIC).__name__]
 
 
-TOP_RUNG_LOWERED = """
+RUNG_LOWERED = """
 import collections, json
 from jax._src import monitoring
 from dew.training.runtime import ready_process
@@ -1894,20 +1961,21 @@ print(json.dumps({"served": dict(served), "kernels": [len(each.kernels) for each
                   "raised": [each.config.producers.of("recurrence_reverse") for each in certified]}))
 """
 """A process configured as a run's (`ready_process`: its compilation cache and its kernels' lowerings kept
-beside it) certifying the 4B reverse walk (`_reverse_walk_certified`): the lowering cache's hits and misses,
-each certification's kernels and its reverse walk's producer."""
+beside it) certifying the 4B reverse walk (`_reverse_walk_certified`), which spills at its producer's least
+and takes its ladder's next rung: the lowering cache's hits and misses, each certification's kernels and its
+reverse walk's producer."""
 
 
 @lowers('sm100')
-def test_a_ladders_top_reads_every_kernel_but_the_raised_one_from_the_lowering_cache(tmp_path):
-    """In a process that keeps its lowerings as a run does (`TOP_RUNG_LOWERED`), the reverse walk's top
+def test_a_ladders_rung_reads_every_kernel_but_the_raised_one_from_the_lowering_cache(tmp_path):
+    """In a process that keeps its lowerings as a run does (`RUNG_LOWERED`), the reverse walk's next
     rung lowers only the kernel its producer changed: every other kernel of the launch is the module it was
     at the floor (its identity, `report.named`), read back from the Pallas lowering cache, whose key holds no
     caller metadata (Dew's JAX build, post93). Named by their launch's whole config, each rung lowered all
     nine of the launch's kernels again in Python."""
     from process_support import fresh
 
-    found = fresh(TOP_RUNG_LOWERED, cache_dir=tmp_path / "cache", platforms="cpu")
+    found = fresh(RUNG_LOWERED, cache_dir=tmp_path / "cache", platforms="cpu")
     assert found["raised"][1:] and found["raised"][-1] is not None, found
     assert found["served"].get("hit", 0) >= found["kernels"][-1] - 1, found
 
@@ -1932,9 +2000,8 @@ device = _device(target).devices.flat[0]
 # Two rungs of a launch's producer ladder past a training case's tiles (`_ladders`).
 with generation.assumed(facts):
     label, bound, pulled, configs = next(
-        (unit[0], unit[1], unit[4], ladder) for unit in gate._identity_units(target)
-        if unit[3] == 'launch' and unit[4]
-        and len(ladder := gate._walked(unit[1], unit[2], 'launch', unit[5], facts)) >= 3)
+        (unit[0], unit[1], unit[4], unit[6]) for unit in gate._identity_units(target)
+        if unit[3] == 'launch' and unit[4] and len(unit[6]) >= 3)
 rungs = configs[1:3]
 programs = []
 with report.refusals(), generation.assumed(facts), report.certifying(device):
@@ -1977,21 +2044,21 @@ def test_a_programs_refusal_is_stored_as_its_own_configs_verdict_whatever_body_n
 @lowers('sm100')
 def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
     """A ladder whose first rung the assembler rejects (the reverse walk's producer past its program's entry
-    share, the roles' setmaxnreg moves inverted: ptxas refuses the kernel) and whose next holds: the rejected
-    rung is refused as a spilling one is, and the derivation takes the one below it, never the one
-    certification could not read (`report.certified`'s None)."""
+    share, the roles' setmaxnreg moves inverted: ptxas refuses the kernel), the template's own rungs after it:
+    the rejected rung is refused as a spilling one is, and the derivation takes the template's rung that
+    holds, never the one certification could not read (`report.certified`'s None)."""
     from dew.nn.kernels.templates import resources
 
     class PastItsTop(type(template.MOSAIC)):
         def rungs(self, ba, config):
-            for cap in (232, 128):
-                yield template._limited(config, producers=resources.Producers((('recurrence_reverse', cap),)),
-                                        residents=config.residents)
+            yield template._limited(config, producers=resources.Producers((('recurrence_reverse', 232),)),
+                                    residents=config.residents)
+            yield from super().rungs(ba, config)
 
     certified, refused = _reverse_walk_certified(PastItsTop())
-    assert [each.config.producers.of('recurrence_reverse') for each in certified] == [None, 128], certified
+    taken = [each.config.producers.of('recurrence_reverse') for each in certified]
     caps = {config.producers.of('recurrence_reverse') for config in refused}
-    assert 232 in caps and 128 not in caps, caps
+    assert 232 in caps and 232 not in taken and not certified[-1].refused, (taken, caps)
 
 
 def _named_bodies(bound, config, target: str, *, training: bool) -> dict[str, str]:
@@ -2057,13 +2124,22 @@ def _rungs_of(bound, tiles, training: bool, facts) -> list:
     return found
 
 
+LADDER_RUNGS = 3
+"""The rungs of a launch's producer ladder the identity test walks past its tiles (`_walked`): its first, the
+consumers' statement's share where it has one, else its top; its top; and the first below it. Each rung's
+cap is one setmaxnreg constant in that launch's producer and in no other launch's kernel, so the rungs past
+them hold no naming another does not: walked to the foot, a ladder of 14 configs of 16 kernels a config
+held one task 171 s (jsf-ideal2)."""
+
+
 def _walked(bound, tiles, kind: str, launch: str, facts) -> list:
-    """A launch's ladder from a case's `tiles`: its tiles and each rung of its producer ladder
-    (`Mosaic._raised`, from its top down), a forward-apart launch's ('forward launch') its forward alone at
-    the case's tiles with that launch's forward producers alone at each rung (a pinned config's, which may set
-    the forward's caps apart from the call's)."""
+    """A launch's ladder from a case's `tiles`: its tiles and its producer ladder's first `LADDER_RUNGS`
+    (`Mosaic._raised`), a forward-apart launch's ('forward launch') its forward alone at the case's tiles
+    with that launch's forward producers alone at each rung (a pinned config's, which may set the forward's
+    caps apart from the call's)."""
     rungs, rung = [], tiles
-    while (up := template.MOSAIC._raised(bound, rung, frozenset({launch}), facts)) is not None:
+    while len(rungs) < LADDER_RUNGS and (
+            up := template.MOSAIC._raised(bound, rung, frozenset({launch}), facts)) is not None:
         rung = template._limited(rung, producers=up, residents=rung.residents)
         rungs.append(rung if kind == 'launch' else dataclasses.replace(
             tiles, forward=dataclasses.replace(tiles.forward, producers=rung.producers)))
@@ -2072,13 +2148,13 @@ def _walked(bound, tiles, kind: str, launch: str, facts) -> list:
 
 @functools.cache
 def _identity_units(target: str) -> tuple:
-    """The identity test's units on `target`: each `(label, bound, tiles, kind, pulled, launch, kernels)`, a
-    launch's ladder unwalked (`_rungs_of`) of every case of the gate's groups that cover every launch and axis
-    the gate reaches there (`_reach`: `GATE_GROUPS` taken in order where a group reaches what none before it
-    did), beside the kernels a config of its case lowers. Derived in each task, as collection cannot afford it
-    (6.0 to 8.0 s a target of the model alone, jsf-cover, in every CI task's collection), and held a process;
-    each task walks its own units' ladders alone (`_walked`): every case's walked in every task took 50 s of
-    each sm100 task (jsf-6547d)."""
+    """The identity test's units on `target`: each `(label, bound, tiles, kind, pulled, launch, configs,
+    lowered)`, a launch's ladder (`_rungs_of`, walked by `_walked`) of every case of the gate's groups that
+    cover every launch and axis the gate reaches there (`_reach`: `GATE_GROUPS` taken in order where a group
+    reaches what none before it did), with the kernels its configs lower, which a task's time follows (0.92
+    correlated over sm90's and sm100's tasks, where the kernels a config lowers alone were 0.29, jsf-ideal2).
+    Derived in each task, as collection cannot afford it (6.0 to 8.0 s a target of the model alone,
+    jsf-cover, in every CI task's collection), and held a process."""
     facts = generation.gpu_target(target)
     held, units = set(), []
     with generation.assumed(facts), report.refusals():
@@ -2090,13 +2166,14 @@ def _identity_units(target: str) -> tuple:
                 for kind, pulled, launch in _rungs_of(bound, tiles, training, facts):
                     walked = tiles.forward if kind == 'forward launch' else tiles
                     kernels = len(template.MOSAIC.launches(bound, walked, facts, backward=pulled))
-                    units.append((label, bound, tiles, kind, pulled, launch, kernels))
+                    configs = tuple(_walked(bound, tiles, kind, launch, facts))
+                    units.append((label, bound, tiles, kind, pulled, launch, configs, kernels * len(configs)))
     return tuple(units)
 
 
 def _dealt(units: list, tasks: int, task: int) -> list:
     """The `task`-th of `tasks` tasks' share of `units` (`_identity_units`'): each case's units kept together
-    in parts of at most a task's even share of the kernels a ladder lowers a config, as every ladder of a case
+    in parts of at most a task's even share of the kernels their ladders lower, as every ladder of a case
     holds its tiles, lowered once a task, the parts packed by those kernels as the CI plan packs files
     (tools/armada/ci.py's `packed`, heaviest first into the lightest task). A name present at a case's tiles
     is compared against one body in every task holding that case; a name absent at the tiles that two parts in
@@ -2119,19 +2196,34 @@ def _dealt(units: list, tasks: int, task: int) -> list:
     return [each for name in names for each in parts[int(name)]]
 
 
-IDENTITY_TASKS = {'sm80': 3, 'sm86': 3, 'sm89': 3, 'sm90': 40, 'sm100': 44, 'sm120': 2}
-"""The tasks a target's identity units are dealt among (`_dealt`), a sharding size like a CI group count:
-dealt by the kernels a config lowers, not yet by their ladders' rungs, which only a walk counts, a task holds
-up to twice a target's mean, so its mean is about 60 s (jsf-6547e: sm90's tasks 16 to 171 s at 28, sm100's
-13 to 157 at 32; sm89's whole 260 s, sm80's 221, sm86's 201, sm120's 175). Every gate group lowered took
-13,478 s of train 878's CI, twelve of its tasks past the train's bound."""
+IDENTITY_TEST = "test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes"
+"""The identity test's name, by which the durations record keys its tasks (`identity_tasks`)."""
+
+
+@functools.cache
+def identity_tasks(target: str) -> int:
+    """The tasks `target`'s identity units are dealt among (`_dealt`), a sharding size like a CI group count,
+    from the record of the gate's own tasks (`ci.durations_record`, folded from main's CI): their seconds over
+    half the group target (.armada.json's), as a task dealt by the kernels a config lowers, not yet by its
+    ladders' rungs, which only a walk counts, holds up to twice its target's mean (jsf-6547e: sm90's tasks
+    16 to 171 s at 28, sm100's 13 to 157 at 32); one for a target the record holds none of, which the next
+    fold sizes. Every gate group lowered took 13,478 s of train 878's CI, twelve of its tasks past the train's
+    bound; a table of the counts by target raised KeyError at a new target's collection (row 6645)."""
+    from tool_support import load
+
+    ci, root = load("ci", "tools/armada"), Path(__file__).resolve().parents[1]
+    task = f"tests/{Path(__file__).name}::{IDENTITY_TEST}[{target}-"
+    seconds = sum(value for node, value in ci.durations_record(root / ci.session.DURATIONS).items()
+                  if node.startswith(task))
+    bound = json.loads((root / ".armada.json").read_text())["target"]
+    return max(1, math.ceil(2 * seconds / bound))
 
 
 @pytest.mark.parametrize('target, task', [pytest.param(target, task, id=f'{target}-{task}')
                                           for target in gate_generations(scoped=True)
-                                          for task in range(IDENTITY_TASKS[target])])
+                                          for task in range(identity_tasks(target))])
 def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target, task):
-    """The `task`-th share of `target`'s identity units (`_identity_units`, dealt among its `IDENTITY_TASKS`,
+    """The `task`-th share of `target`'s identity units (`_identity_units`, dealt among its `identity_tasks`,
     `_dealt`), each launch's ladder walked (`_walked`) and each config's kernels lowered afresh through their
     real names (`_named_bodies`, a config once however many ladders hold it): one name is one body across
     every config, each ladder holding its case's tiles beside its rungs, and along a ladder one body keeps one
@@ -2140,10 +2232,10 @@ def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target,
     bodies: dict[str, set[str]] = collections.defaultdict(set)
     lowered: dict[tuple, dict[str, str]] = {}
     with generation.assumed(facts), report.refusals():
-        for label, bound, tiles, kind, pulled, launch, _ in _dealt(list(_identity_units(target)),
-                                                                     IDENTITY_TASKS[target], task):
+        for label, bound, _, _, pulled, _, configs, _ in _dealt(list(_identity_units(target)),
+                                                                 identity_tasks(target), task):
             named = []
-            for config in _walked(bound, tiles, kind, launch, facts):
+            for config in configs:
                 if (label, pulled, config) not in lowered:
                     lowered[label, pulled, config] = _named_bodies(bound, config, target, training=pulled)
                 named.append(lowered[label, pulled, config])

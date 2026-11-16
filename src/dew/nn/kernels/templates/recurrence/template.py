@@ -17,7 +17,7 @@ import dataclasses
 import functools
 import math
 import threading
-from collections.abc import Hashable, Iterable, Iterator, Set
+from collections.abc import Hashable, Iterable, Iterator, Sequence, Set
 from typing import ClassVar
 
 import jax
@@ -678,17 +678,18 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _settled(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                  ) -> mainloop.Tiles:
-        """`tiles` with their spilling launches' producers stepped down their ladders for as long as a
-        compile refused them (`report.refused_at`: a training call's at its tiles, a forward alone's at
-        its own, `Tiles.forward`) and a rung answers it (`_raised`): first each producer's top, the program's
-        entry share, which every role holds with no register moved, then a setmaxnreg step lower at a time,
-        each rung giving its consumers a step more: the assembler, not a model, finds a producer's registers.
-        A spill at the top is the consumers', the producer holding there all it may; a rung below holds
-        wherever the producer's need and the consumers' meet. Tiles still spilling at the ladder's foot their
-        derivation refuses (`_chunked`). From the foot up, the 4B's reverse walk took eight compiles of a
-        B200's cold start, 95 s, to the 80 registers its producer holds; its top, 128, holds in one. Past its
-        ladder's foot, a launch takes a program fewer a multiprocessor, its producer at the least and its
-        ladder run again there (`_stepped`)."""
+        """`tiles` with their spilling launches' producers stepped along their ladders for as long as a
+        compile refused them (`report.refused_at`: a training call's at its tiles, a forward alone's at its
+        own, `Tiles.forward`) and a rung answers it (`_raised`): first each one's consumers at their
+        statement's share (`resources.stated_producer`), then its producer's top, the program's entry share,
+        which every role holds with no register moved, then a setmaxnreg step lower at a time, each rung
+        giving its consumers a step more: where the statement falls short, the assembler finds a producer's
+        registers. A spill at the top is the consumers', the producer holding there all it may; a rung below
+        holds wherever the producer's need and the consumers' meet. Tiles still spilling at the ladder's foot
+        their derivation refuses (`_chunked`). The 4B training forward's output walk took ten
+        certifications of an H100's start to its share from the top down, two from the least through its
+        statement's share (row 6743). Past its ladder's foot, a launch takes a program fewer a
+        multiprocessor, its producer at the least and its ladder run again there (`_stepped`)."""
         while (spilled := _refused_kernels(self, ba, tiles)) and (
                 stepped := self._stepped(ba, tiles, spilled, target)) is not None:
             tiles = stepped
@@ -715,8 +716,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
         return dataclasses.replace(own(config), forward=forward)
 
     def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> Iterator[mainloop.Tiles]:
-        """The tiles a refused `config`'s spilling launches step through (`_stepped`): each one's producer's
-        top first, then a setmaxnreg step lower a rung, and past its foot a program fewer a multiprocessor
+        """The tiles a refused `config`'s spilling launches step through (`_stepped`): each one's consumers'
+        statement's share first, then its producer's top, then a setmaxnreg step lower a rung past the stated
+        share, and past its foot a program fewer a multiprocessor
         with its producer's ladder run again, each planned as it is asked for: the ladder `_settled` takes a
         compile at a time, which certification asks its top alone and then a round at a time
         (`tuning.KernelOp._climbed`)."""
@@ -730,12 +732,31 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _stepped(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                  target: generation.GpuTarget) -> mainloop.Tiles | None:
         """`joined`'s next rung for its `spilled` launches: their producers a rung down their ladders
-        (`_raised`), or, past a ladder's foot, those launches a program fewer a multiprocessor with their
-        producers at the least again (`_fewer`), whose ladders then run at that residency; None past one
-        program."""
-        if (raised := self._raised(ba, joined, spilled, target)) is not None:
+        (`_raised`), or, past a ladder's foot or where every rung left gives their consumers less
+        (`_consumers_spilled`), those launches a program fewer a multiprocessor with their producers at the
+        least again (`_fewer`), whose ladders then run at that residency; None past one program."""
+        if not self._consumers_spilled(ba, joined, spilled, target) and (
+                raised := self._raised(ba, joined, spilled, target)) is not None:
             return _limited(joined, producers=raised, residents=joined.residents)
         return self._fewer(ba, joined, spilled, target)
+
+    def _consumers_spilled(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
+                           target: generation.GpuTarget) -> bool:
+        """Whether `joined`'s `spilled` kernels each spilled in its consumers' code alone
+        (`report.spilled_in`, the training call's and its forward alone's) with its launch's producer at its
+        consumers' statement's share, or at its least where it states none (`_stated_caps`): every rung its
+        ladder has left raises the producer, giving the consumers less, which a program fewer gives more (row
+        6744: a write-gated H100 scores' backward spilled 16 bytes in its consumers at the least, and its
+        ladder compiled a hundred rungs from the top down, each spilling more, before the program fewer)."""
+        roles = report.spilled_in(self, ba, joined) | (
+            report.spilled_in(self, ba, joined.forward) if joined.forward else {})
+        if any(roles.get(kernel) != (report.CONSUMERS,) for kernel in spilled):
+            return False
+        family = bundle(target, _dtype(ba))
+        assert family is not None
+        moving = self._moving(ba, joined, spilled, target)
+        stated = _stated_caps(moving, family)
+        return all(joined.producers.of(launch.name) == stated.get(launch.name) for launch in moving)
 
     def _fewer(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                target: generation.GpuTarget) -> mainloop.Tiles | None:
@@ -751,9 +772,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         residents = joined.residents.fewer(planned) if planned else None
         if residents is None:
             return None
-        producers = resources.Producers(tuple((name, cap) for name, cap in joined.producers.raised_to
-                                              if name not in planned))
-        return _limited(joined, producers=producers, residents=residents)
+        return _limited(joined, producers=joined.producers.without(planned), residents=residents)
 
     def _raised(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                 target: generation.GpuTarget) -> resources.Producers | None:
@@ -770,7 +789,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         moving = self._moving(ba, joined, spilled, target)
         tops = {launch.name: resources.entry_registers(
             (launch.family or family).warpgroups(launch.consumers), launch.resident) for launch in moving}
-        return joined.producers.stepped(tops) if moving else None
+        return joined.producers.stepped(tops, _stated_caps(moving, family)) if moving else None
 
     def _moving(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                 target: generation.GpuTarget) -> list[mainloop.Launch]:
@@ -1066,6 +1085,19 @@ def _owners(kernels: Iterable[str], launches: Iterable[mainloop.Launch]) -> froz
     """The launches that ran `kernels`, by name (`_owner`)."""
     names = {launch.name for launch in launches}
     return frozenset(owner for kernel in kernels if (owner := _owner(kernel, names)))
+
+
+def _stated_caps(launches: Sequence[mainloop.Launch], family: mosaic.Family) -> dict[str, int]:
+    """Each of `launches`' names whose every instance's consumers' statement leaves its producer more than the
+    least (`resources.stated_producer`), at the fewest its instances leave it, so each holds its consumers'
+    statement."""
+    caps: dict[str, int | None] = {}
+    for launch in launches:
+        cap = resources.stated_producer(launch.registers, (launch.family or family).warpgroups(
+            launch.consumers), launch.consumers, launch.resident)
+        held = caps.get(launch.name, cap)
+        caps[launch.name] = None if cap is None or held is None else min(cap, held)
+    return {name: cap for name, cap in caps.items() if cap is not None}
 
 
 def _limited(tiles: mainloop.Tiles, *, producers: resources.Producers,

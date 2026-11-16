@@ -614,7 +614,8 @@ class KernelOp(tokamax.Op):
         seen = set()
         while config not in seen and (spilling := report.certified(self, ba, config)):
             seen.add(config)
-            report.refuse_launch(self, ba, config, {binary.kernel for binary in spilling})
+            report.refuse_launch(self, ba, config, {binary.kernel for binary in spilling},
+                                 {binary.kernel: binary.spilled_in for binary in spilling})
             # Each refused config stepped to the next refused one; the last, to what the derivation offers.
             refused = [(config, spilling), *self._climbed(ba, config, spilling, seen)]
             stepped = self.remaining(ba)
@@ -665,7 +666,8 @@ class KernelOp(tokamax.Op):
             held = next((index for index, (_, found) in enumerate(answers) if found == ()), None)
             for rung, found in answers[:held]:
                 seen.add(rung)
-                report.refuse_launch(self, ba, rung, {binary.kernel for binary in found} if found else named)
+                report.refuse_launch(self, ba, rung, {binary.kernel for binary in found} if found else named,
+                                     {binary.kernel: binary.spilled_in for binary in found or ()})
                 refused.append((rung, found or ()))
             if held is not None:
                 for rung, found in answers[held + 1:]:
