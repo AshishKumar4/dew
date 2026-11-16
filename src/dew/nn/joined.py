@@ -18,10 +18,10 @@ from flax import linen as nn
 from flax.core import meta
 
 from dew.nn.dense import Dense, _biased, _plain_dense, _promoted, _rounds_once, intercepted
-from dew.nn.precision import float32_dot_general, recipe_role
+from dew.nn.precision import float32_dot_general
 
 from .kernels.generation import INHERENT, Choice, device_generation
-from .kernels.projections import kernel_path, mapped_shards
+from .kernels.projections import kernel_path, mapped_shards, recipe_takes
 from .kernels.selection import Kernel, Op, Requirement, select
 from .sharding import on_shards
 
@@ -31,8 +31,9 @@ class Projections:
     """A layer's projections as a selector that stands in for their own calls reads them (the join's, the
     fused gated MLP's, `dew.nn.gated_mlp`): whether each is a plain Dense (`dense`) on the default product
     (`dot_general`), whether a wrapper intercepts their own calls (`intercepted`), whether each holds
-    its own kernel (`held`), and whether the run's low-precision recipe takes their products by the role
-    they are traced in (`recipe`, `precision.recipe_role`), each quantized as its own."""
+    its own kernel (`held`), and whether the run's low-precision recipe takes any one's product apart
+    or their joined product (`recipe`: `projections.recipe_takes`), each quantized as its own, which a
+    join of them would not be."""
 
     dense: bool
     dot_general: bool
@@ -52,7 +53,21 @@ def projections_of(projections: Sequence[nn.Module]) -> Projections:
         intercepted=(any(projection.product_owned() for projection in projections) if dense
                      else intercepted()),
         held=all(projection.has_variable('params', 'kernel') for projection in projections),
-        recipe=(taken := recipe_role()) is not None and taken[1] in taken[0].roles)
+        recipe=_recipe_differs(projections))
+
+
+def _recipe_differs(projections: Sequence[nn.Module]) -> bool:
+    """Whether the run's low-precision recipe takes any of `projections` apart or their joined product
+    (`projections.recipe_takes`, the one decision `recipe_projection` reads, of each kernel's `[depth,
+    width]` and of the joined `[depth, their widths' sum]` the join multiplies by): either way one GEMM of
+    them would not be quantized as they are apart (train 928 F1: two 16-wide gates no MXFP8 block takes,
+    joined 32 wide, which one does)."""
+    shapes = [meta.unbox(kernel).shape[-2:] for projection in projections
+              if (kernel := projection.get_variable('params', 'kernel')) is not None]
+    if not shapes:
+        return False
+    joined = (shapes[0][0], sum(width for _, width in shapes))
+    return any(recipe_takes(*shape) for shape in (*shapes, joined))
 
 
 def projection_requirements[C](of: Callable[[C], Projections], stands_in: str) -> tuple[Requirement[C], ...]:

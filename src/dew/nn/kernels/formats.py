@@ -185,7 +185,11 @@ class MxFp8:
         bias = -jnp.finfo(scale).minexp
         exponent = jnp.clip(jnp.where(largest > 0, binade - 1 - top, -bias), -bias, bias)
         scales = jax.lax.bitcast_convert_type((exponent + bias).astype(jnp.uint8), scale)
-        codes = fake_quant.fp8_codes(blocks / scales.astype(x.dtype)).reshape(x.shape)
+        # Each value over its scale as its exponent (`jnp.ldexp`), as `decoded` applies it: the least scale,
+        # a block of zeros' or of magnitudes under 2^-118, is float32's subnormal 2^-127, which a program
+        # that flushes subnormals (XLA's CPU, op by op or with its simplifier off) reads as zero, its zeros
+        # over it NaN (row 6931).
+        codes = fake_quant.fp8_codes(jnp.ldexp(blocks, -exponent)).reshape(x.shape)
         return cls(codes.astype(jnp.float8_e4m3fn), scales[..., 0])
 
     def decoded(self, dtype=jnp.float32) -> jax.Array:

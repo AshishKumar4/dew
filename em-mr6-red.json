@@ -1,0 +1,17 @@
+{
+ "sha": "c5056c8d5f85bd5b0c95bcd3216c895563dfabda",
+ "selection": "named",
+ "items": [
+  {
+   "item": "tests/test_memory.py::test_a_decoders_remat_rung_decides_whether_a_memorys_chunks_are_recomputed",
+   "green": false,
+   "why": "exit 1: tests/test_memory.py::test_a_decoders_remat_rung_decides_whether_a_memorys_chunks_are_recomputed",
+   "finished": true,
+   "cases": {
+    "tests/test_memory.py::test_a_decoders_remat_rung_decides_whether_a_memorys_chunks_are_recomputed": "failed"
+   },
+   "tail": "F                                                                        [100%]\n=================================== FAILURES ===================================\n__ test_a_decoders_remat_rung_decides_whether_a_memorys_chunks_are_recomputed __\ntests/test_memory.py:258: in test_a_decoders_remat_rung_decides_whether_a_memorys_chunks_are_recomputed\n    assert any(\"memory_chunk\" in source for _, source in saved_residuals(loss_of(model), params))\nE   assert False\nE    +  where False = any(<generator object test_a_decoders_remat_rung_decides_whether_a_memorys_chunks_are_recomputed.<locals>.<genexpr> at 0x7f66bad69b10>)\nshared XLA cache: 4 programs fetched (0.5 MB read), 2 of those listed loaded, 1 bundles uploaded (0.6 MB)\n=========================== short test summary info ============================\nFAILED tests/test_memory.py::test_a_decoders_remat_rung_decides_whether_a_memorys_chunks_are_recomputed - assert False\n +  where False = any(<generator object test_a_decoders_remat_rung_decides_whether_a_memorys_chunks_are_recomputed.<locals>.<genexpr> at 0x7f66bad69b10>)\n1 failed in 16.77s\nrun_tests: {\"tests\": 1, \"failures\": 1, \"errors\": 0, \"skipped\": 0, \"passed\": 0, \"cases\": {\"tests/test_memory.py::test_a_decoders_remat_rung_decides_whether_a_memorys_chunks_are_recomputed\": \"failed\"}}\n",
+   "evidence": []
+  }
+ ]
+}

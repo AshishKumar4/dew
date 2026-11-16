@@ -912,8 +912,12 @@ def _selections(index: fusion.Index, operands: Sequence[jcore.Var], places: Sequ
                 width = _band(held)
                 if width is not None:
                     windows[width] = None
-            elif held.size and jnp.issubdtype(held.dtype, jnp.floating) and np.all(held == held.flat[0]):
-                fills[float(held.flat[0])] = None
+            elif held.size and jnp.issubdtype(held.dtype, jnp.floating):
+                # A fill is one value held everywhere, bit for bit (`terms.compact`: read once, never whole).
+                compacted = terms.compact(held)
+                # A NaN is no fill: an attention's fill is a value, compared as one (`dew.nn.attention`).
+                if compacted.size == 1 and not np.isnan(compacted.flat[0]):
+                    fills[float(compacted.flat[0])] = None
     return list(fills), list(windows)
 
 

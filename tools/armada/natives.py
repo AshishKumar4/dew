@@ -9,9 +9,10 @@ A collector (`collect`) starts before pytest, outside it. A small library preloa
 action it found and raises the signal again) and does only what is safe in a dying process: it writes its id
 to the collector's pipe and waits, bounded, for the collector's word that pystack (py-spy where it reads none)
 has read every thread's native and Python frames from outside it; then it dies by the same signal, so the exit
-is unchanged. Nothing runs in the faulting process that could need a lock it holds (no fork, no allocation, no
-unwinding in it). The library is built with the container's C compiler once a process; where none builds it,
-or no collector runs, the task says so and runs as before."""
+is unchanged. A fatal signal another thread takes meanwhile waits in its handler, bounded, so the process
+lives until it is read. Nothing runs in the faulting process that could need a lock it holds (no fork, no
+allocation, no unwinding in it). The library is built with the container's C compiler once a process; where
+none builds it, or no collector runs, the task says so and runs as before."""
 
 import functools
 import os
@@ -40,7 +41,7 @@ SHIM = r"""
 
 static const int SIGNALS[] = {SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE};
 static char pipe_path[4096], done_dir[4096];
-static int armed_waits;
+static int armed_waits, reporting;  /* the id of the process whose thread reports */
 
 static size_t digits(char *out, long value) {
     char reversed[24];
@@ -64,7 +65,35 @@ static size_t marked(char *out, const char *name) {
     return at;
 }
 
+/* Dies by `signum`, as the process would have without the handler. */
+static void died(int signum) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = SIG_DFL;
+    sigaction(signum, &action, NULL);
+    raise(signum);
+}
+
 static void caught(int signum) {
+    /* One thread reports; any other thread a fatal signal reaches meanwhile (an XLA pool's next faulting
+       worker) waits here, so the process lives until it is read, and dies with it as the first re-raises:
+       with the handler reset once taken, a second fault ended the process before pystack attached, and no
+       stack was read (train 928, 2026-11-16). It waits for the collector's word (or as long as the first
+       waits for it) and a second more for the first to re-raise, then dies by its own signal: a signal
+       nested in the reporting thread's handler ends there once the stacks are read. The election is the
+       process's own, so a child forked meanwhile reports its own signal (review). */
+    int self = (int)getpid();
+    if (__atomic_exchange_n(&reporting, self, __ATOMIC_SEQ_CST) == self) {
+        char done[4200];
+        marked(done, "/done.");
+        struct timespec pause = {0, 100000000};
+        struct stat held;
+        int wait = 0;
+        while (wait < armed_waits && stat(done, &held) != 0) wait++, nanosleep(&pause, NULL);
+        for (int after = 0; after < 10; after++) nanosleep(&pause, NULL);
+        died(signum);
+        return;
+    }
     /* Seen first, whatever comes of its read: one never read (its word left in the pipe as the collector
        ended) counts as unread (review, 2026-11-13). */
     char seen[4200];
@@ -86,11 +115,7 @@ static void caught(int signum) {
         struct stat held;
         for (int wait = 0; wait < armed_waits && stat(done, &held) != 0; wait++) nanosleep(&pause, NULL);
     }
-    struct sigaction action;
-    memset(&action, 0, sizeof action);
-    action.sa_handler = SIG_DFL;
-    sigaction(signum, &action, NULL);
-    raise(signum);
+    died(signum);
 }
 
 __attribute__((constructor)) static void armed(void) {
@@ -107,7 +132,6 @@ __attribute__((constructor)) static void armed(void) {
         struct sigaction action;
         memset(&action, 0, sizeof action);
         action.sa_handler = caught;
-        action.sa_flags = SA_RESETHAND;
         sigaction(SIGNALS[index], &action, NULL);
     }
 }

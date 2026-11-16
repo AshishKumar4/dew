@@ -18,7 +18,6 @@ import hashlib
 import json
 import os
 import tempfile
-import typing
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -32,7 +31,7 @@ from dew._builds import dew_cache_dir
 from dew._cache import package_digest
 from dew._coordination import agreed_same, from_every_process, reading_home, seen_by_every_process
 from dew._files import staged, write_atomically
-from dew._records import JSON, json_value, mapped_strings
+from dew._records import JSON, json_value, mapped_strings, strings_of
 from dew.checkpoints import RUN_FILE
 from dew.registry import from_record, to_record, trust_sources, trusts_source
 
@@ -320,14 +319,6 @@ class Held:
     step: int
     ema: bool | None
 
-    def __post_init__(self) -> None:
-        # Each field of the type it declares: a release's record names a step, never a moving selection
-        # ('latest'), and an EMA choice, never a word for one.
-        for name, declared in typing.get_type_hints(Held).items():
-            value, kinds = getattr(self, name), typing.get_args(declared) or (declared,)
-            if (isinstance(value, bool) and bool not in kinds) or not isinstance(value, kinds):
-                raise ValueError(f"a release's record holds {name}={value!r}, which is no {declared}")
-
     @classmethod
     def of(cls, run: SavedRun, ema: bool | None) -> Held:
         """What `run`'s release with `ema` holds, its directory absolute where it is local."""
@@ -335,8 +326,8 @@ class Held:
 
     @classmethod
     def read(cls, value: JSON) -> Held:
-        """A release's record `value` (`record`), read by its fields' declarations (`registry.from_record`),
-        refused where it is not one."""
+        """A release's record `value` (`record`), read by its fields' declarations (`registry.from_record`,
+        each scalar of its declared type), refused where it is not one."""
         return from_record(cls, value)
 
     def record(self) -> JSON:
@@ -427,15 +418,8 @@ def releases_here(record: Mapping[str, object], *, mesh: MeshSpec | Mesh | None 
 
 
 def _strings(record: JSON) -> list[str]:
-    """Every string `record` holds at any depth, in the order `mapped_strings` walks them."""
-    held: list[str] = []
-
-    def kept(text: str) -> str:
-        held.append(text)
-        return text
-
-    mapped_strings(record, kept)
-    return held
+    """Every string `record` holds at any depth (`_records.strings_of`)."""
+    return list(strings_of(record))
 
 
 def pooled_export(run: SavedRun, destination: Path, *, ema: bool | None = None,

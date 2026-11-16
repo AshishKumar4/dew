@@ -71,8 +71,6 @@ class KernelReport:
                 entry["configs"].append(call.config)
             stated, flops = entry["flops"], call.flops
             entry["flops"] = stated + flops * runs if stated is not None and flops is not None else None
-            # The launch that traced the call, its caller first (`report.called`): after a step-down the
-            # name's entry keeps the first rung traced, whose padded share was refused.
             traced = report.called(call)
             share = None if traced is None else traced.padded
             held = entry["padded"]

@@ -237,15 +237,24 @@ def emulated(dtype):
     return projection
 
 
-def laid_projection(dtype):
-    """`projections.recipe_projection` of a projection's rows written apart in `dtype`: `run(rows, matrices,
-    sizes)`, each group's rows (`sizes` a group's, in order, any rows past their sum outside every group) laid
-    in whole 128-row blocks behind zero rows, a run of zero blocks after them, the recipe emulated over them
-    (`emulated`), and each row's output read back, a row outside every group's zero."""
-    project = emulated(dtype)
+def laid_projection(dtype, recipe: str = "blockwise_fp8"):
+    """`projections.recipe_projection` of a projection's rows written apart in `dtype` under `recipe`:
+    `run(rows, matrices, sizes)`, each group's rows (`sizes` a group's, in order, any rows past their sum
+    outside every group) laid in whole 128-row blocks behind zero rows, a run of zero blocks after them, the
+    recipe's step over them (the blockwise recipe emulated, `emulated`; a block-scaled one's,
+    `mx_matrix.recipe_truth`, its operands' values quantized along each product's contraction, of concrete
+    `sizes`), and each row's output read back, a row outside every group's zero."""
+    from mx_matrix import mx_values, nvfp4_values, recipe_truth
+
+    def project(laid, matrices, group_blocks):
+        if recipe == "blockwise_fp8":
+            return emulated(dtype)(laid, matrices, group_blocks, out_dtype=dtype)
+        quantized = mx_values if recipe == "mxfp8" else nvfp4_values
+        return recipe_truth(np.asarray(group_blocks), wide=dtype, quantized=quantized)(laid, matrices)
 
     def run(rows, matrices, sizes):
         count, groups = rows.shape[0], matrices.shape[0]
+        sizes = jnp.asarray(sizes, jnp.int32) if recipe == "blockwise_fp8" else np.asarray(sizes)
         blocks = -(-sizes // 128)
         ends = jnp.cumsum(sizes)
         group = jnp.searchsorted(ends, jnp.arange(count), side="right")
@@ -254,8 +263,10 @@ def laid_projection(dtype):
         place = jnp.where(group < groups, ((jnp.cumsum(blocks) - blocks) * 128)[held] + jnp.arange(count)
                           - (ends - sizes)[held], laid_rows)
         laid = jnp.zeros((laid_rows, rows.shape[1]), rows.dtype).at[place].set(rows, mode="drop")
-        group_blocks = blocks.at[-1].add(laid_rows // 128 - blocks.sum())
-        out = project(laid, matrices, group_blocks, out_dtype=dtype)
+        slack = laid_rows // 128 - blocks.sum()
+        group_blocks = (blocks.at[-1].add(slack) if recipe == "blockwise_fp8"
+                        else np.concatenate([blocks[:-1], blocks[-1:] + slack]))
+        out = project(laid, matrices, group_blocks)
         return out.at[place].get(mode="fill", fill_value=0)
 
     return run
@@ -265,7 +276,7 @@ def laid_projection(dtype):
 def test_a_biased_layer_takes_the_recipes_product_and_rounds_once_after_its_bias(recipe):
     """A biased bf16 `Dense` whose bias is stored fp32 (one rounding of its product and bias, as torch's
     addmm), under each recipe's numerics in a role the recipe takes: its output on par with the recipe
-    written apart (`recipe_reference`) over its bf16 kernel, the bias added to its fp32 sums and rounded
+    written apart (`laid_projection`) over its bf16 kernel, the bias added to its fp32 sums and rounded
     once, from it in float64 (check 1)."""
     from dew.nn.dense import Dense
     from dew.nn.precision import projection_role
@@ -283,7 +294,10 @@ def test_a_biased_layer_takes_the_recipes_product_and_rounds_once_after_its_bias
             return layer.apply({"params": {"kernel": kernel, "bias": bias}}, rows)
 
     def reference(dtype):
-        laid = recipe_reference(recipe, dtype, [64])
+        recipes = laid_projection(dtype, recipe)
+
+        def laid(rows, matrices):
+            return recipes(rows, matrices, [64])
 
         def run(rows, kernel, bias):
             summed = laid(rows, kernel.astype(jnp.bfloat16)[None]) + bias.astype(dtype)
@@ -374,6 +388,32 @@ def test_an_mxfp8_product_of_operands_whose_scales_are_subnormal_is_their_value(
     with generation.run_precision(MXFP8), projection_role("mlp"):
         out = jax.jit(Dense(32, dtype=jnp.bfloat16, use_bias=False).apply)(params, x)
     np.testing.assert_array_equal(np.asarray(out, np.float32), 32.0)
+
+
+@pytest.mark.parametrize("program", ["jitted", "op by op"])
+def test_an_mxfp8_operand_of_zero_blocks_and_least_scales_quantizes_to_its_values(program):
+    """MXFP8's quantization (`formats.MxFp8.quantized`) of a block of zeros, a block whose largest magnitude
+    takes the least scale (2^-125: the scale float32's subnormal 2^-127), and a block of ordinary values,
+    jitted and op by op (XLA's CPU flushing subnormals): each decodes to its values, the zeros zero and the
+    least-scaled block 2^-125 exactly, where dividing by the scale read it as zero, its zeros over it NaN
+    (row 6931)."""
+    from dew.nn.kernels.formats import MxFp8
+
+    x = np.zeros((1, 96), np.float32)
+    x[0, 32:64] = 2.0 ** -125
+    x[0, 64:] = np.linspace(-448.0, 448.0, 32, dtype=np.float32)
+
+    def decoded(x):
+        return MxFp8.quantized(x).decoded()
+
+    if program == "jitted":
+        out = jax.jit(decoded)(x)
+    else:
+        with jax.disable_jit():
+            out = decoded(x)
+    expected = np.asarray(jax.jit(decoded)(x))
+    np.testing.assert_array_equal(np.asarray(out)[0, :64], x[0, :64])
+    np.testing.assert_array_equal(np.asarray(out), expected)
 
 
 def test_a_recipe_projection_on_a_data_parallel_mesh_lowers_for_cuda():
@@ -483,33 +523,6 @@ def test_a_recipes_experts_of_rows_an_explicit_axis_splits_are_each_devices_shar
     np.testing.assert_array_equal(np.asarray(d_matrices), np.sum([leaves[2] for leaves in alone], axis=0))
 
 
-def recipe_reference(recipe: str, dtype, sizes):
-    """`projections.recipe_projection` of a projection's rows written apart in `dtype` under `recipe`, its
-    groups' `sizes` given: each group's rows sliced out and padded with zero rows to whole 128-row blocks,
-    the groups concatenated in order, the recipe's step over them (the blockwise recipe emulated,
-    `emulated`, or a block-scaled one's, `mx_matrix.recipe_truth`, its operands' values quantized along each
-    product's contraction), and each group's rows sliced back, a row outside every group's zero."""
-    from mx_matrix import mx_values, nvfp4_values, recipe_truth
-
-    starts = np.cumsum([0, *sizes])
-    blocks = [-(-size // 128) for size in sizes]
-
-    def run(rows, matrices):
-        laid = jnp.concatenate([jnp.pad(rows[first:last], ((0, 128 * count - (last - first)), (0, 0)))
-                                for first, last, count in zip(starts[:-1], starts[1:], blocks, strict=True)])
-        if recipe == "blockwise_fp8":
-            out = emulated(dtype)(laid, matrices, jnp.asarray(blocks, jnp.int32), out_dtype=dtype)
-        else:
-            quantized = mx_values if recipe == "mxfp8" else nvfp4_values
-            out = recipe_truth(np.asarray(blocks), wide=dtype, quantized=quantized)(laid, matrices)
-        places = np.cumsum([0, *blocks]) * 128
-        kept = [out[place:place + size] for place, size in zip(places[:-1], sizes, strict=True)]
-        past = jnp.zeros((rows.shape[0] - starts[-1], out.shape[1]), out.dtype)
-        return jnp.concatenate([*kept, past])
-
-    return run
-
-
 @pytest.mark.parametrize("recipe", RECIPE_NUMERICS)
 @pytest.mark.parametrize("role", ["mlp", "experts"])
 def test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference(role, recipe):
@@ -517,7 +530,7 @@ def test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference(role
     role hands its rows, under the 'fp8', 'mxfp8' or 'nvfp4' numerics): a dense one's, every row its one
     group's, and experts' of ragged groups, one empty, with rows past them; its output and both gradients on
     par with the recipe written apart in float32 over the same groups' whole 128-row blocks
-    (`recipe_reference`: the fake-quantized reference a recipe is measured against), from it in float64
+    (`laid_projection`: the fake-quantized reference a recipe is measured against), from it in float64
     (check 1)."""
     from dew.nn.precision import projection_role
 
@@ -537,7 +550,10 @@ def test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference(role
             return projections.recipe_projection(rows, matrix, sized, out_dtype=jnp.float32)
 
     def reference(dtype):
-        laid = recipe_reference(recipe, dtype, sizes)
+        recipes = laid_projection(dtype, recipe)
+
+        def laid(rows, matrices):
+            return recipes(rows, matrices, sizes)
 
         def run(rows, matrix):
             return laid(rows, matrix if matrix.ndim == 3 else matrix[None])
@@ -646,3 +662,20 @@ def test_a_training_step_in_the_fp8_preset_is_on_par_with_a_fake_quantized_model
 
     assert_as_exact(jax.jit(arm(model, FP8)), jax.jit(arm(model, plain, fake_quantized(jnp.float32))), draw,
                     "fp8 preset step", seeds=SEEDS, truth_fn=truth)
+
+
+def test_the_blockwise_recipes_scales_meet_its_products_in_range():
+    """A bf16 layer in the blockwise recipe whose inputs scale near float32's largest (2^120: a row scale of
+    2^112) and whose weights scale near its least (2^-10: a block scale of 2^-18) projects to their product,
+    2^117 for 128 of each, finite: each 128-deep partial meets its row's and its block's scales in the order
+    that keeps the intermediate normal (`precision.twice_scaled`, train 925 F1: left to right it overflowed
+    to inf)."""
+    from dew.nn.dense import Dense
+    from dew.nn.precision import projection_role
+
+    layer = Dense(128, dtype=jnp.bfloat16, use_bias=False)
+    params = {"params": {"kernel": jnp.full((128, 128), 2.0 ** -10, jnp.float32)}}
+    x = jnp.full((4, 128), 2.0 ** 120, jnp.bfloat16)
+    with generation.run_precision(RECIPE_NUMERICS["blockwise_fp8"]), projection_role("mlp"):
+        out = np.asarray(jax.jit(layer.apply)(params, x), np.float32)
+    np.testing.assert_array_equal(out, np.full((4, 128), 2.0 ** 117, np.float32))

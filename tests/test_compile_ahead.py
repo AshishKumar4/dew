@@ -399,39 +399,42 @@ def test_a_run_refused_before_its_start_is_taken_exits_with_its_refusal_while_it
     assert exited.returncode == 3, (exited.returncode, exited.stderr[-3000:])
 
 
-def test_a_program_whose_compile_was_begun_passes_once_where_it_compiles_over_the_same():
+def _begun(case: str) -> tuple:
+    """`case`'s program, the input it compiles over, what its compile is begun over, and an input of
+    another abstract value: arrays, begun over themselves; a fresh `jax.random.key`, no one committed to
+    its devices, begun over its shape (`shapes_of`, as a fresh fit begins its start), the other a key
+    committed to a device."""
+    if case == "arrays":
+        return lambda x: x * 2, jnp.ones(4), jnp.ones(4), jnp.ones(8)
+    from dew.nn.kernels.options import shapes_of
+
+    key = jax.random.key(0)
+    return (lambda key: jax.random.normal(key, (4,)), key, shapes_of(key),
+            jax.device_put(jax.random.key(1), jax.devices()[0]))
+
+
+@pytest.mark.parametrize("case", ["arrays", "a fresh key's shape"])
+def test_a_program_whose_compile_was_begun_passes_once_where_it_compiles_over_the_same(case):
     """A program whose first compile was begun in a thread of its own (`options.compiling`) and which then
     compiles within `attempting` that compile over the same abstract inputs takes the begun lowering: its
     algebra pass runs once (`report.passes`), not again only to match the begun compile (a DiT start's
-    1.66 s of 11.5 s of passes, simple-dit-b). Over other shapes it lowers, passes and compiles its own."""
+    1.66 s of 11.5 s of passes, simple-dit-b). A fresh key's call matches its begun shape, as a fresh fit's
+    start placed with its key matches the start begun over the key's shape: an uncommitted array lowers as
+    an unplaced shape (train 912's F5, train 914's F2). Over another abstract value it lowers, passes and
+    compiles its own."""
     from dew.nn.kernels.options import attempting, compiling, owned_program
     from dew.nn.kernels.templates import report
 
-    program = owned_program(lambda x: x * 2)
+    function, given, begun_over, other = _begun(case)
+    program = owned_program(function)
     with report.recording() as begun_passes:
-        begun = compiling(program, jnp.ones(4))
+        begun = compiling(program, begun_over)
     with attempting(begun):
         with report.recording() as same:
-            program.compiled(jnp.ones(4))
-        with report.recording() as other:
-            assert program.compiled(jnp.ones(8)).out_info.shape == (8,)
-    assert len(begun_passes.passes) == 1 and not same.passes and len(other.passes) == 1
-
-
-def test_a_start_begun_over_its_keys_shape_passes_once_where_its_fresh_key_places_it():
-    """A fresh fit's start is begun over its key's unplaced shape (the trainer's `_compiled_fresh`) and
-    placed with the run's key, a fresh `jax.random.key` no one committed to its devices (`placed_start`):
-    that call takes the begun lowering, its algebra pass run once, where the array's sharding beside the
-    shape's none kept the two apart and a fit passed its start twice (train 912's F5)."""
-    from dew.nn.kernels.options import attempting, compiling, owned_program
-    from dew.nn.kernels.templates import report
-
-    program = owned_program(lambda key: jax.random.normal(key, (4,)))
-    key = jax.random.key(0)
-    begun = compiling(program, jax.ShapeDtypeStruct(key.shape, key.dtype))
-    with attempting(begun), report.recording() as placed:
-        program.compiled(key)
-    assert not key.committed and not placed.passes
+            program.compiled(given)
+        with report.recording() as elsewhere:
+            program.compiled(other)
+    assert len(begun_passes.passes) == 1 and not same.passes and len(elsewhere.passes) == 1
 
 
 def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):
