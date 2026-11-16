@@ -716,7 +716,7 @@ def _pooled(steps: Sequence[_Step], pool: PoolKind | None) -> None:
     if pool is None:
         return
     for step in steps:
-        if isinstance(step, (Configured, Chunks)):
+        if isinstance(step, (Configured, Chunks)) or not callable(step):
             raise ValueError(f"{_named_step(step)} runs where its read runs; it takes no pool")
         Pool(pool, 1).checked(step, _named_step(step))
 

@@ -39,7 +39,7 @@ class Pool:
         cpus = Host.current().cpus
         return cls(kind, cpus if kind == "processes" else min(32, cpus + 4))
 
-    def checked(self, step: object, named: str) -> None:
+    def checked(self, step: Callable, named: str) -> None:
         """Refuse a process pool for a `step` (the stage `named`) that does not pickle, which no process
         could be handed: a configuration that cannot run, so the read never starts."""
         if self.kind != "processes":
