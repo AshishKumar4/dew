@@ -298,6 +298,11 @@ class RMSNorm(nn.Module):
     groups: int = 1
     scale_axes: LogicalAxes | None = None
     """The scale's logical axes, as its owner declares them where it makes it; None declares none."""
+    weight_dtype_reads: bool = False
+    """With no `dtype`, the normed output in its weight's dtype rather than its input's: how a model whose
+    residual stream sums in fp32 (`CausalTransformer.residual_in_fp32`) with no compute dtype reads it, as
+    mamba_ssm's Block and transformers' Mamba blocks cast the residual to the norm weight's dtype before
+    the norm (`self.norm(residual.to(dtype=self.norm.weight.dtype))`)."""
 
     def __call__(self, x, *, axes=None):
         """The norm of `x`. `axes`, `x`'s logical axes, place the fused kernel on a mesh."""
@@ -325,7 +330,6 @@ class RMSNorm(nn.Module):
         """A pre-norm block's residual seam: `(stream, normed)` for the stream
         `x + branch` (`x` for a None branch) and its norm, whose fused kernel
         owns the add and the stream's cotangent (`stream_rms_normalized`)."""
-        dtype = self.dtype if self.dtype is not None else x.dtype
         stream_dtype = x.dtype if branch is None else jnp.result_type(x, branch)
         epsilon = (float(jnp.finfo(at_least_fp32(stream_dtype)).eps) if self.epsilon is None
                    else self.epsilon)
@@ -333,6 +337,8 @@ class RMSNorm(nn.Module):
             'scale',
             declared(nn.initializers.zeros if self.scale_offset else nn.initializers.ones, self.scale_axes),
             (x.shape[-1],), jnp.float32) if self.with_scale else None
+        dtype = (self.dtype if self.dtype is not None
+                 else scale.dtype if self.weight_dtype_reads and scale is not None else x.dtype)
         if self.groups == 1:
             return stream_rms_normalized(x, branch, scale, epsilon, dtype, self.scale_offset,
                                          self.scale_after_cast, self.fp32_statistics,

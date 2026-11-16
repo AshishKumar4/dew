@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, decode_logits
 from reference_error import assert_as_exact, logits_operands, widened, with_gradients
 from residual_orders import orders, permuted, residual_width
 from selection_margins import MARGIN, capturing, clearing, margin
@@ -506,6 +506,27 @@ ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "lightning_
 
 POLICY_DTYPES = {"force_fp32_for_softmax": jnp.bfloat16, "wide_logits": jnp.bfloat16}
 """The policies whose arithmetic shows in narrow inputs alone: a softmax, or logits, formed in bfloat16."""
+
+
+@pytest.mark.parametrize("residual_in_fp32", [True, False])
+@pytest.mark.parametrize("kind", sorted(set(mixers.paths) - {"mlp"}))
+def test_a_decoder_of_no_compute_dtype_over_bfloat16_weights_decodes(kind, residual_in_fp32):
+    """A decoder of each kind that keeps a decode cache, computing in no dtype of its own over bfloat16
+    weights, its stream summing in fp32 or not, decodes: each norm reads an fp32 stream in its weight's
+    dtype (`RMSNorm.weight_dtype_reads`, mamba_ssm's Block), and Mamba-2's projection reads its scan in its
+    input's dtype (transformers' Mamba2Mixer), so every holder's cache keeps what its forward writes, where
+    the attention kinds' keys and a short conv's history came in fp32 to a bfloat16 cache and were refused
+    by the leaf's name (row 6215). Falcon-H1's parallel mixer among them, its Mamba-2 branch beside its
+    attention."""
+    fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
+    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=32, residual_in_fp32=residual_in_fp32,
+                 **overrides)
+    tokens = jnp.asarray(np.random.default_rng(6215).integers(0, VOCAB, (2, 8)), jnp.int32)
+    variables = jax.tree.map(
+        lambda leaf: leaf.astype(jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
+        model.init(jax.random.key(0), tokens))
+    logits = decode_logits(model, variables, tokens[:, :5], tokens[:, 5:])
+    assert logits.shape == (2, 4, VOCAB) and bool(jnp.all(jnp.isfinite(logits)))
 
 
 @pytest.mark.parametrize("kind", sorted(set(mixers.paths) - ATTENDS_NOTHING))

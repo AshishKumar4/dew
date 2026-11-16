@@ -348,6 +348,13 @@ class Mamba2(nn.Module):
         wide = at_least_fp32(out.dtype)
         return (out.astype(wide) * nn.silu(gate.astype(wide))).astype(out.dtype)
 
+    @staticmethod
+    def _read(gated, x):
+        """The gated scan output as the output projection reads it: in the layer input's dtype, as
+        transformers' Mamba2Mixer casts it (`self.out_proj(scan_output.to(dtype))`, `dtype` its input's),
+        where a projection of no compute dtype would carry the scan's fp32 into the stream."""
+        return gated.astype(x.dtype)
+
     @nn.nowrap
     def cache_spec(self, rows: int) -> dict[str, Opened]:
         """The layer's decode cache for `rows` rows (`scan_cache`): the conv's history of x, B and C and the
@@ -417,7 +424,7 @@ class Mamba2(nn.Module):
                                 ((taps, bias, *heads),))
             if valid is not None:
                 out = jnp.where(valid[:, :, None], out, 0)
-            return self.out_proj(self._gated(out, gate))
+            return self.out_proj(self._read(self._gated(out, gate), x))
         state = (self.num_heads, self.state_size, self.head_dim)
         token = None
         # An initialization runs the general path, where the layer makes its parameters.
@@ -430,7 +437,7 @@ class Mamba2(nn.Module):
                         state_dtype=wide, conv_dtype=wide, dtype=compute, token=token)
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
-        return self.out_proj(self._gated(out, gate))
+        return self.out_proj(self._read(self._gated(out, gate), x))
 
 
 
