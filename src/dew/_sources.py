@@ -238,6 +238,11 @@ def generated(held: type) -> bool:
     return dataclasses.is_dataclass(held) or attrs_made(held)
 
 
+def generated_instance(value) -> bool:
+    """Whether `value` is an instance of a class a generator made (`generated`), which its fields state."""
+    return not isinstance(value, type) and generated(type(value))
+
+
 def field_names(held: type) -> list[str]:
     """The names of the fields a class generator recorded for `held` (`generated`), in order: what an
     instance of it holds, a record's parts."""
@@ -278,7 +283,7 @@ def generated_fields(held: type) -> list[GeneratedField]:
     if attrs_made(held):
         # attrs is loaded where a class of it exists; its sentinel and factory type are its own.
         attr = sys.modules["attr"]
-        converter_type, hooks = vars(attr).get("Converter"), _setattr_hooks(held)
+        hooks = _setattr_hooks(held)
         found = []
         for field in vars(held)["__attrs_attrs__"]:
             default, factory = field.default, MISSING
@@ -286,17 +291,13 @@ def generated_fields(held: type) -> list[GeneratedField]:
                 default, factory = MISSING, default.factory
             # Every other slot of its `Attribute` (converter, validator, eq and order flags and keys, hash,
             # init, repr, metadata, keyword-only, alias, whatever this attrs records) but `ATTRS_UNSTATED`,
-            # an `attrs.Converter` as its converter and how it is called (where this attrs has one), and the
-            # hook the class's generated `__setattr__` runs on it, the class's own where the field sets none
-            # (train 955's review: a class-level hook and an `eq=False` went unstated).
+            # and the hook the class's generated `__setattr__` runs on it, the class's own where the field
+            # sets none (train 955's review: a class-level hook and an `eq=False` went unstated).
             parts = []
             for name in vars(type(field))["__slots__"]:
                 if name in ATTRS_UNSTATED:
                     continue
-                value = getattr(field, name)
-                if converter_type is not None and isinstance(value, converter_type):
-                    value = (value.converter, value.takes_self, value.takes_field)
-                parts.append((name, value))
+                parts.append((name, getattr(field, name)))
             if (hook := hooks.get(field.name)) is not None:
                 parts.append(("on_setattr", hook))
             found.append(GeneratedField(field.name, MISSING if default is attr.NOTHING else default, factory,

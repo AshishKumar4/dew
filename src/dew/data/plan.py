@@ -38,8 +38,6 @@ from dew.data.sources.codec import content_fingerprint
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from _typeshed import DataclassInstance
-
     from dew.batch import Batch
 
 _RESUMED = ("resume with the Dew that wrote it, or go on from its weights as a new run that reads its data "
@@ -229,7 +227,7 @@ class StepIdentity:
         kind = step if inspect.isfunction(step) else type(step)
         module = kind.__module__
         name = f"{module}.{kind.__qualname__}"
-        frozen = dataclasses.is_dataclass(step) and not isinstance(step, type)
+        frozen = _sources.generated_instance(step)
         # A step that declares its identity and states none (a batch encoder of a reader no name holds,
         # `reader_name`) computes what no record holds.
         stating = identity is None and isinstance(step, _DeclaredIdentity)
@@ -258,7 +256,7 @@ class StepIdentity:
             step.dependencies()
             if isinstance(step, _Dependencies)
             else _dependencies(step)
-            if dataclasses.is_dataclass(step) and not isinstance(step, type)
+            if _sources.generated_instance(step)
             else {}
         )
         if frozen and dataclasses.is_dataclass(step) and not isinstance(step, type):
@@ -343,10 +341,12 @@ def _held_code(value, seen: set[int]) -> tuple[list[Callable | type], bool]:
         function, held = _held_code(value.__func__, seen)
         owner, also = _held_code(value.__self__, seen)
         return [*function, *owner], held and also
-    if dataclasses.is_dataclass(value):
+    if _sources.generated_instance(value):
+        # A dataclass's or an attrs class's instance (`dew._sources.generated`), its fields' code with its
+        # class's.
         files, holdable = _held(type(value))
-        for field in dataclasses.fields(value):
-            more, held = _held_code(getattr(value, field.name), seen)
+        for name in _sources.field_names(type(value)):
+            more, held = _held_code(getattr(value, name, None), seen)
             files, holdable = [*files, *more], holdable and held
         return files, holdable
     if isinstance(value, _Dependencies | Enum):
@@ -378,20 +378,21 @@ class _Dependencies(Protocol):
     def dependencies(self) -> Mapping[str, object]: ...
 
 
-def _dependencies(step: DataclassInstance) -> Mapping[str, object]:
+def _dependencies(step) -> Mapping[str, object]:
+    """What the configured objects a generated step's fields hold compute from (`dependencies`), by field."""
     dependencies: dict[str, Mapping[str, object]] = {}
-    for field in dataclasses.fields(step):
-        value = getattr(step, field.name)
+    for name in _sources.field_names(type(step)):
+        value = getattr(step, name, None)
         # A step that calls a configured object's method (`InputSpec.tokenize`) computes what that
         # object's configuration says.
         if inspect.ismethod(value):
             value = value.__self__
         if isinstance(value, _Dependencies):
-            dependencies[field.name] = value.dependencies()
-        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            dependencies[name] = value.dependencies()
+        elif _sources.generated_instance(value):
             nested = _dependencies(value)
             if nested:
-                dependencies[field.name] = nested
+                dependencies[name] = nested
     return dependencies
 
 
