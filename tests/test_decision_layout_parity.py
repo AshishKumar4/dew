@@ -95,3 +95,33 @@ def test_each_layout_writes_the_bytes_mains_renderers_wrote(name):
     """Each configuration's rows, over every state and question set, digest as main's renderers' did."""
     configured = {**question_rows(), **joint()}[name]
     assert digest(*configured) == json.loads(DIGESTS.read_text())[name]
+
+
+PLANS = Path(__file__).with_name("decision_layout_plans.json")
+"""The data plans main wrote, as a position holds them, for a decision chain under each of the three
+layout classes (written at 54416de4b0e by `Plan.record`)."""
+
+
+@pytest.mark.parametrize(("form", "built"), [
+    ("marker", lambda: SegmentLayout.marker_row(max_len=96, parallel=True)),
+    ("state_first", lambda: SegmentLayout.state_first_row(max_len=96)),
+    ("joint", lambda: SegmentLayout.joint_row(max_state_tokens=7))])
+def test_a_position_main_saved_under_a_layout_class_resumes_exactly_under_its_segment_layout(form, built):
+    """A data position main saved for a decision chain under one of the three layout classes resumes
+    exactly under the segment layout of that row: the plan reads its steps' layout descriptions as the
+    segment layout they are now (`earlier_described`), and finds nothing changed. The steps' descriptions
+    named the classes, and an exact resume of every saved position was refused (the head review of theme 17,
+    F1)."""
+    from dew.data.compile import compile
+    from dew.data.dataset import Loading
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Memory
+    from dew.decision.head import DecisionHead
+    from dew.decision.rows import Fit
+
+    specials = Specials(begin=254, separator=253, marker=0, marker_text="\x00", pad=255)
+    chain = Pipeline(Memory([{"id": index} for index in range(4)])).filter_map(
+        Fit(built(), TOKENIZER, specials, DecisionHead(64))).batch(2)
+    plan = compile(chain, read="streamed", loading=Loading(workers=0)).plan
+    assert plan is not None
+    assert plan.check(json.loads(PLANS.read_text())[form], resume="exact") == ()

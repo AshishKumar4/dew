@@ -48,7 +48,8 @@ def released_decision(directory: Path, layout: SegmentLayout, calibration: Calib
     wrote is (`dew._records.earlier_layout`)."""
     release = _loaded(directory)
     if release is not None and release.layout is not None:
-        stated = from_record(Layout, earlier_layout(release.layout), dtypes=False)
+        laid = earlier_layout(release.layout)
+        stated = from_record(Layout, laid, dtypes=False)
         if not isinstance(stated, SegmentLayout) or stated.joint != joint:
             raise ValueError(f"the release in {directory} states the layout {stated!r}, and its format reads "
                              f"{'the joint row' if joint else 'a row a question'}")

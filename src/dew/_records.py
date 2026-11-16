@@ -301,16 +301,25 @@ default that `dew.decision.SegmentLayout` holds otherwise (a joint row's 16384 t
 framing it fills where a record states none, `SegmentLayout.joint_row`)."""
 
 
-def earlier_layout(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A decision layout's class record an earlier Dew saved (a step's declaration, a release's layout), read
-    as the `SegmentLayout` it is now where it names an earlier class (`EARLIER_LAYOUTS`): its own fields over
-    the form and defaults its class held; any other record as it is. The one reader of those records, which
-    the pinned boundaries call (`dew.inference.tasks.earlier_shapes`,
-    `dew.decision.release.released_decision`). Carried to 1.0 (ledger 1552)."""
-    named, fields = record.get("class"), record.get("fields", {})
-    if not (isinstance(named, str) and named in EARLIER_LAYOUTS and isinstance(fields, Mapping)):
-        return record
-    return {**record, "class": "dew.decision.layout:SegmentLayout",
+def earlier_layout(value: JSON) -> JSON:
+    """JSON an earlier Dew saved (a step's declaration, a run's record, a release's layout) with every
+    decision layout's class record in it, at any depth (an objective's `layout`, a recorded stage's), read
+    as the `SegmentLayout` it is now where it names an earlier class (`EARLIER_LAYOUTS`): its own fields
+    over the form and defaults its class held; anything else as it is. The one reader of those records,
+    which the pinned boundaries call (`dew.config.earlier.earlier_run`,
+    `dew.inference.tasks.earlier_shapes`, `dew.decision.release.released_decision`). Carried to 1.0
+    (ledger 1552)."""
+    if isinstance(value, list):
+        return [earlier_layout(held) for held in value]
+    if not isinstance(value, Mapping):
+        return value
+    held = {name: earlier_layout(entry) for name, entry in value.items()}
+    # A class record holds its class and its fields, and nothing else: data that names a class is no record.
+    named, fields = held.get("class"), held.get("fields")
+    if not (set(held) == {"class", "fields"} and isinstance(named, str) and named in EARLIER_LAYOUTS
+            and isinstance(fields, Mapping)):
+        return held
+    return {**held, "class": "dew.decision.layout:SegmentLayout",
             "fields": {**EARLIER_LAYOUTS[named], **fields}}
 
 

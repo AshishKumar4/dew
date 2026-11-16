@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, TypeGuard, get_args
 
 import numpy as np
-from typing_extensions import TypeIs, get_protocol_members
+from typing_extensions import get_protocol_members
 
 from dew import _records
 from dew._records import JSON
@@ -656,7 +656,8 @@ _UNREAD = _Unread()
 
 _QUESTION_ROW: Mapping[str, object] = {
     "head_max_len": None, "option_tokens": None, "parallel": False, "labels": None, "unit": "pieces",
-    "blocks": False, "split": None, "order": None, "shared_state": None, "siblings": False, "streamed": False}
+    "blocks": False, "split": None, "order": None, "shared_state": None, "siblings": False, "streamed": False,
+    "option_text": "named"}
 """The fields only a row a question reads, each at the value a joint row holds (`SegmentLayout.joint_row`)."""
 
 type Form = Literal["marker", "state_first", "joint"]
@@ -848,8 +849,10 @@ class SegmentLayout(Layout):
         return tuple(encoder.encode(text, add_special_tokens=False))
 
     def row_questions(self, questions: int) -> int:
-        """As many of them as one row asks over one state (`shares`, `streamed`: `shared_state`), else
-        one."""
+        """As many of them as one row asks over one state: all of them in the joint row, else as many as
+        share it (`shares`, `streamed`: `shared_state`), else one."""
+        if self.joint:
+            return questions
         if self.shared_state is not None and (self.shares or self.streamed):
             return min(questions, self.shared_state)
         return 1
@@ -2255,7 +2258,47 @@ def _joint_order(question: Question) -> list[int]:
     return list(range(len(keys)))
 
 
-def per_question(layout: Layout | None) -> TypeIs[SegmentLayout]:
+def earlier_described(value: JSON) -> JSON:
+    """A data plan an earlier Dew saved (a position's), with each decision layout its steps' configurations
+    describe by a class it was before (`dew._records.EARLIER_LAYOUTS`, in a description's dotted spelling)
+    described as the `SegmentLayout` it is now: the description of its form's layout by default, its own
+    fields over it. A configuration is JSON in a string (`dew.data.plan.StepIdentity`), read and written
+    back as the plan writes one, so a position saved before the classes became one resumes exactly. The
+    reader of those descriptions, which a plan's comparison calls (`dew.data.plan.Plan.check`)."""
+    from dew._records import EARLIER_LAYOUTS
+    from dew.data.plan import structured
+
+    forms = {named.replace(":", "."): fields for named, fields in EARLIER_LAYOUTS.items()}
+    built = {"marker": SegmentLayout.marker_row, "state_first": SegmentLayout.state_first_row,
+             "joint": SegmentLayout.joint_row}
+
+    def described(held: JSON) -> JSON:
+        if isinstance(held, list):
+            return [described(entry) for entry in held]
+        if isinstance(held, str):
+            if not any(named in held for named in forms):
+                return held
+            try:
+                parsed = json.loads(held)
+            except json.JSONDecodeError:
+                return held
+            return json.dumps(described(parsed), sort_keys=True)
+        if not isinstance(held, Mapping):
+            return held
+        entries = {name: described(entry) for name, entry in held.items()}
+        named = entries.get("class")
+        if not isinstance(named, str) or named not in forms:
+            return entries
+        laid = dict(forms[named])
+        form = laid.pop("form")
+        base = structured(built[str(form)](**laid))
+        if not isinstance(base, Mapping):
+            raise TypeError(f"a layout is described as a mapping, not {base!r}")
+        return {**base, **{name: entry for name, entry in entries.items() if name != "class"}}
+    return described(value)
+
+
+def per_question(layout: Layout | None) -> TypeGuard[SegmentLayout]:
     """Whether `layout` writes a row a question (`SegmentLayout`'s marker or state-first row), whose
     question-row fields it reads (labels, sharing, parallel options, blocks)."""
     return isinstance(layout, SegmentLayout) and not layout.joint

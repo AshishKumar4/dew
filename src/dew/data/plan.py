@@ -30,6 +30,7 @@ from dew._records import (
     moved_paths,
     moved_spelling,
     record,
+    strings_of,
 )
 from dew._stated import Unestablished, stated
 from dew.data.compilation import checkout_now
@@ -1002,6 +1003,11 @@ class Plan:
         """`check` of all but the version and the rules, the changed environment and members returned; the
         saved plan's classes by the paths they have now (`moved_paths`, row 5996)."""
         saved = record(moved_paths(json_value(saved, "saved data plan")), "saved data plan")
+        if any("dew.decision.layout." in text for text in strings_of(saved)):
+            # A decision layout its steps describe by a class it was before (row 6140).
+            from dew.decision.layout import earlier_described
+
+            saved = record(earlier_described(saved), "saved data plan")
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "relaxed":
             raise PlanChanged(
                 ("exact",),

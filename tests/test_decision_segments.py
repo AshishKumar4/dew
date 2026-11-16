@@ -340,3 +340,32 @@ def test_a_record_of_an_earlier_layout_class_reads_as_the_segment_layout_it_is_n
 
     record = earlier_shapes({"layout": {"class": f"dew.decision.layout:{earlier}", "fields": fields}})
     assert from_record(Layout, record["layout"], dtypes=False) == now
+
+
+def test_a_run_record_holding_an_earlier_layout_class_anywhere_reads_as_the_segment_layout():
+    """A run's record (`run.json`) that names an earlier layout class inside a component, an objective's
+    layout or a recorded stage's, reads through the run's boundary (`earlier_run`) as the segment layout of
+    that row, and builds; the record's other fields, an example's data among them, as they were. Only the
+    top-level declaration was read, and the nested record named a class no longer importable (the head review
+    of theme 17, F2)."""
+    from dew.config.earlier import earlier_run
+
+    earlier = {"class": "dew.decision.layout:JointLayout", "fields": {"max_state_tokens": 7}}
+    record = {"objective": {"class": "dew.decision.objective:DecisionObjective",
+                            "fields": {"layout": earlier, "stages": [{"layout": earlier}]}},
+              "examples": [{"class": "dew.decision.layout:JointLayout", "text": "an example's data"}]}
+    read = earlier_run(record)
+    fields = read["objective"]["fields"]
+    for laid in (fields["layout"], fields["stages"][0]["layout"]):
+        assert from_record(Layout, laid, dtypes=False) == SegmentLayout.joint_row(max_state_tokens=7)
+    assert read["examples"] == record["examples"]
+
+
+def test_the_joint_row_asks_every_question_and_refuses_a_question_rows_option_text():
+    """The joint row asks every question of a request in its one row (`row_questions`), and refuses the
+    described option text a row a question writes, which its schema writes otherwise: it took it and wrote
+    option ids beside descriptions (the head review of theme 17, F3, F4)."""
+    assert SegmentLayout.joint_row().row_questions(3) == 3
+    assert SegmentLayout.state_first_row().row_questions(3) == 1
+    with pytest.raises(ValueError):
+        SegmentLayout.joint_row(option_text="described")
