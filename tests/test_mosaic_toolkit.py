@@ -635,12 +635,12 @@ def test_a_sum_of_three_part_products_is_as_accurate_as_fp32():
                                   np.full((ISSUED, ISSUED), half))
 
 
-def _mixed_sums(a, b, c, d, *, interpret, together=False):
+def _mixed_sums(a, b, c, d, *, interpret, together=False, ordered=False):
     """Sums of products of two forms through one prepared-operand issuer (`operands.Issuer.summed`) on
     warpgroup MMA: `a @ b` of three parts each (fp32 tiles' parts in shared memory) and `c @ d` of one
     (bfloat16 tiles): `a @ b + c @ d`, then `c @ d + a @ b`, then `c @ d` from a deferred left operand an
     issuer of no buffers forms (a callable giving a tile in memory). `together`, `a @ b` alone through
-    `summed_together`'s reader instead."""
+    `summed_together`'s reader instead; `ordered`, `c @ d + a @ b + c @ d` alone, in that order."""
     from dew.nn.kernels.templates import mosaic_sm90, operands, product
 
     family = mosaic_sm90.FED  # one warpgroup, no producer
@@ -660,6 +660,10 @@ def _mixed_sums(a, b, c, d, *, interpret, together=False):
                 (read,) = issuer.summed_together([[("wide", a, b)]])
                 outs[0][...] = read()
                 return
+            if ordered:
+                outs[0][...] = issuer.summed([("narrow", c, d), ("wide", a, b), ("narrow", c, d)],
+                                             (ISSUED, ISSUED))
+                return
             outs[0][...] = issuer.summed([("wide", a, b), ("narrow", c, d)], (ISSUED, ISSUED))
             outs[1][...] = issuer.summed([("narrow", c, d), ("wide", a, b)], (ISSUED, ISSUED))
             outs[2][...] = issuer.summed([("deferred", lambda: c, d)], (ISSUED, ISSUED))
@@ -667,7 +671,7 @@ def _mixed_sums(a, b, c, d, *, interpret, together=False):
         pl.run_scoped(scoped, *(wide for _ in range(8)), collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((ISSUED, ISSUED), jnp.float32)
-    count = 1 if together else 3
+    count = 1 if together or ordered else 3
     return family.kernel(body, out_type=(out,) * count, grid=(1,), grid_names=("programs",), consumers=1,
                          interpret=interpret, name="mixed")(a, b, c, d)
 
@@ -689,6 +693,19 @@ def test_a_sum_of_products_of_two_forms_is_one_sum_in_either_order():
     for found in (first, second):
         assert_fp32_reduction_bound(found, expected, magnitudes, terms=ISSUED * 7)
     np.testing.assert_array_equal(np.asarray(deferred), wide[2] @ wide[3])
+
+
+@INTERPRETS
+def test_a_sum_takes_its_products_in_their_order_a_three_part_one_among_them():
+    """Interpreted: `c @ d + a @ b + c @ d`, `c` 2^127 times the identity (one part), `a` its negative (fp32,
+    three parts) and `b`, `d` the identity: 2^127 times the identity, as the products sum in their order,
+    where the three-part product summed after the rest took the two of 2^127 to infinity first (base review
+    670386203 F1)."""
+    eye = jnp.eye(ISSUED, dtype=jnp.float32)
+    big = 2.0 ** 127 * eye
+    (found,) = _mixed_sums(-big, eye, big.astype(jnp.bfloat16), eye.astype(jnp.bfloat16),
+                           interpret=INTERPRETED, ordered=True)
+    np.testing.assert_array_equal(np.asarray(found), np.asarray(big))
 
 
 def _streamed_sums(a, b, c, *, interpret, case: str):
