@@ -706,6 +706,21 @@ class Map:
     where its read runs. How it runs, no part of what it computes or its identity."""
 
 
+def _pooled(steps: Sequence[object], pool: PoolKind | None) -> None:
+    """Refuse, as the stage is declared, a pool its steps cannot run on: a process pool for a step that
+    does not pickle (`dew.data.concurrent.Pool.checked`), or any pool for a cut into chunks, whose counts
+    the reading process keeps (`Chunked`)."""
+    from dew.data.concurrent import Pool
+    from dew.data.text import Chunks
+
+    if pool is None:
+        return
+    for step in steps:
+        if isinstance(step, (Configured, Chunks)):
+            raise ValueError(f"{_named_step(step)} runs where its read runs; it takes no pool")
+        Pool(pool, 1).checked(step, _named_step(step))
+
+
 def examples_bound(stages: Sequence[object]) -> int | None:
     """Where a run bounded in examples marks the source examples it reads (`MarkConsumed`), the stage
     after the bound's limit (`dew.data.compile._bounded`): its index in `stages`, None for a read the run
@@ -1253,6 +1268,7 @@ class Dataset:
                 raise TypeError(f"{_named_step(step)} draws from a generator; apply it with random_map")
             if not isinstance(step, Configured) and _declares_rejects(step):
                 raise TypeError(f"{_named_step(step)} drops records; apply it with filter_map")
+        _pooled(steps, pool)
         return self._then(*(step if isinstance(step, Configured) else Map(step, identity, pool=pool)
                             for step in steps))
 
@@ -1278,6 +1294,7 @@ class Dataset:
             if isinstance(step, pygrain.RandomMapTransform):
                 raise TypeError(f"{_named_step(step)} draws from a generator; "
                                 "apply it with random_filter_map")
+        _pooled(steps, pool)
         return self._then(*(Map(step, identity, rejects=True, pool=pool) for step in steps))
 
     def random_filter_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
@@ -1328,6 +1345,7 @@ class Dataset:
             return self._then(Batched(columns, batch_size, identity, same_rows=False))
         if not _expands(step):
             raise TypeError(f"{_named_step(step)} is not a record expansion function or transform")
+        _pooled((step,), pool)
         return self._then(FlatMap(step, identity, pool=pool))
 
     @property

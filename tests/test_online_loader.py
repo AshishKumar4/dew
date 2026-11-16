@@ -661,8 +661,8 @@ def test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes(re
 
 @pytest.mark.parametrize("read", ["streamed", "memory"])
 def test_a_process_stage_whose_step_does_not_pickle_is_refused_before_it_reads(read):
-    """A stage declaring processes whose step no process can be handed (a lambda) is refused as its read
-    starts, before any record is read; on threads it reads."""
+    """A stage declaring processes whose step no process can be handed (a lambda) is refused as it is
+    declared, before any read; on threads it reads."""
     catalog = Memory([{"id": index} for index in range(4)])
 
     def reader(pool):

@@ -283,7 +283,6 @@ def _memory_stages(
                 # A stage with a pool of its own runs that many records at once, in their order: a process
                 # pool is handed them in chunks, a pickle each.
                 step = _Fetched(stage)
-                pool.checked(step, _identity(stage).name)
                 chunk = 1 if pool.kind == "threads" else max(1, len(rows) // (4 * pool.size))
                 with pool.executor() as running:
                     made = iter(list(running.map(step, rows, chunksize=chunk)))

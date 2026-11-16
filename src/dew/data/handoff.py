@@ -19,7 +19,7 @@ from typing_extensions import TypeIs
 from dew._records import boolean, record
 from dew.batch import Batch
 from dew.data.analysis import _drops
-from dew.data.concurrent import Pool
+from dew.data.concurrent import Pool, PoolKind
 from dew.data.dataset import _column, _shareable, _stacked
 from dew.data.pipeline import (
     ACCOUNTS,
@@ -71,8 +71,8 @@ def pool_of(stages: Sequence[Stage]) -> Pool | None:
     threads = _threads(stages)
     if threads is not None:
         return Pool("threads", threads)
-    declared = [stage.pool for stage in stages
-                if isinstance(stage, (Map, FlatMap)) and stage.pool is not None]
+    declared: list[PoolKind] = [stage.pool for stage in stages
+                                if isinstance(stage, (Map, FlatMap)) and stage.pool is not None]
     return Pool.declared(declared[0]) if declared else None
 
 

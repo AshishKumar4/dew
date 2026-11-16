@@ -578,11 +578,22 @@ def _through(rows: Rows, run: tuple[RecordStage, ...], name: str, label: str, lo
     pool = pool_of(run)
     if pool is not None:
         # A step with a pool of its own: its records in flight at once, delivered in order.
-        pool.checked(lowered, _identity(run[0]).name)
+        if any(isinstance(stage, FlatMap) for stage in run):
+            # An expansion's records each come back as the tuple it made of them, handed on one by one.
+            return gx.FlatMapIterDataset(Concurrently(_as_iter(rows, loading), lowered.flat_map, pool),
+                                         _Made())
         return Concurrently(_as_iter(rows, loading), lowered, pool)
     if any(isinstance(stage, FlatMap) for stage in run):
         return _expanded(_as_iter(rows, loading), run, name, label, unplaced=unplaced)
     return rows.map(lowered) if seed is None else rows.random_map(lowered, seed=seed)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Made(gx.FlatMapTransform):
+    """The records an expansion on a pool of its own made of one (`_through`), handed on one by one."""
+
+    def flat_map(self, element: tuple[Record, ...]) -> tuple[Record, ...]:
+        return element
 
 
 @dataclasses.dataclass(frozen=True)
