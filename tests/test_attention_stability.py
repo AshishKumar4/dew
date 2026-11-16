@@ -155,7 +155,9 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "a subnormal share of an overflowing row, bfloat16": 32,
          "a subnormal share beside 255 equal weights, bfloat16": 32, "a row of no keys": 8,
          "causal queries before every key": 8, "a row that overflows beside one that does not": 8,
-         "two finite slices whose merge overflows": 8, "a resumed state of a large denominator": 64,
+         "two finite slices whose merge overflows": 8,
+         "values at fp32's largest across a split decode's slices": 8,
+         "a resumed state of a large denominator": 64,
          "a resumed state beside an overflowing column": 32,
          "a resumed state of a denominator near fp32's largest beside an overflowing column": 8,
          "fp16 values near their largest beside a state near fp32's largest": 32,
@@ -525,6 +527,32 @@ def _slices(seed):
             dout * np.float32(2.0 ** -8))
 
 
+SPLIT_KEYS = 1024
+"""A split decode step's keys: enough key tiles for its plan to cut its row into slices, each twice its
+ring's stages of them (`attention_decode.plan`)."""
+
+
+def _split_at_the_limit(seed):
+    # Two rows of one query over `SPLIT_KEYS` keys, a decode step whose plan cuts each row into slices: key 0
+    # at logit 0 and the last key at a logit near -ln 29, their values in fp32's top binade's last 0.08%
+    # ([3.4e38, its largest]), every other key's logit far below and its value 0. Each slice's output is
+    # near fp32's largest at a total near 1, their shares near 29/30 and 1/30, whose sum a merge passed
+    # fp32's largest with (row 6826).
+    width = 64
+    query = np.zeros((2, 1, 1, width), np.float32)
+    query[..., 0] = 1.0
+    logits = np.full((2, SPLIT_KEYS), -1000.0, np.float32)
+    logits[:, 0] = 0.0
+    logits[:, -1] = -np.log(29.0) * _uniform(seed, 0.9, 1.1, (2,))
+    key = np.zeros((2, SPLIT_KEYS, 1, width), np.float32)
+    key[:, :, 0, 0] = logits * np.float32(np.sqrt(width))
+    value = np.zeros((2, SPLIT_KEYS, 1, width), np.float32)
+    largest = float(np.finfo(np.float32).max)
+    value[:, [0, SPLIT_KEYS - 1]] = _uniform(seed + 1, 3.4e38, largest, (2, 2, 1, width))
+    (dout,) = _normal(seed + 2, (2, 1, 1, width))
+    return query, key, value, None, dout * np.float32(2.0 ** -8)
+
+
 def _resumed(seed):
     # One query a row resumed from a state of denominator 2^100 to 2^127 and weighted values that
     # times a draw in [-1, 1), over two keys of logit 0 whose values are the denominator times a draw:
@@ -801,6 +829,9 @@ def _structured_families() -> dict[str, Family]:
 
     families["two finite slices whose merge overflows"] = Family(_slices, _kept(1, 64), splits=2,
                                                                  folded=False, overflows=True)
+    families["values at fp32's largest across a split decode's slices"] = Family(
+        _split_at_the_limit, _kept(1, SPLIT_KEYS, rows=2), splits=4, folded=False, overflows=True,
+        decode_only=True)
 
     families["a resumed state of a large denominator"] = Family(_resumed, np.ones((RESUMED, 1, 1, 2), bool),
                                                                 folded=False)
@@ -1447,11 +1478,12 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
 
 
 TEMPLATE_DECODED = list(dict.fromkeys(family for family, _ in DECODED
-                                     if jnp.dtype(FAMILIES[family].dtype).itemsize == 2
-                                     and not FAMILIES[family].decode_only))
+                                     if not FAMILIES[family].decode_only or FAMILIES[family].splits > 1))
 """The decode steps the template's decode takes (`attention_decode.attend`), in its one form, the raw fold
-(no fold's reach, as the decode kernel's): 16-bit operands; a decode step's alone (`Family.decode_only`) too
-long for its interpreted mainloop."""
+(no fold's reach, as the decode kernel's): 16-bit and fp32 operands (an fp32 step's operands as their bf16
+parts, `MosaicForward.parts`); a decode step's alone (`Family.decode_only`) where it is a split one
+(`Family.splits`), whose merge the template's plan reaches over its keys, else too long for its interpreted
+mainloop."""
 
 
 @pytest.mark.skipif(not INTERPRETED and generation.device_generation() != "sm90",
