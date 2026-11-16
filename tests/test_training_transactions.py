@@ -3,6 +3,8 @@
 Replay and effect commits are Dew transaction policies; Optax and Flax oracle their arithmetic.
 """
 
+import math
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -17,6 +19,7 @@ from test_trainer import make_trainer
 from dew.batch import under
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
+from dew.nn.finite import MAGNITUDE_BOUND
 from dew.objectives import Aux, EMASpec, Objective, Ratio
 from dew.training import Trainer
 
@@ -700,24 +703,71 @@ class Pushed(Objective):
         return jnp.mean(batch["x"] @ variables["params"]["w"]), Aux({})
 
 
-class Huge(Counting):
-    """`Counting`'s batches, every input 1e20."""
+class Inputs(Counting):
+    """`Counting`'s batches, every input `value`."""
+
+    value = 1e20
 
     def __next__(self):
         batch = super().__next__()
-        return {**batch, "x": np.full_like(batch["x"], 1e20)}
+        return {**batch, "x": np.full_like(batch["x"], self.value)}
 
 
-def test_a_run_whose_finite_gradient_overflows_its_optimizer_stops_at_its_next_log_step():
-    """A run saving nothing whose finite gradient (inputs of 1e20) puts Adam's second moment past float32
-    stops at its next log step, its state read outside the step (`stop_non_finite`): the moment's update is
-    zero, so its weight froze while its loss stayed finite, and the run went on to its end in silence (row
-    6861: detection apart from rollback)."""
-    from recording import RecordingTracker
+def _pushed_step(value: float, optimizer):
+    """One step with no loss scale of `Pushed` under `optimizer` over inputs of `value`: the state before,
+    and what the step reports."""
+    trainer = Trainer(Pushed(), optimizer, key=jax.random.PRNGKey(0))
+    state = trainer.initial_state()
+    batch = next(type("Fed", (Inputs,), {"value": value})())
+    before = jax.tree.map(np.asarray, (state.variables, state.opt_state))
+    step = trainer.compile(state, batch)
+    return before, step(state, batch)
 
-    tracker = RecordingTracker()
-    trainer = Trainer(Pushed(), optax.adam(0.1), key=jax.random.PRNGKey(0), tracker=tracker)
-    with pytest.raises(RuntimeError):
-        trainer.fit(dataset(Huge), steps=4, log_every=1)
-    (logged,) = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
-    assert np.isfinite(logged["train/loss"])
+
+@pytest.mark.parametrize("value", [1e20, 1e19], ids=["past the bound", "within it"])
+def test_a_step_is_finite_where_its_gradients_magnitude_is_within_the_bound(value):
+    """With no loss scale, a step whose gradient is finite and past the magnitude bound (1e20, whose square
+    no float32 moment holds: `dew.nn.finite.MAGNITUDE_BOUND`) is rejected before Adam forms its update, its
+    weight, moments and update count as they were, and reported not finite; one within it (three weights of
+    1e19, whose squares' sum passes float32 though each square is finite) is taken, its weight moved and
+    finite. Main froze the weight under an infinite moment while the loss stayed finite (row 6861)."""
+    before, (advanced, _, _, finite, _, _) = _pushed_step(value, optax.adam(0.1))
+    weight = np.asarray(advanced.variables["params"]["w"])
+    if value > MAGNITUDE_BOUND:
+        assert not bool(finite) and int(advanced.updates) == 0
+        kept = jax.tree.leaves((advanced.variables, advanced.opt_state))
+        for got, want in zip(kept, jax.tree.leaves(before), strict=True):
+            np.testing.assert_array_equal(np.asarray(got), want)
+    else:
+        assert bool(finite) and int(advanced.updates) == 1
+        assert np.all(np.isfinite(weight)) and not np.array_equal(weight, before[0]["params"]["w"])
+
+
+def test_a_step_at_a_learning_rate_that_is_not_finite_is_rejected():
+    """An injected learning rate set infinite (`optax.inject_hyperparams`) forms an update that is not
+    finite from a bounded gradient: the step is rejected, the weight as it was, and reported not finite;
+    its rate is read where the update is formed."""
+    before, (advanced, _, _, finite, _, _) = _pushed_step(1.0, optax.inject_hyperparams(optax.sgd)(
+        learning_rate=math.inf))
+    assert not bool(finite) and int(advanced.updates) == 0
+    np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), before[0]["params"]["w"])
+
+
+def test_a_window_summing_bounded_gradients_past_the_bound_is_rejected_whole():
+    """An optimizer that holds updates back and sums its window (`optax.MultiSteps(..., use_grad_mean=False)`
+    of two) hands Adam the sum of two gradients of 1.5e19, each within the bound and their sum past it: the
+    window's closing step, whose Adam moment the sum overflows, is rejected whole, its state as it was, and
+    reported not finite; its first step is taken. The bound over a window is the wrapper's own, read in its
+    new state."""
+    held = optax.MultiSteps(optax.adam(0.1), 2, use_grad_mean=False).gradient_transformation()
+    trainer = Trainer(Pushed(), held, key=jax.random.PRNGKey(0))
+    state = trainer.initial_state()
+    batch = next(type("Fed", (Inputs,), {"value": 1.5e19})())
+    step = trainer.compile(state, batch)
+    state, _, _, first, _, _ = step(state, batch)
+    before = jax.tree.map(np.asarray, (state.variables, state.opt_state))
+    state, _, _, second, _, _ = step(state, batch)
+    assert bool(first) and not bool(second)
+    for got, want in zip(jax.tree.leaves((state.variables, state.opt_state)), jax.tree.leaves(before),
+                         strict=True):
+        np.testing.assert_array_equal(np.asarray(got), want)

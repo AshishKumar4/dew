@@ -479,3 +479,21 @@ def test_a_gauss_newton_update_held_by_a_wrapper_that_drops_its_statistics_is_re
     # Unwrapped, the same update compiles: the refusal is the wrapper's dropped statistics.
     trainer = Trainer(LeastSquares(4), gauss_newton(damping=1e-3), key=0, layout=LAYOUT)
     trainer.compile(trainer.initial_state(), batch)
+
+
+def test_an_undamped_gauss_newton_step_over_a_singular_system_is_rejected():
+    """An undamped Gauss-Newton step whose system is singular (a feature every row holds zero, so its
+    normal equations' column is zero) forms a direction that is not finite from finite inputs: the step
+    is rejected, its weights as they were and its update count too, and reported not finite, the solve's
+    direction read into the step's finiteness (training.md, a step that is not finite)."""
+    trainer = Trainer(LeastSquares(4), gauss_newton(damping=0.0), key=0, layout=LAYOUT)
+    state = trainer.initial_state()
+    x = np.random.default_rng(0).normal(size=(16, 4)).astype(np.float32)
+    x[:, 0] = 0.0
+    batch = {"x": x, "y": x[:, 1] * 2}
+    before = jax.tree.map(np.asarray, state.variables)
+    step = trainer.compile(state, batch)
+    advanced, _, _, finite, _, _ = step(state, batch)
+    assert not bool(finite) and int(advanced.updates) == 0
+    for got, want in zip(jax.tree.leaves(advanced.variables), jax.tree.leaves(before), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), want)
