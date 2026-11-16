@@ -85,8 +85,8 @@
 "tests/test_attention_blackwell.py::test_the_blackwell_forward_keeps_finite_a_logit_its_scale_keeps_finite_interpreted"
 ],
 "tests/test_attention_decode_template.py": [
-"tests/test_attention_decode_template.py::test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted[sm90-16-float8_e4m3fn]",
-"tests/test_attention_decode_template.py::test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk_interpreted[plain]",
+"tests/test_attention_decode_template.py::test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted[sm90-16-int8]",
+"tests/test_attention_decode_template.py::test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk_interpreted[far]",
 "tests/test_attention_decode_template.py::test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100[4]",
 "tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[verify-four-sm90-128]"
 ],
@@ -870,9 +870,6 @@
 "tests/test_attention_witness.py": [
 "tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[0-causal]"
 ],
-"tests/test_autoencoder.py": [
-"tests/test_autoencoder.py::test_autoencoders_of_one_module_share_its_programs"
-],
 "tests/test_barren_reads.py": [
 "tests/test_barren_reads.py::test_a_mixture_edit_that_moves_a_kept_corpus_to_other_workers_reads_on",
 "tests/test_barren_reads.py::test_a_mixture_of_corpora_each_kept_in_one_workers_inputs_reads_on[streamed]",
@@ -919,11 +916,14 @@
 "tests/test_block_sft.py::test_official_sft_loss_and_every_parameter_gradient",
 "tests/test_block_sft.py::test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target"
 ],
+"tests/test_block_visibility.py": [
+"tests/test_block_visibility.py::test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_does"
+],
 "tests/test_cache_opening.py": [
 "tests/test_cache_opening.py::test_each_familys_cache_opens_as_its_decode_opens_and_writes_it[causal_transformer]"
 ],
 "tests/test_capability_matrix.py": [
-"tests/test_capability_matrix.py::test_a_refused_cell_names_what_the_family_lacks[mean_flow-flux_transformer]",
+"tests/test_capability_matrix.py::test_a_refused_cell_names_what_the_family_lacks[supervised-user+tuple]",
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[decision-causal_transformer+dory]",
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[decision-causal_transformer+lora_with_head]",
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[decision-diffusion_gemma]",
@@ -1051,7 +1051,7 @@
 "tests/test_compile_ahead.py::test_a_fused_tiled_head_compiles_its_offloaded_frontier",
 "tests/test_compile_ahead.py::test_a_gated_delta_steps_mosaic_kernels_compile_ahead_for_the_gpu_it_targets",
 "tests/test_compile_ahead.py::test_a_kept_programs_failed_check_raises_where_handed_as_where_kept",
-"tests/test_compile_ahead.py::test_a_program_whose_trees_no_file_states_compiles_where_programs_are_handed_and_is_kept_by_none",
+"tests/test_compile_ahead.py::test_a_program_whose_compile_was_begun_passes_once_where_it_compiles_over_the_same[a fresh key's shape]",
 "tests/test_compile_ahead.py::test_a_run_refused_before_its_start_is_taken_exits_with_its_refusal_while_its_compile_runs[1]",
 "tests/test_compile_ahead.py::test_a_run_refused_before_its_start_is_taken_exits_with_its_refusal_while_its_compile_runs[7]",
 "tests/test_compile_ahead.py::test_a_step_compiled_ahead_for_eight_gpus_reads_and_writes_what_the_run_on_eight_devices_does[fsdp4_tensor2]",
@@ -1069,7 +1069,7 @@
 "tests/test_compile_ahead.py::test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step",
 "tests/test_compile_ahead.py::test_an_ahead_plan_that_fits_no_device_reports_every_refused_program",
 "tests/test_compile_ahead.py::test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it",
-"tests/test_compile_ahead.py::test_compiling_ahead_on_gpus_of_no_stated_memory_is_refused_before_anything_traces[False]",
+"tests/test_compile_ahead.py::test_programs_kept_under_other_code_settings_or_target_are_refused_by_name[environment-process1-target1]",
 "tests/test_compile_ahead.py::test_programs_kept_under_other_code_settings_or_target_are_refused_by_name[setting-process3-target3]"
 ],
 "tests/test_config_cli.py": [
@@ -1079,6 +1079,9 @@
 "tests/test_config_paths.py::test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran[diffusion]",
 "tests/test_config_paths.py::test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran[jepa]",
 "tests/test_config_paths.py::test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran[lm]"
+],
+"tests/test_contracts_attention.py": [
+"tests/test_contracts_attention.py::test_a_sink_softmax_holds_every_order[normal]"
 ],
 "tests/test_contracts_gemm.py": [
 "tests/test_contracts_gemm.py::test_a_gemm_prologue_holds_every_order[normal]",
@@ -1113,8 +1116,8 @@
 ],
 "tests/test_cross_attention.py": [
 "tests/test_cross_attention.py::test_a_run_of_a_cross_attending_media_model_loads_as_its_source_carrying_it",
-"tests/test_cross_attention.py::test_a_served_request_reads_its_own_context[paged]",
-"tests/test_cross_attention.py::test_a_zero_gate_leaves_an_ngpt_stream_whatever_its_length",
+"tests/test_cross_attention.py::test_an_objective_with_prediction_depths_scores_and_counts_a_conditioned_batch",
+"tests/test_cross_attention.py::test_every_residual_form_takes_the_blocks[ngpt]",
 "tests/test_cross_attention.py::test_served_requests_score_their_draws_from_their_own_contexts[dense]",
 "tests/test_cross_attention.py::test_served_requests_score_their_draws_from_their_own_contexts[paged]",
 "tests/test_cross_attention.py::test_served_requests_score_their_draws_from_their_own_contexts[prefix]",
@@ -1437,7 +1440,7 @@
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 128-sm89]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 128-sm90]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 64-sm120]",
-"tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 64-sm86]",
+"tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 64-sm80]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 64-sm89]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[recurrence kimi-linear-kda-sm100]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[recurrence kimi-linear-kda-sm80]",
@@ -1712,8 +1715,8 @@
 "tests/test_forked_calls.py::test_a_tree_token_a_row_does_not_hold_passes_its_parents_state_on[mamba2]",
 "tests/test_forked_calls.py::test_a_tree_token_a_row_does_not_hold_passes_its_parents_state_on[mamba]",
 "tests/test_forked_calls.py::test_a_windowed_tree_call_reads_its_cached_keys_at_the_places_forks_give_them[branching]",
-"tests/test_forked_calls.py::test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole[attention]",
-"tests/test_forked_calls.py::test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole[kimi_delta_attention hybrid]",
+"tests/test_forked_calls.py::test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole[engram]",
+"tests/test_forked_calls.py::test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole[kimi linear]",
 "tests/test_forked_calls.py::test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole[mamba hybrid]",
 "tests/test_forked_calls.py::test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole[mamba3 hybrid]",
 "tests/test_forked_calls.py::test_the_per_layer_embedding_reads_each_documents_chain_over_forks[permuted]"
@@ -1857,7 +1860,7 @@
 "tests/test_hf_family_sources.py::test_the_pad_row_takes_the_gradient_its_source_gives_it[deepseek-v41-tiny-stated]",
 "tests/test_hf_family_sources.py::test_the_pad_row_takes_the_gradient_its_source_gives_it[gemma4-moe-tiny-stated]",
 "tests/test_hf_family_sources.py::test_the_pad_row_takes_the_gradient_its_source_gives_it[glm5-next-tiny-stated]",
-"tests/test_hf_family_sources.py::test_the_pad_row_takes_the_gradient_its_source_gives_it[kimi-linear-tiny-null]",
+"tests/test_hf_family_sources.py::test_the_pad_row_takes_the_gradient_its_source_gives_it[k2-horizon-tiny-stated]",
 "tests/test_hf_family_sources.py::test_the_pad_row_takes_the_gradient_its_source_gives_it[llada-tiny-null]",
 "tests/test_hf_family_sources.py::test_the_pad_row_takes_the_gradient_its_source_gives_it[qwen2-moe-tiny-stated]"
 ],
@@ -1902,6 +1905,9 @@
 "tests/test_imports.py": [
 "tests/test_imports.py::test_a_module_imports_its_own_domain_alone[dew.config]"
 ],
+"tests/test_in_backward.py": [
+"tests/test_in_backward.py::test_a_scanned_step_holds_no_more_than_a_layer_at_a_time[sm90-float32]"
+],
 "tests/test_indexer_training.py": [
 "tests/test_indexer_training.py::test_padding_the_model_inputs_mask_leaves_out_counts_no_query[sparse-4]"
 ],
@@ -1915,6 +1921,9 @@
 "tests/test_inference.py::test_an_lm_run_over_a_source_stops_at_its_end_of_sequence_ids",
 "tests/test_inference.py::test_every_saved_text_kind_constructs_through_its_own_task_class[make_block_run-BlockGeneration-prompt1-3]",
 "tests/test_inference.py::test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images"
+],
+"tests/test_inference_sampling.py": [
+"tests/test_inference_sampling.py::test_cached_generation_records_the_transformers_filtered_distribution[sampling0]"
 ],
 "tests/test_inference_tasks.py": [
 "tests/test_inference_tasks.py::test_a_task_moves_onto_a_mesh_with_the_variables_it_holds"
@@ -2161,8 +2170,8 @@
 "tests/test_linear_attention.py::test_the_fused_step_compiles_within_each_gpus_resources[sm120]",
 "tests/test_linear_attention.py::test_the_fused_step_compiles_within_each_gpus_resources[sm80]",
 "tests/test_linear_attention.py::test_the_fused_step_compiles_within_each_gpus_resources[sm89]",
-"tests/test_linear_attention.py::test_the_fused_step_compiles_within_each_gpus_resources[sm90]",
-"tests/test_linear_attention.py::test_the_layer_decodes_as_it_prefills"
+"tests/test_linear_attention.py::test_the_layer_decodes_as_it_prefills",
+"tests/test_linear_attention.py::test_the_masked_conv_matches_the_token_scan[False-left padding]"
 ],
 "tests/test_live_bridge.py": [
 "tests/test_live_bridge.py::test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it"
@@ -2320,10 +2329,10 @@
 "tests/test_mixers.py": [
 "tests/test_mixers.py::test_a_decoder_of_no_compute_dtype_over_bfloat16_weights_decodes[qsa_attention-True]",
 "tests/test_mixers.py::test_a_kind_selects_the_mixer_its_layers_run",
-"tests/test_mixers.py::test_a_packed_row_computes_what_its_documents_compute_alone[deepseek_v4]",
 "tests/test_mixers.py::test_a_packed_row_computes_what_its_documents_compute_alone[kpool_sparse_attention]",
 "tests/test_mixers.py::test_a_packed_row_computes_what_its_documents_compute_alone[mamba]",
-"tests/test_mixers.py::test_a_packed_row_computes_what_its_documents_compute_alone[qsa_attention]",
+"tests/test_mixers.py::test_a_packed_row_computes_what_its_documents_compute_alone[mla]",
+"tests/test_mixers.py::test_a_packed_row_of_kpool_attention_without_tails_computes_what_its_documents_compute_alone",
 "tests/test_mixers.py::test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does[csa2]",
 "tests/test_mixers.py::test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does[csa]",
 "tests/test_mixers.py::test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does[hca]",
@@ -2494,7 +2503,7 @@
 "tests/test_mosaic_toolkit.py::test_a_quantized_stage_converts_into_the_tile_its_products_read[sm80-int8-unscaled]"
 ],
 "tests/test_mtp.py": [
-"tests/test_mtp.py::test_the_term_adds_the_weighted_mean_depth_cross_entropy[mean_stream_trunk]"
+"tests/test_mtp.py::test_the_term_adds_the_weighted_mean_depth_cross_entropy[plain_trunk]"
 ],
 "tests/test_multimodal_model.py": [
 "tests/test_multimodal_model.py::test_a_drawn_site_is_on_par_with_its_reference[llama4]",
@@ -2605,6 +2614,9 @@
 "tests/test_norm_swiglu.py::test_rms_variants_and_every_gradient[True-False-float16-bfloat16]",
 "tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[float16-repeated]",
 "tests/test_norm_swiglu.py::test_stream_seam_takes_the_add_and_the_stream_cotangent[shape0-float32-False]"
+],
+"tests/test_online_loader.py": [
+"tests/test_online_loader.py::test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes[memory-processes-map]"
 ],
 "tests/test_optim.py": [
 "tests/test_optim.py::test_a_scheduled_rate_is_as_near_float64_as_optaxs[linear]",
@@ -2966,7 +2978,7 @@
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-qwen3.5-27b-gdn-bfloat16-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-qwen3.5-27b-gdn-bfloat16-training-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-qwen3.5-27b-gdn-bfloat16-training]",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-a write gate-bfloat16-forward-variant-1]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-a write gate-bfloat16-forward-variant-0]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-kimi-linear-kda-bfloat16-forward-variant-0]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-nemotron-h-4b-ssd-bfloat16-forward-variant-0]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-qwen3.5-27b-gdn-bfloat16-forward-packed]",
@@ -2989,8 +3001,8 @@
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm90-qwen3.5-27b-gdn-bfloat16-training]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm90-qwen3.5-27b-gdn-float32-forward]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm90-qwen3.5-27b-gdn-float32-training-packed]",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm90-qwen3.5-27b-gdn-float32-training]",
-"tests/test_recurrence_mosaic.py::test_the_solve_holds_a_negative_eigenvalue_rules_inverse"
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm90-qwen3.5-27b-gdn-float32-training-variant-two roles]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm90-qwen3.5-27b-gdn-float32-training]"
 ],
 "tests/test_recurrence_mosaic_gradient.py": [
 "tests/test_recurrence_mosaic_gradient.py::test_a_decay_a_key_dimensions_first_token_takes_no_gradient_where_its_sequence_starts_from_none[sm100]",
@@ -3043,6 +3055,9 @@
 "tests/test_recurrence_witness.py": [
 "tests/test_recurrence_witness.py::test_a_grouped_backwards_records_lie_in_their_key_heads_enclosures[keys gated-sm80]",
 "tests/test_recurrence_witness.py::test_an_amperes_inference_forward_is_witnessed_as_its_states_and_output_launches"
+],
+"tests/test_recurrent_sequence_split.py": [
+"tests/test_recurrent_sequence_split.py::test_a_delta_rule_split_over_the_sequence_runs_its_rows_as_whole_ones[kimi delta attention-all_valid]"
 ],
 "tests/test_reference_runs.py": [
 "tests/test_reference_runs.py::test_lm_fine_tune_steps_are_as_exact_as_torch",
@@ -3306,7 +3321,7 @@
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=mamba,precision=bf16-mixed,rows=packed,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=mamba3,precision=32-true,rows=padded,devices=1]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=memory,precision=bf16-mixed,rows=packed,devices=2]",
-"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Online post-training-method=grpo,precision=32-true,devices=1]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Hybrid and state-space models-mixer=short_conv,precision=bf16-mixed,rows=packed,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Online post-training-method=rloo,precision=32-true,devices=2]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Pretrained fine-tuning-precision=32-true,adapter=full,quantization=None,devices=1]",
 "tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[Pretrained fine-tuning-precision=32-true,adapter=lora,quantization=qat,devices=2]",
