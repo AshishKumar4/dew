@@ -8,7 +8,6 @@ import dataclasses
 import hashlib
 import importlib
 import json
-import os
 import shutil
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -18,8 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from lane_environment import without_flags
-from process_support import fresh
+from process_support import device_flags, fresh
 
 from dew._cache import enable_compilation_cache
 from dew.checkpoints import Checkpoints
@@ -84,16 +82,13 @@ def covering(axes: Mapping[str, Sequence]) -> list[dict]:
 
 # --- a scenario's runs, each in a fresh process ------------------------------------------------------------
 
-DEVICES = "--xla_force_host_platform_device_count"
-
-
 def in_fresh_process(module: str, devices: int, function: str, *arguments):
     """`module`'s `function` called on `arguments` (JSON's values) in a fresh process that sees `devices` CPU
-    devices: what it returns (JSON's). A run's device count is its process's, fixed as its backend opens."""
-    flags = f"{without_flags(os.environ.get('XLA_FLAGS', ''), DEVICES)} {DEVICES}={devices}".strip()
+    devices (`process_support.device_flags`, the one way a worker of the suite sets its count): what it
+    returns (JSON's). A run's device count is its process's, fixed as its backend opens."""
     script = (f"import json, sys\nimport {module}\n"
               f"print(json.dumps(getattr({module}, sys.argv[1])(*json.loads(sys.argv[2]))))")
-    return fresh(script, function, json.dumps(arguments), flags=flags, platforms="cpu")
+    return fresh(script, function, json.dumps(arguments), flags=device_flags(devices), platforms="cpu")
 
 
 PAUSE = 1 / 3
@@ -243,7 +238,11 @@ def assert_resumes_onto_its_uninterrupted_run(prepared: Recorded | Called, root:
         assert held.keys() == ran.keys(), set(held) ^ set(ran)
         off = [path for path, value in held.items() if value != ran[path]]
         assert not off, f"{phase.name}: the resumed run's leaves off the uninterrupted run's: {off}"
-        assert counts["train/cache_hits"] > 0, (phase.name, counts)
+        # Every program read from the cache, none compiled again: a program compiled anew over an entry the
+        # cache holds writes no new file (its LRU leaves the key as it is) but counts a miss.
+        missed, hit = counts["train/cache_misses"], counts["train/cache_hits"]
+        assert missed == 0 and hit > 0, (phase.name, counts)
+    # Nothing written after the last logged step either, which its counts do not reach.
     assert not compiled, sorted(compiled)
 
 
