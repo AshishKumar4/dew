@@ -636,8 +636,8 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
 
         current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
     laid = current.get("layout")
-    if isinstance(laid, Mapping) and isinstance(laid.get("fields"), Mapping):
-        fields = laid["fields"]
+    fields = laid.get("fields") if isinstance(laid, Mapping) else None
+    if isinstance(laid, Mapping) and isinstance(fields, Mapping):
         segments = fields.get("segments")
         if isinstance(segments, list | tuple):
             # The layout's segments, each component in today's fields (`earlier_fields`).

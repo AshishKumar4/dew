@@ -29,7 +29,7 @@ import numpy as np
 from typing_extensions import get_protocol_members
 
 from dew import _records
-from dew._records import JSON
+from dew._records import EARLIER_DESCRIPTIONS, EARLIER_LAYOUTS, JSON
 from dew.data.text import HFTokenizer, Offsets, Tokenizer
 from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
@@ -2263,9 +2263,8 @@ def earlier_described(value: JSON) -> JSON:
     describe by a class it was before (`dew._records.EARLIER_LAYOUTS`, in a description's dotted spelling)
     described as the `SegmentLayout` it is now: the description of its form's layout by default, its own
     fields over it. A configuration is JSON in a string (`dew.data.plan.StepIdentity`), read and written
-    back as the plan writes one, so a position saved before the classes became one resumes exactly. The
-    reader of those descriptions, which a plan's comparison calls (`dew.data.plan.Plan.check`)."""
-    from dew._records import EARLIER_LAYOUTS
+    back as the plan writes one, so a position saved before the classes became one resumes exactly.
+    Registered as this module is imported (`dew._records.EARLIER_DESCRIPTIONS`)."""
     from dew.data.plan import structured
 
     forms = {named.replace(":", "."): fields for named, fields in EARLIER_LAYOUTS.items()}
@@ -2273,29 +2272,26 @@ def earlier_described(value: JSON) -> JSON:
              "joint": SegmentLayout.joint_row}
 
     def described(held: JSON) -> JSON:
-        if isinstance(held, list):
-            return [described(entry) for entry in held]
-        if isinstance(held, str):
-            if not any(named in held for named in forms):
+        match held:
+            case list():
+                return [described(entry) for entry in held]
+            case str() if any(named in held for named in forms) and held.startswith("{"):
+                return json.dumps(described(json.loads(held)), sort_keys=True)
+            case {"class": str(named), **entries} if named in forms:
+                laid = dict(forms[named])
+                form = str(laid.pop("form"))
+                base = structured(built[form](**laid))
+                if not isinstance(base, Mapping):
+                    raise TypeError(f"a layout is described as a mapping, not {base!r}")
+                return {**base, **{name: described(entry) for name, entry in entries.items()}}
+            case dict():
+                return {name: described(entry) for name, entry in held.items()}
+            case _:
                 return held
-            try:
-                parsed = json.loads(held)
-            except json.JSONDecodeError:
-                return held
-            return json.dumps(described(parsed), sort_keys=True)
-        if not isinstance(held, Mapping):
-            return held
-        entries = {name: described(entry) for name, entry in held.items()}
-        named = entries.get("class")
-        if not isinstance(named, str) or named not in forms:
-            return entries
-        laid = dict(forms[named])
-        form = laid.pop("form")
-        base = structured(built[str(form)](**laid))
-        if not isinstance(base, Mapping):
-            raise TypeError(f"a layout is described as a mapping, not {base!r}")
-        return {**base, **{name: entry for name, entry in entries.items() if name != "class"}}
     return described(value)
+
+
+EARLIER_DESCRIPTIONS.append(earlier_described)
 
 
 def per_question(layout: Layout | None) -> TypeGuard[SegmentLayout]:

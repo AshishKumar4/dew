@@ -23,6 +23,7 @@ from dew._hashing import array_header
 from dew._position import PER_SHARE, PlanChanged, unplaced
 from dew._records import (
     ADDED,
+    EARLIER_DESCRIPTIONS,
     JSON,
     earlier_spelling,
     json_value,
@@ -30,7 +31,6 @@ from dew._records import (
     moved_paths,
     moved_spelling,
     record,
-    strings_of,
 )
 from dew._stated import Unestablished, stated
 from dew.data.compilation import checkout_now
@@ -67,6 +67,16 @@ DataResume = Literal["relaxed", "exact"]
 reads on at the saved position where the plan makes the same rows, a source or step of no identity taken as
 unchanged, and starts the data again where it differs, naming what differs (`PlanChanged`); exact refuses
 any difference, and a source or step it cannot check."""
+
+
+def _read_saved(saved: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved data plan in the shapes Dew describes now: its classes by the paths they have now
+    (`moved_paths`, row 5996), and descriptions of classes their packages read as they are now
+    (`EARLIER_DESCRIPTIONS`, row 6140)."""
+    read = record(moved_paths(json_value(saved, "saved data plan")), "saved data plan")
+    for earlier in EARLIER_DESCRIPTIONS:
+        read = record(earlier(read), "saved data plan")
+    return read
 
 
 class PlanOrderChanged(PlanChanged):
@@ -1002,12 +1012,7 @@ class Plan:
                   ) -> tuple[str, ...]:
         """`check` of all but the version and the rules, the changed environment and members returned; the
         saved plan's classes by the paths they have now (`moved_paths`, row 5996)."""
-        saved = record(moved_paths(json_value(saved, "saved data plan")), "saved data plan")
-        if any("dew.decision.layout." in text for text in strings_of(saved)):
-            # A decision layout its steps describe by a class it was before (row 6140).
-            from dew.decision.layout import earlier_described
-
-            saved = record(earlier_described(saved), "saved data plan")
+        saved = _read_saved(saved)
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "relaxed":
             raise PlanChanged(
                 ("exact",),
