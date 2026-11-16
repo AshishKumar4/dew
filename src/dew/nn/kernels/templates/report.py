@@ -887,7 +887,7 @@ def _proposing(entries: list[tuple[tuple[str, Hashable], Refused]]) -> Iterator[
     with _GUARD:
         proposed = dict(registry.refused)
     for identity, kernel in entries:
-        proposed[identity] = proposed.get(identity, frozenset()) | {kernel}
+        proposed[identity] = _joined(proposed.get(identity, frozenset()) | {kernel})
     # A replacement's records reach the registry and a `recording` only once it is kept (`_commit`).
     proposal = Recorded()
     token, held = _SCOPE.set(_Registry(refused=proposed)), _RECORDING.set((proposal,))
