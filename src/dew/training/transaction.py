@@ -485,6 +485,18 @@ class Applied:
                                    opt_state=opt_state)
 
 
+def _collections_kept(finite: jax.Array, numerical: TrainState, state: TrainState,
+                      written: Variables | None) -> TrainState:
+    """`numerical` with the forward's collections it wrote back (`written`, a batch norm's statistics) as
+    `state` held them where the step, with no loss scale, is not `finite`, by its attempt or its update
+    (training.md, a step that is not finite)."""
+    if written is None:
+        return numerical
+    kept = {name: _chosen(finite, numerical.variables[name], state.variables[name])
+            for name in dicts(written)}
+    return dataclasses.replace(numerical, variables={**numerical.variables, **kept})
+
+
 def _unfinite_layer(runs: Sequence[jax.Array]) -> jax.Array:
     """The highest-numbered layer whose gradient held a non-finite value, of `runs`' per-layer counts in
     the model's order, the layers numbered across them: the first the backward's walk met; -1 for none."""
@@ -1298,12 +1310,8 @@ class Transaction:
             numerical = dataclasses.replace(numerical, accumulation=previous)
         inspected = {**inspected, **self.watched_summaries(aux, probed)}
         finite = finite & native_finite
-        if scale is None and not holding and aux.variables is not None:
-            # A step with no loss scale that is not finite, by its attempt or its update, writes back none of
-            # its forward's collections (a batch norm's statistics) (training.md, a step that is not finite).
-            kept = {name: _chosen(finite, numerical.variables[name], state.variables[name])
-                    for name in dicts(aux.variables)}
-            numerical = dataclasses.replace(numerical, variables={**numerical.variables, **kept})
+        if scale is None and not holding:
+            numerical = _collections_kept(finite, numerical, state, aux.variables)
         if scale is not None:
             accepted = finite & _all_finite(checked(numerical))
         elif holding:
