@@ -41,6 +41,7 @@ def bounded(tree) -> jax.Array:
     """Whether every floating leaf of `tree` is finite with no magnitude past `MAGNITUDE_BOUND`: one
     max-reduction, which cannot overflow and is false for a value that is not a number, so it holds the
     finiteness check too (training.md, a step that is not finite)."""
-    flags = [jnp.max(jnp.abs(leaf)) <= MAGNITUDE_BOUND for leaf in jax.tree.leaves(tree)
-             if _inexact(leaf) and leaf.size]
+    # Read in float32 at least: a half dtype's bound is its own infinity, which an infinity meets.
+    flags = [jnp.max(jnp.abs(leaf)).astype(jnp.promote_types(leaf.dtype, jnp.float32)) <= MAGNITUDE_BOUND
+             for leaf in jax.tree.leaves(tree) if _inexact(leaf) and leaf.size]
     return jnp.logical_and.reduce(jnp.stack(flags)) if flags else jnp.asarray(a=True)

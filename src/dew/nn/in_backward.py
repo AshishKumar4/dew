@@ -56,12 +56,14 @@ class InBackward:
     `update(path, index, gradient, weights, moments)` is the step's optimizer update of one layer: the
     layer `index` of the run at `path` (the run's module path in the model), its `gradient` and
     `weights` (the masters where the step keeps narrow copies), and its `moments` by collection; it returns
-    the moved weights and moments. `moments` names the collections of the optimizer's moments the step
+    the moved weights and moments, and whether the update formed (its learning rates finite, and the moved
+    weights where the step reads its formed update, `dew.optim.OptimConfig.checks_updates`), the weights
+    kept where it did not. `moments` names the collections of the optimizer's moments the step
     added. `handled` records each run's path as the model traces it in the plan, so the step reads those
     runs' state off the backward."""
 
     update: Callable[[tuple[str, ...], jax.Array, Tree, Tree, Mapping[str, Tree]],
-                     tuple[Tree, dict[str, Tree]]]
+                     tuple[Tree, dict[str, Tree], jax.Array]]
     moments: tuple[str, ...]
     handled: list[tuple[str, ...]] = dataclasses.field(default_factory=list)
 
@@ -167,21 +169,24 @@ def _norms(gradient) -> tuple[jax.Array, jax.Array]:
     return squares, jnp.sum(jnp.stack([jnp.sum(~jnp.isfinite(leaf)) for leaf in leaves])).astype(jnp.float32)
 
 
-def _passed_down(dx, tripped: jax.Array):
-    """The cotangent a run hands the layers below it: not finite where it held a layer (`tripped`), so the
-    walk's latch holds across runs as data the backward carries, every layer below gated on its own
-    gradient, which is then not finite (`gated`)."""
-    return jax.tree.map(lambda leaf: jnp.where(tripped, jnp.full_like(leaf, jnp.nan), leaf), dx)
+def _passed_down(cotangent, tripped: jax.Array):
+    """A cotangent a run hands what it read (its input and every differentiated shared input, an encoder's
+    context among them): not finite where it held a layer (`tripped`), so the walk's latch holds across
+    runs as data the backward carries, every layer reached below gated on its own gradient, which is then
+    not finite (`gated`)."""
+    return jax.tree.map(lambda leaf: jnp.where(tripped, jnp.full_like(leaf, jnp.nan), leaf), cotangent)
 
 
 def _layer_update(update: Callable, finite: jax.Array | None, tripped: jax.Array, gradient, held, moments,
                   bad: jax.Array):
     """One layer's update as the walk takes it: as it is where no step's finiteness gates the walk
     (`gated`), else gated (`_gated_layer`) on the loss's finiteness, the walk's latch (`tripped`) and the
-    layer's own gradient finite within the magnitude bound (`bounded`, counted as not finite past it). The
-    layer's weights, moments, non-finite count and the latch after it."""
+    layer's own gradient finite within the magnitude bound (`bounded`, counted as not finite past it), its
+    weights written where its update formed (`InBackward.update`). The layer's weights, moments, non-finite
+    count and the latch after it."""
     if finite is None:
-        return (*update(gradient, held, moments), bad, tripped)
+        moved, moved_moments, _ = update(gradient, held, moments)
+        return moved, moved_moments, bad, tripped
     bad = bad + (~bounded(gradient)).astype(bad.dtype)
     moved, moved_moments, bad, written = _gated_layer(update, finite & (bad == 0) & ~tripped, gradient, held,
                                                       moments, bad)
@@ -191,12 +196,14 @@ def _layer_update(update: Callable, finite: jax.Array | None, tripped: jax.Array
 def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments, bad: jax.Array):
     """One layer's update in a step that may not be finite (`gated`): where `ok` (the loss finite, the
     layer's gradient finite and bounded, `dew.nn.finite.bounded`) by its gradient, else by a
-    zero gradient, its weights kept as they were. The layer's moved weights, moments and non-finite count,
-    and whether it was written."""
+    zero gradient, its weights kept as they were, as they are where its update did not form (a learning
+    rate not finite), its moments stepped as a commit's are. The layer's moved weights, moments and
+    non-finite count, and whether it was written."""
     gradient = zeroed_unless(ok, gradient)
-    moved, moved_moments = update(gradient, held, moments)
-    moved = jax.tree.map(lambda new, old: jnp.where(ok, new, old), moved, held)
-    return moved, moved_moments, bad, ok
+    moved, moved_moments, formed = update(gradient, held, moments)
+    written = ok & formed
+    moved = jax.tree.map(lambda new, old: jnp.where(written, new, old), moved, held)
+    return moved, moved_moments, bad, written
 
 
 def _pulled(back: Callable, dx):
@@ -308,7 +315,7 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
                  jnp.asarray(a=False))
         (dx, moved, moments, sumsq, nonfinite, dshared, tripped), _ = jax.lax.scan(
             body, start, jnp.arange(count), reverse=True)
-        dx = _passed_down(dx, tripped)
+        dx, dshared = _passed_down((dx, dshared), tripped)
         written_norms = {"sumsq": sumsq.astype(norms["sumsq"].dtype),
                          "nonfinite": nonfinite.astype(norms["nonfinite"].dtype)}
         # The copies' cotangent is nothing the step reads (`Transaction.split_planned` takes the masters').

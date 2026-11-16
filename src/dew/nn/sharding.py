@@ -247,9 +247,12 @@ def layer_norms(leaf: jax.Array, stacked: int, floor: float = 0.0) -> jax.Array:
     """Each stored layer's norm of `leaf`, a leaf whose first `stacked` dimensions stack its layers
     (`layers_of`), over the layer's own values and kept against its layers' axes, at least `floor`: the whole
     leaf's where it stacks none, as an optimizer rule reads one layer. The values flattened to one axis, as
-    `optax.safe_norm` takes one axis or two."""
+    `optax.safe_norm` takes one axis or two, each scaled by its largest magnitude first, so a layer whose
+    values are finite has a finite norm though their squares would pass float32 (a parameter of 1e20)."""
     flat = leaf.reshape((*leaf.shape[:stacked], -1))
-    held = optax.safe_norm(flat, floor, axis=-1, keepdims=True)
+    largest = jnp.max(jnp.abs(flat), axis=-1, keepdims=True)
+    scale = jnp.where(largest > 0, largest, jnp.ones_like(largest))
+    held = jnp.maximum(optax.safe_norm(flat / scale, 0.0, axis=-1, keepdims=True) * scale, floor)
     return held.reshape((*leaf.shape[:stacked], *(1,) * (leaf.ndim - stacked)))
 
 

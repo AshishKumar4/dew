@@ -1910,16 +1910,33 @@ def test_adams_default_first_moment_keeps_its_promoted_dtype():
     assert state.mu["w"].dtype == jnp.float32
 
 
-@pytest.mark.parametrize("optimizer,opts", [("adam", {"eps": 0.0}), ("adamw", {"eps": 0.0}),
-                                            ("lamb", {"eps": 0.0}), ("laprop", {"eps": 0.0}),
-                                            ("muon", {"eps": 0.0})],
-                         ids=["adam", "adamw", "lamb", "laprop", "muon"])
-def test_an_optimizer_dividing_with_no_guard_is_refused_at_build(optimizer, opts):
-    """An optimizer whose division by a moment or a norm has no guard (its eps, and eps_root where it has
-    one, zero) is refused as it is built: a parameter no batch has moved yet, its moments zero, would
-    form 0/0, a step finite in every input made not finite (training.md, a step that is not finite)."""
-    with pytest.raises(ValueError):
-        OptimConfig(optimizer=optimizer, learning_rate=1e-3, optimizer_opts=opts).build(None)
+@pytest.mark.parametrize(("config", "checks"), [
+    (OptimConfig(optimizer="adamw", learning_rate=3e-4), False),
+    (OptimConfig(optimizer="adam", learning_rate=1e-3, state_dtype="int8"), False),
+    (OptimConfig(optimizer="lamb", learning_rate=1e-3), False),
+    (OptimConfig(optimizer="laprop", learning_rate=1e-3), False),
+    (OptimConfig(optimizer="muon", learning_rate=2e-2), False),
+    (OptimConfig(optimizer="adamw", learning_rate=Cosine(peak_value=1e-3, warmup_steps=10)), False),
+    (OptimConfig(optimizer="adam", learning_rate=1.0, b1=0.9, b2=0.1, optimizer_opts={"eps": 1e-21}), True),
+    (OptimConfig(optimizer="adam", learning_rate=1.0, b2=0.0, optimizer_opts={"eps": 1e-20}), True),
+    (OptimConfig(optimizer="adam", learning_rate=1e-3, optimizer_opts={"eps": 0.0}), True),
+    (OptimConfig(optimizer="laprop", learning_rate=1e-3, optimizer_opts={"eps": 0.0}), True),
+    (OptimConfig(optimizer="adamw", learning_rate=1e37), True),
+    (OptimConfig(optimizer="muon", learning_rate=2e-2, optimizer_opts={"adaptive": True}), True),
+    (OptimConfig(optimizer="gauss_newton", learning_rate=1.0), True),
+    (OptimConfig(optimizer="optax:sgd", learning_rate=1e-3), True),
+], ids=["defaults", "8-bit", "lamb", "laprop", "muon", "cosine", "b2 under b1 squared, eps 1e-21",
+        "b2 zero, eps 1e-20", "adam eps zero", "laprop eps zero", "rate past the bound", "adaptive muon",
+        "gauss-newton", "an optax factory"])
+def test_a_step_reads_its_formed_update_only_where_its_bound_cannot_cover_a_bounded_gradient(config, checks):
+    """Whether a step reads its formed update finite, decided as the optimizer is built
+    (`OptimConfig.checks_updates`): Dew's defaults, each optimizer's, a schedule's and 8-bit moments', whose
+    bound times their peak rate stays within float32, read nothing; a tiny eps beside b2 at most b1 squared,
+    a guard of zero, a rate past the bound, an option or an optimizer whose bound Dew does not state read it,
+    and no configuration is refused. Main refused a guard of zero at build and took every other update
+    unread (the round-2 head review's F6)."""
+    assert config.checks_updates() is checks
+    config.build(10)
 
 
 def test_lambs_trust_ratio_is_finite_where_the_update_is_tiny_beside_the_parameters():
@@ -1958,3 +1975,32 @@ def test_a_rate_injected_inside_an_injected_factory_reports_the_factorys():
         _, state = wrapped.update({"w": jnp.ones(3)}, state, params)
     # The rate the second update stepped at: the schedule after one update.
     np.testing.assert_array_equal(np.asarray(learning_rate(state)), np.asarray(schedule(1)))
+
+
+def test_an_injected_guard_is_its_wrappers_and_a_built_one_of_zero_is_refused():
+    """An optimizer whose guard an injected wrapper hands it each update (`inject_hyperparams(scale_by_laprop)
+    (eps=1e-20)`) builds and steps, the guard a traced value its user set, where the refusal read it as a
+    Python number and the step's trace failed (the head review's F1); one built with a guard of zero is
+    refused."""
+    from dew.laprop import scale_by_laprop
+
+    wrapped = optax.inject_hyperparams(scale_by_laprop)(eps=1e-20)
+    params = {"w": jnp.ones(3)}
+    updates, _ = jax.jit(wrapped.update)({"w": jnp.ones(3)}, wrapped.init(params), params)
+    assert np.all(np.isfinite(np.asarray(updates["w"])))
+    with pytest.raises(ValueError):
+        scale_by_laprop(eps=0.0)
+
+
+def test_a_layers_norm_is_finite_where_its_values_squares_pass_float32():
+    """A layer's norm (`layer_norms`, LAMB's and AGC's) is finite where every value is and their squares
+    pass float32: parameters of 1e20 hold a norm of 2e20, where their squares made it infinite and LAMB's
+    update with it (the head review's F5)."""
+    from dew.nn.sharding import layer_norms
+    from dew.optim import scale_by_trust_ratio
+
+    params = {"w": jnp.full((4,), 1e20, jnp.float32)}
+    assert float(layer_norms(params["w"], 0)[0]) == float(np.float32(2e20))
+    scaled, _ = scale_by_trust_ratio().update({"w": jnp.full((4,), 1e-3, jnp.float32)},
+                                              scale_by_trust_ratio().init(params), params)
+    assert np.all(np.isfinite(np.asarray(scaled["w"])))

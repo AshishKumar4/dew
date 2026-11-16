@@ -174,8 +174,10 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: frozenset[int],
         return ["function", module, value.__qualname__, _code(value.__code__), *_main(module),
                 reads(value, at, known, walking)]
     if dataclasses.is_dataclass(value):
-        # A record of the user's is read by its class's methods, which name what its fields hold.
-        held = _method_names(type(value)) if _sources.own_source(type(value).__module__) else names
+        # A record is read by what reads it and, of the user's, by its class's methods too, which name
+        # what its fields hold.
+        own = _method_names(type(value)) if _sources.own_source(type(value).__module__) else frozenset()
+        held = None if names is None and not own else (names or frozenset()) | own
         return ["record", again(type(value), at=at),
                 [[field.name, _stated(getattr(value, field.name, None), f"{at}.{field.name}", known, walking,
                                       held)]

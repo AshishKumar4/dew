@@ -417,6 +417,14 @@ def _held_in_copies(opt_state, params) -> bool:
     return all(np.ndim(leaf) == 0 for leaf in jax.tree.leaves(rest))
 
 
+def _without(tree, cut):
+    """`tree` without the leaves `cut` holds, a tree of some of its branches: its other branches as they
+    are."""
+    if not isinstance(tree, Mapping) or not isinstance(cut, Mapping):
+        return {}
+    return {name: _without(value, cut[name]) if name in cut else value for name, value in tree.items()}
+
+
 def _nested(path: tuple[str, ...], subtree) -> Variables:
     """`subtree` under `path`."""
     for name in reversed(path):
@@ -821,7 +829,8 @@ class Transaction:
     """
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
                  record: bool = False, resting: Mapping[str, object] | None = None,
-                 inspection: Inspection | None = None, examples: int | None = None, placed=None):
+                 inspection: Inspection | None = None, examples: int | None = None, placed=None,
+                 checks_updates: bool = True):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -848,6 +857,8 @@ class Transaction:
         """
         self.resting = dict(resting or {})
         self.placed = placed
+        # Whether a step reads its formed update finite (`dew.optim.OptimConfig.checks_updates`).
+        self.checks_updates = checks_updates
         self.record = record
         # What a sampled step summarizes at its commit (`Committed.inspected`); None in every other step.
         self.inspection = inspection
@@ -1139,7 +1150,11 @@ class Transaction:
             if gated:
                 for rate in learning_rates(opt_state):
                     formed = formed & jnp.isfinite(rate)
-                formed = formed & all_finite(update) if solves_equations(current.opt_state) else formed
+                if self.checks_updates or solves_equations(current.opt_state):
+                    # The runs that updated in their backward checked their own (`planned`); their part
+                    # of this update is read by nothing.
+                    read = update if applied is None else _without(update, applied.params)
+                    formed = formed & all_finite(read)
             update = zeroed_unless(native_finite & formed, update) if gated else update
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
             # rescale, a bounded group's clamp) acts on them (`stepped`).
@@ -1406,14 +1421,20 @@ class Transaction:
                                   lambda index, _: copies[index])
             descent = layer(jax.tree.map(_descending, gradient, weights))
             moved, after = optimizer_update(self.optimizer, descent, before, held, progress=progress)
+            # The update forms where its learning rates are finite (an injected one a user set infinite),
+            # and, where the step reads its formed update, it is: the layer's weights it moves are.
+            formed = functools.reduce(jnp.logical_and, map(jnp.isfinite, learning_rates(after)),
+                                      jnp.asarray(a=True))
+            stepped_held = stepped(held, moved, before, after, post_step_order(self.optimizer, held))
+            formed = formed & all_finite(stepped_held) if self.checks_updates else formed
             # Each copy's new value where the update leaves it in the state it read, which the update keeps
             # laid out as it was: a group with no parameter in this run holds placeholders alone there.
             laid = _laid_as(held)
             slots = [slot for copy in copies
                      for slot, node in enumerate(jax.tree.leaves(before, is_leaf=laid)) if node is copy]
             stepped_copies = [jax.tree.leaves(after, is_leaf=laid)[slot] for slot in slots]
-            return (unlayer(stepped(held, moved, before, after, post_step_order(self.optimizer, held))),
-                    {name: unlayer(copy) for name, copy in zip(names, stepped_copies, strict=True)})
+            return (unlayer(stepped_held), {name: unlayer(copy) for name, copy in zip(names, stepped_copies,
+                                                                                    strict=True)}, formed)
 
         norms = {}
         for path in runs:

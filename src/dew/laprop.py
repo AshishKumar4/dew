@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from dew._moments import bias_corrected, refuse_zero_guard
+from dew._moments import bias_corrected
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import layer_norms, layers_of
 
@@ -50,7 +50,6 @@ def scale_by_laprop(b1: float = 0.9, b2: float = 0.999, eps: float = 1e-20) -> o
     Adam divides the momentum of the gradients; LaProp takes the momentum of the divided ones. Both bias
     corrections form in double (`bias_corrected`). The state is `optax.ScaleByAdamState`'s, its moments in
     float32 at least, as the code keeps them."""
-    refuse_zero_guard(eps, of="LaProp")
 
     def moments(params):
         return jax.tree.map(lambda param: jnp.zeros(param.shape, at_least_fp32(param.dtype)), params)

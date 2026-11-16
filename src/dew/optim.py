@@ -35,7 +35,7 @@ import optax
 import tyro
 from optax.contrib import _muon
 
-from dew._moments import bf16_moments, int8_moments, refuse_zero_guard, scale_by_adam
+from dew._moments import bf16_moments, int8_moments, scale_by_adam
 from dew._records import share
 from dew._schedule_pieces import (
     Horizon,
@@ -323,7 +323,6 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
     (`OptimConfig`'s `ns_group`) and no plan sets yet (row 5889). Each parameter's matrix is its dimension
     numbers' (`muon_weight_dimension_numbers`), or each of its heads' where `per_head` names it
     (`head_widths`)."""
-    refuse_zero_guard(eps, of="Muon")
     coefficients = _coefficients(ns_coeffs, ns_steps)
     algorithm = dot_algorithm(ns_precision)
 
@@ -1087,7 +1086,6 @@ def scale_by_trust_ratio(min_norm: float = 0.0, trust_coefficient: float = 1.0,
 
 def _lamb(learning_rate, b1=0.9, b2=0.999, eps=1e-6, eps_root=0.0, weight_decay=0.0, mask=None):
     """optax.lamb, its trust ratio each stored layer's (`scale_by_trust_ratio`)."""
-    refuse_zero_guard(eps, eps_root, of="LAMB")
     return optax.chain(optax.scale_by_adam(b1=b1, b2=b2, eps=eps, eps_root=eps_root),
                        optax.add_decayed_weights(weight_decay=weight_decay, mask=mask),
                        scale_by_trust_ratio(), optax.scale_by_learning_rate(learning_rate))
@@ -1734,6 +1732,75 @@ def _claims(modules: Sequence[str], leaves: Sequence[str]) -> tuple[str, ...]:
     return (*(f"{glob.escape(module)}/*" for module in modules), *map(glob.escape, leaves))
 
 
+FLOAT32_MAX = float(np.finfo(np.float32).max)
+"""The largest float32, past which a value is not finite."""
+
+
+MUON_BOUND = 1e4
+"""The largest magnitude of Muon's update of a matrix at a unit rate: its orthogonalized momentum's entries,
+at most its largest singular value (about 1.2 after Newton-Schulz's or Polar Express's iteration of a
+Frobenius-normalized matrix), times its shape scaling (`_scale_by_shape`), the root of its larger fan
+(below 2 ** 24) at most, with room."""
+
+UNDERFLOW_BOUND = 1e-18
+"""A bound on the root of what float32 flushes to zero of a second moment's squares (below its smallest
+normal, 1.2e-38): what the moment lacks beside its first, over a guard."""
+
+
+def update_bound(optimizer: str, opts: Mapping[str, object], *, quantized: bool = False) -> float | None:
+    """The largest magnitude of a unit-rate update `optimizer` forms (before its learning rate and decay)
+    from any gradient within `MAGNITUDE_BOUND`, from its constants `opts` over its factory's defaults; None
+    where Dew states none: an Optax factory, a Gauss-Newton solve, a guard of zero (0/0 where a parameter's
+    moments are), a decay of one or more (its bias correction divides by zero), moments in float16, Muon's
+    options its bound does not cover. Moments stored in 8 bits (`quantized`, `dew._moments.int8_moments`)
+    may hold a second moment of zero beside a first that is not, which only the guard bounds.
+
+    Adam's `|m^| / (sqrt(v^) + eps)` is at most `1/sqrt((1 - b2)(1 - b1^2/b2))` where b1 squared is under b2
+    (Cauchy-Schwarz over the moments' weights), Nesterov's adding `1/sqrt(1 - b2)`, twice that for the
+    moments' rounding, times `UNDERFLOW_BOUND / eps` where that is larger, the squares float32 flushed to
+    zero taken from the second moment the bound reads; elsewhere the gradient over its
+    guard, eps or eps_root's root, the bound a tiny eps or b2 at most b1 squared leaves. LAMB's is its Adam's
+    before its trust ratio, which brings the parameters' own norm; LaProp's direction is at most
+    `1/sqrt(1 - b2)` as Adam's, its momentum an average of it; Muon's matrices' `MUON_BOUND`, its other
+    leaves' Adam's."""
+    from dew.nn.finite import MAGNITUDE_BOUND
+
+    make = OPTIMIZER_MAP.get(optimizer)
+    if make is None or make is gauss_newton:
+        return None
+    # MuonClip's factory takes Muon's options through to it.
+    make = _muon_groups if make is _muonclip_groups else make
+    given = {name: parameter.default for name, parameter in inspect.signature(make).parameters.items()
+             if parameter.default is not inspect.Parameter.empty}
+    values = {**given, **opts}
+    if any(str(values.get(name)) == 'float16' for name in ('mu_dtype', 'nu_dtype')):
+        return None
+
+    def bounded(b1, b2, eps, eps_root=0.0, *, momentum: bool = True) -> float | None:
+        if not all(isinstance(value, int | float) for value in (b1, b2, eps, eps_root)):
+            return None
+        guard = max(float(eps), math.sqrt(max(float(eps_root), 0.0)))
+        if guard <= 0 or not (0 <= b1 < 1 and 0 <= b2 < 1):
+            return None
+        if quantized or (momentum and not b1 * b1 < b2):
+            return MAGNITUDE_BOUND / guard
+        ratio = 1 / math.sqrt(1 - b2) if not momentum else (
+            1 / math.sqrt((1 - b2) * (1 - b1 * b1 / b2)) + 1 / math.sqrt(1 - b2))
+        return 2 * ratio * max(1.0, UNDERFLOW_BOUND / guard)
+
+    if make is _muon_groups:
+        covered = (values['ns_coeffs'] in (NEWTON_SCHULZ, 'polar_express') and not values['adaptive']
+                   and values['preconditioning'] == 'frobenius' and values['neuron_beta2'] is None
+                   and values['adam_learning_rate'] is None)
+        adam = bounded(values['adam_b1'], values['adam_b2'], values['eps'], values['adam_eps_root'])
+        rms = values['consistent_rms']
+        scale = 1.0 if not isinstance(rms, int | float) else max(1.0, float(rms))
+        return max(adam, MUON_BOUND * scale) if covered and adam is not None else None
+    if make is laprop:
+        return bounded(values['b1'], values['b2'], values['eps'], momentum=False)
+    return bounded(values['b1'], values['b2'], values['eps'], values['eps_root'])
+
+
 @dataclasses.dataclass(frozen=True)
 class OptimConfig:
     """Holds the optimizer, learning-rate schedule and gradient clipping."""
@@ -2019,6 +2086,26 @@ class OptimConfig:
         rate is the one it steps at."""
         return {group: rates_of(rate, multiplier)
                 for group, (rate, multiplier) in self.grouped_rates().items()}
+
+    def checks_updates(self) -> bool:
+        """Whether a step with no loss scale reads its formed update's finiteness (`Transaction.commit`),
+        decided as the optimizer is built, from its constants: where a bounded gradient (one within
+        `dew.nn.finite.MAGNITUDE_BOUND`, the step's own gate) cannot form a value that is not finite, as
+        Dew's defaults (Adam's eps of 1e-8, b1 squared under b2), no check runs and the update costs
+        nothing more; where its update's bound cannot cover that gradient (a tiny eps, b2 at most b1
+        squared, a rate past what the bound allows, an Optax factory or a solve whose bound Dew does not
+        state), the formed update is read finite, a step skipped only where it is (`update_bound`)."""
+        constants = {name: value for name, value in (('b1', self.b1), ('b2', self.b2)) if value is not None}
+        bound = update_bound(self.optimizer, {**constants, **self.optimizer_opts},
+                             quantized=self.state_dtype == 'int8')
+        # A scheduled b1 (`ParamGroup.b1`) is no constant the bound reads.
+        if bound is None or any(group.b1 is not None for group in self.param_groups):
+            return True
+        # A schedule takes no value past its peak (`ScheduleBase.peak`).
+        peak = max(abs(rate.peak() if isinstance(rate, ScheduleBase) else float(rate)) * multiplier
+                   for rate, multiplier in self.grouped_rates().values())
+        # The parameter's own step, within the largest float with room for the parameter it moves.
+        return not (peak * bound <= FLOAT32_MAX / 4)
 
     def grouped_rates(self) -> dict[str | None, tuple[float | ScheduleBase, float]]:
         """Each of `build`'s solvers' rate and its multiplier, by param group, or under None for the one

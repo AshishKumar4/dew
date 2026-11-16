@@ -21,6 +21,7 @@ from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
 from dew.nn.finite import MAGNITUDE_BOUND
 from dew.objectives import Aux, EMASpec, Objective, Ratio
+from dew.optim import OptimConfig
 from dew.training import Trainer
 
 
@@ -755,6 +756,40 @@ def test_a_step_at_a_learning_rate_that_is_not_finite_is_rejected():
     np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), before[0]["params"]["w"])
 
 
+def _configured_steps(config: OptimConfig, values: list[float]):
+    """`Pushed` stepped with no loss scale under `config`, built over the steps, a step over inputs of each of
+    `values` in turn: each step's weight and whether it was reported finite."""
+    trainer = Trainer(Pushed(), config, key=jax.random.PRNGKey(0))
+    trainer.scheduled(len(values))
+    state = trainer.initial_state()
+    batches = [next(type("Fed", (Inputs,), {"value": value})()) for value in values]
+    step = trainer.compile(state, batches[0])
+    taken = []
+    for batch in batches:
+        state, _, _, finite, _, _ = step(state, batch)
+        taken.append((np.asarray(state.variables["params"]["w"]), bool(finite)))
+    return taken
+
+
+def test_an_update_its_bound_cannot_cover_is_skipped_only_where_it_is_not_finite():
+    """Adam with b2 under b1 squared and a guard of 1e-21, whose bound cannot cover a bounded gradient, so its
+    step reads its formed update (`OptimConfig.checks_updates`): its first step over a gradient of 1e18,
+    whose update is 1, is taken, the weight moved by the rate; with b2 of zero and a guard of 1e-20, a
+    gradient of 1e19 then one of zero divides a first moment of 4.7e18 by the guard, past float32, and that
+    step alone is skipped, its weight as the first left it and reported not finite. The bound refused the
+    first configuration's step, though its update was finite (the round-2 head review's F6, as Main
+    retracted it)."""
+    taken = _configured_steps(OptimConfig(optimizer="adam", learning_rate=1.0, b1=0.9, b2=0.1,
+                                          optimizer_opts={"eps": 1e-21}), [1e18])
+    (weight, finite), = taken
+    assert finite
+    np.testing.assert_allclose(weight, np.full((FEATURES,), -1.0), rtol=1e-6)
+    (first, first_finite), (second, second_finite) = _configured_steps(
+        OptimConfig(optimizer="adam", learning_rate=1.0, b2=0.0, optimizer_opts={"eps": 1e-20}), [1e19, 0.0])
+    assert first_finite and not second_finite and np.all(np.isfinite(first))
+    np.testing.assert_array_equal(second, first)
+
+
 def test_a_window_summing_bounded_gradients_past_the_bound_is_rejected_whole():
     """An optimizer that holds updates back and sums its window (`optax.MultiSteps(..., use_grad_mean=False)`
     of two) hands Adam the sum of two gradients of 1.5e19, each within the bound and their sum past it: the
@@ -773,3 +808,12 @@ def test_a_window_summing_bounded_gradients_past_the_bound_is_rejected_whole():
     for got, want in zip(jax.tree.leaves((state.variables, state.opt_state)), jax.tree.leaves(before),
                          strict=True):
         np.testing.assert_array_equal(np.asarray(got), want)
+
+
+def test_a_half_gradient_that_is_not_finite_is_not_bounded():
+    """A float16 gradient holding an infinity is not within the magnitude bound, read in float32, where the
+    bound read in float16 was its infinity, which an infinity met (the head review's F2)."""
+    from dew.nn.finite import bounded
+
+    assert not bool(bounded({"w": jnp.asarray([1.0, np.inf], jnp.float16)}))
+    assert bool(bounded({"w": jnp.asarray([1.0, 60000.0], jnp.float16)}))

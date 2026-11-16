@@ -82,8 +82,9 @@ class StepSettings[LossT, EffectsT]:
     (`Trainer._settings`): its objective, its optimizer once built (`optimizer`), its layout and device
     mesh, the steps a commit pools (`accumulation`), a custom step, its loss scaler, DiLoCo, whether it
     tunes its kernels, its inspection, the microbatches a pipelined step feeds, whether its steps record
-    what they read, the CUDA generation its first step lowers for in place of compiling it (`lower_for`) and
-    where a CPU-owned run keeps its state (`state_mesh`, the device mesh otherwise)."""
+    what they read, the CUDA generation its first step lowers for in place of compiling it (`lower_for`),
+    where a CPU-owned run keeps its state (`state_mesh`, the device mesh otherwise) and whether its steps
+    read their formed update finite (`checks_updates`)."""
 
     objective: Objective[LossT, EffectsT]
     built_optimizer: optax.GradientTransformation | None
@@ -99,6 +100,9 @@ class StepSettings[LossT, EffectsT]:
     record: bool
     lower_for: str | None
     state_mesh: Mesh
+    checks_updates: bool = True
+    """Whether a step reads its formed update finite (`dew.optim.OptimConfig.checks_updates`): a built
+    transformation's, whose bound Dew does not state, is read."""
 
     @property
     def optimizer(self) -> optax.GradientTransformation:

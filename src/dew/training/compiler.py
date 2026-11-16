@@ -636,7 +636,8 @@ class StepCompiler[L, E]:
                                                         window=settings.accumulation, shape_only=True)
             placement = stepping.shardings(prepared)
             transaction = Transaction(self.objective, settings.optimizer, settings.accumulation, shapes,
-                                      record=settings.record, examples=stepping.shape.examples)
+                                      record=settings.record, examples=stepping.shape.examples,
+                                      checks_updates=settings.checks_updates)
             body = transaction.step(realize=execution.realize, host=True,
                                     frozen=tuple(path for path, _, _ in frozen_trees(state.variables, sites)))
 

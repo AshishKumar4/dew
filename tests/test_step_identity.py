@@ -404,11 +404,15 @@ def test_a_function_step_naming_a_module_is_held_by_what_it_reads_of_it_alike_in
     "    def __call__(self, row):\n        return {**row, 'id': row['id'] + self.settings.delta()}\n\n\n"
     "shifted = Holding()\n",
     "def shifted(row, settings=(helping,)):\n    return {**row, 'id': row['id'] + settings[0].delta()}\n",
-], ids=["a default", "a class attribute", "a container"])
+    "import dataclasses\n\n\n@dataclasses.dataclass(frozen=True)\nclass Settings:\n    modules: tuple\n\n\n"
+    "SETTINGS = Settings((helping,))\n\n\n"
+    "def shifted(row):\n    return {**row, 'id': row['id'] + SETTINGS.modules[0].delta()}\n",
+], ids=["a default", "a class attribute", "a container", "a record of the user's"])
 def test_a_step_reading_a_module_it_holds_holds_what_it_reads_of_it(tmp_path, holder):
     """A step that reads a module of the user's it holds, through a default argument (`settings=helping`),
-    a class attribute (`settings = helping`) or a container (`settings=(helping,)`), holds the attributes it
-    names of it, as one reading it by a
+    a class attribute (`settings = helping`), a container (`settings=(helping,)`) or a record of the
+    user's whose field holds it (`SETTINGS.modules[0]`, the head review's round 2 F7), holds the attributes
+    it names of it, as one reading it by a
     global does: `helping.delta` changed, the step's held code changes. The module was stated by its name
     alone, the step exact across the change (the round-2 review's F4, train 921's review's F9)."""
     (tmp_path / "helping.py").write_text(HELPERS.format(by=1))

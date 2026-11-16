@@ -402,7 +402,8 @@ class Trainer(Generic[Loss, Effects]):
         return StepSettings(self.objective if objective is None else objective, self._optimizer, self.layout,
                             self.device_mesh, self.accumulation,
                             self.step, self.dynamic_scale, self.diloco, self.tune_kernels, self.inspection,
-                            self.microbatches, self.record, self.lower_for, self.state_mesh)
+                            self.microbatches, self.record, self.lower_for, self.state_mesh,
+                            self._config is None or self._config.checks_updates())
 
     # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
@@ -1021,7 +1022,8 @@ class Trainer(Generic[Loss, Effects]):
             return Transaction(objective, self.optimizer, split * self.accumulation, shapes, copies,
                                split=split, record=self.record, resting=resting,
                                examples=self._shape.examples,
-                               inspection=self.inspection if sampled else None, placed=placed).step()
+                               inspection=self.inspection if sampled else None, placed=placed,
+                               checks_updates=self._settings().checks_updates).step()
         # A custom step need not run the objective's loss, which passes a model the run's progress.
         refuse_unpassed_progress(objective, passes=isinstance(self.step, PassesProgress))
         custom = self.step(objective, self.optimizer)
