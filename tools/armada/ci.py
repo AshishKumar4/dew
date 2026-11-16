@@ -2242,22 +2242,22 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     file at a time, each whole, as its floor Python's rows ran it. A file whose rows are all green and
     complete (its whole row, or every group of its cut) takes the times they observed where its record is
     stale (`stale`), or where its tests together took more than `session.KEPT` times what its record sums or
-    less than that sum over it: the record is what the plan weighs each task by and the slow list reads, and a
-    record kept only because its cut still fits read a test of 15 s as 200 s (2026-11-16:
-    test_moe_exchange.py's record summed 601 s against 213 s observed). A group's key holds its tests, not
-    their seconds (`cache_key`), and its cut stays as stored while its groups hold (`session.stored_bounds`),
-    so a refreshed file reruns only the groups whose tests move. A file with a red or missing row keeps its
-    entries, as does a file the verdict did not run, and one the checkout has changed since the verdict's
-    commit, whose rows observed tests it may no longer hold (2026-10-31: train 370's fold replaced a head's 66
-    renamed test ids with main's old ones); a file the checkout no longer has loses them. A file a task's
-    deadline cut off, run whole, takes the times its row observed of the tests it finished (all but the last,
-    which the deadline stopped) where its record lacks them: no green run would ever time it, and the plan
-    cuts it by them, a test it never reached weighing their mean (2026-11-02: base/kernels' test_algebra_laws,
-    recorded nowhere, ran 46 of its ~70 tests and was cut off every run). A reused row (the test cache)
-    carries the times of the run that recorded it. Each train folds main's CI so (the land queue), and nothing
-    else writes the record. A site its file's marks shard (`sites`) keeps its entries: its judge's row times
-    its pooling, no measure of its draws, so its map tasks are weighed by armada's measures of them, never by
-    the record (`site_entries`), and a judge armada did not run is a row of its task's name."""
+    less than that sum over it, by a quarter of `target` at least: the record is what the plan weighs each
+    task by and the slow list reads, and a record kept only because its cut still fits read a test of 15 s as
+    200 s (2026-11-16: test_moe_exchange.py's record summed 601 s against 213 s observed). A group's key holds
+    its tests, not their seconds (`cache_key`), and its cut stays as stored while its groups hold
+    (`session.stored_bounds`), so a refreshed file reruns only the groups whose tests move. A file with a red
+    or missing row keeps its entries, as does a file the verdict did not run, and one the checkout has changed
+    since the verdict's commit, whose rows observed tests it may no longer hold (2026-10-31: train 370's fold
+    replaced a head's 66 renamed test ids with main's old ones); a file the checkout no longer has loses them.
+    A file a task's deadline cut off, run whole, takes the times its row observed of the tests it finished
+    (all but the last, which the deadline stopped) where its record lacks them: no green run would ever time
+    it, and the plan cuts it by them, a test it never reached weighing their mean (2026-11-02: base/kernels'
+    test_algebra_laws, recorded nowhere, ran 46 of its ~70 tests and was cut off every run). A reused row (the
+    test cache) carries the times of the run that recorded it. Each train folds main's CI so (the land queue),
+    and nothing else writes the record. A site its file's marks shard (`sites`) keeps its entries: its judge's
+    row times its pooling, no measure of its draws, so its map tasks are weighed by armada's measures of them,
+    never by the record (`site_entries`), and a judge armada did not run is a row of its task's name."""
     rows = verdict_rows(verdict)
     kept = {node: seconds for node, seconds in record.items() if Path(node.split("::")[0]).is_file()}
     for name, held in rows.items():
@@ -2277,8 +2277,11 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
         own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name
                and session.site_name(node, marked) not in marked}
         took = sum(row_["seconds"] for row_ in held)
+        # Drifted past the cut's own tolerance, and by a quarter of the target at least, so a second's noise in
+        # a light file rewrites nothing.
         recorded_sum, ran_sum = sum(own.values()), sum(observed.values())
-        drifted = max(recorded_sum, ran_sum) > session.KEPT * min(recorded_sum, ran_sum)
+        drifted = (max(recorded_sum, ran_sum) > session.KEPT * min(recorded_sum, ran_sum)
+                   and abs(recorded_sum - ran_sum) > target / 4)
         if drifted or cuts.stale(session, own, observed, took, max(counts, default=1), target):
             kept = {node: seconds for node, seconds in kept.items() if node not in own}
             kept.update({node: round(seconds, 3) for node, seconds in observed.items()})
