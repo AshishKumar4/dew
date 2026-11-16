@@ -1908,8 +1908,10 @@ def _direction_bound(values: Mapping[str, object], dtype, *, quantized: bool, mo
     # too.
     widened = stored == {'float32'}
     smallest = max(float(jnp.finfo(jnp.float32).tiny), 0.0 if widened else float(jnp.finfo(dtype).tiny))
-    guard = max(float(eps), math.sqrt(max(float(eps_root), 0.0)))
-    if guard < smallest or not (0 <= b1 < 1 and 0 <= b2 < 1):
+    # Each guard as the arithmetic holds it: one below its smallest normal rounds or flushes to zero, eps_root
+    # before its root is taken (it is added to the second moment).
+    guard = max(float(eps) if eps >= smallest else 0.0, math.sqrt(eps_root) if eps_root >= smallest else 0.0)
+    if guard <= 0 or not (0 <= b1 < 1 and 0 <= b2 < 1):
         return None
     if quantized or (momentum and not b1 * b1 < b2):
         return MAGNITUDE_BOUND / guard
@@ -1941,9 +1943,12 @@ def _muon_bounds(values: Mapping[str, object], quantized: bool) -> LeafBounds:
     rms = float(rms) if isinstance(rms, int | float) else None
     adam = {**values, 'b1': values['adam_b1'], 'b2': values['adam_b2'], 'eps_root': values['adam_eps_root']}
 
+    # A momentum stored in float16 cannot hold a bounded gradient's average (`_direction_bound`'s rule).
+    momentum_held = str(values.get('mu_dtype')) != 'float16'
+
     def matrix(leaf, number) -> float | None:
         smallest = max(float(jnp.finfo(leaf.dtype).tiny), float(jnp.finfo(jnp.float32).tiny))
-        if not covered or eps < smallest:
+        if not covered or not momentum_held or eps < smallest:
             return None
         return (ROUNDING_ROOM * spectral * shape_scale(leaf, number, rms, math.sqrt)
                 + decay * parameter_bound(leaf.dtype))

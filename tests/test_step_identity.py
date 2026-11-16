@@ -783,3 +783,23 @@ def test_a_function_reading_a_module_by_a_computed_name_is_stated_by_the_whole_m
     before = stated(reading.read, "step")
     held.scale = 2
     assert stated(reading.read, "step") != before
+
+
+def test_a_classs_default_read_through_its_methods_names_is_stated_by_them(tmp_path, monkeypatch):
+    """A dataclass of the user's whose field default is a module of the user's (`settings: object =
+    settings`) and whose method reads an attribute of it (`self.settings.scale`) is stated with that
+    attribute: set at run time, the class's statement changes. The default was stated without the names its
+    methods read, the module by its name alone (the round-4 head review's F2)."""
+    from dew._stated import stated
+
+    settings = tmp_path / f"settings_{uuid4().hex}.py"
+    settings.write_text("scale = 1\n")
+    user = tmp_path / f"user_{uuid4().hex}.py"
+    user.write_text(f"import dataclasses\n\nimport {settings.stem}\n\n\n@dataclasses.dataclass(frozen=True)\n"
+                    f"class Reading:\n    settings: object = {settings.stem}\n\n"
+                    f"    def __call__(self, row):\n        return row + self.settings.scale\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    held, reading = importlib.import_module(settings.stem), importlib.import_module(user.stem)
+    before = stated(reading.Reading, "step")
+    held.scale = 2
+    assert stated(reading.Reading, "step") != before

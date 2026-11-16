@@ -318,9 +318,12 @@ def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, .
     dataclass's or an attrs class's), and its
     metaclass where that is the user's own code too (which runs as the class is made and may set what it
     holds)."""
+    # A default is read through the names the class's methods read of it, as its members are.
+    names = _method_names(held)
     fields: list[JSON] = [
-        [field.name, _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking),
-         _field_part(field.factory, f"{at} ({held.__name__}.{field.name} factory)", known, walking)]
+        [field.name,
+         _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking, names),
+         _field_part(field.factory, f"{at} ({held.__name__}.{field.name} factory)", known, walking, names)]
         for field in _sources.generated_fields(held)]
     maker = type(held)
     made = (_stated(maker, f"{at} ({held.__name__}'s metaclass)", known, walking)
@@ -330,10 +333,11 @@ def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, .
     return entry
 
 
-def _field_part(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
+def _field_part(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...],
+                names: frozenset[str]) -> JSON:
     """A generated field's default or default factory as an identity states it, `"missing"` where it has
     none (`dew._sources.MISSING`)."""
-    return "missing" if value is _sources.MISSING else _stated(value, at, known, walking)
+    return "missing" if value is _sources.MISSING else _stated(value, at, known, walking, names)
 
 
 def _again(value, walking: tuple[int, ...]) -> JSON:

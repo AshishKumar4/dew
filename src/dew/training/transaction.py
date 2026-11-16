@@ -1133,7 +1133,9 @@ class Transaction:
         gradient, opt_state, params = inputs
         update, after = optimizer_update(self.optimizer, gradient, opt_state, params, qk=qk,
                                          statistics=statistics, progress=progress)
-        return all_finite((update if applied is None else _without(update, applied.params), after))
+        # The state without its injected controls, which may be legally infinite (`checked`).
+        read = update if applied is None else _without(update, applied.params)
+        return all_finite((read, _numerical(after)))
 
     def _solved(self, current, update, opt_state, taken: jax.Array) -> tuple[jax.Array, optax.OptState]:
         """Whether a gated step that solves its system (`solves_equations`) takes its `update`, read finite
@@ -1235,10 +1237,12 @@ class Transaction:
             if self.aux_shape.effects is not None:
                 written = write_back(params, self.objective.apply_effects(
                     params, self.effects_tree.unflatten(effects)))
-                # A gated step's forward writes back nothing: its collections (batch statistics) stay.
+                # A gated step's forward writes back nothing where it is rejected, for whatever reason: its
+                # collections (batch statistics) stay, and so does whatever its effects would move (a
+                # router's balancing biases), its parameters among them.
                 params = written if not gated else {
-                    **written, **{name: _chosen(native_finite, value, params[name])
-                                  for name, value in written.items() if name != "params"}}
+                    **written, **{name: _chosen(native_finite & formed, value, params[name])
+                                  for name, value in written.items()}}
             averaged = current.ema
             if self.objective.ema is not None:
                 if averaged is None:
@@ -1496,7 +1500,8 @@ class Transaction:
             # backward (`_Planned.rated`).
             formed = jnp.asarray(a=True)
             if self._reads(state.opt_state):
-                formed = all_finite(formed_from(descent))
+                moved_held, moved_state = formed_from(descent)
+                formed = all_finite((moved_held, _numerical(moved_state)))
                 descent = zeroed_unless(formed, descent)
             stepped_held, after = formed_from(descent)
             # Each copy's new value where the update leaves it in the state it read, which the update keeps

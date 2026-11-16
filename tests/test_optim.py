@@ -1930,16 +1930,16 @@ def test_adams_default_first_moment_keeps_its_promoted_dtype():
     (OptimConfig(optimizer="adamw", learning_rate=1e37), jnp.float32, True),
     (OptimConfig(optimizer="adamw", learning_rate=1e3), jnp.float16, True),
     (OptimConfig(optimizer="muon", learning_rate=2e-2, optimizer_opts={"adaptive": True}), jnp.float32, True),
-    (OptimConfig(optimizer="adam", learning_rate=1e-3, weight_decay=1.0, spared=False), jnp.float32, True),
-    (OptimConfig(optimizer="lamb", learning_rate=1e19), jnp.float32, True),
-    (OptimConfig(optimizer="adamw", learning_rate=3e-4, optimizer_opts={"eps": 1e-50}), jnp.float32, True),
     (OptimConfig(optimizer="laprop", learning_rate=1e-3), jnp.float16, True),
-    (OptimConfig(optimizer="muon", learning_rate=2e-2, optimizer_opts={"eps": 0.0}), jnp.float32, True),
+    (OptimConfig(optimizer="adamw", learning_rate=3e-4, optimizer_opts={"eps": 0.0, "eps_root": 1e-50}),
+     jnp.float32, True),
+    (OptimConfig(optimizer="muon", learning_rate=2e-2, optimizer_opts={"mu_dtype": "float16"}), jnp.float32,
+     True),
 ], ids=["defaults", "defaults in float16", "8-bit", "lamb", "laprop", "muon", "polar express", "cosine",
         "b2 under b1 squared, eps 1e-21", "b2 zero, eps 1e-20", "adam eps zero", "laprop eps zero",
-        "rate past float32's half", "rate past float16's half", "adaptive muon", "coupled decay",
-        "lamb past its parameters' norm", "eps below float32's smallest normal",
-        "laprop's eps below float16's smallest normal", "muon's normalization unguarded"])
+        "rate past float32's half", "rate past float16's half", "adaptive muon",
+        "laprop's eps below float16's smallest normal", "eps_root below float32's smallest normal",
+        "muon's momentum in float16"])
 def test_a_built_optimizer_reads_its_update_only_where_its_bound_cannot_cover_a_bounded_gradient(
         config, dtype, reads):
     """Whether a step reads its formed update finite, decided as Dew's build makes its state

@@ -879,6 +879,93 @@ def test_an_injected_schedules_step_after_a_rejected_one_is_taken():
     assert taken == [True, False, True]
 
 
+def _started_at(value: float):
+    """`Pushed`, its weight starting at `value`."""
+    return type("Started", (Pushed,), {"fresh_variables": lambda self, key, held: {
+        "params": {"w": jnp.full((FEATURES,), value)}}})()
+
+
+def _adam_moments(state):
+    """The first and second moments of the one Adam state `state` holds."""
+    def adam_node(node):
+        return isinstance(node, optax.ScaleByAdamState)
+    adam, = [node for node in jax.tree.leaves(state, is_leaf=adam_node) if adam_node(node)]
+    return np.asarray(adam.mu["w"]), np.asarray(adam.nu["w"])
+
+
+@pytest.mark.parametrize(("config", "start", "value"), [
+    (OptimConfig(optimizer="adam", learning_rate=1e-3, weight_decay=1.0, spared=False), 1e18, 1.8e19),
+    (OptimConfig(optimizer="lamb", learning_rate=1e19), 1e20, 1.0)], ids=["coupled decay", "lamb"])
+def test_a_step_its_bound_cannot_cover_is_rejected_to_the_zero_gradients_step(config, start, value):
+    """A configured step whose optimizer's bound cannot cover a bounded gradient reads its update and the
+    state it leaves: Adam with a coupled decay of 1 over a weight of 1e18, whose second moment the gradient
+    of 1.8e19 plus the decayed weight takes past float32 beside a finite update, and LAMB at a rate of 1e19,
+    whose trust ratio takes its direction to its weights' norm of 1.7e20 and its update past float32. Each
+    step is rejected, its weight as it was, and its moments those of an explicit step of zero gradient
+    (training.md, a step that is not finite). The marker alone was checked before (the round-4 head review's
+    F6), and the coupled decay's step was taken unread, its second moment infinite (the round-3's F2)."""
+    trainer = Trainer(_started_at(start), config, key=jax.random.PRNGKey(0))
+    trainer.scheduled(1)
+    state = trainer.initial_state()
+    params = jax.device_get(state.variables["params"])
+    zero_step = config.build(1)
+    _, expected = zero_step.update({"w": jnp.zeros((FEATURES,))}, zero_step.init(params), params)
+    batch = next(type("Fed", (Inputs,), {"value": value})())
+    advanced, _, _, finite, _, _ = trainer.compile(state, batch)(state, batch)
+    assert not bool(finite)
+    np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), params["w"])
+    moments = _adam_moments(jax.device_get(advanced.opt_state))
+    for got, want in zip(moments, _adam_moments(expected), strict=True):
+        np.testing.assert_array_equal(got, want)
+
+
+def test_a_step_whose_guard_flushes_is_rejected_only_where_its_update_is_not_finite():
+    """AdamW with an eps of 1e-50, which float32 flushes to zero, so its bound covers nothing and its update
+    is read: a zero gradient over zero moments forms 0/0, and that step is rejected, its weight as it was;
+    the next, over a gradient of one, is taken. Its bound was the eps's, and the 0/0 was written unread (the
+    round-3 head review's F4)."""
+    flushed = OptimConfig(optimizer="adamw", learning_rate=1e-3, optimizer_opts={"eps": 1e-50})
+    taken = _configured_steps(flushed, [0.0, 1.0])
+    assert [finite for _, finite in taken] == [False, True]
+    np.testing.assert_array_equal(taken[0][0], np.zeros((FEATURES,)))
+    assert np.all(np.isfinite(taken[1][0])) and np.all(taken[1][0] < 0)
+
+
+def test_an_injected_control_that_is_infinite_does_not_reject_a_step():
+    """A transformation Dew did not build, so every update is read, whose injected clip bound is infinite
+    (`optax.inject_hyperparams(optax.clip)(max_delta=inf)`, legal: no clip) beside SGD: its finite updates
+    are taken, the read reading the optimizer's numbers and not its controls. The read took the whole
+    state and rejected every step (the round-4 head review's F1)."""
+    clipped = optax.chain(optax.inject_hyperparams(optax.clip)(max_delta=math.inf), optax.sgd(0.1))
+    assert [finite for _, finite in _configured_steps(clipped, [1.0, 1.0])] == [True, True]
+
+
+class CountingEffects(Pushed):
+    """`Pushed`, counting each update it commits in its own collection, a post-step effect (`Aux.effects`)."""
+
+    def fresh_variables(self, key, held):
+        return {**super().fresh_variables(key, held), "stats": {"seen": jnp.zeros(())}}
+
+    def loss(self, variables, batch, step):
+        loss, _ = super().loss(variables, batch, step)
+        return loss, Aux({}, effects=jnp.asarray(1.0))
+
+    def apply_effects(self, variables, effects):
+        return {"stats": {"seen": variables["stats"]["seen"] + effects}}
+
+
+def test_a_step_rejected_for_its_update_applies_no_effect():
+    """A step whose gradient is finite and whose update, read (a transformation Dew did not build, a scale
+    of -1e30), is not finite is rejected, and its objective's effects move nothing: its count stays zero.
+    The effects were gated on the gradient alone and counted the rejected step (the round-4 head review's
+    F5)."""
+    trainer = Trainer(CountingEffects(), optax.scale(-1e30), key=jax.random.PRNGKey(0))
+    state = trainer.initial_state()
+    batch = next(type("Fed", (Inputs,), {"value": 1e10})())
+    advanced, _, _, finite, _, _ = trainer.compile(state, batch)(state, batch)
+    assert not bool(finite) and float(advanced.variables["stats"]["seen"]) == 0.0
+
+
 def test_a_window_summing_bounded_gradients_past_the_bound_is_rejected_whole():
     """An optimizer that holds updates back and sums its window (`optax.MultiSteps(..., use_grad_mean=False)`
     of two) hands Adam the sum of two gradients of 1.5e19, each within the bound and their sum past it: the
