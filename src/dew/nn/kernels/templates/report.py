@@ -757,7 +757,7 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
     if not modules:
         return {}
     return {name: (modules[name], binary)
-            for binary in binaries(xla_compiled(lowered, None))
+            for binary in binaries(xla_compiled(lowered, None), spills=True)
             if (name := launch_name(binary.kernel, binary.launch)) in modules}
 
 
@@ -1469,7 +1469,8 @@ class Binary:
     Mosaic GPU kernel's); none where its call states none (a Pallas-Triton kernel's, a build without them)."""
     spilled_in: tuple[str, ...] | None = ()
     """The roles whose code its spill stands in where it spills (`spilled_roles`: `PRODUCER`, `CONSUMERS`),
-    none where it spills none; None where no disassembler listed it (`disassembler`)."""
+    read `decoded` or for its `spills` (`binaries`, certification's), none where it spills none; None where
+    it was not read, or no disassembler listed it (`disassembler`)."""
 
     @property
     def launched(self) -> str | None:
@@ -1484,7 +1485,7 @@ class Binary:
         return bool(self.frame) or any(note.code in SERIALIZED for note in self.notes)
 
 
-def binaries(executable: jax.stages.Compiled, *, decoded: bool = False) -> list[Binary]:
+def binaries(executable: jax.stages.Compiled, *, decoded: bool = False, spills: bool = False) -> list[Binary]:
     """Every Mosaic GPU and Pallas-Triton kernel binary `executable` carries, read from its own serialized
     form: XLA keeps a Mosaic kernel's cubin in its custom call's state (`MosaicGpuKernelProto`), whether this
     compile ran ptxas for it, another thread's program compiled it first (Mosaic compiles a module once a
@@ -1495,25 +1496,26 @@ def binaries(executable: jax.stages.Compiled, *, decoded: bool = False) -> list[
     that set Mosaic's dump settings around itself handed its directory to every other thread's compile and
     removed it under them ('Directory not empty', row 2790), and the settings turn on every dump Mosaic has
     (row 2816). `decoded`, each binary's SASS findings too (`sass_findings`, the compile gate's), each
-    cubin disassembled from a file of its own."""
+    cubin disassembled from a file of its own; `spills`, each spilling binary's roles its spill stands in
+    (`Binary.spilled_in`, certification's: its ladder steps by them), its cubin disassembled alike."""
     runtime = executable.runtime_executable()
     if runtime is None:
         raise ValueError("a compiled program with no runtime executable carries no kernel binaries to read")
-    return _carried(runtime.serialize(), decoded)
+    return _carried(runtime.serialize(), decoded, spills)
 
 
-def _carried(serialized: bytes, decoded: bool = False) -> list[Binary]:
+def _carried(serialized: bytes, decoded: bool = False, spills: bool = False) -> list[Binary]:
     """`binaries`' reading of an executable as XLA serializes it (a program's, or a kernel's compiled alone,
     `compiled_alone`)."""
     found: list[Binary] = []
     for name, proto in _thunk_protos(serialized):
-        found.extend(thunk_kernels(proto, decoded=decoded))
+        found.extend(thunk_kernels(proto, decoded=decoded, spills=spills))
         # XLA's own kernels (its fusions, its Triton GEMMs) carry their cubins too: a template launch's
         # names its launch (`named`).
         kernel = custom_kernel(proto) if LAUNCH_SUFFIX.search(name) else None
         if kernel is not None:
             elf, shared = kernel
-            found.append(dataclasses.replace(_binary(name, elf, decoded), shared=shared))
+            found.append(dataclasses.replace(_binary(name, elf, decoded, spills), shared=shared))
     return found
 
 
@@ -1554,10 +1556,10 @@ def _thunk_protos(serialized: bytes) -> list[tuple[str, bytes]]:
     return found
 
 
-def thunk_kernels(proto: bytes, *, decoded: bool = False) -> list[Binary]:
+def thunk_kernels(proto: bytes, *, decoded: bool = False, spills: bool = False) -> list[Binary]:
     """The kernel binaries of a thunk's serialized proto (`_kernels`), one for each Mosaic GPU call it names:
     a call whose binary is missing would read as a kernel that does not spill, so it raises."""
-    kernels, calls = _kernels(proto, decoded)
+    kernels, calls = _kernels(proto, decoded, spills)
     if len(kernels) != calls:
         raise ValueError(f"a thunk names {calls} Mosaic GPU calls but carries {len(kernels)} kernel binaries")
     return kernels
@@ -1595,7 +1597,7 @@ def proto_fields(message: bytes) -> dict[int, list]:
     return fields
 
 
-def _kernels(message: bytes, decoded: bool = False) -> tuple[list[Binary], int]:
+def _kernels(message: bytes, decoded: bool = False, spills: bool = False) -> tuple[list[Binary], int]:
     """The kernels of each `MosaicGpuKernelProto` within a thunk's serialized proto (a message of jaxlib's
     version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, whose
     `SHARED_BYTES` its launch's dynamic shared memory, whose `CALLER_METADATA` the launch its call carried
@@ -1615,7 +1617,7 @@ def _kernels(message: bytes, decoded: bool = False) -> tuple[list[Binary], int]:
         stated_caller = caller[0].decode() if len(caller) == 1 and isinstance(caller[0], bytes) else None
         notes = tuple(AssemblerNote(*(part[0].decode() for part in (note.get(1, [b""]), note.get(2, [b""]))))
                       for note in map(proto_fields, fields.get(ASSEMBLER_NOTES, [])))
-        return [dataclasses.replace(_binary(name[0].decode(), binary[0], decoded), shared=stated,
+        return [dataclasses.replace(_binary(name[0].decode(), binary[0], decoded, spills), shared=stated,
                                     caller=stated_caller, notes=notes)], 0
     found, calls = [], 0
     for values in fields.values():
@@ -1623,16 +1625,17 @@ def _kernels(message: bytes, decoded: bool = False) -> tuple[list[Binary], int]:
             if value == MOSAIC_TARGET:
                 calls += 1
             elif isinstance(value, bytes):
-                kernels, named = _kernels(value, decoded)
+                kernels, named = _kernels(value, decoded, spills)
                 found += kernels
                 calls += named
     return found, calls
 
 
-def _binary(function: str, elf: bytes, decoded: bool = False) -> Binary:
+def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = False) -> Binary:
     """The `Binary` of the kernel `function` from its cubin `elf`: its `.nv.info` attributes' registers and
-    frame (`REGISTER_COUNT`, `FRAME_SIZE`; a Mosaic module compiles one kernel function), and `decoded` its
-    SASS findings (`sass_findings`)."""
+    frame (`REGISTER_COUNT`, `FRAME_SIZE`; a Mosaic module compiles one kernel function), `decoded` its
+    SASS findings (`sass_findings`), and where it spills, `decoded` or `spills`, the roles its spill stands
+    in (`spilled_roles`)."""
     (sections_at,) = struct.unpack_from("<Q", elf, 0x28)
     entry, count, names = struct.unpack_from("<HHH", elf, 0x3A)
     headers = [struct.unpack_from("<IIQQQQIIQQ", elf, sections_at + index * entry) for index in range(count)]
@@ -1657,8 +1660,7 @@ def _binary(function: str, elf: bytes, decoded: bool = False) -> Binary:
     if REGISTER_COUNT not in stated:
         raise ValueError(f"the binary of {function} states no registers")
     frame = stated.get(FRAME_SIZE, 0)
-    # Listed where its findings are asked or it spills, whose roles the ladder that steps it reads.
-    listing = _listing(elf) if decoded or frame else None
+    listing = _listing(elf) if decoded or (spills and frame) else None
     return Binary(*kernel_of(function), stated[REGISTER_COUNT], frame,
                   sass=(None if listing is None else sass_findings_of(listing)) if decoded else (),
                   spilled_in=(None if listing is None else spilled_roles(listing)) if frame else ())
