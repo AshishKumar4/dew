@@ -139,7 +139,7 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         module = _coded(value.__module__, at)
         return ["class", module, value.__qualname__]
     if isinstance(value, (tuple, list, set, frozenset, Mapping, functools.partial, types.MethodType)) or (
-            not isinstance(value, type) and _sources.generated(type(value))):
+            _sources.generated_instance(value)):
         # A container met again within itself (a mapping one of whose values is that mapping, a registry
         # holding a function that reads it) is a reference back to where the path met it, as a function
         # met again is itself: finite, where walking it recursed past Python's limit and crashed the read
@@ -171,7 +171,7 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         module = _coded(value.__module__, at)
         return ["function", module, value.__qualname__, _code(value.__code__),
                 reads(value, at, known, walking)]
-    if not isinstance(value, type) and _sources.generated(type(value)):
+    if _sources.generated_instance(value):
         # An instance of a class a generator made (a dataclass's, attrs', its validators' among them) by its
         # fields: one unset (an attrs field with no init) is None.
         return ["record", again(type(value), at=at),
@@ -182,6 +182,8 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         return ["native", _plain(key, at)]
     if (parts := _parts(value, at, again)) is not None:
         return parts
+    if (converted := _converter(value, at, again)) is not None:
+        return converted
     raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} has no form an "
                         "identity can state")
 
@@ -313,6 +315,18 @@ def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, .
     # How its generator made it where that departs from the generator's defaults (eq=False, order=True).
     options = _sources.generation_options(held)
     return [*entry, dict(options)] if options else entry
+
+
+def _converter(value, at: str, again: Callable[..., JSON]) -> JSON | None:
+    """An `attrs.Converter` (attrs 24.1 and later) by its converter and how it is called, wherever the walk
+    meets one: a field's own, or one nested in `attrs.converters.pipe` or `optional`'s closure; None for any
+    other value. Unwrapped in a field's own slot alone, a nested one left its step inexact (train 957's
+    review)."""
+    attr = sys.modules.get("attr")
+    converter_type = None if attr is None else vars(attr).get("Converter")
+    if converter_type is None or not isinstance(value, converter_type):
+        return None
+    return ["converter", again(value.converter, at=f"{at}'s converter"), value.takes_self, value.takes_field]
 
 
 def _field(held: type, field: _sources.GeneratedField, at: str, known: Mapping[int, JSON],
