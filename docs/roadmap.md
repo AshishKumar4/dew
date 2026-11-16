@@ -35,6 +35,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - Block-selected attention's other selections as mixers. [6301]
 - Mosaic has no float32 forward at width 256 on Hopper. [6508]
+- The derived forms' Triton decode is 0.36-0.66% slower than the hand forms' on a GH200 at B8 x 32768. [6898]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm. [6030]
 - A Hopper kernel gradient's cluster along its output's columns. [6318]
 - Exact on every path, every edge and every derivative order. [2656]
