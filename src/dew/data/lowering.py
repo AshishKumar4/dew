@@ -1455,8 +1455,8 @@ class _Build:
     def member_records(self, member: Pipeline, index: int) -> int | None:
         """The records the `index`th member of a mix, `member`, reads before it ends (`dew.data.epochs`),
         counted by an indexed read of it (a JSON lines or CSV file's provisioned offset index, a Parquet
-        file's footer); None for one read on without end or of no indexed read, which ends its mix at its first
-        failed pull."""
+        file's footer); None for one read on without end or of no indexed read, which ends its mix at its
+        first failed pull."""
         analyzed = self.lowering.children[index]
         if (isinstance(member.source, Combined) or not member.source.supports("indexed") or analyzed.unending
                 or any(isinstance(stage, Repeat) for stage in member.stages)):
