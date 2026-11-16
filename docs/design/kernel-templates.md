@@ -157,6 +157,8 @@ Auxiliary scans (a normalizer z, LSE pre-passes) are an algebra extension point,
 
 A recurrence's memory is read through its decays within a stated range, within 2^100 of its values: there every form is on par with the recurrence a token at a time (check 1). Past it fp32's own token recurrence holds no such read (4e-6 from float64 at 2^110, 6e-2 at 2^124, its decays subnormal), and no form loses the read to zero: under a decay a head every form reads the memory output-side, `(q S) exp2(g)`, each within 2.5 times the fp32 recurrence's distance from float64 (row 2344); no form carries an exponent past fp32's range. A decay a key dimension's read past the range is unmeasured.
 
+**Its backward's range is its upstream's.** The chunked backward forms each chunk's local scores' gradient `do vᵀ` before the key's product, as fla's does (`chunk_bwd_dqkwg`, which `chunk_gated_delta_rule` and `chunk_simple_gla` call: `ds = dot(do, vᵀ)` into fp32 first, then `dq += dot(ds, k)`; fla 0.5.2 fla/ops/common/chunk_o.py:226-267, 288-329) and mamba_ssm's (`dcb = dot(dout, xᵀ)` first; 2.3.2.post1 mamba_ssm/ops/triton/ssd_chunk_scan.py:828-871). A cotangent of 2^110 through values of 2^30 and a key of 2^-30 is infinite in all three, where the float32 token recurrence, forming `k vᵀ` first, gives 2^110 (row 6656); a cotangent's difference below bf16's precision, or TF32's, is lost in each (row 6655). The contract is finite where its upstream is finite. The owner, 2026-11-16: "what do other frameworks do? Pretty sure no need to pay ANY performance penalties?" So no scaling is paid for the float32 recurrence's range.
+
 ### GEMM
 
 **Product declaration**, the same for every product in every template:
