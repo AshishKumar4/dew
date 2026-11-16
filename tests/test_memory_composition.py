@@ -734,7 +734,8 @@ def test_a_memory_decoder_marks_and_climbs_by_the_paths_it_can_take(capsys):
     memory on the delta rule marks the rule's port's decay, inverse and memory on the recurrence, and
     its chunk scan's carry under an input quantization of its first head, which takes it off the
     recurrence; its ladder takes the rung recomputing the rule's memory alone. Titans' memory marks its
-    carry and its chunks' own values (row 6577), and its ladder has no such rung."""
+    carry and its chunks' own values (row 6577), and its ladder has no such rung: it climbs through
+    `save_dot_except_mlp`, which keeps the chunks, to `full`, the one rung that recomputes them."""
     from jax.ad_checkpoint import print_saved_residuals
     from model_support import TINY_DECODER
 
@@ -779,6 +780,9 @@ def test_a_memory_decoder_marks_and_climbs_by_the_paths_it_can_take(capsys):
     assert set(DELTA_RESIDUALS) <= delta and "all_but_delta_memory" in delta_rungs
     assert CARRY in quantized
     assert {CARRY, CHUNK} <= titans and "all_but_delta_memory" not in titans_rungs
+    # Every rung that changes what its layers keep, in order: `save_dot_except_mlp` keeps the chunks (and the
+    # MLP's names no more), `full` alone recomputes them (train 933 F2: kept alike, the climb skipped one).
+    assert titans_rungs == [None, "minimal", "save_dot_except_mlp", "full"]
 
 
 def test_muon_steps_each_memory_heads_matrices_on_their_own():
