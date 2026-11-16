@@ -238,9 +238,9 @@ class Encoded:
     @property
     def cuts(self) -> dict[str, int]:
         """The tokens each cut removed from the row, by what it cut (`instructions`, `options`,
-        `state`, `context` beside a schema in the row's context), or the characters of a state its row encodes whole (`state_characters`), and
-        `options_alike` where its options' cut left two alike; empty where the row holds its state and
-        its questions whole. Training counts them in
+        `state`, `context` beside a schema in the row's context), or the characters of a state its row
+        encodes whole (`state_characters`), and `options_alike` where its options' cut left two alike;
+        empty where the row holds its state and its questions whole. Training counts them in
         its data counters and a server in its own (`dew.data.mixing.CorpusCounts`), alike."""
         kinds = (("instructions", self.instructions_cut), ("options", self.options_cut),
                  ("state", self.state_cut), ("state_characters", self.state_characters_cut),
