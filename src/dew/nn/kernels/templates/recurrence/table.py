@@ -22,18 +22,19 @@ if TYPE_CHECKING:
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Table:
-    """A forked call's table as the walks take it (`chunk_forward.ForkedTable`, laid on
-    `chunked_launch.AlignedDocuments`): each row's given memories `given` `[rows * count * HV * Dk, Dv]` fp32,
+    """A forked call's table as the walks take it (`chunk_forward.ForkedTable`, on a packed call's chunks,
+    `chunked_launch.ForkedChunks`): each row's given memories `given` `[rows * count * HV * Dk, Dv]` fp32,
     laid as the memories are; the slot each chunk takes its memory up from, `loads` `[chunks]` (one-based,
     zero a zero memory, -1 none: the chunk continues the one before), and the stored slot it leaves its
     memory in, `stores` (zero none); each chunk's entry write `entries` `[chunks * HV * Dk, Dv]` fp32, zero
-    but where it takes a document up, where the call gives one; and a row's slots, `count` given and `held`
-    stored."""
+    but where it takes a document up, where the call gives one; the row each chunk walks (`rows` `[chunks]`,
+    which the gradients' sums read and no launch); and a row's slots, `count` given and `held` stored."""
 
     given: jax.Array
     loads: jax.Array
     stores: jax.Array
     entries: jax.Array | None
+    rows: jax.Array
     count: int = dataclasses.field(metadata={'static': True})
     held: int = dataclasses.field(metadata={'static': True})
 

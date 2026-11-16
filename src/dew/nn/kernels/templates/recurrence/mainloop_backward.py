@@ -237,11 +237,10 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
 
 def _taken_up(run, taken):
     """The gradient of the memory each chunk takes up (`taken`, the reverse walk's, `[chunks * HV * Dk, Dv]`),
-    `[B, NC, HV, Dk, Dv]`, zero at a chunk that takes nothing up (which the walk wrote nothing to)."""
+    `[NC, HV, Dk, Dv]`, zero at a chunk that takes nothing up (which the walk wrote nothing to)."""
     call, table = run.call, run.table
-    taking = (table.loads >= 0).reshape(run.batch, -1)
-    taken = taken.reshape(*taking.shape, call.heads, call.width, call.value_width)
-    return jnp.where(taking[..., None, None, None], taken, 0.0)
+    taken = taken.reshape(-1, call.heads, call.width, call.value_width)
+    return jnp.where((table.loads >= 0)[:, None, None, None], taken, 0.0)
 
 
 def _tabled_gradients(run, grads: tuple, taken) -> tuple:
@@ -251,15 +250,16 @@ def _tabled_gradients(run, grads: tuple, taken) -> tuple:
     if taken is None:
         return grads
     table = run.table
-    loads = table.loads.reshape(run.batch, -1)
-    slots = jnp.arange(1, table.count + 1)
-    given = jnp.einsum("bcs,bchkv->bshkv", (loads[..., None] == slots).astype(jnp.float32),
-                       _taken_up(run, taken))
+    # Each chunk taking a given slot up adds to its row's slot (a stored slot's, its storing chunk's walk).
+    given_slot = (table.loads > 0) & (table.loads <= table.count)
+    given = jnp.zeros((run.batch, table.count, *_taken_up(run, taken).shape[1:]), jnp.float32).at[
+        table.rows, jnp.clip(table.loads - 1, 0, table.count - 1)].add(
+        jnp.where(given_slot[:, None, None, None], _taken_up(run, taken), 0.0), mode="drop")
     return (*grads[:5], given[..., :run.key_width, :run.value_width])
 
 
 def _entered_gradient(run, taken):
-    """A forked call's entry write's gradient `[B, NC, HV, Dk, Dv]` (`chunk_forward.ForkedTable.entries`): the
+    """A forked call's entry write's gradient `[NC, HV, Dk, Dv]` (`chunk_forward.ForkedTable.entries`): the
     memory's each chunk takes up, which its entry write adds to; None where the call gives none."""
     if taken is None or run.table.entries is None:
         return None

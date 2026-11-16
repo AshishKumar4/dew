@@ -243,9 +243,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     `chunk_forward.forward`). Where `recomputed`, its fast backward forms the forward's memories again rather
     than keeping them (a remat rung recomputing 'delta_memory', `recurrence_chunk.RECOMPUTED`, resolved at its
     route). A `forked` call's documents (`recurrence_chunk.Chunk.loads`), `state` its table's given memories
-    `[B, S', HV, Dk, Dv]`, are laid from its chunks' edges (`chunked_launch.AlignedDocuments`), each taking
-    its memory up from the table there in the walks (`chunk_forward.ForkedTable`): the laying and the entry
-    write differentiated by JAX, the table's memories by the walks."""
+    `[B, S', HV, Dk, Dv]`, are laid as a packed call's are (`forked_table`), each row's walk taking each
+    document's memory up from the table at its first chunk (`chunk_forward.ForkedTable`): a forked row costs
+    its packed row at its documents' bound; the entry write is differentiated by JAX, the table's memories by
+    the walks."""
 
     dtype = jnp.result_type(query, key, value)
     device, interpret = mainloop.issued(dtype)
@@ -261,11 +262,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                                   f"{generation.family(generation.device_generation())!r} family")
     run = {"family": issuing, "interpret": interpret, "tiles": tiles,
            "ranged": ranged(dtype, delta, bound)}
-    aligned, table = None, None
+    table = None
     if forked is not None:
-        (query, key, value, g, beta), table, aligned = forked_laid(query, key, value, g, beta, state, forked,
-                                                                   tiles.chunk)
-        state = starts = firsts = max_segments = None
+        table, starts, firsts, max_segments = forked_table(state, forked, *query.shape[:2], tiles.chunk)
+        state = None
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
     fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=wide)
             and backward_holds(
@@ -319,7 +319,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 max_segments=max_segments, scale=scale, inverse=inverse, kept=kept, delta=delta,
                 rounded=rounded, skip=skip, forked=table, **run)
         # A forked call's given memories' gradient its table's first, its slots' none.
-        tabled_grads = None if table is None else dataclasses.replace(table, given=dh0, loads=None,
+        tabled_grads = None if table is None else dataclasses.replace(table, given=dh0, loads=None, rows=None,
                                                                        stores=None, entries=dentries)
         # The skip's gradient formed in its dtype before the inputs' cotangents leave (row 6027).
         (grads, dh0, tabled_grads), dskip = derivatives.with_gradients_formed(
@@ -328,24 +328,20 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
 
     rule = derivatives.contracted("test_the_template_rule_holds_its_orders")(
         derivatives.declared_derivative(derivatives.KernelGlue(), primal, forward, backward))
-    out, final = rule(query, key, value, g, beta, state, starts, firsts, skip, table)
-    return (out, final) if aligned is None else (aligned.unlaid(out), final)
+    return rule(query, key, value, g, beta, state, starts, firsts, skip, table)
 
 
-def forked_laid(query, key, value, g, beta, given, forked: chunked_launch.Forked, chunk: int) -> tuple:
-    """A forked call's operands laid from its `chunk`-token chunks' edges (`chunked_launch.AlignedDocuments`,
-    `mosaic_rule`'s), its table as the walks take it, `(given, loads, stores, entries)` with its memories
-    fp32 (`chunk_forward.ForkedTable`), and the laying."""
-    aligned = chunked_launch.AlignedDocuments.of(forked, query.shape[1], chunk)
-    entries = aligned.entries(forked)
-    table = chunk_forward.ForkedTable(given.astype(jnp.float32), aligned.loads, aligned.stores,
-                                      None if entries is None else entries.astype(jnp.float32), forked.held)
-    return aligned.laid(query, key, value, g, beta), table, aligned
-
-
-def _laid_shapes(query, key, value, g, beta, given, forked, *, chunk: int) -> tuple:
-    """`forked_laid`'s operands and table alone, the arrays a plan's shapes read."""
-    return forked_laid(query, key, value, g, beta, given, forked, chunk)[:2]
+def forked_table(given, forked: chunked_launch.Forked, batch: int, length: int, chunk: int) -> tuple:
+    """A forked call (`mosaic_rule`'s) as a packed call of its documents: its table as the walks take it,
+    `(given, loads, stores, entries)` on its documents' chunks with its memories fp32
+    (`chunk_forward.ForkedTable`, `chunked_launch.ForkedChunks`), its documents' first tokens, their firsts
+    and its documents' bound, the packed call's `starts`, `firsts` and `max_segments`."""
+    chunks = chunked_launch.ForkedChunks.of(forked, batch, length, chunk)
+    entries = chunks.entries(forked)
+    table = chunk_forward.ForkedTable(given.astype(jnp.float32), chunks.loads, chunks.stores,
+                                      None if entries is None else entries.astype(jnp.float32), chunks.rows,
+                                      forked.held)
+    return table, forked.tokens(length)[0] >= 0, forked.firsts, forked.loads.shape[1]
 
 
 def walk_roles(family: mosaic.Family) -> int:
@@ -417,10 +413,12 @@ class Mosaic(base.Template[mainloop.Tiles]):
         skip = arguments.get("skip")
         forked, table, max_segments = arguments.get("forked"), None, arguments.get("max_segments")
         if forked is not None:
-            # A forked call's walks over its documents laid at the config's chunk, and its table.
-            laid, table = jax.eval_shape(functools.partial(_laid_shapes, chunk=config.chunk), *given[:6],
-                                         forked)
-            shapes, max_segments = (*laid, None, None), None
+            # A forked call's walks over its documents laid as a packed call's at the config's chunk, and
+            # its table.
+            table, starts, _, max_segments = jax.eval_shape(
+                functools.partial(forked_table, batch=given[0].shape[0], length=given[0].shape[1],
+                                  chunk=config.chunk), given[5], forked)
+            shapes = (*shapes[:5], None, starts)
         return _planned(shapes, config, family, target, max_segments, delta, bool(fast) and backward,
                         arguments.get("rounded", False), arguments.get("wide", False),
                         ranged(dtype, delta, arguments.get("bound")),
@@ -848,7 +846,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
                   target: generation.GpuTarget, *, training: bool = True) -> int:
         """The walk's value blocks at `tiles`, its launch's grid as planned (`_states`): a block of each laid
         sequence and head, `tiles.walkers` of them a program, a forward's values padded as it pads them;
-        a forked call's sequences its laid rows, each walking its documents in turn (`forked_laid`)."""
+        a forked call's sequences its rows, each walking its documents in turn (`forked_table`)."""
         return self._states(ba, tiles, target, training=training).programs * tiles.walkers
 
     def _one_wave(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,

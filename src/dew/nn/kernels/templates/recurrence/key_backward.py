@@ -581,17 +581,16 @@ def _taken_memories(run) -> jax.Array:
     `run.stored`), its entry write added; zero at a chunk that took none up."""
     call, table = run.call, run.table
     slots = call.heads * call.width
-    per_row = call.chunks // run.batch
 
     def by_row(memories):
         return memories.reshape(run.batch, -1, slots, memories.shape[-1])
 
     held = [] if run.stored is None else [by_row(run.stored)]
     given = by_row(table.given)
-    # Slot zero a zero memory, then the given slots and the stored ones, one-based as `loads` counts them.
+    # Slot zero a zero memory, then the given slots and the stored ones, one-based as `loads` counts them;
+    # each chunk its own row's.
     slotted = jnp.concatenate([jnp.zeros_like(given[:, :1]), given, *held], axis=1)
-    loads = table.loads.reshape(run.batch, per_row)
-    memories = jnp.take_along_axis(slotted, jnp.maximum(loads, 0)[..., None, None], axis=1)
+    memories = slotted[jnp.clip(table.rows, 0, run.batch - 1), jnp.maximum(table.loads, 0)]
     memories = memories.reshape(-1, memories.shape[-1])
     if table.entries is not None:
         memories = memories + table.entries

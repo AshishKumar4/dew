@@ -1681,9 +1681,9 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
     """`name`'s 16-bit call over a forked call's three documents a row, entering a table of a given memory
     and two stored slots (`chunked_launch.Forked`), the gated delta net's with an entry write, at the
     template's derived tiles on `target` (a forward alone at its own, `_ran`), its forward or training pass
-    as a gate case (`KernelCase`): its operands laid from the chunks' edges and its table as the walks take it
-    (`template.forked_laid`). Returns the case (None where the template derives no tiles), the bound call, its
-    derived tiles and the same call unforked, bound."""
+    as a gate case (`KernelCase`): its documents laid as a packed call's and its table as the walks take
+    it (`template.forked_table`). Returns the case (None where the template derives no tiles), the bound
+    call, its derived tiles and the same call unforked, bound."""
     from fla_gdn_support import KernelCase
 
     facts = generation.gpu_target(target)
@@ -1704,25 +1704,26 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
         tiles = template.MOSAIC.derived(bound, facts)
     if tiles is None:
         return None, bound, tiles, unforked
-    laid, table = jax.eval_shape(lambda *x: template.forked_laid(*x, tiles.chunk)[:2], q, k, v, g, beta,
-                                 given, forked)
+    table, starts, firsts, segments = jax.eval_shape(
+        lambda given, forked: template.forked_table(given, forked, *q.shape[:2], tiles.chunk), given, forked)
     formed = {key: value for key, value in _form(name, jnp.bfloat16).items() if key != 'wide' or not training}
-    cotangents = [jax.ShapeDtypeStruct(laid[2].shape, jnp.bfloat16), h0] if training else []
+    cotangents = [jax.ShapeDtypeStruct(v.shape, jnp.bfloat16), h0] if training else []
     tabled, laid_table = jax.tree.flatten(table)
 
     def call():
         def fn(*operands):
-            (q, k, v, g, beta), leaves, rest = (operands[:5], operands[5:5 + len(tabled)],
-                                                operands[5 + len(tabled):])
+            (q, k, v, g, beta, starts, firsts), leaves, rest = (operands[:7], operands[7:7 + len(tabled)],
+                                                                operands[7 + len(tabled):])
             *rest, fused = rest if skip else (*rest, None)
             forked = jax.tree.unflatten(laid_table, leaves)
+            documents = {'starts': starts, 'firsts': firsts, 'max_segments': segments}
             if training:
                 return mainloop_backward.gradients(q, k, v, g, beta, None, *rest, tiles=tiles, family=family,
-                                                   forked=forked, skip=fused, **formed)
+                                                   forked=forked, skip=fused, **documents, **formed)
             return chunk_forward.forward(q, k, v, g, beta, None, tiles=_ran(tiles, training=False),
-                                         family=family, forked=forked, skip=fused, **formed)
+                                         family=family, forked=forked, skip=fused, **documents, **formed)
 
-        return fn, (*laid, *tabled, *cotangents, *skip)
+        return fn, (q, k, v, g, beta, starts, firsts, *tabled, *cotangents, *skip)
 
     label = f"{name} bfloat16 {'training' if training else 'forward'} forked {_ran(tiles, training=training)}"
     return KernelCase(label, call), bound, tiles, unforked
