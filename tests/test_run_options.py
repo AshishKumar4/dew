@@ -175,11 +175,10 @@ def test_a_process_option_the_process_does_not_carry_is_refused_before_training(
 # ----------------------------------------------------------- options a saved task is built with (row 2285)
 
 WITNESSED_ON = {"DecideSettings": {
-    "decision": ("context_encoder", "layout", "layout.form", "layout.framing", "layout.head_max_len",
-                 "layout.option_text", "layout.option_tokens", "layout.order", "layout.parallel",
-                 "layout.reads", "options"),
+    "decision": ("context_encoder", "layout", "layout.framing", "layout.head_max_len", "layout.option_text",
+                 "layout.option_tokens", "layout.order", "layout.parallel", "layout.reads", "options"),
     "blocked": ("layout.blocks", "layout.segments", "layout.split", "specials"),
-    "lettered": ("layout.labels",),
+    "lettered": ("layout.form", "layout.labels"),
     "merged": ("layout.unit",),
     "shared": ("layout.shared_state", "layout.siblings")},
     "ImageSettings": {"diffusion": ("process", "solver", "guidance")}}
