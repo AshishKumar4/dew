@@ -231,7 +231,8 @@ def test_a_notebooks_step_compiles_and_reads_its_rows(monkeypatch):
     assert loader.plan is not None and not loader.plan.manifest.exact
 
 
-@pytest.mark.parametrize("saved", ["without held", "held in its code list", "held apart", "reached as before"])
+@pytest.mark.parametrize("saved", ["without held", "held in its code list", "held apart",
+                                   "reached as before"])
 def test_a_position_saved_before_reached_code_is_held_to_what_it_saved(tmp_path, monkeypatch, saved):
     """A position saved before steps' reached code was saved under its own key (`reached`): one saved before
     any held code (`without held`), one main saved for an hour with each step's class text appended to its
