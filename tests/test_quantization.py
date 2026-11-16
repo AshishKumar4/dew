@@ -1837,12 +1837,17 @@ def placed(tree, dtype):
 def with_triton_gemms(flow) -> None:
     """Run `flow`, a function of this module, in a fresh process under the lane's flags without the
     one that keeps XLA's Triton GEMM fusion out of a program, deterministic ops (tests/lane_environment.py's
-    `REPEATABLE_GPU_FLAGS`). Its pinned autotuning then gives every GEMM a program leaves to Triton the
-    fusion, as XLA's own autotuner does at small contractions, where it computed int8 dots as two or four
-    times their product (openxla/xla#51016). XLA reads its flags once a process."""
+    `REPEATABLE_GPU_FLAGS`); here, where the lane sets no such flag. Its pinned autotuning then gives every
+    GEMM a program leaves to Triton the fusion, as XLA's own autotuner does at small contractions, where it
+    computed int8 dots as two or four times their product (openxla/xla#51016). XLA reads its flags once a
+    process."""
     pytest.importorskip("qwix")
     here = Path(__file__).resolve().parent
     flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_deterministic_ops")
+    if flags.split() == os.environ.get("XLA_FLAGS", "").split():
+        # A lane with no such flag (the CPU lane's): a fresh process would run under this one's flags.
+        flow()
+        return
     script = f"import {Path(__file__).stem} as tests; tests.{flow.__name__}()"
     # pytest's own path (pyproject's `pythonpath`: the sources and the repository root) and this directory.
     path = os.pathsep.join([str(here.parent / "src"), str(here.parent), str(here)])

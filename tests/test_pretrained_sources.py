@@ -470,7 +470,9 @@ def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
     config is tier 1; a type a registered convention computes, verified, is tier 2; an unregistered
     causal LM none computes is tier 3; and each configuration of a type is its own verdict, in either
     order (BERT as a decoder is tier 3, as an encoder refused; Cohere asking for an attention backend
-    transformers has none of is refused), every route counted in the summary."""
+    transformers has none of is refused), every route counted in the summary. One census holds every
+    config in each order, so a verdict a configuration of a type left behind would reach the other's
+    later row in one order or the other."""
     from tool_support import load
 
     census = load("hf_coverage")
@@ -490,16 +492,17 @@ def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
     expected = {"storage": "refused", "gptq": "refused", "custom": "remote code", "llama": "tier 1",
                 "cwm": "tier 2", "cohere": "tier 3", "bert decoder": "tier 3", "bert encoder": "refused",
                 "cohere, no backend": "refused"}
-    for ordered in (list(configs), list(reversed(configs))):
-        rows = [{"id": name, "model_type": configs[name]["model_type"], "downloads": len(configs) - index,
-                 "config": configs[name]} for index, name in enumerate(ordered)]
-        (tmp_path / "census.json").write_text(json.dumps(rows))
-        census.classify(tmp_path)
-        coverage = json.loads((tmp_path / "coverage.json").read_text())
-        assert {model["id"]: model["route"] for model in coverage["models"]} == expected
-        shares = coverage["summary"]["all types"]
-        assert sum(entry["models"] for entry in shares.values()) == len(configs)
-        assert shares["tier 3"]["models"] == 2
+    ordered = [*((name, "") for name in configs), *((name, " reversed") for name in reversed(configs))]
+    rows = [{"id": name + order, "model_type": configs[name]["model_type"], "downloads": len(ordered) - index,
+             "config": configs[name]} for index, (name, order) in enumerate(ordered)]
+    (tmp_path / "census.json").write_text(json.dumps(rows))
+    census.classify(tmp_path)
+    coverage = json.loads((tmp_path / "coverage.json").read_text())
+    assert {model["id"]: model["route"] for model in coverage["models"]} == {
+        name + order: expected[name] for name, order in ordered}
+    shares = coverage["summary"]["all types"]
+    assert sum(entry["models"] for entry in shares.values()) == len(ordered)
+    assert shares["tier 3"]["models"] == 4
 
 
 
