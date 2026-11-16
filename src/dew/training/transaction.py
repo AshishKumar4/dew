@@ -1260,8 +1260,12 @@ class Transaction:
         # Runs that updated in their backward wrote it only where the step commits (`in_backward.gated`).
         numerical = numerical if pending.applied is None else pending.applied.onto(numerical)
 
+        # What the commit's own finiteness (its gradient, effects and logit maxima) leaves out: the attempt's
+        # loss, its microbatch's and its collections.
+        attempted = pending.local_finite & _all_finite((loss, aux.variables))
+
         def commit(current):
-            return self.commit(current, gradient, effects, qk, pending.pooled, pending.applied, finite)
+            return self.commit(current, gradient, effects, qk, pending.pooled, pending.applied, attempted)
 
         def recopied(current):
             # A window of several microbatches reads one set of copies
