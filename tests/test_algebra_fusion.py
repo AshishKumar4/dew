@@ -571,6 +571,7 @@ def test_a_plain_programs_masked_attention_compiles_under_a_sequence_axis():
 
 
 @pytest.mark.parametrize(("variant", "options"), [("attention", {}), ("finite fill", {"fill": 0.0}),
+                                                  ("a fill of NaN", {"fill": jnp.nan}),
                                                   ("truncated logits", {"logits_cast": jnp.int32}),
                                                   ("initial above", {"initial": 1e30}),
                                                   ("another row's sum", {"other_rows": True}),
@@ -585,9 +586,10 @@ def test_only_attention_written_out_is_rewritten_as_dews(variant, options):
     """Causal softmax attention written out runs Dew's kernel through `dew.jit` on an H100, scaled after its
     product or its queries divided by sqrt(D) before it (Flax's), its masked logits filled with -inf or a
     finite constant (Dew's call's `mask_fill`, the future keys weighed as that fill weighs them); written out
-    with any step computing otherwise (truncated or narrowed logits, an initial maximum above the logits, a
-    row normalized by another's sum, a sum narrowed past its range, a divisor near sqrt(D) but not it, in
-    float32, where bfloat16 holds no value that near), it stays as written, XLA's."""
+    with any step computing otherwise (a NaN fill, which no call of Dew's takes, truncated or narrowed logits,
+    an initial maximum above the logits, a row normalized by another's sum, a sum narrowed past its range, a
+    divisor near sqrt(D) but not it, in float32, where bfloat16 holds no value that near), it stays as
+    written, XLA's."""
     import dew
 
     options = dict(options)

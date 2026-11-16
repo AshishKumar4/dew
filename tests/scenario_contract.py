@@ -216,8 +216,9 @@ def assert_resumes_onto_its_uninterrupted_run(prepared: Recorded | Called, root:
     compiles no program the runs before it did not: it writes nothing to the cache (`written`), and found
     programs there. A checkpoint that holds an average (`TrainState.ema`) restores it from its difference to
     the weights, a program the save that wrote it compiles (`dew.checkpoints._state_trees.decoded_ahead`):
-    the run resumed again from the same pause, in a fresh process, is held alike, each resume against the
-    cache the runs before the first left, and each ends where the uninterrupted run ends."""
+    the run resumed a second time from the same pause, its own copy of the paused run in a fresh process
+    beside the first, is held alike, both against the cache the runs before them left, and each ends where
+    the uninterrupted run ends."""
     whole_phase, paused_phase, resumed_phase = resumption(root)
     cache = Path(str(resumed_phase.cache))
     # Two processes of their own, run side by side: each its own run directory, one cache, compiling alike.
@@ -225,23 +226,25 @@ def assert_resumes_onto_its_uninterrupted_run(prepared: Recorded | Called, root:
         (whole, _), (paused, _) = pool.map(prepared.trained, (whole_phase, paused_phase))
     end = Checkpoints(str(whole)).latest
     assert end is not None and 0 < Checkpoints(str(paused)).latest < end
-    averaged = Checkpoints(str(paused)).stored().get("ema") is not None
+    resumes = [resumed_phase]
+    if Checkpoints(str(paused)).stored().get("ema") is not None:
+        again = dataclasses.replace(resumed_phase, name=f"{resumed_phase.name}-again")
+        shutil.copytree(paused, paused.with_name(again.name))
+        resumes.append(again)
     held = checkpointed(whole)
-    kept = paused.with_name(f"{paused.name}-paused")
-    shutil.copytree(paused, kept)
     before = written(cache)
-    for resume in range(2 if averaged else 1):
-        if resume:
-            shutil.rmtree(paused)
-            shutil.copytree(kept, paused)
-        resumed, counts = prepared.trained(resumed_phase)
-        assert Checkpoints(str(resumed)).latest == end
+    # Side by side, as the uninterrupted and paused runs are: each its own copy of the paused run.
+    with concurrent.futures.ThreadPoolExecutor(len(resumes)) as pool:
+        finished = list(pool.map(prepared.trained, resumes))
+    compiled = written(cache) - before
+    for phase, (resumed, counts) in zip(resumes, finished, strict=True):
+        assert Checkpoints(str(resumed)).latest == end, phase.name
         ran = checkpointed(resumed)
         assert held.keys() == ran.keys(), set(held) ^ set(ran)
         off = [path for path, value in held.items() if value != ran[path]]
-        assert not off, f"the resumed run's leaves off the uninterrupted run's: {off}"
-        compiled = written(cache) - before
-        assert not compiled and counts["train/cache_hits"] > 0, (resume, sorted(compiled), counts)
+        assert not off, f"{phase.name}: the resumed run's leaves off the uninterrupted run's: {off}"
+        assert counts["train/cache_hits"] > 0, (phase.name, counts)
+    assert not compiled, sorted(compiled)
 
 
 def cached(cache: str, module: str, function: str, *arguments) -> dict:
