@@ -6,9 +6,13 @@ Run in the project's reference environment. The tests own the workloads; referen
 the sizing rule. --start and --most bound one reference-only sizing job.
 
 The backward recording, BACKWARD_WINDOW draws a seed, is made in shards of seeds where one process is
-too slow for it, each run as one process runs it, then joined:
+too slow for it, each run as one process runs it, its pilots' shards (seeds from SIZING_FROM) holding Dew's
+errors on their draws beside the reference's, then joined, the count sized paired on the pilots (its errors
+are heavy-tailed alike in both arms, so the reference compared with itself never resolves):
 
     PYTHONPATH=src:tests:tools python tools/qualify_gemma4_unified.py backward --shard 0:32 --output 0.npz
+    PYTHONPATH=src:tests:tools python tools/qualify_gemma4_unified.py backward --shard 1048576:1048608 \
+        --output pilot-0.npz
     PYTHONPATH=src:tests:tools python tools/qualify_gemma4_unified.py backward --merge *.npz \
         --output tests/fixtures/hf/gemma4-unified-native-tiny/backward.npz
 """
@@ -58,10 +62,20 @@ def workload(site, directory, device):
 
 def backward_recording(device, seeds=None):
     """The backward site's summarized recording, BACKWARD_WINDOW draws a seed (`windows`): whole
-    (`record_case`), or the shard of `seeds` a merge joins (`record_shard`)."""
+    (`record_case`), or the shard of `seeds` a merge joins (`record_shard`), a pilot shard's (seeds from
+    SIZING_FROM) with Dew's errors on its draws, Dew's arm run as check 1 runs it (`summed_as_run`), which
+    the merge sizes the count paired by and keeps none of."""
     import jax
     from recorded_references import record_case, record_shard
-    from reference_error import assert_computes_the_oracle, chain_roundings, over_windows, widened, windows
+    from reference_error import (
+        SIZING_FROM,
+        assert_computes_the_oracle,
+        chain_roundings,
+        over_windows,
+        summed_as_run,
+        widened,
+        windows,
+    )
     from test_gemma4_unified import BACKWARD_WINDOW, FIXTURE, gradient_functions, source_pair
 
     from dew.interop import Pretrained
@@ -69,7 +83,7 @@ def backward_recording(device, seeds=None):
     source = source_pair(FIXTURE)
     source[1].to(device)
     source[2].to(device)
-    _, reference, truth, drawn = gradient_functions(source)
+    ours, reference, truth, drawn = gradient_functions(source)
     with jax.enable_x64(new_val=True):
         native = Pretrained.load(FIXTURE, dtype="float64", param_dtype="float64", attention_impl="reference")
         native_truth = gradient_functions((native, source[1], source[2]))[0]
@@ -92,8 +106,14 @@ def backward_recording(device, seeds=None):
         return observed, exact
 
     windowed = windows(lambda seed: drawn(seed)[0], BACKWARD_WINDOW)
+
+    def dew(inputs):
+        with summed_as_run():
+            return over_windows(ours)(inputs)
+
     if seeds is not None:
-        return record_shard("backward", windowed, evaluate, seeds), FIXTURE
+        pilots = seeds.start >= SIZING_FROM
+        return record_shard("backward", windowed, evaluate, seeds, dew=dew if pilots else None), FIXTURE
     return record_case("backward", windowed, evaluate, store_inputs=False, summary=True), FIXTURE
 
 
@@ -165,7 +185,8 @@ def record_site(site, output, device, *, shards=()):
             made["device"],
             (f"PYTHONPATH=src:tests:tools python tools/qualify_gemma4_unified.py backward --device {device} "
              f"--shard START:STOP --output SHARD.npz, over seeds 0 to {len(stored['backward.input_digest'])} "
-             f"in shards, then --merge SHARD.npz... --output {RECORDINGS}/backward.npz" if shards else
+             f"and pilots from 1048576 (Dew's errors on their draws beside the reference's) in shards, then "
+             f"--merge SHARD.npz... --output {RECORDINGS}/backward.npz" if shards else
              f"PYTHONPATH=src:tests:tools python tools/qualify_gemma4_unified.py {site} --device {device} "
              f"--record --output {RECORDINGS}/{site}.npz"),
             generator_revision=made["revision"],
@@ -173,43 +194,6 @@ def record_site(site, output, device, *, shards=()):
             config_sha256=hashlib.sha256((source / "config.json").read_bytes()).hexdigest(),
             packages=made["packages"])
         save(output, stored, reference="transformers Gemma4 Unified", license="Apache-2.0")
-
-
-REFERENCE_PACKAGES = ("torch", "transformers", "numpy")
-"""The packages the backward site's reference arm computes with: a pilot run's must be its verdict's."""
-
-
-def add_pilots(shards, output, host: str) -> None:
-    """The backward recording with the pilots of `shards` (`record_shard` over seeds from SIZING_FROM on,
-    `with_pilots`) beside its verdict seeds, written to `output`: the pilots only fix a count a paired
-    sizing gives (`seeds_for`), so they come from the verdict's reference arm in law, its device and
-    reference packages, not in bits (torch's CPU reductions vary with the host and its threads); the
-    pilot run's environment and `host`, where it ran and on how many threads, is kept in the provenance
-    beside the verdict's."""
-    import numpy as np
-    from recorded_references import save, with_pilots
-    from reference_error import recording
-
-    stored = dict(recording(ROOT / RECORDINGS / "backward.npz"))
-    verdict = json.loads(str(stored["provenance"]))
-    held, environments = [], set()
-    for path in shards:
-        with np.load(path, allow_pickle=False) as shard:
-            held.append({key: value for key, value in shard.items() if key != ENVIRONMENT})
-            environments.add(str(shard[ENVIRONMENT]))
-    if len(environments) != 1:
-        raise ValueError(f"the pilot shards were recorded in {len(environments)} environments")
-    pilots = json.loads(environments.pop())
-    if pilots["device"] != verdict["device"] or any(
-            pilots["packages"][name] != verdict["packages"][name] for name in REFERENCE_PACKAGES):
-        raise ValueError(f"the pilots' reference arm ({pilots['device']}, {pilots['packages']}) is not the "
-                         f"verdict's ({verdict['device']}, {verdict['packages']})")
-    stored = with_pilots("backward", stored, held)
-    stored["provenance"] = np.asarray(json.dumps({**verdict, "pilots": {**pilots, "recorded": host,
-        "command": "PYTHONPATH=src:tests:tools python tools/qualify_gemma4_unified.py backward --device cpu "
-                   "--shard START:STOP from 1048576 in shards, then --pilots SHARD.npz... --output "
-                   f"{RECORDINGS}/backward.npz"}}))
-    save(output, stored, reference="transformers Gemma4 Unified", license="Apache-2.0")
 
 
 def main():
@@ -232,16 +216,11 @@ def main():
     parser.add_argument("--shard", help="the backward site's seeds START:STOP alone, recorded to --output "
                                         "for a --merge")
     parser.add_argument("--merge", type=Path, nargs="+", default=(),
-                        help="the backward site's shards, joined into its recording at --output")
-    parser.add_argument("--pilots", type=Path, nargs="+", default=(),
-                        help="the backward site's pilot shards, from SIZING_FROM, added to its recording")
-    parser.add_argument("--pilot-host", help="where the pilot shards ran and on how many threads")
+                        help="the backward site's shards, its pilots' from SIZING_FROM among them, joined "
+                             "into its recording at --output")
     args = parser.parse_args()
     torch.set_float32_matmul_precision("highest")
     torch.backends.cudnn.allow_tf32 = False
-    if args.pilots:
-        add_pilots(args.pilots, args.output, args.pilot_host)
-        return
     if args.shard is not None:
         start, stop = (int(bound) for bound in args.shard.split(":"))
         shard, _ = backward_recording(args.device, range(start, stop))

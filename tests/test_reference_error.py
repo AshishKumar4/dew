@@ -663,12 +663,12 @@ def test_a_recordings_measured_errors_size_its_site_as_seeds_for_would():
 
     count = seeds_for(_product, _draw, "product")
     draws = _drawn(_product, _product, _draw, range(4 * count))
-    assert seeds_resolving(draws.theirs, draws.names, "product") == count
+    assert seeds_resolving(draws.theirs, draws.names, "product", widths=draws.widths) == count
     with pytest.raises(AssertionError):
-        seeds_resolving(draws.theirs[:count], draws.names, "product", start=count)
+        seeds_resolving(draws.theirs[:count], draws.names, "product", widths=draws.widths, start=count)
     # Past its ceiling it refuses, as seeds_for does, however many seeds are recorded.
     with pytest.raises(AssertionError):
-        seeds_resolving(draws.theirs, draws.names, "product", most=count // 2)
+        seeds_resolving(draws.theirs, draws.names, "product", widths=draws.widths, most=count // 2)
 
 
 def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
@@ -1341,6 +1341,54 @@ def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
         with pytest.raises(ValueError):
             recorder.merge_shards("site", [shards[0], recorder.record_shard("site", draw, evaluate,
                                                                             range(cut - 1))])
+
+
+def _apart_recording():
+    """A recording's draw and evaluation of `rounded_apart`'s arms, by name: each seed's value, its
+    heavy-tailed scale and the arms' sizes (`rounding_apart`), the reference arm 1's outputs beside their
+    float64 truth, and Dew's run arm 0's, the two rounding apart on draws whose errors are heavy-tailed alike
+    in both."""
+    def draw(seed):
+        x, scale, sizes = rounding_apart(seed)
+        return {"x": x, "scale": np.asarray(scale), "sizes": sizes}
+
+    def arm(index):
+        rounded = rounded_apart(index)
+        return lambda inputs: {"y": rounded(inputs["x"], inputs["scale"], inputs["sizes"])}
+
+    def evaluate(inputs):
+        return arm(1)(inputs), {"y": np.asarray(inputs["x"], np.float64)}
+    return draw, evaluate, arm(0)
+
+
+def test_a_recording_made_in_shards_sizes_paired_on_pilots_holding_dews_errors():
+    """A summarized recording of arms whose errors are heavy-tailed alike in both (`_apart_recording`), made
+    in shards whose pilots hold Dew's errors on their draws (`record_shard`'s `dew`), declares the count
+    `record_case` declares sized paired on the same draws (its `dew`), and keeps none of Dew's errors, where
+    the same shards without Dew's errors leave the count unresolved; pilots that hold them on some shards
+    and not others are refused (row 6835)."""
+    from tool_support import load
+
+    from dew.parity import SIZING_FROM
+
+    recorder = load("recorded_references")
+    draw, evaluate, dew = _apart_recording()
+    with jax.enable_x64(new_val=True):
+        whole = recorder.record_case("site", draw, evaluate, summary=True, dew=dew)
+        kept = len(whole["site.input_digest"])
+        pilots = [range(start, start + MOST_SEEDS) for start in (SIZING_FROM, SIZING_FROM + MOST_SEEDS)]
+        verdict = recorder.record_shard("site", draw, evaluate, range(kept))
+        paired = [recorder.record_shard("site", draw, evaluate, seeds, dew=dew) for seeds in pilots]
+        merged = recorder.merge_shards("site", [verdict, *paired])
+        for key, value in whole.items():
+            np.testing.assert_array_equal(merged[key], value, err_msg=key)
+        assert not any(".dew_mse." in key for key in merged)
+        with pytest.raises(Inconclusive):
+            recorder.merge_shards("site", [verdict, *(recorder.record_shard("site", draw, evaluate, seeds)
+                                                      for seeds in pilots)])
+        with pytest.raises(ValueError):
+            recorder.merge_shards("site", [verdict, paired[0],
+                                           recorder.record_shard("site", draw, evaluate, pilots[1])])
 
 
 def test_a_recording_kept_as_row_distances_judges_as_the_live_reference_does():
