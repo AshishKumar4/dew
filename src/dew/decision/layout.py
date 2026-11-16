@@ -23,7 +23,7 @@ import re
 import weakref
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeGuard, get_args
+from typing import TYPE_CHECKING, Literal, Protocol, TypeGuard, get_args
 
 import numpy as np
 from typing_extensions import TypeIs, get_protocol_members
@@ -414,14 +414,20 @@ class Layout:
     """How a state and its questions become rows of tokens that fit `max_len` (`fits`)."""
 
     max_len: int = 512
-    joint: ClassVar[bool] = False
-    """Whether every question of a request shares one row, rather than one row each."""
 
     def __post_init__(self) -> None:
         _least("max_len", self.max_len, 1)
-    images: ClassVar[bool] = False
-    """Whether a row holds a request's images, each as the backbone's processor
-    writes and expands one (`Processor.image_text`)."""
+
+    @property
+    def joint(self) -> bool:
+        """Whether every question of a request shares one row, rather than one row each."""
+        return False
+
+    @property
+    def images(self) -> bool:
+        """Whether a row holds a request's images, each as the backbone's processor
+        writes and expands one (`Processor.image_text`)."""
+        return False
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
         """Return the state's tokens, which every question of a request shares."""
@@ -702,7 +708,7 @@ class SegmentLayout(Layout):
     labels: Labels | None = dataclasses.field(default=None, metadata={"derived": "head"})
     """Options rendered as lettered lines and read at an answer cue (`Labels`), or None for a marker
     after each option, read at the marker."""
-    segments: "tuple[QuestionSegment, ...] | tuple[Segment, ...] | None" = None
+    segments: "tuple[RowSegment, ...] | None" = None
     """A row's text as segments of its own (`dew.decision.renderer`): a question row's, read at its labels'
     readout at the row's last token, or None for the layout's own text; the joint row's user turn
     (`JOINT_SEGMENTS` by default)."""
@@ -1311,12 +1317,12 @@ class SegmentLayout(Layout):
         return self.form == "state_first"
 
     @property
-    def joint(self) -> bool:  # type: ignore[override]
+    def joint(self) -> bool:
         """Whether every question of a request shares one row (the joint form), rather than one row each."""
         return self.form == "joint"
 
     @property
-    def images(self) -> bool:  # type: ignore[override]
+    def images(self) -> bool:
         """Whether a row holds a request's images: the joint row's (`Media`)."""
         return self.joint
 
@@ -2237,39 +2243,7 @@ def _joint_order(question: Question) -> list[int]:
     return list(range(len(keys)))
 
 
-EARLIER_LAYOUTS: Mapping[str, Mapping[str, JSON]] = {
-    "dew.decision.layout:MarkerLayout": {"form": "marker"},
-    "dew.decision.layout:StateFirstLayout": {"form": "state_first"},
-    "dew.decision.layout:QuestionLayout": {"form": "state_first"},
-    "dew.decision.layout:JointLayout": {"form": "joint", "max_len": 16384},
-}
-"""Each layout class an earlier Dew recorded (decision-inputs.md §1: three classes, and their base, which
-wrote its rows state first), by its import path: the form it is now and the fields its class held by
-default that `SegmentLayout` holds otherwise (a joint row's 16384 tokens; its segments and framing it
-fills where a record states none, `joint_row`)."""
-
-
-def earlier_layouts(value: JSON) -> JSON:
-    """`value`, a record an earlier Dew saved (a run's, a step's declaration, a release's layout), with
-    each class record of an earlier layout class (`EARLIER_LAYOUTS`) read as the `SegmentLayout` it is
-    now, at any depth: the record's own fields over the form and defaults its class held. The one reader
-    of those records, which the pinned boundaries call (`dew.config.earlier.earlier_run`,
-    `dew.inference.tasks.earlier_shapes`, `dew.decision.release.released_decision`). Carried to 1.0
-    (ledger 1552)."""
-    if isinstance(value, list):
-        return [earlier_layouts(held) for held in value]
-    if not isinstance(value, Mapping):
-        return value
-    held = {name: earlier_layouts(entry) for name, entry in value.items()}
-    named = held.get("class")
-    fields = held.get("fields", {})
-    if isinstance(named, str) and named in EARLIER_LAYOUTS and isinstance(fields, Mapping):
-        return {**held, "class": "dew.decision.layout:SegmentLayout",
-                "fields": {**EARLIER_LAYOUTS[named], **fields}}
-    return held
-
-
-def per_question(layout: object) -> TypeIs[SegmentLayout]:
+def per_question(layout: Layout) -> TypeIs[SegmentLayout]:
     """Whether `layout` writes a row a question (`SegmentLayout`'s marker or state-first row), whose
     question-row fields it reads (labels, sharing, parallel options, blocks)."""
     return isinstance(layout, SegmentLayout) and not layout.joint

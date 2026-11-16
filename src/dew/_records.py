@@ -289,6 +289,31 @@ _EARLIER = {now: earlier for earlier, now in MOVED_PATHS.items()}
 _SPELLED_EARLIER = re.compile("|".join(rf"\b{re.escape(path)}\b" for path in _EARLIER))
 
 
+EARLIER_LAYOUTS: Mapping[str, Mapping[str, JSON]] = {
+    "dew.decision.layout:MarkerLayout": {"form": "marker"},
+    "dew.decision.layout:StateFirstLayout": {"form": "state_first"},
+    "dew.decision.layout:QuestionLayout": {"form": "state_first"},
+    "dew.decision.layout:JointLayout": {"form": "joint", "max_len": 16384},
+}
+"""Each decision layout class an earlier Dew recorded (decision-inputs.md §1: three classes, and their base,
+which wrote its rows state first), by its import path: the form it is now and the fields its class held by
+default that `dew.decision.SegmentLayout` holds otherwise (a joint row's 16384 tokens; its segments and
+framing it fills where a record states none, `SegmentLayout.joint_row`)."""
+
+
+def earlier_layout(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A decision layout's class record an earlier Dew saved (a step's declaration, a release's layout), read
+    as the `SegmentLayout` it is now where it names an earlier class (`EARLIER_LAYOUTS`): its own fields over
+    the form and defaults its class held; any other record as it is. The one reader of those records, which
+    the pinned boundaries call (`dew.inference.tasks.earlier_shapes`,
+    `dew.decision.release.released_decision`). Carried to 1.0 (ledger 1552)."""
+    named, fields = record.get("class"), record.get("fields", {})
+    if not (isinstance(named, str) and named in EARLIER_LAYOUTS and isinstance(fields, Mapping)):
+        return record
+    return {**record, "class": "dew.decision.layout:SegmentLayout",
+            "fields": {**EARLIER_LAYOUTS[named], **fields}}
+
+
 def moved_record(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved record's fields, the JSON its file holds, with the paths they name translated
     (`moved_paths`)."""

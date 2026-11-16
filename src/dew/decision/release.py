@@ -15,8 +15,9 @@ from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 
+from dew._records import earlier_layout
 from dew.decision.calibration import Calibration
-from dew.decision.layout import Layout, SegmentLayout, earlier_layouts
+from dew.decision.layout import Layout, SegmentLayout
 from dew.interop.release import ReleaseDtypes, ReleaseTask
 from dew.interop.release_record import Release
 from dew.nn.precision import Numerics
@@ -44,10 +45,10 @@ def released_decision(directory: Path, layout: SegmentLayout, calibration: Calib
     """`layout` and `calibration`, the ones a decision format derives of its own files, as the release beside
     them states them over those (`decision_envelope`), the layout's rows `joint` or a question's (a Laya
     head reads rows a question, the joint head's the joint row), its record read as one an earlier Dew
-    wrote is (`earlier_layouts`)."""
+    wrote is (`dew._records.earlier_layout`)."""
     release = _loaded(directory)
     if release is not None and release.layout is not None:
-        stated = from_record(Layout, earlier_layouts(release.layout), dtypes=False)
+        stated = from_record(Layout, earlier_layout(release.layout), dtypes=False)
         if not isinstance(stated, SegmentLayout) or stated.joint != joint:
             raise ValueError(f"the release in {directory} states the layout {stated!r}, and its format reads "
                              f"{'the joint row' if joint else 'a row a question'}")
