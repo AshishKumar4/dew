@@ -1750,7 +1750,7 @@ class UpdatesRead(NamedTuple):
 
 class Bounded(optax.GradientTransformationExtraArgs):
     """A transformation `OptimConfig.build` made, which decides as its state is made whether a step reads its
-    update (`bounded_updates`); a transformation of no other making is taken unread."""
+    update (`bounded_updates`); a run reads every update of a transformation of any other making."""
 
     __slots__ = ()
 
@@ -1807,7 +1807,7 @@ def spectral_bound(coefficients: np.ndarray) -> float:
     return bound
 
 
-def shape_scale(update: jax.Array | jax.ShapeDtypeStruct, numbers: optax.contrib.MuonDimensionNumbers,
+def shape_scale(update: jax.Array, numbers: optax.contrib.MuonDimensionNumbers,
                 consistent_rms: float | None, root: Callable = jnp.sqrt):
     """The factor Muon's shape scaling (`_scale_by_shape`) multiplies a matrix's update by, from its fans
     (optax's `scale_by_shape`): Jordan's width transfer, `sqrt(max(1, fan_out / fan_in))`, or Moonlight's
@@ -1820,6 +1820,11 @@ def shape_scale(update: jax.Array | jax.ShapeDtypeStruct, numbers: optax.contrib
     return root(max(fan_in, fan_out)) * consistent_rms
 
 
+def unbounded(params: optax.Params) -> list[float | None]:
+    """No bound for any leaf of `params`: every update read (`bounded_updates`)."""
+    return [None] * len(jax.tree.leaves(params))
+
+
 def update_bounds(optimizer: Optimizer | str, opts: Mapping[str, object], *, quantized: bool = False
                   ) -> LeafBounds | None:
     """Each parameter's bound on the unit-rate update `optimizer` forms (before its learning rate and decay)
@@ -1827,8 +1832,8 @@ def update_bounds(optimizer: Optimizer | str, opts: Mapping[str, object], *, qua
     `opts` over its factory's defaults (`bounded_updates`); a leaf's None where Dew states none: a guard of
     zero (0/0 where a parameter's moments are), a decay of one or more (its bias correction divides by zero),
     moments in float16, Muon's options its bound does not cover, a Gauss-Newton solve (which a step reads
-    whatever its bound, `solves_equations`). None for a factory Dew does not build, whose update it takes
-    unread. Moments stored in 8 bits (`quantized`, `dew._moments.int8_moments`) may hold a second moment of
+    whatever its bound, `solves_equations`). None for a factory Dew does not build, whose bound it cannot
+    read. Moments stored in 8 bits (`quantized`, `dew._moments.int8_moments`) may hold a second moment of
     zero beside a first that is not, which only the guard bounds.
 
     Adam's `|m^| / (sqrt(v^) + eps)` is at most `1/sqrt((1 - b2)(1 - b1^2/b2))` where b1 squared is under b2
@@ -1879,10 +1884,12 @@ def _muon_bounds(values: Mapping[str, object], adam: float | None) -> LeafBounds
     spectral bound times its shape scaling, where the options leave its update the normalized iteration's
     (Frobenius preconditioning, no dual scaling, neuron norm or heads of its own), the rest `adam`'s, the
     AdamW leaves' bound, which steps at Muon's rate."""
+    ns_steps = values['ns_steps']
+    if not isinstance(ns_steps, int):
+        return unbounded
     covered = (values['preconditioning'] == 'frobenius' and not values['adaptive']
                and values['neuron_beta2'] is None and values['per_head'] is None
                and values['adam_learning_rate'] is None)
-    ns_steps = values['ns_steps']
     rows = np.asarray(_coefficients(values['ns_coeffs'], ns_steps), np.float64).reshape(-1, 3)
     spectral = spectral_bound(np.repeat(rows, ns_steps, axis=0) if len(rows) == 1 else rows)
     rms = values['consistent_rms']
@@ -2104,13 +2111,13 @@ class OptimConfig:
         """`solver` as `build` returns it: deciding as its state is made whether a step reads its update
         (`bounded_updates`), from its factory's options `opts` and the largest rate any group steps at (a
         schedule's peak, `ScheduleBase.peak`), every update read where a group's b1 is scheduled; a factory
-        Dew does not build is returned as it is, its updates taken unread (`update_bounds`)."""
+        Dew does not build is returned as it is, no build of Dew's, whose every update a run reads
+        (`dew.training.transaction.Transaction.reads_all`)."""
         bounds = update_bounds(self.optimizer, opts, quantized=self.state_dtype == 'int8')
         if bounds is None:
             return solver
         if any(group.b1 is not None for group in self.param_groups):
-            def bounds(params) -> list[float | None]:
-                return [None] * len(jax.tree.leaves(params))
+            bounds = unbounded
         peak = max(abs(rate.peak() if isinstance(rate, ScheduleBase) else float(rate)) * multiplier
                    for rate, multiplier in self.grouped_rates().values())
         return bounded_updates(solver, bounds, peak)

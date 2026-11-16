@@ -1790,7 +1790,7 @@ def test_a_clocked_state_supplied_to_a_run_of_steps_takes_its_optimizers_horizon
     config = OptimConfig(optimizer="adam", learning_rate=dataclasses.replace(
         SCHEDULES["cosine"], peak_value=1e-2, init_value=1e-4, end_value=1e-3, warmup_steps=2), clip_grads=0)
     params, grads = {"w": jnp.ones(3)}, {"w": jnp.ones(3)}
-    built = config.build(10)
+    built = config.build(100)
     state, want = reclocked(config.build(10, clocked=True).init(params), schedule_states(built, params)), \
         built.init(params)
     for _ in range(4):
