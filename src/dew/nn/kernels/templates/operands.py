@@ -153,8 +153,8 @@ class Issuer:
         products before and after it each summed in one. An operand may be a callable forming it then, where
         `shape`, the sum's, is given. A register left operand whose product takes it in registers (its buffers
         a count) is issued so (`Family.register_products`). Products whose operands take three parts (an fp32
-        call's accurate forms) are summed whole, a product at a time, its terms added a term at a time
-        (`_termwise`), added to
+        call's accurate forms) are summed whole, each in its place among the rest, its terms added a term at
+        a time (`_runs`, `_whole`), added to
         the rest's sum. `into`, an accumulator the walk carries (its home, a warpgroup accumulator ref or a
         register array), takes every unscaled product in place and is
         returned, no value read; a scaled operand's product its own accumulator, restored and added into it
@@ -163,17 +163,16 @@ class Issuer:
         registers (`Family.operands_in_registers`, whose accumulator is a value the loop carries): unrolled,
         ptxas held every block's fragments at once, an A100's scores backward at keys and values 256 wide
         spilling 280 bytes a thread (wide-kv at e1f928585); elsewhere a product a block, as listed."""
-        rest, termwise = self._set_aside(products)
         family, interpret = self.call.family, self.call.interpret
+        if isinstance(products, Sequence):
+            runs = self._runs(products)
+            if any(whole for whole, _ in runs):
+                return self._summed_runs(runs, shape, retired=retired, into=into)
+            products = runs[0][1] if runs else []
+        rest = iter(self._entries(products))
         first = next(rest, None)
         if first is None:
-            # Every product of three parts: their terms' sums alone.
-            values = self._termwise(termwise, shape, retired=retired)
-            if into is None:
-                return functools.reduce(jnp.add, values)
-            for value in values:
-                into = family.added_into(into, value, interpret)
-            return into
+            raise ValueError("a sum of no products")
         products = rest
         if not isinstance(first, product.Blocks) and isinstance(first[1], product.Scaled):
             # Scaled products (fp16's) each issue in a scope of their own (`Family.summed`): every part formed
@@ -239,34 +238,50 @@ class Issuer:
                 # the products in flight on the carried one done first (`Family.added_into`).
                 part = summed_group()
                 into = family.added_into(into, part, interpret)
-            for value in self._termwise(termwise, shape, retired=retired):
-                into = family.added_into(into, value, interpret)
             return into
         total = summed_group()
         while held:
             total = total + summed_group()
-        for value in self._termwise(termwise, shape, retired=retired):
-            total = total + value
         return total
 
-    def _set_aside(self, products: Sequence[Entry] | Iterator[Entry]
-                   ) -> tuple[Iterator[Entry], dict[tuple[int, int], list[Entry]]]:
-        """`products` (`summed`'s) to issue as they come, and those of a listed sum whose operands take three
-        parts set aside by their form for their terms' sums (`_termwise`): each operand its caller formed
-        before the call, which every term reads where it stands. A stream's are each issued before the next is
-        formed, as they come: a stream may stage its next operand into the last one's buffers (`retired`), or
-        form it within the scope the last one issues in."""
-        termwise: dict[tuple[int, int], list[Entry]] = {}
-        if not isinstance(products, Sequence):
-            return iter(self._entries(products)), termwise
-        rest = []
+    def _runs(self, products: Sequence[Entry]) -> list[tuple[bool, list[Entry]]]:
+        """A listed sum's products (`summed`'s) in their order, each of three parts alone, whole (`_whole`),
+        the others' runs between them each one run: `(whole, entries)`. Each operand its caller formed before
+        the call, which every term of a whole product reads where it stands."""
+        runs: list[tuple[bool, list[Entry]]] = []
         for entry in self._entries(products):
             counts = self._counted(entry)
-            if counts is not None and max(counts) == 3:
-                termwise.setdefault(counts, []).append(entry)
+            whole = counts is not None and max(counts) == 3
+            if whole or not runs or runs[-1][0]:
+                runs.append((whole, [entry]))
             else:
-                rest.append(entry)
-        return iter(rest), termwise
+                runs[-1][1].append(entry)
+        return runs
+
+    def _summed_runs(self, runs: list[tuple[bool, list[Entry]]], shape: tuple[int, int] | None, *,
+                     retired: bool, into):
+        """`runs`' sum (`_runs`), in their order: each whole product's own sum (`_whole`), each other run
+        summed as `summed` sums it (into the carried accumulator `into` in place, where given), each added in
+        turn, so the sum leaves float32's range only where the products in order do (a whole product's
+        set after the rest took two of 2^127 to infinity where the middle -2^127 kept it finite, base review
+        670386203 F1)."""
+        family, interpret = self.call.family, self.call.interpret
+        total = into
+        for whole, entries in runs:
+            if not whole:
+                if into is not None:
+                    total = self.summed(entries, shape, retired=retired, into=total)
+                    continue
+                value = self.summed(entries, shape, retired=retired)
+            else:
+                value = self._whole(entries[0], shape, retired=retired)
+            if total is None:
+                total = value
+            elif into is not None:
+                total = family.added_into(total, value, interpret)
+            else:
+                total = total + value
+        return total
 
     def _counted(self, entry: Entry) -> tuple[int, int] | None:
         """How many parts each of `entry`'s operands (`_entries`') takes as it is issued (`_count`), staging
@@ -294,37 +309,33 @@ class Issuer:
         buffers = self.buffers[name]
         return len(buffers[0] if isinstance(buffers, list) else buffers)
 
-    def _termwise(self, groups: dict[tuple[int, int], list], shape: tuple[int, int] | None, *,
-                  retired: bool) -> Iterator[jax.Array]:
-        """`groups`' products of three parts (a group a form, its operands' parts, `_counted`), each whole, a
-        product at a time: its terms (`product.terms`, smallest first, as `Family.apart` sums one product's)
-        each issued into a fresh fp32 accumulator and added into the product's sum as it comes, which its
-        caller adds into its own sum once complete. A sum takes whole products, as the per-product path
-        (`__call__`) adds them, so it leaves float32's range only where the products' own sums do: a
-        product's terms added into the caller's sum one at a time took a later product's small remainder
-        onto a sum already at float32's largest before its leading term took it back (base reviews
-        0dac2d104 F1, 60efbe75f F1). Its operands are staged again for each term (none where they are tiles
-        in memory, or a value held in a list of buffer sets), so one term's accumulator is live beside the
-        product's sum and the caller's, where an accumulator a term held at once spilled an fp32 solve 576
-        bytes a thread on an H100 (fast32d-sm90 at 83b47d66f6)."""
+    def _whole(self, entry: Entry, shape: tuple[int, int] | None, *, retired: bool) -> jax.Array:
+        """A product of three parts' own sum (`_runs`), as `__call__` sums one: its terms (`product.terms`,
+        smallest first, as `Family.apart` sums one product's) each issued into a fresh fp32 accumulator and
+        added into the product's sum as it comes, its caller adding the sum once complete, so it leaves
+        float32's range only where the products' own sums do (base reviews 0dac2d104 F1, 60efbe75f F1). Its
+        operands are staged again for each term (none where they are tiles in memory, or a value held in a
+        list of buffer sets), so one term's accumulator is live beside the product's sum and the caller's,
+        where an accumulator a term held at once spilled an fp32 solve 576 bytes a thread on an H100
+        (fast32d-sm90 at 83b47d66f6)."""
         family = self.call.family
-        for counts, entries in groups.items():
-            for name, lhs, rhs in entries:
-                if shape is None:
-                    shape = (lhs.shape[0], rhs.shape[1])
+        name, lhs, rhs = entry
+        shape = shape or (lhs.shape[0], rhs.shape[1])
 
-                def term(i: int, j: int, acc, name=name, lhs=lhs, rhs=rhs):
-                    # The product's operands staged as the term reaches them, a staging that would overwrite
-                    # the tile the term's own product reads waiting for it (`_settle`).
-                    read: list = []
-                    left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
-                    acc = family.products(acc, left[i], right[j])
-                    if retired:
-                        family.settled(0)
-                    return acc
+        def term(i: int, j: int, acc):
+            # The product's operands staged as the term reaches them, a staging that would overwrite the tile
+            # the term's own product reads waiting for it (`_settle`).
+            read: list = []
+            left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
+            acc = family.products(acc, left[i], right[j])
+            if retired:
+                family.settled(0)
+            return acc
 
-                yield functools.reduce(jnp.add, (family.summed(shape, functools.partial(term, i, j))
-                                                 for i, j in product.terms(*counts)))
+        counts = self._counted(entry)
+        assert counts is not None
+        return functools.reduce(jnp.add, (family.summed(shape, functools.partial(term, i, j))
+                                          for i, j in product.terms(*counts)))
 
     def summed_together(self, groups: list) -> tuple[Callable[[], jax.Array], ...]:
         """Readers of `groups`' sums (each a list `summed` takes), none of which reads another's: issued
