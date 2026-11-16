@@ -743,7 +743,7 @@ def test_a_backward_certification_refuses_every_config_of_takes_another_route():
 
     query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
-    temperature = jax.ShapeDtypeStruct((1, tokens, heads), jnp.float32)
+    temperature = jax.ShapeDtypeStruct((1, heads, tokens), jnp.float32)
     with report.certifying(compile_only_gpus("sm80")[0]):
         lowered_for(jax.grad(loss, argnums=(0, 1, 2, 3)), (query, key, key, temperature), "sm80")
 
