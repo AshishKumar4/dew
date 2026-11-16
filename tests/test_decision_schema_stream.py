@@ -162,15 +162,17 @@ def test_a_schema_read_in_context_reads_the_context_after_it_in_the_room_it_leav
     task = Decide(objective.model, objective.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS)
     assert isinstance(task("one two three", QUESTION, context=note)["pick"], ChoiceAnswer)
     examples = [Example("one", QUESTION, {"pick": "a"}, context=note)] * 8
-    tracker = RecordingTracker()
-    Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker).fit(
-        decision_rows(examples, 8, objective=objective.data()), steps=1, log_every=1)
-    [logged] = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
-    [rows] = [value for name, value in logged.items()
-              if name.startswith("data/cut/") and name.endswith("/context")]
-    [dropped] = [value for name, value in logged.items()
-                 if name.startswith("data/cut_removed/") and name.endswith("/context")]
-    assert rows > 0 and dropped == rows * (len(note) - room)
+    data = decision_rows(examples, 8, objective=objective.data())
+    reader = data.train(DataPartition())
+    try:
+        next(reader)
+    finally:
+        reader.close()
+    # The counters a run's data report logs (`data/cut/<corpus>/context`,
+    # `data/cut_removed/<corpus>/context`).
+    [counts] = data.counts.values()
+    assert counts.cut_rows["context"] == len(examples)
+    assert counts.cut_removed["context"] == len(examples) * (len(note) - room)
 
 
 def test_a_schema_read_in_context_refuses_what_cannot_read_it():

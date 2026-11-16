@@ -255,7 +255,7 @@ def packed_arms(packed: DecisionObjective, alone: DecisionObjective, rows):
     initialized = jax.jit(lambda key: unboxed(packed.init(key, variables={})))
     wide = copy.copy(alone)
     wide.model = DecisionModel(alone.model.backbone.clone(dtype=jnp.float64),
-                               alone.model.head.clone(dtype=jnp.float64), alone.model.conditions)
+                               alone.model.head.clone(dtype=jnp.float64), alone.model.context_encoder)
 
     @as_given
     def truth(variables):

@@ -20,7 +20,7 @@ from dew.decision.calibration import Temperatures
 from dew.decision.head import DecisionHead, Head
 from dew.decision.inputs import OPTION_TILE, DecisionInputs
 from dew.decision.layout import Bounds, Layout, Specials, default_layout, per_question
-from dew.decision.model import DecisionModel, context_streams
+from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Score
 from dew.decision.rows import (
     ConfigureLayout,
@@ -402,7 +402,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             # one its rows are laid out by, which names them where the layout names none.
             head, labels = head.labelled(layout.labels, tokenizer)
             layout = dataclasses.replace(layout, labels=labels)
-        self.model = DecisionModel(module, head, context_streams(context_encoder or "table"))
+        self.model = DecisionModel(module, head, context_encoder or "table")
         if layout is None:
             if not isinstance(module, TokenModel):
                 raise ValueError(

@@ -39,10 +39,6 @@ def _encoder_of(condition: Condition) -> ContextEncoder:
     return encoder.encoder
 
 
-TABLE_CONTEXT = context_streams("table")
-"""A decision model's streams with a row's context through the backbone's token table."""
-
-
 @dataclass(frozen=True)
 class DecisionModel(HeadedModel):
     """Any backbone with final states, read by a decision head (`HeadedModel`).
@@ -54,12 +50,19 @@ class DecisionModel(HeadedModel):
     """
 
     head: Head
-    conditions: tuple[tuple[str, Condition], ...] = TABLE_CONTEXT
-    """The conditioning streams its cross-attention reads, by name, each an ordinary `Condition` whose
-    encoder is the backbone itself (`BackboneContext`, decision-inputs.md section 2): `context`, a row's
-    context, through the backbone's own token table or its own pass, and `schema`, a schema read as the
-    row's context, with the example's context in the room after it, always the backbone's own pass,
-    whose states its spans are pooled from (`context_streams`)."""
+    context_encoder: ContextEncoder = "table"
+    """How the backbone encodes a row's context for its cross-attention (`BackboneContext.encoder`): `table`,
+    its tokens through the backbone's own embedding table, or `backbone`, its own final states over it in a
+    pass of its own, which a run records."""
+
+    @property
+    def conditions(self) -> tuple[tuple[str, Condition], ...]:
+        """The conditioning streams its cross-attention reads, by name, each an ordinary `Condition` whose
+        encoder is the backbone itself (`BackboneContext`, decision-inputs.md section 2): `context`, a row's
+        context, as `context_encoder` says, and `schema`, a schema read as the row's context, with the
+        example's context in the room after it, always the backbone's own pass, whose states its spans are
+        pooled from (`context_streams`)."""
+        return context_streams(self.context_encoder)
 
     def stream(self, spans_in_context: bool) -> Condition:
         """The stream a row's context is: the schema's where the row reads its schema in its context
@@ -71,10 +74,6 @@ class DecisionModel(HeadedModel):
         step counts the work of (`dew.decision.DecisionObjective`), rather than its token table."""
         return _encoder_of(self.stream(spans_in_context)) == "backbone"
 
-    @property
-    def context_encoder(self) -> ContextEncoder:
-        """How the `context` stream's backbone encodes it (`BackboneContext.encoder`), which a run records."""
-        return _encoder_of(dict(self.conditions)["context"])
 
     def reads_progress(self) -> bool:
         """Whether its backbone's computation changes over a run (`dew.nn.progress.ReadsProgress`)."""
@@ -159,9 +158,9 @@ class DecisionModel(HeadedModel):
             stream = self.stream(inputs.spans_in_context)
             tokens = ContextTokens(inputs.context, inputs.context_lengths, inputs.context_segments,
                                    inputs.max_segments)
-            conditioning = encode_conditions(
-                (("stream", stream.encoder),), {}, {"stream": tokens},
-                backbone=BackboneCall(self.backbone, part(variables, "backbone"), train, rngs, progress))["stream"]
+            live = BackboneCall(self.backbone, part(variables, "backbone"), train, rngs, progress)
+            conditioning = encode_conditions((("stream", stream.encoder),), {}, {"stream": tokens},
+                                             backbone=live)["stream"]
             spanned = conditioning[CONTEXT] if inputs.spans_in_context else None
         if media is not None:
             if inputs.slots is not None or inputs.streams is not None:
