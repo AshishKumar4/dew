@@ -1251,14 +1251,11 @@ class Transaction:
         (`dropped_window`), its parameters, optimizer state and EMA untouched,
         and the scaler moved.
 
-        A window of one microbatch commits on every step it can, so its
-        commit is computed and kept by elementwise selects. A longer window
-        commits under `lax.cond`, which skips the optimizer on the
-        microbatches that do not close it. A GPU conditional whose branch
-        holds a collective, as fsdp's gradient norm is, reads its predicate
-        on the host: the host then queues the next step only once the device
-        has reached this one's commit, and the device idles through every
-        step's host work (15.9 ms a 32.5 ms DiT step on four RTX 3090s).
+        A window of one microbatch commits on every step it can, by elementwise selects; a longer window
+        under `lax.cond`, which skips the optimizer on the microbatches that do not close it. A GPU
+        conditional whose branch holds a collective (fsdp's gradient norm) reads its predicate on the host,
+        which then idles the device through every step's host work (15.9 ms a 32.5 ms DiT step on four
+        RTX 3090s).
 
         A window that is not due retains this microbatch's batch, read
         snapshots and `attempt` in its slot, so a later replay can reproduce

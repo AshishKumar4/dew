@@ -174,6 +174,20 @@ def _passed_down(dx, tripped: jax.Array):
     return jax.tree.map(lambda leaf: jnp.where(tripped, jnp.full_like(leaf, jnp.nan), leaf), dx)
 
 
+def _layer_update(update: Callable, finite: jax.Array | None, tripped: jax.Array, gradient, held, moments,
+                  bad: jax.Array):
+    """One layer's update as the walk takes it: as it is where no step's finiteness gates the walk
+    (`gated`), else gated (`_gated_layer`) on the loss's finiteness, the walk's latch (`tripped`) and the
+    layer's own gradient finite within the magnitude bound (`bounded`, counted as not finite past it). The
+    layer's weights, moments, non-finite count and the latch after it."""
+    if finite is None:
+        return (*update(gradient, held, moments), bad, tripped)
+    bad = bad + (~bounded(gradient)).astype(bad.dtype)
+    moved, moved_moments, bad, written = _gated_layer(update, finite & (bad == 0) & ~tripped, gradient, held,
+                                                      moments, bad)
+    return moved, moved_moments, bad, tripped | ~written
+
+
 def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments, bad: jax.Array):
     """One layer's update in a step that may not be finite (`gated`): where `ok` (the loss finite, the
     layer's gradient finite and bounded, `dew.nn.finite.bounded`) by its gradient, else by a
@@ -277,16 +291,9 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
             held = _sliced(moving, index)
             held_moments = {name: _sliced(tree, index) for name, tree in moments.items()}
             squares, bad = _norms(gradient)
-            if finite is None:
-                moved, moved_moments = current.update(path, index, gradient, held, held_moments)
-            else:
-                # A gradient past the magnitude bound (`bounded`) forms an update that is not finite: it is
-                # held as a non-finite one is, and counted so.
-                bad = bad + (~bounded(gradient)).astype(bad.dtype)
-                moved, moved_moments, bad, written = _gated_layer(
-                    functools.partial(current.update, path, index), finite & (bad == 0) & ~tripped,
-                    gradient, held, held_moments, bad)
-                tripped = tripped | ~written
+            moved, moved_moments, bad, tripped = _layer_update(
+                functools.partial(current.update, path, index), finite, tripped, gradient, held,
+                held_moments, bad)
             if due is not None:
                 moved, moved_moments = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old),
                                                     (moved, moved_moments), (held, held_moments))
