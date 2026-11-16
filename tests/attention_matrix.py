@@ -11,7 +11,9 @@ launches at the derivation's where it takes two, else (a call whose derivation t
 deterministic mode's) at the dK/dV launch on the layout whose consumers feed their rings (`FED`).
 """
 
+import concurrent.futures
 import functools
+import multiprocessing
 
 import jax
 import jax.numpy as jnp
@@ -144,10 +146,43 @@ def _route(call: tuple[tuple[str, str], ...]):
         return False, op.derived(ba, target), two if op.legal(ba, two, target) else None
 
 
-def pin_of(case: dict[str, str]) -> attention_mosaic.BackwardTiles | None:
+_CERTIFYING: dict[str, concurrent.futures.ProcessPoolExecutor] = {}
+"""A process of each GPU generation's, which certifies its calls' backwards (`_certified_route`): Mosaic GPU
+compiles a module once a process, for one architecture."""
+
+
+def _certified_route(call: tuple[tuple[str, str], ...]):
+    """`_route` as a run takes it: the backward's config certified (`KernelOp.taken`: its derived config, or
+    the next where that one spills as the GPU assembles it alone) on a compile-only GPU of the call's
+    generation, and the two launches' pin only where it holds there too, in that generation's own process."""
+    name = dict(call)["generation"]
+    if name not in _CERTIFYING:
+        _CERTIFYING[name] = concurrent.futures.ProcessPoolExecutor(
+            max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+    return _CERTIFYING[name].submit(_certified_in_process, call).result()
+
+
+def _certified_in_process(call: tuple[tuple[str, str], ...]):
+    from dew.nn.kernels.templates import report
+
+    case = dict(call)
+    with generation.assumed(case["generation"]), report.certifying(
+            generation.compile_only_gpus(case["generation"])[0]):
+        op, ba, target = _backward_op(case)
+        if op.declined(ba, target) is not None:
+            return True, None, None
+        two = attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2 if case["width"] == "256" else 1,
+                                             family=WGMMA, **FED)
+        held = op.legal(ba, two, target) and report.certified(op, ba, two) == ()
+        return False, op.taken(ba), two if held else None
+
+
+def pin_of(case: dict[str, str], *, certified: bool = False) -> attention_mosaic.BackwardTiles | None:
     """The backward config `case` pins (its launch form on the Mosaic mainloop, the module's docstring), or
-    None where another mainloop runs its backward; raises where the route serves no such form."""
-    declined, derived, two = _route(tuple((axis, value) for axis, value in case.items() if axis != "launch"))
+    None where another mainloop runs its backward; raises where the route serves no such form. Its route's
+    derivation's offer (`_route`), or as a run takes it where `certified` (`_certified_route`)."""
+    call = tuple((axis, value) for axis, value in case.items() if axis != "launch")
+    declined, derived, two = (_certified_route if certified else _route)(call)
     if declined:
         if case["launch"] != "two":
             raise ValueError(f"the Mosaic backward declines {case}: no form but another mainloop's")
@@ -166,11 +201,24 @@ def pin_of(case: dict[str, str]) -> attention_mosaic.BackwardTiles | None:
 
 
 def supported(case: dict[str, str]) -> bool:
-    """Whether the route serves `case` (tests/kernel_matrix.py): its backward on the Mosaic mainloop in the
-    case's launch form (the one launch only where the derivation takes one, `pin_of`), or on another mainloop
-    in two."""
+    """Whether the route's derivation offers `case` (tests/kernel_matrix.py's census): its backward on the
+    Mosaic mainloop in the case's launch form (the one launch only where the derivation takes one,
+    `pin_of`), or on another mainloop in two. The derivation's offer, not what a run takes: certification
+    steps a proposal that spills to the next, which may be another form (`served`)."""
     try:
         pin_of(case)
+    except ValueError:
+        return False
+    return True
+
+
+def served(case: dict[str, str]) -> bool:
+    """Whether the route serves `case` as a run takes it (a declared cell's check, tests/kernel_matrix.py):
+    `supported` with the backward's config certified (`pin_of(certified=True)`), each call compiled for its
+    generation's GPU in a process of that generation (an sm90 shared-keys cell whose derived proposal spills
+    is served by its certified one, two consumers fed)."""
+    try:
+        pin_of(case, certified=True)
     except ValueError:
         return False
     return True
