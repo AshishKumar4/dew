@@ -377,6 +377,14 @@ class Architecture:
     vmem_bytes: int | None = None
     cluster: int = 1
     block_scales: bool = False
+    float16: bool = True
+    """Whether the device computes in float16: a v5e does not, so its Mosaic lowers no float16 load a TPU
+    kernel issues (a sublane-masked load, or a one-head slice, of a 16-bit (8,128)(2,1)-tiled block), where
+    bf16 at the same shapes compiles (rows 6993, 7227)."""
+    mixed_highest: bool = True
+    """Whether its matrix unit takes an fp32-precision product of an fp32 operand with a bf16 one, which a
+    default matmul precision of 'highest' asks of a kernel's fp32 weights and bf16 values: a v5e's MXU does
+    not (row 6994)."""
 
     @property
     def family(self) -> str | None:
@@ -445,7 +453,7 @@ _BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
 _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
-                             vmem_bytes=128 * 2 ** 20),
+                             vmem_bytes=128 * 2 ** 20, float16=False, mixed_highest=False),
          'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20)}
 
@@ -595,6 +603,17 @@ class GpuTarget:
         """A TPU's scoped VMEM limit in bytes at XLA's default, past which a Mosaic kernel refuses to
         compile (`dew.nn.kernels.splash.block_sizes`); None where no rule states it."""
         return self.architecture.scoped_vmem
+
+    @property
+    def float16(self) -> bool:
+        """Whether the device computes in float16 (`Architecture.float16`)."""
+        return self.architecture.float16
+
+    @property
+    def mixed_highest(self) -> bool:
+        """Whether its matrix unit takes an fp32 by bf16 product at fp32 precision
+        (`Architecture.mixed_highest`)."""
+        return self.architecture.mixed_highest
 
     @property
     def vmem_bytes(self) -> int | None:

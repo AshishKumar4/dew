@@ -459,13 +459,13 @@ where it was measured faster (an RTX 4080's SimpleDiT-B attention 5.62 to 4.33 m
 decoder's 1.82 to 1.24; Qwen3-0.6B's 128-wide 9.13 to 9.24), and no window, mask, block groups, bias,
 sinks, softcap, documents or key lengths or starts."""
 
-V5E_FLOAT16 = _Need('v5e_float16', lambda case: not (case.dtype == np.dtype(np.float16)
-                                                     and device_generation() == 'v5e'),
-                    "a v5e has no native float16: its Mosaic lowers no float16 load the TPU kernels issue (a "
-                    "sublane-masked load, or a one-head slice, of a 16-bit (8,128)(2,1)-tiled block), where "
-                    "bf16 at the same shapes compiles (rows 6993, 7227)", row=INHERENT)
-"""A Mosaic TPU kernel's capability, splash's and the template's on a TPU: no float16 on a v5e. A capability,
-so a call that names its kernel is refused too (`selection.KernelRefused`) rather than failing its compile."""
+NATIVE_FLOAT16 = _Need('float16', lambda case: (case.dtype != np.dtype(np.float16)
+                                                 or generation.gpu_target().float16),
+                       "the TPU computes in no float16, so its Mosaic lowers no float16 load the kernel "
+                       "issues (`generation.Architecture.float16`: a v5e, rows 6993, 7227)", row=INHERENT)
+"""A Mosaic TPU kernel's capability, splash's and the template's on a TPU: float16 only where the TPU
+computes in it. A capability, so a call that names its kernel is refused too (`selection.KernelRefused`)
+rather than failing its compile."""
 
 TPU_BACKEND = _Need('backend', lambda case: generation.backend() == 'tpu', "it runs on a TPU", row=INHERENT,
                     kind='measured')
@@ -477,7 +477,7 @@ TPU_SUPPORTS = (
     _WHOLE_PRODUCTS,
     # Elsewhere it runs interpreted, where 'tpu' is named.
     TPU_BACKEND,
-    V5E_FLOAT16,
+    NATIVE_FLOAT16,
     _Need('bias', lambda case: not case.bias, "splash takes no bias", row=INHERENT, kind='measured'),
     _Need('spans_only', lambda case: not case.spans_only,
           "splash's descriptor describes no mask of the call's own data, which block groups, key validity "
@@ -664,7 +664,7 @@ TEMPLATE_SUPPORTS = (
     _Need('dtype', lambda case: case.dtype in TEMPLATE_DTYPES and case.key_dtype == case.dtype,
           lambda case: f"the query is {case.dtype} and the keys are {case.key_dtype}, where the template "
                        "takes one dtype of fp32, bf16 and fp16 on its operands", row=INHERENT),
-    V5E_FLOAT16,
+    NATIVE_FLOAT16,
     _Need('mask', lambda case: not case.mask,
           "the call has an arbitrary mask, which the template reads as spans and never as a mask",
           row=INHERENT),
