@@ -728,16 +728,18 @@ def _pushed_step(value: float, optimizer):
 def test_a_step_is_finite_where_its_gradients_magnitude_is_within_the_bound(value):
     """With no loss scale, a step whose gradient is finite and past the magnitude bound (1e20, whose square
     no float32 moment holds: `dew.nn.finite.MAGNITUDE_BOUND`) is rejected before Adam forms its update, its
-    weight, moments and update count as they were, and reported not finite; one within it (three weights of
+    weight as it was, its update count too and Adam's moments those of a step of zero gradient, and
+    reported not finite; one within it (three weights of
     1e19, whose squares' sum passes float32 though each square is finite) is taken, its weight moved and
     finite. Main froze the weight under an infinite moment while the loss stayed finite (row 6861)."""
     before, (advanced, _, _, finite, _, _) = _pushed_step(value, optax.adam(0.1))
     weight = np.asarray(advanced.variables["params"]["w"])
     if value > MAGNITUDE_BOUND:
+        # The weight as it was, Adam's moments those of one step of zero gradient (training.md).
         assert not bool(finite) and int(advanced.updates) == 0
-        kept = jax.tree.leaves((advanced.variables, advanced.opt_state))
-        for got, want in zip(kept, jax.tree.leaves(before), strict=True):
-            np.testing.assert_array_equal(np.asarray(got), want)
+        np.testing.assert_array_equal(weight, before[0]["params"]["w"])
+        moments = advanced.opt_state[0]
+        assert np.all(np.asarray(moments.mu["w"]) == 0) and np.all(np.asarray(moments.nu["w"]) == 0)
     else:
         assert bool(finite) and int(advanced.updates) == 1
         assert np.all(np.isfinite(weight)) and not np.array_equal(weight, before[0]["params"]["w"])

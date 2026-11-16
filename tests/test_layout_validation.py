@@ -453,4 +453,4 @@ def test_a_layout_places_a_parameter_with_no_declared_axes_by_its_shape_and_name
     validation = Trainer(BoxedReadout(), optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
                          layout=Layout(min_shard=1, rules=(("vocab", "fsdp"),))).validate()
     assert validation.by_shape == ("params/decoder/readout/kernel",)
-    assert validation.leaves["variables/params/decoder/readout/kernel"].spec == P("fsdp", None)
+    assert validation.leaves["variables/params/decoder/readout/kernel"].spec == P("fsdp")

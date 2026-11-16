@@ -1359,7 +1359,8 @@ class Transaction:
         return advanced, loss, aux, Committed(
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
             jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted),
-            own=pending.own if self.split > 1 else None, finite=finite if scale is None else None,
+            own=pending.own if self.split > 1 else None,
+            finite=(accepted if holding else finite) if scale is None else None,
             unfinite_layer=None if pending.applied is None else pending.applied.unfinite_layer)
 
     def planned(self, state: TrainState) -> _Planned | None:

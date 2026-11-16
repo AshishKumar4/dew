@@ -1923,12 +1923,12 @@ def test_an_optimizer_dividing_with_no_guard_is_refused_at_build(optimizer, opts
 
 
 def test_lambs_trust_ratio_holds_where_the_update_is_tiny_beside_the_parameters():
-    """LAMB's trust ratio scales a layer's update to its parameters' norm: an update of 1e-38 beside
-    parameters of norm 2e4 is scaled to that norm, finite, as `(u / |u|) |p|`, where the quotient of the
-    two norms, formed first, passed float32 and made the update infinite."""
+    """LAMB's trust ratio scales a layer's update to its parameters' norm: an update of 1e-22 beside
+    parameters of norm 2e17 is scaled to that norm, finite, as `(u / |u|) |p|`, where the quotient of the
+    two norms, 1e39, formed first, passed float32 and made the update infinite."""
     from dew.optim import scale_by_trust_ratio
 
-    params = {"w": jnp.full((4,), 1e4, jnp.float32)}
-    updates = {"w": jnp.full((4,), 1e-38, jnp.float32)}
+    params = {"w": jnp.full((4,), 1e17, jnp.float32)}
+    updates = {"w": jnp.full((4,), 1e-22, jnp.float32)}
     scaled, _ = scale_by_trust_ratio().update(updates, scale_by_trust_ratio().init(params), params)
-    np.testing.assert_allclose(np.asarray(scaled["w"]), np.full((4,), 1e4), rtol=1e-5)
+    np.testing.assert_allclose(np.asarray(scaled["w"]), np.full((4,), 1e17), rtol=1e-5)
