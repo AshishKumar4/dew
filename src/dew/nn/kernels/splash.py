@@ -1369,6 +1369,20 @@ def backward_vmem(block_q: int, block_kv: int, width: int, itemsize: int, softca
     return logits + blocks + 2 * 4 * width * block_kv
 
 
+def forward_vmem(block_q: int, block_kv: int, width: int, itemsize: int) -> int:
+    """A bound on the scoped VMEM splash's forward with its residuals plans, in bytes: its fp32 logits block
+    and its weights, each `block_q` by `block_kv`; its query, key and value blocks and its output block,
+    each double-buffered in the operands' dtype; its fp32 output accumulator; and its rows' maximum, sum and
+    log-sum-exp, each at 128 lanes in fp32. On a v5e at the 16 MiB default it is 19.0 MiB at fp32 width 256
+    over 1024 blocks, where Mosaic refused 19.3 (rows 6992, 7226's cells), and within it on every config the
+    TPU tier compiled (bf16 width 256 with a softcap 15.0, fp32 width 128 14.5). A segment ids' or dense
+    mask's blocks are not in the bound."""
+    logits = 2 * 4 * block_q * block_kv
+    blocks = 2 * itemsize * width * (2 * block_q + 2 * block_kv)
+    # Its rows' maximum and sum as scratch, its log-sum-exp an output double-buffered.
+    return logits + blocks + 4 * width * block_q + (2 + 2) * 4 * 128 * block_q
+
+
 def block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, softcap: bool):
     """Narrow `SPLASH_BLOCK` to a divisor of each sequence, forward and backward.
 
@@ -1385,12 +1399,16 @@ def block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, softcap: 
     VMEM limit is measured (`GpuTarget.scoped_vmem`), past which a kernel fails
     to compile, they halve together, as measured (half of `SPLASH_BLOCK`
     compiled on every config), while they stay whole lanes, until its plan fits
-    it (`backward_vmem`). Splash takes no VMEM limit of its own (its
+    it (`backward_vmem`); the forward's halve as theirs until its own plan fits
+    (`forward_vmem`: a v5e's fp32 forward at width 256, row 6992). Splash takes no VMEM limit of its own (its
     kernels set none), so the limit is the target's default, which a TPU does
     not report: where it is unmeasured the blocks stay whole.
     """
     block_q, block_kv = math.gcd(SPLASH_BLOCK, q_len), math.gcd(SPLASH_BLOCK, kv_len)
     budget = generation.gpu_target().scoped_vmem
+    while (budget is not None and forward_vmem(block_q, block_kv, width, itemsize) > budget
+           and min(block_q, block_kv) > SPLASH_LANES):
+        block_q, block_kv = block_q // 2, block_kv // 2
     back_q, back_kv = block_q, block_kv
     while (budget is not None and backward_vmem(back_q, back_kv, width, itemsize, softcap) > budget
            and min(back_q, back_kv) > SPLASH_LANES):
