@@ -248,6 +248,26 @@ def test_a_steps_relowering_traces_none_of_its_written_regions_again():
     assert other > {chained.__name__}, other
 
 
+def test_a_written_region_records_the_facts_its_trace_read_wherever_it_is_written():
+    """A step lowered twice in one process (`dew.jit`), each within a recording (`generation.recording`): the
+    second writes its regions from the traces the first made (`fusion._traced`), and its recording holds the
+    facts their traces read (the fused products' launches' legality, `report.refused`), as the first's did,
+    where a held region dropped them and a trace kept under the second recording could not tell when they
+    no longer held (row 6708)."""
+    import dew
+
+    operands = draw()
+    step = dew.jit(chained)
+    recorded = []
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        for _ in range(2):
+            with generation.recording() as reads:
+                step.trace(*operands)
+            recorded.append(reads)
+    cold, warm = recorded
+    assert cold and set(warm) >= set(cold), (cold, warm)
+
+
 def _template_routes(trace) -> list:
     """The grouped matmul's routes `trace()` reports that run the template."""
     with generation.routes() as found:
