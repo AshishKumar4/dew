@@ -354,7 +354,18 @@ def decode_cells() -> list[Cell]:
     ]
 
 
+def lightning_cells() -> list[Cell]:
+    """Lightning attention's fast forms on the template held to fla's own `chunk_simple_gla`
+    (`simple_gla_support.fla_simple_gla`), the bar its CPU cell states in JAX."""
+    from simple_gla_support import fla_simple_gla
+
+    return [Cell("lightning attention's fast forms on the template are as exact as fla",
+                 functools.partial(forward.lightning_fast_forms_are_as_exact_as, fla_simple_gla),
+                 native={"launch": "lightning template"})]
+
+
 FAMILIES = {"two-role walk": walk_cells, "template stability": template_stability_cells,
+            "lightning": lightning_cells,
             "portable": portable_cells, "SSD port": ssd_port_cells, "selective scan": selective_cells,
             "forked template": forked_cells, "fp32 template": fp32_template_cells,
             "port training and decode": lambda: [*port_training_cells(), *decode_cells()]}

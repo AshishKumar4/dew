@@ -273,18 +273,24 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
 
 def release(hooks: recurrence.Hooks) -> str | None:
     """The upstream library a form's family has a release of, whose own code is its oracle (testing.md): fla's
-    for the delta rule, mamba_ssm's for the rated scan; None for a write gate without the delta rule, whose
-    oracle is the recurrence a token at a time (`token_by_token`)."""
-    return "fla" if hooks.delta else "mamba_ssm" if hooks.rated else None
+    for the delta rule and for its simple GLA (lightning attention's, `recurrence_chunk.simple_gla`),
+    mamba_ssm's for the rated scan; None for a write gate without the delta rule, whose oracle is the
+    recurrence a token at a time (`token_by_token`)."""
+    if hooks.delta or recurrence_chunk.simple_gla(hooks):
+        return "fla"
+    return "mamba_ssm" if hooks.rated else None
 
 
 def oracle(hooks: recurrence.Hooks, dtype) -> str | None:
     """A cell's independent oracle at `dtype` (testing.md): its form's release (`release`) where the run's
     declaration admits that release's products for the dtype (`recurrence_chunk.upstream_precision`: fp32's
-    TF32 at no more than the default), else None, the recurrence a token at a time: no run of the release
-    computes the call's numbers there."""
+    TF32 at no more than the default) and its route takes the release's numbers (a simple GLA's under the
+    fast forms alone, `recurrence_chunk.chunk_rounding`), else None, the recurrence a token at a time: no run
+    of the release computes the call's numbers there."""
     found = release(hooks)
-    return found if found is not None and recurrence_chunk.upstream_precision(dtype) else None
+    taken = hooks.delta or hooks.rated or recurrence_chunk.chunk_rounding(delta=False, dtype=dtype,
+                                                                          released=True)
+    return found if found is not None and taken and recurrence_chunk.upstream_precision(dtype) else None
 
 
 def against_the_portable_math(label: str, dew_fn, portable_fn, draw, truth_fn, seeds: int) -> str | None:
