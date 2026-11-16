@@ -296,3 +296,22 @@ def test_a_gate_multiplier_keeps_gate_and_up_joined():
     assert_joined_as_exact("gate_up", with_gradients(layer.apply), draw,
                            with_gradients(layer.clone(dtype=jnp.float64).apply), "gate multiplier joined",
                            seeds=JOINED_SEEDS["gate multiplier"])
+
+
+def test_a_recipe_that_takes_neither_of_a_delta_nets_gates_keeps_them_joined():
+    """Under a run's low-precision recipe (each preset's: blockwise FP8, MXFP8, NVFP4), a gated delta net's b
+    and a projections, 4 wide each, hold no whole block of the recipe's, so it takes neither
+    (`projections.recipe_refusal`, the one decision `recipe_projection` reads): their row still joins them,
+    one dot fewer, as without a recipe (train 925 F3: the join decided by role alone ran them apart)."""
+    from dew.nn.precision import NUMERICS_PRESETS, projection_role
+
+    layer = GatedDeltaNet(emb_features=128, num_k_heads=2, num_v_heads=4, head_k_dim=32, head_v_dim=32,
+                          dtype=jnp.bfloat16)
+    params = layer.init(jax.random.key(9), jnp.zeros((2, 128, 128), jnp.bfloat16))
+    x = jnp.zeros((2, 128, 128), jnp.bfloat16)
+    for numerics in (each for each in NUMERICS_PRESETS.values() if each.low_precision is not None):
+        with generation.run_precision(numerics), projection_role("mixer"):
+            with row_joins("delta_gates", joins=False):
+                apart = dots(layer.apply, params, x)
+            with row_joins("delta_gates"):
+                assert dots(layer.apply, params, x) == apart - 1, numerics.low_precision.recipe

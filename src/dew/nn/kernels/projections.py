@@ -57,6 +57,26 @@ def blockwise_fp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array
     return _blockwise_projection(x, w, group_blocks, jnp.dtype(out_dtype), interpret_on_cpu)
 
 
+def recipe_refusal(depth: int, width: int) -> selection.Refusal | None:
+    """Why the run's low-precision recipe (`dew.nn.precision.recipe_role`) does not take a `depth` x `width`
+    projection traced in its role, None where it takes it or the run trains in none: the role keeps the
+    run's dtypes (a router's, a head's), or the widths hold no whole blocks of the recipe's. The one
+    decision `recipe_projection` and a join of projections (`dew.nn.joined.Projections.recipe`) read."""
+    from dew.nn.precision import recipe_role
+
+    if (held := recipe_role()) is None:
+        return None
+    recipe, role = held
+    block = RECIPES[recipe.recipe].block
+    if role not in recipe.roles:
+        return selection.Refusal("kept_role", f"a {role or 'role-less'} projection keeps the run's dtypes "
+                                 f"under {recipe.recipe}", kind="handoff")
+    if depth % block or width % block:
+        return selection.Refusal("block_shape", f"a {depth} x {width} projection holds no whole "
+                                 f"{block}-wide blocks", kind="handoff")
+    return None
+
+
 def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None = None, *,
                       out_dtype, bias: jax.Array | None = None) -> jax.Array | None:
     """`rows @ matrix` in the run's low-precision recipe (`dew.nn.precision.recipe_role`), where the
@@ -73,16 +93,9 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     held = recipe_role()
     if held is None:
         return None
-    recipe, role = held
+    recipe = held[0]
     taken = RECIPES[recipe.recipe]
-    depth, width = matrix.shape[-2:]
-    refusal = (None if role in recipe.roles else
-               selection.Refusal("kept_role", f"a {role or 'role-less'} projection keeps the run's dtypes "
-                                 f"under {recipe.recipe}", kind="handoff"))
-    if refusal is None and (depth % taken.block or width % taken.block):
-        refusal = selection.Refusal("block_shape", f"a {depth} x {width} projection holds no whole "
-                                    f"{taken.block}-wide blocks", kind="handoff")
-    if refusal is not None:
+    if (refusal := recipe_refusal(*matrix.shape[-2:])) is not None:
         generation.route(taken.choice, kernel="unquantized", preferred=recipe.recipe, refusal=refusal)
         return None
     edge = SCALE_DEPTH
@@ -106,7 +119,7 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     held_group = jnp.minimum(group, groups - 1)
     place = jnp.where(group < groups, (jnp.cumsum(blocks) - blocks)[held_group] * edge
                       + jnp.arange(count) - (ends - sizes)[held_group], padded)
-    laid = jnp.zeros((padded, depth), rows.dtype).at[place].set(rows, mode="drop")
+    laid = jnp.zeros((padded, rows.shape[1]), rows.dtype).at[place].set(rows, mode="drop")
     # The run's slack, zero rows, as the last group's further blocks: the recipe's rows are whole blocks.
     group_blocks = blocks.at[-1].add(padded // edge - blocks.sum())
     # A biased product's sums stay fp32 through the bias, as the template's epilogue adds it (moe's
