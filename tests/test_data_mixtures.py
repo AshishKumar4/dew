@@ -2448,7 +2448,7 @@ def test_a_streamed_unseeded_mix_of_a_file_with_no_length_is_refused_or_provisio
     preparation, where it read on to a different end than its indexed read; provisioned, as a pass read
     once and `fit` provision it, the mix reads to its share-spans."""
     for name, count, first in (("many", 100, 0), ("one", 1, 1000)):
-        rows = "".join(f'{{"id": {first + index}}}\\n' for index in range(count))
+        rows = "".join(f'{{"id": {first + index}}}\n' for index in range(count))
         (tmp_path / f"{name}.jsonl").write_text(rows)
 
     def chain():

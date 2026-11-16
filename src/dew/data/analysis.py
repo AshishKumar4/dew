@@ -1191,7 +1191,7 @@ def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool,
     and of a streamed read of `ending` (the reads that end, no training read's), the indexed read whose
     length each member of an unseeded mix needs (`_measured_members`), which ends the mix at its members'
     share-spans (data.md §3)."""
-    missing = [(source, read) for source in _unsupported(pipelines, read)]
+    missing: list[tuple[Source, Read]] = [(source, read) for source in _unsupported(pipelines, read)]
     if read == "streamed":
         measured = [source for pipeline in ending for source in _measured_members(pipeline)]
         missing += [(source, "indexed") for source in measured if not source.supports("indexed")]
