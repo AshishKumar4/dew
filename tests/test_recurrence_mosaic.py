@@ -1486,10 +1486,17 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
     assert not mosaic_failures([record]), mosaic_failures([record])
 
 
+def _lost(kernel: dict) -> bool:
+    """Whether a compiled kernel's record (`kernel_compile`'s) is one a run's certification refuses: spilled,
+    or its warpgroup MMAs serialized (`report.Binary.refused`)."""
+    return bool(kernel.get("spilled")) or bool(report.SERIALIZED & set(kernel.get("losses", ())))
+
+
 def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:
     """The gate's cases of `group` on `target` (`compiled_cases`) and their records, compiled, then, for as
-    long as a required launch spills at a config not refused before, its launch refused
-    (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps a spilling
+    long as a required launch spills or serializes its warpgroup MMAs (`report.SERIALIZED`, which a run's
+    certification refuses, `report.Binary.refused`) at a config not refused before, its launch refused
+    (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps such a
     launch down through its derivation's configs (`report.settled`): a launch whose every config spills
     derives none and leaves the template. `refused` holds the calls the template's own model refuses (its
     first derivation, before any compile); the plans and launches held apart are those of the cases
@@ -1502,7 +1509,7 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
     stepped: set = set()
     while True:
         spilling = {case.name: {kernel["kernel"] for kernel in record.get("kernels", ())
-                                if kernel.get("spilled") and kernel["kernel"] not in
+                                if _lost(kernel) and kernel["kernel"] not in
                                 refused_kernels(record, apart.get(case.name, set()))}
                     for case, record in zip(cases, found, strict=True) if case.required}
         # A case refused once at a config, and again at the config its derivation then gives (a launch's
@@ -1561,7 +1568,10 @@ def test_a_launchs_call_and_its_gradients_product_are_two_launches_in_either_ord
 @COMPILES_ON_CPU
 def test_a_packed_key_decay_training_call_checks_forward_and_recomputed_kernels():
     """A forward and its backward's recomputations can share kernel names at different resource sizes:
-    each name's model must cover both, while a model-refused launch remains a counterfactual."""
+    each name's model must cover both, while a model-refused launch remains a counterfactual. A launch whose
+    producer spills at the least climbs its ladder as a run's certification raises it (`Mosaic._raised`: a
+    producer's need is the assembler's alone, `resources.producer_floor`; sm100's decayed keys spilled 16
+    bytes in its producer at the least, row 6747), and holds there."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -1571,17 +1581,29 @@ def test_a_packed_key_decay_training_call_checks_forward_and_recomputed_kernels(
     args = resource_operands(name, dtype, 1, 256)
     starts = jax.ShapeDtypeStruct((1, 256), jnp.bool_)
     bound = template.MOSAIC.bind(*args, starts, max_segments=8, bound=1.0, **_form(name, dtype))
-    tiles = mainloop.Tiles(32, 3, 128, 2, chunk=64)
-    launches = template.MOSAIC.launches(bound, tiles, facts, backward=True)
-    models = _models(launches, family, facts)
     given = [*args, jax.ShapeDtypeStruct(args[2].shape, dtype),
              jax.ShapeDtypeStruct(args[5].shape, jnp.float32)]
-    call = functools.partial(_gate_call, name, dtype, given, starts, tiles, family, training=True)
     label = 'packed key-decay training and its recomputations'
-    case = KernelCase(label, call, models)
-    apart = {label: {kernel for kernel, model in models.items()
-                     if model.registers is not None and model.registers > model.budget}}
-    found = compile_mosaic_kernels([case], 'sm100')
+
+    def compiled(tiles):
+        launches = template.MOSAIC.launches(bound, tiles, facts, backward=True)
+        models = _models(launches, family, facts)
+        call = functools.partial(_gate_call, name, dtype, given, starts, tiles, family, training=True)
+        case = KernelCase(label, call, models)
+        apart = {label: {kernel for kernel, model in models.items()
+                         if model.registers is not None and model.registers > model.budget}}
+        return case, launches, apart, compile_mosaic_kernels([case], 'sm100')
+
+    tiles = mainloop.Tiles(32, 3, 128, 2, chunk=64)
+    case, launches, apart, found = compiled(tiles)
+    while spilled := frozenset(kernel["kernel"] for kernel in found[0].get("kernels", ())
+                               if kernel.get("spilled")):
+        with generation.assumed(facts):
+            producers = template.MOSAIC._raised(bound, tiles, spilled, facts)
+        if producers is None:
+            break
+        tiles = dataclasses.replace(tiles, producers=producers)
+        case, launches, apart, found = compiled(tiles)
     assert resource_failures([case], found, {label: launches}, apart) == []
 
 
