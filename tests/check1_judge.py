@@ -10,11 +10,10 @@ import json
 import os
 from collections.abc import Callable
 
-import numpy as np
 from check1_wire import DRAWS, STAGES
 from map_judge import PoolRefused, ask_later, manifests, pooled_units
 
-from dew.parity import NARROW_FACTORS, GateFailure, Inconclusive, _Draws, _staged, _verdict
+from dew.parity import NARROW_FACTORS, GateFailure, Inconclusive, _Draws, _exact, _staged, _verdict
 
 SWITCHED: list[dict] = []
 """The sites decided onto YNNPACK's fusions (`_ynn_decided`) since the last test's report took them: each its
@@ -79,7 +78,7 @@ def _verdicts(drawn_for, verdict: Verdict, narrow_leaves: list[str], mode: Calla
     for index, named in enumerate(verdict.labels):
         over, unresolved, stage = _staged(drawn_for(index), seeds, named)
         exact = (None if verdict.library and not index
-                 else not np.any(drawn_for(index)(0, seeds).theirs > -np.inf))
+                 else _exact(drawn_for(index)(0, seeds).theirs))
         _logged(named, stage, _verdict(over, unresolved), narrow_leaves, mode(), exact)
         overs += over
         unresolveds += unresolved

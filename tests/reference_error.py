@@ -119,6 +119,7 @@ from dew.parity import (
     _Draws,
     _enough_seeds,
     _evidence,
+    _exact,
     _example_ratios,
     _example_worst_rows,
     _interval,
@@ -1716,9 +1717,9 @@ def _moved(draws: _Draws, stage: int) -> tuple[list[str], list[str], bool]:
         if not draws.finite[:, index].all():
             kept.append(f"{name}: a value not finite, which moves nothing a ratio can show")
             unresolved = True
-        elif not np.any(theirs > -np.inf):
+        elif _exact(theirs):
             # The original holds the float64 truth exactly: any move off it is past its rounding.
-            off = bool(np.any(mine > -np.inf))
+            off = not _exact(mine)
             (moved if off else kept).append(
                 f"{name}: {'moved off' if off else 'kept'} the original's exact value")
         else:
