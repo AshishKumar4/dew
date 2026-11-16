@@ -329,12 +329,18 @@ def test_a_process_two_threads_of_which_a_signal_ends_keeps_its_native_stacks(ci
         until = time.monotonic() + 60
         while handling() < 2 and child.poll() is None and time.monotonic() < until:
             time.sleep(0.05)
-        assert child.poll() is None, "the second fault ended the process before its stacks were read"
-        assert handling() == 2
+        overlapped = child.poll() is None and handling() == 2
     finally:
         os.kill(capture.collector.pid, signal.SIGCONT)
-    assert child.wait(timeout=120) == -signal.SIGSEGV
-    assert capture.evidence(capture.stacks()) == {"capture": "armed", "natives": "read"}
+        try:
+            ended = child.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            ended = child.wait()
+        stacks = capture.stacks()
+    assert overlapped, "the second fault ended the process before its stacks were read"
+    assert ended == -signal.SIGSEGV
+    assert capture.evidence(stacks) == {"capture": "armed", "natives": "read"}
 
 
 def test_a_worker_a_signal_ends_keeps_its_native_stacks_though_pytest_exits_red(ci, tmp_path):
