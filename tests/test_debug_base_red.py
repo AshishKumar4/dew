@@ -84,3 +84,15 @@ def test_certified_deepest(cell, name):
     print("CERTIFIED " + json.dumps({"cell": cell, "generation": name, "chosen": selected,
                                      "failures": mosaic_failures(found)}, default=str), flush=True)
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
+
+
+def test_derived_decisions():
+    for cell, name in (("attention forward 128", "sm90"), ("attention backward 64", "sm80"),
+                       ("attention backward 64", "sm100")):
+        base._DERIVED.clear()
+        with generation.assumed(name):
+            op, ba, config = CELLS[cell][0]()
+            at = deepest(op, ba, config, generation.gpu_target())
+            print("DECISION " + json.dumps({"cell": cell, "generation": name, "derived": repr(config),
+                                            "deepest": repr(at), "registers": op.registers(ba, at),
+                                            "budget": op.register_budget(at)}, default=str), flush=True)
