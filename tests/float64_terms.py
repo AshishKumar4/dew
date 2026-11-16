@@ -13,7 +13,7 @@ from typing import Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import on_float64_device, on_float64_host, unrewritten
+from arm_arithmetic import as_written, on_float64_device, on_float64_host, unrewritten
 from jax.extend.core import primitives
 from jax.interpreters import partial_eval as pe
 from truths_ahead import AT_RUN, COMPILED as STORE, running
@@ -334,7 +334,9 @@ def _compiled(jaxpr):
     its inputs, compiled once a program (`traced`)."""
     key = (jaxpr, _target(), POWER.get())
     if key not in COMPILED:
-        COMPILED[key] = jax.jit(lambda consts, given: evaluated(jaxpr, consts, given))
+        # As written, as every truth the gate runs (`arm_arithmetic.Truth`).
+        COMPILED[key] = jax.jit(lambda consts, given: evaluated(jaxpr, consts, given),
+                                compiler_options=as_written(_target()))
     return COMPILED[key]
 
 
@@ -560,7 +562,7 @@ def _span(jaxpr, start: int, stop: int):
                 energies.update(zip(equation.outvars, made, strict=True))
             return [values[var] for var in kept], [energies[var] for var in kept]
 
-        RUNS[key] = (reads, kept, freed, jax.jit(evaluate))
+        RUNS[key] = (reads, kept, freed, jax.jit(evaluate, compiler_options=as_written(_target())))
     return RUNS[key]
 
 

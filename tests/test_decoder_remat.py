@@ -21,7 +21,7 @@ import pytest
 import selection_margins
 from flax import linen as nn
 from model_support import largest_difference
-from reference_error import as_given, assert_as_exact, without_ynn
+from reference_error import as_given, assert_as_exact, dew_path, without_ynn
 
 from dew.checkpoints import Checkpoints
 from dew.distributed.batches import shard_batch
@@ -206,10 +206,10 @@ def assert_recomputed_blocks_train_the_same_model(shape, *, scan):
     draw = drawn_steps(plain, stepped, routed=shape == "sparse")
     wide = plain.clone(dtype=jnp.float64)
     assert_as_exact(lambda variables, *_: remat.apply(variables, ids),
-                    lambda variables, *_: plain.apply(variables, ids), draw,
+                    dew_path(lambda variables, *_: plain.apply(variables, ids)), draw,
                     f"a recomputed {shape} block's forward, scan {scan}", seeds=STEP_SEEDS,
                     truth_fn=jax.jit(lambda variables, *_: wide.apply(variables, ids)))
-    assert_as_exact(committed(rerun), committed(run), draw,
+    assert_as_exact(committed(rerun), dew_path(committed(run)), draw,
                     f"a recomputed {shape} block's step, scan {scan}",
                     seeds=SIZED_STEP_SEEDS.get((shape, scan), STEP_SEEDS),
                     truth_fn=committed(wide_step(plain)))
@@ -358,7 +358,7 @@ def against_full(scan):
     def draw(seed):
         return initialized(jax.random.key(seed)), jax.random.key_data(jax.random.key(seed + (1 << 20)))
 
-    return full, draw, gradient_step(full), jax.jit(gradient_step(full.clone(dtype=jnp.float64)))
+    return full, draw, dew_path(gradient_step(full)), jax.jit(gradient_step(full.clone(dtype=jnp.float64)))
 
 
 @pytest.mark.parametrize("policy", NAMED)

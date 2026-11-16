@@ -25,7 +25,7 @@ from lane_environment import without_flags
 from flax import linen as nn
 from interop_support import extract_fixture, token_draw
 from model_support import parameter_loss
-from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, with_gradients
+from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, dew_path, with_gradients
 from token_support import token_rows
 
 from dew.batch import unboxed
@@ -1504,7 +1504,7 @@ def _assert_blocks_on_par(block: Callable[[str], nn.Module], ours: str, label: s
         return (params, jax.random.normal(streams[0], (2, 32, 64)) * 2,
                 jax.random.normal(streams[1], (2, 32, 64)))
 
-    assert_as_exact(arm(ours), arm("reference"), draw, label, seeds=QUANTIZED_ATTENTION_SEEDS)
+    assert_as_exact(arm(ours), dew_path(arm("reference")), draw, label, seeds=QUANTIZED_ATTENTION_SEEDS)
 
 
 def test_an_int8_attention_block_on_the_template_is_on_par_with_the_reference_path():

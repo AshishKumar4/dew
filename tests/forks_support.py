@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from model_support import float64_twin
-from reference_error import assert_as_exact, widened
+from reference_error import assert_as_exact, dew_path, widened
 
 from dew.batch import Forks, coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -112,8 +112,8 @@ def assert_forks_as_own_rows(module, variables, width: int, layout: str, label: 
     def truth(params, hidden):
         return apart(params, hidden, model=wide, collections=wide_variables)
 
-    assert_as_exact(outputs(forked), outputs(apart), draw, f"{label}, {layout}", seeds=FORKED_SEEDS,
+    assert_as_exact(outputs(forked), dew_path(outputs(apart)), draw, f"{label}, {layout}", seeds=FORKED_SEEDS,
                     truth_fn=outputs(truth, wide_variables["params"]))
-    assert_as_exact(gradients(forked), gradients(apart), draw, f"{label}'s gradients, {layout}",
+    assert_as_exact(gradients(forked), dew_path(gradients(apart)), draw, f"{label}'s gradients, {layout}",
                     seeds=FORKED_SEEDS, truth_fn=gradients(truth, wide_variables["params"]))
     assert not np.any(np.asarray(outputs(forked)(*draw(0)))[:, ~valid])

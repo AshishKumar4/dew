@@ -165,6 +165,36 @@ def summed_as_run():
     return contextlib.nullcontext()
 
 
+AS_WRITTEN = {"cpu": "algsimp,constant_folding,fusion,cpu-instruction-fusion,reduction-splitter,"
+                     "multi_output_fusion",
+              "gpu": "algsimp,constant_folding,fusion,priority-fusion,multi_output_fusion,"
+                     "horizontal-loop-fusion,horizontal-input-fusion",
+              "tpu": "algsimp,constant_folding,fusion,multi_output_fusion"}
+"""XLA's passes a reference arm and a float64 truth compile without (`as_written`), by backend: its
+algebraic simplifier, which rewrites (A/B)/C as A/(B*C) and divides by a broadcast through its reciprocal;
+its constant folding, which computes at compile time what the program computes when it runs (and, without
+the simplifier, XLA:CPU's raises SIGFPE on an operation of no elements: an MXFP8 step over an empty group);
+and its fusions, which sum a product unrounded beside its rounded opposite (a fused multiply-add), so equal
+and opposite terms do not cancel. With them a reference carries the rewrite Dew's arm, compiled by the same
+XLA, carries too, and check 1 holds the two on par wherever both are wrong (a merge of +-2^127 and a least
+normal: 3.6e30 where the truth is 1.2e-38, row 6909). Without them each operation is as written, still
+compiled: the platform's own compiled semantics (XLA:CPU flushes a compiled program's subnormals, Dew's arm's
+and the reference's alike, where an operation run alone keeps them) at a compiled program's cost (armada, a
+transformer block's gradient: 3.4 ms a draw, 9.9 ms with the passes, 43 ms an operation at a time). The GPU's
+names are its fusion passes', read on the GPU tier; the TPU's, the open pipeline's, on the TPU tier."""
+
+
+def as_written(platform: str | None = None) -> dict:
+    """The compiler options that compile a program as written on `platform` (`AS_WRITTEN`; where none is
+    named, the platform the context places a call on, `generation.placed_platform`: a GPU tier part's prepare
+    places its programs on its compile-only GPU; a device's `platform` where a program runs on one): each of
+    its operations as it is, none rewritten with another or fused with it."""
+    from dew.nn.kernels.generation import placed_platform
+
+    platform = platform or placed_platform()
+    return {"xla_disable_hlo_passes": AS_WRITTEN["gpu" if platform in ("cuda", "rocm", "gpu") else platform]}
+
+
 def unrewritten(fn):
     """`fn` run with the algebra pass off (`Unrewritten`), the one scope of every reference arm
     (`reference_error._compiled`) and float64 truth (`reference_error._truth_program`, `Truth`) the gate
@@ -213,16 +243,20 @@ class Unrewritten:
 
 
 class Truth:
-    """A check's float64 truth as the gate runs it (`reference_error._truth_program`): its own function
-    jitted, which every site of it shares, run unrewritten (`unrewritten`), compiled from its first call and
-    never run eagerly, so a seed's truth is the same whichever seed a process draws first (a map task's,
-    DRAWS) and a large truth pays no eager run. A truth that does host work on its values (NumPy, torch, a
-    fetch to the host) states it, `as_given`, and the gate runs it so; unstated, its trace fails at its
-    first seed, naming it (ledger 3198). On `device` where one is named (a GPU run's sizing, whose truths its
-    host computes as a prepare's do, the GPU's memory left to the arms)."""
+    """A check's float64 truth as the gate runs it (`reference_error._truth_program`): its own function jitted
+    as written (`as_written`), which every site of it shares, run unrewritten (`unrewritten`), compiled from
+    its first call and never run eagerly, so a seed's truth is the same whichever seed a process draws first
+    (a map task's, DRAWS) and a large truth pays no eager run. A truth that does host work on its values
+    (NumPy, torch, a fetch to the host) states it, `as_given`, and the gate runs it so; unstated, its trace
+    fails at its first seed, naming it (ledger 3198). On `device` where one is named (a GPU run's sizing,
+    whose truths its host computes as a prepare's do, the GPU's memory left to the arms)."""
 
     def __init__(self, fn, device=None):
-        self.fn, self.run, self.device = fn, unrewritten(jax.jit(fn)), device
+        # As written (`as_written`) on the device it computes on: a truth rewritten into another value makes
+        # every ratio meaningless.
+        placed = device or float64_host()
+        written = as_written(None if placed is None else placed.platform)
+        self.fn, self.run, self.device = fn, unrewritten(jax.jit(fn, compiler_options=written)), device
 
     def __call__(self, *inputs):
         # On `device` where one is named: a GPU run's sizing computes its truths on the host, as a prepare

@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import as_given, assert_as_exact, widened, with_gradients
+from reference_error import as_given, assert_as_exact, dew_path, widened, with_gradients
 
 from dew.lora import LoRA
 from dew.nn.attention import scaled_dot_product_attention
@@ -257,7 +257,7 @@ def test_a_qwix_quantized_kv_b_proj_attends_as_its_latents_allow(weight_only):
     traced = jax.make_jaxpr(model.apply)(*draw(0))
     assert ((2, HEADS, 21, 21) in produced_shapes(traced.jaxpr)) == (not weight_only)
     label = 'weight-quantized kv_b_proj' if weight_only else 'act-quantized kv_b_proj'
-    assert_as_exact(jax.jit(model.apply), jax.jit(masked), draw, label, seeds=SEEDS[label],
+    assert_as_exact(jax.jit(model.apply), dew_path(jax.jit(masked)), draw, label, seeds=SEEDS[label],
                     truth_fn=as_given(lambda variables, hidden: masked(widened(variables), hidden)))
 
 

@@ -28,7 +28,7 @@ from memory_support import (
     written,
 )
 from port_support import row_names_port
-from reference_error import as_given, assert_as_exact, widened
+from reference_error import as_given, assert_as_exact, dew_path, widened
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -93,7 +93,7 @@ def test_a_scanned_memory_decoder_trains_as_the_plain_loop():
     float64 (check 1)."""
     plain = decoder()
     _, draw = memory_draw(plain)
-    assert_as_exact(trained(decoder(scan_layers=True)), trained(plain), draw,
+    assert_as_exact(trained(decoder(scan_layers=True)), dew_path(trained(plain)), draw,
                     "scanned memory decoder gradient", seeds=SEEDS["scanned memory decoder gradient"],
                     truth_fn=trained(decoder(dtype=jnp.float64)))
 
@@ -503,7 +503,7 @@ def served_site(case: str):
         return stored, start, ids
 
     return (served, lambda stored, start, ids: served.apply(stored, ids),
-            lambda stored, start, ids: spec.apply(model).apply(start, ids), draw,
+            dew_path(lambda stored, start, ids: spec.apply(model).apply(start, ids)), draw,
             lambda stored, start, ids: spec.apply(wide).apply(start, ids))
 
 

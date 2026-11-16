@@ -22,7 +22,7 @@ from arm_arithmetic import float64_held
 from checkpoint_cases import LENGTH, PATHS, ROWS, loaded, tokens
 from flax import linen as nn
 from model_support import float64_twin, floating_gradient, stepped_outputs
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, dew_path
 from tool_support import load
 
 from dew.nn.attention_residuals import AttentionResiduals
@@ -217,7 +217,7 @@ def _steps_its_forward(model, variables, inputs, **apply) -> None:
     from the model's float64 twin over drawn inputs (`_against_its_twin`)."""
     variables, top, record, twin, wide = _against_its_twin(model, variables)
     assert_as_exact(lambda *drawn: _call(top, variables, drawn, **apply),
-                    lambda *drawn: _call(model, variables, drawn, **apply),
+                    dew_path(lambda *drawn: _call(model, variables, drawn, **apply)),
                     lambda seed: _redrawn(inputs, seed), f"forward at {record}", seeds=RUNG_SEEDS,
                     truth_fn=lambda *drawn: _call(twin, wide, drawn, **apply))
 
@@ -229,7 +229,7 @@ def _steps_its_gradient(name: str, model, variables, inputs, **apply) -> None:
     parameter its own leaf (`_against_its_twin`), at the setting its truth resolves (`judged`)."""
     variables, top, record, twin, wide = _against_its_twin(model, variables)
     assert_as_exact(lambda *drawn: _stepped(judged(top), variables, drawn, **apply),
-                    lambda *drawn: _stepped(judged(model), variables, drawn, **apply),
+                    dew_path(lambda *drawn: _stepped(judged(model), variables, drawn, **apply)),
                     lambda seed: _redrawn(inputs, seed), f"gradient at {record}", seeds=GRADIENT_SEEDS[name],
                     truth_fn=lambda *drawn: _stepped(judged(twin), wide, drawn, **apply))
 

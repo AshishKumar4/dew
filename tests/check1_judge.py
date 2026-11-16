@@ -51,13 +51,16 @@ def _with_mode(findings: list, refused: str | None) -> list:
 @dataclasses.dataclass(frozen=True)
 class Verdict:
     """What a check-1 site's verdict reads beside its draws (`_verdicts`): its declared `seeds`, its
-    `labels` (the site's own, then one against each further reference, `also`, in its draws' order),
-    whether a `library` arm stands in for the reference on some leaves, and the site's weighed check
-    (`_deferred`) it `defers_to` where it stays undecided. A map task records it with its draws (`_recorded`),
-    and the judge reads that record (`judged_from_records`): one object, whichever process judges."""
+    `labels` (the site's own, then one against each further reference, `also`, then one against each of
+    those its accuracy claim holds as written, in its draws' order), the `powers` of check 1's factors each
+    is judged at (`_staged`'s: one, or WRITTEN as written), whether a `library` arm stands in for the
+    reference on some leaves, and the site's weighed check (`_deferred`) it `defers_to` where it stays
+    undecided. A map task records it with its draws (`_recorded`), and the judge reads that record
+    (`judged_from_records`): one object, whichever process judges."""
 
     seeds: int
     labels: tuple[str, ...]
+    powers: tuple[int, ...]
     library: bool
     defers_to: str | None = None
 
@@ -69,14 +72,15 @@ def _narrow(draws: _Draws) -> list[str]:
 
 def _verdicts(drawn_for, verdict: Verdict, narrow_leaves: list[str], mode: Callable[[], str | None]) -> None:
     """Each reference's check 1 over its draws (`_staged`, `drawn_for(index)` the draws against reference
-    `index`, judged under `verdict.labels[index]` over its declared seeds), each logged (STAGES_LOG) with
+    `index`, judged under `verdict.labels[index]` over its declared seeds, its factors to
+    `verdict.powers[index]`), each logged (STAGES_LOG) with
     whether its reference equalled the truth on every first-stage seed, unknown (None) for the first where a
     `library` arm's error stands in for its reference's on some leaves, and the arms' YNNPACK mode (`mode`,
     read once they have run); a GateFailure where any leaf is over, else an Inconclusive where any is left
     unresolved."""
     overs, unresolveds, seeds = [], [], verdict.seeds
     for index, named in enumerate(verdict.labels):
-        over, unresolved, stage = _staged(drawn_for(index), seeds, named)
+        over, unresolved, stage = _staged(drawn_for(index), seeds, named, power=verdict.powers[index])
         exact = (None if verdict.library and not index
                  else _exact(drawn_for(index)(0, seeds).theirs))
         _logged(named, stage, _verdict(over, unresolved), narrow_leaves, mode(), exact)

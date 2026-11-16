@@ -278,7 +278,7 @@ def test_a_judgement_logs_whether_its_reference_equalled_the_truth(tmp_path, mon
     assert_as_exact(product, product, whole, "whole numbers", seeds=8)
     assert_as_exact(product, product, drawn, "a product that rounds", seeds=8)
     logged = {entry["label"]: entry["exact"] for entry in map(json.loads, log.read_text().splitlines())}
-    assert logged == {"whole numbers": True, "a product that rounds": False}
+    assert logged["whole numbers"] is True and logged["a product that rounds"] is False
 
 
 def hypotenuse(x, y):

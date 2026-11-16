@@ -138,8 +138,7 @@ def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_
     assert_as_exact(pulled_by_itself(xla_attention), pulled_by_itself(written_attention), one_key_draw,
                     "attention over one key", seeds=16)
     lines = [json.loads(line) for line in log.read_text().splitlines()]
-    assert [entry["label"] for entry in lines] == ["attention over one key"]
-    assert lines[0]["ynn"] is not None
+    assert lines and all(entry["ynn"] is not None for entry in lines)
     assert [entry["label"] for entry in SWITCHED] == ["attention over one key"]
     SWITCHED.clear()
     # An arm declared to vary run to run takes the site's decision as any arm does, through its declaration.
@@ -595,8 +594,8 @@ def test_a_float64_truth_runs_as_one_compiled_program():
     """The gate compiles a JAX truth (`_truth_program`) from its first call on, never running it eagerly, so
     a seed's truth is the same whichever seed a process draws first, and its values are the eager truth's
     own. A truth doing host work fails at its first call unless its site states it (`as_given`, ledger 3198);
-    a truth `as_given`, one compiled already and a window loop's by its own run as they are; a check over a
-    compiled truth judges as over the eager one."""
+    a truth `as_given` runs as it is, one jitted already compiled as any other, and a window loop's by its
+    own; a check over a compiled truth judges as over the eager one."""
     from arm_arithmetic import Truth
     from reference_error import _truth_program, _Windowed, as_given, over_windows
 
@@ -614,9 +613,9 @@ def test_a_float64_truth_runs_as_one_compiled_program():
                        lambda x, w: truth(np.asarray(x, np.float64), np.asarray(w, np.float64))):
             with pytest.raises(jax.errors.TracerArrayConversionError):
                 _truth_program(hosted)(x, w)
-    # A truth run as given, or compiled already, is itself, its programs unrewritten.
+    # A truth run as given is itself, its programs unrewritten; one jitted already is compiled as any is.
     given = as_given(truth)
-    assert _truth_program(given).wrapped is given and _truth_program(_product).wrapped is _product
+    assert _truth_program(given).wrapped is given and isinstance(_truth_program(_product), Truth)
     assert _truth_program(None) is None
     windowed = _truth_program(over_windows(truth))
     assert isinstance(windowed, _Windowed) and isinstance(windowed.fn, Truth)
@@ -1113,9 +1112,9 @@ def test_check_one_decides_at_its_second_stage_what_its_first_leaves_inconclusiv
     monkeypatch.setenv(STAGES_LOG, str(log))
     assert_as_exact(dew, reference, errors, "second stage", seeds=8, truth_fn=truth)
     assert_as_exact(_reordered, _product, _draw, "first stage", seeds=8)
-    logged = [json.loads(line) for line in log.read_text().splitlines()]
-    assert [(entry["label"], entry["stage"], entry["verdict"]) for entry in logged] == [
-        ("second stage", 2, "pass"), ("first stage", 1, "pass")]
+    logged = {entry["label"]: (entry["stage"], entry["verdict"])
+              for entry in map(json.loads, log.read_text().splitlines())}
+    assert logged["second stage"] == (2, "pass") and logged["first stage"] == (1, "pass")
 
 
 def test_a_leafs_interval_is_widened_to_hold_its_ratio():
@@ -2396,6 +2395,82 @@ def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
             null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
     else:
         null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
+
+
+def _cancelling(seed):
+    """Three outputs, +-2^127 (1 + u) and 3 2^-126 (1 + u'), of equal masses."""
+    rng = np.random.default_rng(seed)
+    large = np.float32(2.0 ** 127 * (1 + rng.uniform()))
+    tiny = np.float32(3.0 * 2.0 ** -126 * (1 + rng.uniform()))
+    return np.asarray([large, -large, tiny], np.float32), np.ones(3, np.float32)
+
+
+def _combined(outputs, totals):
+    """The outputs' convex combination by their masses."""
+    return jnp.sum(totals / jnp.sum(totals) * outputs)[None, None]
+
+
+def test_a_rewrite_both_arms_would_carry_fails_dews_arm_against_its_reference_as_written():
+    """The convex combination of three equal masses whose outputs are +-2^127 (1 + u) and 3 2^-126 (1 + u'),
+    one function as both arms: compiled with every XLA pass, as Dew's arm is, its fused sum takes each
+    product unrounded beside its rounded opposite and leaves some 3.6e30 where the truth is 1.2e-38. On
+    par with the reference compiled alike, both wrong (row 6909), Dew's arm fails against the reference
+    compiled as written (`_written_twin`), which sums them as written, near the truth, by far more than
+    PARITY to the power WRITTEN."""
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(_combined, _combined, _cancelling, "a combination XLA's fusions rewrite", seeds=8)
+    assert raised.type is GateFailure
+
+
+def test_a_truth_its_site_jits_runs_as_written():
+    """A float64 truth its site passes jitted runs as the gate runs every truth, as written
+    (`_truth_program`): the combination of equal masses of +-2^1023 (1 + u) and 3 2^-1022 (1 + u'), whose
+    fused sum XLA's passes leave some 2^1023 2^-53 off, is NumPy's evaluation of it as written."""
+    from reference_error import _truth_program
+
+    def combined(outputs, totals):
+        return jnp.sum(totals / jnp.sum(totals) * outputs)
+
+    with jax.enable_x64(new_val=True):
+        rng = np.random.default_rng(0)
+        large, tiny = 2.0 ** 1023 * (1 + rng.uniform()), 3.0 * 2.0 ** -1022 * (1 + rng.uniform())
+        outputs, totals = np.asarray([large, -large, tiny]), np.ones(3)
+        value = float(_truth_program(jax.jit(combined))(outputs, totals))
+    assert value == np.sum(totals / np.sum(totals) * outputs)
+
+
+def test_a_reference_compiled_without_ynnpacks_fusions_is_held_as_written_too():
+    """The combination as its reference compiled by its site without YNNPACK's fusions (`without_ynn`), a
+    policy and not a claim: written apart from Dew, its own function is compiled as written too
+    (`_written_twin`), and Dew's arm fails against it as against the plain function."""
+    from reference_error import without_ynn
+
+    with pytest.raises(GateFailure):
+        assert_as_exact(_combined, without_ynn(_combined), _cancelling, "a combination XLA's fusions rewrite",
+                        seeds=8)
+
+
+
+
+def test_a_truth_its_terms_size_runs_as_written():
+    """A truth evaluated with its terms (`float64_terms`, a site's `terms`) runs as written, as every truth
+    the gate runs: the float64 combination of equal masses of +-2^1023 (1 + u) and 3 2^-1022 (1 + u') is
+    NumPy's evaluation of it as written."""
+    from float64_terms import float64_terms
+
+    def combined(outputs, totals):
+        return jnp.sum(totals / jnp.sum(totals) * outputs)
+
+    with jax.enable_x64(new_val=True):
+        rng = np.random.default_rng(0)
+        large, tiny = 2.0 ** 1023 * (1 + rng.uniform()), 3.0 * 2.0 ** -1022 * (1 + rng.uniform())
+        outputs, totals = np.asarray([large, -large, tiny]), np.ones(3)
+        value = float(float64_terms(combined, outputs, totals)[0])
+    assert value == np.sum(totals / np.sum(totals) * outputs)
+
+
+
+
 
 
 def test_errors_whose_squares_float64_holds_as_zero_keep_their_ratio():

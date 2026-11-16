@@ -16,7 +16,7 @@ import pytest
 from flax import linen as nn
 from forks_support import LAYOUTS, assert_forks_as_own_rows
 from model_support import TINY_DECODER, float64_twin
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, dew_path
 
 from dew.batch import Forks, coordinates
 from dew.data.forked_rows import ForkedRows
@@ -160,7 +160,7 @@ def test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole(kind):
             return {"losses": losses, "grads": grads}
         return jax.jit(run)
 
-    assert_as_exact(scored(objective, shared), scored(objective, whole),
+    assert_as_exact(scored(objective, shared), dew_path(scored(objective, whole)),
                     lambda seed: (nn.unbox(initialized(jax.random.key(seed))),), f"{kind} over forks",
                     seeds=KIND_SEEDS.get(kind, FORK_SEEDS),
                     truth_fn=scored(LMObjective(float64_twin(model), WIDTH - 1), whole))
@@ -550,7 +550,7 @@ def test_a_groups_chains_score_over_their_shared_prompt_as_laid_whole(kind):
 
     truth = scored(GRPOObjective(float64_twin(model), WIDTH - 1), whole)
     initialized = jax.jit(grpo.init)
-    assert_as_exact(scored(grpo, shared), scored(grpo, whole),
+    assert_as_exact(scored(grpo, shared), dew_path(scored(grpo, whole)),
                     lambda seed: (nn.unbox(initialized(jax.random.key(seed))),),
                     f"{kind} group over its prompt", seeds=FORK_SEEDS, truth_fn=truth)
 
