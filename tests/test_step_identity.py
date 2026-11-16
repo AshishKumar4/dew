@@ -766,40 +766,32 @@ def test_a_step_reading_a_module_it_holds_holds_what_it_reads_of_it(tmp_path, ho
     assert _held_in_a_process(tmp_path, "1")[1] != first[1]
 
 
-def test_a_function_reading_a_module_by_a_computed_name_is_stated_by_the_whole_module(tmp_path, monkeypatch):
-    """A function of the user's that reads a module of the user's by a name it computes
-    (`getattr(settings, "scale")`) is stated by every attribute of that module, not only those its code
-    names: a value set on the module at run time, its file unchanged, changes the statement. Filtered to the
-    names its code reads, the statement held none of it (the round-3 head review's F11)."""
+READING = {"a computed name": ("def read(row):\n    return getattr({settings}, 'scale')\n", "read"),
+           "a class's default": ("import dataclasses\n\n\n@dataclasses.dataclass(frozen=True)\n"
+                                 "class Reading:\n    settings: object = {settings}\n\n"
+                                 "    def __call__(self, row):\n        return row + self.settings.scale\n",
+                                 "Reading")}
+"""Code of the user's reading a module of the user's other than by the names its own code states: by a name it
+computes (`getattr`), and through a class's field default its methods read an attribute of."""
+
+
+@pytest.mark.parametrize("reading", READING)
+def test_a_module_read_past_its_codes_own_names_is_stated_by_what_is_read(tmp_path, monkeypatch, reading):
+    """Code of the user's that reads a module of the user's by a name it computes (`getattr(settings,
+    "scale")`), or through a dataclass's field default its method reads an attribute of
+    (`self.settings.scale`), is stated with that attribute: set on the module at run time, its file
+    unchanged, the statement changes. Filtered to the names its code reads, the statement held none of it
+    (the round-3 head review's F11), and the default was stated without its methods' names, the module by
+    its name alone (the round-4's F2)."""
     from dew._stated import stated
 
+    text, name = READING[reading]
     settings = tmp_path / f"settings_{uuid4().hex}.py"
     settings.write_text("scale = 1\n")
     user = tmp_path / f"user_{uuid4().hex}.py"
-    user.write_text(f"import {settings.stem}\n\n\n"
-                    f"def read(row):\n    return getattr({settings.stem}, 'scale')\n")
+    user.write_text(f"import {settings.stem}\n\n\n" + text.format(settings=settings.stem))
     monkeypatch.syspath_prepend(str(tmp_path))
-    held, reading = importlib.import_module(settings.stem), importlib.import_module(user.stem)
-    before = stated(reading.read, "step")
+    held, reader = importlib.import_module(settings.stem), importlib.import_module(user.stem)
+    before = stated(vars(reader)[name], "step")
     held.scale = 2
-    assert stated(reading.read, "step") != before
-
-
-def test_a_classs_default_read_through_its_methods_names_is_stated_by_them(tmp_path, monkeypatch):
-    """A dataclass of the user's whose field default is a module of the user's (`settings: object =
-    settings`) and whose method reads an attribute of it (`self.settings.scale`) is stated with that
-    attribute: set at run time, the class's statement changes. The default was stated without the names its
-    methods read, the module by its name alone (the round-4 head review's F2)."""
-    from dew._stated import stated
-
-    settings = tmp_path / f"settings_{uuid4().hex}.py"
-    settings.write_text("scale = 1\n")
-    user = tmp_path / f"user_{uuid4().hex}.py"
-    user.write_text(f"import dataclasses\n\nimport {settings.stem}\n\n\n@dataclasses.dataclass(frozen=True)\n"
-                    f"class Reading:\n    settings: object = {settings.stem}\n\n"
-                    f"    def __call__(self, row):\n        return row + self.settings.scale\n")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    held, reading = importlib.import_module(settings.stem), importlib.import_module(user.stem)
-    before = stated(reading.Reading, "step")
-    held.scale = 2
-    assert stated(reading.Reading, "step") != before
+    assert stated(vars(reader)[name], "step") != before
