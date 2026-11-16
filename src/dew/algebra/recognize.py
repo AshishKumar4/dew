@@ -24,7 +24,6 @@ import collections
 import functools
 import hashlib
 import itertools
-import threading
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Sequence
 from typing import NamedTuple
@@ -36,7 +35,7 @@ from egglog import eq
 from jax._src import core as jax_core
 from jax.extend import core as jcore
 
-from dew.algebra import SATURATION, derive, forms, fusion, normal_form, program, rules, terms
+from dew.algebra import SATURATION, forms, fusion, normal_form, program, rules, terms
 from dew.algebra.forms import aval
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Choice
@@ -87,47 +86,10 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, families: Sequence[Famil
     half of one equation, for no region, 37 of its seconds, row 5556)."""
     if _bound(jaxpr).isdisjoint(family.anchor for family in families):
         return []
-    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families), _chosen_under())
-    found = _held_in(_HELD_BODIES, key, lambda: [_positioned(jaxpr, written)
+    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families), fusion.choice_context())
+    found = fusion.holding(_HELD_BODIES, key, lambda: [_positioned(jaxpr, written)
                                                  for written in _recognizing(jaxpr, index, held, families)])
     return [_placed(jaxpr, written) for written in found]
-
-
-def _chosen_under() -> Hashable:
-    """The context a kernel of Dew's is chosen in, which every held recognition is keyed by
-    (`_HELD_BODIES`, `_HELD_REGIONS`, `_TAKEN`): the derivation's (`derive.context`: the mesh, the target
-    priced for, the numerics), what a trace reads of this thread's context (`options.trace_context`: an
-    assumed generation and whether it is interpreted, the kernel choices, a whole-sequence scope, a
-    quantization's owner and rule, Dew's environment), the launches the compiles refused, which a
-    template's legality reads (`report.refused_launches`), as a fused region's written program is held
-    (`fusion._traced`), and whether XLA's flags ask for deterministic operations, which FlashAttention's
-    eligibility reads (`_devices.deterministic_ops_requested`) and no `DEW_` variable holds."""
-    from dew._devices import deterministic_ops_requested
-    from dew.nn.kernels.options import trace_context
-    from dew.nn.kernels.templates import report
-
-    return derive.context(), trace_context(), report.refused_launches(), deterministic_ops_requested()
-
-
-def _held_in[Value](cache: collections.OrderedDict[Hashable, Value], key: Hashable,
-                    made: Callable[[], Value]) -> Value:
-    """`cache`'s entry at `key`, made (`made()`) where it holds none, outside the lock compiles share
-    (`_HOLDING`: the pass runs on several threads), the least recently read dropped past
-    `fusion.DECISIONS_HELD`."""
-    with _HOLDING:
-        if key in cache:
-            cache.move_to_end(key)
-            return cache[key]
-    value = made()
-    with _HOLDING:
-        cache[key] = value
-        if len(cache) > fusion.DECISIONS_HELD:
-            cache.popitem(last=False)
-    return value
-
-
-_HOLDING = threading.Lock()
-"""Held while recognition's caches are read or written: compiles trace on several threads."""
 
 
 _HELD_BODIES: collections.OrderedDict[Hashable, list] = collections.OrderedDict()
@@ -212,7 +174,7 @@ def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[
             # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
             with generation.routes(alone=True):
                 return _chosen(index, places, members, accurate)
-        chosen = _held_in(_HELD_REGIONS, key, chose)
+        chosen = fusion.holding(_HELD_REGIONS, key, chose)
         if chosen is not None:
             candidate = members[chosen]
             # Its call's identity: the region's (its structure and its constants' values) and the candidate.
@@ -230,11 +192,11 @@ def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...]
                 outputs: Sequence[jcore.Var], accurate: bool) -> Hashable:
     """What a region's choice reads: its structure (`program.structure`, every value it reads an input), the
     values of the constants among them (`_digest`: a statistic's divisor, an epsilon held as an array), the
-    numerics' forms and the context its kernels are chosen in (`_chosen_under`)."""
+    numerics' forms and the context its kernels are chosen in (`fusion.choice_context`)."""
     inputs = fusion.region_inputs(jaxpr, places)
     window = jcore.Jaxpr([], list(inputs), list(outputs), [jaxpr.eqns[place] for place in places])
     held = tuple(_digest(index.consts[var]) if var in index.consts else None for var in inputs)
-    return program.structure(window), held, accurate, _chosen_under()
+    return program.structure(window), held, accurate, fusion.choice_context()
 
 
 def _digest(value) -> Hashable:
@@ -433,16 +395,14 @@ def _declaration(candidate: Candidate) -> Callable:
     keywords = tuple(sorted((function.__kwdefaults__ or {}).items()))
     key = (function.__code__, _typed(function.__defaults__), _typed(keywords), _typed(cells),
            _typed(tuple(sorted(declared.keywords.items()))), _typed(tuple(candidate.operands)))
-    if key not in _DECLARATIONS:
+
+    def traced() -> Callable:
         # Dew's own choices by the platform read as their default branch (`forms.inlined`): its product under
         # a wide arithmetic is the product a program writes; a program's own choices stay as written.
-        traced = jax.make_jaxpr(lambda *values: jax.tree.leaves(forms.inlined(declared)(*values)))(
+        written = jax.make_jaxpr(lambda *values: jax.tree.leaves(forms.inlined(declared)(*values)))(
             *(_shape(var) for var in candidate.operands))
-        _DECLARATIONS[key] = jcore.jaxpr_as_fun(traced)
-        if len(_DECLARATIONS) > fusion.DECISIONS_HELD:
-            _DECLARATIONS.popitem(last=False)
-    _DECLARATIONS.move_to_end(key)
-    return _DECLARATIONS[key]
+        return jcore.jaxpr_as_fun(written)
+    return fusion.holding(_DECLARATIONS, key, traced)
 
 
 def _typed(value) -> Hashable:
@@ -972,9 +932,9 @@ KEPT = frozenset({"xla", "reference"})
 def _attention_taken(attend: Callable, operands: Sequence[jcore.Var], options: Hashable) -> bool:
     """Whether Dew's selector gives the call a kernel of its own (the template, FlashAttention, cuDNN; none
     of `KEPT`), asked once by what it reads (`_TAKEN`): its operands' shapes and dtypes, the call's
-    `options` and the context its kernels are chosen in (`_chosen_under`)."""
-    key = (tuple((aval(var).shape, aval(var).dtype) for var in operands), options, _chosen_under())
-    return _held_in(_TAKEN, key, lambda: _traced_taken(attend, operands))
+    `options` and the context its kernels are chosen in (`fusion.choice_context`)."""
+    key = (tuple((aval(var).shape, aval(var).dtype) for var in operands), options, fusion.choice_context())
+    return fusion.holding(_TAKEN, key, lambda: _traced_taken(attend, operands))
 
 
 _TAKEN: collections.OrderedDict[Hashable, bool] = collections.OrderedDict()
