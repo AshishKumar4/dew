@@ -2483,17 +2483,15 @@ def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path
     DiLoCo run's replicas' inner copies, which its next meeting averages into the outer model, saved
     unchecked between meetings (`diloco`, train 904's review, F3)."""
     def trainer():
-        if tier == "diloco":
-            # Two replicas meeting every fourth step: the third update poisons their inner copies mid-period.
-            return make_trainer(tmp_path, step=poisoned_third_step, keep=2,
-                                mesh=MeshSpec(diloco=2).build(jax.devices()[:2]),
-                                diloco=DiLoCo(every=4, rate=0.7, momentum=0.9))
-        return (make_trainer(tmp_path, step=poisoned_third_step, keep=2) if tier == "persistent"
-                else local_trainer(tmp_path, step=poisoned_third_step))
+        if tier == "local":
+            return local_trainer(tmp_path, step=poisoned_third_step)
+        # DiLoCo's two replicas meet every fourth step: the third update poisons their copies mid-period.
+        met = {} if tier == "persistent" else {"mesh": MeshSpec(diloco=2).build(jax.devices()[:2]),
+                                                "diloco": DiLoCo(every=4, rate=0.7, momentum=0.9)}
+        return make_trainer(tmp_path, step=poisoned_third_step, keep=2, **met)
 
     with pytest.raises(RuntimeError):
-        trainer().fit(dataset(), steps=5, log_every=100,
-                      checkpoint_every=10 if tier == "local" else 1)
+        trainer().fit(dataset(), steps=5, log_every=100, checkpoint_every=10 if tier == "local" else 1)
     resumed = trainer()
     assert resumed.checkpoints.latest == 2
     restored, *_ = resumed.checkpoints.restore(resumed.initial_state())

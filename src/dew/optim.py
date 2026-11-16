@@ -1748,7 +1748,8 @@ UNDERFLOW_BOUND = 1e-18
 normal, 1.2e-38): what the moment lacks beside its first, over a guard."""
 
 
-def update_bound(optimizer: str, opts: Mapping[str, object], *, quantized: bool = False) -> float | None:
+def update_bound(optimizer: Optimizer | str, opts: Mapping[str, object], *,
+                 quantized: bool = False) -> float | None:
     """The largest magnitude of a unit-rate update `optimizer` forms (before its learning rate and decay)
     from any gradient within `MAGNITUDE_BOUND`, from its constants `opts` over its factory's defaults; None
     where Dew states none: an Optax factory, a Gauss-Newton solve, a guard of zero (0/0 where a parameter's
@@ -1766,8 +1767,8 @@ def update_bound(optimizer: str, opts: Mapping[str, object], *, quantized: bool 
     leaves' Adam's."""
     from dew.nn.finite import MAGNITUDE_BOUND
 
-    make = OPTIMIZER_MAP.get(optimizer)
-    if make is None or make is gauss_newton:
+    make = optimizers[optimizer]
+    if make not in OPTIMIZER_MAP.values() or make is gauss_newton:
         return None
     # MuonClip's factory takes Muon's options through to it.
     make = _muon_groups if make is _muonclip_groups else make

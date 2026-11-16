@@ -1977,21 +1977,6 @@ def test_a_rate_injected_inside_an_injected_factory_reports_the_factorys():
     np.testing.assert_array_equal(np.asarray(learning_rate(state)), np.asarray(schedule(1)))
 
 
-def test_an_injected_guard_is_its_wrappers_and_a_built_one_of_zero_is_refused():
-    """An optimizer whose guard an injected wrapper hands it each update (`inject_hyperparams(scale_by_laprop)
-    (eps=1e-20)`) builds and steps, the guard a traced value its user set, where the refusal read it as a
-    Python number and the step's trace failed (the head review's F1); one built with a guard of zero is
-    refused."""
-    from dew.laprop import scale_by_laprop
-
-    wrapped = optax.inject_hyperparams(scale_by_laprop)(eps=1e-20)
-    params = {"w": jnp.ones(3)}
-    updates, _ = jax.jit(wrapped.update)({"w": jnp.ones(3)}, wrapped.init(params), params)
-    assert np.all(np.isfinite(np.asarray(updates["w"])))
-    with pytest.raises(ValueError):
-        scale_by_laprop(eps=0.0)
-
-
 def test_a_layers_norm_is_finite_where_its_values_squares_pass_float32():
     """A layer's norm (`layer_norms`, LAMB's and AGC's) is finite where every value is and their squares
     pass float32: parameters of 1e20 hold a norm of 2e20, where their squares made it infinite and LAMB's

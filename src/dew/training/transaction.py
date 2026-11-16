@@ -1081,6 +1081,33 @@ class Transaction:
                              "a run bounded in examples that no plan counts ahead keeps")
         return jnp.asarray(current.consumed, jnp.float32) / self.bound
 
+    def _refuse_unheld(self, current) -> None:
+        """Refuse, as the step is traced and before any runs, a commit whose clocks could not count the
+        updates its optimizer applies (`update_applied`): one whose state does not say which it holds back,
+        a held update whose post-step effects no update would apply, and a held one with no tokens
+        waiting for it."""
+        refuse_untold(current.opt_state)
+        if holds_back(current.opt_state) and self.aux_shape.effects is not None:
+            raise ValueError("an objective with post-step effects (Aux.effects) under an optimizer that "
+                             "holds updates back, whose held calls' effects no update applies; accumulate "
+                             "gradients with Trainer(accumulation=k)")
+        if holds_back(current.opt_state) and current.deferred is None:
+            raise ValueError("the state holds no tokens waiting for the update its optimizer holds back "
+                             "(TrainState.deferred): build it with Trainer.initial_state, or restore it "
+                             "through the trainer, which gives one written before them none waiting")
+
+    def _formed(self, current, opt_state, update, applied: Applied | None) -> jax.Array:
+        """Whether a gated step's `update`, formed from bounded inputs, is one it takes: its learning rates
+        finite (one scalar each), and the update read finite where the optimizer's bound cannot cover a
+        bounded gradient (`checks_updates`) or it solves a system (`solves_equations`), whose conditioning
+        no input bounds. The runs that updated in their backward read their own (`planned`); their part of
+        `update` is read by nothing."""
+        formed = functools.reduce(jnp.logical_and, map(jnp.isfinite, learning_rates(opt_state)),
+                                  jnp.asarray(a=True))
+        if self.checks_updates or solves_equations(current.opt_state):
+            formed = formed & all_finite(update if applied is None else _without(update, applied.params))
+        return formed
+
     def commit(self, current, gradient, effects, qk, statistics, applied: Applied | None = None,
                attempted: jax.Array | None = None):
         """Apply the pooled native gradient and return its finiteness and global norm. An optimizer that
@@ -1093,18 +1120,7 @@ class Transaction:
         Admission is decided by finish_attempt after checking the updated
         parameters and optimizer state as well.
         """
-        # The clocks count the updates the optimizer applies (`update_applied`), which an optimizer that holds
-        # some back says by its state; one whose state does not, or a held update whose post-step
-        # effects no update would apply, is refused as the step is traced, before any runs.
-        refuse_untold(current.opt_state)
-        if holds_back(current.opt_state) and self.aux_shape.effects is not None:
-            raise ValueError("an objective with post-step effects (Aux.effects) under an optimizer that "
-                             "holds updates back, whose held calls' effects no update applies; accumulate "
-                             "gradients with Trainer(accumulation=k)")
-        if holds_back(current.opt_state) and current.deferred is None:
-            raise ValueError("the state holds no tokens waiting for the update its optimizer holds back "
-                             "(TrainState.deferred): build it with Trainer.initial_state, or restore it "
-                             "through the trainer, which gives one written before them none waiting")
+        self._refuse_unheld(current)
         # The gradient where the parameters are placed (`placed`): left where the backward made it, a
         # stage-local leaf's update came out split over the tensor axis its pipeline's read took, and the
         # commit gathered every parameter and moment back each step (row 3697).
@@ -1148,15 +1164,7 @@ class Transaction:
             # each (an injected rate a user set infinite), and a Gauss-Newton solve's direction, its
             # system's (`statistics`) conditioning no input bounds, over the few weights such a solve has.
             # A scaled step's acceptance reads its whole new state instead (`finish_attempt`).
-            formed = jnp.asarray(a=True)
-            if gated:
-                for rate in learning_rates(opt_state):
-                    formed = formed & jnp.isfinite(rate)
-                if self.checks_updates or solves_equations(current.opt_state):
-                    # The runs that updated in their backward checked their own (`planned`); their part
-                    # of this update is read by nothing.
-                    read = update if applied is None else _without(update, applied.params)
-                    formed = formed & all_finite(read)
+            formed = self._formed(current, opt_state, update, applied) if gated else jnp.asarray(a=True)
             update = zeroed_unless(native_finite & formed, update) if gated else update
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
             # rescale, a bounded group's clamp) acts on them (`stepped`).
