@@ -39,6 +39,7 @@ from dew.nn.kernels.templates import (
     attention_mosaic_program,
     attention_route,
     bundles,
+    report,
 )
 
 pytestmark = pytest.mark.kernel
@@ -715,6 +716,36 @@ def test_the_walked_backward_of_the_4b_heads_compiles_spill_free_on_a_b200(width
                                            "sm100")
     failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
+
+
+@COMPILES_ON_CPU
+def test_a_backward_certification_refuses_every_config_of_takes_another_route():
+    """A training call whose Mosaic backward certification refuses every config of on a compile-only A100
+    (causal bf16 over 512 tokens, four query heads over two key heads, width 128, the accurate backward, a
+    query temperature) lowers its public gradient through the route: the route reads certification's
+    exhausted verdict as the Mosaic mainloop's refusal and takes another (the base review of 4edd498ac, F3:
+    the verdict discarded, the gradient raised Exhausted)."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    tokens, heads, kv_heads, width = 512, 4, 2, 128
+    spans = template.spans(tokens, tokens, 1, causal=True)
+
+    def tempered(s, q_pos, k_pos, temperature):
+        return s / temperature
+
+    def loss(query, key, value, temperature):
+        hooks = template.Hooks(score_mod=tempered,
+                               score_params=(template.Param(temperature, template.Kind.QUERY),))
+        out = attention_route.attend(query, key, value, spans, hooks, accurate=True)
+        return jnp.sum(out.astype(jnp.float32))
+
+    query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
+    temperature = jax.ShapeDtypeStruct((1, tokens, heads), jnp.float32)
+    with report.certifying(compile_only_gpus("sm80")[0]):
+        lowered_for(jax.grad(loss, argnums=(0, 1, 2, 3)), (query, key, key, temperature), "sm80")
 
 
 CERTIFIED_FORWARD = """

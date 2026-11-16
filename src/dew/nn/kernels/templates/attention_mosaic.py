@@ -107,7 +107,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     walked_layouts,
     whole_tiles,
 )
-from dew.nn.kernels.templates.base import Template, Unfitted
+from dew.nn.kernels.templates.base import Template
 
 
 def _column_blocks_of(family: mosaic.Family, dtype, value_width: int) -> list[int | None]:
@@ -315,13 +315,10 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         derived in its place), or None: a call the route sends here alone is certified, once it is selected
         (`attention_route._mainloop`), so a call another mainloop takes compiles none of its kernels. A
         process compiling for no GPU certifies none, and its derived config holds."""
-        config = self.derived(ba, target)
-        if config is None:
+        if self.derived(ba, target) is None:
             return self.declined(ba, target)
-        try:
-            self._certified(ba, config)
-        except Unfitted:
-            # Certification refused every config the derivation offers.
+        if not self.holds(ba):
+            # Certification refused every config the derivation offers (`tuning`'s exhausted verdict, None).
             return Refusal('resources', f"every config of the Mosaic mainloop spills or serializes its "
                            f"products as {target.generation}'s assembler builds them")
         return None
