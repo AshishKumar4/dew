@@ -147,7 +147,7 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
     state = trainer.fit(data, steps=1, log_every=1)
     output = loaded.model.apply(state.variables, inputs.tokens, **inputs.kwargs())
     valid = np.asarray(inputs.token_fields["attention_mask"])
-    assert_trainer_takes_the_plain_step(loaded, inputs, trainer)
+    assert_trainer_takes_the_plain_step(loaded, inputs, trainer, state)
     # The step moved Dew's own logits: an update is a structural change, exact inequality says enough.
     untrained = loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs())
     assert not np.array_equal(np.asarray(output)[valid], np.asarray(untrained)[valid])
@@ -167,12 +167,12 @@ TRAINER_STEP_SEEDS = 8
 """The trainer's step against the plain step's declared draws (check 1), sized by `seeds_for` on armada."""
 
 
-def assert_trainer_takes_the_plain_step(loaded, inputs, trainer) -> None:
-    """`trainer`'s compiled step (`Trainer.compile`) over `inputs`' rows, from its first state, on par with
-    the plain SGD step (`_stepped`, `_trained`) by check 1 over drawn pixels near the source draw's: the
-    logits after each step at every valid slot, the plain step in float64 the truth. The trainer takes
-    `inputs`' rows each repeated to its batch, which leaves the step's mean loss and so its gradient the
-    same."""
+def assert_trainer_takes_the_plain_step(loaded, inputs, trainer, fitted) -> None:
+    """`fitted`, the state `trainer.fit` returned after one step over `inputs`' rows, is its compiled step's
+    (`Trainer.compile`) from its first state, to the bit; and that step is on par with the plain SGD step
+    (`_stepped`, `_trained`) by check 1 over drawn pixels near the source draw's: the logits after each step
+    at every valid slot, the plain step in float64 the truth. The trainer takes `inputs`' rows each repeated
+    to its batch, which leaves the step's mean loss and so its gradient the same."""
     rows = 2 * jax.device_count()
     valid = jnp.asarray(inputs.token_fields["attention_mask"], bool)[..., None]
     first = trainer.initial_state()
@@ -180,8 +180,12 @@ def assert_trainer_takes_the_plain_step(loaded, inputs, trainer) -> None:
     def with_pixels(pixels):
         return dataclasses.replace(inputs, conditioning={**inputs.conditioning, "pixel_values": pixels})
 
-    step = trainer.compile(first, {"text": with_pixels(inputs.conditioning["pixel_values"]).take_rows(
-        jnp.arange(rows) % 2)})
+    batch = {"text": with_pixels(inputs.conditioning["pixel_values"]).take_rows(jnp.arange(rows) % 2)}
+    step = trainer.compile(first, batch)
+    stepped, *_ = step(jax.tree.map(jnp.copy, first), batch)
+    for actual, wanted in zip(jax.tree.leaves(fitted.variables), jax.tree.leaves(stepped.variables),
+                              strict=True):
+        np.testing.assert_array_equal(actual, wanted)
 
     @as_given
     def trained(pixels):
