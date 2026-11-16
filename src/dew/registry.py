@@ -663,6 +663,13 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     if isinstance(annotation, type) and issubclass(annotation, Enum):
         # An enum's member is recorded as its value, an IntEnum's its int (`to_record`).
         return annotation(value)
+    if (isinstance(annotation, type) and annotation in _SCALARS
+            and not isinstance(value, (np.generic, np.ndarray, jax.Array))):
+        # A field declaring a scalar holds one of its type (`dew._records`' readers), kept as written: a
+        # null, a list or a record (a function's among them) is refused as a mistyped scalar is; a NumPy
+        # or JAX value, which a module built in Python may hold, is the field's as built.
+        _SCALARS[annotation](value, name or annotation.__name__)
+        return configured(value)
     if (isinstance(value, Mapping) and set(value) == {"function"} and isinstance(value["function"], str)
             and _admits_function(annotation)):
         return imported(value["function"])
@@ -690,13 +697,6 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
         if isinstance(value, list) and len(sequences) == 1:
             # A record's list is the union's one sequence member (`Files.url: str | tuple[str, ...]`).
             return _rebuilt(sequences[0], value, dtypes=dtypes)
-        return configured(value)
-    if (isinstance(annotation, type) and annotation in _SCALARS
-            and not isinstance(value, (np.generic, np.ndarray, jax.Array))):
-        # A field declaring a scalar holds one of its type (`dew._records`' readers), kept as written: a
-        # null, a list or a record is refused as a mistyped scalar is; a NumPy or JAX value, which a module
-        # built in Python may hold, is the field's as built.
-        _SCALARS[annotation](value, name or annotation.__name__)
         return configured(value)
     if isinstance(value, Mapping):
         if typing.get_origin(annotation) is Callable or annotation is Callable:
