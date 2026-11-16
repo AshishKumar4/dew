@@ -114,3 +114,31 @@ def test_forward_raise(monkeypatch):
                                    ("kernel", "registers", "spilled", "cap")}
                                   for record in found for kernel in record.get("kernels", [])]}), flush=True)
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
+
+
+@pytest.mark.parametrize("index", [0, 1])
+def test_certified_matrix(index):
+    import attention_matrix
+    import kernel_matrix
+
+    label, case = [(label, case) for label, case in kernel_matrix.covered("attention")
+                   if case["generation"] == "sm90" and case["width"] == "128"
+                   and case["launch"] == "shared-keys"][index]
+    base._DERIVED.clear()
+    chosen = []
+    with generation.assumed("sm90"):
+        op, ba, target = attention_matrix._backward_op(case)
+        raw = op.derived(ba, target)
+        _, shapes = op.lowering(ba, raw)
+
+        def routed(*arrays):
+            config = op.taken(ba)
+            chosen.append(repr(config))
+            assert config is not None
+            fn, _ = op.lowering(ba, config)
+            return fn(*arrays)
+
+        found = compile_mosaic_kernels([KernelCase(label, lambda: (routed, shapes))], "sm90")
+    print("CERTIFIED_MATRIX " + json.dumps({"label": label, "raw": repr(raw), "chosen": chosen,
+                                            "failures": mosaic_failures(found)}), flush=True)
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)
