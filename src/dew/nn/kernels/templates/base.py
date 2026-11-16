@@ -11,7 +11,6 @@ every run.
 import collections
 import dataclasses
 import functools
-import threading
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import ClassVar, TypeGuard
 
@@ -27,33 +26,22 @@ them: a model's distinct launches (each call's shapes and dtypes on its target),
 step's trace (FS-WALKELIG)."""
 
 _DERIVED: collections.OrderedDict[Hashable, Hashable] = collections.OrderedDict()
-"""Each launch's derived config by what its derivation reads (`_derived_once`), the least recently read
-first."""
-
-_DERIVED_GUARD = threading.Lock()
+"""Each launch's derived config by what its derivation reads (`_derived_once`, held through
+`_cache.holding`), the least recently read first."""
 
 
 def _derived_once(derive: Callable) -> Callable:
     """A launch's `derived`, run once for what it reads: the call, the target and the configs its compiles
     refused (`report.derivation_inputs`), and the run's numerics, its algebra pass and its kernel choices,
-    the contexts a derivation's forms and costs read (`dew._cache`); every eligibility check
+    the contexts a derivation's forms and costs read (`dew._cache`); held through `_cache.holding`, the
+    latest `DERIVATIONS_HELD`; every eligibility check
     and planner candidate after reads that once (row 4259: the GEMM's tile, derived at every check, took 36
     s of a Qwen3.5-4B step's compile_ahead)."""
     @functools.wraps(derive)
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget):
         key = (derive, report.derivation_inputs(self, ba, target), _cache.NUMERICS.value,
                _cache.ALGEBRA.value, _cache.KERNEL_CHOICES.value)
-        with _DERIVED_GUARD:
-            if key in _DERIVED:
-                _DERIVED.move_to_end(key)
-                return _DERIVED[key]
-        config = derive(self, ba, target)
-        with _DERIVED_GUARD:
-            config = _DERIVED.setdefault(key, config)
-            _DERIVED.move_to_end(key)
-            while len(_DERIVED) > DERIVATIONS_HELD:
-                _DERIVED.popitem(last=False)
-            return config
+        return _cache.holding(_DERIVED, key, lambda: derive(self, ba, target), DERIVATIONS_HELD)
 
     return derived
 

@@ -46,8 +46,9 @@ import numpy as np
 from jax import lax
 from jax.extend import core as jcore
 
+from dew import _cache
 from dew._cache import ALGEBRA
-from dew.algebra import carry, cost, derive, fusion, linear_scan, program, terms
+from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
 from dew.nn.derivatives import Protected, contracted
 from dew.nn.nested import nested
@@ -147,9 +148,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     def affine_of(chunk: Mapping):
         key = (tuple((tuple(chunk[name].shape), str(chunk[name].dtype)) for name in names), derive.context())
-        return fusion.holding(decomposed, key, lambda: linear_scan.parts(
+        return _cache.holding(decomposed, key, lambda: linear_scan.parts(
             _traced(declaration, declaration.update, names, chunk),
-            _traced(declaration, declaration.readout, names, chunk), saturation), held=derive.FORMS_HELD)
+            _traced(declaration, declaration.readout, names, chunk), saturation), derive.FORMS_HELD)
 
     def parts(chunk: Mapping):
         affine = affine_of(chunk)
@@ -186,9 +187,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         # target, precision, numerics or mesh is none of this one's.
         key = (derive.context(), affine.base2, corrected, affine.values_read,
                *((value.shape, str(value.dtype)) for value in given))
-        split = fusion.holding(splits, key, lambda: _split(
+        split = _cache.holding(splits, key, lambda: _split(
             declaration, names, chunk, affine, form, tuple(held), given, jax.ShapeDtypeStruct(shape, carried),
-            extents.tokens, saturation), held=splits_held)
+            extents.tokens, saturation), splits_held)
         prepared = Prepared((natural, split.prepare(*given, issue=issue or _issued)), split, corrected,
                             entering=entering, values_read=affine.values_read)
         if not (corrected and transition):

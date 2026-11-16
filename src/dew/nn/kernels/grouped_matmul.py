@@ -49,7 +49,7 @@ from . import generation, selection, tuning
 from .generation import INHERENT
 from .templates import across, base, bundles, mosaic, report, resources, stores, swizzling
 from .templates.axes import held as held_axes
-from .templates.gemm import mosaic_gpu, packed, pricing
+from .templates.gemm import mosaic_gpu, packed, pricing, producers
 from .templates.gemm.hooks import NO_HOOKS, Hooks
 from .templates.product import SCALE_DEPTH, Product, eight
 
@@ -544,9 +544,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     EXACT_SUMS: ClassVar[bool] = False
     """Whether the kernel adds each depth step's product apart (`exact_sums`); one that does not is not
     eligible where the call asks for it."""
-    PRODUCER_GATHERS: ClassVar[bool] = False
-    """Whether its producer gathers the rows its table names (`gmm`'s `gather`); a kernel gradient's tables
-    are its consumers' copies (`mosaic_gpu.tgmm`'s `gather`)."""
+    KERNEL: ClassVar[str] = mosaic_gpu.GMM
+    """Its kernel's name, which its tile's producer registers are kept by (`mosaic_gpu.Tiles.producers`)."""
     STAGED_ROWS: ClassVar[bool] = False
     """Whether a consumer prepares its share of each step's rows stage itself (the kernel gradient's
     prologue and group zeroing, `registers`)."""
@@ -792,7 +791,21 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         `mosaic_gpu.derived` reads them."""
 
     def derived(self, ba, target) -> mosaic_gpu.Tiles | None:
+        # The derivation's tile (`_tile`), its producer raised through the rungs compiles refused.
+        tile = self._tile(ba, target)
+        return None if tile is None else producers.settled(self, ba, tile)
+
+    def _tile(self, ba, target) -> mosaic_gpu.Tiles | None:
+        """The derivation's tile of `ba` on `target` at its producer's least: a launch's own rule
+        (`MosaicGmm._tile`'s swap, `MosaicTgmm._tile`'s split) over `_derived`."""
         return self._derived(ba, target)
+
+    def rungs(self, ba, config):
+        return producers.rungs(self, ba, config) if isinstance(config, mosaic_gpu.Tiles) else iter(())
+
+    def _refused(self, ba, config: mosaic_gpu.Tiles) -> bool:
+        # Refused past its producer's ladder: spilling at the rung it settles on (`producers.settled`).
+        return report.refused(self, ba, producers.settled(self, ba, config))
 
     def _derived(self, ba, target, admits=None) -> mosaic_gpu.Tiles | None:
         """The derivation's tile of `ba` on `target` (`mosaic_gpu.derived`), each candidate also one `admits`
@@ -909,11 +922,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # A family rewriting the staged rows in a role of its own runs it beside the consumers
         # (`mosaic_gpu.tgmm`'s `roles`).
         roles = config.warpgroups + self.rewritten(ba, family)
-        # A producer whose issue loop holds more than its family's least states its own (a tcgen05 load warp
-        # gathering rows, `mosaic_gpu.gmm_producer`), as its kernel lowers it.
-        gathers = self.PRODUCER_GATHERS and ba.arguments.get('gather') is not None
-        producer = mosaic_gpu.gmm_producer(family, gathers)
-        return resources.Launch(scope, roles, self.registers(ba, config), most=most, producer=producer)
+        # Its producer at the registers its tile states, the least where unraised (`rungs`), as its kernel
+        # lowers it.
+        return resources.Launch(scope, roles, self.registers(ba, config), most=most,
+                                producer=config.producers.of(self.KERNEL))
 
     def rewritten(self, ba, family: mosaic.Family) -> bool:
         """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`): its
@@ -956,7 +968,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
                 or (family.pairs_product and ba.arguments['interpret'])
                 or self._pair_refuses(ba, config, family) or self._pingpong_refuses(config, family)
-                or not self._divides(ba, config) or report.refused(self, ba, config)):
+                or not self._divides(ba, config) or self._refused(ba, config)):
             return False
         # A family fixing its accumulator's rows takes a tile of exactly them a consumer, and one holding its
         # accumulators in tensor memory a tile whose accumulators it holds (a paired product's two).
@@ -1127,7 +1139,6 @@ class MosaicGmm(_Mosaic):
     """`Gmm` through the template's mainloop (`mosaic_gpu.gmm`) on a GPU family's bundle or a TPU core's,
     exact sums too: an FP8 product's running sum promoted into fp32 every step (`product.eight`)."""
 
-    PRODUCER_GATHERS: ClassVar[bool] = True
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
     EXACT_SUMS: ClassVar[bool] = True
     FP8: ClassVar[bool] = True
@@ -1311,14 +1322,14 @@ class MosaicGmm(_Mosaic):
     BLOCKS: ClassVar[dict[str, str]] = {'rows': 'block_m', 'depth': 'block_k', 'columns': 'block_n'}
 
 
-    def derived(self, ba, target) -> mosaic_gpu.Tiles | None:
+    def _tile(self, ba, target) -> mosaic_gpu.Tiles | None:
         # A dense product of fewer rows than a role's (a decode step's) may run swapped: its matrix takes the
         # MMA's rows and its rows the columns, whose unit is narrower, so its tile multiplies no padding rows
         # (CUTLASS's and cuBLAS's swap of A and B; megabake's 4 x 2048 x 2048 product went from 10.0 to
         # 4.7 us swapped, cuBLAS's time, row 1762), derived as the swapped call's own tile, and taken where
         # its walk prices below the unswapped tile's (row 5874: an NVFP4 decode's swap won on wide outputs
         # and lost 25-31% on square and narrow ones, M-EM-26-gh200).
-        plain = self._decode_split(ba, super().derived(ba, target), target)
+        plain = self._decode_split(ba, super()._tile(ba, target), target)
         swapped = self._swapped(ba, target)
         tile = None if swapped is None else self._derived(swapped, target, admits=lambda tile: (
             self._left_fits(ba, tile) and tile.block_m <= SWAPPED_ROWS))
@@ -1646,6 +1657,7 @@ class MosaicTgmm(_Mosaic):
     `block_m` x `block_n` tiles of each group's gradient, its rows `block_k` at a time."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
+    KERNEL: ClassVar[str] = mosaic_gpu.TGMM
 
     def output_sides(self, ba) -> tuple[int, int]:
         return _gradient_sides(ba)
@@ -1688,7 +1700,7 @@ class MosaicTgmm(_Mosaic):
                 ('prologue_operands', ba.arguments['prologue_operands'],
                  _side_dims(ba.arguments['prologue_operands'], hooks.prologue_axes, {'depth': 'depth'}))]
 
-    def derived(self, ba, target) -> mosaic_gpu.Tiles | None:
+    def _tile(self, ba, target) -> mosaic_gpu.Tiles | None:
         # The derived tile, split where its output tiles underfill a wave (`_split_tile`). An exact sum splits
         # too, its runs summed exactly and their partials by IEEE adds (`mosaic_gpu.tgmm`): unsplit,
         # Qwen3.5-4B's key kernel gradient ran 2.03-2.06x the tensor cores' split sums on a GH200
@@ -1728,7 +1740,7 @@ class MosaicTgmm(_Mosaic):
             return tile
         split = dataclasses.replace(sliced, splits=splits)
         # A split a compile of this process found spilling (`report.refused`) gives way to the call's own.
-        return tile if report.refused(self, ba, split) else split
+        return tile if self._refused(ba, split) else split
 
     def _balances(self, ba, tile: mosaic_gpu.Tiles, target) -> bool:
         """Whether the call's last wave runs balanced over the programs (`tail.balanced`), which it

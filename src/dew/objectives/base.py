@@ -45,6 +45,7 @@ from flax import struct
 from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
+from dew import _cache
 from dew._distributions import counter_key
 from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts
@@ -2189,7 +2190,8 @@ _TRACED: weakref.WeakKeyDictionary[object, dict[Hashable, tuple[float, float]]] 
 
 _KEYED_FLOPS: collections.OrderedDict[Hashable, tuple[float, float]] = collections.OrderedDict()
 """`traced_update_flops`' counts of objectives that state their trace (`Objective.trace_key`), by that key
-and the batch's shapes, the `KEYED_FLOPS` latest: a refit's objective, built anew, reads its equal's."""
+and the batch's shapes, the `KEYED_FLOPS` latest (`_cache.holding`): a refit's objective, built anew, reads
+its equal's."""
 
 KEYED_FLOPS = 256
 
@@ -2211,27 +2213,25 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
     shapes = traced_shapes(batch)
     signature = shapes_key(shapes)
     kept = _TRACED.setdefault(objective, {})
-    if (key := stated_trace(objective)) is not None and signature not in kept:
-        counted = _KEYED_FLOPS.get((type(objective), key, signature))
-        if counted is not None:
-            kept[signature] = counted
     if signature not in kept:
-        variables = objective.drawn_shapes()
-        step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
-        rest = {name: value for name, value in variables.items() if name != "params"}
+        def counted() -> tuple[float, float]:
+            variables = objective.drawn_shapes()
+            step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
+            rest = {name: value for name, value in variables.items() if name != "params"}
 
-        def forward(variables: Variables, batch: Batch) -> jax.Array:
-            return objective.scalar_loss(variables, batch, step)[0]
+            def forward(variables: Variables, batch: Batch) -> jax.Array:
+                return objective.scalar_loss(variables, batch, step)[0]
 
-        def gradient(params: Variables, rest: Variables, batch: Batch) -> Variables:
-            return jax.grad(lambda params: forward({**rest, "params": params}, batch))(params)
+            def gradient(params: Variables, rest: Variables, batch: Batch) -> Variables:
+                return jax.grad(lambda params: forward({**rest, "params": params}, batch))(params)
 
-        kept[signature] = (traced_flops(forward, variables, shapes),
-                           traced_flops(gradient, variables["params"], rest, shapes))
-        if key is not None:
-            _KEYED_FLOPS[type(objective), key, signature] = kept[signature]
-            while len(_KEYED_FLOPS) > KEYED_FLOPS:
-                _KEYED_FLOPS.popitem(last=False)
+            return (traced_flops(forward, variables, shapes),
+                    traced_flops(gradient, variables["params"], rest, shapes))
+
+        key = stated_trace(objective)
+        # An objective that states its trace reads its equal's counts (`_cache.holding`).
+        kept[signature] = counted() if key is None else _cache.holding(
+            _KEYED_FLOPS, (type(objective), key, signature), counted, KEYED_FLOPS)
     return kept[signature]
 
 __all__ = [

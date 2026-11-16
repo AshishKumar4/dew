@@ -25,6 +25,7 @@ import jax
 import numpy as np
 from jax._src import api_util, config as jax_config, core as jax_core
 from jax._src.array import ArrayImpl
+from jax._src.interpreters import pxla
 from jax.experimental.layout import Format
 from jax.sharding import Sharding
 
@@ -337,19 +338,40 @@ _COLLECTED: contextvars.ContextVar[dict[str, jax.stages.Compiled] | None] = _cac
 
 
 def shapes_of(tree):
-    """`tree`'s arrays or shapes as their shapes, dtypes, shardings and weak types, the layouts left the
-    arrays' own, as a call over arrays of those shardings lowers (`collecting`): an array no one committed
-    to its devices (a fresh `jax.random.key`) as an unplaced shape, which jit places as it places the
-    array (JAX's `pjit` lowers an uncommitted array's sharding as unspecified)."""
+    """`tree`'s arrays or shapes as their shapes, dtypes, shardings and weak types, as a call over arrays of
+    those shardings lowers (`collecting`): an array no one committed to its devices (a fresh
+    `jax.random.key`) as an unplaced shape, which jit places as it places the array (JAX's `pjit` lowers an
+    uncommitted array's sharding as unspecified); a committed array's or a shape's device-local layout
+    where it is not its devices' default (`_stated_layout`), which jit lowers as the array's own and its
+    dispatcher holds the call to (a program compiled over another layout refuses the array, JAX's
+    `check_array_xla_sharding_layout_match`), the default left unstated as an array's own."""
+    def placed(leaf, layout):
+        return leaf.sharding if layout is None else Format(layout, leaf.sharding)
+
     def shaped(leaf):
         if not isinstance(leaf, jax.Array):
-            return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding,
+            layout = _stated_layout(leaf.format.layout, leaf.sharding, leaf.shape, leaf.dtype)
+            return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=placed(leaf, layout),
                                         weak_type=leaf.weak_type)
-        # Its abstract value's weak type: a key array states none of its own.
-        placed = leaf.sharding if leaf.committed else None
-        return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=placed, weak_type=leaf.aval.weak_type)
+        if not leaf.committed:
+            # Its abstract value's weak type: a key array states none of its own.
+            return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=None, weak_type=leaf.aval.weak_type)
+        # A typed key array states no layout (`_signature`).
+        layout = (_stated_layout(leaf.format.layout, leaf.sharding, leaf.shape, leaf.dtype)
+                  if isinstance(leaf, ArrayImpl) else None)
+        return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=placed(leaf, layout),
+                                    weak_type=leaf.aval.weak_type)
 
     return jax.tree.map(shaped, tree)
+
+
+def _stated_layout(layout, sharding, shape, dtype):
+    """`layout`, a device-local layout of an array of `shape` and `dtype` placed by `sharding`, where it is
+    not those devices' default; None where it is, or none is stated (JAX's own reading,
+    `pxla.is_default_layout`, as its dispatcher takes a default layout as unstated)."""
+    if layout is None or pxla.is_default_layout(layout, sharding, jax_core.ShapedArray(shape, dtype)):
+        return None
+    return layout
 
 
 @contextlib.contextmanager
@@ -795,6 +817,19 @@ def trace_context() -> Hashable:
             deterministic_ops_requested())
 
 
+def held_context() -> Hashable:
+    """The key a trace kept outside the compile point is held by, beside what it is of: the state a trace
+    reads of this thread's context (`trace_context`) and the launches the compiles refused, which a
+    template's legality reads as the call traces (`report.refused_launches`, a process's fact a trace reads
+    and a caller names beside the trace's state). A step's candidates (`dew.training._candidates`) and the
+    algebra's held kernel decisions (`fusion.choice_context`, the derivation's context beside it) are each
+    held by it, so a fact added to it reaches both; a launch's derived config is keyed by what its
+    derivation reads (`report.derivation_inputs`, `templates.base`)."""
+    from dew.nn.kernels.templates import report
+
+    return trace_context(), report.refused_launches()
+
+
 def _signature(leaf) -> Hashable:
     """What jit keys an argument on: an array's abstract value (shape, dtype, weak type), placement
     and layout (its `format`, which holds its sharding; a key array's sharding), another value's type,
@@ -809,12 +844,15 @@ def _signature(leaf) -> Hashable:
 
 def _abstract_signature(leaf) -> Hashable:
     """What a lowering reads of an argument (`OuterProgram.abstract_of`): an array's or a shape's shape,
-    dtype and weak type (its abstract value, a key array's among them) and its sharding, each as its shape
-    (`shapes_of`), so a call over arrays and one over their shapes share it, an array no one committed to
-    its devices lowering as an unplaced shape does; another value's type, shape and dtype."""
+    dtype and weak type (its abstract value, a key array's among them), its sharding and its device-local
+    layout where it is no default, each as its shape (`shapes_of`), so a call over arrays and one over their
+    shapes share it, an array no one committed to its devices lowering as an unplaced shape does, and a
+    lowering over one layout is never taken for an array of another (the morning audit of 2026-11-16: a
+    begun compile over a default layout taken for a column-major array, which its executable refused);
+    another value's type, shape and dtype."""
     if isinstance(leaf, jax.Array | jax.ShapeDtypeStruct):
         shaped = shapes_of(leaf)
-        return shaped.shape, shaped.dtype, shaped.weak_type, shaped.sharding
+        return shaped.shape, shaped.dtype, shaped.weak_type, shaped.sharding, shaped.format.layout
     return type(leaf), np.shape(leaf), np.result_type(leaf)
 
 

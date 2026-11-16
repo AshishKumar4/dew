@@ -1,10 +1,12 @@
-"""Where Dew keeps what it caches on disk, and JAX's persistent compilation cache.
+"""Where Dew keeps what it caches on disk, and JAX's persistent compilation cache; and what a process holds
+of what it decides and derives (`holding`).
 
 Kept apart from the telemetry and the loaders that read it, so the
 interop, config and inference modules take their cache paths without
 importing the FLOP accounting.
 """
 
+import collections
 import contextlib
 import contextvars
 import dataclasses
@@ -15,7 +17,7 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Hashable, Iterator
 from pathlib import Path
 
 import jax
@@ -24,6 +26,32 @@ from dew._builds import dew_cache_dir
 from dew._devices import cuda_builds, deterministic_ops_requested, xla_flag
 
 _log = logging.getLogger(__name__)
+
+def holding[Key: Hashable, Value](cache: collections.OrderedDict[Key, Value], key: Key,
+                                  made: Callable[[], Value], held: int) -> Value:
+    """`cache`'s entry at `key`, made (`made()`) where it holds none, outside the lock every held value shares
+    (`_HOLDING`: compiles trace on several threads, and a value made may hold another), the least recently
+    read dropped past `held`, each cache's own bound. Two threads missing one key at once each make it, the
+    later kept: a held value is a function of its key, so either is the same. How a process holds what it
+    decides and derives once for what it reads: the algebra's kernel decisions, written programs,
+    recognitions, window derivations and scan forms (`dew.algebra`), a declared walk's forms
+    (`derive.derived`), a launch's derived config (`templates.base`), a module's counted work
+    (`dew.nn.flops`) and a keyed objective's traced work (`objectives.base.traced_update_flops`)."""
+    with _HOLDING:
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key]
+    value = made()
+    with _HOLDING:
+        cache[key] = value
+        cache.move_to_end(key)
+        if len(cache) > held:
+            cache.popitem(last=False)
+    return value
+
+
+_HOLDING = threading.Lock()
+"""Held while a held value's cache is read or written (`holding`)."""
 
 VERSION_FILE = "_version.py"
 """The release's version (`dew._version`), which no code of Dew's computes from: no part of its

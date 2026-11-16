@@ -35,6 +35,7 @@ from egglog import eq
 from jax._src import core as jax_core
 from jax.extend import core as jcore
 
+from dew import _cache
 from dew.algebra import SATURATION, forms, fusion, normal_form, program, rules, terms
 from dew.algebra.forms import aval
 from dew.nn.kernels import generation
@@ -87,8 +88,9 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, families: Sequence[Famil
     if _bound(jaxpr).isdisjoint(family.anchor for family in families):
         return []
     key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families), fusion.choice_context())
-    found = fusion.holding(_HELD_BODIES, key, lambda: [_positioned(jaxpr, written)
-                                                 for written in _recognizing(jaxpr, index, held, families)])
+    def recognizing() -> list:
+        return [_positioned(jaxpr, written) for written in _recognizing(jaxpr, index, held, families)]
+    found = _cache.holding(_HELD_BODIES, key, recognizing, fusion.DECISIONS_HELD)
     return [_placed(jaxpr, written) for written in found]
 
 
@@ -174,7 +176,7 @@ def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[
             # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
             with generation.routes(alone=True):
                 return _chosen(index, places, members, accurate)
-        chosen = fusion.holding(_HELD_REGIONS, key, chose)
+        chosen = _cache.holding(_HELD_REGIONS, key, chose, fusion.DECISIONS_HELD)
         if chosen is not None:
             candidate = members[chosen]
             # Its call's identity: the region's (its structure and its constants' values) and the candidate.
@@ -402,7 +404,7 @@ def _declaration(candidate: Candidate) -> Callable:
         written = jax.make_jaxpr(lambda *values: jax.tree.leaves(forms.inlined(declared)(*values)))(
             *(_shape(var) for var in candidate.operands))
         return jcore.jaxpr_as_fun(written)
-    return fusion.holding(_DECLARATIONS, key, traced)
+    return _cache.holding(_DECLARATIONS, key, traced, fusion.DECISIONS_HELD)
 
 
 def _typed(value) -> Hashable:
@@ -934,7 +936,7 @@ def _attention_taken(attend: Callable, operands: Sequence[jcore.Var], options: H
     of `KEPT`), asked once by what it reads (`_TAKEN`): its operands' shapes and dtypes, the call's
     `options` and the context its kernels are chosen in (`fusion.choice_context`)."""
     key = (tuple((aval(var).shape, aval(var).dtype) for var in operands), options, fusion.choice_context())
-    return fusion.holding(_TAKEN, key, lambda: _traced_taken(attend, operands))
+    return _cache.holding(_TAKEN, key, lambda: _traced_taken(attend, operands), fusion.DECISIONS_HELD)
 
 
 _TAKEN: collections.OrderedDict[Hashable, bool] = collections.OrderedDict()

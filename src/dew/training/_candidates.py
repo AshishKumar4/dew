@@ -27,8 +27,7 @@ from dew.distributed.batches import PREFETCH_DEPTH, batch_shardings, prefetched_
 from dew.distributed.placement import Placement, Validation, placed_bytes, placed_shapes
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
-from dew.nn.kernels.options import owned_program, trace_context
-from dew.nn.kernels.templates import report
+from dew.nn.kernels.options import held_context, owned_program
 from dew.nn.sharding import Link, Schedule, spread_axes, spread_over
 from dew.state import Accumulation, TrainState, apart, taken, together
 from dew.training._lowering import Routed, kernel_report, routed
@@ -190,13 +189,12 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     key = None if stated is None else (
         stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow, mesh,
         platforms, stepping.shape.rows,
-        stepping.shape.split, stepping.shape.prefetch, stepping.shape.examples, report.refused_launches(),
-        trace_context())
+        stepping.shape.split, stepping.shape.prefetch, stepping.shape.examples, held_context())
     if key is not None:
         with _KEEPING:
             if (kept := _CANDIDATES.get(key)) is not None:
                 _CANDIDATES.move_to_end(key)
-                # Its links decide as its trace decided them: the key holds their figures (`trace_context`).
+                # Its links decide as its trace decided them: the key holds their figures (`held_context`).
                 spread_over(kept.spread)
                 sampled = _sampled(stepping, kept, batch, placement, replicated, split, platforms)
                 return dataclasses.replace(kept, sampled=sampled)

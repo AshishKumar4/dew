@@ -236,7 +236,7 @@ def _drop(f):
     return lambda x, w, ms, nw, b, u, s, ct: f(x, w, ms, nw, b, u, s)
 
 
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "v5e"))
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "v5e", "v6e"))
 @pytest.mark.parametrize("case", list(CASES))
 def test_the_template_holds_check_1_with_its_hooks(generation_name, case):
     """Each hook through the launch the generation picks, interpreted on the CPU: as exact as the plain
@@ -355,7 +355,7 @@ def _gradients(run):
     return with_gradients(lambda *operands: tuple(run(*operands)))
 
 
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "v5e"))
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "v5e", "v6e"))
 @pytest.mark.parametrize("case", GRADIENT_CASES)
 def test_the_templates_gradients_hold_check_1(generation_name, case):
     """Every operand's cotangent through the template's own reverse mode, against JAX's derivative of

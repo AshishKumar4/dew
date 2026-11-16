@@ -314,16 +314,16 @@ def _own(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) ->
 
 def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
     """One class of a user's own class's MRO, completely: its module and name, its members (`_members`), its
-    generated fields with their defaults and default factories (`dew._sources.generated_fields`: a
-    dataclass's or an attrs class's), and its
+    generated fields with their defaults, default factories, converters and validators
+    (`dew._sources.generated_fields`: a dataclass's or an attrs class's), and its
     metaclass where that is the user's own code too (which runs as the class is made and may set what it
     holds)."""
     # A default is read through the names the class's methods read of it, as its members are.
     names = _method_names(held)
     fields: list[JSON] = [
-        [field.name,
-         _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking, names),
-         _field_part(field.factory, f"{at} ({held.__name__}.{field.name} factory)", known, walking, names)]
+        [field.name, *(_field_part(part, f"{at} ({held.__name__}.{field.name} {kind})", known, walking, names)
+                       for kind, part in (("default", field.default), ("factory", field.factory),
+                                          ("converter", field.converter), ("validator", field.validator)))]
         for field in _sources.generated_fields(held)]
     maker = type(held)
     made = (_stated(maker, f"{at} ({held.__name__}'s metaclass)", known, walking)
