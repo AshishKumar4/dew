@@ -231,11 +231,12 @@ def test_a_notebooks_step_compiles_and_reads_its_rows(monkeypatch):
     assert loader.plan is not None and not loader.plan.manifest.exact
 
 
-@pytest.mark.parametrize("saved", ["without held", "held in its code list", "held apart"])
+@pytest.mark.parametrize("saved", ["without held", "held in its code list", "held apart", "reached as before"])
 def test_a_position_saved_before_reached_code_is_held_to_what_it_saved(tmp_path, monkeypatch, saved):
     """A position saved before steps' reached code was saved under its own key (`reached`): one saved before
     any held code (`without held`), one main saved for an hour with each step's class text appended to its
-    code list (`held in its code list`) and one saved since with it under `held` (`held apart`) hold nothing
+    code list (`held in its code list`), one saved since with it under `held` (`held apart`) and one saved
+    with the code it reaches stated as Dew stated it before (`reached as before`, `REACHED_AS`) hold nothing
     that proves the code the step reaches unchanged, so an exact resume is refused, changed or not, and a
     relaxed one reads on naming the step (Main: missing evidence is not proof of unchanged code; train 909's
     F8: the class text read as changed code)."""
@@ -251,12 +252,14 @@ def test_a_position_saved_before_reached_code_is_held_to_what_it_saved(tmp_path,
         return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
 
     place = json.loads(saved_after_one(reader))[_position.ENVELOPE]
-    plan = {name: value for name, value in place["plan"].items() if name != "reached"}
+    plan = {name: value for name, value in place["plan"].items() if name not in ("reached", "reached_as")}
     if saved == "held in its code list":
         plan["code"] = [[*code, *held] for code, held in zip(plan["code"], place["plan"]["reached"],
                                                                strict=True)]
     if saved == "held apart":
         plan["held"] = place["plan"]["reached"]
+    if saved == "reached as before":
+        plan["reached"] = place["plan"]["reached"]
     position = json.dumps({_position.ENVELOPE: {**place, "plan": plan}}).encode()
     with pytest.raises(ValueError):
         resumed_changes(reader(), position)

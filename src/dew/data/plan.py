@@ -195,6 +195,13 @@ def reader_name(reader: Callable[..., Batch], declared: str | None) -> str | Non
     return None
 
 
+REACHED_AS = 2
+"""How a plan states the code a data step's own code reaches (`dew._stated.stated`), saved beside it
+(`reached_as`): 2 since a module is stated by its file and the attributes the code names of it, and a set in
+its members' order. A position that saved it otherwise (none, before) holds digests no statement now makes,
+so it proves no step's code unchanged (`Plan.check`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class StepIdentity:
     """What a step computes (`semantic`), and the bytes of each external
@@ -924,6 +931,7 @@ class Plan:
             "manifest": manifest,
             "code": json_value(self.manifest.code(), "code"),
             "reached": json_value(self.manifest.held(), "reached"),
+            "reached_as": REACHED_AS,
             "order": referenced(self.spelled_order(), _identities(manifest["steps"])),
             "derived": json_value(self.derived, "derived"),
             "topology": json_value(self.topology, "topology"),
@@ -955,7 +963,7 @@ class Plan:
         reads, which only the position it saves keeps: the manifest's parts each apart, and a list's entries,
         such as each source's content and each step's identity, one by one."""
         recorded = self.record()
-        for name in ("order", "code", "reached", "manifest", "version"):
+        for name in ("order", "code", "reached", "reached_as", "manifest", "version"):
             del recorded[name]
         recorded["topology"] = json_value(
             {name: value for name, value in self.topology.items() if name != "share"}, "topology"
@@ -1075,7 +1083,10 @@ class Plan:
                          and not (appended and list(before)[:len(now)] == list(now))]
             # The code a step's own code reaches beside its module's (`Manifest.held`, `dew._stated.stated`),
             # where its position holds it (`reached`).
-            if "reached" in saved:
+            # Reached code a position states as this plan does (`REACHED_AS`); one stated otherwise proves
+            # nothing either way, so it reads as unsaved, below.
+            stated_alike = "reached" in saved and saved.get("reached_as") == REACHED_AS
+            if stated_alike:
                 saved_reached = listed(saved["reached"], "saved data reached code", read=json_value,
                                        what="each step's reached code")
                 reached = zip(steps, saved_reached, self.manifest.held(), strict=False)
@@ -1087,13 +1098,14 @@ class Plan:
             # code (a function or a callable object of the user's, a class or one a field holds) is refused an
             # exact resume rather than read as unchanged.
             unproven = [step.name for step, held in zip(steps, self.manifest.held(), strict=False)
-                        if "reached" not in saved and held and step.name not in rewritten]
+                        if not stated_alike and held and step.name not in rewritten]
             if unproven and resume != "relaxed":
                 raise PlanChanged(
                     tuple(f"code.{name}" for name in unproven),
-                    f"the position was saved before Dew saved the code a data step's own code reaches, so "
-                    f"nothing it holds proves the code of {', '.join(unproven)} unchanged; declare the "
-                    "step's identity (identity='name@version') to resume exactly, or resume relaxed "
+                    f"the position was saved before Dew saved the code a data step's own code reaches as it "
+                    f"states it now, so nothing it holds proves the code of {', '.join(unproven)} unchanged; "
+                    "declare the step's identity (identity='name@version') to resume exactly, or resume "
+                    "relaxed "
                     "(`data_resume='relaxed'`)")
             rewritten += unproven
             if rewritten and resume != "relaxed":
