@@ -108,7 +108,7 @@ _OPERATIONS = frozenset({
     lax.abs_p, lax.add_p, lax.and_p, lax.ceil_p, lax.clamp_p, lax.div_p, lax.eq_p, lax.floor_p, lax.ge_p,
     lax.gt_p, lax.le_p, lax.lt_p, lax.max_p, lax.min_p, lax.mul_p, lax.ne_p, lax.neg_p, lax.not_p, lax.or_p,
     lax.rem_p, lax.select_n_p, lax.shift_left_p, lax.shift_right_logical_p, lax.shift_right_arithmetic_p,
-    lax.sign_p, lax.sub_p, lax.xor_p, lax.integer_pow_p, lax.sqrt_p, lax.rsqrt_p, lax.square_p, lax.round_p,
+    lax.sign_p, lax.sub_p, lax.xor_p, lax.integer_pow_p, lax.square_p, lax.round_p,
     lax.one_minus_square_p, ad_util.add_jaxvals_p, lax.clz_p})
 """Elementwise operations of the CUDA cores, one an output element (a cotangent's sum, `add_any`, among
 them; a leading-zero count, `clz`, an integer instruction the finish's exponent reads a subnormal's by,
@@ -123,10 +123,13 @@ APPROXIMATED = frozenset({lax.exp_p, lax.exp2_p, lax.log_p, lax.log2_p, lax.log1
 (`mosaic.compiler_params`; its lowering's exp, exp2, log, log2, tanh, sin, cos, sqrt and rsqrt; jax's
 logistic, log1p and pow lower through them)."""
 
-_EXPONENTIALS = APPROXIMATED - {lax.sqrt_p, lax.rsqrt_p}
-"""The special-function units' operations, one an output element: those Mosaic GPU lowers to the hardware's
-approximate forms, or through them (`APPROXIMATED`), but its square roots, which the CUDA cores' operations
-count."""
+SPECIAL_FUNCTIONS = APPROXIMATED
+"""The special-function units' operations, one an output element, the one rule Dew counts them by: those
+Mosaic GPU lowers to the hardware's approximate forms, or through them (`APPROXIMATED`), square roots among
+them. An fp32 sqrt and rsqrt issue one MUFU each an element on sm80, sm90 and sm100 alike, beside two FMULs
+and an FSETP scaling a subnormal: Mosaic GPU's `sqrt.approx.f32` a MUFU.SQRT and `rsqrt.approx.f32` a
+MUFU.RSQ, and XLA's `sqrt.rn.f32` a MUFU.RSQ refined on the FMA pipe (ptxas 13.0's SASS, probes FS-SQRT2 and
+FS-SQRT4, 2026-11-16), as an exp's MUFU.EX2 is one beside its scaling FMUL."""
 
 _FREE = frozenset({
     lax.axis_index_p, gpu.barrier_arrive_p, gpu.barrier_wait_p, lax.bitcast_convert_type_p,
@@ -399,7 +402,7 @@ class _Counting:
             self.add(Work(operations=sum(_elements(v.aval) for v in equation.outvars)))
         elif primitive in _REDUCTIONS:
             self.add(Work(operations=_elements(equation.invars[0].aval)))
-        elif primitive in _EXPONENTIALS:
+        elif primitive in SPECIAL_FUNCTIONS:
             self.add(Work(exponentials=sum(_elements(v.aval) for v in equation.outvars)))
         elif primitive is lax.convert_element_type_p:
             self.add(Work(conversions=sum(_elements(v.aval) for v in equation.outvars)))

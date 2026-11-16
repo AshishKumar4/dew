@@ -45,6 +45,15 @@ def _emitted(fn, *args) -> emission.Emitted:
     return emission.emitted(jax.make_jaxpr(fn, axis_env=[("wg", 2)])(*args), 2, "wg")
 
 
+@pytest.mark.parametrize("operation", [jnp.exp, jnp.sqrt, lax.rsqrt, jnp.tanh], ids=lambda f: f.__name__)
+def test_a_square_root_counts_on_the_special_function_units_as_an_exponential_does(operation):
+    """A row's sqrt or rsqrt counts one special-function operation an element and no operation of the CUDA
+    cores, as an exp or a tanh does: each an fp32 MUFU on sm80, sm90 and sm100 (`emission.SPECIAL_FUNCTIONS`,
+    their SASS), where a square root counted on the CUDA cores."""
+    role = _emitted(operation, _ROW).roles[0]
+    assert (role.fixed.exponentials, role.fixed.operations) == (128, 0), role.fixed
+
+
 def test_a_step_counts_each_trip_of_a_loop_inside_it():
     """A walk step holding a loop of four trips counts its body four times."""
     walk = _walked(lambda row: lax.scan(lambda row, _: (jnp.exp(row), None), row, length=4)[0])

@@ -54,7 +54,7 @@ from dew.nn import programs
 from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
-from dew.nn.kernels.templates import cost
+from dew.nn.kernels.templates import cost, emission
 
 FUSION_ROW = 'ledger 1295'
 """The fusion analysis's limits."""
@@ -221,19 +221,10 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
 
 
 def _chain(consumer, values, acc) -> cost.Work:
-    """The consumers' elementwise work on the whole product: each equation of their program an operation an
-    element of its result, one the special-function units evaluate on them (the algebra's declaration of
-    it, `dew.algebra.terms.Operation.exponential`), a conversion's apart."""
-    closed = jax.make_jaxpr(consumer)(values, acc)
-    work = cost.Work()
-    for eqn in closed.jaxpr.eqns:
-        elements = float(sum(math.prod(shape) for var in eqn.outvars
-                             if (shape := getattr(var.aval, 'shape', None)) is not None))
-        spoken = algebra.terms.OPERATIONS.get(eqn.primitive)
-        work = work + (cost.Work(exponentials=elements) if spoken is not None and spoken.exponential
-                       else cost.Work(conversions=elements) if eqn.primitive is jax.lax.convert_element_type_p
-                       else cost.Work(operations=elements))
-    return work
+    """The consumers' work on the whole product, their program counted as a kernel's body is
+    (`emission.emitted`): each operation of the CUDA cores, of the special-function units and each
+    conversion an element of its result, each reduction an element of its input."""
+    return emission.emitted(jax.make_jaxpr(consumer)(values, acc).jaxpr, 1, None).fixed
 
 
 def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared: tuple, *fusions):
