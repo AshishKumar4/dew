@@ -362,7 +362,10 @@ def _transcendental(enclose, special):
         for bits in (96, 192, 384, 768):
             if not rest.size:
                 break
-            low, high = enclose(value.flat[rest], bits)
+            # Each distinct value enclosed once, by its bits (a signed zero's own).
+            bits_of = np.asarray(value.flat[rest], np.float64).view(np.uint64)
+            words, at = np.unique(bits_of, return_inverse=True)
+            low, high = (ends[at] for ends in enclose(words.view(np.float64), bits))
             down, up, decided = _neighbours(low, high, fmt, flushes)
             found.flat[rest[decided]] = _past(result.flat[rest], down, up, fmt, flushes)[decided]
             rest = rest[~decided]
@@ -398,8 +401,12 @@ def allowance(magnitude, count: int, fmt: Format, underflow: float):
     `underflow` lost at each rounding below the normal range. Check 2's sums (`_terms_hold`) and a native
     GEMM's (`native_certificates.native_dot_ends`) are held within it; `count` an int or each element's
     count, an array (an add of an exact zero rounding nothing)."""
-    gammas = (np.vectorize(lambda n: gamma(int(n), fmt), otypes=[np.float64])(count) if np.ndim(count)
-              else gamma(count, fmt))
+    if np.ndim(count):
+        # Each distinct count's gamma once: a sum's elements share a few counts.
+        counts, at = np.unique(np.asarray(count), return_inverse=True)
+        gammas = np.asarray([gamma(int(n), fmt) for n in counts], np.float64)[at].reshape(np.shape(count))
+    else:
+        gammas = gamma(count, fmt)
     return (gammas + 2.0 ** -52) * magnitude + count * underflow
 
 
@@ -762,14 +769,15 @@ def _integer_power(params, operands, result, fmt):
         return _bits(result) == _bits(powered(result, value))
     read = _read(value, lane().flushes)
     lost = _underflow(fmt)
-    low, high = np.empty(read.shape), np.empty(read.shape)
-    for index, element in enumerate(read.flat):
-        if np.isfinite(element) and element != 0:
-            low.flat[index], high.flat[index] = _power_ends(abs(float(element)), power, fmt, lost)
-        else:
-            # A zero's or a non-finite value's power is exact in float64.
-            with np.errstate(divide="ignore"):
-                low.flat[index] = high.flat[index] = abs(np.float64(element) ** power)
+    # A zero's or a non-finite value's power is exact in float64; each distinct finite magnitude's ends
+    # once (`_power_ends`).
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        low = high = np.abs(np.asarray(read, np.float64) ** power)
+    low, high = np.array(low), np.array(high)
+    moved = np.isfinite(read) & (read != 0)
+    sizes, at = np.unique(np.abs(read[moved]), return_inverse=True)
+    ends = np.asarray([_power_ends(float(size), power, fmt, lost) for size in sizes]).reshape(-1, 2)
+    low[moved], high[moved] = ends[at, 0], ends[at, 1]
     native = np.asarray(result, np.float64)
     size = np.abs(native)
     undefined = np.isnan(low)
