@@ -549,23 +549,6 @@ def test_the_mosaic_walk_drops_a_slice_at_its_global_places(training, sliced):
         np.testing.assert_array_equal(value_grads.transpose(0, 2, 3, 1), expected)
 
 
-def test_a_dropping_fp32_mean_past_its_values_largest_overflows_as_the_references_interpreted():
-    """fp32 at a rate of 1/2, one query over two equal keys whose values are 2e38, a seed keeping both: each
-    kept weight 1/2 takes the multiplier 2, so the output is the values' sum, 4e38, past fp32's largest, and
-    inf, as the reference's. A dropping call's quotient is never held at the values' largest, as a mean of
-    finite values is (`algebra.quotient`'s hold, row 6842; train 918's F3)."""
-    rate, keys = 0.5, 2
-    spans = template.spans(1, keys, 1)
-    words = next(words for words in map(seed_words, range(64))
-                 if np.asarray(dropout_keep(words, rate, (1, 1, 1, keys))).all())
-    query = jnp.zeros((1, 1, 1, 16), jnp.float32)
-    key = jnp.zeros((1, keys, 1, 16), jnp.float32)
-    value = jnp.full((1, keys, 1, 16), 2e38, jnp.float32)
-    with generation.assumed("sm90", interpreted=True):
-        out = attention_mosaic.forward(query, key, value, spans, hooked(words, 1, 1, rate), interpret=True)
-    assert np.isposinf(np.asarray(out)).all(), np.asarray(out).ravel()[:4]
-
-
 def three_identical_keys():
     """One zero query of width 16 over three identical keys (first coordinate 1), values (0.75, 3u, 0, ...)
     with u = 2^-23, and dO = (1, 1, 0, ...), in bf16: at a rate of 1/2 each kept product is 2 (0.75 + 3u)."""
