@@ -221,25 +221,27 @@ class Offset:
     __scale: int = {scale}
 
 
-def shifted(row):
-    return {{**row, "id": row["id"] + Offset().by * Offset()._Offset__scale}}
+@dataclasses.dataclass(frozen=True)
+class Shifting:
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + Offset().by * Offset()._Offset__scale}}
 """
 
 
 @pytest.mark.parametrize("edit", [{"by": 2, "scale": 1}, {"by": 1, "scale": 3}], ids=["field", "mangled"])
 def test_an_exact_resume_refuses_a_step_whose_slotted_classs_default_changed(tmp_path, monkeypatch, edit):
-    """A step whose code builds a frozen, slotted dataclass of its file with a field default (`Offset().by`,
-    a name-mangled field's too) reads that default as its code: edited, an exact resume is refused, the
-    change named in code, and unchanged it resumes exactly. Its slots move the default off the class, and
-    the walk skipped it with the slot's descriptor, so an edited default resumed exactly (train 942's
-    review)."""
+    """A step of a class of the user's file, stated by its members, whose code builds a frozen, slotted
+    dataclass of the file with a field default (`Offset().by`, a name-mangled field's too), reads that
+    default as its code: edited, an exact resume is refused, the change named in code, and unchanged it
+    resumes exactly. Its slots move the default off the class, and the walk skipped it with the slot's
+    descriptor, so an edited default resumed exactly (train 942's review)."""
     module = tmp_path / f"defaulted_{uuid4().hex}.py"
     module.write_text(DEFAULTED.format(by=1, scale=1))
     monkeypatch.syspath_prepend(str(tmp_path))
     defaulted = importlib.import_module(module.stem)
 
     def reader(resume="exact"):
-        pipeline = Pipeline(ROWS).map(defaulted.shifted).shuffle(0).repeat().batch(2)
+        pipeline = Pipeline(ROWS).map(defaulted.Shifting()).shuffle(0).repeat().batch(2)
         return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
 
     state = saved_after_one(reader)
