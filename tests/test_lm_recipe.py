@@ -684,7 +684,7 @@ def test_a_run_whose_tokenizer_is_gone_exports_and_starts_a_run_from_the_copy_it
     source = export_tiny_decoder(tmp_path / "source", tokenizer=tokenizer_for(str(vocabulary)),
                                  vocab_size=len(HFTokenizer(str(vocabulary)).tokenizer))
     own = write_token_files(tmp_path / "own", 40 * SEQ, 8 * SEQ, tokenizer=str(source), eos_id=0)
-    pretrained_config(own, source, "--trainer.steps", "1", "--max-new-tokens", "0",
+    pretrained_config(own, source, "--tokenizer", str(source), "--trainer.steps", "1", "--max-new-tokens", "0",
                       "--trainer.name", "first").run()
     source.rename(tmp_path / "moved")
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "fresh"))
@@ -696,8 +696,8 @@ def test_a_run_whose_tokenizer_is_gone_exports_and_starts_a_run_from_the_copy_it
     bundle.save(tmp_path / "exported")
     assert HFTokenizer(str(tmp_path / "exported")).encode(text) == expected
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, tokenizer=str(vocabulary), eos_id=0)
-    started = pretrained_config(tokens, first, "--trainer.steps", "1", "--max-new-tokens", "0",
-                                "--trainer.name", "started").run()
+    started = pretrained_config(tokens, first, "--tokenizer", str(vocabulary), "--trainer.steps", "1",
+                                "--max-new-tokens", "0", "--trainer.name", "started").run()
     assert int(started.updates) == 1
 
 
