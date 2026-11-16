@@ -260,24 +260,17 @@ def generation_options(held: type) -> tuple[tuple[str, bool], ...]:
     return ()
 
 
-def _field_departures(field: dataclasses.Field) -> tuple[tuple[str, Any], ...]:
-    """A dataclass field's flags that depart from `FIELD_FLAGS`, each by its name (an empty metadata is the
-    default's none)."""
-    departures = []
-    for name, default in FIELD_FLAGS.items():
-        value = getattr(field, name)
-        if not (name == "metadata" and not value) and value != default:
-            departures.append((name, value))
-    return tuple(departures)
-
-
 def generated_fields(held: type) -> list[GeneratedField]:
     """The fields a class generator recorded on `held` itself, in order, its bases' among them and an
     override's default its own: a dataclass's (`dataclasses.fields`, its class and init variables, which
     are no fields, apart) or an attrs class's (`__attrs_attrs__`, a default `attrs.Factory`'s factory its
     factory, its hooks where set). Empty for a class no generator made itself."""
     if "__dataclass_fields__" in vars(held):
-        return [GeneratedField(field.name, field.default, field.default_factory, _field_departures(field))
+        # Each field's flags that depart from `FIELD_FLAGS` (an empty metadata is the default's none).
+        return [GeneratedField(field.name, field.default, field.default_factory,
+                               tuple((name, getattr(field, name)) for name, default in FIELD_FLAGS.items()
+                                     if not (name == "metadata" and not field.metadata)
+                                     and getattr(field, name) != default))
                 for field in dataclasses.fields(held)]
     if "__attrs_attrs__" in vars(held):
         # attrs is loaded where a class of it exists; its sentinel and factory type are its own.
