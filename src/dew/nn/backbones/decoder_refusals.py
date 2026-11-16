@@ -79,9 +79,10 @@ def forked(decoder: CausalTransformer, train: bool = False, *, joint: bool = Fal
     own row does, or None (`dew.nn.protocols.ForkedCalls`): a bidirectional decoder, whose shared prefix
     reads each branch's tokens; in training, dropout, which draws each row's masks apart where a shared
     prefix draws them once; its mixture's block routing or capacity (`Mixture.fork_refusal`), or a layer
-    whose mixer reads no forks (`MixerBase.fork_refusal`). Attention, the recurrent mixers, engram's n-gram
-    hashes (over each chain, `dew.nn.engram._forked_lookback`) and tokenwise layers read each document
-    from its ancestors alone; a learned position embedding reads the places forks give each
+    whose mixer reads no forks (`MixerBase.fork_refusal`), or none under the wrappers of the model's
+    products (`MixerBase.wrapped_fork_refusal`: an in-context memory's). Attention, the recurrent mixers,
+    engram's n-gram hashes (over each chain, `dew.nn.engram._forked_lookback`) and tokenwise layers read
+    each document from its ancestors alone; a learned position embedding reads the places forks give each
     token; cross-attention reads each tree's own context (`Forks.trees`), a context a tree."""
     if not decoder.causal:
         return "a bidirectional decoder reads each token's later tokens, which a fork's branches hold apart"
@@ -90,6 +91,12 @@ def forked(decoder: CausalTransformer, train: bool = False, *, joint: bool = Fal
                                 or decoder.attention_dropout_rate):
         return "dropout draws each row's masks apart, which a shared prefix draws once"
     if decoder.mixture is not None and (refusal := decoder.mixture.fork_refusal()) is not None:
+        return refusal
+    from dew.registry import wrapper_layers
+
+    # A wrapper of the model's products may take a layer off the one path of it that reads forks.
+    if wrapper_layers(type(decoder))[1] and (refusal := _layer(
+            decoder, lambda mixer, _: mixer.wrapped_fork_refusal())) is not None:
         return refusal
     return _layer(decoder, lambda mixer, _: mixer.fork_refusal())
 
