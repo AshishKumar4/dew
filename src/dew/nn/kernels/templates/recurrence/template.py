@@ -1011,14 +1011,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
             return self.holds(ba, target)
         return bool(self.fits(ba, target))
 
-    def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> mainloop.Tiles:
-        # Its derived config on the target it launches for (`Template.estimate` and its ranking are gone).
-        return self.fitting(ba, self.launched())[0]
-
-    def remaining(self, ba: tokamax.BoundArguments) -> mainloop.Tiles | None:
-        # The first config it offers on the target it launches for, none where it offers none.
-        offered = self.offering(ba, self.launched())
-        return offered[0] if offered else None
+    def launch_target(self) -> generation.GpuTarget:
+        # Its configs derived for the target it launches for (`launched`), the interpreted one's off a GPU.
+        return self.launched()
 
 
 

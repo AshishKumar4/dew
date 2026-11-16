@@ -468,6 +468,11 @@ def refusals_at(op, arguments: tokamax.BoundArguments
     return identity, refusals_of(identity)
 
 
+def refused_any(op, arguments: tokamax.BoundArguments) -> bool:
+    """Whether a compile of this process refused any config of `op`'s launch of `arguments` (`refused`)."""
+    return bool(refusals_of(_identity(op, arguments)))
+
+
 def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable) -> frozenset[str]:
     """The names of `op`'s kernels a compile of this process refused at `config` for `arguments`
     (`Binary.refused`: spilling, or their warpgroup MMAs serialized): a launch of several kernels (a

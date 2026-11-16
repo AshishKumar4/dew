@@ -564,8 +564,7 @@ class KernelOp(tokamax.Op):
                 collected.found.append((self, self.keyed(ba)))
             config = self.taken(ba)
             if config is None:
-                raise report.Exhausted(f"no config of {type(self).__name__} holds this call: none fits, or "
-                                       f"certification refused each that did (report.misses names them)")
+                raise self.exhausted(ba)
             if collected is not None:
                 collected.found.taken.append((config, ba))
         else:
@@ -577,6 +576,12 @@ class KernelOp(tokamax.Op):
         # kernels carry it in their names, so a compile's reports name it (`report.launching`).
         with report.launching(self, ba, config):
             return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
+
+    def exhausted(self, ba: tokamax.BoundArguments) -> report.Exhausted:
+        """The refusal of a call of `ba` no config holds (`taken` None): none fits, or certification refused
+        each that did."""
+        return report.Exhausted(f"no config of {type(self).__name__} holds this call: none fits, or "
+                                f"certification refused each that did (report.misses names them)")
 
     def taken(self, ba: tokamax.BoundArguments) -> Hashable | None:
         """The config a call of `ba` takes: a pin, a tuned pick the call's shapes take, else its derived
