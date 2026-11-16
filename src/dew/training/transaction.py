@@ -1260,9 +1260,11 @@ class Transaction:
         # Runs that updated in their backward wrote it only where the step commits (`in_backward.gated`).
         numerical = numerical if pending.applied is None else pending.applied.onto(numerical)
 
-        # What the commit's own finiteness (its gradient, effects and logit maxima) leaves out: the attempt's
-        # loss, its microbatch's and its collections.
-        attempted = pending.local_finite & _all_finite((loss, aux.variables))
+        # What the commit's own finiteness (its pooled gradient, effects and logit maxima) leaves out: the
+        # attempt's loss and its collections. A microbatch's own gradient (`local_finite`) is in the pooled
+        # one; read here, its reduction would hold the window's step back (a tenth more of a split step's
+        # need in test_plan's tight start).
+        attempted = _all_finite((loss, aux.variables))
 
         def commit(current):
             return self.commit(current, gradient, effects, qk, pending.pooled, pending.applied, attempted)
