@@ -1464,7 +1464,7 @@ def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
             report.refuse_launch(template.MOSAIC, bound, tiles, {kernel}, {kernel: roles})
             keys.append(report.derivation_inputs(template.MOSAIC, bound, template.Mosaic.launched()))
             handed = report.refused_launches()
-        with report.refusals():
+        with report.refusals(), generation.assumed('sm90'):
             report.refuse(handed)
             assert report.spilled_in(template.MOSAIC, bound, tiles) == {kernel: roles}
     assert keys[0] != keys[1]
