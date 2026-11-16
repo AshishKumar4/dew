@@ -38,7 +38,6 @@ from dew.parity import (
     Conditioning,
     Inconclusive,
     RecordedLeaf,
-    _width,
     example_mse,
     example_worst,
     heavy_masks,
@@ -539,8 +538,7 @@ def record_distances(label: str, draw, distances: Mapping[str, np.ndarray], trut
     errors = np.stack([np.asarray([float(log_mean_square(seed)) for seed in rows]) if rows.shape[1]
                        else np.full(rows.shape[0], -np.inf)
                        for rows in (np.asarray(distances[name], np.float64) for name in names)], axis=1)
-    first = truth_of(0)
-    confirmed = seeds_resolving(errors, names, label, widths=[_width(first[name]) for name in names])
+    confirmed = seeds_resolving(errors, names, label)
     kept = staged_units(confirmed)
 
     def records():
@@ -586,14 +584,11 @@ def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict
     holding = {any(key.startswith(f"{label}.dew_mse.") for key in shard) for shard in pilots}
     if len(holding) > 1:
         raise ValueError(f"{label}: some pilot shards hold Dew's errors on their draws and some do not")
-    # Each leaf's row width, as check 1 reads it (`_width`) of the leaf's shape.
-    widths = [_width(np.broadcast_to(np.zeros(()), tuple(joined[f"{label}.shape.{name}"]))) for name in names]
     if holding == {True}:
         held = _joined(label, pilots, SIZING_FROM)
-        confirmed = seeds_resolving(logs(held, "mse"), names, label, widths=widths,
-                                    mine=logs(held, "dew_mse"))
+        confirmed = seeds_resolving(logs(held, "mse"), names, label, mine=logs(held, "dew_mse"))
     else:
-        confirmed = seeds_resolving(logs(joined, "mse"), names, label, widths=widths)
+        confirmed = seeds_resolving(logs(joined, "mse"), names, label)
     kept = staged_units(confirmed)
     if len(drawn) < kept:
         raise ValueError(f"{label}: {confirmed} seeds resolve, and their redraw needs {kept} seeds; the "
