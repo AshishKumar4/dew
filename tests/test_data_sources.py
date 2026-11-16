@@ -2119,6 +2119,27 @@ def test_a_concatenation_states_what_its_stores_state_of_their_records():
         Concatenate((first, other)).metadata()
 
 
+def test_stores_whose_tokenizers_hold_one_files_join_whatever_they_name_them():
+    """Two token stores whose tokenizers resolved to the same files (`tokenizer_revision`'s `files`) join,
+    though each names its tokenizer by the place or hub revision it was read from, as runs of one tokenizer
+    blend; stores whose files differ in one hash do not. A store's tokenizer was its name and revision, so
+    one tokenizer at two places made two contracts (train 968's review, F5)."""
+    from dew.data import Concatenate
+
+    files = {"tokenizer.json": "a" * 64, "tokenizer_config.json": "b" * 64}
+
+    def stated(name: str, revision: str, held: dict) -> Stated:
+        return Stated([{"id": np.int32(0)}], facts=(
+            ("tokenizer", name), ("vocab_size", 64),
+            ("tokenizer_revision", {"name": name, "revision": revision, "files": held})))
+
+    joined = Concatenate((stated("org/tiny", "1" * 40, files), stated("/copies/tiny", None, files)))
+    assert joined.metadata()["tokenizer"] == "org/tiny"
+    changed = {**files, "tokenizer.json": "c" * 64}
+    with pytest.raises(ValueError):
+        Concatenate((stated("org/tiny", "1" * 40, files), stated("org/tiny", "1" * 40, changed))).metadata()
+
+
 @pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
 def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(read):
     """Two stores read in turn (`dew.data.Concatenate`) are one store to the verbs: a pass over it

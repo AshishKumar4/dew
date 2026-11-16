@@ -47,23 +47,41 @@ TOKENIZER_CONTRACT = ("tokenizer", "vocab_size", "eos_id", "tokenizer_revision")
 """The facts of a store of token ids that say what its ids mean, which every corpus a run reads
 together, and every store a concatenation joins, must state alike where they state them:
 `tokenizer_revision` the identity its tokenizer resolved to as it was written (a hub name's commit and
-each file's digest, `dew.data.text.export_tokens`), which a store written before it stated one leaves out."""
+each file's digest, `dew.data.text.export_tokens`), which a store written before it stated one leaves out.
+A tokenizer is what its files are, as a run's is (`dew.data.text.PinnedTokenizer.files`): stores that state
+its files compare by them alone, one tokenizer under two names or at two places alike."""
+
+
+def tokenizer_files(metadata: Mapping[str, object]) -> JSON:
+    """The files' hashes a store's tokenizer resolved to (`tokenizer_revision`'s `files`), or None where it
+    states none."""
+    revision = metadata.get("tokenizer_revision")
+    return json_value(revision.get("files"), "tokenizer files") if isinstance(revision, Mapping) else None
 
 
 def tokenizer_contract(stated: Iterable[tuple[str, Mapping[str, object]]]) -> dict[str, JSON]:
     """The tokenizer contract (`TOKENIZER_CONTRACT`) of stores read together, each `(name,
-    metadata)`: every fact any of them states, which every other that states it states alike.
-    Raises ValueError naming the store whose fact differs from the first's."""
+    metadata)`: every fact any of them states, as the first states it, which every other that states it
+    states alike; a tokenizer by its files where both state them (`tokenizer_files`), its name and
+    revision then no part of it. Raises ValueError naming the store whose fact differs from the first's."""
     declared: dict[str, JSON] = {}
+    first: JSON = None
     for name, metadata in stated:
+        files = tokenizer_files(metadata)
+        by_files = files is not None and first is not None
+        if by_files and files != first:
+            raise ValueError(f"{name}'s tokenizer files differ from the first store's; stores read together "
+                             "must share the tokenizer contract, whose ids they hold")
         for key in TOKENIZER_CONTRACT:
             if key not in metadata:
                 continue
             value = json_value(metadata[key], key)
-            if key in declared and value != declared[key]:
+            if (key in declared and value != declared[key]
+                    and not (by_files and key in ("tokenizer", "tokenizer_revision"))):
                 raise ValueError(f"{name} has {key}={value!r}, expected {declared[key]!r}; stores read "
                                  "together must share the tokenizer contract, whose ids they hold")
-            declared[key] = value
+            declared.setdefault(key, value)
+        first = files if first is None else first
     return declared
 
 
