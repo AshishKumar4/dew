@@ -276,8 +276,9 @@ class Issuer:
         if isinstance(entry, product.Blocks):
             return None
         name, lhs, rhs = entry
-        if (isinstance(lhs, product.Scaled) or self._registered(name, lhs) is not None
-                or callable(lhs) or callable(rhs)):
+        # An operand formed later is formed once, where its product issues: never to read its parts here.
+        if (isinstance(lhs, product.Scaled) or callable(lhs) or callable(rhs)
+                or self._registered(name, lhs) is not None):
             return None
         return self._count(name, lhs), self._count(name, rhs)
 
