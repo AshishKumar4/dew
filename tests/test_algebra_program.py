@@ -685,6 +685,25 @@ def test_an_fp8_product_is_priced_in_the_tensor_mode_its_gpu_runs_it_in(generati
     assert seconds(jnp.float8_e4m3fn) == seconds(jnp.bfloat16) / speedup
 
 
+@pytest.mark.parametrize("target_name", ["v5e", "v6e"])
+def test_an_fp32_product_on_a_tpu_is_its_matrix_units_bf16_passes(target_name):
+    """An fp32 product priced for a TPU is its matrix units' bfloat16 passes (`jax.lax.Precision`'s: one at
+    the default precision, three at HIGH, six at HIGHEST), a bf16 product's work that many times, all of it
+    work the TPU's rates price (row 7201: counted as CUDA-core operations, which a TPU states no rate of,
+    every product of a scan's chunk forms priced at nothing)."""
+    tpu = generation.TARGETS[target_name]
+
+    def work(dtype, precision):
+        with program.passes(target=target_name):
+            made = cost.product_work(1024, 1024, 1024, dtype=dtype, precision=precision)
+        assert not any(kernel_cost.units(made, kernel_cost.rates(tpu, device=True))[1])
+        return made.flops
+
+    bf16 = work(jnp.bfloat16, None)
+    assert [work(jnp.float32, precision) for precision in ("default", "high", "highest")] == [
+        bf16, 3 * bf16, 6 * bf16]
+
+
 def test_xlas_schedule_prices_each_kernel_its_parts_fixed_latency():
     """XLA's schedule (`cost.fused`) prices each kernel of a form, a product's or a reduction's (a root of
     XLA's fusion), at its part's measured fixed latency (`GpuTarget.fixed_seconds`, its launch and first

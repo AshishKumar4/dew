@@ -448,6 +448,8 @@ def _split(declaration: Scan, names: Sequence[str], chunk: Mapping, affine, form
     """The chunk function's split (`carry.split`) at the shapes of `given`, its decays, tokens and the form's
     values that read no state (`held`, prepared), its operands bounded as the declaration ranges them
     (`_ranges`), a solve's inverse by its bound."""
+    if linear_scan.looped((form.outputs, form.state)):
+        return _looped_split(form, held, affine.values_read)
     ranges = _ranges(declaration, names, chunk, affine, chunk_size)
     bound = ranges.pop("inverse", None)
     ranges.update({DECAYS + len(TOKENS) + place: bound for place, node in enumerate(held)
@@ -456,6 +458,31 @@ def _split(declaration: Scan, names: Sequence[str], chunk: Mapping, affine, form
     return carry.split(functools.partial(_chunk, form, held, affine.values_read), state, avals, (1,),
                        saturation=saturation, ranges=ranges,
                        state_range=_magnitude(declaration.ranges.get("state")))
+
+
+def _looped_split(form: linear_scan.Form, held: tuple, values_read: bool) -> carry.Split:
+    """A form that runs the token loop split by its construction, never by extraction: every value it reads
+    but the state's is a token's or a decay's, so what it prepares is the chunk function's operands, and its
+    carry and its emitted outputs each run the chunk function (`_chunk`, the loop a scan of one token's step)
+    from the state entering the chunk. Its chunk function unrolled was a chain of every token's step, which
+    the split's e-graph saturated and extracted whole: a 256-token chunk's 6,917 equations, 20 minutes, and
+    egglog's extraction past Python's stack (row 7201)."""
+    def prepare(*given, issue=None):
+        del issue
+        return given
+
+    def ran(prepared: tuple, h):
+        return _chunk(form, held, values_read, h, *prepared)
+
+    def carried(prepared: tuple, h, issue=None) -> tuple:
+        del issue
+        return (ran(prepared, h)[1],)
+
+    def emitted(prepared: tuple, h, issue=None) -> tuple:
+        del issue
+        return (ran(prepared, h)[0],)
+
+    return carry.Split(prepare, carried, emitted)
 
 
 def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
@@ -610,21 +637,24 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
 
 
 def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, values_read: bool = False):
-    """The token loop over the chunk, each token's step in turn (its decay `exp(z_t)` the pair of it and the
-    token before, `between[t, t - 1]`, the first's `entering[0]`): its outputs and the state it leaves. Each
-    token's output is placed at its row by a constant one-hot column and the rows summed, the carry's own
-    language (`carry.split` reads products and sums, not a concatenation)."""
+    """The token loop over the chunk, a scan of one token's step (its decay `exp(z_t)` the pair of it and the
+    token before, `between[t, t - 1]`, the first's `entering[0]`): its outputs, a row a token, and the state
+    it leaves. Split by its construction (`_looped_split`), never unrolled into an e-graph."""
     B, s, C, Q, R = (tokens[name] for name in ("B", "s", "C", "Q", "R"))
-    placed = jnp.eye(B.shape[0], dtype=B.dtype)
-    outputs = 0.0
-    for t in range(B.shape[0]):
-        decay = decays.entering[0] if t == 0 else decays.between[t, t - 1]
+    count = B.shape[0]
+    between = decays.between[jnp.arange(1, count), jnp.arange(count - 1)]
+    stepped = jnp.concatenate([decays.entering[:1], between])
+
+    def step(h, token):
+        decay, b, strength, c, q, r, value = token
         h = decay[:, None] * h
         if corrected:
-            h = h - s[t] * B[t][:, None] * _portable(C[t][None, :], h)
-        h = h + B[t][:, None] * values[t][None, :]
-        read = _portable(h, Q[t][:, None])[:, 0] if values_read else _portable(Q[t][None, :], h)[0]
-        outputs = outputs + placed[:, t][:, None] * (read + R[t])[None, :]
+            h = h - strength * b[:, None] * _portable(c[None, :], h)
+        h = h + b[:, None] * value[None, :]
+        read = _portable(h, q[:, None])[:, 0] if values_read else _portable(q[None, :], h)[0]
+        return h, read + r
+
+    h, outputs = lax.scan(step, h, (stepped, B, s, C, Q, R, values))
     return outputs, h
 
 
