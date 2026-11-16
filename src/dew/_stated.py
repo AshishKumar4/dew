@@ -360,10 +360,11 @@ def _generated(member: types.FunctionType | tuple[str, ...]) -> JSON:
     the generator wrote from the class's fields and options; `__match_args__` by its names."""
     if not isinstance(member, types.FunctionType):
         return json_value(member, "a generated member")
-    parameters = [[parameter.name, parameter.kind.name, _sources.annotation_text(parameter.annotation)
-                   if parameter.annotation is not inspect.Parameter.empty else None,
-                   parameter.default is not inspect.Parameter.empty]
-                  for parameter in inspect.signature(member).parameters.values()]
+    parameters: list[JSON] = [
+        [parameter.name, parameter.kind.name, _sources.annotation_text(parameter.annotation)
+         if parameter.annotation is not inspect.Parameter.empty else None,
+         parameter.default is not inspect.Parameter.empty]
+        for parameter in inspect.signature(member).parameters.values()]
     stated: list[JSON] = ["generated", parameters, _code(member.__code__)]
     return stated
 
