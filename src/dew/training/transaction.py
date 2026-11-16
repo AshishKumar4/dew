@@ -588,8 +588,10 @@ def _finite_each(leaves: list[jax.Array]) -> list[jax.Array]:
 def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
     """Whether each of `leaves`, arrays placed anywhere, is finite throughout (`leaf_finite`), read outside a
     step: one program for each placement the leaves share (their devices and memory kind), as no one
-    program spans two meshes (a CPU-owned run's host companion and its accelerator); a leaf in host memory
-    (a layout's pinned-host field) brought to its devices' memory one leaf at a time (`fetched`)."""
+    program spans two meshes (a CPU-owned run's host companion and its accelerator), which hands back one
+    flag for them all and, only where it is false, each leaf's; a leaf in host memory (a layout's
+    pinned-host field) brought to its devices' memory one leaf at a time (`fetched`). A flag a leaf, read
+    each check, took 0.19 s a check of the 4B's 1,493 leaves on a GH200 (UB-6861-FIT2)."""
     groups: dict[tuple, list[int]] = {}
     for index, leaf in enumerate(leaves):
         sharding = leaf.sharding
@@ -601,7 +603,10 @@ def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
                 leaf = leaves[index]
                 flags[index] = bool(program(leaf_finite)(fetched(leaf, leaf.sharding)))
             continue
-        read = jax.device_get(program(_finite_each)([leaves[index] for index in members]))
+        held = [leaves[index] for index in members]
+        if bool(program(all_finite)(held)):
+            continue
+        read = jax.device_get(program(_finite_each)(held))
         for index, finite in zip(members, read, strict=True):
             flags[index] = bool(finite)
     return flags
