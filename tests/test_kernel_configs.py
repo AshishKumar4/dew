@@ -5,6 +5,7 @@ are the verdict, runs none of them: the file carries no `kernel` mark."""
 
 import dataclasses
 import functools
+import itertools
 import os
 import re
 import tempfile
@@ -839,20 +840,39 @@ def test_a_b200s_gathered_launch_fits_its_derived_resources(name):
 def test_a_refused_gathering_producer_offers_its_whole_ladder_and_its_refused_tile_is_no_pick():
     """The B200's gathered input gradient's derived tile, its producer at its ladder's top
     (`producers.started`), refused as a compile finding its kernel spilling refuses it
-    (`report.refuse_launch`): its rungs (`_Mosaic.rungs`) are its producer's whole ladder below it, a
-    setmaxnreg step lower each down to a step above the least, none waiting on a rung's own refusal, so
-    certification asks them a round at a time (`tuning.KernelOp._climbed`); the refused tile is no pin or
-    stored pick (`pinnable`)."""
+    (`report.refuse_launch`): its rungs (`_Mosaic.rungs`) are offered whole, each a lower producer above the
+    least, though no compile refused any of them, so certification asks them a round at a time
+    (`tuning.KernelOp._climbed`); the refused tile is no pin or stored pick (`pinnable`)."""
     launch, arguments = _gathered_on_a_b200("input gradient, its rows gathered")
     with report.refusals(), generation.assumed("sm100"):
         tile = launch.derived(arguments, generation.gpu_target())
-        steps = resources.facts().raises()
+        least = resources.facts().raises().lowest
         report.refuse_launch(launch, arguments, tile, {launch.KERNEL})
-        ladder = [rung.producers.of(launch.KERNEL) for rung in launch.rungs(arguments, tile)]
+        ladder = [tile.producers.of(launch.KERNEL),
+                  *(rung.producers.of(launch.KERNEL) for rung in launch.rungs(arguments, tile))]
         pinnable = launch.pinnable(arguments, tile)
-    top = tile.producers.of(launch.KERNEL)
-    assert ladder == list(range(top - steps.step, steps.lowest, -steps.step)), ladder
+    assert len(ladder) > 2 and all(high > low > least for high, low in itertools.pairwise(ladder)), ladder
     assert not pinnable
+
+
+@lowers("sm90")
+@pytest.mark.parametrize("name", GATHERED_ON_A_B200)
+def test_an_h100s_gathered_launch_certifies_its_tile_at_its_first_compile(name):
+    """The B200's gathered launches certified on a compile-only H100 as a run takes them: each at its first
+    compile, nothing spilling, its producer at setmaxnreg's least, as its warpgroup MMA's consumers hold
+    their accumulators in registers (`producers.started`): at its entry share the producer left them 168,
+    which spilled, the kernel gradient certified at its sixth compile (train 952 F2)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    launch, arguments = _gathered_on_a_b200(name)
+    [device] = compile_only_gpus("sm90", 1)
+    with report.refusals(), generation.assumed("sm90"), report.certifying(device):
+        before = len(report.certifications())
+        tile = launch.taken(arguments)
+        certified = report.certifications()[before:]
+    assert tile.producers.of(launch.KERNEL) is None, tile
+    assert len(certified) == 1, [(each.config, [b.frame for b in each.refused]) for each in certified]
+    assert not certified[-1].refused
 
 
 def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():

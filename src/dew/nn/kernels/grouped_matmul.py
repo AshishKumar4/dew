@@ -928,10 +928,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # A family rewriting the staged rows in a role of its own runs it beside the consumers
         # (`mosaic_gpu.tgmm`'s `roles`).
         roles = config.warpgroups + self.rewritten(ba, family)
-        # Its producer at the registers its tile states, or where it states none its ladder's first rung
-        # (`producers.started`), as its derived tile's kernel lowers it.
+        # Its producer at the registers its tile states, as its kernel lowers it: a derived tile's its
+        # ladder's first rung (`producers.started`), a pin's as pinned.
         return resources.Launch(scope, roles, self.registers(ba, config), most=most,
-                                producer=producers.started(self, ba, config).producers.of(self.KERNEL))
+                                producer=config.producers.of(self.KERNEL))
 
     def rewritten(self, ba, family: mosaic.Family) -> bool:
         """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`): its
@@ -1677,7 +1677,7 @@ class MosaicTgmm(_Mosaic):
             rhs_dtype=ba.arguments['cotangent'].dtype, prologue_axes=ba.arguments['hooks'].prologue_axes,
             prologue_dtypes=tuple(side.dtype for side in ba.arguments['prologue_operands']),
             out_dtype=ba.arguments['out_dtype'], k_major=self.K_MAJOR, step_scaled=self.K_MAJOR,
-            unstaged=self.unstaged(ba),
+            unstaged=self.unstaged(ba), interpret=bool(ba.arguments['interpret']),
             gathered=tuple(table is not None for table in ba.arguments.get('gather') or (None, None)))
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
