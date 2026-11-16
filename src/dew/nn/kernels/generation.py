@@ -560,14 +560,17 @@ class GpuTarget:
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
     (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
     step_seconds: float | None = None
-    """One dependent step's latency on XLA's path: an iteration of a loop XLA lowers, its launches and its
-    predicate, each reading the last (the work-span model's step, `templates.cost.Work.span`), measured per
-    GPU (FS-STEP-SECONDS1's receipts); None where none was, so a form's span there is priced by no time."""
+    """The least one step of a form's dependent chain costs on XLA's path (the work-span model's step,
+    `templates.cost.Work.span`), each step reading the last: the slope over its iterations of a loop XLA
+    lowers, measured per device (FS-STEP-SECONDS1's script). What bounds it is the device's: on a GPU each
+    iteration's launch, a one-element loop's launch and predicate; on a TPU, whose iterations launch nothing
+    (a one-element loop's slope zero within 1e-9 s), the step's body, the chunk's forward-substitution row (64
+    rows of 128 values). None where none was measured, so a form's span there is priced by no time."""
     kernel_step_seconds: float | None = None
     """One dependent step's latency within a kernel: a tile's 128-lane reduction broadcast into the next
     step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
-    measured per GPU as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None where
-    none was."""
+    measured per device as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None
+    where none was."""
 
     @property
     def architecture(self) -> Architecture:
@@ -856,12 +859,23 @@ TARGETS = {target.generation: target for target in (
     # 197e12 / 131072, derived from the peak, no stated clock. Its scoped VMEM and MXU rate are its family's
     # (`_TPUS`).
     GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, multiprocessors=1,
-              clock_hz=197e12 / 131072, memory_bandwidth=819e9),
+              clock_hz=197e12 / 131072, memory_bandwidth=819e9,
+              # A step of a form's chain on XLA's path, 1.77 us: the substitution row's slope over 64 to 1024
+              # iterations (FS-STEP-SECONDS1's script on a Colab v5e, colab7062's steps-v5e1, its two rounds
+              # 1.772 and 1.770, 1.8% from the line); its one-element loop's slopes +-1e-9 s, zero.
+              step_seconds=1.77e-6,
+              # In-kernel: a dependent lane reduction's 133.8 ns (its two rounds 133.78 and 133.70).
+              kernel_step_seconds=133.8e-9),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
     # One TensorCore a chip, of two 256 x 256 MXUs, 918 TF of bf16 and 1638 GB/s of HBM
     # (cloud.google.com/tpu/docs/v6e); the clock is 918e12 / 524288, derived from the peak as v5e's.
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}, multiprocessors=1,
-              clock_hz=918e12 / 524288, memory_bandwidth=1638e9),
+              clock_hz=918e12 / 524288, memory_bandwidth=1638e9,
+              # A step of a form's chain on XLA's path, 2.45 us: the substitution row's slope (colab7062's
+              # steps-v6e1, its two rounds 2.452 and 2.445); its one-element loop's slopes 6e-9 and 2e-10 s.
+              step_seconds=2.45e-6,
+              # In-kernel: a dependent lane reduction's 141.1 ns (its two rounds 141.12 and 141.07).
+              kernel_step_seconds=141.1e-9),
 )}
 
 
