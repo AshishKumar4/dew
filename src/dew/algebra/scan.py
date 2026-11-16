@@ -281,9 +281,14 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
     a write's gate) then meets the operand's cotangent inside the step, so a second derivative applies it
     before the step's products, never after them, which near float32's largest overflowed (row 5426)."""
     along, every = _walked_tokens(declaration, chunk)
+    # The chunk's shared operands (`every`: RWKV6's bonus) a copy a token, so their cotangents leave the
+    # scan a token each and are summed outside it, as fla sums them (chunk_rwkv6's du): closed over, the
+    # scan's reverse added them a token at a time in its carry, 1.67 times fla's error from float64.
+    count = next(iter(along.values())).shape[0]
+    along.update({name: jnp.broadcast_to(value, (count, *value.shape)) for name, value in every.items()})
 
     def token(h, step):
-        z, b, u, strength, c, q, r = _at_token(declaration, names, affine, {**step, **every})
+        z, b, u, strength, c, q, r = _at_token(declaration, names, affine, step)
         # A token that reads the state entering it (`Scan.reads`) reads it before its decay and its write: a
         # reset's zero, any other's whole, a decay that vanishes at this token erasing nothing it reads.
         entering = None
