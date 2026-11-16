@@ -110,8 +110,6 @@ def shifting(metadata):
 
 @dataclasses.dataclass(frozen=True)
 class Shifting:
-    ranged: object = Ranged()
-
     def __call__(self, row):
         return {{**row, "id": row["id"] + {by}}}
 """
@@ -460,6 +458,8 @@ class Keyed:
 
 @dataclasses.dataclass(frozen=True)
 class Shifting:
+    ranged: object = Ranged()
+
     def __call__(self, row):
         hooked, classhooked = Hooked(), ClassHooked()
         hooked.scaled = classhooked.scaled = 2
