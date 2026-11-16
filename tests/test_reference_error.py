@@ -2394,6 +2394,18 @@ def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
         null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
 
 
+def test_a_leaf_held_exactly_has_minus_infinity_for_its_log_mean_square_unwarned():
+    """Errors all zero, a leaf an arm holds exactly: the log of their mean square is -inf, selected, never a
+    log of zero computed, which NumPy warned of 233 times in one GPU models run (test_gpu_models)."""
+    import warnings
+
+    from dew.parity import log_mean_square
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert log_mean_square(np.zeros((3, 4))) == -np.inf
+
+
 def test_errors_whose_squares_float64_holds_as_zero_keep_their_ratio():
     """A float64 reference 1e-200 off a scalar truth and a Dew arm 1e-180 off it, over eight seeds: each
     squared error is below float64's least and read as one floor, so the two passed at ratio 1 where Dew is
