@@ -34,11 +34,15 @@ class InContextMemoryMixer(MixerBase):
                 "parent: its general path steps each document's weights from its own start")
 
     def wrapped_fork_refusal(self) -> str | None:
-        """Why the layer reads no forks under a wrapper of the model's products
-        (`MixerBase.wrapped_fork_refusal`): a quantized kernel or a rounded input takes the memory's heads
-        off its shared recurrence (`InContextMemory._route`), the one path of it that reads them."""
-        return ("a wrapper's products (a quantization's) take an in-context memory's heads off its shared "
-                "recurrence, the one path of it that reads forks")
+        """Why the layer reads no forks under a wrapper whose products are not linear
+        (`MixerBase.wrapped_fork_refusal`): a quantized kernel, a rounded input or an adapter's dropout
+        takes the memory's heads off its shared recurrence (`InContextMemory._route`), the one path of it
+        that reads them, wherever its sites reach the heads, which only the bound model's scopes tell
+        (`dew.quantization.Quantization.rule_for`); so the decoder lays its rows whole under any such
+        wrapper, a correct run that shares no prefix."""
+        return ("a wrapper whose products are not linear (a quantization's, an adapter's dropout in "
+                "training) may take an in-context memory's heads off its shared recurrence, the one path of "
+                "it that reads forks")
 
     def marks(self) -> tuple[str, ...]:
         """The residuals of every path the memory's configuration can take (`InContextMemory.residuals`):
