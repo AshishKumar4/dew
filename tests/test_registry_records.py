@@ -261,7 +261,8 @@ def test_a_users_decorated_model_builds_by_its_alias_from_a_config(tmp_path):
     """A user's model class named by `@dew.register(name)` as its module is imported builds by that alias
     from a config's record, as Dew's own models do (`ModelConfig`), and the record names it by its import
     path, which a process that never imported the user's module rebuilds (the owner, 2026-11-16: "if
-    decorators could also be a supported way, I would like it"; row 6151)."""
+    decorators could also be a supported way, I would like it"; row 6151), once it trusts the user's package
+    (`import_trusted`), as a record of any class outside Dew."""
     (tmp_path / "users_models.py").write_text(USER_MODELS)
     record = json.loads(_ran(tmp_path, """
 import json
@@ -276,9 +277,11 @@ print(json.dumps(to_record(config, ModelConfig)))
     rebuilt = _ran(tmp_path, f"""
 import json
 import sys
-from dew.registry import ModelConfig
+from dew.registry import ModelConfig, import_trusted
 assert "users_models" not in sys.modules
-model = ModelConfig.from_dict(json.loads({json.dumps(json.dumps(record))})).build()
+record = json.loads({json.dumps(json.dumps(record))})
+import_trusted(record, ("users_models",))
+model = ModelConfig.from_dict(record).build()
 print(type(model).__module__, type(model).__name__, model.features)
 """)
     assert rebuilt.split() == ["users_models", "UsersDense", "3"]

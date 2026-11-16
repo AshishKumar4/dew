@@ -89,7 +89,8 @@ kind, and then builds by that name from a config, a record or the command line a
 2026-11-16: "I want really good DX. if decorators could also be a supported way, I would like it."). The
 decorator refuses a name another class holds and a class not of the kind. It is one table with two ways
 in, not a second registry. A record names every class by its import path, a user's registered one too, so a
-saved record rebuilds in a process that has not imported the user's module
+saved record rebuilds in a process that has not imported the user's module once it trusts the module's
+package (`import_trusted`, a run's `--trust`), as any class outside Dew
 (tests/test_registry_records.py::test_a_users_decorated_model_builds_by_its_alias_from_a_config); only a
 run's own record names its run class by its alias in `runs`. A class is read by its alias or its path: the
 attribute view (`models.SimpleDiT`) of the original design was not built.

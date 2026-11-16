@@ -18,7 +18,8 @@ user's class joins it under a name of its own with a decorator,
 `@dew.register("my_model")` for a model (`register`) or a kind's own
 `@mixers.register("my_mixer")`, as its module is imported. A record still
 names the user's class by its path, so it loads without that module imported
-first. An unknown name or field raises an error.
+first where the process trusts its package (`import_trusted`), as any class
+outside Dew does. An unknown name or field raises an error.
 
 A run's model is one such record, `ModelConfig`: the model's class, the fields
 the run gives it, the defaults it took and the wrappers it was made in. A
@@ -308,7 +309,7 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         imported: `models.build("name", ...)`, a config's `{"class": "name"}` and the command line build it
         as they build Dew's own. The member must be of the kind (`base`), and the name no other member's; a
         record names the member by its import path still (`name_of`), so it loads in a process that has
-        not imported the member's module."""
+        not imported the member's module, once that process trusts its package (`import_trusted`)."""
         def registered(member: M) -> M:
             path = import_path(member)
             held = self._paths.get(name)
