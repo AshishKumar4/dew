@@ -943,15 +943,6 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         # A call no launch takes (a TPU's widths its blocks do not divide) runs XLA's program; a paired one no
         # launch takes whole its two products apart, each through the launches that take it (`_apart`).
         launch = grouped_matmul.launched(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
-        if launch is grouped_matmul.APART and joined is not None:
-            # Joined rows no launch takes whole: each product wide, through the launches that take it, summed
-            # and rounded once, as the launch sums them.
-            wide = (at_least_fp32(dtypes[0]),)
-            parts = [_gemm(rows, matrix, group_sizes, None, (), (), None, (), (), wide, several=False,
-                           transpose_rhs=transpose_rhs, interpret_on_cpu=interpret_on_cpu,
-                           precision=precision, dense=dense, first=first, summed_as=summed_as or dtypes)
-                     for rows, matrix in ((lhs, rhs), (joined, paired))]
-            return (jnp.asarray(parts[0]) + jnp.asarray(parts[1])).astype(dtypes[0])
         if launch is grouped_matmul.APART:
             return scattered(_apart(lhs if gather is None else lhs[gather], (rhs, paired), group_sizes,
                                      prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
@@ -973,16 +964,9 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter,
                  joined):
         config = XlaConfig(transpose_rhs, precision, dense=dense)
-        if joined is not None:
-            # The two products wide, summed and rounded once (`xla_mainloop`'s each).
-            wide = (at_least_fp32(dtypes[0]),)
-            parts = [xla_mainloop(config, rows, matrix, group_sizes, None, (), (), None, (), (), wide,
-                                  several=False, first=first)
-                     for rows, matrix in ((lhs, rhs), (joined, paired))]
-            return (jnp.asarray(parts[0]) + jnp.asarray(parts[1])).astype(dtypes[0])
         outs = xla_mainloop(config, lhs if gather is None else lhs[gather], rhs, group_sizes, prologue,
                             prologue_arrays, prologue_axes, epilogue, epilogue_arrays, epilogue_axes, dtypes,
-                            several, paired=paired, first=first)
+                            several, paired=paired, first=first, joined=joined)
         return scattered(outs, scatter)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
@@ -1400,7 +1384,7 @@ class XlaConfig:
 
 def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
                  epilogue_arrays, epilogue_axes, dtypes, several: bool, *, paired: jax.Array | None = None,
-                 first: jax.Array | None = None):
+                 first: jax.Array | None = None, joined: jax.Array | None = None):
     """The template's portable mainloop at `config` (docs/design/kernel-templates.md's `xla_mainloop`):
     `gemm`'s arithmetic in XLA, the kernels' products of `lhs`'s dtype summed in at least fp32 (an fp64
     product's in fp64, which no kernel takes), one rounding, a dense call's as XLA's own dot
@@ -1409,7 +1393,8 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
     (`xla_products.portable_projection`, whose sum, at least fp32, it reads); with `paired`, both matrices'
     products, the epilogue's two accumulators; with `first`, the groups' matrices of a stacked `rhs` from
     that one (`_grouped`), sliced out, as XLA's ragged dot reads a matrix a group, a pair's second stack's
-    alike."""
+    alike; with `joined` too, the paired matrix multiplies those rows, the two accumulators added once
+    (`mosaic_gpu.joined_sum`, the launch's own finish) where no epilogue is given."""
     transpose_rhs, precision, compute, dense = (config.transpose_rhs, config.precision, config.compute,
                                                 config.dense)
     if first is not None:
@@ -1419,21 +1404,24 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
         paired = None if paired is None else layer_of(paired)
     matrices = tuple(jnp.swapaxes(each, 1, 2) if transpose_rhs else each
                      for each in (rhs, *(() if paired is None else (paired,))))
+    rows = (lhs,) * len(matrices) if joined is None else (lhs, joined)
+    epilogue = mosaic_gpu.joined_sum if joined is not None else epilogue
     prologue_arrays = _rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
     epilogue_arrays = _rows(epilogue_arrays, epilogue_axes, group_sizes, lhs.shape[0])
     if compute is not None:
         # Summed and kept at least fp32 (an fp64 product's in fp64), the accumulator the epilogue reads.
         wide = at_least_fp32(compute)
-        accs = tuple(xla_products.portable_projection(lhs, matrix, group_sizes, compute, precision, wide)
-                     for matrix in matrices)
+        accs = tuple(xla_products.portable_projection(row, matrix, group_sizes, compute, precision, wide)
+                     for row, matrix in zip(rows, matrices, strict=True))
     else:
-        product = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
+        products = tuple(row if prologue is None else prologue(row, *prologue_arrays).astype(lhs.dtype)
+                         for row in rows)
         wide = at_least_fp32(lhs.dtype)
         accs = tuple(xla_products.xla_dot(product, each[0].astype(lhs.dtype), precision=precision,
                                             preferred_element_type=wide) if dense
                      else xla_products.xla_ragged_dot(product, each.astype(lhs.dtype), group_sizes,
                                                         precision=precision, preferred_element_type=wide)
-                     for each in matrices)
+                     for product, each in zip(products, matrices, strict=True))
     outs = accs if epilogue is None else _as_tuple(epilogue(*accs, *epilogue_arrays))
     outs = tuple(out.astype(dtype) for out, dtype in zip(outs, dtypes, strict=True))
     return outs if several else outs[0]

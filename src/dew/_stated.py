@@ -11,7 +11,6 @@ file, its slots) and refuse what answers nothing."""
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import hashlib
 import logging
@@ -23,6 +22,7 @@ from pathlib import Path
 import jax
 import numpy as np
 from jax.experimental.layout import Format, Layout
+from jaxlib import xla_client
 
 from dew import _hashing, _sources
 from dew._records import JSON
@@ -140,8 +140,7 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         module = _coded(value.__module__, at)
         return ["class", module, value.__qualname__]
     if isinstance(value, (tuple, list, set, frozenset, Mapping, functools.partial, types.MethodType)) or (
-            not isinstance(value, type) and (dataclasses.is_dataclass(value)
-                                             or "__attrs_attrs__" in vars(type(value)))):
+            _sources.generated_instance(value)):
         # A container met again within itself (a mapping one of whose values is that mapping, a registry
         # holding a function that reads it) is a reference back to where the path met it, as a function
         # met again is itself: finite, where walking it recursed past Python's limit and crashed the read
@@ -173,17 +172,19 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         module = _coded(value.__module__, at)
         return ["function", module, value.__qualname__, _code(value.__code__),
                 reads(value, at, known, walking)]
-    if dataclasses.is_dataclass(value):
+    if _sources.generated_instance(value):
+        # An instance of a class a generator made (a dataclass's, attrs', its validators' among them) by its
+        # fields: one unset (an attrs field with no init) is None.
         return ["record", again(type(value), at=at),
-                [[field.name, again(getattr(value, field.name, None), at=f"{at}.{field.name}")]
-                 for field in dataclasses.fields(value)]]
+                [[name, again(getattr(value, name, None), at=f"{at}.{name}")]
+                 for name in _sources.field_names(type(value))]]
     key = terms.parameter_key(value)
     if isinstance(key, tuple) and key[0] != "object":
         return ["native", _plain(key, at)]
     if (parts := _parts(value, at, again)) is not None:
         return parts
-    if (made := _attrs_made(value, at, again)) is not None:
-        return made
+    if (converted := _converter(value, at, again)) is not None:
+        return converted
     raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} has no form an "
                         "identity can state")
 
@@ -215,12 +216,23 @@ def _data(value, at: str) -> JSON | None:
     return None
 
 
+def _traceback(value) -> JSON | None:
+    """A traceback of JAX's by its frames, as a file of programs holds one
+    (`dew.training.ahead.HeldTraceback`): a checkified program's error tree holds each check's in its node
+    data, which prints by its address; None for any other value."""
+    if isinstance(value, xla_client.Traceback):
+        return ["traceback", [str(frame) for frame in value.frames]]
+    return None
+
+
 def _parts(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     """One of JAX's values that a call's key holds and the algebra's key does not state, by its parts
     (each through `again`, `stated` as its caller walks): a tree's structure, a format,
     one device's sharding, a device, and any other of JAX's by its attributes where it holds them plainly
-    (an axis environment's sizes and names), the layout XLA chooses (`Layout.AUTO`). None for a value that
-    is none of them."""
+    (an axis environment's sizes and names), the layout XLA chooses (`Layout.AUTO`), a traceback
+    (`_traceback`). None for a value that is none of them."""
+    if (frames := _traceback(value)) is not None:
+        return frames
     if isinstance(value, type(jax.tree.structure(()))):
         return _tree(value, at, again)
     if isinstance(value, Format):
@@ -312,40 +324,36 @@ def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, .
             if _sources.own_source(maker.__module__) else None)
     entry: list[JSON] = [_coded(held.__module__, at), held.__qualname__, _members(held, at, known, walking),
                          fields, made]
-    return entry
+    # How its generator made it where that departs from the generator's defaults (eq=False, order=True).
+    options = _sources.generation_options(held)
+    return [*entry, dict(options)] if options else entry
 
 
-def _attrs_made(value, at: str, again: Callable[..., JSON]) -> JSON | None:
-    """An instance of a class attrs made (its own validators, `attrs.validators.instance_of`'s and
-    `and_`'s among them) by its type and its fields' values, as a dataclass's record is, and an
-    `attrs.Converter` by its converter and how it is called; None for any other value, or where attrs is
-    not loaded (no such value exists then). Refused before, a step whose attrs class held a validator of
-    attrs' own was inexact (train 953's review)."""
+def _converter(value, at: str, again: Callable[..., JSON]) -> JSON | None:
+    """An `attrs.Converter` (attrs 24.1 and later) by its converter and how it is called, wherever the walk
+    meets one: a field's own, or one nested in `attrs.converters.pipe` or `optional`'s closure; None for any
+    other value. Unwrapped in a field's own slot alone, a nested one left its step inexact (train 957's
+    review)."""
     attr = sys.modules.get("attr")
-    if attr is None:
+    converter_type = None if attr is None else vars(attr).get("Converter")
+    if converter_type is None or not isinstance(value, converter_type):
         return None
-    if "__attrs_attrs__" in vars(type(value)):
-        return ["attrs", again(type(value), at=at),
-                [[field.name, again(getattr(value, field.name), at=f"{at}.{field.name}")]
-                 for field in vars(type(value))["__attrs_attrs__"]]]
-    if isinstance(value, attr.Converter):
-        return ["converter", again(value.converter, at=at), value.takes_self, value.takes_field]
-    return None
+    return ["converter", again(value.converter, at=f"{at}'s converter"), value.takes_self, value.takes_field]
 
 
 def _field(held: type, field: _sources.GeneratedField, at: str, known: Mapping[int, JSON],
            walking: tuple[int, ...]) -> JSON:
     """A generated field (`dew._sources.generated_fields`) as an identity states it: its name, default and
-    default factory, and the hooks attrs runs on its value where it has any (its converter, validator,
-    `on_setattr`, eq and order keys), each by its part's name. A field with no hooks, every dataclass's, is
-    stated as it was before them, so a position saved then holds (train 953's review)."""
+    default factory, and for an attrs field the rest of what attrs recorded of it
+    (`dew._sources.generated_fields`), each by its part's name. A dataclass's field is stated as it was before
+    them, so a position saved then holds (train 953's review)."""
     stated: list[JSON] = [field.name,
                           _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking),
                           _field_part(field.factory, f"{at} ({held.__name__}.{field.name} factory)", known,
                                       walking)]
-    if field.hooks:
+    if field.parts:
         stated.append({part: _stated(value, f"{at} ({held.__name__}.{field.name} {part})", known, walking)
-                       for part, value in field.hooks})
+                       for part, value in field.parts})
     return stated
 
 

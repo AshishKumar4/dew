@@ -30,11 +30,12 @@ This page is generated from the maintainers' findings ledger as each change land
 - Convolution repairs above their owner. [5665]
 - The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
 - The sm100 training backward runs Ampere's mma.sync two-launch backward at 32x32 tiles where the template holds a certified tcgen05 backward it does not route. [6918]
+- finished_merged's derivative as to a slice of zero total is 0 where the merge formula's is (o - out) e^(m - M) / W. [7124]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
 - Native TPU GEMM dispatch. [1560]
-- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 5895, 5988, 6008, 6010]
+- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 5895, 6008, 6010]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product (a float32 output), a legitimate…. [4860]
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5278, 5327]
 - Derived resources: tiles, registers, residency and issued work. [5567]
@@ -69,7 +70,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556, 5558]
+- Time to first step: the compile path's re-derivations. [5556]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5361]
 - XLA:CPU edges. [1591]
@@ -102,13 +103,12 @@ This page is generated from the maintainers' findings ledger as each change land
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
 - Tools/layout_parity.py:816-839 keeps a second accuracy policy. [793]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
-- Released checkpoints judged on GPUs. [1703, 1549]
+- Released checkpoints judged on GPUs. [1703]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - Saved runs carried across. [2791, 2792]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 - The saved data plan as recorded rules, one last version, and the resume modes. [6861]
-- The float64 terms walk (tests/float64_terms.py scanned_steps and its eager evaluation) runs a scanned model's float64 truth one eager step at a time on a GPU. [7096]
 
 ## Tutorials and docs
 

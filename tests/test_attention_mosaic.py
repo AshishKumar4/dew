@@ -13,7 +13,6 @@ import contextvars
 import dataclasses
 import functools
 import gc
-import os
 import weakref
 from collections.abc import Callable
 
@@ -1409,24 +1408,21 @@ def test_a_pin_the_mosaic_program_cannot_take_is_illegal():
                                          interpret=True)
 
 
-def test_a_backward_derived_again_under_deterministic_ops_takes_no_fused_launch(monkeypatch):
+def test_a_backward_derived_again_under_deterministic_ops_takes_no_fused_launch(request):
     """A Qwen3.5-4B-shaped causal backward (16 heads over 4, 128 wide, 4,096 tokens) on an H100, derived with
     XLA's deterministic ops off (its fused launch, one atomic dQ sum) and then, in the same process, on: the
-    second derivation is derived anew and takes no fused launch, whose atomic sums the flag refuses
-    (`MosaicBackward`'s legality), where the derivation's cache, keyed without the flag, held the first
-    (train 944 F1)."""
-    import lane_environment
-
-    flags = lane_environment.without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
-    monkeypatch.setenv("XLA_FLAGS", flags)
+    second derivation is derived anew and takes an ordered launch, not the fused one whose atomic sums the
+    flag refuses (`MosaicBackward`'s legality), where the derivation's cache, keyed without the flag, held
+    the first (train 944 F1)."""
+    request.getfixturevalue("without_deterministic_ops")
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _backward_call((1, 4096, 16, 4), 128, accurate=False)
         free = op.derived(ba, target)
-        monkeypatch.setenv("XLA_FLAGS", f"{flags} {lane_environment.DETERMINISTIC_OPS}".strip())
+        request.getfixturevalue("with_deterministic_ops")
         ordered = op.derived(ba, target)
     assert free is not None and free.fused, free
-    assert ordered is None or not ordered.fused, ordered
+    assert ordered is not None and not ordered.fused, ordered
 
 
 @INTERPRETS

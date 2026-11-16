@@ -1509,6 +1509,23 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert mosaic_failures([{**record, "kernels": [unbound]}])
 
 
+def test_a_kernel_no_ptx_covers_takes_its_binarys_figures_only_under_a_build_its_gpus_run(monkeypatch):
+    """A kernel whose module this process compiled before the gate, so no PTX of it was dumped, takes its
+    registers and spills from its executable's binary where this process's one CUDA build is a build the
+    generation's GPUs run (cuda12 for an H100), and keeps them unread for a B200, which runs cuda13 alone,
+    whose ptxas spills where cuda12's held and holds where it spilled (rows 5671, 5759, 5761)."""
+    import kernel_compile
+    from kernel_compile import inherited, reports
+
+    complete = "Resources(smem_scratch_bytes=1024, tmem_scratch_cols=0, tmem_collective_scratch_cols=0)"
+    (found,) = reports({"a": complete}, [report.Binary("a", None, 168, 0, shared=1024)])
+    monkeypatch.setattr(kernel_compile, "cuda_builds", lambda: ["cuda12"])
+    hopper, blackwell = (inherited(dataclasses.asdict(found), {}, generation)
+                         for generation in ("sm90", "sm100"))
+    assert (hopper["registers"], hopper["spilled"]) == (168, 0) and not hopper["unread"], hopper
+    assert blackwell["registers"] is None and {"registers", "spills"} <= set(blackwell["unread"]), blackwell
+
+
 def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
     """Evidence of one kernel's name and launch from two kernels is one kernel's at most: two modules
     (`report.kernel_modules`), two binaries (`reports`) or two PTX modules (`write_modules`) of one raise."""

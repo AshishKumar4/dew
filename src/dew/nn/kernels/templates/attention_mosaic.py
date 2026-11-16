@@ -372,7 +372,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def remaining(self, ba: tokamax.BoundArguments) -> Config | None:
         # Its derived config, none where it derives none; a call it refuses refused (`refusal`).
-        target = generation.gpu_target()
+        target = self.launch_target()
         family = self._bundle(target.generation, ba.arguments["query"].dtype)
         if family is not None and (reason := self.refusal(ba, family)):
             raise NotImplementedError(reason)

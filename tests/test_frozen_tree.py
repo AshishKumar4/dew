@@ -184,3 +184,58 @@ def test_a_source_on_one_device_starts_placed_on_the_mesh_as_it_starts_fresh():
         assert np.array_equal(np.asarray(mine), np.asarray(theirs))
     held = objective.held_variables()
     assert held is not None and not any(leaf.is_deleted() for leaf in jax.tree.leaves(held[FROZEN]))
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("devices", [1, 2], ids=["in place", "resharded"])
+def test_a_run_placing_its_held_tree_copies_it_by_transfer_and_compiles_no_copy_program(devices):
+    """A run placing the objective's held tree, held on one device, takes a copy of each held array the
+    state takes over, its own buffers, made by the transfer that places it, on one device or resharded
+    over two: a step that donates the state leaves the objective's arrays alive and as they were, where a
+    resharding transfer reused the source's buffer and the step freed it. In place, the placement compiles
+    the start's program alone, so a run handed its programs compiled ahead compiles nothing to place its
+    weights (row 4779: each held array's `copy()` compiled a program of its own, five here); resharded,
+    JAX's transfer compiles its own slicing of each array (row 7106)."""
+    from test_trainer import held_lm_trainer
+
+    from dew.telemetry.compiles import Compiles
+
+    trainer, objective, weights = held_lm_trainer()
+    trainer.device_mesh = MeshSpec(fsdp=devices).build(jax.devices()[:devices])
+    with Compiles(None) as compiles:
+        state, _, _ = trainer.place()
+    compiled = [program.name for program in compiles.programs if program.kind == "compiled"]
+    if devices == 1:
+        assert len(compiled) == 1, compiled
+    held = {leaf.unsafe_buffer_pointer() for leaf in jax.tree.leaves(objective.variables)}
+    assert not held & {shard.data.unsafe_buffer_pointer() for leaf in jax.tree.leaves(state.variables)
+                       for shard in leaf.addressable_shards}
+    batch = {"text": jnp.tile(jnp.arange(1, 6, dtype=jnp.int32)[None], (devices, 1))}
+    stepped, *_ = trainer.compile(state, batch)(state, batch)
+    jax.block_until_ready(stepped)
+    for kept, drawn in zip(jax.tree.leaves(objective.variables), jax.tree.leaves(weights), strict=True):
+        np.testing.assert_array_equal(np.asarray(kept), np.asarray(drawn))
+
+
+def test_an_eager_initial_state_of_a_held_tree_copies_it_by_transfer():
+    """A state the trainer builds eagerly from the objective's held tree (`Trainer.initial_state`, which a
+    caller makes before stepping one by hand) takes buffers of its own for the arrays it moves, made by the
+    transfer (`distributed.transferred_copy`), as a placed state's are: no copy program compiles, where each
+    held array's `copy()` compiled one (train 957's F4), and the state shares no buffer of the objective's
+    moving arrays. Its run keeps no EMA, whose first copy of the parameters is a program of its own."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.telemetry.compiles import Compiles
+
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1, mlp_features=16,
+                              max_seq_len=8)
+    weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
+    objective = LMObjective(model, seq_len=4, variables=weights, ema_decay=None)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0), mesh=MeshSpec())
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    with Compiles(None) as compiles:
+        state = trainer.initial_state()
+    compiled = [program.name for program in compiles.programs if program.kind == "compiled"]
+    assert "jit(copy)" not in compiled, compiled
+    held = {leaf.unsafe_buffer_pointer() for leaf in jax.tree.leaves(objective.variables["params"])}
+    assert not held & {leaf.unsafe_buffer_pointer() for leaf in jax.tree.leaves(state.variables["params"])}

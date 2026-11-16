@@ -38,6 +38,7 @@ from sharded import collective_axes
 
 from dew import _cache
 from dew._builds import generation_builds
+from dew._devices import cuda_builds
 from dew.nn.kernels import grouped_matmul
 from dew.nn.kernels.generation import assumed, capability, compile_only_gpus, gpu_target
 from dew.nn.kernels.lowered import kernel_calls, triton_kernels
@@ -562,7 +563,11 @@ def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     own reports dumped (`_dumped`): its name, the generation's shared-memory and tensor-memory limits
     (`GpuTarget.tmem_columns`, 0 where it has none), and each of its kernels' report (`mosaic_kernels`),
     or the error. In a process that compiled Mosaic kernels for another capability
-    (`_BINARY_CAPABILITY`) these are the records its process of its own gives (`compiled_apart`)."""
+    (`_BINARY_CAPABILITY`) these are the records its process of its own gives (`compiled_apart`), and so where
+    a module of its kernels was compiled in this process before the gate's, outside it, so that no PTX of
+    it was dumped (`_undumped`: an earlier test certified the same launch; Mosaic compiles a module once a
+    process): the test's own process, which compiles it first (train 957's red, the B200 gathered cells'
+    producer read as None)."""
     wanted = capability(generation)
     test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" ", 1)[0]
     call = _CALLS[test]
@@ -573,7 +578,14 @@ def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     found = _compiled_here(cases, generation)
     if apart_records.RECORDS in os.environ:
         apart_records.written(Path(os.environ[apart_records.RECORDS]), test, call, found)
+    elif _undumped(found):
+        return compiled_apart(wanted, test, call, alone=True)
     return found
+
+
+def _undumped(found: list[dict]) -> bool:
+    """Whether a kernel of `found`'s records has no PTX this process dumped (`_compiled_here`'s `dumped`)."""
+    return any(not kernel["dumped"] for record in found for kernel in record.get("kernels", ()))
 
 
 _CALLS: Counter[str] = Counter()
@@ -585,13 +597,17 @@ _APART: dict[tuple[int, int] | str, Path] = {}
 ran where that test states no capability of the gate's (`compiled_apart`)."""
 
 
-def compiled_apart(wanted: tuple[int, int], test: str, call: int) -> list[dict]:
+def compiled_apart(wanted: tuple[int, int], test: str, call: int, *, alone: bool = False) -> list[dict]:
     """The records of `test`'s `call`-th Mosaic GPU compile, for a capability other than the one this process
     compiles for, from a pytest process of its own: one a capability, the first test to ask it starting it
     with every test of the session whose cells state it (`_stated`), so a test of another capability costs
     no process of its own; a test it did not run (one that states no capability of the gate's) its own.
     Read only where the test passed there, as its records are written before its own checks and teardown
-    (row 1877)."""
+    (row 1877). With `alone`, the test's own process, which runs it and nothing before it."""
+    if alone:
+        if test not in _APART:
+            _APART[test] = _ran_apart([test])
+        return apart_records.read(_APART[test], test, call)
     if wanted not in _APART:
         _APART[wanted] = _ran_apart([test, *(item.nodeid for item in apart_records.SESSION
                                              if item.nodeid != test and _stated(item) == wanted)])
@@ -630,12 +646,13 @@ module: Mosaic compiles a module once a process, so a later case of the same mod
 (`inherited`)."""
 
 
-def inherited(kernel: dict, compiled: dict[str, dict]) -> dict:
+def inherited(kernel: dict, compiled: dict[str, dict], generation: str | None = None) -> dict:
     """`kernel`'s record (`mosaic_kernels`) with its registers and spills, their only source: as the GPU
     compiles its PTX, this compile's (`compiled`, by its name and launch, `report.launch_name`), which this
     process keeps by its module (`COMPILED`), or, where Mosaic compiled the same module before in this process
-    and so printed no PTX, that compile's. Its binary is this process's compile, which may not be the GPU's
-    (`RELOCATABLE`): a kernel neither covers keeps them unread."""
+    and so printed no PTX, that compile's. A kernel neither covers takes its executable's binary's where this
+    process's one CUDA build is a build `generation`'s GPUs run (`_assembles_for`), its assembler then theirs;
+    elsewhere it keeps them unread, another compiler's verdict no evidence of the GPU's."""
     name = report.launch_name(kernel["kernel"], kernel["launch"])
     if name in compiled:
         if kernel["module"] is not None:
@@ -643,14 +660,23 @@ def inherited(kernel: dict, compiled: dict[str, dict]) -> dict:
         return {**kernel, **compiled[name]}
     if kernel["module"] in COMPILED:
         return {**kernel, **COMPILED[kernel["module"]], "ptxas": "an earlier compile of its module"}
-    if kernel["binary_registers"] is not None:
-        # No PTX of it in this process (its module compiled before the gate's): this process's assembly, its
-        # executable's binary (`report.binaries`), as certification reads it.
+    if kernel["binary_registers"] is not None and generation is not None and _assembles_for(generation):
+        # No PTX of it in this process (its module compiled before the gate's): its executable's binary
+        # (`report.binaries`), as certification reads it, where this process's one CUDA build is a build the
+        # generation's GPUs run, so its assembler's verdict is one of theirs (train 956 F1: a B200 runs the
+        # cuda13 build alone, whose spills the cuda12 build's differ from, rows 5671, 5759, 5761).
         return {**kernel, "registers": kernel["binary_registers"], "spilled": kernel["binary_frame"],
                 "ptxas": "its executable's binary"}
     unread = [*kernel["unread"], *(field for field in ("registers", "spills")
                                    if field not in kernel["unread"])]
     return {**kernel, "registers": None, "spilled": None, "unread": unread}
+
+
+def _assembles_for(generation: str) -> bool:
+    """Whether this process's Mosaic GPU binaries are assembled by a build `generation`'s GPUs run: its one
+    CUDA build installed (`dew._devices.cuda_builds`) among theirs (`dew._builds.generation_builds`)."""
+    builds = cuda_builds()
+    return len(builds) == 1 and builds[0] in generation_builds(generation)
 
 
 PTX: dict[str, str] = {}
@@ -784,7 +810,7 @@ def _compiled_here(cases, generation: str) -> list[dict]:
                 and (launch := report.traced(kernel["launched"])) is not None
                 and (stated := launch.kernels.get(kernel["kernel"])) is not None}
             compiled = _compiled_reports(directory, generation)
-            record["kernels"] = [inherited(kernel, compiled) for kernel in kernels]
+            record["kernels"] = [inherited(kernel, compiled, generation) for kernel in kernels]
             printed = {path.stem: path.read_text() for path in Path(directory).glob("*.ptx")}
             for kernel in record["kernels"]:
                 name = report.launch_name(kernel["kernel"], kernel["launch"])
@@ -799,6 +825,8 @@ def _compiled_here(cases, generation: str) -> list[dict]:
                 # Its threads a block, as its PTX states (`.maxntid`); None likewise. A record compiled in a
                 # process of its own (`compiled_apart`) carries it where this process's `PTX` holds none.
                 kernel["threads"] = int(threads.group(1)) if (threads := THREADS.search(ptx)) else None
+                # Whether this process dumped its PTX: none where its module compiled before the gate's.
+                kernel["dumped"] = bool(ptx)
                 # The registers its launch runs a thread at, as its compile states them: its consumers' raise
                 # where it raises, else its threads' share of the multiprocessor's registers at the programs
                 # it is launched to hold (`resources.thread_share`); None where no PTX states its threads.

@@ -521,11 +521,10 @@ def test_a_decoder_of_no_compute_dtype_over_bfloat16_weights_decodes(kind, resid
     """A decoder of each kind that keeps a decode cache, computing in no dtype of its own over bfloat16
     weights, its stream summing in fp32 or not, decodes: each norm reads an fp32 stream in its weight's
     dtype (`RMSNorm.weight_dtype_reads`, mamba_ssm's Block), and Mamba-2's projection reads its scan in its
-    input's dtype (transformers' Mamba2Mixer, `dew.nn.linear.as_projected`), so every holder's cache
-    keeps what its forward writes, where
-    the attention kinds' keys and a short conv's history came in fp32 to a bfloat16 cache and were refused
-    by the leaf's name (row 6215). Falcon-H1's parallel mixer among them, its Mamba-2 branch beside its
-    attention."""
+    projections' dtype (transformers' Mamba2Mixer), so every holder's cache keeps what its forward
+    writes, where the attention kinds' keys and a short conv's history came in fp32 to a bfloat16 cache
+    and were refused by the leaf's name (row 6215). Falcon-H1's parallel mixer among them, its Mamba-2
+    branch beside its attention."""
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=32, residual_in_fp32=residual_in_fp32,
                  **overrides)
@@ -542,21 +541,14 @@ RECURRENT = ("gated_delta_net", "kimi_delta_attention", "lightning_attention", "
 """The registered recurrent kinds, each beside attention in a hybrid."""
 
 
-CONTINUUM = InContextMemory(network=MLPMemory(hidden=(16,)), heads=1, head_features=None, chunk=4,
-                            project_query=False, project_key=False, project_value=False, output=False,
-                            normalize=False, learning_rate=Gate(scale=0.01))
-"""A continuum-memory level's form (Nested Learning Sec 7.1, tests/memory_support.py's `cms`): its views the
-stream itself, unprojected, and no output projection, so its read is the layer's output."""
-
-
 @pytest.mark.parametrize("dtype", [None, jnp.float32])
 @pytest.mark.parametrize("kind", RECURRENT)
 def test_a_recurrent_layer_reads_its_scan_in_its_projections_dtype(kind, dtype):
     """A recurrent layer over float32 weights and bfloat16 activations, computing in float32 or in no dtype
     of its own (its projections then computing in the activations' and weights' promoted float32), reads
-    its scan back in its projections' float32, as its reference reads it in its query's dtype
-    (`dew.nn.linear.as_projected`): its output is what the same values given in float32 give, which a scan
-    read back in the activations' bfloat16 would not be (train 941 F1)."""
+    its scan back in its projections' float32, as its reference reads it in its query's dtype: its output
+    is what the same values given in float32 give, which a scan read back in the activations' bfloat16
+    would not be (train 941 F1)."""
     fields, _ = KIND_FIELDS.get(kind, ({}, {}))
     layer = mixers.build(kind, **fields).build(MixerContext(
         emb_features=32, num_heads=4, num_kv_heads=4, head_dim=8, max_seq_len=16, dtype=dtype))(name="mixer")
@@ -570,13 +562,15 @@ def test_a_recurrent_layer_reads_its_scan_in_its_projections_dtype(kind, dtype):
 
 
 def test_a_continuum_memory_reads_in_its_stated_dtype():
-    """A continuum memory, its views the stream itself and no output projection (`CONTINUUM`), computing in
-    float32 over bfloat16 activations, reads in its float32, its output what the same values in float32
-    give, in float32: an unprojected view computes in the layer's dtype (`dew.nn.linear.as_projected`)."""
-    layer = mixers.build("memory", memory=CONTINUUM).build(MixerContext(
-        emb_features=32, num_heads=1, num_kv_heads=1, head_dim=32, max_seq_len=16, dtype=jnp.float32))(
-        name="mixer")
-    x = jax.random.normal(jax.random.key(0), (1, 8, 32), jnp.bfloat16)
+    """A continuum memory (tests/memory_support.py's `cms`: its views the stream itself, no output
+    projection), computing in float32 over bfloat16 activations, reads in its float32, its output what the
+    same values in float32 give, in float32: an unprojected view computes in the layer's dtype."""
+    from memory_support import WIDTH, layer as memory_layer
+
+    layer = mixers.build("memory", memory=memory_layer("cms")).build(MixerContext(
+        emb_features=WIDTH, num_heads=1, num_kv_heads=1, head_dim=WIDTH, max_seq_len=16,
+        dtype=jnp.float32))(name="mixer")
+    x = jax.random.normal(jax.random.key(0), (1, 8, WIDTH), jnp.bfloat16)
     variables = layer.init(jax.random.key(1), x)
     out = layer.apply(variables, x)
     assert out.dtype == jnp.float32
@@ -587,9 +581,9 @@ def test_a_continuum_memory_reads_in_its_stated_dtype():
 def test_a_hybrid_of_no_compute_dtype_over_bfloat16_weights_decodes(kind):
     """A hybrid of a recurrent kind beside full attention, computing in no dtype of its own over bfloat16
     weights, decodes: the stream stays the weights' dtype, each recurrent layer's scan output read back
-    in its input's dtype where its reference casts it (`dew.nn.linear.as_projected`), so the attention
-    layer's keys come to its cache in the dtype the cache states, where a gated delta net's, Kimi's or
-    lightning's fp32 scan widened the stream and the keys were refused by the leaf's name (row 6935)."""
+    in its projections' dtype where its reference casts it, so the attention layer's keys come to its
+    cache in the dtype the cache states, where a gated delta net's, Kimi's or lightning's fp32 scan
+    widened the stream and the keys were refused by the leaf's name (row 6935)."""
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
     model = tiny(max_seq_len=32, num_layers=2, layer_types=("recurrent", "full_attention"),
                  kinds={"recurrent": {"mixer": {"class": kind, "fields": fields}}},

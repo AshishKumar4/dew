@@ -1,5 +1,6 @@
 """Fusion search (docs/design/algebra.md §2 "Fusion"): a program's products fused with their elementwise
-consumers into the GEMM template's epilogue, where the template takes them and fusing is the cheaper.
+producers and consumers into the GEMM template's prologue and epilogue, where the template takes them and
+fusing is the cheaper.
 
 The compile-time pass (`program._rewritten`) hands each body here after its algebra: the compile point at
 which a plain JAX program gets the template (row 3450). Each matrix product of the body the template takes
@@ -8,6 +9,12 @@ which a plain JAX program gets the template (row 3450). Each matrix product of t
 equations that follow it, up to the first equation outside them that reads one of their values, with the
 broadcasts only they read of their captured operands (a bias's), are one region (`_regions`), a product
 alone among them: its inputs the values it reads from before it, its outputs the values read after it. A
+product whose left operand is its rows (x @ W, dy @ Wᵀ, a group's rows) takes as its prologue the elementwise
+equations of the operand's shape that make it, back to a value of another shape or another kind (an RMSNorm's
+row statistic, a reduction, stays outside, a captured input; its normalization, x · inv · scale and its cast,
+the prologue), with the broadcasts only they read: replayed in the region, and removed from the program where
+nothing else reads them (q, k and v projections of one normalized row each replay it, and the row it made
+then goes unread). A
 region is substituted where its launch is the template's, its selector's choice (`grouped_matmul.DECLARED`,
 or a call's, `generation.chosen`), and where it has an epilogue, where the template takes it and its price
 says fused wins (`_takes`): its equations replaced by one nested program of `fused_gemm.fused` over the
@@ -61,14 +68,23 @@ recently weighed dropped past them: a model's distinct projections, each shape o
 
 
 class Region(NamedTuple):
-    """A product and its elementwise consumers in a body (`_regions`): their equations' places in the body,
-    in order, the values they read from before them (`inputs`), the values read after them (`outputs`), and
+    """A product, the elementwise equations making its rows (its prologue) and its elementwise consumers in
+    a body (`_regions`): the places of the equations the fused region replaces (`places`, in the body's
+    order: its prologue's equations nothing outside it reads, the product, its consumers), those of its
+    prologue (`prologue`, each replayed in the region, the ones something else reads kept in the program
+    too), the values they read from before them (`inputs`), the values read after them (`outputs`), and
     the place of the first equation after them that reads one (where the fused region is written)."""
 
     places: tuple[int, ...]
     inputs: tuple[jcore.Var, ...]
     outputs: tuple[jcore.Var, ...]
     at: int
+    prologue: tuple[int, ...] = ()
+
+    @property
+    def replayed(self) -> tuple[int, ...]:
+        """The places the fused region computes, in the body's order: its prologue's and its own."""
+        return tuple(sorted({*self.prologue, *self.places}))
 
 
 def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
@@ -85,7 +101,8 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
                   if not held & set(region.places)}
     products = [region for region, identity in identities.items()
                 if _decided(identity, lambda region=region: _takes(fused_gemm, jaxpr, region))]
-    held |= {place for region in products for place in region.places}
+    # A norm a product's prologue replays is the product's (`_prologue`), as an epilogue's norm is.
+    held |= {place for region in products for place in region.replayed}
     written = attention + recognize.recognized(jaxpr, index, recognize.NORMS, frozenset(held))
     if not products and not written:
         return jaxpr
@@ -202,17 +219,56 @@ def _follows(operand: tuple[int, ...], shape: tuple[int, ...]) -> bool:
                            and all(axis in (1, extent) for axis, extent in zip(operand, shape, strict=True)))
 
 
+def _elementwise(equation: jcore.JaxprEqn, shape: tuple[int, ...]) -> bool:
+    """Whether `equation` computes each entry of a value of `shape` from the same entry of its operands, each
+    following its tiles (`_follows`): a member of a product's prologue or epilogue."""
+    return (entrywise(equation.primitive) and not equation.effects
+            and all(_shape(var) == shape for var in equation.outvars)
+            and all(_follows(_shape(var), shape) for var in equation.invars))
+
+
+def _prologue(index: Index, start: int, claimed: set[int]) -> tuple[int, ...]:
+    """The places of the product at `start`'s prologue (`_regions`): the elementwise equations of its left
+    operand's shape (`_elementwise`) that make it, walked back from it to a value of another shape or kind or
+    an equation another region holds (`claimed`), with the layout equations of their captured operands only
+    they read (`CAPTURED`: a row statistic broadcast over the depth, a scale over the rows); none for a
+    product whose left operand is not its rows (a kernel gradient's xᵀ @ dy)."""
+    jaxpr, producer = index.jaxpr, index.producer
+    equation = jaxpr.eqns[start]
+    form, lhs = _form(equation), equation.invars[0]
+    if form is None or form.transpose_lhs or not isinstance(lhs, jcore.Var):
+        return ()
+    shape, members, frontier = _shape(lhs), set(), [lhs]
+    while frontier:
+        place = producer.get(frontier.pop())
+        if place is None or place in members or place in claimed or not _elementwise(jaxpr.eqns[place],
+                                                                                      shape):
+            continue
+        members.add(place)
+        frontier.extend(var for var in jaxpr.eqns[place].invars if isinstance(var, jcore.Var))
+    for place in list(members):
+        for var in jaxpr.eqns[place].invars:
+            source = producer.get(var) if isinstance(var, jcore.Var) else None
+            if (source is not None and source not in members and source not in claimed
+                    and jaxpr.eqns[source].primitive in CAPTURED and index.readers[var] <= members
+                    and var not in index.escaping):
+                members.add(source)
+    return tuple(sorted(members))
+
+
 def _regions(index: Index) -> list[Region]:
-    """Each product of `jaxpr` (`_form`) and the elementwise equations after it that read its values, each of
-    the product's shape over operands that follow its tiles (`_follows`, `dew.nn.programs.entrywise`), up to
-    the first equation outside them that reads one of their values, with the layout equations of its captured
-    operands that no other equation reads (`CAPTURED`)."""
+    """Each product of `jaxpr` (`_form`), its prologue (`_prologue`) and the elementwise equations after it
+    that read its values, each of the product's shape over operands that follow its tiles (`_elementwise`),
+    up to the first equation outside them that reads one of their values, with the layout equations of its
+    captured operands that no other equation reads (`CAPTURED`). A prologue's equation nothing outside the
+    region reads is replaced with it (`Region.places`); one something else reads stays in the program too."""
     jaxpr, readers, escaping, producer = index.jaxpr, index.readers, index.escaping, index.producer
     found: list[Region] = []
     claimed: set[int] = set()
     for start, equation in enumerate(jaxpr.eqns):
         if _form(equation) is None or start in claimed:
             continue
+        prologue = _prologue(index, start, claimed)
         shape = _shape(equation.outvars[0])
         places, made, at = [start], set(equation.outvars), len(jaxpr.eqns)
         for place in range(start + 1, len(jaxpr.eqns)):
@@ -220,9 +276,7 @@ def _regions(index: Index) -> list[Region]:
             if not any(isinstance(var, jcore.Var) and var in made for var in later.invars):
                 continue
             # A product's epilogue takes each entry of its output from the same entry of its inputs.
-            if not (entrywise(later.primitive) and not later.effects and place not in claimed
-                    and all(_shape(var) == shape for var in later.outvars)
-                    and all(_follows(_shape(var), shape) for var in later.invars)):
+            if place in claimed or not _elementwise(later, shape):
                 at = place
                 break
             places.append(place)
@@ -242,11 +296,26 @@ def _regions(index: Index) -> list[Region]:
         read_after = {var for later in jaxpr.eqns[places[-1] + 1:] for var in later.invars
                       if isinstance(var, jcore.Var)} | escaping
         outputs = tuple(var for place in places for var in jaxpr.eqns[place].outvars if var in read_after)
-        inputs = tuple(dict.fromkeys(var for place in places for var in jaxpr.eqns[place].invars
+        computed = {*prologue, *places}
+        made.update(var for place in prologue for var in jaxpr.eqns[place].outvars)
+        inputs = tuple(dict.fromkeys(var for place in sorted(computed) for var in jaxpr.eqns[place].invars
                                      if isinstance(var, jcore.Var) and var not in made))
+        # A prologue's equation goes with the region where only the region reads it and nothing kept reads
+        # it; one something else reads stays, and every one of the prologue it reads with it.
+        kept = [place for place in prologue if any(not readers[var] <= computed or var in escaping
+                                                   for var in jaxpr.eqns[place].outvars)]
+        held = set(kept)
+        while kept:
+            for var in jaxpr.eqns[kept.pop()].invars:
+                source = producer.get(var) if isinstance(var, jcore.Var) else None
+                if source in prologue and source not in held:
+                    held.add(source)
+                    kept.append(source)
+        alone = [place for place in prologue if place not in held]
         if outputs:
-            found.append(Region(tuple(places), inputs, outputs, min(at, places[-1] + 1)))
-            claimed.update(places)
+            replaced = tuple(sorted({*places, *alone}))
+            found.append(Region(replaced, inputs, outputs, min(at, places[-1] + 1), prologue))
+            claimed.update(replaced)
     return found
 
 
@@ -259,7 +328,7 @@ def _replayed(jaxpr: jcore.Jaxpr, region: Region, fused_gemm):
         def read(atom):
             return atom.val if isinstance(atom, jcore.Literal) else values[atom]
 
-        for place in region.places:
+        for place in region.replayed:
             equation = jaxpr.eqns[place]
             operands = [read(atom) for atom in equation.invars]
             form = _form(equation)
@@ -321,7 +390,7 @@ def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
     from dew.algebra import program
 
     return program.structure(jcore.Jaxpr([], list(region.inputs), list(region.outputs),
-                                         [jaxpr.eqns[place] for place in region.places]))
+                                         [jaxpr.eqns[place] for place in region.replayed]))
 
 
 def _decided(identity: Hashable, decide: Callable[[], bool]) -> bool:

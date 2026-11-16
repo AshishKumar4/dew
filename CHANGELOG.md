@@ -7,6 +7,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- `dew.training.ahead.kept(path)` verifies by default: each handed call's own program is lowered and held to
+  the kept one's digest before the kept executable runs, so a kept program its call no longer lowers to is
+  refused (`NotTheKeptProgram`), never run; it still compiles nothing. `kept(path, verify=False)` is the
+  explicit opt-in that trusts the identity alone: a change it does not state (an installed distribution's
+  file edited in place, or a wheel rebuilt at the same version, which it states by its version) ran its
+  stale program by default.
+
 - A run refused before it takes its start, whose start program still compiles in its own thread, exits with
   its refusal's status once that compile ends: JAX's exit cleanup and the C runtime's exit tore XLA down under
   the running compile, and 12 of 48 such exits ended by a segmentation fault

@@ -992,18 +992,23 @@ def _add(**records: Iterable) -> None:
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
             kernels: frozenset[str] = frozenset()) -> bool:
-    """`refusal` and `miss` recorded; whether `miss` is new. A miss is recorded once: a launch's derivation
-    asked again (its route's eligibility, then its call, `tuning.KernelOp.taken`) reads its certification
-    back and finds the same misses."""
+    """`refusal` and `miss` recorded; whether `miss` is new to this context's registry. A miss is recorded
+    once a holder, the registry and each `recording` open: a launch's derivation asked again (its route's
+    eligibility, then its call, `tuning.KernelOp.taken`) reads its certification back and finds the same
+    misses, and a recording opened since the first (a later plan's admission, `planning.admitted`) holds
+    the misses its own trace meets, those the process met before among them."""
     registry = _registry()
     with _GUARD:
         if refusal is not None:
             registry.refused[refusal] = registry.refused.get(refusal, frozenset()) | kernels
             registry.by_launch.pop(refusal[0], None)
-        if miss is None or miss in registry.missed:
+        if miss is None:
             return False
-        _add(missed=(miss,))
-        return True
+        new = miss not in registry.missed
+        for held in (registry, *_RECORDING.get()):
+            if miss not in held.missed:
+                held.missed.append(miss)
+        return new
 
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
