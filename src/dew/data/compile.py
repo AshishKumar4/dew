@@ -115,6 +115,7 @@ from dew.data.pipeline import (
     FlatMap,
     HostStep,
     Interleave,
+    LaysOutWindows,
     Limit,
     Map,
     MapBatch,
@@ -1222,21 +1223,23 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
     laid: dict[str, bool] = {}
     unseen = False
 
-    def declare(pack: Pack, most: int | None) -> None:
+    def declare(pack: Pack, most: int | None, laid_out: bool = True) -> None:
         ids = pack.fields[0]
         fields[ids] = tuple(dict.fromkeys((*fields.get(ids, ()), *pack.fields)))
         bound = pack.seq_len if most is None else max(1, min(pack.seq_len, most))
         bounds[ids] = max(bounds.get(ids, 0), bound)
-        # A field's windows laid out by the read unless a pack of it says its objective lays them out.
-        laid[ids] = laid.get(ids, True) and pack.laid_out
+        # A field's windows laid out by the read unless a step over a pack's windows lays them out itself.
+        laid[ids] = laid.get(ids, True) and laid_out
 
     def walk(pipeline: Pipeline, *, packed: bool) -> None:
         nonlocal unseen
         for at, stage in enumerate(pipeline.stages):
             if isinstance(stage, Pack):
                 floor = _floor(pipeline, at, stage)
+                itself = any(isinstance(after, Map) and isinstance(after.step, LaysOutWindows)
+                             for after in pipeline.stages[at + 1:])
                 declare(stage, stage.segments if floor is None else min(
-                    stage.segments or stage.seq_len, max(1, stage.seq_len // floor)))
+                    stage.segments or stage.seq_len, max(1, stage.seq_len // floor)), not itself)
                 packed = True
         source = pipeline.source
         if isinstance(source, Combined):

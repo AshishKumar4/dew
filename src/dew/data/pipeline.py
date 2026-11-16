@@ -787,6 +787,16 @@ class BatchStage:
         return {**facts, "batch": self.size}
 
 
+@runtime_checkable
+class LaysOutWindows(Protocol):
+    """A step over each packed window (`ObjectiveData.packed`) that lays its documents out itself, as its
+    model reads them (a decision's rows, `dew.decision.rows.PackedRows`): the read then states the bound of
+    its windows' documents alone (`dew.data.steps.generic.Coordinated`). Stated by the step's class, so no
+    recorded plan changes."""
+
+    lays_out_windows: ClassVar[bool]
+
+
 @dataclasses.dataclass(frozen=True)
 class Pack:
     """Documents packed into windows of `seq_len` tokens along `fields`.
@@ -810,12 +820,6 @@ class Pack:
     segments: int | None = None
     along: tuple[tuple[str, int], ...] = ()
     overlap: int = 0
-    laid_out: bool = dataclasses.field(default=True, repr=False, metadata={ADDED: True})
-    """Whether a read lays each window's documents out as its model reads them, on the host
-    (`dew.data.steps.generic.Coordinated`, `Coordinates`); False where the objective's own packed steps lay
-    them out (a decision's rows, `dew.decision.rows.PackedRows`), the read stating their bound alone
-    (`dew.batch.SegmentBound`). Added since runs were saved, so a pack that lays them out records as it
-    did."""
 
     @property
     def packed(self) -> tuple[str, ...]:

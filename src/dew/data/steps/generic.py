@@ -72,12 +72,14 @@ class Coordinated(grain.MapTransform):
     None (static, so a compiled step is specialized to it). A window holding
     more than its read declared is refused, which a sequence kernel would run
     into its neighbours' sequences. `ids` is the packed ids field, the first
-    of `fields`. A read whose objective lays its windows out itself (`Pack.laid_out` false: a decision's
-    rows) states their bound alone (`dew.batch.SegmentBound`), as `<ids>_bound`."""
+    of `fields`. A read whose objective lays its windows out itself (`dew.data.pipeline.LaysOutWindows`: a
+    decision's rows) states their bound alone (`dew.batch.SegmentBound`), as `<ids>_bound`."""
 
     fields: tuple[str, ...]
     max_segments: int | None
-    laid_out: bool = True
+    # Derived from the chain's own steps (a step over its windows that lays them out), which its plan
+    # describes, so it is no part of the step's description: a recorded plan reads as it did.
+    laid_out: bool = dataclasses.field(default=True, repr=False)
 
     def map(self, element: Batch) -> Batch:
         from dew.batch import SegmentBound, coordinates
