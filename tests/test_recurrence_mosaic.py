@@ -1450,6 +1450,26 @@ def resource_failures(cases: list, found: list, plans: dict, apart: dict) -> lis
     return failed + apart_failures([record for record in found if record['name'] in apart], apart)
 
 
+def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
+    """A kernel's refusal keeps the roles its spill stood in (`report.Refused`): refusals of one config that
+    differ in them alone are two derivations' inputs (`report.derivation_inputs`), whose ladders step
+    apart (`Mosaic._consumers_spilled`), and a plan handing its refusals to another process
+    (`refused_launches` into `refuse`) states them again there (base review 60efbe75f F2: a cache key
+    without them stood for either)."""
+    bound = template.MOSAIC.bind(*resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256), None, bound=1.0)
+    tiles, kernel = mainloop.Tiles(32, 3, 128, 2, chunk=64), 'recurrence_output'
+    keys = []
+    for roles in ((report.CONSUMERS,), (report.PRODUCER,)):
+        with report.refusals(), generation.assumed('sm90'):
+            report.refuse_launch(template.MOSAIC, bound, tiles, {kernel}, {kernel: roles})
+            keys.append(report.derivation_inputs(template.MOSAIC, bound, template.Mosaic.launched()))
+            handed = report.refused_launches()
+        with report.refusals():
+            report.refuse(handed)
+            assert report.spilled_in(template.MOSAIC, bound, tiles) == {kernel: roles}
+    assert keys[0] != keys[1]
+
+
 def test_a_kernel_is_held_to_its_own_launchs_plan_where_another_launchs_name_begins_its_own():
     """`planned_failures` holds `recurrence_intra_solve` to its own launch's shared memory, not to the larger
     plan of `recurrence_intra`, whose name begins its own, and `recurrence_intra` to its own."""
