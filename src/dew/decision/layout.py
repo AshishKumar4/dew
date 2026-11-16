@@ -1362,9 +1362,11 @@ class SegmentLayout(Layout):
                       "form": "joint"})
 
     @property
-    def _joint_segments(self) -> "tuple[RowSegment, ...]":
-        """The joint row's segments: its own, `JOINT_SEGMENTS` where it states none."""
-        return JOINT_SEGMENTS if self.segments is None else self.segments
+    def _joint_segments(self) -> "tuple[Segment, ...]":
+        """The joint row's segments: its own, which its checks hold to the joint row's parts
+        (`JOINT_KINDS`, `_joint_post_init`), or `JOINT_SEGMENTS` where it states none."""
+        segments = JOINT_SEGMENTS if self.segments is None else self.segments
+        return tuple(segment for segment in segments if isinstance(segment, JOINT_KINDS))
 
     def _joint_post_init(self) -> None:
         """The joint row's own checks (`joint_row`): its question-row fields refused, its turn's segments and
@@ -1379,8 +1381,8 @@ class SegmentLayout(Layout):
             object.__setattr__(self, "framing", Framing())
         if self.max_state_tokens is not None:
             _least("max_state_tokens", self.max_state_tokens, 0)
-        kinds = [type(segment) for segment in self._joint_segments]
-        others = sorted({type(segment).__name__ for segment in self._joint_segments
+        kinds = [type(segment) for segment in (self.segments or ())]
+        others = sorted({type(segment).__name__ for segment in (self.segments or ())
                      if not isinstance(segment, JOINT_KINDS)})
         if others:
             raise ValueError(f"a joint row writes its questions in its schema and reads no cue, so it has no "
@@ -1390,10 +1392,10 @@ class SegmentLayout(Layout):
                              f"at most once each, not {[kind.__name__ for kind in kinds]}")
         if any(isinstance(segment, State) and (segment.render != "compact" or segment.turns is not None
                                                or segment.values != Values())
-               for segment in self._joint_segments):
+               for segment in (self.segments or ())):
             raise ValueError("a joint row writes its state as sorted compact JSON (State(render='compact')); "
                              "its turns and values are a question row's")
-        _streamed(self._joint_segments, self.reads)
+        _streamed((self.segments or ()), self.reads)
 
     def _joint_spans_in_context(self) -> bool:
         """Whether the row's schema is its context (`Schema.stream`), its spans the context's."""
@@ -1424,7 +1426,7 @@ class SegmentLayout(Layout):
         state_ids = tuple(self._joint_state(encoder, specials, state) if tokens is None else tokens)
         whole = len(state_ids)
         # The turn's markup and the text beside it are read as one piece each, as the turn writes them.
-        before, after = self.framing.around(encoder)
+        before, after = (self.framing or Framing()).around(encoder)
         parts: list[str | Segment] = [before, *self._joint_segments, after]
         laid_out: list[tuple[Segment | None, Chunk]] = []
         for part in parts:
