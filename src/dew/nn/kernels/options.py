@@ -41,8 +41,6 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from flax import linen as nn
 
-_log = logging.getLogger(__name__)
-
 
 class QuantizedDtypes(Protocol):
     """What the options read of a run's quantization (`dew.quantization.Quantization`, above the kernels):
