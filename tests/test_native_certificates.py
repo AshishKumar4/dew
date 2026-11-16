@@ -104,7 +104,7 @@ STEPS = {grouped_matmul.MosaicTgmm: ("block_k", True), grouped_matmul.Tgmm: ("bl
          grouped_matmul.Gmm: ("block_k", False)}
 """Each launch of exact sums: its tile's field that is its depth step's width, and whether its steps are
 the global blocks of that many rows a group's rows meet (Mosaic GPU's kernel gradient,
-`mosaic_gpu._group_blocks`) rather than runs from the contraction's first (Triton's: a kernel gradient's
+`row_tiles.group_blocks`) rather than runs from the contraction's first (Triton's: a kernel gradient's
 from its group's first row, `ragged_dot.tgmm`; a forward's from the first column, `ragged_dot.gmm`)."""
 
 

@@ -48,14 +48,14 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax
 from jax import lax, numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import generation, tables, tuning
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     axes,
     bodies,
@@ -71,6 +71,7 @@ from dew.nn.kernels.templates import (
 )
 from dew.nn.kernels.templates.gemm import (
     packed as packing,
+    row_tiles,
     rows_extended,
     rows_padded,
     scattered,
@@ -78,6 +79,7 @@ from dew.nn.kernels.templates.gemm import (
     sides_padded,
 )
 from dew.nn.kernels.templates.gemm.pricing import balanced_tail, family_of, fixes_up, tile_columns, tile_rows
+from dew.nn.kernels.templates.gemm.row_tiles import TMA_ROWS
 from dew.nn.kernels.templates.product import SCALE_DEPTH, block_format
 
 GMM = "dew_gmm"
@@ -393,104 +395,6 @@ def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, pr
                  programs=programs)
 
 
-class TileGroup(NamedTuple):
-    """Dew: a row tile's entry in a grouped call's tile table (`_grouped_table`, `tables.packed`): its group
-    (the lengths' index), the tile's first row, its group's first and past-last row, and the matrix it
-    multiplies (its group's, the unrouted rows' the last's, or a stack's from `first`); a tile no group
-    reaches, zeros. Its one declaration, which the table's writer and its reader (`GroupInfo.create`) take
-    their columns from."""
-
-    group: tables.Column
-    block_start: tables.Column
-    group_start: tables.Column
-    group_end: tables.Column
-    matrix: tables.Column
-
-
-@dataclasses.dataclass(frozen=True)
-class GroupInfo:
-    """Information regarding the group being processed in a block."""
-
-    group_id: jax.Array
-    block_start: jax.Array
-    actual_start: jax.Array
-    actual_end: jax.Array
-    start_within_block: jax.Array
-    actual_size: jax.Array
-    matrix: jax.Array
-    """Dew: the matrix the tile multiplies (`TileGroup.matrix`)."""
-
-    @classmethod
-    def create(cls, table, tile, tid, unit: int = 8):
-        """Dew: the group info of row tile `tid`, read from its call's tile table (`TileGroup`) rather than
-        walked over every group's length in each tile."""
-        tile = jnp.int32(tile)
-        entry = tables.unpacked(TileGroup, lambda column: table[tid, column])
-        # Mosaic's copies and stores read a slice's start as a multiple of the rows its tiling takes
-        # (`row_unit`).
-        block_start = pl.multiple_of(entry.block_start, unit)
-        actual_start = jnp.maximum(entry.group_start, block_start)
-        actual_end = jnp.minimum(entry.group_end, block_start + tile)
-        start_within_block = actual_start - block_start
-        actual_size = actual_end - actual_start
-        return cls(group_id=entry.group, block_start=block_start, actual_start=actual_start,
-                   actual_end=actual_end, start_within_block=start_within_block, actual_size=actual_size,
-                   matrix=entry.matrix)
-
-    @classmethod
-    def dense(cls, tile: int, tid, rows: int):
-        """A dense row tile's bounds, with a final tile clipped to the padded operand's rows."""
-        start = pl.multiple_of(tid * tile, TMA_ROWS)
-        size = jnp.minimum(tile, rows - start)
-        return cls(group_id=jnp.int32(0), block_start=start, actual_start=start,
-                   actual_end=start + size, start_within_block=jnp.int32(0), actual_size=size,
-                   matrix=jnp.int32(0))
-
-
-def tile_groups(lengths: jax.Array, tile: int, tiles: int, unit: int = 8,
-                first: jax.Array | None = None) -> TileGroup:
-    """Dew: each row tile's group info for `GroupInfo.create`, in XLA before the launch (`TileGroup`, packed
-    by `_grouped_table`): of tiles `0` to `tiles`, the group (`lengths`' index), the tile's first row, its
-    group's first and past-last row, and its matrix (its group's, the last group's for the rows past the
-    routed ones `lengths` ends with, or from `first` a stack's); a tile no group reaches, zeros. A group's
-    tiles start at its first row (rounded down to the `unit` rows its family's copies start at, `row_unit`),
-    whole tiles after it, as CUTLASS's grouped GEMM tiles each group: a group of up to a tile's rows reads its
-    matrix once, where tiles on the product's own row grid read it once a tile the group touches (two for most
-    of Kimi Linear's 128-row experts at 128-row tiles). The tiles number at most `cdiv(rows, tile)` plus the
-    groups less one (a ceiling's sum exceeds the sum's ceiling by at most one a part). Upstream's
-    `GroupInfo.create` walked every group's length in every tile, unrolled: at 129 groups (Qwen3's 128
-    experts and the unrouted rows) two thirds of a down projection's instructions, and its global loads a
-    third of its stalls (NCU-full)."""
-    lengths = lengths.astype(jnp.int32)
-    ends = _prefix_sums(lengths)
-    starts = ends - lengths
-    rows = jnp.int32(tile)
-    first_rows = starts // unit * unit
-    counts = lax.div(ends - first_rows + rows - 1, rows) * (lengths > 0)
-    firsts = _prefix_sums(counts) - counts
-    tids = jnp.arange(tiles, dtype=jnp.int32)[:, None]
-    ours = (firsts[None] <= tids) & (tids < (firsts + counts)[None])
-    group = jnp.argmax(ours, axis=1).astype(jnp.int32)
-    found = jnp.any(ours, axis=1)
-    block_start = first_rows[group] + (tids[:, 0] - firsts[group]) * rows
-    matrix = jnp.minimum(group, lengths.shape[0] - 2) + (0 if first is None else first)
-    return TileGroup(*(jnp.where(found, column, 0)
-                       for column in (group, block_start, starts[group], ends[group], matrix)))
-
-
-def _prefix_sums(values: jax.Array) -> jax.Array:
-    """`values`' inclusive prefix sums, as one sum over a lower-triangular mask: a group count's square is
-    a few hundred thousand integers at most, which XLA fuses into the table's own kernels, where
-    `jnp.cumsum` lowers to reduce-window kernels of its own. The table so took 6.4 to 7.2 us against 18 to
-    20 at 129 and 257 groups, decode to training rows (row 3622, FS-3622-TABLE1-h100), the same table."""
-    count = values.shape[0]
-    held = jnp.arange(count)[None, :] <= jnp.arange(count)[:, None]
-    return jnp.sum(jnp.where(held, values[None, :], 0), axis=1, dtype=values.dtype)
-
-
-TMA_ROWS = 8
-"""The rows a TMA descriptor tiles by, to which `gmm` pads its rows and a group's first tile starts."""
-
 JOINED = 'joined'
 """The stream of a joined product's second rows (`gmm`'s `joined`), each step's block multiplied by the paired
 matrix's into the one accumulator."""
@@ -777,7 +681,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     lhs, gather, scatter, m, extent = walked_rows(lhs, gather, scatter)
     joined = None if joined is None else walked_rows(joined, None, None)[0]  # of `lhs`'s shape: its padding
     row_tile = tiles.block_m * tiles.cluster
-    table = None if dense else _grouped_table(group_sizes, m, row_tile, first, unit)
+    table = None if dense else row_tiles.grouped_table(group_sizes, m, row_tile, first, unit)
     per = 1
     if step_scales is not None:
         column_scales, per = _column_scales(step_scales[1], n, block_n)
@@ -1226,8 +1130,8 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
         start, gathered = split * share, None
         count = jnp.minimum(share, steps - start)
     mi, ni = tail_of.planar_snake(snaked, grid, 1, tiles.grid_block_n)
-    group = (GroupInfo.dense(tiles.block_m * pair, mi, m) if dense
-             else GroupInfo.create(table_gmem, tiles.block_m * pair, mi, unit))
+    group = (row_tiles.GroupInfo.dense(tiles.block_m * pair, mi, m) if dense
+             else row_tiles.GroupInfo.create(table_gmem, tiles.block_m * pair, mi, unit))
     # This multiprocessor's row tile of its pair, from its group's first: a multiple of the rows a TMA
     # descriptor tiles by, as Mosaic's layout inference reads a slice's start.
     row_start = pl.multiple_of(group.block_start + mosaic.cluster_index(pair) * tiles.block_m, unit)
@@ -1340,18 +1244,6 @@ def _gathered(gather, tiles: Tiles, dtype, interpret) -> dict:
 GATHERED_STREAMS = ('rows',)
 """The streams a gathered product's producer gathers (`gmm`'s `gather`): its rows'."""
 
-def _grouped_table(group_sizes: jax.Array, m: int, row_tile: int, first: jax.Array | None,
-                   unit: int = TMA_ROWS) -> jax.Array:
-    """A grouped call's tile table (`tile_groups`) over its `m` padded rows at `row_tile`-row tiles: its
-    groups', then the rows past the routed ones a last group, whose tiles store zeros."""
-    g = group_sizes.shape[0]
-    lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
-                               jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
-    # Each tile's matrix is its group's, of the stack from `first` where given (`TileGroup.matrix`): the
-    # group itself stays the call's, which its validity and its side operands read.
-    return tables.packed(tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g, unit, first))
-
-
 def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, dense: bool,
                  bounded: bool, unit: int = TMA_ROWS, least: int = 0) -> tuple:
     """Dew: `gmm`'s rows as its schedule walks them: `lhs`, or a gathered product's table (`gather`, a pad
@@ -1380,7 +1272,7 @@ def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, den
     row_tile = tiles.block_m * tiles.cluster
     tabled = gather is not None or scatter is not None
     extent = (m if bounded and not tabled else -(-m // row_tile) * row_tile if dense
-              else row_extent(m, row_tile, unit))
+              else row_tiles.row_extent(m, row_tile, unit))
     walked = rows_extended(walked, axis, extent)
     if scatter is not None:
         scatter = jnp.pad(scatter.astype(jnp.int32), (0, extent - scatter.shape[0]), constant_values=-1)
@@ -1889,7 +1781,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     accumulators in registers. A `dense` call (one group, every row) on a family that fixes up a tile
     across programs (`balanced`) runs its output tiles' last wave balanced over the programs; with no
     prologue, its stages are read as loaded (`rows_unstaged`), and so are the runs of its split (each a group
-    of whole steps from the call's first row, `_sliced`: `whole_steps`, which no other call states).
+    of whole steps from the call's first row, `sliced`: `whole_steps`, which no other call states).
     With `k_major`, `lhs` is `[depth, rows]` and `rhs` `[width, rows]`, the rows contiguous (an FP8
     product's operands, as Hopper's FP8 tensor cores read both), each group's rows whole steps of
     `tiles.block_k` (the caller's layout: no step straddles groups, so no stage is rewritten), with no
@@ -1956,7 +1848,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
         # interpreted slice clamps, and cp.async reads past it (a gathered operand's producer's too,
         # `gathered.Ring`), so their depth is padded (`ragged_rows`).
         lhs = rows_padded(lhs, 1, block_m)
-    group_starts, group_ends, group_num_blocks, group_block_starts = _group_blocks(group_sizes, block_k)
+    group_starts, group_ends, group_num_blocks, group_block_starts = row_tiles.group_blocks(group_sizes,
+                                                                                          block_k)
     # The groups walked longest first (`_segmented`), a group's tiles their steps (ties in their order).
     order = jnp.argsort(-group_num_blocks).astype(jnp.int32)
     # A tile summed across programs adds their exact partials by IEEE adds (`Family.fixed_up`), as a split's.
@@ -1984,7 +1877,7 @@ def _tgmm_split(lhs, rhs, group_sizes, shape: tuple, *, tiles: Tiles, out_dtype,
     which the exact-sum contract (`templates.product.promoted`) allows, where the tensor cores' truncating
     adds are what it rules out."""
     g, m, n = shape
-    sliced = _sliced(group_sizes, tiles.block_k, tiles.splits)
+    sliced = row_tiles.sliced(group_sizes, tiles.block_k, tiles.splits)
     # A side operand by group follows its group into each of its runs: its value repeated a run each, in
     # the runs' group-major order, so a run's group reads its own group's (`axes.at_group`, modulo the
     # side's groups, as a stacked layer's call numbers them).
@@ -2104,7 +1997,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     signalling a semaphore, which the first waits on and adds before storing the tile. Interpreted, one
     program walks every program's tiles in turn (the interpreter runs its programs one after another, each
     paying its own setup), a balanced tail's programs ordered so no semaphore is needed (`tail.ordered`).
-    `operands` are padded, then each one's gather table (or None); `groups` `_group_blocks`' (`tgmm`)."""
+    `operands` are padded, then each one's gather table (or None); `groups` `group_blocks`' (`tgmm`)."""
     lhs, rhs, tables = operands[0], operands[1], tuple(operands[2:])
     family = family_of(tiles, lhs.dtype)
     rewritten = rewrites(family, k_major, unstaged)
@@ -2474,34 +2367,3 @@ def _zero_neighbours_of(family: mosaic.Issuer, refs: list, step, start, end, ste
     pl.when(first)(lambda: zero(lambda rows: rows >= lax.rem(start, block_k)))
     pl.when(last)(lambda: zero(lambda rows: rows <= lax.rem(end - 1, block_k)))
     return first | last
-
-
-def _sliced(group_sizes: jax.Array, block_k: int, splits: int) -> jax.Array:
-    """Dew: each group's rows as `splits` consecutive runs (group-major, a run's size each): the group's
-    `block_k`-row blocks, from its first row's block, shared out in whole blocks as evenly as they divide, the
-    first run starting at the group's first row and the last ending at its last; a run of a group with
-    fewer blocks than runs is empty."""
-    starts, ends, blocks, block_starts = _group_blocks(group_sizes, block_k)
-    shares = jnp.arange(1, splits)[None, :] * blocks[:, None] // splits
-    inner = jnp.clip(block_starts[:, None] + shares * block_k, starts[:, None], ends[:, None])
-    bounds = jnp.concatenate([starts[:, None], inner, ends[:, None]], axis=1)
-    return jnp.diff(bounds, axis=1).reshape(-1).astype(jnp.int32)
-
-
-def _group_blocks(group_sizes: jax.Array, block_k: int) -> tuple:
-    """Each group's first row, end, count of `block_k`-row blocks, and its first block's first row, from the
-    groups' one prefix sum (`_prefix_sums`, as `tile_groups` reads them)."""
-    group_sizes = group_sizes.astype(jnp.int32)
-    group_ends = _prefix_sums(group_sizes)
-    group_starts = group_ends - group_sizes
-    group_block_starts = group_starts // block_k * block_k
-    group_block_ends = -(group_ends // -block_k) * block_k
-    return group_starts, group_ends, (group_block_ends - group_block_starts) // block_k, group_block_starts
-
-
-def row_extent(rows: int, row_tile: int, unit: int = TMA_ROWS) -> int:
-    """Dew: the rows `gmm`'s tile schedule reads of `rows` rows (a multiple of `unit`, `row_unit`) at tiles
-    of `row_tile` rows: a tile starts at most `unit` before the rows end (`tile_groups`) and reads
-    `row_tile` rows on."""
-    return rows + row_tile - unit
-

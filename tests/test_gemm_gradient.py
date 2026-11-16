@@ -92,7 +92,7 @@ def test_an_exact_kernel_gradients_depth_split_sums_its_partials_once(generation
 @INTERPRETS
 def test_a_split_kernel_gradient_reads_each_groups_side_operand_at_its_own_group():
     """A kernel gradient split in two (`Tiles.splits`), each group's rows two runs of their own groups
-    (`mosaic_gpu._sliced`), whose prologue scales each group's rows by its group's own vector (`('groups',
+    (`row_tiles.sliced`), whose prologue scales each group's rows by its group's own vector (`('groups',
     'depth')`, an expert's input scale): each run reads its own group's vector (it read the run's index
     modulo the groups, so a group's second run took the next group's), and over ones the gradient is each
     group's rows times its scale, 128 and 256, as unsplit."""

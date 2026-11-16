@@ -35,22 +35,15 @@ from typing import ClassVar, NamedTuple, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src.pallas.mosaic import core as tpu_core, lowering as mosaic_tpu_lowering
-from jax._src.pallas.mosaic_gpu import (
-    core as plgpu_core,  # the lowering's semantics (`_lowers`)
-    lowering as mosaic_gpu_lowering,
-)
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from ...algebra import bits
-from ..derivatives import marked_call_p
-from ..programs import equations
 from . import generation, selection, tuning
 from .generation import INHERENT
 from .templates import across, base, bundles, mosaic, report, resources, stores, swizzling
 from .templates.axes import held as held_axes
-from .templates.gemm import mosaic_gpu, packed, pricing, producers
-from .templates.gemm.hooks import NO_HOOKS, Hooks
+from .templates.gemm import mosaic_gpu, packed, pricing, producers, row_tiles
+from .templates.gemm.hooks import NO_HOOKS, Hooks, hook_lowers as hook_lowers, hooks_lower
 from .templates.product import SCALE_DEPTH, Product, eight
 
 
@@ -78,45 +71,6 @@ stages at the narrowest output tile."""
 EXACT_STEP = 64
 """The most of the contraction one step of a launch with `exact_sums` takes: the tensor cores truncate
 each add within a step's MMA chain, and exact sums promote only between steps."""
-
-
-def _lowers(hook, tiles: tuple, sides, rules) -> bool:
-    """Whether a Pallas lowering's `rules` hold a rule for every primitive of `hook` on its `tiles` and its
-    side tiles: Mosaic GPU's, at warpgroup semantics, have none for a transpose, which Triton's lowering
-    takes. A marked span (`derivatives.marked_call_p`) lowers as its body, whose primitives are read."""
-    if hook is None:
-        return True
-    return all(equation.primitive in rules or equation.primitive is marked_call_p
-               for equation in equations(jax.make_jaxpr(hook)(*tiles, *sides).jaxpr))
-
-
-def lowering_rules(target) -> dict:
-    """The rules a hook's operations need on `target`'s Mosaic launches: a TPU core's TensorCore rules; a
-    GPU's at warpgroup semantics."""
-    if generation.tpu(target):
-        return mosaic_tpu_lowering.lowering_rules[tpu_core.CoreType.TC]
-    return mosaic_gpu_lowering.mosaic_lowering_rules[plgpu_core.WGxWG_SEMANTICS]
-
-
-def hook_lowers(hook, tiles: tuple, target) -> bool:
-    """Whether `target`'s Mosaic launches take `hook` on `tiles` (`_lowers`, `lowering_rules`): a caller's
-    hook asked before it is bound to a launch (`dew.nn.gated_mlp`'s gated product)."""
-    return _lowers(hook, tiles, (), lowering_rules(target))
-
-
-def _hooks_lower(ba, dtype, rules) -> bool:
-    """Whether a lowering's `rules` take the launch's hooks (`_lowers`), traced on 128-wide tiles: the
-    primitives a hook makes do not depend on its tile's extents."""
-    hooks = ba.arguments['hooks']
-
-    def tiles(name, axes_of):
-        return [jax.ShapeDtypeStruct((128,) * len(axes), side.dtype)
-                for side, axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)]
-
-    return (_lowers(hooks.before(), (jax.ShapeDtypeStruct((128, 128), dtype),),
-                    tiles('prologue_operands', hooks.prologue_axes), rules)
-            and _lowers(hooks.after(), (jax.ShapeDtypeStruct((128, 128), jnp.float32),) * hooks.accumulators,
-                        tiles('epilogue_operands', hooks.epilogue_axes), rules))
 
 
 def _side_tile_bytes(operands, axes_of, extents: dict) -> int:
@@ -1090,9 +1044,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     @staticmethod
     def _hooks_lower(ba, dtype, target) -> bool:
-        """Whether the target's Mosaic lowering takes the launch's hooks (`_hooks_lower`, `lowering_rules`). A
-        side operand the launch squeezes comes back broadcast across its tile (`_unsqueezed`)."""
-        return _hooks_lower(ba, dtype, lowering_rules(target))
+        """Whether the target's Mosaic lowering takes the launch's hooks (`hooks.hooks_lower`). A side operand
+        the launch squeezes comes back broadcast across its tile (`_unsqueezed`)."""
+        return hooks_lower(ba, dtype, target)
 
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles, target) -> int:
         # The kernel's own allocations at `config` (`mosaic_gpu.Allocations`), counted as Mosaic's resource
@@ -1367,7 +1321,7 @@ class MosaicGmm(_Mosaic):
             tile, target, rows=rows, groups=ba.arguments['sizes'].shape[0], depth=depth, width=width,
             columns=None if swapped is None else swapped.arguments['kernel'].shape[1],
             # A decode step's partials hold its rows, a TMA descriptor's whole 8s of them.
-            held=-(-rows // mosaic_gpu.TMA_ROWS) * mosaic_gpu.TMA_ROWS,
+            held=-(-rows // row_tiles.TMA_ROWS) * row_tiles.TMA_ROWS,
             operands=self._operand_bytes(ba, tile), multiprocessors=_multiprocessors(target))
 
     def _operand_bytes(self, ba, tile: mosaic_gpu.Tiles) -> tuple[tuple[float, float], tuple]:
@@ -1699,7 +1653,7 @@ class MosaicTgmm(_Mosaic):
         # fewer of ("dimension 1 must have size smaller or a multiple of its tiling 64, but got 200", a
         # 200-deep kernel gradient on sm90 and sm120, the compile gate at c717a2439b4).
         if self._ragged(ba, family):
-            return math.lcm(mosaic_gpu.TMA_ROWS, swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES))
+            return math.lcm(row_tiles.TMA_ROWS, swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES))
         return family.role_rows
 
     def _padded_extents(self, ba) -> dict[str, int]:

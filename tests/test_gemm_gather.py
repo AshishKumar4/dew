@@ -15,7 +15,7 @@ from reference_error import assert_as_exact, equations
 
 from dew.nn.kernels import formats, gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates import product
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu, row_tiles
 
 SEEDS = 8
 """The gathered product's check-1 seeds, the template's grouped products' count."""
@@ -346,7 +346,7 @@ def test_a_blackwells_gathered_block_scaled_product_gathers_its_scales_by_its_ta
 
 def test_a_gathered_products_table_covers_every_tile_its_schedule_walks():
     """A gathered product's table, on a family whose loads past the rows are bounded (wgmma's TMA, compiled),
-    still extends to every row its schedule's tiles walk (`mosaic_gpu.row_extent`): the producer's threads
+    still extends to every row its schedule's tiles walk (`row_tiles.row_extent`): the producer's threads
     read a tile's entries by plain loads, which no TMA bounds; read past it, a GH200 faulted
     (CUDA_ERROR_ILLEGAL_ADDRESS, FS-4346-base-sm90)."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
@@ -354,7 +354,7 @@ def test_a_gathered_products_table_covers_every_tile_its_schedule_walks():
     tokens = jnp.zeros((200, 128), jnp.bfloat16)
     _, gathered, _, m, extent = mosaic_gpu._walked_rows(tokens, table, None, tiles, transpose_lhs=False,
                                                         dense=False, bounded=True)
-    assert gathered.shape[0] == extent == mosaic_gpu.row_extent(m, tiles.block_m) > m
+    assert gathered.shape[0] == extent == row_tiles.row_extent(m, tiles.block_m) > m
 
 
 def test_a_grouped_products_depth_split_sums_as_its_walk_apart():
