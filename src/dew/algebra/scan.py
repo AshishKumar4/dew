@@ -66,6 +66,10 @@ kernel's segment sums formed as a matmul against a 0/1 triangle stay finite (an 
 thousands of resets in a walk's sum stay far inside fp32's range, and the compensated prefix keeps each
 difference of two partials exact past them."""
 
+Reads = Literal["after", "before"]
+"""Where a scan's readout reads its state (`Scan.reads`): after its token's update, or the state entering it."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Scan:
     """A recurrence over its `walked` axis (time): `update(h, **token)` the state after one token,
@@ -91,7 +95,7 @@ class Scan:
     state: tuple[tuple[int, ...], jnp.dtype]
     reset: str | None = None
     ranges: Mapping[str, float | tuple[float, float]] = dataclasses.field(default_factory=dict)
-    reads: Literal["after", "before"] = "after"
+    reads: Reads = "after"
 
 
 def _traced(declaration: Scan, function: Callable, names: tuple[str, ...], chunk: Mapping):

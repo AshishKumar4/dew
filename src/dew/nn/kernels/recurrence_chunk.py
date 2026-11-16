@@ -36,7 +36,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.algebra import derive
 from dew.algebra.derive import FORMS_HELD
-from dew.algebra.scan import RESET_DECAY
+from dew.algebra.scan import RESET_DECAY, Reads
 from dew.batch import document_firsts
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed_at
@@ -557,7 +557,7 @@ def _chunked(named: dict, starts, chunk_size: int, work) -> dict:
 
 def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, firsts=None, *,
                  scale: float, delta: bool, dtype=None, bound: float | None = None,
-                 forked: Forked | None = None, reads: str = 'after', own=None):
+                 forked: Forked | None = None, reads: Reads = 'after', own=None):
     """The recurrence template's plain-JAX mainloop: the recurrence over `config.chunk`-token chunks by the
     forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
@@ -626,7 +626,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
 
 @functools.lru_cache(maxsize=FORMS_HELD)
 def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, columns: int, work: jnp.dtype,
-                 reset: bool, bound: float | None, reads: str = 'after', own: bool = False):
+                 reset: bool, bound: float | None, reads: Reads = 'after', own: bool = False):
     """The delta rule's (or a plain linear recurrence's, without `delta`) chunk forms (`scan.derive_scan`) for
     these facts, every one its declaration reads: the update `h = D h - beta k (k^T D h) + beta k v^T` (`D h
     + beta k v^T` without the delta rule) of a `[width, columns]` state in `work`, `D = exp(g)` a head's or
