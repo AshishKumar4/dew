@@ -299,7 +299,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
-                gathered: tuple[str, ...] = ()) -> dict:
+                gathered: tuple[str, ...] = (), joined: tuple[str, ...] = ()) -> dict:
+        del joined  # a pair a stream (`Family.streams`)
         # Each stream's ring of `STAGES` slots, whatever the stages asked: a DMA a step ahead hides a step's.
         del stages, swizzles
         if gathered:

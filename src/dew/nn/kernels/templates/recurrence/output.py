@@ -127,11 +127,15 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     # Accurate three-part products each take a fresh accumulator (`Issuer.apart`), the memory's output
     # beside the local product's sums: two stated, an unrounded fp32 write gate's output was admitted where
     # ptxas serialized its warpgroup MMAs (C7512, sm90; armada output-values-fresh-sums). Two parts issue
-    # into one accumulator (`Issuer.__call__`).
+    # into one accumulator a product (`Issuer.__call__`), each key block's memory product its own beside
+    # the local product's, all in flight at once (`algebra.chunk_output`): two stated, a 192-wide value
+    # head's output stated 248 registers where its three accumulators alone held 288 and ptxas serialized
+    # them (C7512, row 7151).
     fresh = (max(len(product.terms(given.parts, memories.parts)),
                  len(product.terms(held.parts, held.parts)))
              if family.products_overlap and max(given.parts, memories.parts, held.parts) > 2 else 1)
-    values = ([f32(chunk, bv)] * (1 + fresh if family.products_overlap else 1)
+    memory = call.width // call.block if fresh == 1 else 1
+    values = ([f32(chunk, bv)] * (memory + fresh if family.products_overlap else 1)
               + held_tile(held, chunk, bv))
     # The prologue's high and low prefixes as a row's vectors, read by the first step's scores and by every
     # value block's output (`algebra.chunk_output`'s decay), held across the walk: unstated, a 192-wide value

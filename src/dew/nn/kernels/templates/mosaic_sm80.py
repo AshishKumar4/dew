@@ -617,7 +617,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
-                gathered: tuple[str, ...] = ()):
+                gathered: tuple[str, ...] = (), joined: tuple[str, ...] = ()):
+        del joined  # a pair a stream (`Family.streams`)
         _one(consumers, clustered=bool(multicast))
         if gathered and set(gathered) != set(blocks):
             raise NotImplementedError("an A100's walk gathers every stream's rows or none")

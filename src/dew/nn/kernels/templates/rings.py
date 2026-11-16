@@ -6,7 +6,7 @@ of (`passed`), and a step's slots of them (`Slots`, `WholeSlots`; `Beside` its o
 them). The families and walks that compose them are `mosaic`'s."""
 
 import dataclasses
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 import jax
@@ -91,6 +91,43 @@ def viewed(view: tuple, block: tuple, step):
     return at(indices, block)
 
 
+def held_together(rings: dict) -> list[dict]:
+    """`rings` by the barrier pair they hold (`joined`'s rings one pair, every other ring its own), each group
+    its rings by their keys in `rings`' order: a step's slots of a group are loaded once their one slot is
+    free, awaited at its one load barrier and given back at its one release barrier, once each a step."""
+    groups: list[dict] = []
+    for key, ring in rings.items():
+        group = next((group for group in groups if _lead(group).full is ring.full), None)
+        if group is None:
+            groups.append({key: ring})
+        else:
+            group[key] = ring
+    return groups
+
+
+def _loaded(group: dict, turn_of: Callable, view_of: Callable) -> None:
+    """A group's step loaded (`held_together`): a ring holding its own pair by its own load (`Ring.load`, a
+    gathered ring's its own copies), a joined pair's slot freed once and each member copied into it."""
+    if len(group) == 1:
+        [(key, ring)] = group.items()
+        ring.load(turn_of(key, ring), view_of(key, ring))
+        return
+    key, lead = next(iter(group.items()))
+    lead.freed(turn_of(key, lead))
+    for key, ring in group.items():
+        ring.copied(turn_of(key, ring), view_of(key, ring))
+
+
+def _keyed(rings) -> dict:
+    """`rings` (a sequence) keyed by their places, as `held_together` groups them."""
+    return dict(enumerate(rings))
+
+
+def _lead(group: dict) -> "Ring":
+    """A group's first ring (`held_together`), which waits and arrives for every ring of it."""
+    return next(iter(group.values()))
+
+
 def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
     """A producer's loads of one persistent tile (`persistent.tiled`'s visit): each of its steps' blocks
     into its stream's ring at the step the rings are at (`counter`), none where it streams nothing."""
@@ -98,8 +135,9 @@ def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
 
     @pl.loop(0, jnp.where(active, steps, 0))
     def _(step):
-        for name, ring in rings.items():
-            ring.load(ring.turn(counter + step), ring.viewed(views[name], step))
+        for group in held_together(rings):
+            _loaded(group, lambda name, ring: ring.turn(counter + step),
+                    lambda name, ring: ring.viewed(views[name], step))
 
 
 def loaded_once(rings: dict, views: dict) -> None:
@@ -114,8 +152,9 @@ def streamed(rings: tuple, views, lo, hi) -> None:
     from its view of `views(step)`, then each ring drained."""
     @pl.loop(lo, hi)
     def _(index):
-        for ring, view in zip(rings, views(index), strict=True):
-            ring.load(ring.turn(index - lo), view)
+        given = dict(zip(_keyed(rings), views(index), strict=True))
+        for group in held_together(_keyed(rings)):
+            _loaded(group, lambda key, ring: ring.turn(index - lo), lambda key, ring: given[key])
 
     drain(rings, hi - lo)
 
@@ -126,9 +165,9 @@ def passed(rings: tuple, lo, hi, *, first: jax.Array | int = 0, between=None) ->
     barrier's next phase, so every consumer waits on every load; `between()` after each step."""
     @pl.loop(lo, hi)
     def _(index):
-        for ring in rings:
-            ring.acquire(ring.turn(index - first))
-            ring.release(ring.turn(index - first))
+        for group in held_together(_keyed(rings)):
+            _lead(group).acquire(_lead(group).turn(index - first))
+            _lead(group).release(_lead(group).turn(index - first))
         if between is not None:
             between()
 
@@ -241,12 +280,22 @@ class Ring:
         return viewed(view, self.block, step)
 
     def load(self, turn: Turn, view) -> None:
-        """The producer's load of `turn`'s step from `view`, once its slot is free: released by the last
-        rotation's step, whose parity is the other; `Pieces` each into its part of the slot's rows, one
-        arrival each at the slot's load barrier, which takes as many (`ring`'s `copies`)."""
+        """The producer's load of `turn`'s step from `view`, once its slot is free (`freed`, `copied`)."""
+        self.freed(turn)
+        self.copied(turn, view)
+
+    def freed(self, turn: Turn) -> None:
+        """The producer's wait for `turn`'s slot to be free: released by the last rotation's step, whose
+        parity is the other; none for a slot's first fill."""
         slot = opaque(turn.slot)
         pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
             self.consumed.at[slot], phase=turn.rotation - 1))
+
+    def copied(self, turn: Turn, view) -> None:
+        """`turn`'s step copied from `view` into its slot, freed (`freed`): `Pieces` each into its part of the
+        slot's rows, one arrival each at the slot's load barrier, which takes as many (`ring`'s `copies`, a
+        joined pair's every member's, `joined`)."""
+        slot = opaque(turn.slot)
         if not isinstance(view, Pieces):
             plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot],
                                     collective_axes=self.multicast)
@@ -275,6 +324,11 @@ class Ring:
                  physical.at[slot, (start + row) // swizzling.TILE_ROWS, column,
                              pl.ds((start + row) % swizzling.TILE_ROWS, 1)])
                 for row, column in cells[1]]
+
+    def slot(self, turn: Turn):
+        """`turn`'s slot, its load awaited by the step already (a ring of a joined pair whose first ring's
+        wait covers it, `Slots`)."""
+        return self.smem.at[opaque(turn.slot)]
 
     def acquire(self, turn: Turn):
         """A consumer's wait for `turn`'s load: its slot. Each load is waited for by each consumer, as every
@@ -319,7 +373,7 @@ def drain(rings: Iterable[Ring], end) -> None:
     """The producer's wait, after its last load (step `end - 1`), for the consumers' release of each slot of
     `rings` it filled last, so no slot is freed (or reallocated) while a consumer still reads it, and every
     release is seen: the rings of a depth drained together (`drained`)."""
-    rings = tuple(rings)
+    rings = tuple(_lead(group) for group in held_together(_keyed(rings)))
     for stages in sorted({ring.stages for ring in rings}):
         drained(tuple(ring.consumed for ring in rings if ring.stages == stages), end, stages)
 
@@ -359,6 +413,61 @@ def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: boo
         consumed = plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)
     return {'smem': swizzling.staged((stages, *block), dtype, swizzle),
             'full': plgpu.Barrier(num_arrivals=copies, num_barriers=stages), 'consumed': consumed}
+
+
+JOINED = "+"
+"""What joins a joined pair's stream names into its allocation's key (`joined`, `opened`), a name marked
+multicast (`MULTICAST`) where its loads are a cluster's."""
+
+MULTICAST = "*"
+
+
+def joined(members: dict[str, dict], multicast: tuple[str, ...] = ()) -> tuple[str, dict]:
+    """One barrier pair for the rings of `members` (each `ring`'s allocations, at one depth), CUTLASS's
+    PipelineTmaAsync for a GEMM's operands: their slots as they are, a load barrier each slot that every
+    member's copies of a step arrive at, its bytes theirs together, and a release barrier each slot that the
+    consumers arrive at once a step for all of them, a cluster's where any member is multicast (its slot is
+    free once every program's consumers released it, as a multicast ring's is, a stricter wait for a member
+    of its own). Its key (`JOINED`-joined names, each `multicast` one marked `MULTICAST`) and allocations,
+    which `opened` reads back as one `JoinedRing` a member, the pair shared. A step of the pair waits one
+    load barrier and arrives at one release barrier where its members each did (`held_together`)."""
+    stages = {int(allocated['smem'].shape[0]) for allocated in members.values()}
+    if len(stages) != 1:
+        raise ValueError(f"a joined pair's rings hold one depth, not {sorted(stages)}")
+    clustered = [allocated['consumed'] for name, allocated in members.items() if name in multicast]
+    consumed = clustered[0] if clustered else next(iter(members.values()))['consumed']
+    copies = sum(allocated['full'].num_arrivals for allocated in members.values())
+    key = JOINED.join(f"{name}{MULTICAST if name in multicast else ''}" for name in members)
+    return key, {'smem': {name: allocated['smem'] for name, allocated in members.items()},
+                 'full': plgpu.Barrier(num_arrivals=copies, num_barriers=stages.pop()), 'consumed': consumed}
+
+
+def opened_joined(key: str, scoped: dict) -> dict[str, "JoinedRing"]:
+    """A joined pair's rings (`joined`) by stream name, from its key and its allocations scoped."""
+    names = key.split(JOINED)
+    return {name.rstrip(MULTICAST): JoinedRing(scoped['smem'][name.rstrip(MULTICAST)], scoped['full'],
+                                               scoped['consumed'], axes=_axes(scoped['consumed'])
+                                               if name.endswith(MULTICAST) else None)
+            for name in names}
+
+
+def _axes(consumed) -> tuple | None:
+    """A cluster barrier's collective axes, None for a program's own."""
+    dtype = consumed.dtype
+    return dtype.collective_axes if isinstance(dtype, plgpu_core.ClusterBarrierType) else None
+
+
+@dataclasses.dataclass(frozen=True)
+class JoinedRing(Ring):
+    """A ring of a joined pair (`joined`): its own slots, the pair's barriers, multicast along `axes` alone
+    (its loads a cluster's where it is a multicast member, its program's own otherwise), whatever the
+    pair's release barrier."""
+
+    axes: tuple | None = None
+
+    @property
+    def multicast(self) -> tuple | None:
+        return self.axes
 
 
 class WholeSlots:
@@ -428,6 +537,8 @@ class Slots:
         self._rings, self._turn = rings, turn
         self._held: dict[str, Ref] = {}
         self._released: set[str] = set()
+        # Each stream's barrier pair's streams (`held_together`): one wait and one release a step for them.
+        self._together = {name: tuple(group) for group in held_together(rings) for name in group}
         self._ahead, self.more, self.first = ahead, more, first
 
     def __getitem__(self, name: str):
@@ -435,7 +546,9 @@ class Slots:
             raise ValueError(f"{name}'s slot is read a step ahead: the step before read it (`following`), or "
                              "the range's first step reads its own (`opened`)")
         if name not in self._held:
-            self._held[name] = self._rings[name].acquire(self._turn)
+            ring = self._rings[name]
+            awaited = any(other in self._held for other in self._together[name])
+            self._held[name] = ring.slot(self._turn) if awaited else ring.acquire(self._turn)
         return self._held[name]
 
     def opened(self, name: str):
@@ -454,8 +567,10 @@ class Slots:
         the step before where the walk reads it ahead)."""
         if name not in self._ahead:
             self[name]
-        self._rings[name].release(self._turn)
         self._released.add(name)
+        # A joined pair's slots given back once, by its last stream's release.
+        if all(other in self._released for other in self._together[name]):
+            self._rings[name].release(self._turn)
 
     def done(self) -> None:
         """Every slot the step has not given back given back, each acquired: each consumer waits on every load
@@ -484,6 +599,7 @@ class Slots:
 
 
 def released(rings: dict[str, Ring], turn: Turn) -> None:
-    """Every ring's slot of `turn` given back: a step's slots its walk held past it (`Slots.held`)."""
-    for ring in rings.values():
-        ring.release(turn)
+    """Every ring's slot of `turn` given back, once a barrier pair (`held_together`): a step's slots its walk
+    held past it (`Slots.held`)."""
+    for group in held_together(rings):
+        _lead(group).release(turn)

@@ -27,6 +27,7 @@ from reference_error import (
     assert_moves,
     assert_same_artifact,
     declared_seeds,
+    dew_path,
     distance,
     indexed_recording,
     input_digest,
@@ -2394,6 +2395,18 @@ def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
         null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
 
 
+def test_a_leaf_held_exactly_has_minus_infinity_for_its_log_mean_square_unwarned():
+    """Errors all zero, a leaf an arm holds exactly: the log of their mean square is -inf, selected, never a
+    log of zero computed, which NumPy warned of 233 times in one GPU models run (test_gpu_models)."""
+    import warnings
+
+    from dew.parity import log_mean_square
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert log_mean_square(np.zeros((3, 4))) == -np.inf
+
+
 def test_errors_whose_squares_float64_holds_as_zero_keep_their_ratio():
     """A float64 reference 1e-200 off a scalar truth and a Dew arm 1e-180 off it, over eight seeds: each
     squared error is below float64's least and read as one floor, so the two passed at ratio 1 where Dew is
@@ -2413,3 +2426,25 @@ def test_errors_whose_squares_float64_holds_as_zero_keep_their_ratio():
     assert raised.type is GateFailure
     assert_as_exact(off_by(1e-200), off_by(1e-200), draw, "as far below squares", seeds=8,
                     truth_fn=as_given(lambda x: {"y": x}))
+
+
+def test_one_of_dews_own_paths_as_the_reference_is_one_program_with_dews_arm():
+    """A reference declared one of Dew's own paths (`dew_path`), both arms one jitted function run as given
+    (a decision head's `decide`, packed against alone): the gate runs it under the rewrite as Dew's arm, so
+    the function is traced and compiled once for both, where an unrewritten reference traced it again under
+    the pass switched off."""
+    traced = []
+
+    @jax.jit
+    def decide(x):
+        traced.append(x.shape)
+        return jnp.tanh(x) * 2
+
+    def draw(seed):
+        return (np.random.default_rng(seed).standard_normal(8).astype(np.float32),)
+
+    assert_as_exact(as_given(lambda x: decide(x)), dew_path(as_given(lambda x: decide(x))), draw,
+                    "one function as both arms, a path of Dew's own", seeds=8,
+                    truth_fn=as_given(lambda x: np.tanh(np.asarray(x, np.float64)) * 2))
+    assert len(traced) == 1
+

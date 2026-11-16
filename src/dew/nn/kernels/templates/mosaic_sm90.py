@@ -6,6 +6,7 @@ accumulates in a warpgroup's registers in the WGMMA layout, and runs asynchronou
 
 import jax
 import jax.numpy as jnp
+from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -97,13 +98,17 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         plgpu.wgmma(acc, lhs, rhs)
         return acc
 
-    def products_unless(self, idle, acc, lhs, rhs):
-        # The warpgroup's accumulator its MMAs write in place: issued under a branch on `idle`, the group
-        # counted either way (`Issuer.settled` waits until at most so many are in flight, which fewer meet).
-        if bodies.interpreting():
-            return super().products_unless(idle, acc, lhs, rhs)
-        mosaic.committed()
-        pl.when(~idle)(lambda: plgpu.wgmma(acc, lhs, rhs))
+    def issued_unless(self, idle, acc, issue):
+        # The warpgroup's accumulator its MMAs write in place: issued under a branch on `idle`, its groups
+        # counted either way (`Issuer.settled` waits until at most so many are in flight, which fewer meet); a
+        # value (a running sum's, an interpreted walk's) by the issuer's own branch.
+        if not (isinstance(acc, state_types.TransformedRef)
+                or isinstance(jax.typeof(acc), state_types.AbstractRef)):
+            return super().issued_unless(idle, acc, issue)
+        @pl.when(~idle)
+        def _():
+            issue()  # into `acc` in place; its returned ref no branch's value
+
         return acc
 
     def read(self, acc, *, first: int = 0, columns: int | None = None, pending: int = 0) -> jax.Array:

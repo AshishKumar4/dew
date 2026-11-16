@@ -33,7 +33,7 @@ The properties checked in every reachable state of every interleaving, within th
   that barrier: no barrier runs past the completion a thread's next wait on it awaits (a parity wait's
   aliasing),
   and no thread arrives twice in one phase of a barrier (an early arrival counted toward a phase it does not
-  belong to);
+  belong to), but a producer's copies of one step, each arriving at its load barrier with its bytes;
 - with that, every execution synchronizes alike, so its happens-before order is one: every read of shared
   memory (a load's consumer's, a product's, a store's) happens after the write it reads has landed and
   before the next write to the location lands, and a store's source was fenced after its last generic
@@ -460,7 +460,10 @@ class _State:
 
     def arrive(self, at, arrivals, thread, trace, *, transaction: int = 0, count: bool = True) -> None:
         state = self.barrier(at, arrivals)
-        if count and thread in state.arrived:
+        # A load's arrival (its expected bytes, `transaction`) may come from one thread as many times as the
+        # barrier counts copies (`rings.ring`'s copies, a joined pair's members' every copy, `rings.joined`);
+        # any other arrival twice in a phase is an early one.
+        if count and not transaction and thread in state.arrived:
             raise Violation("early", f"thread {thread} arrives twice in phase {state.phases} of {at}", trace)
         pending = state.pending - int(count)
         transactions = state.transactions + transaction

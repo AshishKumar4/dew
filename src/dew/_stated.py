@@ -14,6 +14,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import logging
+import os
 import sys
 import types
 from collections.abc import Callable, Hashable, Mapping
@@ -217,11 +218,33 @@ def _data(value, at: str) -> JSON | None:
 
 
 def _traceback(value) -> JSON | None:
-    """A traceback of JAX's by its kind alone: a checkified program's error tree holds each check's in its
-    node data, which labels no leaf its executable takes or gives, and whose frames name the files where
-    the run is installed (a file of programs holds them, `dew.training.ahead.HeldTraceback`); None for any
-    other value."""
-    return ["traceback"] if isinstance(value, xla_client.Traceback) else None
+    """A traceback of JAX's by its frames (`traceback_frames`): a checkified program's error tree holds each
+    check's in its node data, which tells where a check that fails was; None for any other value."""
+    if not isinstance(value, xla_client.Traceback):
+        return None
+    frames: list[JSON] = list(traceback_frames(value))
+    return ["traceback", frames]
+
+
+def traceback_frames(traceback) -> list[str]:
+    """Each frame of a JAX `traceback` as its module, line and function (`dotted.module:12 (function)`), where
+    its code is wherever the run is installed: so two programs whose checks sit on other lines are two, and
+    one of the same code is one across installs. The one statement of a traceback, a program file's too
+    (`dew.training.ahead.HeldTraceback`)."""
+    return [f"{_frame_module(frame.file_name)}:{frame.line_num} ({frame.function_name})"
+            for frame in traceback.frames]
+
+
+def _frame_module(file: str) -> str:
+    """The module a frame's `file` is, by the longest import path entry it lies under (`a/b.py` under it is
+    `a.b`), else its file's name: no directory where the run is installed."""
+    real = os.path.realpath(file)
+    roots = [root for entry in sys.path if entry
+             and real.startswith(root := os.path.join(os.path.realpath(entry), ""))]
+    if not roots:
+        return os.path.basename(file)
+    relative = os.path.splitext(real[len(max(roots, key=len)):])[0]
+    return relative.replace(os.sep, ".").removesuffix(".__init__")
 
 
 def _parts(value, at: str, again: Callable[..., JSON]) -> JSON | None:
@@ -343,9 +366,10 @@ def _converter(value, at: str, again: Callable[..., JSON]) -> JSON | None:
 def _field(held: type, field: _sources.GeneratedField, at: str, known: Mapping[int, JSON],
            walking: tuple[int, ...]) -> JSON:
     """A generated field (`dew._sources.generated_fields`) as an identity states it: its name, default and
-    default factory, and for an attrs field the rest of what attrs recorded of it
-    (`dew._sources.generated_fields`), each by its part's name. A dataclass's field is stated as it was before
-    them, so a position saved then holds (train 953's review)."""
+    default factory, and the rest of what its generator recorded of it (`dew._sources.generated_fields`),
+    each by its part's name: an attrs field's every part, a dataclass field's flags where they depart from
+    `dataclasses.field`'s. A dataclass field of default flags is stated as it was before them, so a
+    position saved then holds (train 953's review)."""
     stated: list[JSON] = [field.name,
                           _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking),
                           _field_part(field.factory, f"{at} ({held.__name__}.{field.name} factory)", known,

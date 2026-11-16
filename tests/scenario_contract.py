@@ -50,11 +50,15 @@ def held_out_measures(objective, optimizer, loader_of: Callable[[int], object],
     (the runs a learning claim's gate asks for, `learning_gate.assert_learns`, trained as it asks): on the
     run's own held-out batch (`held_out_of(run)`), each run from its own initialization key and data
     (`loader_of(run)`), a Trainer of `trainer`'s options (a rollout's among them). The measure is
-    `measure(variables, held_out)`, the objective's loss read at `HELD_OUT` where None. A learning claim's
-    contrasts are formed of them, one a run, and judged by the learning gate
-    (`learning_gate.assert_learns`)."""
+    `measure(variables, held_out)`, the objective's loss read at `HELD_OUT` where None, one compiled program
+    for every run's reads (a released decoder's loss run eagerly dispatched each operation: 30 s its first
+    read and 4 s each later, against 5 s and 0.2 s compiled). A learning claim's contrasts are formed of
+    them, one a run, and judged by the learning gate (`learning_gate.assert_learns`)."""
+    held_out_loss = jax.jit(lambda variables, held_out: objective.scalar_loss(variables, held_out,
+                                                                              HELD_OUT)[0])
+
     def loss(variables: Mapping, held_out: Mapping) -> float:
-        return float(objective.scalar_loss(variables, held_out, HELD_OUT)[0])
+        return float(held_out_loss(variables, held_out))
 
     measured = loss if measure is None else measure
     before, after = [], []

@@ -56,6 +56,7 @@ from dew.nn.kernels.templates import (
 from dew.nn.kernels.templates.cost import Stated, Work
 from dew.nn.kernels.templates.rings import (
     CLUSTER,
+    JOINED,
     Ref,
     Ring,
     Slots,
@@ -64,6 +65,7 @@ from dew.nn.kernels.templates.rings import (
     drain,
     loaded_once,
     loads,
+    opened_joined,
     passed,
     released,
     streamed,
@@ -1221,13 +1223,15 @@ class Issuer[Accumulator](abc.ABC):
         unless `accumulate`, the accumulator started from zero (a walk's own fresh product, `read` once
         done)."""
 
-    def products_unless(self, idle: jax.Array, acc: Accumulator, lhs, rhs) -> Accumulator:
-        """`products`, none issued where `idle` (traced, one value across the issuing warpgroup): `acc` as it
-        was, a consumer whose share of a tile's rows lies outside its group multiplying nothing (row 5623: an
-        A100's grouped forward padded each ragged group to whole 128-row tiles, 14% more products than its
-        rows). A value accumulator's (mma.sync's, an interpreted walk's) by a branch on `idle`; an issuer
-        whose accumulator is a place its instructions write states its own (`WgmmaIssuer`)."""
-        return lax.cond(idle, lambda: acc, lambda: self.products(acc, lhs, rhs))
+    def issued_unless(self, idle: jax.Array, acc, issue: Callable):
+        """`issue()`'s accumulator, its products issued only where `idle` (traced, one value across the
+        issuing warpgroup) is false: `acc` as it was where true. A consumer whose share of a tile's rows lies
+        outside its group multiplies nothing (row 5623: a ragged group padded to whole tiles), whatever form
+        its products take, a stage's (`products`), a prologue's registers' (`register_products`) or an
+        exact sum's (`summed_apart`, row 7139). A value accumulator's (mma.sync's, a running sum's, an
+        interpreted walk's) by a branch on `idle`; an issuer whose accumulator is a place its instructions
+        write states its own (`WgmmaIssuer`). The walk's ring waits and releases are its own, outside it."""
+        return lax.cond(idle, lambda: acc, issue)
 
     def looped_products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True) -> Accumulator:
         """`products`, its instruction steps issued in a loop of their own where the issuer reads its
@@ -1633,13 +1637,17 @@ class Transport[Allocated, Opened](abc.ABC):
     @abc.abstractmethod
     def streams(self, blocks: dict, stages: int, consumers: int,
                 multicast: tuple[str, ...] = (), swizzles: dict[str, int] | None = None,
-                copies: dict[str, int] | None = None, gathered: tuple[str, ...] = ()) -> Allocated:
+                copies: dict[str, int] | None = None, gathered: tuple[str, ...] = (),
+                joined: tuple[str, ...] = ()) -> Allocated:
         """The scoped allocations of a stream of each `blocks[name]` `(shape, dtype)` in `stages` slots read
         by `consumers` (`opened` once scoped), each stream `multicast` names one the programs of a cluster
         share, loaded once between them (`kernel`'s `cluster`), each `swizzles` names staged at its swizzle
         (`swizzle_for`; inference's own otherwise), each `copies` names a step's tile loaded in that many
         copies (`Pieces`; one otherwise), each `gathered` names a step's tile whose rows a table gathers (a
-        family that gathers rows alone, `gathers_rows`)."""
+        family that gathers rows alone, `gathers_rows`), and the streams `joined` names one barrier pair
+        between them where a family's producer loads them by TMA a step at a time (`rings.joined`: sm90's);
+        a family loading otherwise (cp.async's, a TPU's DMAs, tcgen05's rings its products release) holds a
+        pair a stream."""
 
     @abc.abstractmethod
     def opened(self, allocated: Allocated, views: dict | None = None) -> Opened:
@@ -2194,14 +2202,22 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
-                gathered: tuple[str, ...] = ()) -> dict:
+                gathered: tuple[str, ...] = (), joined: tuple[str, ...] = ()) -> dict:
         from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on `Ring`
-        from dew.nn.kernels.templates.rings import ring
+        from dew.nn.kernels.templates.rings import joined as joined_rings, ring
 
-        return {name: gathered_rows.ring(shape, dtype, stages, consumers=consumers) if name in gathered
-                else ring(shape, dtype, stages, consumers=consumers, multicast=name in multicast,
-                          swizzle=(swizzles or {}).get(name), copies=(copies or {}).get(name, 1))
-                for name, (shape, dtype) in blocks.items()}
+        allocated = {name: gathered_rows.ring(shape, dtype, stages, consumers=consumers) if name in gathered
+                     else ring(shape, dtype, stages, consumers=consumers, multicast=name in multicast,
+                               swizzle=(swizzles or {}).get(name), copies=(copies or {}).get(name, 1))
+                     for name, (shape, dtype) in blocks.items()}
+        # The streams `joined` names, one barrier pair between them (`rings.joined`), in the place of its
+        # first: each step's loads of them awaited once and their slots given back once.
+        together = tuple(name for name in joined if name in allocated and name not in gathered)
+        if len(together) < 2:
+            return allocated
+        key, pair = joined_rings({name: allocated[name] for name in together}, multicast)
+        return {key if name == together[0] else name: pair if name == together[0] else value
+                for name, value in allocated.items() if name not in together[1:]}
 
     def opened(self, allocated: dict, views: dict | None = None) -> dict[str, Ring]:
         from dew.nn.kernels.templates import gathered  # it builds on `Ring`
@@ -2210,8 +2226,13 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         # A gathered stream's load barriers are shared memory of its own (`gathered.ring`), initialized here:
         # a program opens its rings once, every warpgroup before the roles split (`Ring.initialized`; its
         # gathered rings' users, a forward's `_launched` and `persist`, open them so).
-        rings = {name: (Ring if isinstance(scoped['full'].dtype, plgpu_core.BarrierType) else gathered.Ring)(
-                     **scoped) for name, scoped in allocated.items()}
+        rings = {}
+        for name, scoped in allocated.items():
+            if JOINED in name:
+                rings.update(opened_joined(name, scoped))
+            else:
+                plain = isinstance(scoped['full'].dtype, plgpu_core.BarrierType)
+                rings[name] = (Ring if plain else gathered.Ring)(**scoped)
         for ring_ in rings.values():
             ring_.initialized()
         return rings
