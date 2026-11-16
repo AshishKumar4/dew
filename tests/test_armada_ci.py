@@ -594,15 +594,15 @@ def test_the_scenario_suites_coverage_items_are_its_tasks_alone(ci, tmp_path):
     assert any("test_unit.py" in item for item in whole)
     items = ci.coverage_items(300.0, {}, scenarios=True)
     ran = sorted(name for item in items for name in re.search(r"--tests='([^']*)'", item)[1].split())
-    assert ran == sorted(ci.SCENARIO_SUITE)
+    assert ran == sorted(ci.coverage_report.SCENARIO_SUITE)
 
 
 def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):
-    """Branch tracing slows a task several times over: each coverage item runs by COVERAGE_DEADLINE,
-    not a CI task's."""
+    """Branch tracing slows a task several times over: each coverage item runs by the coverage pass's
+    DEADLINE, not a CI task's."""
     (tmp_path / "tests/test_one.py").write_text("def test_one(): pass\n")
     items = ci.coverage_items(300.0, {})
-    assert items and all(f"--deadline={ci.COVERAGE_DEADLINE:.0f}" in item for item in items)
+    assert items and all(f"--deadline={ci.coverage_report.DEADLINE:.0f}" in item for item in items)
 
 
 def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):

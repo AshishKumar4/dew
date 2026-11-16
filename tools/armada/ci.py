@@ -109,14 +109,15 @@ test cache off, since a reused row covers nothing, and writing its data among
 the task's artifacts; a traced task records nothing in the cache either.
 `report` combines the artifacts' data under DIR and writes DIR/coverage.json and
 DIR/coverage.md, a module a line, the least covered first. `items --scenarios` measures the
-scenario suite alone (`SCENARIO_SUITE`, docs/design/testing.md: a short run a cell of each scenario):
+scenario suite alone (coverage_report.py's `SCENARIO_SUITE`, docs/design/testing.md: a short run a cell
+of each scenario):
 
     armada map --commit=SHA --artifacts=DIR --items=ITEMS --timeout=6000 --secrets=DEW_XLA_CACHE_TOKEN \
         -- sh -c {item}
 
 A task reads the shared XLA cache as CI's do (--commit gives the checkout, its environments and the
-cache's URL), and has `COVERAGE_DEADLINE` and armada's timeout past it; a pass with a task cut short is
-refused (`report`), its coverage partial. A target well under CI's keeps tasks short.
+cache's URL), and has coverage_report.py's `DEADLINE` and armada's timeout past it; a pass with a task
+cut short is refused (`report`), its coverage partial. A target well under CI's keeps tasks short.
 """
 
 import argparse
@@ -2241,24 +2242,21 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     """The durations `record` with main's CI `verdict` (`armada verdict <sha> --json`) folded in, one test
     file at a time, each whole, as its floor Python's rows ran it. A file whose rows are all green and
     complete (its whole row, or every group of its cut) takes the times they observed where its record is
-    stale (`stale`), or where its tests together took more than `session.KEPT` times what its record sums or
-    less than that sum over it, by a quarter of `target` at least: the record is what the plan weighs each
-    task by and the slow list reads, and a record kept only because its cut still fits read a test of 15 s as
-    200 s (2026-11-16: test_moe_exchange.py's record summed 601 s against 213 s observed). A group's key holds
-    its tests, not their seconds (`cache_key`), and its cut stays as stored while its groups hold
-    (`session.stored_bounds`), so a refreshed file reruns only the groups whose tests move, and every group of
-    it where its group count changes (a file crossing the target runs whole, or cut, anew). A file with a red
-    or missing row keeps its entries, as does a file the verdict did not run, and one the checkout has changed
-    since the verdict's commit, whose rows observed tests it may no longer hold (2026-10-31: train 370's fold
-    replaced a head's 66 renamed test ids with main's old ones); a file the checkout no longer has loses them.
-    A file a task's deadline cut off, run whole, takes the times its row observed of the tests it finished
-    (all but the last, which the deadline stopped) where its record lacks them: no green run would ever time
-    it, and the plan cuts it by them, a test it never reached weighing their mean (2026-11-02: base/kernels'
-    test_algebra_laws, recorded nowhere, ran 46 of its ~70 tests and was cut off every run). A reused row (the
-    test cache) carries the times of the run that recorded it. Each train folds main's CI so (the land queue),
-    and nothing else writes the record. A site its file's marks shard (`sites`) keeps its entries: its judge's
-    row times its pooling, no measure of its draws, so its map tasks are weighed by armada's measures of them,
-    never by the record (`site_entries`), and a judge armada did not run is a row of its task's name."""
+    stale (`stale`, its total drifted among it). A group's key holds its tests, not their seconds
+    (`cache_key`), and its cut stays as stored while its groups hold (`session.stored_bounds`), so a refreshed
+    file reruns only the groups whose tests move, and every group of it where its group count changes. A file
+    with a red or missing row keeps its entries, as does a file the verdict did not run, and one the checkout
+    has changed since the verdict's commit, whose rows observed tests it may no longer hold (2026-10-31: train
+    370's fold replaced a head's 66 renamed test ids with main's old ones); a file the checkout no longer has
+    loses them. A file a task's deadline cut off, run whole, takes the times its row observed of the tests it
+    finished (all but the last, which the deadline stopped) where its record lacks them: no green run would
+    ever time it, and the plan cuts it by them, a test it never reached weighing their mean (2026-11-02:
+    base/kernels' test_algebra_laws, recorded nowhere, ran 46 of its ~70 tests and was cut off every run). A
+    reused row (the test cache) carries the times of the run that recorded it. Each train folds main's CI so
+    (the land queue), and nothing else writes the record. A site its file's marks shard (`sites`) keeps its
+    entries: its judge's row times its pooling, no measure of its draws, so its map tasks are weighed by
+    armada's measures of them, never by the record (`site_entries`), and a judge armada did not run is a row
+    of its task's name."""
     rows = verdict_rows(verdict)
     kept = {node: seconds for node, seconds in record.items() if Path(node.split("::")[0]).is_file()}
     for name, held in rows.items():
@@ -2278,12 +2276,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
         own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name
                and session.site_name(node, marked) not in marked}
         took = sum(row_["seconds"] for row_ in held)
-        # Drifted past the cut's own tolerance, and by a quarter of the target at least, so a second's noise
-        # in a light file rewrites nothing.
-        recorded_sum, ran_sum = sum(own.values()), sum(observed.values())
-        drifted = (max(recorded_sum, ran_sum) > session.KEPT * min(recorded_sum, ran_sum)
-                   and abs(recorded_sum - ran_sum) > target / 4)
-        if drifted or cuts.stale(session, own, observed, took, max(counts, default=1), target):
+        if cuts.stale(session, own, observed, took, max(counts, default=1), target):
             kept = {node: seconds for node, seconds in kept.items() if node not in own}
             kept.update({node: round(seconds, 3) for node, seconds in observed.items()})
     return dict(sorted(kept.items()))
@@ -2291,34 +2284,13 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
 
 ARTIFACTS = "/armada/task/artifacts"
 """Where an armada task's files are kept for `armada map --artifacts`."""
-COVERAGE_DEADLINE = 5400.0
-"""A coverage task's deadline. Branch tracing slows a task several times over, and a task cut short leaves
-its files' coverage partial, which `coverage_report.report` refuses."""
-
-
-SCENARIO_SUITE = ("tests/test_scenario_runs.py", "tests/test_decision_workflow.py")
-"""The scenario suite's files, as docs/design/testing.md names them: a short run a cell of each scenario its
-`SCENARIOS` registry holds, and the decision workflow's cells; `coverage items --scenarios` measures their
-per-module coverage (row 6118; train 878's review F2)."""
-
-
 def coverage_items(target: float, timings: dict, scenarios: bool = False) -> list[str]:
-    """The plan's tasks for the oldest Python, as armada map items: each runs its files under coverage.py
-    with the test cache off, its rows and data among its artifacts, by `COVERAGE_DEADLINE`. A check-1 site's
-    map tasks run its code over every seed; its judge, which pools their draws, has none to pool here. With
-    `scenarios`, the scenario suite's tasks alone (`SCENARIO_SUITE`), each running the suite's files it
-    held."""
+    """The coverage pass's armada map items (`coverage_report.items`): the plan's tasks for the oldest Python,
+    but its collections, and a check-1 site's judge, which pools its map tasks' draws and has none to pool
+    here."""
     entries = [entry for entry in plan(target, timings)
                if entry["python"] == PYTHONS[0] and entry["split"] != COLLECT and "after" not in entry]
-    if scenarios:
-        def held(entry: dict) -> list[str]:
-            tokens = entry["tests"].split()
-            return [name for name in SCENARIO_SUITE if any(token.startswith(name) for token in tokens)]
-
-        entries = [{**entry, "tests": " ".join(held(entry))} for entry in entries if held(entry)]
-    return [f"mkdir -p {ARTIFACTS} && python3 tools/armada/ci.py task --python={entry['python']} "
-            f"--tests='{entry['tests']}' --split='{entry['split']}' --out={ARTIFACTS}/rows.json --cache=off "
-            f"--deadline={COVERAGE_DEADLINE:.0f} --coverage={ARTIFACTS}" for entry in entries]
+    return coverage_report.items(entries, ARTIFACTS, scenarios)
 
 
 GANG = 4
