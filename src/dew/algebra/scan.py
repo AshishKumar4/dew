@@ -644,6 +644,9 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
     count = B.shape[0]
     between = decays.between[jnp.arange(1, count), jnp.arange(count - 1)]
     stepped = jnp.concatenate([decays.entering[:1], between])
+    # The state carried in the type its first step leaves it in: operands wider than it widen it (a float32
+    # state's walk over float64 operands, x64's).
+    h = h.astype(jnp.result_type(h, stepped, B, values, *((s, C) if corrected else ())))
 
     def step(h, token):
         decay, b, strength, c, q, r, value = token

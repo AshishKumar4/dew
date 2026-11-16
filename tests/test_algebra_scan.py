@@ -430,6 +430,19 @@ def test_a_long_chunks_token_loop_is_split_by_its_construction(target):
                         seeds=8)
 
 
+def test_a_token_loop_carries_its_state_in_its_operands_wider_type():
+    """A float32 state walked over float64 operands (x64's) by a token loop (a v5e's, `_looped_split`): its
+    outputs and the state it leaves are float64, the token scan's types, its carry widened once."""
+    with jax.enable_x64(new_val=True), program.passes(target="v5e"):
+        forms = scan.derive_scan(DECLARED, saturation=SATURATION)
+        wide = tuple(value.astype(jnp.float64) for value in long_draw(0))
+        values = operands(*wide)
+        prepared = forms.prepare(values)
+        outputs, (_, state) = forms.mapped(prepared, forms.init({})), forms.step(forms.init({}), prepared)
+        expected = tokenwise(*wide)
+    assert (outputs.dtype, state.dtype) == (expected[0].dtype, expected[1].dtype) == (jnp.float64,) * 2
+
+
 @pytest.mark.parametrize("target", ["sm86", "sm90"])
 def test_a_chunk_form_any_target_extracts_computes_the_token_scan(target):
     """The gated delta rule's chunks derived under an A10 (its step's latency unstated, so the token loop is
