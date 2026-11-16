@@ -42,8 +42,9 @@ env:
   # pin, as the lint gates' does (armada d1db76c; 2026-11-10: unpinned maps landed on hosts the pin leaves out), and
   # whose judges' and later map tasks' jobs run a task's timeout and ten minutes past the run's deadline, so a judged
   # run whose first wave ran long still judges (armada 080b5dd; train 795: its judges got 192 s and it went ungraded),
-  # and which shows a local plan's stderr, where Dew's plan states its reuse (armada bc61de0).
-  ARMADA: github:AshishKumar4/armada#bc61de0a56e8864a04b89cd3bef6937c98e11f8e
+  # and which shows a local plan's stderr, where Dew's plan states its reuse (armada bc61de0), and which grades a task's
+  # kill for memory as a red row of its own beside its rows (armada 84a05a4; 2026-11-16: a killed test may report none).
+  ARMADA: github:AshishKumar4/armada#84a05a44525cb1364acff2cdaaf7b5a68660a87c
 
 jobs:
   # A commit this workflow passed on another push, or one the land queue
