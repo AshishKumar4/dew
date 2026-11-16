@@ -647,11 +647,11 @@ def test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100
 
 @COMPILES_ON_CPU
 def test_a_decode_step_launches_only_kernels_its_certification_held():
-    """A decode step through the public route (`attention_route.attend`: fp16, one query row of four heads over
-    two key heads 128 wide and 1024 keys) compiled for an H100 (`kernel_compile.compile_mosaic_kernels`): each
-    Mosaic kernel it launches is one certification compiled alone and held (`report.certified`), its plan's
-    config the one certified at the key tile its walk streams at, where the plan pinned its derived config
-    uncertified and its kernels met the assembler first in the program's compile (row 7259)."""
+    """A decode step through the public route (`attention_route.attend`: fp16, one query row of four heads
+    over two key heads 128 wide and 1024 keys) compiled for an H100 (`kernel_compile.compile_mosaic_kernels`):
+    each Mosaic kernel it launches is one certification compiled alone and held (`report.certified`), its
+    plan's config the one certified at the key tile its walk streams at, where the plan pinned its derived
+    config uncertified and its kernels met the assembler first in the program's compile (row 7259)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 

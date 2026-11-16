@@ -213,7 +213,8 @@ def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale:
     return None if config is None else (config, op, ba)
 
 
-def _certified_stream(op: attention_mosaic.MosaicForward, ba, target: generation.GpuTarget):
+def _certified_stream(op: attention_mosaic.MosaicForward, ba, target: generation.GpuTarget
+                      ) -> attention_mosaic.Tiles | None:
     """The config a decode launch of `ba` runs, which its plan pins: the forward's own as certification holds
     it (`taken`: a pin, a tuned pick, else the first derived config whose kernels hold), at the key tile a
     decode step's few rows a key head stream at (`MosaicForward.streaming`), that tile's kernels certified in
@@ -221,7 +222,7 @@ def _certified_stream(op: attention_mosaic.MosaicForward, ba, target: generation
     streams at its next tile, else at the certified config itself. None where certification refuses every
     config. A pinned raw proposal compiled uncertified (row 7259)."""
     config = op.taken(ba)
-    if config is None:
+    if not isinstance(config, attention_mosaic.Tiles):
         return None
     seen = set()
     while (streamed := op.streaming(ba, config, target)) != config and streamed not in seen:
