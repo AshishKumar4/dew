@@ -18,7 +18,7 @@ from typing import Any, Concatenate, Protocol
 import jax
 import numpy as np
 from flax import linen as nn
-from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P, Sharding
 
 from dew._coordination import from_every_process
 from dew._files import write_atomically
@@ -353,14 +353,22 @@ def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Var
     as they are, the same arrays where they are placed already, and kept: no
     copy of them is made."""
     where, takes = _placements(held, variables, shardings, mesh, shared)
-    # A copy of an array already on the devices, which the transfer makes (`may_alias=False`): device_put
-    # otherwise reuses a buffer the target shares with the source, which donation would free. Dew's JAX
-    # build copies a resharded source too (from post77; JAX's own reshard path dropped the forced copy). No
-    # program compiles for it (`jax.Array.copy` compiles one per shape and placement), so a run handed its
-    # programs compiled ahead compiles nothing to place its held tree (row 4779).
     shared = shared or {}
-    aliased = jax.tree.map(lambda leaf: id(leaf) in shared or not isinstance(leaf, jax.Array), held)
-    return _split(takes, jax.device_put(held, where, may_alias=aliased))
+    return _split(takes, jax.tree.map(
+        lambda leaf, target: (jax.device_put(leaf, target)
+                              if id(leaf) in shared or not isinstance(leaf, jax.Array)
+                              else transferred_copy(leaf, target)), held, where))
+
+
+def transferred_copy(leaf: jax.Array, target: Sharding | None = None) -> jax.Array:
+    """A copy of `leaf` in buffers of its own, made by a transfer (`may_alias=False`), placed by `target`, or
+    where `leaf` is as it is, committed to its devices or not, where None: `jax.device_put` otherwise reuses
+    a buffer the target shares with the source, which a step's donation would free, and `jax.Array.copy`
+    compiles a program for each shape and placement, so a run handed its programs compiled ahead would
+    compile at its start (row 4779). Dew's JAX build copies a resharded source too (from post77; JAX's own
+    reshard path dropped the forced copy). The one copy of a held array a state takes over (`placed_held`;
+    `Trainer.initial_state`, whose arrays a step then places as it places any uncommitted one)."""
+    return jax.device_put(leaf, target, may_alias=False)
 
 
 def held_shapes[Held](held: Held, variables: Variables, shardings: Placement[Variables], mesh: Mesh,
