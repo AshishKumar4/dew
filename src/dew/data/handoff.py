@@ -19,6 +19,7 @@ from typing_extensions import TypeIs
 from dew._records import boolean, record
 from dew.batch import Batch
 from dew.data.analysis import _drops
+from dew.data.concurrent import Pool
 from dew.data.dataset import _column, _shareable, _stacked
 from dew.data.pipeline import (
     ACCOUNTS,
@@ -61,6 +62,18 @@ def _threads(stages: Sequence[Stage]) -> int | None:
     pools = [stage.step.threads for stage in stages
              if isinstance(stage, Map) and isinstance(stage.step, Fetch) and stage.step.threads is not None]
     return max(pools, default=None)
+
+
+def pool_of(stages: Sequence[Stage]) -> Pool | None:
+    """The pool a run of `stages` runs its records on, several at once (`Pool`): a fetch's threads
+    (`Fetch.threads`), or the pool a record stage declares (`Map.pool`, `FlatMap.pool`), sized by the host;
+    None where none runs on one. Such a stage runs alone (`lowering._run`)."""
+    threads = _threads(stages)
+    if threads is not None:
+        return Pool("threads", threads)
+    declared = [stage.pool for stage in stages
+                if isinstance(stage, (Map, FlatMap)) and stage.pool is not None]
+    return Pool.declared(declared[0]) if declared else None
 
 
 def _carried(pipeline: Pipeline, consumed: int, *, marked: bool, windows: bool = False) -> int:
@@ -133,7 +146,7 @@ def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, elastic: bool
     if spread:
         expanded = False
         for at, stage in enumerate(stages[start:], start=start):
-            pooled = isinstance(stage, _RECORD) and _threads((stage,)) is not None
+            pooled = isinstance(stage, _RECORD) and pool_of((stage,)) is not None
             # A step of each row's index reads a row's place in the stream, which an input's rows share.
             placed = expanded and isinstance(stage, MapWithIndex)
             grain = isinstance(stage, Native) and (elastic or expanded)

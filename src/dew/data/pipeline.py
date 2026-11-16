@@ -25,6 +25,7 @@ import numpy as np
 
 from dew._records import ADDED, JSON, integer, json_value, record, text
 from dew.batch import Batch
+from dew.data.concurrent import PoolKind
 from dew.data.dataset import WORKER_BUFFER, Records, phase_ends
 
 if TYPE_CHECKING:
@@ -700,6 +701,9 @@ class Map:
     identity: str | None = None
     rejects: bool = False
     configured: Bound | None = None
+    pool: PoolKind | None = None
+    """The pool its step runs on, several records at once (`dew.data.concurrent.Pool`); None where it runs
+    where its read runs. How it runs, no part of what it computes or its identity."""
 
 
 def examples_bound(stages: Sequence[object]) -> int | None:
@@ -741,6 +745,8 @@ class FlatMap:
     """Whether this is an objective's step that makes several rows of each source example (a decision
     layout's row a question): a corpus counts its source examples before it (`Accepted`), and a run's
     `examples=` bound stands before it (`dew.data.compile._bounded`)."""
+    pool: PoolKind | None = None
+    """The pool its step runs on (`Map.pool`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1209,7 +1215,7 @@ class Dataset:
         return dataclasses.replace(after, piped=(*kept, dataclasses.replace(called, start=0, input=before)))
 
     def map(self, *steps: RecordStep | Configured | HostStep, batched: bool = False, batch_size: int = 1000,
-            identity: str | None = None) -> Pipeline:
+            identity: str | None = None, pool: PoolKind | None = None) -> Pipeline:
         """One record to one: each step returns its record's replacement. A
         step that drops records (returns `Rejected`) goes through `filter_map`.
 
@@ -1217,7 +1223,14 @@ class Dataset:
         of columns, each a list, and returns columns of as many rows, which
         replace or join the record's own (Hugging Face's `map(batched=True)`).
         After `batch`, a step reads each training batch on the host.
+
+        With `pool`, a record step runs on a pool of its own, several records at
+        once, delivered in their order (data.md §10): `"threads"` for a step that
+        waits on IO, `"processes"` for one that holds the CPU (its step must pickle).
         """
+        if pool is not None and (batched or self.batched):
+            raise ValueError("pool= runs a record step on a pool of its own; a batched step or one after "
+                             "batch runs where its read runs")
         if self.batched:
             if batched:
                 raise ValueError("after batch, map already reads the training batch")
@@ -1240,7 +1253,8 @@ class Dataset:
                 raise TypeError(f"{_named_step(step)} draws from a generator; apply it with random_map")
             if not isinstance(step, Configured) and _declares_rejects(step):
                 raise TypeError(f"{_named_step(step)} drops records; apply it with filter_map")
-        return self._then(*(step if isinstance(step, Configured) else Map(step, identity) for step in steps))
+        return self._then(*(step if isinstance(step, Configured) else Map(step, identity, pool=pool)
+                            for step in steps))
 
     def random_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
         """One record to one, each step drawing from the record's generator
@@ -1254,16 +1268,17 @@ class Dataset:
                 raise TypeError(f"{_named_step(step)} drops records; apply it with random_filter_map")
         return self._then(*(RandomMap(step, identity) for step in steps))
 
-    def filter_map(self, *steps: RecordStep, identity: str | None = None) -> Pipeline:
+    def filter_map(self, *steps: RecordStep, identity: str | None = None,
+                   pool: PoolKind | None = None) -> Pipeline:
         """One record to none or one: each step returns its record's
         replacement or `Rejected(reason)`, which drops it, counted by reason
         in the reader's checkpointed counts, as `images.fetch` and
-        `images.DecodeImage` do."""
+        `images.DecodeImage` do. `pool` runs it on a pool of its own (`map`)."""
         for step in steps:
             if isinstance(step, pygrain.RandomMapTransform):
                 raise TypeError(f"{_named_step(step)} draws from a generator; "
                                 "apply it with random_filter_map")
-        return self._then(*(Map(step, identity, rejects=True) for step in steps))
+        return self._then(*(Map(step, identity, rejects=True, pool=pool) for step in steps))
 
     def random_filter_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
         """One record to none or one, each step drawing from the record's
@@ -1299,16 +1314,21 @@ class Dataset:
         return self._then(Filter(predicate, reason or _reason(predicate), identity))
 
     def flat_map(self, step: ExpandStep | ColumnStep, *, batched: bool = False,
-                 batch_size: int = 1000, identity: str | None = None) -> Pipeline:
+                 batch_size: int = 1000, identity: str | None = None,
+                 pool: PoolKind | None = None) -> Pipeline:
         """One record to any number: the step returns a record's records. With
         `batched`, it reads `batch_size` records at a time as a dict of columns
-        and returns columns of any length, the records that replace them."""
+        and returns columns of any length, the records that replace them.
+        `pool` runs a record step on a pool of its own (`map`)."""
+        if pool is not None and batched:
+            raise ValueError("pool= runs a record step on a pool of its own; a batched step runs where its "
+                             "read runs")
         if batched:
             (columns,) = _columns((step,))
             return self._then(Batched(columns, batch_size, identity, same_rows=False))
         if not _expands(step):
             raise TypeError(f"{_named_step(step)} is not a record expansion function or transform")
-        return self._then(FlatMap(step, identity))
+        return self._then(FlatMap(step, identity, pool=pool))
 
     @property
     def batched(self) -> bool:

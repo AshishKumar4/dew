@@ -24,7 +24,7 @@ import numpy as np
 
 from dew._builds import dew_cache_dir
 from dew._records import integer
-from dew.data.concurrent import Concurrently
+from dew.data.concurrent import Concurrently, Pool
 from dew.data.dataset import Loading, Ranges
 from dew.data.declared import Declared
 from dew.data.generation import (
@@ -910,7 +910,7 @@ class _PassthroughReader:
             return self.reader(shard, options).map_with_index(self.transform)
         # A fetch with a pool of its own runs its records at once, in their order.
         indexed = self.reader(shard, options).map_with_index(_Indexed())
-        return Concurrently(indexed, _Applied(self.transform), self.threads)
+        return Concurrently(indexed, _Applied(self.transform), Pool("threads", self.threads))
 
 
 @dataclass(frozen=True)

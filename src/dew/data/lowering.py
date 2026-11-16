@@ -86,6 +86,7 @@ from dew.data.handoff import (
     _Ungrouped,
     _Unspread,
     draws_after_expansion,
+    pool_of,
     record_stage_of,
 )
 from dew.data.mixing import (
@@ -512,7 +513,8 @@ def _run(
     The run's one random stage draws from the rng Grain hands its operator, keyed by the record's
     place in what that operator reads, as it would lowered alone: so a stage before it that drops
     records (counted out by `Accepted`, unless they go on `marked`) or expands them ends the run,
-    as does a second random stage. A fetch on its own pool (`Fetch.threads`) runs alone on it.
+    as does a second random stage. A stage on a pool of its own (a fetch's threads, a declared pool,
+    `pool_of`) runs alone on it.
     Over `indexed` rows the steps before an expansion run by index, on the read's threads, and the
     expansion and the steps after it read them as a stream (`_expanded`)."""
     run: list[RecordStage] = []
@@ -520,7 +522,7 @@ def _run(
     for stage in stages[start:stop]:
         if not record_stage_of(stage):
             break
-        if _threads((stage,)) is not None:
+        if pool_of((stage,)) is not None:
             return tuple(run) or (stage,)
         if isinstance(stage, RandomMap):
             if drawn or counted:
@@ -573,10 +575,11 @@ def _through(rows: Rows, run: tuple[RecordStage, ...], name: str, label: str, lo
     """`rows` through a run of record stages (`_run`) as one Grain operator: on the pool of its
     fetch, as an expansion, as a draw from `seed` where it holds its random stage, or as a map."""
     lowered = _Rows(run, unplaced=unplaced)
-    threads = _threads(run)
-    if threads is not None:
+    pool = pool_of(run)
+    if pool is not None:
         # A step with a pool of its own: its records in flight at once, delivered in order.
-        return Concurrently(_as_iter(rows, loading), lowered, threads)
+        pool.checked(lowered, _identity(run[0]).name)
+        return Concurrently(_as_iter(rows, loading), lowered, pool)
     if any(isinstance(stage, FlatMap) for stage in run):
         return _expanded(_as_iter(rows, loading), run, name, label, unplaced=unplaced)
     return rows.map(lowered) if seed is None else rows.random_map(lowered, seed=seed)

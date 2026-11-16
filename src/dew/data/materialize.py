@@ -29,7 +29,7 @@ from dew.batch import Batch
 from dew.data.analysis import _analyzed, _identity, _label, _name, written
 from dew.data.dataset import Ranges, Records
 from dew.data.facts import largest_bounds
-from dew.data.handoff import _threads
+from dew.data.handoff import pool_of
 from dew.data.lowering import (
     _cache_inputs,
     _CachedOutputs,
@@ -276,14 +276,17 @@ def _memory_stages(
                 # objective's step makes rows of them (`FlatMap.examples`), and not of the rows after.
                 examples = list(rows)
             expanded: list[tuple[tuple[int, ...], Record]] = []
-            threads = _threads((stage,))
-            if threads is None:
+            pool = pool_of((stage,))
+            if pool is None:
                 made = (_outputs(stage, identifier[0], value, counts=counter) for identifier, value in rows)
             else:
-                # A fetch with a pool of its own runs that many records at once, in their order.
-                pool = concurrent.futures.ThreadPoolExecutor(threads, thread_name_prefix="dew-step")
-                with pool:
-                    made = iter(list(pool.map(_Fetched(stage), rows)))
+                # A stage with a pool of its own runs that many records at once, in their order: a process
+                # pool is handed them in chunks, a pickle each.
+                step = _Fetched(stage)
+                pool.checked(step, _identity(stage).name)
+                chunk = 1 if pool.kind == "threads" else max(1, len(rows) // (4 * pool.size))
+                with pool.executor() as running:
+                    made = iter(list(running.map(step, rows, chunksize=chunk)))
             for (identifier, _), outputs in zip(rows, made, strict=True):
                 for child, output in enumerate(outputs):
                     if isinstance(output, Rejected):
