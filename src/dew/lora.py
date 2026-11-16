@@ -489,7 +489,8 @@ class Adapter:
         """
         from dew.inference.tasks import SavedRun, saved_model
 
-        run = SavedRun.pinned(str(directory), step, trust)
+        # Its weights and model record alone, which no path of the source's release holds (`selected`).
+        run = SavedRun.selected(str(directory), step, trust)
         config = saved_model(run.record, None)
         adapter = recorded_adapter(config.wrappers)
         if adapter is None:

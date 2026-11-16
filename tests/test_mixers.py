@@ -349,6 +349,29 @@ seventeen, the third's one."""
 
 
 @pytest.mark.parametrize("compressor", sorted(COMPRESSED))
+def test_deepseek_v4s_projections_are_matrices_muon_steps(compressor):
+    """Every DeepSeek V4 projection is a matrix by its declared axes, a contracted side and an output side,
+    which Muon orthogonalizes (`dew.optim.muon_weight_dimension_numbers`): its attention's and its
+    compressor's key/value projection and the compressor's gate among them (row 6654), where their output
+    side declared no axis and Muon refused the decoder."""
+    from flax.traverse_util import flatten_dict
+
+    from dew.batch import unboxed
+    from dew.nn.sharding import boxed, boxed_axes
+    from dew.optim import muon_weight_dimension_numbers
+
+    fields, overrides = KIND_FIELDS["deepseek_v4"]
+    model = tiny(mixer=mixers.build("deepseek_v4", **fields, **COMPRESSED[compressor]), max_seq_len=64,
+                 **overrides)
+    draw = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 16), jnp.int32))
+    with boxed(boxed_axes(draw)):
+        numbers = flatten_dict(muon_weight_dimension_numbers(unboxed(draw)))
+    projections = {path for path in numbers if path[-2] in ("kv_proj", "gate_proj") and path[-1] == "kernel"}
+    assert {path[-2] for path in projections} >= {"kv_proj"}
+    assert all(numbers[path] is not None for path in projections), sorted(projections)
+
+
+@pytest.mark.parametrize("compressor", sorted(COMPRESSED))
 def test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does(compressor):
     """DeepSeek V4's compressed windows over a packed row (`document_windows`, ledger 2679): each
     document's windows pool its own real tokens from its first, rotate at its own places and are read by

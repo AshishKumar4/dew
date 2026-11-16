@@ -425,6 +425,29 @@ def _greedy(programs: _Served, variables, tokens, forced=None, decided=None):
     return cache, jnp.stack(drawn, axis=1), scores, roundings
 
 
+def _margined_prompts(name: str, call: tuple) -> jax.Array:
+    """`ROWS` prompts of `LENGTH` tokens in `name`'s vocabulary whose float64 greedy walk through its cache
+    (the `wide` programs) selects each of its `STEPS` tokens by more than `MARGIN` of its logits' scale
+    (`top_margin`), the first such draw from seed 0 (`clearing`): a float32 run of either cache shape
+    selects as it does (testing.md, a selection compared across programs)."""
+    from selection_margins import MARGIN, clearing, top_margin
+
+    source = loaded(name)
+    wide, variables = _programs(name, "wide", call), widened(source.variables)
+
+    def draw(key):
+        rng = np.random.default_rng([0x6693, key])
+        return rng.integers(0, source.model.vocab_size, (ROWS, LENGTH)).astype(np.int32)
+
+    def clears(prompts) -> bool:
+        with jax.enable_x64(new_val=True):
+            _, _, scores, _ = _greedy(wide, variables, prompts)
+        return all(float(np.min(top_margin(np.asarray(score[:, -1], np.float64), 1))) > MARGIN
+                   for score in scores[:STEPS])
+
+    return jnp.asarray(clearing(draw, clears)(0))
+
+
 def _by_call(decisions: dict) -> list[dict]:
     """A run's decisions (`_scored`'s, `<call>/<kind>`) as each of its `STEPS + 1` calls takes them."""
     return [{name.split("/", 1)[1]: value for name, value in decisions.items()
@@ -503,7 +526,8 @@ def _reference(name: str, call: tuple) -> tuple[Callable, Callable]:
 @pytest.mark.parametrize("name", PATHS)
 def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
     """The resized model reads the same variables to the model's logits, both in one program, bit for bit,
-    and a causal one decodes into a cache of `CAPACITY` slots and draws the same tokens. Its attention
+    and a causal one decodes into a cache of `CAPACITY` slots and draws the same tokens over prompts whose
+    float64 greedy walk clears the selection margin at every step (`_margined_prompts`). Its attention
     reduces over the shorter cache, so the cached logits are the model's bits or as exact as them
     (`as_exact`). Each call is compiled, where op by op the logits took a minute of the test, and the
     greedy decodes run as the check runs its arms (`summed_as_run`), whose programs they share (ledger
@@ -517,9 +541,12 @@ def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name)
         return
     call = tuple(_decoding(name).items())
     own, at_capacity = _programs(name, "model", call), _programs(name, "sized", call)
+    # Prompts whose float64 greedy walk selects each token by a margin float32's rounding cannot cross, so
+    # the two programs' draws are the model's, whatever order each sums in.
+    prompts = _margined_prompts(name, call)
     with summed_as_run():
-        cache, drawn, _, _ = _greedy(own, variables, rows)
-        sized_cache, sized_drawn, _, _ = _greedy(at_capacity, variables, rows)
+        cache, drawn, _, _ = _greedy(own, variables, prompts)
+        sized_cache, sized_drawn, _, _ = _greedy(at_capacity, variables, prompts)
     assert jax.tree.structure(sized_cache) == jax.tree.structure(cache)
     assert (any(CAPACITY in leaf.shape for leaf in jax.tree.leaves(sized_cache))
             == any(model.max_seq_len in leaf.shape for leaf in jax.tree.leaves(cache)))

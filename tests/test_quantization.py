@@ -1971,13 +1971,13 @@ def autoguided_image_flow():
 
 
 def test_an_int8_decision_task_answers_as_the_host_does():
-    """`Decide` over a backbone quantized to int8 gives each option the probability the same task
-    gives it on the host. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    """`Decide` over a backbone quantized to int8 gives each option of each request the probability the
+    same task gives it on the host. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
     with_triton_gemms(decision_flow)
 
 
 def decision_flow():
-    from test_decision_objective import INTENT, LAYOUT, SPECIALS, TOKENIZER
+    from test_decision_objective import EXAMPLES, INTENT, LAYOUT, SPECIALS, TOKENIZER
 
     from dew.decision import Decide, DecisionObjective
     from dew.decision.model import DecisionModel
@@ -1992,9 +1992,12 @@ def decision_flow():
         return (nn.unbox(base.init(jax.random.key(seed))),)
 
     def run(dtype, held):
+        # Every example's state asked at once: a decision's few probabilities a request, too few alone for a
+        # GPU's ratio to the host's to resolve within the site's seeds (row 5017).
         model = DecisionModel(spec.apply(backbone.clone(dtype=dtype)), base.model.head.clone(dtype=dtype))
         task = Decide(model, placed(held, dtype), LAYOUT, TOKENIZER, SPECIALS)
-        return task("charged twice!", {"team": INTENT})["team"].probabilities
+        answers = task([(example.state, {"team": INTENT}) for example in EXAMPLES])
+        return jnp.stack([answer["team"].probabilities for answer in answers])
 
     assert_computed_as_on_the_host(run, draw, "an int8 decision task's probabilities")
 

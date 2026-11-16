@@ -593,7 +593,8 @@ class Decide(SavedRunTask, InItsForm):
         from dew.checkpoints import averaged_pinned
         from dew.inference.tasks import saved_settings
 
-        pinned = [SavedRun.at(directory, step) for directory in runs]
+        # Its task reads the runs' tokenizer and processor, their paths named where this host holds them.
+        pinned = [SavedRun.at(directory, step).here() for directory in runs]
         recorded = [run.record for run in pinned]
         settings = [saved_settings(saved, DecideSettings) for saved in recorded]
         # A setting its data derives (its padding, `metadata["derived"]`) may differ between the runs, and
