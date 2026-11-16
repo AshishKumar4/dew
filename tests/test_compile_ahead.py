@@ -437,6 +437,27 @@ def test_a_program_whose_compile_was_begun_passes_once_where_it_compiles_over_th
     assert len(begun_passes.passes) == 1 and not same.passes and len(elsewhere.passes) == 1
 
 
+def test_a_begun_compile_is_not_taken_by_a_call_over_another_layout():
+    """A program whose compile was begun over a committed array of its devices' default layout, called within
+    `attempting` over a committed array of another layout on the same sharding, lowers and compiles its own
+    and computes what the program does: the begun lowering's layout is not the call's, which JAX's
+    dispatcher holds a program to (the morning audit of 2026-11-16: the begun executable taken, the call
+    refused with a ValueError)."""
+    from jax.experimental.layout import Format, Layout
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.options import attempting, compiling, owned_program
+
+    sharding = NamedSharding(Mesh(jax.devices()[:1], ("x",)), PartitionSpec())
+    values = np.arange(6, dtype=np.float32).reshape(2, 3)
+    default, other = (jax.device_put(values, Format(Layout(major_to_minor=order), sharding))
+                      for order in ((0, 1), (1, 0)))
+    program = owned_program(lambda x: x * 2)
+    begun = compiling(program, default)
+    with attempting(begun):
+        np.testing.assert_array_equal(np.asarray(program(other)), values * 2)
+
+
 def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):
     """`kept(path, verify=True)` lowers each handed call's own program and holds it to the kept one's
     digest: a file whose program for a call is another program (here its recorded digest changed) is
