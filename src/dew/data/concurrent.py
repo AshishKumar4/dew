@@ -13,6 +13,7 @@ import pickle
 from collections.abc import Callable, Mapping
 from typing import Literal
 
+import grain.experimental as gx
 import grain.python as grain
 
 type PoolKind = Literal["threads", "processes"]
@@ -38,7 +39,7 @@ class Pool:
         cpus = Host.current().cpus
         return cls(kind, cpus if kind == "processes" else min(32, cpus + 4))
 
-    def checked(self, step: Callable, named: str) -> None:
+    def checked(self, step: object, named: str) -> None:
         """Refuse a process pool for a `step` (the stage `named`) that does not pickle, which no process
         could be handed: a configuration that cannot run, so the read never starts."""
         if self.kind != "processes":
@@ -72,6 +73,13 @@ class _InPlace(concurrent.futures.Executor):
         except Exception as error:
             done.set_exception(error)
         return done
+
+
+class Made[Record](gx.FlatMapTransform):
+    """The records a pooled expansion made of one (`dew.data.lowering._through`), handed on one by one."""
+
+    def flat_map(self, element: tuple[Record, ...]) -> tuple[Record, ...]:
+        return element
 
 
 class Concurrently[Element, Result](grain.IterDataset):

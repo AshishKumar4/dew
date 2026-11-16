@@ -706,7 +706,7 @@ class Map:
     where its read runs. How it runs, no part of what it computes or its identity."""
 
 
-def _pooled(steps: Sequence[object], pool: PoolKind | None) -> None:
+def _pooled(steps: Sequence[_Step], pool: PoolKind | None) -> None:
     """Refuse, as the stage is declared, a pool its steps cannot run on: a process pool for a step that
     does not pickle (`dew.data.concurrent.Pool.checked`), or any pool for a cut into chunks, whose counts
     the reading process keeps (`Chunked`)."""
