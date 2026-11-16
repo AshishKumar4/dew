@@ -85,7 +85,7 @@ from dew.data.dataset import (
     take_batch,
 )
 from dew.data.facts import laid_out, merge_facts, row_lengths
-from dew.data.handoff import record_stage_of
+from dew.data.handoff import pool_of, record_stage_of
 from dew.data.lowering import (
     _as_iter,
     _Build,
@@ -738,6 +738,12 @@ def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, traini
     scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise, and
     the branch's own key where it is named (`_own_key`)."""
     lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
+    pooled = None if lowered.cache is None else pool_of(branch.stages[:lowered.cache])
+    if read == "indexed" and pooled is not None:
+        # An indexed read fills its cache as its threads read the cached inputs, so a thread pool among the
+        # cached steps (a process pool there is refused as the read is analyzed) reads with that many.
+        threads = max(loading.threads, pooled.size)
+        loading = dataclasses.replace(loading, threads=threads, read_buffer=max(loading.read_buffer, threads))
     return _Build(read, loading, seed, batch, lowered, training=training, elastic=branch._elastic,
                   named=_own_key(branch))
 

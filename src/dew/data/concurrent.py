@@ -9,7 +9,6 @@ import collections
 import concurrent.futures
 import dataclasses
 import multiprocessing
-import sys
 from collections.abc import Callable, Mapping
 from typing import Literal, Protocol
 
@@ -54,8 +53,7 @@ class Pool:
 class Running[Element, Result](Protocol):
     """A started pool running one step (`Pool.running`): over one record (`submit`), its result a future
     whose `result` raises the step's error, or the pool's where a process of it died (a lost record raises,
-    never waits); and it stops (`stop`), dropping what has not started and ending, or waiting for, what
-    has."""
+    never waits); and it stops (`stop`), dropping what has not started and waiting for what has."""
 
     def submit(self, element: Element) -> concurrent.futures.Future[Result]: ...
 
@@ -81,9 +79,8 @@ class _Processes[Element, Result]:
     """A process pool of the stage's own (`Running`): each process is handed the step once, as it starts
     (`_installed`), and each record alone after (`_installed_step`); a process that dies, as one whose step
     no process can rebuild does, fails what it held and the pool (`BrokenProcessPool`). Stopped, it drops
-    what has not started and its processes are ended and waited for, whatever their step is doing (Python
-    3.14's `terminate_workers`); under an earlier Python, which cannot end them, one running a step finishes
-    that record first, as a thread does. Each ends with its reading process too (`dies_with_parent`)."""
+    what has not started, and a process running a step finishes that record, as a thread does, before it
+    ends and is waited for. Each ends with its reading process too (`dies_with_parent`)."""
 
     def __init__(self, size: int, step: Callable[[Element], Result]):
         self._pool = concurrent.futures.ProcessPoolExecutor(
@@ -93,8 +90,6 @@ class _Processes[Element, Result]:
         return self._pool.submit(_installed_step, element)
 
     def stop(self) -> None:
-        if sys.version_info >= (3, 14):
-            self._pool.terminate_workers()
         self._pool.shutdown(wait=True, cancel_futures=True)
 
 

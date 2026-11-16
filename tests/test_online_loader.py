@@ -22,6 +22,7 @@ from process_support import serving
 from dew.batch import VALID_ROWS
 from dew.data import Files, Loading, Memory, Rejected, images, video
 from dew.data.compile import compile, iterate
+from dew.data.concurrent import Pool
 from dew.data.dataset import DataPartition
 from dew.data.images import DecodeImage, Resize
 from dew.data.pipeline import Pipeline
@@ -738,10 +739,30 @@ def test_a_stage_on_processes_before_a_cache_is_refused_and_one_on_threads_fills
                 .cache(str(tmp_path / "a")).batch(3), read=read, loading=READ)
     after = first(Pipeline(catalog).cache(str(tmp_path / "b")).map(ran_where, pool="processes"))
     assert [int(value) for value in after["id"]] == [0, 1, 2]
-    filled = first(Pipeline(catalog).map(ran_where, pool="threads", identity="ran_where@1")
+    ACTIVE.update(now=0, most=0)
+    filled = first(Pipeline(catalog).map(overlapping, pool="threads", identity="overlapping@1")
                    .cache(str(tmp_path / "c")))
     assert [int(value) for value in filled["id"]] == [0, 1, 2]
     assert all(int(pid) == os.getpid() for pid in filled["pid"])
+    # Several inputs filled at once, as the declared threads run them, where one thread read each in turn.
+    assert ACTIVE["most"] > 1
+
+
+ACTIVE = {"now": 0, "most": 0}
+"""How many `overlapping` steps run at once in this process, and the most that ran at once."""
+ACTIVE_LOCK = threading.Lock()
+
+
+def overlapping(row: Mapping) -> dict:
+    """The record beside its process, counted among the steps running at once (`ACTIVE`) while it waits a
+    moment, as a step that waits on IO does."""
+    with ACTIVE_LOCK:
+        ACTIVE["now"] += 1
+        ACTIVE["most"] = max(ACTIVE["most"], ACTIVE["now"])
+    time.sleep(0.2)
+    with ACTIVE_LOCK:
+        ACTIVE["now"] -= 1
+    return {**row, "pid": os.getpid()}
 
 
 def first_where(row: Mapping) -> dict:
@@ -771,6 +792,25 @@ def test_adjacent_stages_declaring_one_pool_run_each_record_on_one_process_of_on
                for first, second in zip(batch["first"], batch["second"], strict=True))
 
 
+def test_a_fetch_on_threads_of_its_own_runs_alone_whatever_pool_the_stage_after_it_shares():
+    """A fetch with threads of its own runs alone on them, whatever pool it declares besides: the stage
+    after it declaring processes runs in processes of its own, not on the fetch's threads in the reader.
+    The two fused into one run, which the fetch's threads ran (theme 18's head review)."""
+    handle = Slow()
+    with serving(handle) as address:
+        catalog = Memory([{"url": f"http://{address}/{index}", "id": index} for index in range(6)],
+                         shard_rows=6)
+        chain = (Pipeline(catalog).filter_map(images.fetch(to="bytes", threads=2), pool="processes")
+                 .map(second_where, pool="processes").batch(2))
+        reader = compile(chain, read="streamed", loading=READ).train(DataPartition())
+        try:
+            batches = [next(reader) for _ in range(3)]
+        finally:
+            reader.close()
+    assert [int(value) for batch in batches for value in batch["id"]] == list(range(6))
+    assert all(int(pid) != os.getpid() for batch in batches for pid in batch["second"])
+
+
 BUILT: collections.Counter[str] = collections.Counter()
 """How many times this process rebuilt a `BuiltOnce` from its pickle."""
 
@@ -795,9 +835,11 @@ def test_a_process_stage_hands_each_process_its_step_once():
     """A stage declaring processes hands each process its step once, as the process starts, and each record
     alone after: every record's process rebuilt the step once. The step was pickled with every record and
     rebuilt for each (train 967's review, F3)."""
-    rows = list(iterate(Pipeline(Memory([{"id": index} for index in range(16)])).map(BuiltOnce(),
-                                                                                     pool="processes")))
-    assert [int(row["id"]) for row in rows] == list(range(16))
+    # Many records a process, whatever the host's count of processes, so each process is handed several.
+    count = 8 * Pool.declared("processes").size
+    rows = list(iterate(Pipeline(Memory([{"id": index} for index in range(count)])).map(BuiltOnce(),
+                                                                                        pool="processes")))
+    assert [int(row["id"]) for row in rows] == list(range(count))
     assert {int(row["built"]) for row in rows} == {1}
     assert all(int(row["pid"]) != os.getpid() for row in rows)
 

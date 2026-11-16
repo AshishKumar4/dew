@@ -70,6 +70,12 @@ def declared_pool(stage: Stage) -> PoolKind | None:
     return stage.pool if isinstance(stage, (Map, FlatMap)) else None
 
 
+def fetches_on_own_threads(stage: Stage) -> bool:
+    """Whether `stage` is a fetch with threads of its own (`Fetch.threads`), which runs alone on them,
+    whatever pool it declares besides (`lowering._run`)."""
+    return _threads((stage,)) is not None
+
+
 def pooled(stage: Stage) -> bool:
     """Whether `stage` runs its records on a pool of its own (`pool_of`): a fetch with threads of its own,
     or a record stage that declares its pool."""

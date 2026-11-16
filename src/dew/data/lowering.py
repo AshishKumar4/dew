@@ -86,6 +86,7 @@ from dew.data.handoff import (
     _Unspread,
     declared_pool,
     draws_after_expansion,
+    fetches_on_own_threads,
     pool_of,
     record_stage_of,
 )
@@ -523,11 +524,10 @@ def _run(
     for stage in stages[start:stop]:
         if not record_stage_of(stage):
             break
+        if fetches_on_own_threads(stage):
+            return tuple(run) or (stage,)
         if run and declared_pool(stage) != declared_pool(run[0]):
             break
-        if declared_pool(stage) is None and pool_of((stage,)) is not None:
-            # A fetch on threads of its own.
-            return tuple(run) or (stage,)
         if isinstance(stage, RandomMap):
             if drawn or counted:
                 break
@@ -1527,13 +1527,9 @@ class _Build:
             kept = (_as_iter(single, self.loading) if marked
                     else Accepted(_as_iter(single, self.loading), _name(pipeline), _label(pipeline)))
             return kept, cache + 1, None
-        # A stage on a thread pool of its own among the cached steps reads that many inputs at once (a
-        # process pool before an indexed read's cache is refused as the read is analyzed).
-        pooled = prefix.pool
-        threads = max(self.loading.threads, 0 if pooled is None else pooled.size)
-        read = dataclasses.replace(self.loading, threads=threads,
-                                   read_buffer=max(self.loading.read_buffer, threads))
-        flat = gx.FlatMapIterDataset(_as_iter(view, read), _CachedOutputs())
+        # A stage on a thread pool of its own among the cached steps reads that many inputs at once, as the
+        # read's threads do (`dew.data.compile._build`).
+        flat = gx.FlatMapIterDataset(_as_iter(view, self.loading), _CachedOutputs())
         return (flat if marked else Accepted(flat, _name(pipeline), _label(pipeline))), cache + 1, None
 
     @property

@@ -758,11 +758,15 @@ def _main_named(step: _Step) -> list[str]:
 
 def _main_importable() -> bool:
     """Whether a process started afresh imports this one's `__main__` (by its file or its module's name, as
-    `multiprocessing.spawn` prepares a child), which a notebook or `python -c` holds neither of."""
+    `multiprocessing.spawn` prepares a child), which a notebook, `python -c` and a package's `__main__`
+    run with `-m` give it none of. A name defined only under `if __name__ == "__main__":` passes here and
+    fails the read as its process dies (`dew.data.concurrent._Processes`)."""
     import multiprocessing.spawn
 
     prepared = multiprocessing.spawn.get_preparation_data("dew")
-    return "init_main_from_path" in prepared or "init_main_from_name" in prepared
+    # A main run as a package's `__main__` (`python -m package`) is one spawn does not import again.
+    named = str(prepared.get("init_main_from_name", "__main__"))
+    return "init_main_from_path" in prepared or not (named == "__main__" or named.endswith(".__main__"))
 
 
 def examples_bound(stages: Sequence[object]) -> int | None:
