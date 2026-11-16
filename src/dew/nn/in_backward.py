@@ -157,12 +157,19 @@ def _merged(shared: tuple, flowed: tuple, *, flows: tuple[bool, ...]) -> tuple:
     return tuple(next(given) if flow else leaf for leaf, flow in zip(shared, flows, strict=True))
 
 
+def _norms(gradient) -> tuple[jax.Array, jax.Array]:
+    """A layer's gradient's sum of squares and its count of values that are not finite (`NORMS`)."""
+    leaves = jax.tree.leaves(gradient)
+    squares = jnp.sum(jnp.stack([jnp.sum(jnp.square(leaf.astype(jnp.float32))) for leaf in leaves]))
+    return squares, jnp.sum(jnp.stack([jnp.sum(~jnp.isfinite(leaf)) for leaf in leaves])).astype(jnp.float32)
+
+
 def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments, bad: jax.Array):
     """One layer's update in a step that may not be finite (`gated`): where `ok` (the loss and the layer's
     gradient finite) by its gradient, else by a zero gradient, its weights kept as they were. Finite inputs
     can still form a value that is not finite (a moment past its dtype): a layer whose candidate weights or
     moments are not takes the zero gradient's update too, formed only then, and counts not finite (`bad`), so
-    the step does. The layer's moved weights, moments and non-finite count."""
+    the step does. The layer's moved weights, moments and non-finite count, and whether it was written."""
     gradient = jax.tree.map(lambda leaf: jnp.where(ok, leaf, jnp.zeros_like(leaf)), gradient)
     moved, moved_moments = update(gradient, held, moments)
     formed = _finite((moved, moved_moments))
@@ -171,7 +178,7 @@ def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments, bad: 
                                  lambda: moved_moments)
     written = ok & formed
     moved = jax.tree.map(lambda new, old: jnp.where(written, new, old), moved, held)
-    return moved, moved_moments, bad + (ok & ~formed).astype(bad.dtype)
+    return moved, moved_moments, bad + (ok & ~formed).astype(bad.dtype), written
 
 
 def _finite(tree) -> jax.Array:
@@ -260,7 +267,7 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
         narrow = masters is not None
 
         def body(carry, index):
-            dx, moving, moments, sumsq, nonfinite, dshared = carry
+            dx, moving, moments, sumsq, nonfinite, dshared, tripped = carry
             weights_i = _sliced(weights if narrow else moving, index)
             given = {"weights": jax.tree.leaves(weights_i), "shared": shared_leaves,
                      "x": jax.tree.leaves(_sliced(inputs, index)),
@@ -272,29 +279,29 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
             dshared = jax.tree.map(jnp.add, dshared, dflowed)
             held = _sliced(moving, index)
             held_moments = {name: _sliced(tree, index) for name, tree in moments.items()}
-            leaves = jax.tree.leaves(gradient)
-            squares = jnp.sum(jnp.stack([jnp.sum(jnp.square(leaf.astype(jnp.float32))) for leaf in leaves]))
-            bad = jnp.sum(jnp.stack([jnp.sum(~jnp.isfinite(leaf)) for leaf in leaves])).astype(jnp.float32)
+            squares, bad = _norms(gradient)
             if finite is None:
                 moved, moved_moments = current.update(path, index, gradient, held, held_moments)
             else:
-                moved, moved_moments, bad = _gated_layer(
-                    functools.partial(current.update, path, index), finite & (bad == 0), gradient, held,
-                    held_moments, bad)
+                # Once a layer the walk reached is held, every layer after it is too (`tripped`).
+                moved, moved_moments, bad, written = _gated_layer(
+                    functools.partial(current.update, path, index), finite & (bad == 0) & ~tripped,
+                    gradient, held, held_moments, bad)
+                tripped = tripped | ~written
             if due is not None:
-                moved = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old), moved, held)
-                moved_moments = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old),
-                                             moved_moments, held_moments)
+                moved, moved_moments = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old),
+                                                    (moved, moved_moments), (held, held_moments))
             moving = _written(moving, moved, index)
             moments = {name: _written(tree, moved_moments[name], index) for name, tree in moments.items()}
             sumsq = sumsq.at[index].set(squares)
             nonfinite = nonfinite.at[index].set(bad)
-            return (dx, moving, moments, sumsq, nonfinite, dshared), None
+            return (dx, moving, moments, sumsq, nonfinite, dshared, tripped), None
 
         start = (cotangent, masters if narrow else weights, moments, jnp.zeros((count,), jnp.float32),
-                 jnp.zeros((count,), jnp.float32), tuple(jnp.zeros_like(leaf) for leaf in flowing(shared)))
-        (dx, moved, moments, sumsq, nonfinite, dshared), _ = jax.lax.scan(body, start, jnp.arange(count),
-                                                                         reverse=True)
+                 jnp.zeros((count,), jnp.float32), tuple(jnp.zeros_like(leaf) for leaf in flowing(shared)),
+                 jnp.asarray(a=False))
+        (dx, moved, moments, sumsq, nonfinite, dshared, _), _ = jax.lax.scan(body, start, jnp.arange(count),
+                                                                            reverse=True)
         written_norms = {"sumsq": sumsq.astype(norms["sumsq"].dtype),
                          "nonfinite": nonfinite.astype(norms["nonfinite"].dtype)}
         # The copies' cotangent is nothing the step reads (`Transaction.split_planned` takes the masters').

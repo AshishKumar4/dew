@@ -692,3 +692,32 @@ def test_a_step_whose_update_overflows_from_a_finite_gradient_writes_nothing_and
     assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in held)
     with Checkpoints(str(tmp_path / "run")) as checkpoints:
         assert checkpoints.latest == 3
+
+
+class Overflowing(Objective):
+    """A weight's square, its batch statistic the exponential of its inputs' mean: a finite loss and gradient
+    beside a collection that overflows where the inputs are large."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.ones(())}, "stats": {"seen": jnp.zeros(())}}
+
+    def loss(self, variables, batch, step):
+        w = variables["params"]["w"]
+        return w * w, Aux({}, variables={"stats": {"seen": jnp.exp(jnp.mean(batch["x"]))}})
+
+
+def test_a_step_whose_collection_overflows_moves_no_weight_and_writes_no_collection():
+    """With no loss scale, a step whose loss and gradient are finite and whose forward's collection is not
+    (an exponential past float32) is not finite as a whole: its weight, its update count and its collection
+    stay as they were, and it reports not finite. Its collection was kept while its weight and update count
+    moved (the round-2 review's F3)."""
+    rows = jax.device_count()
+    stepper = Trainer(Overflowing(), optax.sgd(0.1), key=jax.random.PRNGKey(0))
+    state = stepper.initial_state()
+    batch = {"x": jnp.full((rows,), 100.0, jnp.float32)}
+    step = stepper.compile(state, batch)
+    before = jax.tree.map(np.asarray, state.variables)
+    advanced, _, _, finite, _, _ = step(state, batch)
+    assert not bool(finite) and int(advanced.updates) == 0
+    for got, want in zip(jax.tree.leaves(advanced.variables), jax.tree.leaves(before), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), want)

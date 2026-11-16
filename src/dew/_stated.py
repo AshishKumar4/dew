@@ -262,19 +262,22 @@ def reads(function: types.FunctionType, at: str, known: Mapping[int, JSON] = _NO
     cells, read = _sources.function_reads(function)
     names = _sources.names_read(function.__code__)
 
-    def global_read(name: str, value) -> JSON:
-        # A module of the user's the body names: the attributes of it the body names too, as each is
-        # stated, beside its file's code; every other value as stated.
-        stated_value = _stated(value, f"{at} ({named}'s global {name})", known, within)
+    def value_read(value, where: str) -> JSON:
+        # A module of the user's the body reads, by a global, a closure or a default: the attributes of it
+        # the body names, as each is stated, beside its file's code; every other value as stated.
+        stated_value = _stated(value, where, known, within)
         if not (isinstance(value, types.ModuleType) and _sources.own_source(value.__name__)):
             return stated_value
-        return [stated_value, _module_state(value, names, f"{at} ({named}'s global {name})", known, within)]
+        return [stated_value, _module_state(value, names, where, known, within)]
 
-    return {"closure": {name: _stated(value, f"{at} ({named}'s closure, {name})", known, within)
+    return {"closure": {name: value_read(value, f"{at} ({named}'s closure, {name})")
                         for name, value in sorted(cells.items())},
-            "globals": {name: global_read(name, value) for name, value in sorted(read.items())},
-            "defaults": _stated((function.__defaults__, function.__kwdefaults__),
-                                f"{at} ({named}'s defaults)", known, within)}
+            "globals": {name: value_read(value, f"{at} ({named}'s global {name})")
+                        for name, value in sorted(read.items())},
+            "defaults": [value_read(value, f"{at} ({named}'s defaults)")
+                         for value in function.__defaults__ or ()],
+            "keyword defaults": {name: value_read(value, f"{at} ({named}'s default {name})")
+                                 for name, value in sorted((function.__kwdefaults__ or {}).items())}}
 
 
 def _own(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) -> JSON:
@@ -313,8 +316,17 @@ def _module_state(module: types.ModuleType, names: set[str], at: str, known: Map
     if id(module) in walking:
         return "itself"
     within = walking | {id(module)}
-    return {name: _stated(member, f"{at} ({module.__name__}.{name})", known, within)
-            for name, member in _sources.members(module) if name in names}
+
+    def member_read(name: str, member) -> JSON:
+        stated_member = _stated(member, f"{at} ({module.__name__}.{name})", known, within)
+        if isinstance(member, types.ModuleType) and _sources.own_source(member.__name__):
+            # A module of the user's held by this one, read through it (`helpers.sub.X`): what of it the
+            # code names too.
+            return [stated_member, _module_state(member, names, f"{at} ({module.__name__}.{name})", known,
+                                                 within)]
+        return stated_member
+
+    return {name: member_read(name, member) for name, member in _sources.members(module) if name in names}
 
 
 def _tree(tree, at: str, again: Callable[..., JSON]) -> JSON:

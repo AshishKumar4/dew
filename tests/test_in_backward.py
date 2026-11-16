@@ -231,13 +231,13 @@ def test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time(opt
                     truth_fn=truth)
 
 
-def _walked(e, *, scale: float = 1.0, finite: bool = True):
+def _walked(e, *, scale: float = 1.0, finite: bool = True, top: float = 1.0):
     """Three layers, each `y = a x + sqrt(0 x + s - s' + e)` with `s'` the stop-gradient of `s`: a finite
     forward, whose gradient is not finite at a layer whose `e` is zero, in its own weights and in the input
     it hands the layer below (0 times infinity). Updated in their backward (`dew.nn.in_backward`) by an
     Adam-like rule that counts its steps per layer, its second moment the square of `scale` times the
-    gradient, under a step whose loss is `finite`: the weights, moments and per-layer non-finite counts the
-    walk leaves."""
+    gradient (the top layer's `top` times more), under a step whose loss is `finite`: the weights, moments
+    and per-layer non-finite counts the walk leaves."""
     from dew.nn import in_backward
 
     count = 3
@@ -251,7 +251,8 @@ def _walked(e, *, scale: float = 1.0, finite: bool = True):
 
     def update(path, index, gradient, held, moments):
         mu = jax.tree.map(lambda m, g: 0.9 * m + g, moments["mu"], gradient)
-        nu = jax.tree.map(lambda v, g: 0.99 * v + jnp.square(scale * g), moments["nu"], gradient)
+        factor = scale * jnp.where(index == 2, top, 1.0)
+        nu = jax.tree.map(lambda v, g: 0.99 * v + jnp.square(factor * g), moments["nu"], gradient)
         moved = jax.tree.map(lambda w, m, v: w - 0.1 * m / (jnp.sqrt(v) + 1.0), held, mu, nu)
         return moved, {"mu": mu, "nu": nu, "count": jax.tree.map(lambda c: c + 1, moments["count"])}
 
@@ -280,3 +281,19 @@ def test_a_layer_walked_past_a_gradient_that_is_not_finite_keeps_its_weights_and
     assert bool(jnp.all(jnp.isfinite(held["nu"]["a"]))) and bool(jnp.all(norms["nonfinite"] > 0))
     unmoved, _, _ = _walked([1.0, 1.0, 1.0], finite=False)
     np.testing.assert_array_equal(np.asarray(unmoved["a"]), [0.5, 0.5, 0.5])
+    # The top layer's candidate overflows from a finite gradient: it and every layer walked after it keep
+    # their weights, each count stepping (the round-2 review's F1: the layers below it moved).
+    latched, counted, _ = _walked([1.0, 1.0, 1.0], top=1e20)
+    np.testing.assert_array_equal(np.asarray(latched["a"]), [0.5, 0.5, 0.5])
+    np.testing.assert_array_equal(np.asarray(counted["count"]["a"]), [1.0, 1.0, 1.0])
+
+
+def test_a_walk_names_the_first_layer_it_met_not_finite_across_its_stage_axis():
+    """The first layer a backward walk met a gradient not finite at, of runs whose counts lie on a stage axis
+    and a layer axis (one stage): the highest-numbered layer holding one, numbered across the runs in order.
+    The stage axis was read as the layers, naming layer 0 (the round-2 review's F2)."""
+    from dew.training.transaction import _unfinite_layer
+
+    assert int(_unfinite_layer([jnp.asarray([[1.0, 1.0, 0.0]])])) == 1
+    assert int(_unfinite_layer([jnp.asarray([[0.0, 0.0]]), jnp.asarray([[1.0, 0.0, 0.0]])])) == 2
+    assert int(_unfinite_layer([jnp.asarray([[0.0, 0.0, 0.0]])])) == -1

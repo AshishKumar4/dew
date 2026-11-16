@@ -514,9 +514,11 @@ def _unfinite_layer(runs: Sequence[jax.Array]) -> jax.Array:
     the model's order, the layers numbered across them: the first the backward's walk met; -1 for none."""
     first, offset = jnp.asarray(-1, jnp.int32), 0
     for counts in runs:
-        places = jnp.arange(counts.shape[0], dtype=jnp.int32) + offset
+        # A run's counts lie on its stage and layer axes (one stage), its layers in order.
+        counts = counts.reshape(-1)
+        places = jnp.arange(counts.size, dtype=jnp.int32) + offset
         first = jnp.maximum(first, jnp.max(jnp.where(counts > 0, places, -1)))
-        offset += counts.shape[0]
+        offset += counts.size
     return first
 
 
@@ -587,7 +589,10 @@ def _numerical(opt_state: optax.OptState) -> optax.OptState:
     """`opt_state` without the hyperparameters injected beside it (`dew.optim_schedules.INJECTED`): the
     state a step's gradients write, which `checked` and `_formed` read."""
     def numerical(node):
-        return node._replace(hyperparams={}) if isinstance(node, INJECTED) else node
+        # An injected state's inner state may hold injected states in turn (a factory's chain of them).
+        if not isinstance(node, INJECTED):
+            return node
+        return node._replace(hyperparams={}, inner_state=_numerical(node.inner_state))
 
     return jax.tree.map(numerical, opt_state, is_leaf=lambda node: isinstance(node, INJECTED))
 
@@ -1088,7 +1093,8 @@ class Transaction:
                              "a run bounded in examples that no plan counts ahead keeps")
         return jnp.asarray(current.consumed, jnp.float32) / self.bound
 
-    def commit(self, current, gradient, effects, qk, statistics, applied: Applied | None = None):
+    def commit(self, current, gradient, effects, qk, statistics, applied: Applied | None = None,
+               attempted: jax.Array | None = None):
         """Apply the pooled native gradient and return its finiteness and global norm. An optimizer that
         reads more than the gradient is handed the update's pooled loss `statistics` (a Gauss-Newton
         update's system, `dew.gauss_newton`) and attention logit maxima (`qk`).
@@ -1134,6 +1140,9 @@ class Transaction:
         gated = current.scale is None and not holds_back(current.opt_state)
         if gated:
             native_finite = native_finite & _all_finite((qk, statistics, effects))
+            # The attempt's own finiteness (its loss, its collections, its microbatch), as its acceptance
+            # reads it (`finish_attempt`): one gate for every write.
+            native_finite = native_finite if attempted is None else native_finite & attempted
             native, qk, statistics, effects = (_gated(native_finite, value)
                                                for value in (native, qk, statistics, effects))
 
@@ -1286,20 +1295,13 @@ class Transaction:
         # back is rejected whole, its optimizer state kept, as a scaled step's is.
         holding = holds_back(state.opt_state)
         accepted = jnp.asarray(a=True) if scale is None and not holding else finite
-        written = aux.variables
-        if scale is None and not holding and written is not None:
-            # A step with no loss scale that is not finite writes back none of its forward's collections
-            # (a batch norm's statistics), as it moves no parameter (training.md, a step that is not finite).
-            written = dicts(written)
-            kept = finite if pending.applied is None else finite & (pending.applied.nonfinite == 0)
-            written = _chosen(kept, written, {name: state.variables[name] for name in written})
-        numerical = dataclasses.replace(state, variables=write_back(state.variables, written),
+        numerical = dataclasses.replace(state, variables=write_back(state.variables, aux.variables),
                                         microstep=state.microstep + 1)
         # Runs that updated in their backward wrote it only where the step commits (`in_backward.gated`).
         numerical = numerical if pending.applied is None else pending.applied.onto(numerical)
 
         def commit(current):
-            return self.commit(current, gradient, effects, qk, pending.pooled, pending.applied)
+            return self.commit(current, gradient, effects, qk, pending.pooled, pending.applied, finite)
 
         def recopied(current):
             # A window of several microbatches reads one set of copies
@@ -1330,6 +1332,12 @@ class Transaction:
             numerical = dataclasses.replace(numerical, accumulation=previous)
         inspected = {**inspected, **self.watched_summaries(aux, probed)}
         finite = finite & native_finite
+        if scale is None and not holding and aux.variables is not None:
+            # A step with no loss scale that is not finite, by its attempt or its update, writes back none of
+            # its forward's collections (a batch norm's statistics) (training.md, a step that is not finite).
+            kept = {name: _chosen(finite, numerical.variables[name], state.variables[name])
+                    for name in dicts(aux.variables)}
+            numerical = dataclasses.replace(numerical, variables={**numerical.variables, **kept})
         if scale is not None:
             accepted = finite & _all_finite(checked(numerical))
         elif holding:

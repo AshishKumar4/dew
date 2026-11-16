@@ -391,3 +391,18 @@ def test_a_function_step_naming_a_module_is_held_by_what_it_reads_of_it_alike_in
     assert first == second and first[0] is True and first[1]
     (tmp_path / "helping.py").write_text(HELPERS.format(by=10))
     assert _held_in_a_process(tmp_path, "1")[1] != first[1]
+
+
+def test_a_function_step_reading_a_module_by_its_default_holds_what_it_reads_of_it(tmp_path):
+    """A function step that reads a module of the user's through a default argument (`settings=helping`)
+    holds the attributes it names of it, as one reading it by a global does: `helping.delta` changed, the
+    step's held code changes. The module was stated by its name alone, the step exact across the change
+    (the round-2 review's F4)."""
+    (tmp_path / "helping.py").write_text(HELPERS.format(by=1))
+    (tmp_path / "stepping.py").write_text(
+        "import helping\n\n\ndef shifted(row, settings=helping):\n"
+        "    return {**row, 'id': row['id'] + settings.delta()}\n")
+    first = _held_in_a_process(tmp_path, "1")
+    assert first[0] is True
+    (tmp_path / "helping.py").write_text(HELPERS.format(by=10))
+    assert _held_in_a_process(tmp_path, "1")[1] != first[1]
