@@ -803,7 +803,8 @@ def lightning_fast_forms_are_as_exact_as(reference) -> None:
     """Lightning attention's form (`recurrence_chunk.simple_gla`) at bf16 under the run's fast forms, which
     take fla's rounding (`recurrence_chunk.chunk_rounding`), on the template: its output, final memory and
     every operand's gradient on par from float64 with `reference(operands, cotangents)`, fla's (its own code
-    on a GPU tier, `simple_gla_support.fla_simple_gla`; its rounding stated off one, `fla_rounding`), the
+    on a GPU tier, `simple_gla_support.fla_simple_gla`, an arm run as given; its rounding stated off one,
+    `fla_rounding`, whose gradients are the statement's own, not fla's backward's), the
     truth the recurrence a token at a time in float64. Held whole there in fp32's three parts, lightning ran
     4.9 times fla's forward on a GH200 (row 6823); rounded, each leaf was 0.43 to 1.15 times fla's
     rounding's distance interpreted (jsf-lround5)."""
