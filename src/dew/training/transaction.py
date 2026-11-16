@@ -35,7 +35,7 @@ from dew.data.dataset import rows_of
 from dew.gauss_newton import solves_equations
 from dew.held_updates import holds_back, holds_state, input_taken, refuse_untold, update_applied
 from dew.nn import in_backward
-from dew.nn.finite import all_finite, bounded, leaf_finite, zeroed_unless
+from dew.nn.finite import all_finite, leaf_finite, norm_and_bound, zeroed_unless
 from dew.nn.inspection import (
     PROBES,
     Watched,
@@ -962,7 +962,10 @@ class Transaction:
         due = (fill + 1) == self.size
         if closing is not None:
             due = due | closing
-        local_finite = all_finite((loss, stats, gradient, aux.variables, aux.effects))
+        # A step with no loss scale reads its gradient's finiteness once, in its commit's bound
+        # (`dew.nn.finite.norm_and_bound`), its pooled gradient carrying every microbatch's.
+        gated = state.scale is None and not holds_back(state.opt_state)
+        local_finite = all_finite((loss, stats, aux.variables, aux.effects, *(() if gated else (gradient,))))
         local_ok = jnp.asarray(a=True) if state.scale is None else local_finite
         qk = compact_qk(aux.qk_stats)
         effects = tuple(jax.tree.leaves(aux.effects))
@@ -1168,11 +1171,11 @@ class Transaction:
         # commit gathered every parameter and moment back each step (row 3697).
         gradient = gradient if self.placed is None else placed_as(gradient, self.placed)
         native = jax.tree.map(_descending, gradient, current.variables["params"])
-        # A gradient finite throughout with no magnitude past the bound (`bounded`, one max-reduction, which
-        # holds the finiteness check) forms a finite update with every optimizer Dew builds but a
-        # Gauss-Newton solve: every square of it is finite where a moment is stored.
-        native_finite = bounded(native)
-        norm = optax.global_norm(native)
+        # A gradient finite throughout with no magnitude past the bound (one max-reduction, which holds the
+        # finiteness check, read with the norm's sum of squares, `norm_and_bound`) forms a bounded update
+        # with every optimizer Dew builds but a Gauss-Newton solve: every square of it is finite where a
+        # moment is stored.
+        norm, native_finite = norm_and_bound(native)
         norm = norm.astype(at_least_fp32(norm.dtype))
         if applied is not None:
             # The runs that updated in their backward hold no gradient here (zeros where theirs would be):
@@ -1348,7 +1351,9 @@ class Transaction:
         """
         scale, previous = state.scale, state.accumulation
         effects, qk, loss = pending.effects, pending.qk, pending.loss
-        finite = pending.local_finite & all_finite((loss, gradient, effects, qk, aux.variables))
+        gated = scale is None and not holds_back(state.opt_state)
+        finite = pending.local_finite & all_finite((loss, effects, qk, aux.variables,
+                                                    *(() if gated else (gradient,))))
         # A step with no loss scale is gated in its commit (`commit`), but one whose optimizer holds updates
         # back is rejected whole, its optimizer state kept, as a scaled step's is.
         holding = holds_back(state.opt_state)

@@ -45,3 +45,25 @@ def bounded(tree) -> jax.Array:
     flags = [jnp.max(jnp.abs(leaf)).astype(jnp.promote_types(leaf.dtype, jnp.float32)) <= MAGNITUDE_BOUND
              for leaf in jax.tree.leaves(tree) if _inexact(leaf) and leaf.size]
     return jnp.logical_and.reduce(jnp.stack(flags)) if flags else jnp.asarray(a=True)
+
+
+def norm_and_bound(tree) -> tuple[jax.Array, jax.Array]:
+    """The global norm of `tree`'s floating leaves, as `optax.global_norm` states it, and whether each is
+    finite within `MAGNITUDE_BOUND` (`bounded`), from one reduction a leaf: its squares' sum and its largest
+    magnitude reduced together, so the bound reads the gradient in the pass its norm does. Read apart, the
+    two took a kernel each a leaf and the gradient's finiteness a third, 1.9 times main's kernels on the 4B
+    decision step (+5.3% of its step on a GH200, UB-ATTR5)."""
+    squares, within = [], jnp.asarray(a=True)
+    for leaf in jax.tree.leaves(tree):
+        if not (_inexact(leaf) and leaf.size):
+            continue
+        square = jnp.real(leaf * jnp.conj(leaf)) if jnp.iscomplexobj(leaf) else leaf * leaf
+        # Read in float32 at least: a half dtype's bound is its own infinity, which an infinity meets.
+        magnitude = jnp.abs(leaf).astype(jnp.promote_types(leaf.dtype, jnp.float32))
+        summed, top = jax.lax.reduce((square, magnitude),
+                                     (jnp.zeros((), square.dtype), jnp.zeros((), magnitude.dtype)),
+                                     lambda one, other: (one[0] + other[0], jnp.maximum(one[1], other[1])),
+                                     tuple(range(leaf.ndim)))
+        squares.append(summed)
+        within = within & (top <= MAGNITUDE_BOUND)
+    return (jnp.sqrt(sum(squares)) if squares else jnp.zeros(())), within
