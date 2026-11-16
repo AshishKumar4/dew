@@ -439,7 +439,6 @@ class InContextMemory(LinearProducts):
             read = self._chunked(heads, steps)
         if counted is not None:
             counted()
-        # An unprojected query is the stream itself, read in the layer's dtype or the stream's.
         # In the dtype its projections compute in: the layer's, or its query's (an unprojected one's the
         # stream's).
         read = read.astype(self.dtype or query.dtype)

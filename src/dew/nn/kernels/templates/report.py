@@ -981,13 +981,14 @@ def _commit(proposal: Recorded) -> None:
     _add(rewritten=proposal.rewritten, passes=proposal.passes)
 
 
-def _add(**records: Iterable) -> None:
+def _add(**records: Sequence) -> None:
     """Each of `records`, a `Recorded` field's entries, added to this context's registry and to every
-    `recording` open in it."""
+    `recording` open in it; a miss once a holder (`_record`), each other record as often as it is made."""
     with _GUARD:
         for held in (_registry(), *_RECORDING.get()):
             for name, entries in records.items():
-                getattr(held, name).extend(entries)
+                found = getattr(held, name)
+                found.extend(entry for entry in entries if name != "missed" or entry not in found)
 
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
@@ -1005,9 +1006,7 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
         if miss is None:
             return False
         new = miss not in registry.missed
-        for held in (registry, *_RECORDING.get()):
-            if miss not in held.missed:
-                held.missed.append(miss)
+        _add(missed=(miss,))
         return new
 
 
