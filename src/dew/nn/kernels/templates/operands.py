@@ -153,7 +153,7 @@ class Issuer:
         products before and after it each summed in one. An operand may be a callable forming it then, where
         `shape`, the sum's, is given. A register left operand whose product takes it in registers (its buffers
         a count) is issued so (`Family.register_products`). Products whose operands take three parts (an fp32
-        call's accurate forms) are summed a term at a time, those of one form together (`_termwise`), added to
+        call's accurate forms) are summed a product at a time, each a term at a time (`_termwise`), added to
         the rest's sum. `into`, an accumulator the walk carries (its home, a warpgroup accumulator ref or a
         register array), takes every unscaled product in place and is
         returned, no value read; a scaled operand's product its own accumulator, restored and added into it
@@ -294,33 +294,35 @@ class Issuer:
 
     def _termwise(self, groups: dict[tuple[int, int], list], shape: tuple[int, int] | None, *,
                   retired: bool) -> Iterator[jax.Array]:
-        """Each term's sum of `groups`' products of three parts, a group a form (its operands' parts,
-        `_counted`): each group's terms (`product.terms`, smallest first, as `Family.apart` sums one
-        product's) a term at a time, each term's products across the group into one accumulator, which its
-        caller adds into its own sum as it comes. Their operands are staged again for each term (none where
-        they are tiles in memory, or a value held in a list of buffer sets), so one accumulator is live beside
-        the caller's where an accumulator a term held at once spilled an fp32 solve 576 bytes a thread on an
-        H100 (fast32d-sm90 at 83b47d66f6), and a group's terms summed apart before joining the caller's held a
-        third (MiniMax's lightning training query/key walk on an H100 spilled 200 bytes, jsf-lightning-fs)."""
+        """`groups`' products of three parts (a group a form, its operands' parts, `_counted`) a product at a
+        time, each term of it (`product.terms`, smallest first, as `Family.apart` sums one product's) issued
+        into a fresh fp32 accumulator, which its caller adds into its own sum as it comes: whole products join
+        the sum in turn, each partial sum the products' before it and a prefix of one product's terms,
+        smallest first, so no products' leading terms meet before their smaller ones (two products' leading
+        terms summed alone left float32's range where the whole products' sum stayed in it, base review
+        0dac2d104 F1). Its operands are staged again for each term (none where they are tiles in memory, or a
+        value held in a list of buffer sets), so one accumulator is live beside the caller's where an
+        accumulator a term held at once spilled an fp32 solve 576 bytes a thread on an H100 (fast32d-sm90 at
+        83b47d66f6), and a product's terms summed apart before joining the caller's held a third (MiniMax's
+        lightning training query/key walk on an H100 spilled 200 bytes, jsf-lightning-fs)."""
         family = self.call.family
         for counts, entries in groups.items():
-            if shape is None:
-                _, lhs, rhs = entries[0]
-                shape = (lhs.shape[0], rhs.shape[1])
+            for name, lhs, rhs in entries:
+                if shape is None:
+                    shape = (lhs.shape[0], rhs.shape[1])
 
-            def term(i: int, j: int, acc, entries=entries):
-                # Each product's operands staged as the term's pass reaches it, the pass's earlier products in
-                # flight waited for where a staging would overwrite one's tile (`_settle`).
-                read: list = []
-                for name, lhs, rhs in entries:
+                def term(i: int, j: int, acc, name=name, lhs=lhs, rhs=rhs):
+                    # The product's operands staged as the term reaches them, a staging that would overwrite
+                    # the tile the term's own product reads waiting for it (`_settle`).
+                    read: list = []
                     left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
                     acc = family.products(acc, left[i], right[j])
                     if retired:
                         family.settled(0)
-                return acc
+                    return acc
 
-            for i, j in product.terms(*counts):
-                yield family.summed(shape, functools.partial(term, i, j))
+                for i, j in product.terms(*counts):
+                    yield family.summed(shape, functools.partial(term, i, j))
 
     def summed_together(self, groups: list) -> tuple[Callable[[], jax.Array], ...]:
         """Readers of `groups`' sums (each a list `summed` takes), none of which reads another's: issued
