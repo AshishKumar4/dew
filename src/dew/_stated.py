@@ -384,12 +384,13 @@ def _module(value: types.ModuleType, at: str, known: Mapping[int, JSON], walking
     """A module as an identity states it: one of the user's by its file's code, beside the attributes the
     code reading it names of it (`names`, `_module_state`); another by its version. The script's
     (`__main__`) file is no process record's, so what it holds, read by no names, is stated whole."""
-    module = ["module", _coded(value.__name__, at)]
+    module: list[JSON] = ["module", _coded(value.__name__, at)]
     if value.__name__ == "__main__" and names is None:
         names = DYNAMIC
     if names is None or not _sources.own_source(value.__name__):
         return module
-    return [module, _module_state(value, names, at, known, walking)]
+    stated: list[JSON] = [module, _module_state(value, names, at, known, walking)]
+    return stated
 
 
 def _tree(tree, at: str, again: Callable[..., JSON]) -> JSON:
