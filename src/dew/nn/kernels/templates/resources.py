@@ -74,7 +74,8 @@ class Producers:
         steps, held = facts().raises(), dict(self.raised_to)
         for launch, top in tops.items():
             cap = held.get(launch)
-            lower = min(top, steps.highest) if cap is None else cap - steps.step
+            # A top in setmaxnreg's steps: a program of two warpgroups launches at a thread's 255, no step.
+            lower = min(top, steps.highest) // steps.step * steps.step if cap is None else cap - steps.step
             if lower <= steps.lowest:
                 return None
             held[launch] = lower

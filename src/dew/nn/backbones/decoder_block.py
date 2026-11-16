@@ -575,8 +575,10 @@ def recomputed_inside(remat: RematPolicy | None) -> tuple[str, ...]:
     (`memory_chunk`), whose scan's backward would otherwise stack them all inside the block's recompute, a
     layer's at a time (row 6577: 320 GiB of a Titans step at 4 x 2048); a lighter rung keeps them, each step
     that fits as fast as it ran, so the ladder recomputes them last."""
-    if remat is None or remat.recompute:
-        return () if remat is None else tuple(remat.recompute)
+    if remat is None:
+        return ()
+    if remat.recompute:
+        return remat.recompute
     return () if remat.save or remat.offload else (Residual.MEMORY_CHUNK,)
 
 
@@ -1005,11 +1007,10 @@ class DecoderBlock(nn.Module):
                  prediction_phase: PredictionPhase = "ordinary") -> jax.Array | Carried:
         """The residual the next block reads, in the form `x` came in: an array (the plain stream,
         AltUp's copies, mHC's streams, the depth state), or single-pass mHC's `Carried`."""
-        if self.remat is None or self.remat.recompute or self.is_initializing() or decode:
-            with recomputing(recomputed_inside(self.remat)):
+        with recomputing(recomputed_inside(self.remat)):
+            if self.remat is None or self.remat.recompute or self.is_initializing() or decode:
                 return self._forward(x, train, decode, kv_store, per_layer_input, attention_metadata,
                                      prediction_phase)
-        with recomputing(recomputed_inside(self.remat)):
             return self._rematted(self.remat, x, train, kv_store, per_layer_input, attention_metadata,
                                   prediction_phase)
 

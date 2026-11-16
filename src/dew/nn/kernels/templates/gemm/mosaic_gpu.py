@@ -80,6 +80,12 @@ from dew.nn.kernels.templates.gemm import (
 from dew.nn.kernels.templates.gemm.pricing import balanced_tail, family_of, fixes_up, tile_columns, tile_rows
 from dew.nn.kernels.templates.product import SCALE_DEPTH, block_format
 
+GMM = "dew_gmm"
+"""The name of a product's kernel (`gmm`), its producer's registers `Tiles.producers`' by it."""
+
+TGMM = "dew_tgmm"
+"""The name of a kernel gradient's kernel (`tgmm`), its producer's registers `Tiles.producers`' by it."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Tiles:
@@ -102,7 +108,9 @@ class Tiles:
     consumers take alternate tiles whole (`pingpong`, CUTLASS's ping-pong sm90 schedule: each consumer's tile
     its own, their MMA phases alternating, so one's epilogue overlaps the other's products;
     `Family.persist`'s `pingpong`; on a cluster too, its programs multicasting the blocks they read alike)
-    rather than halving each tile's rows."""
+    rather than halving each tile's rows; and the registers its kernel's producer lowers to (`producers`,
+    by kernel, `GMM` or `TGMM`; setmaxnreg's least where unraised), a rung its derivation raises a compile
+    found spilling at, each a certification's (`grouped_matmul._Mosaic.rungs`)."""
     block_m: int
     block_n: int
     block_k: int
@@ -115,6 +123,7 @@ class Tiles:
     splits: int = 1
     swapped: bool = False
     pingpong: bool = False
+    producers: resources.Producers = dataclasses.field(default_factory=resources.Producers)
 
     @property
     def sharing(self) -> int:
@@ -932,7 +941,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=_unrolled(prologue, packed_rows, exact_sums),
                            accumulators=(part,) * len(matrices), **_summed(family, tiles, exact_sums),
-                           producer=gmm_producer(family, gather is not None),
+                           producer=tiles.producers.of(GMM),
                            **({'pingpong': True} if tiles.pingpong else {}),
                            **_prologue_rewrite(rewritten, family, prologue, (prologue_axes, prologue_gmems),
                                                (stepped, read, fixed), (fixed_smems, fixed_barriers), g))
@@ -948,9 +957,9 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     kernel = family.kernel(body, out_type=out_type,
                            grid=(multiprocessors // pair,), grid_names=("programs",),
                            consumers=consumers + rewritten,
-                           interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
+                           interpret=interpret, approx_math=False, name=GMM, cluster=pair,
                            resident=tiles.programs, scalars=0 if dense else 1, registers=registers,
-                           producer=gmm_producer(family, gather is not None), shared=shared, moves=MOVES,
+                           producer=tiles.producers.of(GMM), shared=shared, moves=MOVES,
                            cost=unit_cost.estimate(2 * m * n * k * len(matrices), *operands,
                                                    *prologue_operands, *epilogue_operands, *out_type),
                            **_prefetched(tiles, grid, k // block_k, transpose_rhs, interpret,
@@ -1270,14 +1279,6 @@ def _gathered(gather, tiles: Tiles, dtype, interpret) -> dict:
 
 GATHERED_STREAMS = ('rows',)
 """The streams a gathered product's producer gathers (`gmm`'s `gather`): its rows'."""
-
-def gmm_producer(family: mosaic.Family, gathered: bool) -> int | None:
-    """Dew: the registers a GEMM launch's producer is lowered to where its issue loop holds more than its
-    family's least (`resources.Launch.producer`, `Family.persist`'s `producer`): its family's gathering
-    producer's (`Transport.gathering_producer`) where it gathers rows; None elsewhere
-    (`resources.producer_floor`)."""
-    return family.gathering_producer if gathered else None
-
 
 def _grouped_table(group_sizes: jax.Array, m: int, row_tile: int, first: jax.Array | None,
                    unit: int = TMA_ROWS) -> jax.Array:
@@ -2117,7 +2118,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=unrolled, accumulators=(part,),
-                           **_summed(family, tiles, exact_sums),
+                           producer=tiles.producers.of(TGMM), **_summed(family, tiles, exact_sums),
                            **_stage_rewrite(rewritten, family, starts_gmem, ends_gmem, block_k))
 
         family.scoped(scope, *allocations.staged,
@@ -2130,8 +2131,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     kernel = family.kernel(body, out_type=out_type,
                            grid=(1 if interpret else multiprocessors // pair,), grid_names=("programs",),
                            consumers=consumers + rewritten, interpret=interpret, approx_math=False,
-                           name="dew_tgmm", cluster=pair, registers=registers, shared=shared, moves=MOVES,
-                           resident=tiles.programs, scalars=len(groups),
+                           name=TGMM, cluster=pair, registers=registers, producer=tiles.producers.of(TGMM),
+                           shared=shared, moves=MOVES, resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
     return kernel(*groups, lhs, rhs, *(table for table in tables if table is not None), *(step_scales or ()),
                   *prologue_operands, *_workspace(tail, (multiprocessors, 2, consumers, *part), interpret))

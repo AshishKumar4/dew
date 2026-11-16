@@ -437,14 +437,17 @@ _BLACKWELL = Architecture(('tcgen05', 'mma.sync'), {'16bit': 8192, 'tf32': 4096,
 _BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
                                    Multiprocessor(resident_blocks=24), tma=True, dependent_launch=True)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072) and the scoped VMEM limit at XLA's
-# default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's).
+# default, read from a Mosaic kernel's refusal of a scratch it uses whole (a flag such as
+# --xla_tpu_scoped_vmem_limit_kib moves it): v5e 16 MiB ("limit 16.00M"); v6e 32 MiB ("Scoped allocation with
+# size 32.01M and limit 32.00M", M-EM-37: TPU v6 lite, jax 0.11.2, libtpu 0.0.50, XLA's default flags).
 # v6e: two 256x256 MXUs, 918 TF over its clock -> 524288. T4: 65 TF fp16 summed in fp32 and 8.1 TF fp32
 # over 40 SMs at 1590 MHz -> 1024 and 128.
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
 _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20),
-         'v6e': Architecture(('tpu',), {'16bit': 524288}, None, vmem_bytes=128 * 2 ** 20)}
+         'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
+                             vmem_bytes=128 * 2 ** 20)}
 
 
 def architecture(generation: str) -> Architecture | None:
@@ -854,7 +857,10 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, multiprocessors=1,
               clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
-    GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
+    # One TensorCore a chip, of two 256 x 256 MXUs, 918 TF of bf16 and 1638 GB/s of HBM
+    # (cloud.google.com/tpu/docs/v6e); the clock is 918e12 / 524288, derived from the peak as v5e's.
+    GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}, multiprocessors=1,
+              clock_hz=918e12 / 524288, memory_bandwidth=1638e9),
 )}
 
 
