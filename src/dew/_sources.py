@@ -16,7 +16,7 @@ import sysconfig
 import types
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 
 def source_file(held: Callable | type) -> Path | None:
@@ -192,26 +192,54 @@ def members(held) -> list[tuple]:
     descriptor wraps (`wrapped`), anything else as itself. Of Python's own entries (`__dict__`, `__doc__`,
     `__annotations__`) only the methods the user wrote (`__call__`), which a call runs; the rest are its
     machinery's, the methods a dataclass makes among them, which the class's description states, the
-    state `abc.ABCMeta` writes into every class it makes (`_ABC_STATE`), a Grain transform's among them, and
-    the descriptor Python makes for each of a class's own slots (a slotted dataclass's fields), whose values
-    an instance's fields state (`structured`): read as code, a frozen slotted step was inexact, and its
-    unchanged exact resume refused (the base review of 826882bbf). A slotted dataclass's field default,
-    which its slots move off the class to where the dataclass's `__init__` holds it, is stated in its
-    descriptor's place, as a plain dataclass's class attribute states it: code that builds the class reads
-    it (train 942's review: skipped with the descriptor, an edited default resumed exactly)."""
-    defaults = ({field.name: field.default for field in dataclasses.fields(held)
-                 if field.default is not dataclasses.MISSING}
-                if isinstance(held, type) and dataclasses.is_dataclass(held) else {})
+    state `abc.ABCMeta` writes into every class it makes (`_ABC_STATE`), a Grain transform's among them, the
+    descriptor Python makes for each of a class's own slots (mangled or not), and a generated field's
+    default where the class attribute still holds it, which `generated_fields` states with its factory:
+    a slotted class's and a child overriding a default hold it where their class attributes do not (train
+    947's review), and a value set on the class at run time, or a class variable, stays a member (train
+    950's review: skipping every field name left them unstated)."""
+    defaults = {field.name: field.default for field in generated_fields(held)}
     found = []
     for name, member in sorted(vars(held).items()):
         member = wrapped(member)
         if ((name.startswith("__") and name.endswith("__") and not hand_written(member))
-                or isinstance(member, _ABC_STATE)):
+                or isinstance(member, _ABC_STATE)
+                or (name in defaults and member is defaults[name])
+                or (isinstance(member, types.MemberDescriptorType) and member.__objclass__ is held)):
             continue
-        if isinstance(member, types.MemberDescriptorType) and member.__objclass__ is held:
-            # The class's own slot, mangled or not: its default where a dataclass field has one.
-            if name not in defaults:
-                continue
-            member = defaults[name]
         found.append((name, member))
     return found
+
+
+class GeneratedField(NamedTuple):
+    """A field a class generator (`dataclasses`, attrs) recorded on a class: its name, its default and its
+    default factory, each `MISSING` where it has none."""
+
+    name: str
+    default: Any
+    factory: Any
+
+
+MISSING = dataclasses.MISSING
+"""What a `GeneratedField` holds where its field has no default or no factory."""
+
+
+def generated_fields(held: type) -> list[GeneratedField]:
+    """The fields a class generator recorded on `held` itself, in order, its bases' among them and an
+    override's default its own: a dataclass's (`dataclasses.fields`, its class and init variables, which
+    are no fields, apart) or an attrs class's (`__attrs_attrs__`, a default `attrs.Factory`'s factory its
+    factory). Empty for a class no generator made itself."""
+    if "__dataclass_fields__" in vars(held):
+        return [GeneratedField(field.name, field.default, field.default_factory)
+                for field in dataclasses.fields(held)]
+    if "__attrs_attrs__" in vars(held):
+        # attrs is loaded where a class of it exists; its sentinel and factory type are its own.
+        attr = sys.modules["attr"]
+        found = []
+        for field in vars(held)["__attrs_attrs__"]:
+            default, factory = field.default, MISSING
+            if isinstance(default, attr.Factory):
+                default, factory = MISSING, default.factory
+            found.append(GeneratedField(field.name, MISSING if default is attr.NOTHING else default, factory))
+        return found
+    return []

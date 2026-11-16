@@ -430,7 +430,8 @@ def traced(digest: str) -> Launch | None:
     return _LAUNCHES.get(digest)
 
 
-def derivation_inputs(op, arguments: tokamax.BoundArguments, target) -> Hashable:
+def derivation_inputs(op, arguments: tokamax.BoundArguments, target
+                      ) -> tuple[str, Hashable, frozenset[tuple[Hashable, frozenset[str]]], bool]:
     """What a launch's derivation of its config for `arguments` on `target` reads of the launch and its
     compiles: the launch's identity (`_identity`: the op, its arguments' shapes and dtypes, its hooks), the
     whole target, whose facts price its schedules, each config this context's compiles refused it
@@ -460,14 +461,6 @@ def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
     spilled or serialized its warpgroup MMAs (`refused_at`). A template's legality reads it, so its derivation
     takes the next config."""
     return bool(refused_at(op, arguments, config))
-
-
-def refusals_at(op, arguments: tokamax.BoundArguments
-                ) -> tuple[str, frozenset[tuple[Hashable, frozenset[str]]]]:
-    """`op`'s launch of `arguments` by its identity (`_identity`), and each config a compile of this process
-    refused it at, with the kernels refused there (`refusals_of`)."""
-    identity = _identity(op, arguments)
-    return identity, refusals_of(identity)
 
 
 def refused_any(op, arguments: tokamax.BoundArguments) -> bool:

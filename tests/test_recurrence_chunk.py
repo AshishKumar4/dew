@@ -1104,3 +1104,25 @@ def test_the_derived_rule_runs_in_a_shard_map_that_checks_varying_axes(entering,
         got = jax.jit(jax.value_and_grad(lambda *given: jnp.sum(mapped(*given) * do),
                                          argnums=range(len(operands))))(*operands)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(got))
+
+
+def test_a_call_inside_a_map_holding_an_axis_manual_selects_its_kernel():
+    """The chunked op traced inside a map that holds one mesh axis manual and leaves another automatic (a
+    DiLoCo replica's step, `dew.training.diloco`): its selectors bind the template's call on each shard of the
+    axes its own map holds (`sharding.shard_shapes`), and the trace completes. A sharding over the whole mesh
+    there named the manual axis, a manual subgroup JAX refuses, and the selection raised before any kernel ran
+    (train 942's review of the shared bind)."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    mesh = AbstractMesh((2, 2), ("outer", "data"), axis_types=(AxisType.Auto, AxisType.Auto))
+    hooks = recurrence.Hooks(decay="scalar", delta=True)
+    given = jax.ShapeDtypeStruct((4, 128, 2, 64), jnp.float32)
+    heads = jax.ShapeDtypeStruct((4, 128, 2), jnp.float32)
+
+    def inner(query, key, value, g, beta):
+        return chunk(hooks, Chunk(query, key, value, log_decay=g, beta=beta))[0]
+
+    mapped = jax.shard_map(inner, mesh=mesh, in_specs=P("outer"), out_specs=P("outer"), axis_names={"outer"})
+    with jax.sharding.use_abstract_mesh(mesh):
+        out = jax.eval_shape(mapped, given, given, given, heads, heads)
+    assert out.shape == given.shape

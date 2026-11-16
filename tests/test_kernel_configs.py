@@ -779,39 +779,80 @@ ahead's every-template cell, the hybrid compile-ahead step's: 4 experts of 8192 
 shapes and what its table gathers."""
 
 
-@lowers("sm100")
-@pytest.mark.parametrize("name", GATHERED_ON_A_B200)
-def test_a_b200s_gathered_launch_certifies_its_tcgen05_tile_on_its_second_compile(name):
-    """Each of the B200's gathered launches, certified on a compile-only B200 as a run takes it
-    (`tuning.KernelOp.taken`): its load warp's TMA gathers spill its producer at setmaxnreg's least, so its
-    certification raises the producer to its ladder's top (`grouped_matmul._Mosaic.rungs`, the program's
-    entry share) and takes its derived tcgen05 128 x 128 tile there, two certifications, nothing spilling.
-    Where its tile alone could step (row 6783), the kernel gradients stepped to 128 x 64 and then to
-    mma.sync, three certifications each."""
-    from dew.nn.kernels.generation import compile_only_gpus
-
+def _gathered_on_a_b200(name: str):
+    """The launch of `GATHERED_ON_A_B200`'s case `name` and its bound call."""
     kind, rows, matrix, gathered = GATHERED_ON_A_B200[name]
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    table = jax.ShapeDtypeStruct((4096,), jnp.int32)
-    sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+    indices = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.int32)
+    if kind == "gmm":
+        launch = grouped_matmul.MosaicGmm()
+        return launch, launch.bind(shaped(rows), shaped(matrix), indices((4,)), gather=indices(gathered),
+                                   out_dtype="bfloat16", trans_rhs=True, interpret=False)
+    launch = grouped_matmul.MosaicTgmm()
+    tables = (indices((4096,)), None) if gathered == "tokens" else (None, indices((4096,)))
+    return launch, launch.bind(shaped(rows), shaped(matrix), indices((4,)), gather=tables,
+                               out_dtype="float32", interpret=False)
+
+
+@lowers("sm100")
+@pytest.mark.parametrize("name", GATHERED_ON_A_B200)
+def test_a_b200s_gathered_launch_certifies_its_tcgen05_tile_at_its_first_compile(name):
+    """Each of the B200's gathered launches, certified on a compile-only B200 as a run takes it
+    (`tuning.KernelOp.taken`), takes its derived tcgen05 128 x 128 tile at one certification, nothing
+    spilling: its producer, which gathers a step's rows, starts at its ladder's top (`producers.started`, the
+    program's entry share). At setmaxnreg's least each spilled its load warp's gathers (row 6783): the
+    kernel gradients stepped to 128 x 64 and then to mma.sync, three certifications each; from the least
+    up the ladder, two each, the input gradient two where a constant 40 had held it at one."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    launch, arguments = _gathered_on_a_b200(name)
     [device] = compile_only_gpus("sm100", 1)
     with report.refusals(), generation.assumed("sm100"), report.certifying(device):
-        if kind == "gmm":
-            launch = grouped_matmul.MosaicGmm()
-            arguments = launch.bind(shaped(rows), shaped(matrix), sizes, gather=jax.ShapeDtypeStruct(gathered,
-                                    jnp.int32), out_dtype="bfloat16", trans_rhs=True, interpret=False)
-        else:
-            launch = grouped_matmul.MosaicTgmm()
-            tables = (table, None) if gathered == "tokens" else (None, table)
-            arguments = launch.bind(shaped(rows), shaped(matrix), sizes, gather=tables, out_dtype="float32",
-                                    interpret=False)
         before = len(report.certifications())
         tile = launch.taken(arguments)
         certified = report.certifications()[before:]
     assert (tile.family.startswith("tcgen05"), tile.block_m, tile.block_n) == (True, 128, 128), tile
     assert tile.producers.of(launch.KERNEL) is not None, tile
-    assert len(certified) == 2, [(each.config, [b.frame for b in each.refused]) for each in certified]
+    assert len(certified) == 1, [(each.config, [b.frame for b in each.refused]) for each in certified]
     assert not certified[-1].refused
+
+
+@lowers("sm100")
+@pytest.mark.parametrize("name", GATHERED_ON_A_B200)
+def test_a_b200s_gathered_launch_fits_its_derived_resources(name):
+    """Each of the B200's gathered launches compiles at its derived tile as its model plans it
+    (`mosaic_failures`): the shared memory the planner sized, its gathered stream's barriers among it (row
+    5358: planned as plain ones, 976 bytes short), and the producer registers its schedule lowers to."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    launch, arguments = _gathered_on_a_b200(name)
+    with report.refusals(), generation.assumed("sm100"):
+        tile = launch.derived(arguments, generation.gpu_target())
+        assert tile is not None
+        found = compile_mosaic_kernels([support.KernelCase(name, lambda: launch.lowering(arguments, tile),
+                                                           {launch.KERNEL: _model(launch, arguments, tile)})],
+                                       "sm100")
+    failed = mosaic_failures(found)
+    assert not failed, "\n".join(failed)
+
+
+def test_a_refused_gathering_producer_offers_its_whole_ladder_and_its_refused_tile_is_no_pick():
+    """The B200's gathered input gradient's derived tile, its producer at its ladder's top
+    (`producers.started`), refused as a compile finding its kernel spilling refuses it
+    (`report.refuse_launch`): its rungs (`_Mosaic.rungs`) are its producer's whole ladder below it, a
+    setmaxnreg step lower each down to a step above the least, none waiting on a rung's own refusal, so
+    certification asks them a round at a time (`tuning.KernelOp._climbed`); the refused tile is no pin or
+    stored pick (`pinnable`)."""
+    launch, arguments = _gathered_on_a_b200("input gradient, its rows gathered")
+    with report.refusals(), generation.assumed("sm100"):
+        tile = launch.derived(arguments, generation.gpu_target())
+        steps = resources.facts().raises()
+        report.refuse_launch(launch, arguments, tile, {launch.KERNEL})
+        ladder = [rung.producers.of(launch.KERNEL) for rung in launch.rungs(arguments, tile)]
+        pinnable = launch.pinnable(arguments, tile)
+    top = tile.producers.of(launch.KERNEL)
+    assert ladder == list(range(top - steps.step, steps.lowest, -steps.step)), ladder
+    assert not pinnable
 
 
 def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():

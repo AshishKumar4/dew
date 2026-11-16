@@ -514,9 +514,10 @@ class Allocations:
     matrices, each row tile's the same column block; `tgmm`'s cotangent, each depth tile's the same rows and
     columns."""
     gathered: tuple = ()
-    """The streams a producer gathers (`GATHERED_STREAMS`, `mosaic.Family.streams`' `gathered`): their load
-    barriers its family's own (`gathered.ring`'s 8-byte words at a 1024-byte alignment, which the planner
-    counted as plain barriers: 976 bytes short of a B200's gathered input gradient's, row 5358)."""
+    """The streams a producer gathers (`GATHERED_STREAMS`, a kernel gradient's `_tgmm_rings`;
+    `mosaic.Family.streams`' `gathered`): their load barriers its family's own (`gathered.ring`'s 8-byte
+    words at a 1024-byte alignment, which the planner counted as plain barriers: 976 bytes short of a B200's
+    gathered input gradient's, row 5358, and of its gathered kernel gradients')."""
 
     def scope(self, family: mosaic.Family, tiles: "Tiles", steps: int | None = None,
               rewritten: bool = False) -> resources.Scope:
@@ -628,12 +629,13 @@ SCALE_SWIZZLES = {'row_scales': swizzling.UNSWIZZLED, 'column_scales': swizzling
 def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dtype,
                      prologue_axes: tuple, prologue_dtypes: tuple, out_dtype, k_major: bool = False,
                      step_scaled: bool = False, unstaged: bool = False,
-                     gathered: bool = False) -> Allocations:
+                     gathered: tuple[bool, ...] = (False, False), interpret: bool = False) -> Allocations:
     """Dew: `tgmm`'s allocations at `tiles` (`Allocations`): a ring for the rows, the cotangent and each
     prologue side operand with rows that follows the steps (`_stepped`), each side operand without rows'
     staging, the consumers' meeting where they prepare their stages (not `unstaged`, `rows_unstaged`), and
     its output's share of the tile; a cluster's depth tiles reading the cotangent's blocks alike, which they
-    load once between them (`Allocations.shared`), but where its rows are `gathered` (a table's)."""
+    load once between them (`Allocations.shared`), but where its rows are gathered; the rings a producer
+    gathers compiled (`gathered`: whether the rows' and the cotangent's are a table's, `_tgmm_rings`)."""
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     stepped, _, fixed = _stepped(family, prologue_axes, 'rows')
     extent = {'rows': block_k, 'depth': block_m}
@@ -652,7 +654,7 @@ def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dt
     # (`tile_columns`), each stream's slot a multiprocessor's block.
     return Allocations(blocks, (held['fixed_smems'], held['fixed_barriers'], *meeting),
                        (((tiles.share, tile_columns(tiles, family)), jnp.dtype(out_dtype)),),
-                       () if gathered else ('ring_1',))
+                       () if gathered[1] else ('ring_1',), () if interpret else _tgmm_rings(gathered))
 
 
 def _stepped(family: mosaic.Family, axes_of: tuple, stepping: str) -> tuple[tuple, tuple, tuple]:
@@ -2051,10 +2053,10 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     # from global memory.
     stepped, read, fixed = _stepped(family, prologue_axes, 'rows')
     allocations = tgmm_allocations(tiles, family, lhs_dtype=lhs.dtype, rhs_dtype=rhs.dtype,
-                                   gathered=tables[1] is not None, prologue_axes=prologue_axes,
-                                   prologue_dtypes=_dtypes_of(prologue_operands),
-                                   out_dtype=out_dtype, k_major=k_major, step_scaled=step_scales is not None,
-                                   unstaged=unstaged)
+                                   gathered=tuple(table is not None for table in tables),
+                                   interpret=bool(interpret), prologue_axes=prologue_axes, unstaged=unstaged,
+                                   prologue_dtypes=_dtypes_of(prologue_operands), out_dtype=out_dtype,
+                                   k_major=k_major, step_scaled=step_scales is not None)
     unrolled = _gradient_unrolled(family, unstaged=unstaged, exact_sums=exact_sums,
                                   scaled=step_scales is not None)
 
@@ -2195,13 +2197,19 @@ def _tgmm_gathered(tables: tuple, blocks: dict, interpret: bool) -> dict:
     """Dew: a gathered kernel gradient's streams (`family.streams`' arguments, `_gathered`'s for `gmm`): each
     gathered operand's ring (`ring_0` the rows', `ring_1` the cotangent's) its producer's gather, or
     interpreted each of a step's rows its copies (`rings.piece_copies`, at no stated swizzle)."""
-    names = tuple(name for name, table in zip(('ring_0', 'ring_1'), tables, strict=True) if table is not None)
+    names = _tgmm_rings(tuple(table is not None for table in tables))
     if not names:
         return {}
     if interpret:
         return {'copies': {name: blocks[name][0][0] * rings.piece_copies(blocks[name][0], blocks[name][1],
                                                                           None, 1) for name in names}}
     return {'gathered': names}
+
+
+def _tgmm_rings(gathered: tuple[bool, ...]) -> tuple[str, ...]:
+    """Dew: a kernel gradient's gathered rings, `ring_0` the rows', `ring_1` the cotangent's, of whether each
+    is a table's."""
+    return tuple(name for name, held in zip(('ring_0', 'ring_1'), gathered, strict=True) if held)
 
 
 def _tgmm_scheduled(index, *, groups: tuple, operands: tuple, tail: tail_of.Tail | None, programs: int,

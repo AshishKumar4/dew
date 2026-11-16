@@ -1,6 +1,6 @@
 """XLA's portable grouped and dense products, the arm every grouped launch's selector falls back to and the
 GEMM's own portable branch (`kernels.gemm`): its products as the call's precision multiplies them
-(`_as_multiplied`), dense (`xla_dot`) and ragged (`xla_ragged_dot`, its rows placed past the groups,
+(`as_multiplied`), dense (`xla_dot`) and ragged (`xla_ragged_dot`, its rows placed past the groups,
 `ragged_placement`), a step-scaled one (`step_scaled`), a projection differentiated by its own products
 (`portable_projection`), and the platform choice between a kernel and them (`_on_platform`)."""
 
@@ -38,7 +38,7 @@ def _on_platform(kernel, fallback, interpret_on_cpu: bool):
     return branches, fallback
 
 
-def _as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLike) -> tuple:
+def as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLike) -> tuple:
     """`tokens` and `kernel` as XLA's portable product multiplies them, and its precision (`xla_ragged_dot`,
     `xla_dot`). A precision level (`lax.Precision`) on 16-bit operands is their product's at the default,
     every level the same exact products; an explicit dot algorithm a call states (`lax.DotAlgorithm`,
@@ -65,10 +65,10 @@ def _as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLik
 def xla_dot(tokens: jax.Array, matrix: jax.Array, *, precision: PrecisionLike = None,
             preferred_element_type: Dtype | None = None) -> jax.Array:
     """A dense product, every row through one matrix (`[depth, width]`), as `xla_ragged_dot` multiplies a
-    group's rows (`_as_multiplied`), as XLA's own dot: no group, so no row masked, and no ragged dot to
+    group's rows (`as_multiplied`), as XLA's own dot: no group, so no row masked, and no ragged dot to
     trace or to expand (a dense call's portable branch, `gemm`'s), summed as `precision.accumulated` sums a
     contraction (XLA's own on a CPU, row 5448)."""
-    tokens, matrix, precision = _as_multiplied(tokens, matrix, precision)
+    tokens, matrix, precision = as_multiplied(tokens, matrix, precision)
     return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (0,)), ((), ())),
                                          precision=precision),
                        tokens, matrix, preferred_element_type=preferred_element_type)
@@ -89,7 +89,7 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     nor a dropped row's gradient carries them. Its sums are `precision.accumulated`'s (XLA's own on a CPU,
     row 5448).
     """
-    tokens, kernel, precision = _as_multiplied(tokens, kernel, precision)
+    tokens, kernel, precision = as_multiplied(tokens, kernel, precision)
     # bincount widens under x64; TPU ragged-dot only lowers int32 counts.
     # Keep the wider domain for CPU calls whose row count actually needs it.
     index_dtype = jnp.int32 if tokens.shape[0] <= np.iinfo(np.int32).max else jnp.int64
