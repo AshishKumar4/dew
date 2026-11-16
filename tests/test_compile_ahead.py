@@ -628,6 +628,44 @@ def test_a_program_kept_over_a_numpy_scalar_is_not_handed_for_a_0d_array_of_its_
         assert fresh()(Factor(np.array(1, np.float32)), values).tolist() == [3.0] * 3
 
 
+def counting_state(values: jax.Array):
+    """The state of an optimizer whose factory makes its state's class at each call (`counting`), begun for
+    `values`: a program whose results' tree no file of programs states."""
+    from optim_support import counting
+
+    return counting(1e-2).init(values)
+
+
+def test_a_program_whose_trees_no_file_states_compiles_where_programs_are_handed_and_is_kept_by_none(
+        tmp_path):
+    """A program whose results are an optimizer's state of a class its factory makes (`counting`), a node
+    no process names, is one no file of programs holds: a block that keeps programs refuses it, and a block
+    handed a file, or programs compiled ahead, compiles and runs it; a training step over that state
+    compiled ahead is refused (`Unestablished`, which names it). The keeping block pickled the class's
+    tree before stating it, and raised on Python 3.12 (train 964)."""
+    from optim_support import counting
+
+    from dew._stated import Unestablished
+    from dew.nn.kernels.options import owned_program, taking
+    from dew.training.ahead import compile_ahead, keeping, kept
+
+    values = jnp.ones(3)
+    path = tmp_path / "programs.dew-aot"
+    with keeping() as programs:
+        owned_program(counting_state)(values)
+    programs.save(path)
+    assert len(programs.refused) == 1 and programs.kept == {}
+    with kept(path):
+        assert int(owned_program(counting_state)(values).steps) == 0
+    with taking({}):
+        assert int(owned_program(counting_state)(values).steps) == 0
+    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER)
+    trainer = Trainer(LMObjective(model, SEQ_LEN), counting(1e-2), key=jax.random.key(0),
+                      mesh=MeshSpec().build(gpus("sm80")))
+    with pytest.raises(Unestablished):
+        compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class Scales:
     """A static argument whose field holds dictionaries through NumPy's storage of pointers."""

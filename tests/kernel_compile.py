@@ -668,12 +668,12 @@ module: Mosaic compiles a module once a process, so a later case of the same mod
 (`inherited`)."""
 
 
-def inherited(kernel: dict, compiled: dict[str, dict], generation: str | None = None) -> dict:
+def inherited(kernel: dict, compiled: dict[str, dict], generation: str) -> dict:
     """`kernel`'s record (`mosaic_kernels`) with its registers and spills, their only source: as the GPU
     compiles its PTX, this compile's (`compiled`, by its name and launch, `report.launch_name`), which this
     process keeps by its module (`COMPILED`), or, where Mosaic compiled the same module before in this process
     and so printed no PTX, that compile's. A kernel neither covers takes its executable's binary's where this
-    process's one CUDA build is a build `generation`'s GPUs run (`_assembles_for`), its assembler then theirs;
+    process's builds are every build `generation`'s GPUs run (`_assembles_for`), its verdict then theirs;
     elsewhere it keeps them unread, another compiler's verdict no evidence of the GPU's."""
     name = report.launch_name(kernel["kernel"], kernel["launch"])
     if name in compiled:
@@ -682,11 +682,10 @@ def inherited(kernel: dict, compiled: dict[str, dict], generation: str | None = 
         return {**kernel, **compiled[name]}
     if kernel["module"] in COMPILED:
         return {**kernel, **COMPILED[kernel["module"]], "ptxas": "an earlier compile of its module"}
-    if kernel["binary_registers"] is not None and generation is not None and _assembles_for(generation):
+    if kernel["binary_registers"] is not None and _assembles_for(generation):
         # No PTX of it in this process (its module compiled before the gate's): its executable's binary
-        # (`report.binaries`), as certification reads it, where this process's one CUDA build is a build the
-        # generation's GPUs run, so its assembler's verdict is one of theirs (train 956 F1: a B200 runs the
-        # cuda13 build alone, whose spills the cuda12 build's differ from, rows 5671, 5759, 5761).
+        # (`report.binaries`), as certification reads it, where this process's builds are every build the
+        # generation's GPUs run (`_assembles_for`; train 956 F1, train 960 F1).
         return {**kernel, "registers": kernel["binary_registers"], "spilled": kernel["binary_frame"],
                 "ptxas": "its executable's binary"}
     unread = [*kernel["unread"], *(field for field in ("registers", "spills")
@@ -695,10 +694,11 @@ def inherited(kernel: dict, compiled: dict[str, dict], generation: str | None = 
 
 
 def _assembles_for(generation: str) -> bool:
-    """Whether this process's Mosaic GPU binaries are assembled by a build `generation`'s GPUs run: its one
-    CUDA build installed (`dew._devices.cuda_builds`) among theirs (`dew._builds.generation_builds`)."""
-    builds = cuda_builds()
-    return len(builds) == 1 and builds[0] in generation_builds(generation)
+    """Whether this process's Mosaic GPU binaries are the verdict of every build `generation`'s GPUs run: its
+    CUDA builds installed (`dew._devices.cuda_builds`) theirs exactly (`dew._builds.generation_builds`), the
+    gate judging a kernel by its worst result under each (an H100 runs cuda13 and cuda12, whose spills differ,
+    rows 5671, 5759, 5761; a B200 cuda13 alone)."""
+    return tuple(cuda_builds()) == generation_builds(generation)
 
 
 PTX: dict[str, str] = {}

@@ -7,6 +7,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A process holds the step executables its plans compiled (`dew.nn.kernels.options.hold`), by the program,
+  its options and its devices: a later trainer of the same step plans on the earlier's executable, where
+  each new trainer read it back from the persistent compilation cache (4.4 s of a small model's 11.9 s
+  start on CPU). It still traces its step, whose kernel report its lowering gives; `options.release` drops
+  them with every program's executables.
+
 - `dew.training.ahead.kept(path)` verifies by default: each handed call's own program is lowered and held to
   the kept one's digest before the kept executable runs, so a kept program its call no longer lowers to is
   refused (`NotTheKeptProgram`), never run; it still compiles nothing. `kept(path, verify=False)` is the
