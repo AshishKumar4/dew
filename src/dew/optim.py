@@ -35,7 +35,7 @@ import optax
 import tyro
 from optax.contrib import _muon
 
-from dew._moments import bf16_moments, int8_moments, scale_by_adam
+from dew._moments import bf16_moments, int8_moments, refuse_zero_guard, scale_by_adam
 from dew._records import share
 from dew._schedule_pieces import (
     Horizon,
@@ -323,6 +323,7 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
     (`OptimConfig`'s `ns_group`) and no plan sets yet (row 5889). Each parameter's matrix is its dimension
     numbers' (`muon_weight_dimension_numbers`), or each of its heads' where `per_head` names it
     (`head_widths`)."""
+    refuse_zero_guard(eps, of="Muon")
     coefficients = _coefficients(ns_coeffs, ns_steps)
     algorithm = dot_algorithm(ns_precision)
 
@@ -1085,6 +1086,7 @@ def scale_by_trust_ratio(min_norm: float = 0.0, trust_coefficient: float = 1.0,
 
 def _lamb(learning_rate, b1=0.9, b2=0.999, eps=1e-6, eps_root=0.0, weight_decay=0.0, mask=None):
     """optax.lamb, its trust ratio each stored layer's (`scale_by_trust_ratio`)."""
+    refuse_zero_guard(eps, eps_root, of="LAMB")
     return optax.chain(optax.scale_by_adam(b1=b1, b2=b2, eps=eps, eps_root=eps_root),
                        optax.add_decayed_weights(weight_decay=weight_decay, mask=mask),
                        scale_by_trust_ratio(), optax.scale_by_learning_rate(learning_rate))

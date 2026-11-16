@@ -340,6 +340,13 @@ def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     wrapper of other hyperparameters is read through to the optimizer it holds. The result is None
     when the optimizer closes over the rate, or when parameter groups hold several rates.
     """
+    rates = learning_rates(opt_state)
+    return rates[0] if len(rates) == 1 else None
+
+
+def learning_rates(opt_state: optax.OptState) -> list[jax.typing.ArrayLike]:
+    """Every learning rate injected in `opt_state` (`injected_edited`), each group's where parameter groups
+    hold several, in the state's order: what a step reads to refuse a rate that is not finite."""
     rates = []
 
     def read(path, node):
@@ -348,7 +355,7 @@ def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
         return node
 
     injected_edited(opt_state, read)
-    return rates[0] if len(rates) == 1 else None
+    return rates
 
 
 def schedule_states(optimizer: optax.GradientTransformation, params) -> optax.OptState:

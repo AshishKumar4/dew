@@ -66,6 +66,15 @@ def moment_dtype(param, dtype):
     return dtype
 
 
+def refuse_zero_guard(eps: float, eps_root: float = 0.0, *, of: str) -> None:
+    """Refuse an optimizer `of` whose division by a moment or a norm has no guard (`eps` and `eps_root` both
+    zero): a value whose moments are zero, a parameter no batch has moved yet, would form 0/0, a step
+    finite in every input made not finite (training.md, a step that is not finite)."""
+    if eps == 0 and eps_root == 0:
+        raise ValueError(f"{of} divides by a moment or a norm, so its eps and eps_root cannot both be zero: "
+                         "a value whose moments are zero would form 0/0")
+
+
 def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
                   nesterov: bool = False, nu_dtype=None) -> optax.GradientTransformation:
     """`optax.scale_by_adam` (optax 0.2.8) with its bias corrections formed in double
@@ -73,6 +82,7 @@ def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
     composed from optax's public tree math. `nu_dtype` stores the second moment as `mu_dtype` does
     the first, each the parameter's dtype where None; a gradient narrower than its moment is
     widened before either reads it, so an fp16 gradient's square does not underflow first."""
+    refuse_zero_guard(eps, eps_root, of="Adam")
     mu_dtype = None if mu_dtype is None else jax.dtypes.canonicalize_dtype(mu_dtype)
     nu_dtype = None if nu_dtype is None else jax.dtypes.canonicalize_dtype(nu_dtype)
 

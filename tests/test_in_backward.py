@@ -232,30 +232,35 @@ def test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time(opt
                     truth_fn=truth)
 
 
-def _walked(e, *, scale: float = 1.0, finite: bool = True, top: float = 1.0, runs: int = 1):
-    """Three layers, each `y = a x + sqrt(0 x + s - s' + e)` with `s'` the stop-gradient of `s`: a finite
-    forward, whose gradient is not finite at a layer whose `e` is zero, in its own weights and in the input
-    it hands the layer below (0 times infinity). Updated in their backward (`dew.nn.in_backward`) by an
-    Adam-like rule that counts its steps per layer, its second moment the square of `scale` times the
-    gradient (the top layer's `top` times more), under a step whose loss is `finite`: the weights, moments
-    and per-layer non-finite counts the walk leaves. Given `runs` of two, the same three layers run twice,
-    two runs one after the other in one step, the upper reading the lower's output: each run's own."""
+def _walked(e, *, finite: bool = True, top: float = 1.0, runs: int = 1):
+    """Three layers, each `y = a x + sqrt(0 x + s - s' + e) + c k` with `s'` the stop-gradient of `s` and
+    `k` a constant: a finite forward, whose gradient is not finite at a layer whose `e` is zero, in its own
+    weights and in the input it hands the layer below (0 times infinity), and whose `c` takes the gradient
+    `k`, 1 at every layer but the walk's first (the top of the upper run), whose is `top`. Updated in their
+    backward (`dew.nn.in_backward`) by an Adam-like rule that counts its steps per layer, under a step whose
+    loss is `finite`: the weights, moments and per-layer non-finite counts the walk leaves. Given `runs` of
+    two, the same three layers run twice, the upper reading the lower's output: each run's own."""
     from dew.nn import in_backward
 
     count = 3
-    weights = {"a": jnp.full((count,), 0.5), "s": jnp.ones((count,)), "e": jnp.asarray(e, jnp.float32)}
-    moments = {"mu": jax.tree.map(jnp.zeros_like, weights), "nu": jax.tree.map(jnp.zeros_like, weights),
-               "count": {name: jnp.zeros((count,)) for name in weights}}
-    norms = {"sumsq": jnp.zeros((count,)), "nonfinite": jnp.zeros((count,))}
+
+    def weights_of(run):
+        first = jnp.arange(count) == count - 1 if run == runs - 1 else jnp.zeros((count,), bool)
+        return {"a": jnp.full((count,), 0.5), "s": jnp.ones((count,)), "e": jnp.asarray(e, jnp.float32),
+                "c": jnp.zeros((count,)), "k": jnp.where(first, top, 1.0).astype(jnp.float32)}
+
+    weights = [weights_of(run) for run in range(runs)]
+    moments = [{"mu": jax.tree.map(jnp.zeros_like, held), "nu": jax.tree.map(jnp.zeros_like, held),
+                "count": {name: jnp.zeros((count,)) for name in held}} for held in weights]
+    norms = [{"sumsq": jnp.zeros((count,)), "nonfinite": jnp.zeros((count,))} for _ in range(runs)]
 
     def layer(w, x, per_layer):
-        return w["a"] * x + jnp.sqrt(0 * x + w["s"] - jax.lax.stop_gradient(w["s"]) + w["e"])
+        return (w["a"] * x + jnp.sqrt(0 * x + w["s"] - jax.lax.stop_gradient(w["s"]) + w["e"])
+                + w["c"] * jax.lax.stop_gradient(w["k"]))
 
     def update(path, index, gradient, held, moments):
         mu = jax.tree.map(lambda m, g: 0.9 * m + g, moments["mu"], gradient)
-        # The walk's first layer: the top of the upper run.
-        factor = scale * jnp.where((index == 2) & (path[0] == f"run{runs - 1}"), top, 1.0)
-        nu = jax.tree.map(lambda v, g: 0.99 * v + jnp.square(factor * g), moments["nu"], gradient)
+        nu = jax.tree.map(lambda v, g: 0.99 * v + 0.01 * jnp.square(g), moments["nu"], gradient)
         moved = jax.tree.map(lambda w, m, v: w - 0.1 * m / (jnp.sqrt(v) + 1.0), held, mu, nu)
         return moved, {"mu": mu, "nu": nu, "count": jax.tree.map(lambda c: c + 1, moments["count"])}
 
@@ -266,12 +271,11 @@ def _walked(e, *, scale: float = 1.0, finite: bool = True, top: float = 1.0, run
                                         x, None, ())
         return x
 
-    copies = [weights] * runs, [moments] * runs, [norms] * runs
     with in_backward.planned(in_backward.InBackward(update=update, moments=("mu", "nu", "count"))), \
             in_backward.gated(jnp.asarray(a=True), jnp.asarray(finite)):
         # Compiled, as a step is: each run's backward traced on its own (`marked`), so the latch crosses
         # runs as data the walk carries, not as a value one trace leaves another.
-        walked = program(jax.grad(loss, argnums=(0, 1, 2)))(*copies)
+        walked = program(jax.grad(loss, argnums=(0, 1, 2)))(weights, moments, norms)
     return walked if runs > 1 else tuple(each[0] for each in walked)
 
 
@@ -279,26 +283,22 @@ def test_a_layer_walked_past_a_gradient_that_is_not_finite_keeps_its_weights_and
     """A step updating in its backward whose gradient first turns non-finite at the middle of three layers,
     a finite loss above it: the top layer, walked first, moves and stays finite; the middle layer and the
     one below, whose gradients are not finite, keep their weights and take the zero gradient's update, so
-    every layer's count steps alike; the walk counts both non-finite (training.md, a step that is not finite;
-    train 912's review, F2). A layer whose candidate overflows from a finite gradient (a moment past float32)
-    keeps its weights too, and a step whose loss is not finite moves no layer."""
+    every layer's count steps alike; the walk counts both non-finite (training.md, a step that is not
+    finite; train 912's review, F2). A top layer whose gradient is finite and past the magnitude bound
+    (`dew.nn.finite.MAGNITUDE_BOUND`: 1e20, whose square no moment holds) is held, and every layer walked
+    after it by the walk's latch, each count stepping; a step whose loss is not finite moves no layer."""
     weights, moments, norms = _walked([1.0, 0.0, 1.0])
     assert bool(jnp.all(jnp.isfinite(weights["a"]))) and float(weights["a"][2]) != 0.5
     np.testing.assert_array_equal(np.asarray(weights["a"][:2]), [0.5, 0.5])
     np.testing.assert_array_equal(np.asarray(moments["count"]["a"]), [1.0, 1.0, 1.0])
     assert [bool(count > 0) for count in norms["nonfinite"]] == [True, True, False]
-    overflowed, held, norms = _walked([1.0, 1.0, 1.0], scale=1e20)
-    np.testing.assert_array_equal(np.asarray(overflowed["a"]), [0.5, 0.5, 0.5])
-    # The top layer's candidate counts not finite; those after it are held by the walk's latch.
-    assert bool(jnp.all(jnp.isfinite(held["nu"]["a"])))
+    latched, counted, norms = _walked([1.0, 1.0, 1.0], top=1e20)
+    np.testing.assert_array_equal(np.asarray(latched["a"]), [0.5, 0.5, 0.5])
+    np.testing.assert_array_equal(np.asarray(counted["count"]["a"]), [1.0, 1.0, 1.0])
+    assert bool(jnp.all(jnp.isfinite(counted["nu"]["c"])))
     np.testing.assert_array_equal(np.asarray(norms["nonfinite"] > 0), [False, False, True])
     unmoved, _, _ = _walked([1.0, 1.0, 1.0], finite=False)
     np.testing.assert_array_equal(np.asarray(unmoved["a"]), [0.5, 0.5, 0.5])
-    # The top layer's candidate overflows from a finite gradient: it and every layer walked after it keep
-    # their weights, each count stepping (the round-2 review's F1: the layers below it moved).
-    latched, counted, _ = _walked([1.0, 1.0, 1.0], top=1e20)
-    np.testing.assert_array_equal(np.asarray(latched["a"]), [0.5, 0.5, 0.5])
-    np.testing.assert_array_equal(np.asarray(counted["count"]["a"]), [1.0, 1.0, 1.0])
 
 
 def test_a_walk_names_the_first_layer_it_met_not_finite_across_its_stage_axis():
@@ -319,7 +319,7 @@ def test_a_walk_names_the_first_layer_it_met_not_finite_across_its_stage_axis():
 
 def test_a_layer_held_in_an_upper_run_holds_every_layer_of_the_runs_walked_after_it():
     """A compiled step of two in-backward runs, one after the other, whose upper run's top layer, the walk's
-    first, forms a candidate past float32 from a finite gradient: every layer of both runs keeps its
+    first, takes a finite gradient past the magnitude bound: every layer of both runs keeps its
     weights, each count stepping alike, as one run's layers after a held one do (training.md, a step that
     is not finite). The latch started anew in each run, so the lower run's layers moved (train 921's
     review, F1), and carried as a value between runs it escaped the compiled backward's own trace (the

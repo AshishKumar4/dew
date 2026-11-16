@@ -246,16 +246,6 @@ def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | N
                            f"is written and {said} is the one a resume finds")
 
 
-def stop_non_finite(state: TrainState, step: int) -> None:
-    """Stop a run whose `state` holds a value that is not finite (`first_non_finite`), naming the step and
-    the first such leaf: read at each log step, outside the step's program, so a finite gradient whose
-    update overflowed (an Adam moment past float32, which freezes its parameter while the loss stays
-    finite) stops the run though it saves nothing (training.md, a step that is not finite)."""
-    first = first_non_finite(state)
-    if first is not None:
-        raise RuntimeError(f"step {step}'s state holds a non-finite value at {first}, so the run stops")
-
-
 def _closer(stream: Iterator[Batch]) -> Callable[[], None] | None:
     """`stream`'s close, where it states one."""
     return stream.close if isinstance(stream, Closeable) else None
@@ -1861,7 +1851,6 @@ class Trainer(Generic[Loss, Effects]):
         logged = plan.falls(plan.log_every, current, counts)
         if logged:
             self._take(plan, run, interval, state)
-            stop_non_finite(state, current)
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
             # The clock is read at the log interval, where the step is already waited on, so a pool's

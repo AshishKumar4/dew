@@ -64,7 +64,7 @@ from dew.objectives.base import (
 )
 from dew.objectives.routing import refuse_fixed_routers
 from dew.optim import clips_qk, post_step_order, stepped
-from dew.optim_schedules import injected_edited
+from dew.optim_schedules import injected_edited, learning_rates
 from dew.state import Accumulation, ReplicaState, TokenCount, TrainState, apart, occupancy, together
 from dew.training.distributed import microbatch
 from dew.training.inspection import Inspection, Summaries, stacked, summaries
@@ -1131,7 +1131,16 @@ class Transaction:
             update, opt_state = optimizer_update(
                 self.optimizer, native, current.opt_state, stored, qk=qk, statistics=statistics,
                 progress=None if self.bound is None else self.progress(current))
-            update = zeroed_unless(native_finite, update) if gated else update
+            # What bounded inputs leave open, read where it is formed: the step's learning rates, a scalar
+            # each (an injected rate a user set infinite), and a Gauss-Newton solve's direction, its
+            # system's (`statistics`) conditioning no input bounds, over the few weights such a solve has.
+            # A scaled step's acceptance reads its whole new state instead (`finish_attempt`).
+            formed = jnp.asarray(a=True)
+            if gated:
+                for rate in learning_rates(opt_state):
+                    formed = formed & jnp.isfinite(rate)
+                formed = formed & all_finite(update) if solves_equations(current.opt_state) else formed
+            update = zeroed_unless(native_finite & formed, update) if gated else update
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
             # rescale, a bounded group's clamp) acts on them (`stepped`).
             params = {**current.variables, "params": stepped(stored, update, current.opt_state, opt_state,
@@ -1142,7 +1151,7 @@ class Transaction:
                 moved = applied.onto(dataclasses.replace(current, variables=params, opt_state=opt_state))
                 params, opt_state = moved.variables, moved.opt_state
             params = {**params, "params": self.objective.projected(params["params"], updated=True)}
-            done = update_applied(current.opt_state, opt_state) & (native_finite | (not gated))
+            done = update_applied(current.opt_state, opt_state) & ((native_finite & formed) | (not gated))
             if self.aux_shape.effects is not None:
                 written = write_back(params, self.objective.apply_effects(
                     params, self.effects_tree.unflatten(effects)))
@@ -1162,15 +1171,21 @@ class Transaction:
                 self.inspection, stored, native, update, params["params"])
             updates = current.updates + done.astype(current.updates.dtype)
             return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
-                                       updates=updates), inspected
+                                       updates=updates), inspected, formed
 
         if current.scale is None:
-            return *apply(current), native_finite, norm
+            committed, inspected, formed = apply(current)
+            return committed, inspected, native_finite & formed, norm
+
+        def scaled(current):
+            committed, inspected, _ = apply(current)
+            return committed, inspected
+
         if self.size == 1:
-            applied, inspected = apply(current)
+            applied, inspected = scaled(current)
             return _chosen(native_finite, applied, current), inspected, native_finite, norm
-        unapplied = jax.tree.map(jnp.zeros_like, jax.eval_shape(apply, current)[1])
-        return *_only_when(native_finite, apply, lambda x: (x, unapplied), current), native_finite, norm
+        unapplied = jax.tree.map(jnp.zeros_like, jax.eval_shape(scaled, current)[1])
+        return *_only_when(native_finite, scaled, lambda x: (x, unapplied), current), native_finite, norm
 
     def watched_summaries(self, aux, probed) -> dict[str, jax.Array]:
         """A sampled step's watched modules' summaries: their outputs' (`watched_activations`), and with
@@ -1302,10 +1317,12 @@ class Transaction:
         finite = finite & native_finite
         if scale is None and not holding:
             numerical = _collections_kept(finite, numerical, state, aux.variables)
-        if scale is not None:
+        if scale is not None or holding:
+            # A step taken whole or not at all reads what it formed: its whole new state finite. For an
+            # optimizer that holds updates back (`optax.MultiSteps`), that is its inner optimizer's state over
+            # the window's gathered gradient, which a sum of the window's bounded gradients can carry past
+            # the bound its moments hold (`dew.nn.finite.MAGNITUDE_BOUND` over the window's length).
             accepted = finite & all_finite(checked(numerical))
-        elif holding:
-            accepted = finite
         if previous is not None:
             numerical = dataclasses.replace(
                 numerical, accumulation=self._retained_window(state, batch, pending, attempt, read))
