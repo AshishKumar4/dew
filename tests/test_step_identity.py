@@ -424,7 +424,7 @@ class Hooked:
     scaled: int = attrs.field(default=1, on_setattr=lambda instance, attribute, value: value * {hook})
 
 
-@attrs.define(frozen=True)
+@attrs.define(frozen=True, order=True)
 class Keyed:
     value: int = attrs.field(eq=lambda value: value % {modulus}, order=lambda value: value * {sign})
     checked: int = attrs.field(default=1, validator=attrs.validators.and_(
