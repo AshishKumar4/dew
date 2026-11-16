@@ -1920,3 +1920,19 @@ def test_an_optimizer_dividing_with_no_guard_is_refused_at_build(optimizer, opts
     form 0/0, a step finite in every input made not finite (training.md, a step that is not finite)."""
     with pytest.raises(ValueError):
         OptimConfig(optimizer=optimizer, learning_rate=1e-3, optimizer_opts=opts).build(None)
+
+
+def test_lambs_trust_ratio_is_finite_where_the_update_is_tiny_beside_the_parameters():
+    """LAMB's trust ratio scales a layer's update to its parameters' norm: an update of 1e-22 beside
+    parameters of 5e18 (norm 1e19) is scaled to that norm, each element 5e18, finite, as `(u / |u|) |p|`, where a backend keeps the
+    update's subnormal squares (its norm near 2e-22), and the quotient of the two norms, 1e41, formed first,
+    passed float32 and made the update infinite; where a backend flushes them, the norm is zero and the
+    layer keeps its update (XLA:CPU does)."""
+    from dew.nn.sharding import layer_norms
+    from dew.optim import scale_by_trust_ratio
+
+    params = {"w": jnp.full((4,), 5e18, jnp.float32)}
+    updates = {"w": jnp.full((4,), 1e-22, jnp.float32)}
+    scaled, _ = scale_by_trust_ratio().update(updates, scale_by_trust_ratio().init(params), params)
+    kept = float(layer_norms(updates["w"], 0, 0.0).max()) == 0.0
+    np.testing.assert_allclose(np.asarray(scaled["w"]), np.full((4,), 1e-22 if kept else 5e18), rtol=1e-5)
