@@ -741,8 +741,41 @@ LAID_SEEDS = {"dense": {"packed": 8, "padded": 128, "split": 256},
 5b91fd892, pretrained's and distributed's at 88edfcc4a (armada, 2026-11-15)."""
 
 
-@pytest.mark.parametrize("claim", LAID)
-@pytest.mark.parametrize(("name", "cell", "site"), LAID_CELLS)
+CHECK1_SHARDS = {
+    "test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[hybrid-mamba-split]":
+        {"seeds": 256, "per_task": 64},
+    "test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[hybrid-kimi_delta_attention-split]":
+        {"seeds": 256, "per_task": 64},
+    "test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[hybrid-mamba2-padded]":
+        {"seeds": 256, "per_task": 64},
+    "test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[hybrid-mamba2-split]":
+        {"seeds": 256, "per_task": 64},
+    "test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[hybrid-memory-split]":
+        {"seeds": 256, "per_task": 64},
+    "test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid[hybrid-mamba3-split]":
+        {"seeds": 256, "per_task": 64},
+}
+"""The rows sites whose check-1 seeds run as map tasks (`check1_shards`), by node id, a literal the CI plan
+reads as it reads a mark's (tools/armada/ci.py): each takes 62 to 118 s whole on the CPU lane (main's CI
+durations) and 122 to 144 s under a loaded train's (queue train 922, row 6885), past the group target, its
+setup some 15 to 20 s of it, so 64 seeds a task keeps each well inside it."""
+
+
+def laid_sites(test: str) -> list:
+    """Every rows site (`LAID_CELLS`, each claim of `LAID`), as `test`'s parameters: each marked to run its
+    seeds as map tasks where `CHECK1_SHARDS` names its node, its declared count `LAID_SEEDS`'."""
+    def param(cell, claim: str):
+        name, values, site = cell.values
+        held = CHECK1_SHARDS.get(f"{test}[{site}-{claim}]")
+        assert held is None or held["seeds"] == LAID_SEEDS[site][claim], (site, claim, held)
+        return pytest.param(name, values, site, claim, id=f"{site}-{claim}",
+                            marks=[pytest.mark.check1_shards(**held)] if held else [])
+
+    return [param(cell, claim) for cell in LAID_CELLS for claim in LAID]
+
+
+@pytest.mark.parametrize(("name", "cell", "site", "claim"),
+                         laid_sites("test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid"))
 def test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid(name, cell, site, claim, tmp_path):
     """Packed rows equal their documents run separately, right-padded rows equal unpadded ones on the real
     tokens, and rows split over devices equal one device's read in as many microbatches (testing.md's
