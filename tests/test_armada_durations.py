@@ -185,10 +185,11 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
     """`durations` folds main's CI verdict into the record a file at a time, each whole, from its floor rows:
     a file whose cut no longer fits as its tests ran takes what they took, though no test's node id changed
     and its total barely moved (one test grown from 10 s to 180 s of 100; ten of 20 grown from 30 s to 39 s,
-    each within half again), so the next plan cuts it to fit; a file whose cut fits keeps its entries byte for
-    byte, as does one whose heaviest group is a test past the budget alone, which no cut shortens, though
-    its time moves; a file with a red group keeps its own; a file the checkout no longer has loses them; the
-    newest Python's times move nothing."""
+    each within half again), so the next plan cuts it to fit, and so does a file whose tests together took
+    under a third of its record though its cut fits; a file whose cut fits and whose total holds keeps its
+    entries byte for byte, as does one whose heaviest group is a test past the budget alone, which no cut
+    shortens, though its time moves; a file with a red group keeps its own; a file the checkout no longer has
+    loses them; the newest Python's times move nothing."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
     record, rows = {}, []
 
@@ -213,6 +214,8 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
     file("test_partial", [150.0] * 4, [[400.0, 400.0], [150.0, 150.0]], red=2)
     file("test_empty", [], [[]])  # every test deselected, its collection past the target
     rows[-2]["seconds"] = 300.0
+    # A file whose cut still fits though its tests now take a sixth of what its record says.
+    file("test_shrunk", [100.0] * 6, [[15.0, 15.0], [15.0, 15.0], [15.0, 15.0]])
     record["tests/test_gone.py::test_x"] = 5.0
     rows.append({"name": "3.12:tests/test_gone.py", "exitCode": 0, "seconds": 5.0,
                  "tests": {"tests/test_gone.py::test_x": 5.0, "tests/test_gone.py::test_y": 1.0}})
@@ -224,7 +227,7 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
     folded = json.loads((tmp_path / "tests/test_durations.json").read_text())
     observed = {node: seconds for row in rows if row["name"].startswith("3.12:") and not row["exitCode"]
                 for node, seconds in row["tests"].items()}
-    for name in ("test_grown", "test_drift"):
+    for name in ("test_grown", "test_drift", "test_shrunk"):
         assert {node: s for node, s in folded.items() if f"/{name}.py" in node} == {
             node: s for node, s in observed.items() if f"/{name}.py" in node}
     for name in ("test_steady", "test_straggler", "test_partial"):

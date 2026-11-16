@@ -1,12 +1,36 @@
-"""The coverage pass's report (tools/armada/ci.py `coverage report`): the coverage data `ci.py coverage items`'
-tasks left among their artifacts, combined, and a table a module a line, the least covered first. It runs where
-the artifacts were downloaded, under the interpreter that runs it, which must have coverage.py."""
+"""The coverage pass (tools/armada/ci.py `coverage`): its tasks, each running a plan task's files under
+coverage.py (`items`), and its report (`report`): the coverage data those tasks left among their artifacts,
+combined, and a table a module a line, the least covered first. The report runs where the artifacts were
+downloaded, under the interpreter that runs it, which must have coverage.py."""
 
 import importlib.util
 import json
 import subprocess
 import sys
 from pathlib import Path
+
+DEADLINE = 5400.0
+"""A coverage task's deadline. Branch tracing slows a task several times over, and a task cut short leaves
+its files' coverage partial, which `report` refuses."""
+SCENARIO_SUITE = ("tests/test_scenario_runs.py", "tests/test_decision_workflow.py")
+"""The scenario suite's files, as docs/design/testing.md names them: a short run a cell of each scenario its
+`SCENARIOS` registry holds, and the decision workflow's cells; `coverage items --scenarios` measures their
+per-module coverage (row 6118; train 878's review F2)."""
+
+
+def items(entries: list[dict], artifacts: str, scenarios: bool = False) -> list[str]:
+    """Plan tasks `entries` as armada map items: each runs its files under coverage.py with the test cache
+    off, its rows and data among its artifacts (`artifacts`), by `DEADLINE`. With `scenarios`, the scenario
+    suite's tasks alone (`SCENARIO_SUITE`), each running the suite's files it held."""
+    if scenarios:
+        def held(entry: dict) -> list[str]:
+            tokens = entry["tests"].split()
+            return [name for name in SCENARIO_SUITE if any(token.startswith(name) for token in tokens)]
+
+        entries = [{**entry, "tests": " ".join(held(entry))} for entry in entries if held(entry)]
+    return [f"mkdir -p {artifacts} && python3 tools/armada/ci.py task --python={entry['python']} "
+            f"--tests='{entry['tests']}' --split='{entry['split']}' --out={artifacts}/rows.json --cache=off "
+            f"--deadline={DEADLINE:.0f} --coverage={artifacts}" for entry in entries]
 
 
 def report(directory: Path) -> int:

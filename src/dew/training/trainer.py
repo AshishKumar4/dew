@@ -1663,6 +1663,8 @@ class Trainer(Generic[Loss, Effects]):
                 # (`_prefetched`), which the run reports as it starts (`DataRestarted`).
                 waited_read(run, interval, agree=True, peek=True)
         state, shardings = placed(begun)
+        if begun is not None:
+            run.startup.overlapped = begun.taken.is_set()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
         if not branched:
