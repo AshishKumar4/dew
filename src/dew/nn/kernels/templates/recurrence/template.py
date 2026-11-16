@@ -698,8 +698,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """What `kernel` reads of `config` as it is emitted: all of it but the other launches' producers and
         residents (`Tiles.producers`, each launch's own setmaxnreg cap, and `Tiles.residents`, the call's
         tiles' and its forward's apart, each a level a launch reads), so a producer's raise leaves every other
-        kernel of the launch the module it was, which a rung's certification then reads from the lowering cache and Mosaic's compile (`rungs`):
-        a rung re-lowered and recompiled every kernel of the 4B's training launch, 7 and 5 s of each 12."""
+        kernel of the launch the module it was, which a rung's certification then reads from the lowering
+        cache and Mosaic's compile (`rungs`): a rung re-lowered and recompiled every kernel of the 4B's
+        training launch, 7 and 5 s of each 12."""
         if not self._typed(config):
             return config
         # The tiles its launch is given (`Tiles.at`), its cap and residents by its name, which the launch
