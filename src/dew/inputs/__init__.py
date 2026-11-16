@@ -9,8 +9,8 @@ from typing import TYPE_CHECKING
 from dew._exports import lookup as _lookup
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
-    from dew.inputs.condition import ConditionEncoder
-    from dew.inputs.encoders import CharTable
+    from dew.inputs.condition import BackboneCall, BackboneEncoder, ConditionEncoder
+    from dew.inputs.encoders import BackboneContext, CharTable, ContextTokens
     from dew.inputs.spec import (
         AudioCondition,
         Condition,
@@ -25,7 +25,9 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.interop.encoders import CLIPText, HFAudio, T5Text
 
 _EXPORTS = {
-    "AudioCondition": "dew.inputs.spec", "CLIPText": "dew.interop.encoders",
+    "AudioCondition": "dew.inputs.spec", "BackboneCall": "dew.inputs.condition",
+    "BackboneContext": "dew.inputs.encoders", "BackboneEncoder": "dew.inputs.condition",
+    "CLIPText": "dew.interop.encoders", "ContextTokens": "dew.inputs.encoders",
     "CharTable": "dew.inputs.encoders", "Condition": "dew.inputs.spec",
     "ConditionEncoder": "dew.inputs.condition", "DiffusionConditioner": "dew.interop.conditioners",
     "Field": "dew.inputs.spec", "HFAudio": "dew.interop.encoders", "InputSpec": "dew.inputs.spec",
@@ -37,10 +39,14 @@ __getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 
 __all__ = [
     "AudioCondition",
+    "BackboneCall",
+    "BackboneContext",
+    "BackboneEncoder",
     "CLIPText",
     "CharTable",
     "Condition",
     "ConditionEncoder",
+    "ContextTokens",
     "DiffusionConditioner",
     "Field",
     "HFAudio",
