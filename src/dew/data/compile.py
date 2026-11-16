@@ -2085,13 +2085,41 @@ def _share(batch: Batch, partition: DataPartition, *, held: bool) -> Batch:
     return FilledBatch(filled, real=real).map(take_batch(batch, np.arange(rows)[mine]))
 
 
+class _Replayed:
+    """A Grain iterator whose first element was read already (`native_loader`'s probe of the batch): it
+    gives that element first, then reads on, its position the one before it until it is given."""
+
+    def __init__(self, source: pygrain.DatasetIterator, first, before):
+        self._source, self._first, self._before, self._pending = source, first, before, True
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._pending:
+            self._pending = False
+            return self._first
+        return next(self._source)
+
+    def get_state(self):
+        return self._before if self._pending else self._source.get_state()
+
+    def set_state(self, state) -> None:
+        self._pending = False
+        self._source.set_state(state)
+
+    def close(self) -> None:
+        if isinstance(self._source, Closeable):
+            self._source.close()
+
+
 class _Shared(Forwarding):
     """The `partition`'s share of each batch a stream yields (`_share`), its position, stop and close
     the stream's; it never ends where it reads a map dataset repeated without end (`native`, `endless`),
     which says so of nothing it reads."""
 
-    def __init__(self, batches: pygrain.DatasetIterator | _Whole, partition: DataPartition, *, held: bool,
-                 endless: bool = False):
+    def __init__(self, batches: pygrain.DatasetIterator | _Whole | _Replayed, partition: DataPartition, *,
+                 held: bool, endless: bool = False):
         self._source, self.partition, self.held, self._endless = batches, partition, held, endless
 
     @property
@@ -2130,23 +2158,36 @@ def native(handed: Handed, *, training: bool) -> Reader:
 
 def native_loader(handed: Handed) -> Loader:
     """The data handed to `fit` as it is (`native`) as the loader the run reads, its global batch
-    its first element's rows."""
+    its first element's rows. A Grain iterable is read once for that element: its run's first stream
+    gives it again and reads on (`_Replayed`), as the batch contract asks (training.md; row 6663)."""
     if isinstance(handed, pygrain.IterDataset):
         probe = iter(handed)
         try:
+            before = probe.get_state()
             first = next(probe)
-        finally:
+        except BaseException:
             if isinstance(probe, Closeable):
                 probe.close()
-    else:
-        first = handed[0] if isinstance(handed, pygrain.MapDataset) else {
-            name: np.asarray(column) for name, column in handed.items()}
+            raise
+        replayed = [_Replayed(probe, first, before)]
+
+        def train(partition: DataPartition) -> Iterator[Batch]:
+            source = replayed.pop() if replayed else iter(handed)
+            return _Shared(source, partition, held=False)
+
+        return Loader(train=train, val=None, records=None, batch=rows_of(_present(first)))
+    first = handed[0] if isinstance(handed, pygrain.MapDataset) else {
+        name: np.asarray(column) for name, column in handed.items()}
+    batch = rows_of(_present(first))
+    records = len(handed) * batch if isinstance(handed, pygrain.MapDataset) else batch
+    return Loader(train=native(handed, training=True), val=None, records=records, batch=batch)
+
+
+def _present(first):
+    """`first`, a dataset's first element, refused where it is missing."""
     if first is None:
         raise ValueError("a Grain dataset handed to fit gives its batches, and its first is missing (None)")
-    batch = rows_of(first)
-    records = (len(handed) * batch if isinstance(handed, pygrain.MapDataset)
-               else batch if isinstance(handed, Mapping) else None)
-    return Loader(train=native(handed, training=True), val=None, records=records, batch=batch)
+    return first
 
 
 def run_widths(measured: Sequence[_Measured], objective: ObjectiveData) -> Mapping[str, object]:

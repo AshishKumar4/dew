@@ -256,6 +256,17 @@ def stop_non_finite(state: TrainState, step: int) -> None:
         raise RuntimeError(f"step {step}'s state holds a non-finite value at {first}, so the run stops")
 
 
+def _closer(stream: Iterator[Batch]) -> Callable[[], None] | None:
+    """`stream`'s close, where it states one."""
+    return stream.close if isinstance(stream, Closeable) else None
+
+
+def _closed(stream: Iterator[Batch]) -> None:
+    """Close `stream`, where it states a close."""
+    if (close := _closer(stream)) is not None:
+        close()
+
+
 def program_digest(signature: Hashable) -> str:
     """The digest of a step's batch signature (`batch_signature`, keyed by its phase's passes), which names
     the program compiled for it in a run's records (`StepCompiled.program`, `ProfileTraced.program`)."""
@@ -1461,7 +1472,10 @@ class Trainer(Generic[Loss, Effects]):
         # its peers may never finish (`LogWriter.raise_failure`).
         unread = functools.partial(self._read_taken, run, agree=False)
         exported = waited_export(profile, profiler)
+        primed, run.primed = run.primed, None
+        unopened = None if primed is None else _closer(primed[1])
         cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
+                    ("Primed stream", unopened),
                     ("Profiler", stop_trace), ("Profile export", exported),
                     ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
                     ("Display", self._display.close))
@@ -1489,7 +1503,7 @@ class Trainer(Generic[Loss, Effects]):
         `resume="require"` refuses, and under "never" into a directory that holds no run either. An
         objective that names its input field alone declares it first (`_declare_input`)."""
         checkpoints = self.checkpoints
-        self._declare_input(lambda: first_batch(dataset, self._stream_partition()))
+        self._declare_input(lambda: self._primed_first(run, dataset))
         if resume == "require" and (checkpoints is None or initial is not None):
             raise ValueError("resume='require' continues the checkpointer's latest checkpoint, which a "
                              "trainer with no checkpointer, or a run given its state=, starts without")
@@ -1536,6 +1550,25 @@ class Trainer(Generic[Loss, Effects]):
         """The share of the run's data this process's training stream reads: the mesh's, its ramp's stages
         beginning where updates do (`window`, `Ramp.stages`)."""
         return DataPartition.of(self.device_mesh, window=self.accumulation)
+
+    def _primed_first(self, run: FitRun, dataset: Loader) -> Batch:
+        """The first batch of this process's share of `dataset`'s training stream, its stream kept open with
+        its position after it (`FitRun.primed`), which a fresh start's prefetcher hands on as its first
+        batch (`_opened`), so the run reads it once (training.md, the batch contract; row 6663); a share
+        that reads none of its own reads its pool's (`first_batch`)."""
+        partition = self._stream_partition()
+        stream = dataset.train(partition)
+        try:
+            batch = next(iter(stream), None)
+            position = stream.get_state() if isinstance(stream, Checkpointable) else None
+        except BaseException:
+            _closed(stream)
+            raise
+        if batch is None:
+            _closed(stream)
+            return first_batch(dataset, partition)
+        run.primed = (partition, stream, batch, position)
+        return batch
 
     def _declare_input(self, first: Callable[[], Batch]) -> None:
         """Declare the objective's input where it names its field alone (`Objective.named_inputs`), at the
@@ -1589,7 +1622,12 @@ class Trainer(Generic[Loss, Effects]):
         self._refusal = None
         if not complete and (pending or not plan.ended(current, interval.real_tokens, interval.consumed)):
             partition = self._stream_partition()
-            run.source = plan.dataset.train(partition)
+            primed, run.primed = run.primed, None
+            # The stream the start read its first batch from, where this run reads it from its beginning.
+            handed = primed is not None and primed[0] == partition and position is None
+            if primed is not None and not handed:
+                _closed(primed[1])
+            run.source = primed[1] if handed else plan.dataset.train(partition)
             run.unworked = isinstance(run.source, ReadsInProcess) and run.source.in_process
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None and run.restarted is None else None)
@@ -1606,7 +1644,8 @@ class Trainer(Generic[Loss, Effects]):
                                                   for stage, after in pairwise(stages))))
 
             run.partition = partition
-            run.train = self._prefetched(plan, run, run.source, position)
+            run.train = self._prefetched(plan, run, run.source, position,
+                                         primed[2:] if handed and primed is not None else None)
             run.source = None  # Lifetime transferred to the prefetch worker.
             if abstract is not None and self.rollout is None:
                 # Read on the host before the state is placed, and agreed: a process whose read failed
@@ -1701,10 +1740,11 @@ class Trainer(Generic[Loss, Effects]):
                 refusals.append(refused)
         raise refusals[-1]
 
-    def _prefetched(self, plan: FitPlan, run: FitRun, source: Iterator[Batch],
-                    position: bytes | None) -> DevicePrefetchIterator:
+    def _prefetched(self, plan: FitPlan, run: FitRun, source: Iterator[Batch], position: bytes | None,
+                    primed: tuple[Batch, object] | None = None) -> DevicePrefetchIterator:
         """`source`'s batches placed ahead of the step by the prefetch worker, which restores it to
-        `position` first, once a pool's processes agree their streams read the same records."""
+        `position` first, once a pool's processes agree their streams read the same records; a batch the
+        start read already (`primed`, with the position after it) is its first."""
         assert run.partition is not None
         if position is None and run.restarted is not None and isinstance(
                 source, StepPhases | RampedStream | PhasedStream):
@@ -1747,7 +1787,7 @@ class Trainer(Generic[Loss, Effects]):
             run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), run.marked,
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))
         return DevicePrefetchIterator(source, self.device_mesh, self._shape.prefetch, source_state=position,
-                                      reads=run.reads, prepare=prepare, restore=restore)
+                                      reads=run.reads, prepare=prepare, restore=restore, primed=primed)
 
     @staticmethod
     def _restarting(run: FitRun, differs: tuple[str, ...]) -> None:

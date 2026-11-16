@@ -412,6 +412,10 @@ class FitRun:
     """The steps a stopped profile window traced, the step it stopped at, its directory and the program its
     last step ran (`program`), whose export the run's cleanup waits for before it reports the window
     (`Trainer._exported_profile`)."""
+    primed: tuple[DataPartition, Iterator[Batch], Batch, object] | None = None
+    """The stream the start read its first batch from to declare its input (`Trainer._primed_first`): the
+    share it reads, the stream, the batch and the stream's position after it, which a fresh start's
+    prefetcher takes over (`Trainer._opened`) and any other start closes."""
     program: str | None = None
     """The program the run's latest step ran, by its batch signature's digest
     (`dew.training.trainer.program_digest`)."""
