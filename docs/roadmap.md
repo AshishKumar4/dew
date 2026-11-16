@@ -8,7 +8,8 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- The attention launches' outputs state no dimensions. [6733]
+- A launch's call and its gradient's product shared one digest. [6780]
+- Dew's jaxlib 0.12.0.1.post99 crashed CPU processes by SIGFPE. [6829]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -21,12 +22,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
 - Convolution repairs above their owner. [5665]
 - The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
-- Every reverse mode that forms a parameter gradient calls with_gradients_formed. [6471]
-- Gemm.in_layer deleted; gemm's reverse mode and the plain projection call derivatives.with_gradients_formed, the one statement. [6472]
-- Kernel-templates.md section 10. [6473]
-- The contract's guard, tests/test_declared_cells_memory.py, runs over every instruction family a GPU target claims. [6474]
 - The resource gate, now compiling a training case's forward with its kept memories as Mosaic.launches(backward=True) plans. [6553]
-- A Mamba-2 decoder's (and the parallel mixer's) trainer step does not compile on an H100. [6718]
+- XLA:GPU's Triton nested-GEMM fusion of a residual add into a dot inside a while body rounds worse than the separate add cuBLAS's program keeps. [6759]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -39,7 +36,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - Block-selected attention's other selections as mixers. [6301]
 - Mosaic has no float32 forward at width 256 on Hopper. [6508]
 - Py `mxfp8_projection` and `nvfp4_projection`. [6658]
-- An in-key forward's interpreted launches state no cost. [6675]
+- Fused_gemm.priced charged a region's product at the ambient default precision. [6774]
+- Fused_gemm.priced charged a grouped product one bank of its matrix. [6775]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm. [6030]
 - A Hopper kernel gradient's cluster along its output's columns. [6318]
 - Exact on every path, every edge and every derivative order. [2656]
@@ -63,19 +61,20 @@ This page is generated from the maintainers' findings ledger as each change land
 - Saved runs carried across. [1622, 1641, 2791, 2792]
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [5450, 5625]
+- Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
 
 ## Training and parallelism
 
 - Time to first step: the compile path's re-derivations. [5556, 5558]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
-- CI time: every test within 120 seconds. [6731]
+- CI time: every test within 120 seconds. [6731, 6846]
 - XLA:CPU edges. [1591]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
+- Src/dew/optim.py _placement refuses Muon for a rank-2 kernel declared with one named axis and one None. [6746]
 
 ## Data
 
@@ -85,7 +84,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - Training and serving efficiency. [3330, 1880, 5292]
-- DeepSeek V4's attention declares its kv_proj kernels. [6654]
 - Dory: the release qualified and its tests' oracles. [596]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
 - A decoder computing in no dtype of its own. [6215]
@@ -93,11 +91,8 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Algebra
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235, 5239]
-- Spec alignment 2026-11-15 §2 (algebra.md §2:259, §6.2:491-496. [6672]
-- Spec alignment 2026-11-15 §3 (algebra.md §6.1:425 context is every derivation's key. [6673]
 - Bit-level synthesis in dew.algebra. [3733]
 - Py `_holds_regions`: 'any other holder of a program. [6578]
-- Spec alignment 2026-11-15 §4 (algebra.md §6.9:953-961). [6674]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
@@ -108,6 +103,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
+- The saved data plan as recorded rules, one last version, and the resume modes. [6861]
 
 ## Tutorials and docs
 

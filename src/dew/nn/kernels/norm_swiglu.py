@@ -81,7 +81,7 @@ from jax.experimental.pallas import triton as plgpu
 from jax.extend import core
 
 from dew.mesh import logical_spec
-from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
+from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_gradients_formed
 from dew.nn.kernels import launches
 
 from .. import programs
@@ -431,8 +431,9 @@ def _shard_spec(axes, first) -> jax.sharding.PartitionSpec | None:
 def _per_shard(local, axes, operands, replicated):
     """`local(*operands)` as it runs: whole where no mesh axis splits, else on
     each shard (`on_shards`), the operands placed as `axes` names and those
-    marked `replicated` (a norm's weight) whole on every shard, so the weight's
-    gradient sums over the shards. Every output takes the first operand's place."""
+    marked `replicated` (a norm's weight) whole on every shard, widened
+    (`_widened`), so the weight's gradient sums over the shards before it is
+    rounded to its own dtype. Every output takes the first operand's place."""
     if not automatic_axes():
         return local(*operands)
     spec = _shard_spec(axes, operands[0])
@@ -440,7 +441,8 @@ def _per_shard(local, axes, operands, replicated):
         raise ValueError("an automatic mesh axis no caller names splits the operands, which the kernel's "
                          "selector refuses (`_placed`)")
     whole = {index for index, replicated in enumerate(replicated) if replicated}
-    return on_shards(local, spec, operands, whole)
+    return on_shards(local, spec, tuple(_widened(operand) if index in whole else operand
+                                        for index, operand in enumerate(operands)), whole)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -957,20 +959,37 @@ def _varying(operands: tuple, outputs):
         lambda shape: jax.ShapeDtypeStruct(shape.shape, shape.dtype, manual_axis_type=mat), outputs)
 
 
-def _typed(backward):
-    """`backward(saved, operands, cotangents)` with each operand's cotangent of the operand's varying type:
-    summed over each manual axis it varies over and its operand does not (a weight replicated in a checked
-    `shard_map`, whose shards' partial gradients its varying cast's transpose sums: `_varying`)."""
+def _typed(backward, parameters: int = 0):
+    """`backward(saved, operands, cotangents)` with each operand's cotangent of the operand's varying type and
+    dtype: summed over each manual axis it varies over and its operand does not (a weight replicated in a
+    checked `shard_map`, whose shards' partial gradients its varying cast's transpose sums: `_varying`),
+    then rounded to the operand's dtype (summed widened over the shards); the inputs' cotangents returned
+    only with the last `parameters` operands' gradients formed (a norm's weight,
+    `derivatives.with_gradients_formed`), each as its device forms it: a gradient no shards sum rounded to
+    its stored dtype, a per-shard partial before its sum, so an input's cotangent waits on no cross-device
+    sum, as a projection's per-shard reverse mode ties its own."""
     def typed(saved, operands, cotangents):
         gradients = backward(saved, operands, cotangents)
-        return tuple(gradient if gradient is None or operand is None else _summed_to(gradient, operand)
-                     for gradient, operand in zip(gradients, operands, strict=True))
+        local = tuple(gradient if gradient is None or operand is None or _shard_axes(gradient, operand)
+                      else gradient.astype(jax.typeof(operand).dtype)
+                      for gradient, operand in zip(gradients, operands, strict=True))
+        if parameters:
+            inputs, formed = with_gradients_formed(local[:-parameters], local[-parameters:])
+            local = (*inputs, *formed)
+        return tuple(gradient if gradient is None or operand is None
+                     else _summed_to(gradient, operand).astype(jax.typeof(operand).dtype)
+                     for gradient, operand in zip(local, operands, strict=True))
     return typed
 
 
+def _shard_axes(gradient: jax.Array, operand: jax.Array) -> tuple[str, ...]:
+    """The manual axes `gradient` varies over that `operand` does not: its shards' partials to sum."""
+    return tuple(sorted(jax.typeof(gradient).mat.varying - jax.typeof(operand).mat.varying))
+
+
 def _summed_to(gradient: jax.Array, operand: jax.Array) -> jax.Array:
-    """`gradient` summed over each manual axis it varies over that `operand` does not."""
-    axes = tuple(sorted(jax.typeof(gradient).mat.varying - jax.typeof(operand).mat.varying))
+    """`gradient` summed over each manual axis it varies over that `operand` does not (`_shard_axes`)."""
+    axes = _shard_axes(gradient, operand)
     return jax.lax.psum(gradient, axes) if axes else gradient
 
 
@@ -1150,14 +1169,14 @@ def _norm(epsilon: float, dtype, offset: bool, after_cast: bool, scale, activati
 
 
 def _widened(scale):
-    """The weight in fp32 for the kernels, so its gradient is summed over a
-    mesh's row shards before the cast back to its own dtype rounds it."""
+    """The weight in fp32 for the kernels, and across a mesh's row shards (`_per_shard`), so its gradient is
+    summed widened before it is rounded to its own dtype (`_typed`; the map's transpose's sum there)."""
     return None if scale is None else scale.astype(at_least_fp32(scale.dtype))
 
 
 def _stored(portable, norm: _Norm, at: int):
     """`portable` given the weight, operand `at`, in its stored dtype: the kernels read it widened
-    (`_widened`) and round it back there (`_weight`), and the tangent is the widened weight's."""
+    (`_widened`) and round it back there (`_weight`)."""
     def stated(*operands):
         weight = operands[at]
         stored = None if weight is None else weight.astype(norm.stored)
@@ -1187,19 +1206,21 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
                                                                      epilogue=epilogue)
 
     def forward(x, branch, scale):
-        outputs, mean_square = _rms_with_mean_square(x, branch, scale, None, norm)
+        outputs, mean_square = _rms_with_mean_square(x, branch, _widened(scale), None, norm)
         return outputs, (outputs[0], mean_square)
 
     def backward(saved, operands, cotangents):
         stream, mean_square = saved
         ds, dy = map(_cotangent, cotangents)
-        dstream, _, dscale = _rms_backward_call(stream, operands[2], None, mean_square, dy, ds, norm)
+        dstream, _, dscale = _rms_backward_call(stream, _widened(operands[2]), None, mean_square, dy, ds,
+                                                norm)
         # The sum's two addends share its cotangent: one buffer, read by both.
         return dstream, dstream, dscale
 
     local = contracted("test_the_fused_norms_and_products_hold_every_order")(
-        generation.linear_tangent(forward, _typed(backward), _stored(portable, norm, 2), kind=KernelGlue()))
-    return _per_shard(local, axes, (x, branch, _widened(scale)), (False, False, True))
+        generation.linear_tangent(forward, _typed(backward, parameters=1), _stored(portable, norm, 2),
+                                  kind=KernelGlue()))
+    return _per_shard(local, axes, (x, branch, scale), (False, False, True))
 
 
 def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, portable, *, axes=None,
@@ -1212,17 +1233,18 @@ def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, po
                                                                      epilogue=epilogue)
 
     def forward(x, scale):
-        (_, y), mean_square = _rms_with_mean_square(x, None, scale, None, norm)
+        (_, y), mean_square = _rms_with_mean_square(x, None, _widened(scale), None, norm)
         return y, mean_square
 
     def backward(mean_square, operands, dy):
         x, scale = operands
-        dx, _, dscale = _rms_backward_call(x, scale, None, mean_square, dy, None, norm)
+        dx, _, dscale = _rms_backward_call(x, _widened(scale), None, mean_square, dy, None, norm)
         return dx, dscale
 
     local = contracted("test_the_fused_norms_and_products_hold_every_order")(
-        generation.linear_tangent(forward, _typed(backward), _stored(portable, norm, 1), kind=KernelGlue()))
-    return _per_shard(local, axes, (x, _widened(scale)), (False, True))
+        generation.linear_tangent(forward, _typed(backward, parameters=1), _stored(portable, norm, 1),
+                                  kind=KernelGlue()))
+    return _per_shard(local, axes, (x, scale), (False, True))
 
 
 def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, portable, *, axes=None):
@@ -1233,16 +1255,17 @@ def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, porta
     norm = _norm(epsilon, dtype, offset=False, after_cast=False, scale=scale, activation=activation)
 
     def forward(x, gate, scale):
-        (_, y), mean_square = _rms_with_mean_square(x, None, scale, gate, norm)
+        (_, y), mean_square = _rms_with_mean_square(x, None, _widened(scale), gate, norm)
         return y, mean_square
 
     def backward(mean_square, operands, dy):
         x, gate, scale = operands
-        return _rms_backward_call(x, scale, gate, mean_square, dy, None, norm)
+        return _rms_backward_call(x, _widened(scale), gate, mean_square, dy, None, norm)
 
     local = contracted("test_the_fused_norms_and_products_hold_every_order")(
-        generation.linear_tangent(forward, _typed(backward), _stored(portable, norm, 2), kind=KernelGlue()))
-    return _per_shard(local, axes, (x, gate, _widened(scale)), (False, False, True))
+        generation.linear_tangent(forward, _typed(backward, parameters=1), _stored(portable, norm, 2),
+                                  kind=KernelGlue()))
+    return _per_shard(local, axes, (x, gate, scale), (False, False, True))
 
 
 def _product(gate, up, dtype, interpret: bool):

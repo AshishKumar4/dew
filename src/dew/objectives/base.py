@@ -871,16 +871,24 @@ class ProgramModule(NamedTuple):
     more than a tile (`Objective.unfuse_head`)."""
 
 
-def _ruled_tangent(primals, tangents, _value) -> jax.Array:
-    """`_ruled`'s tangent: the value's own, and in `params` the rule's inner product with their tangent."""
+def _ruled_tangent(primals, tangents, value) -> jax.Array:
+    """`_ruled`'s tangent: the value's own, and in `params` the rule's inner product with their tangent; a
+    symbolic zero adds nothing. The value's side is a stopped gradient's, so no input's cotangent leaves
+    beside the rule's gradients for the rule to tie."""
+    from jax.custom_derivatives import SymbolicZero
+
     _, rule, _ = primals
     moved_value, _, moved = tangents
-    return moved_value + sum(accumulated(jnp.vdot, leaf, change) for leaf, change in
-                             zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
+    changes = jax.tree.leaves(moved, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+    total = jnp.zeros_like(value) if isinstance(moved_value, SymbolicZero) else moved_value
+    for leaf, change in zip(jax.tree.leaves(rule), changes, strict=True):
+        if not isinstance(change, SymbolicZero):
+            total = total + accumulated(jnp.vdot, leaf, change)
+    return total
 
 
 _ruled = contracted("test_a_ruled_loss_holds_every_order")(
-    surrogate(lambda value, rule, params: value, _ruled_tangent))
+    surrogate(lambda value, rule, params: value, _ruled_tangent, symbolic_zeros=True))
 """`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`): a surrogate
 (`dew.nn.derivatives.surrogate`), the loss's own derivative replaced by a learning rule's."""
 
@@ -1378,8 +1386,22 @@ class Objective(ABC, Generic[Loss, Effects]):
         (`dew.optim.OptimConfig.fresh_groups`): what the source it trains drew (`Pretrained.fresh`, held
         where `bind_model` holds its tree as the objective's), an objective declaring besides what it
         draws beside the base it holds. One drawn with no parameter, a tied readout, the group leaves out
-        (`dew.config.trained_modules`)."""
+        (`fresh_trained`)."""
         return self._fresh
+
+    def fresh_trained(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Those of `fresh_modules` that hold a parameter this objective trains, as its tree is drawn (its
+        shapes alone), and those that are one (a parameter a loaded module gained, `Pretrained.with_model`):
+        what a fresh group claims (`dew.optim.OptimConfig.claiming`). A tied readout is drawn with none."""
+        modules = self.fresh_modules()
+        if not modules:
+            return (), ()
+        from dew.optim import parameter_name
+
+        names = [parameter_name(path) for path, _ in
+                 jax.tree_util.tree_leaves_with_path(self.drawn_shapes()["params"])]
+        return (tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names)),
+                tuple(module for module in modules if module in names))
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Return `tree`, held or drawn, with what the objective's own modules

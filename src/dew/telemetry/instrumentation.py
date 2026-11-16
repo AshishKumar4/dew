@@ -1042,6 +1042,11 @@ class CompiledMemory(NamedTuple):
     alias: int
     temp: int
     generated_code: int
+    live: int | None = None
+    """The most its buffers hold at once over its schedule, as XLA's heap simulation states it
+    (`peak_memory_in_bytes`): its arguments and the values live beside them, where `temp` is the one
+    allocation its temporaries are packed into, that packing's room included. None where the backend states
+    none (a TPU's, an older plugin's), never zero."""
 
 
 _ANALYSED: weakref.WeakKeyDictionary[jax.stages.Compiled, CompiledMemory | None] = (
@@ -1059,7 +1064,8 @@ def compiled_memory(executable: jax.stages.Compiled) -> CompiledMemory | None:
         _ANALYSED[executable] = None if stats is None else CompiledMemory(
             int(stats.argument_size_in_bytes), int(stats.output_size_in_bytes),
             int(stats.alias_size_in_bytes), int(stats.temp_size_in_bytes),
-            int(stats.generated_code_size_in_bytes))
+            int(stats.generated_code_size_in_bytes),
+            int(stats.peak_memory_in_bytes) or None)
     return _ANALYSED[executable]
 
 

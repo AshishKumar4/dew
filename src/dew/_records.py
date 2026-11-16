@@ -294,12 +294,17 @@ def moved_paths(value: JSON) -> JSON:
     itself JSON in a string, among its other parts. Readers of saved records translate by it (`earlier_run`,
     `dew.inference.tasks.earlier_shapes`, `dew.data.plan.Plan.check`); a path given today is read as given
     (`dew.registry.imported`)."""
+    return mapped_strings(value, moved_spelling)
+
+
+def mapped_strings(value: JSON, rewrite: Callable[[str], str]) -> JSON:
+    """`value` with each string it holds at any depth replaced by `rewrite` of it, its keys as they are."""
     if isinstance(value, str):
-        return moved_spelling(value)
+        return rewrite(value)
     if isinstance(value, dict):
-        return {key: moved_paths(held) for key, held in value.items()}
+        return {key: mapped_strings(held, rewrite) for key, held in value.items()}
     if isinstance(value, list):
-        return [moved_paths(held) for held in value]
+        return [mapped_strings(held, rewrite) for held in value]
     return value
 
 

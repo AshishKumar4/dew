@@ -79,7 +79,8 @@ GENERATOR = load("mla_reference")
 
 SEEDS = {"v3 block": 16, "v3n block": 32, "v32 block": 8, "auto": 64, "decode": 8, "value columns": 8,
          "yarn": 16, "visibility": 16, "mla_v3 int8 latent decode": 8, "mla_v32 int8 latent decode": 8,
-         "mla_v3 float8_e4m3fn latent decode": 8, "mla_v32 float8_e4m3fn latent decode": 8}
+         "mla_v3 float8_e4m3fn latent decode": 8, "mla_v32 float8_e4m3fn latent decode": 8,
+         "paged decode": 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada: the most any of
 a site's cases took."""
 PREFIX_RUN_SEEDS = 32
@@ -356,20 +357,69 @@ def test_decode_matches_prefill(name):
                     seeds=SEEDS["decode"], truth_fn=jax.jit(module.apply))
 
 
+def kept_by_slot(cache) -> dict[tuple[str, ...], np.ndarray]:
+    """Each leaf of a latent attention's decode `cache` by its path, what a slot keeps as `[rows, capacity,
+    ...]`: a pool's leaf (`[heads, pages, page_size, ...]`, `kv_cache.POOLED`) read through each row's pages
+    (`kv_cache.TABLE`), a compact cache's scales and bounds (head-major, `kv_cache.scale_shape`) by slot
+    first, and every other leaf as it is (the cursor, the indexer's keys, which a paged cache keeps
+    compact too)."""
+    from flax.traverse_util import flatten_dict
+
+    from dew.nn.kv_cache import BOUND, POOLED, SCALES, TABLE
+
+    flat = {path: np.asarray(leaf) for path, leaf in flatten_dict(nn.unbox(cache)).items()}
+    tables = {path[:-1]: leaf for path, leaf in flat.items() if path[-1] == TABLE}
+    kept = {}
+    for path, leaf in flat.items():
+        table = tables.get(path[:-1])
+        if path[-1] == TABLE:
+            continue
+        if table is not None and path[-1] in POOLED:
+            rows, pages = table.shape
+            leaf = np.moveaxis(leaf[:, table].reshape(leaf.shape[0], rows, pages * leaf.shape[2],
+                                                      *leaf.shape[3:]), 0, 2)
+        elif table is None and path[-1] in {*SCALES, BOUND}:
+            leaf = np.swapaxes(leaf, 1, 2)
+        kept[path] = leaf
+    return kept
+
+
 @pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v32"])
 def test_a_paged_latent_cache_decodes_what_the_compact_cache_decodes(name, quantized):
-    """A latent attention's cache takes the layer's layout: paged, it decodes every step as the compact
-    cache does at the same format, bit for bit, both decoded in one program (ledger 3178), full precision
-    or quantized, over the latents (V3) and over the expanded keys the indexer selects among (V3.2), the
-    quantized keys read back in the basis their queries or their expansion take."""
+    """A latent attention's cache takes the layer's layout: paged, it keeps every slot bit for bit as the
+    compact cache keeps it at the same format, values moved without arithmetic, and decodes each step on
+    par with the compact cache (check 1) from the float64 decode, the two being two computations, which XLA
+    fuses apart (the page gather into the products, ledger 3178); full precision or quantized, over the
+    latents (V3) and over the expanded keys the indexer selects among (V3.2), the quantized keys read back
+    in the basis their queries or their expansion take."""
     settings = CONFIG[SETTINGS[name]]
     variables = block_variables(fixture(name))
-    hidden = block_draw(name)(0)[0]
     paged, compact = (mla_module(settings, kv_cache=layout)
                       for layout in (KVCache(quantized=quantized, page_size=4), KVCache(quantized=quantized)))
-    np.testing.assert_array_equal(*jax.jit(lambda variables, hidden: [
-        decode_loop(module, variables, hidden) for module in (paged, compact)])(variables, hidden))
+    caches = jax.jit(lambda variables, hidden: [
+        decode_through(module, {"params": variables["params"]}, hidden, prefill=1)[2]
+        for module in (paged, compact)])(variables, block_draw(name)(0)[0])
+    held, rows = (kept_by_slot(cache) for cache in caches)
+    assert held.keys() == rows.keys()
+    for path, kept in held.items():
+        np.testing.assert_array_equal(kept, rows[path], err_msg="/".join(path))
+
+    def decoded(module):
+        return jax.jit(lambda hidden: decode_loop(module, variables, hidden))
+
+    def draw(seed):
+        return (block_draw(name)(seed)[0],)
+
+    def truth(hidden):
+        # The float64 decode: each position as the block's whole pass computes it, over the keys a quantized
+        # cache reads back dequantized in their own basis.
+        if quantized is None:
+            return compact.apply(widened(variables), hidden)
+        return uncached_dequantized_steps(compact, widened(variables), hidden, quantized)
+
+    assert_as_exact(decoded(paged), decoded(compact), draw, f"{name} {quantized} paged decode",
+                    seeds=SEEDS["paged decode"], truth_fn=truth)
 
 
 def uncached_dequantized_steps(module, variables, hidden, quantized: str):

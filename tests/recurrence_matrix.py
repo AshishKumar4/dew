@@ -32,16 +32,19 @@ import pytest
 from delta_rule_support import fla_layer_side
 from gpu_flow import cell
 from kernel_matrix import AXES
-from reference_error import (
-    FEWEST_SEEDS,
-    assert_as_exact,
-    indexed_recording,
-    recording,
-    widened,
-    with_gradients,
-)
+from reference_error import FEWEST_SEEDS, assert_as_exact, indexed_recording, recording, with_gradients
 from ssd_support import mamba_side
-from test_recurrence_chunk import FORMED, VALUE_HEADS, chunk_on, draw, hosted, token_by_token
+from test_recurrence_chunk import (
+    FORMED,
+    VALUE_HEADS,
+    against_the_portable_math,
+    chunk_on,
+    draw,
+    hosted,
+    oracle,
+    release,
+    token_by_token,
+)
 from upstream_support import upstream_arm
 
 from dew.nn.kernels import generation, recurrence_chunk
@@ -69,10 +72,10 @@ FLA_LAYERS = {"gated delta net": "gdn", "kimi delta attention": "kda"}
 """fla's own layer each delta rule form is (`delta_rule_support.FLA_LAYER_SIDE`): Qwen3.5's gated delta net
 and Kimi Linear's."""
 
-FORM_RELEASES = {**dict.fromkeys(FLA_LAYERS, "fla"), "rated scan": "mamba_ssm"}
-"""The upstream library each form's family has a release of (testing.md: a cell's oracle is that release's
-own code): fla's layers for the delta rule's forms, mamba_ssm's scan for Mamba-2's rated scan; the step
-write gate's form has none."""
+FORM_RELEASES = {form: found for form, hooks in FORMS.items() if (found := release(hooks)) is not None}
+"""The upstream library each form's family has a release of (`test_recurrence_chunk.release`): fla's layers
+for the delta rule's forms, mamba_ssm's scan for Mamba-2's rated scan; the step write gate's form has
+none."""
 
 
 def _fla(named: dict[str, str], leaves: dict, cotangents: tuple, starts) -> dict:
@@ -204,15 +207,13 @@ def _routed(case: tuple[tuple[str, str], ...], kernel: str) -> frozenset | None:
 
 def _reference(case: dict[str, str]) -> str:
     """`case`'s family's independent oracle at its dtype: the upstream's own code (`upstream <library>`,
-    `UPSTREAMS`) where its form's family has a release (`FORM_RELEASES`) and the run's declaration admits
-    that release's products for the dtype (`recurrence_chunk.upstream_precision`: fp32's TF32 at no more than
-    the default), whatever kernel the cell names; else the recurrence a token at a time ('token': a step
-    write gate's form, which no release runs, and a call declared above what the release computes,
-    testing.md). Taken from whether Dew's port routed the call, a released family's cell would have dropped
-    its upstream wherever the port refused for any other reason (row 6150)."""
-    release = FORM_RELEASES.get(case["form"])
-    taken = release is not None and recurrence_chunk.upstream_precision(case["dtype"])
-    return f"upstream {release}" if taken else "token"
+    `UPSTREAMS`) where its form's family has a release the run's declaration admits for the dtype
+    (`test_recurrence_chunk.oracle`), whatever kernel the cell names; else the recurrence a token at a time
+    ('token': a step write gate's form, which no release runs, and a call declared above what the release
+    computes, testing.md). Taken from whether Dew's port routed the call, a released family's cell would have
+    dropped its upstream wherever the port refused for any other reason (row 6150)."""
+    found = oracle(FORMS[case["form"]], case["dtype"])
+    return "token" if found is None else f"upstream {found}"
 
 
 def supported(case: dict[str, str]) -> bool:
@@ -299,24 +300,6 @@ def _upstream(named: dict[str, str], block: int, *, first: int = 0):
                         keyed=lambda operands, cotangents: operands)
 
 
-def _deficit(named: dict[str, str], seeds: int, truth) -> str:
-    """The cell's kernel's distance from float64 against Dew's own chunk math's (the portable math's), each
-    leaf's pooled RMS ratio over the first `seeds` draws: reported beside the verdict, never judged."""
-    port, portable = (jax.jit(_step(named, kernel)) for kernel in (named["kernel"], "xla"))
-    errors: dict[str, dict[str, list[float]]] = {}
-    for seed in range(seeds):
-        drawn = _drawn(named, seed)
-        with jax.enable_x64(new_val=True):
-            exact = truth(*widened(drawn))
-        for arm, results in (("port", port(*drawn)), ("portable", portable(*drawn))):
-            for (path, leaf), true in zip(jax.tree_util.tree_flatten_with_path(results)[0],
-                                         jax.tree.leaves(exact), strict=True):
-                errors.setdefault(jax.tree_util.keystr(path), {}).setdefault(arm, []).append(
-                    float(np.mean((np.asarray(leaf, np.float64) - np.asarray(true, np.float64)) ** 2)))
-    return ", ".join(f"{name} {np.sqrt(sum(arms['port']) / max(sum(arms['portable']), 1e-300)):.3g}"
-                     for name, arms in errors.items())
-
-
 def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> None:
     """The chunked op's training step of `case` on its GPU, its kernel named, on par with its reference's
     (`_reference`; check 1, the recurrence a token at a time in float64 the truth) over `seeds` draws: the
@@ -339,12 +322,14 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> No
     if upstream is not None and not os.environ.get(INTERPRETERS[upstream]):
         _on_par_recorded(named, step, with_gradients(truth), upstream, seeds)
         return
-    oracle = jax.jit(with_gradients(truth)) if upstream is None else _upstream(named, (1 + REDRAW) * seeds)
-    assert_as_exact(step, oracle, functools.partial(_drawn, named), "-".join(case), seeds=seeds,
-                    truth_fn=with_gradients(truth))
-    if named["kernel"] != "xla":
+    held_to = jax.jit(with_gradients(truth)) if upstream is None else _upstream(named, (1 + REDRAW) * seeds)
+    if named["kernel"] != "xla" and (distance := against_the_portable_math(
+            "-".join(case), _step(named, named["kernel"]), _step(named, "xla"),
+            functools.partial(_drawn, named), with_gradients(truth), FEWEST_SEEDS)) is not None:
         print(f"{'-'.join(case)} under the {generation.numerics().forms} forms, its distance against Dew's "
-              f"own chunk math's: {_deficit(named, FEWEST_SEEDS, with_gradients(truth))}", flush=True)
+              f"own chunk math's: {distance}", flush=True)
+    assert_as_exact(step, held_to, functools.partial(_drawn, named), "-".join(case), seeds=seeds,
+                    truth_fn=with_gradients(truth))
 
 
 def _on_par_recorded(named: dict[str, str], step, truth, upstream: str, seeds: int) -> None:
@@ -386,3 +371,41 @@ def a_recurrences_training_step_is_on_par(case: tuple[str, ...]) -> None:
 def a_recurrences_training_step_on_a_tpu_is_on_par(case: tuple[str, ...]) -> None:
     """`_on_par` of a TPU's case (the TPU tier's flow, tests/test_ssd_kernel.py)."""
     _on_par("recurrence_tpu", case)
+
+SHARDED_SEEDS = 8
+"""The per-shard cells' declared draws (check 1, `sharded.assert_runs_per_shard`)."""
+
+
+def per_shard(choice: str, kernel: str) -> dict:
+    """`kernel`'s per-shard cells (`sharded.Shard`, tests/test_per_shard.py): `choice`'s form (the delta
+    rule's Qwen3.5 gated delta net, the scan's Mamba-2 rated scan) over packed bf16 rows, through the chunked
+    op on `kernel` (`chunk_on`) over the rows a two-device mesh splits as data or fsdp parallelism does,
+    every operand led by its rows split (queries, keys, values, gates, steps, cotangents) and each per-head
+    parameter whole: the output, the final memory and every operand's gradient on par with one device's from
+    the recurrence a token at a time in float64, as an H100's, a TPU's as a v6e's over fp32."""
+    from jax.sharding import PartitionSpec
+    from sharded import Shard
+
+    form = "rated scan" if choice == recurrence_chunk.SCAN.choice else "gated delta net"
+    # A TPU's scan over fp32, as its cases run it (`TPU_CASES`).
+    target, dtype = ("v6e", "float32") if kernel == "tpu" else ("sm90", "bfloat16")
+    case = {"generation": target, "form": form, "kernel": kernel, "dtype": dtype, "documents": "packed"}
+    hooks, starts = FORMS[form], _starts(case)
+
+    def truth(operands):
+        return _wide(token_by_token(hooks, dataclasses.replace(operands, starts=starts)))
+
+    def specs(axis: str):
+        def placed(leaf) -> PartitionSpec:
+            return PartitionSpec(axis) if leaf.ndim >= 3 else PartitionSpec()
+
+        def laid(mesh) -> list:
+            del mesh
+            operands, cotangents = _drawn(case, 0)
+            return [jax.tree.map(placed, operands), jax.tree.map(placed, cotangents)]
+
+        return laid
+
+    return {axis: Shard(_step(case, kernel), functools.partial(_drawn, case), specs(axis),
+                        with_gradients(truth), SHARDED_SEEDS, axis, target=target)
+            for axis in ("data", "fsdp")}

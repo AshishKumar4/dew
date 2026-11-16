@@ -39,7 +39,7 @@ from dew.algebra.derive import FORMS_HELD
 from dew.algebra.scan import RESET_DECAY
 from dew.batch import document_firsts
 from dew.nn.attention_masks import repeat_kv_heads
-from dew.nn.derivatives import KernelGlue, Protected, contracted
+from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed_at
 from dew.nn.inputs import cu_seqlens
 from dew.nn.nested import nested
 from dew.nn.precision import asks_default_precision, at_least_fp32, exact_products, l2norm, rounds_products
@@ -251,8 +251,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             out = out.astype(work)
             return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
 
+        # The skip's `D` (operand 5) is the call's parameter.
         out, final = _per_product(product_kernel, run, query, key, value, g, beta, skip, state, starts,
-                                  firsts, *(() if forked is None else forked.walked))
+                                  firsts, *(() if forked is None else forked.walked), parameters=(5,))
     # The epilogue in the working precision, and the output rounded once.
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
 
@@ -959,7 +960,7 @@ def _read_once(value, work) -> tuple[jax.Array, jax.Array]:
     return wide, wide.astype(value.dtype)
 
 
-def _per_product(kernel_of: Callable[[str], str], run, *operands):
+def _per_product(kernel_of: Callable[[str], str], run, *operands, parameters: tuple[int, ...]):
     """`run(kernel, *operands)` on the kernel a selector gives each product (`kernel_of('forward')`,
     `kernel_of('training')`), differentiated at every order through the portable math (`run('xla', ...)`,
     `generation.linear_tangent`): the forward's kernel where no derivative is taken, the training kernel's
@@ -972,7 +973,9 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
     traced, not a forward alone. Where both products are the portable math's (a CPU's, or a device no
     kernel takes), the call is the portable math itself, whose own derivatives hold every order: traced
     through the products' split it traced the portable math three times over, half of a gated delta net
-    layer's training step's trace on a CPU (row 3142)."""
+    layer's training step's trace on a CPU (row 3142). The operands at `parameters` are the call's
+    parameters (a skip's `D`, a rate, A), whose gradients reverse mode forms with the others' cotangents
+    (`derivatives.with_gradients_formed_at`)."""
     forward = kernel_of('forward')
     try:
         trained = kernel_of('training')
@@ -994,7 +997,7 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
 
     def pulled(pullback, operands, cotangent):
         del operands
-        return pullback(cotangent)
+        return with_gradients_formed_at(tuple(pullback(cotangent)), parameters)
 
     return contracted("test_the_chunked_op_holds_every_order")(
         generation.linear_tangent(functools.partial(jax.vjp, training), pulled, portable, primal=primal,
@@ -1343,8 +1346,9 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
                                   scale=1.0, delta=False, dtype=work, forked=forked)
         return recurrence.skipped(hooks, out, wide, {'skip': skip}, work), final
 
+    # The rate and the skip's `D` (operands 5 and 6) are the call's parameters.
     return _per_product(product_kernel, run, query, key, value, g, beta, rate, skip, state, starts, firsts,
-                        *(() if forked is None else forked.walked))
+                        *(() if forked is None else forked.walked), parameters=(5, 6))
 
 
 def _scan_widths(width: int) -> int:
@@ -1750,5 +1754,6 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, load
         specs = (three, three, P(None, None), three, three, P(None), three, P(rows, None))
         return manual_map(template, specs[:len(operands)], (three, three))(*operands)
 
+    # A and D (operands 2 and 5) are the call's parameters.
     return _per_product(lambda product: selective_kernel(x, A, B, C), run, x, dt, A, B, C, D, state,
-                        *(() if forked is None else forked.walked))
+                        *(() if forked is None else forked.walked), parameters=(2, 5))

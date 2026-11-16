@@ -2374,3 +2374,18 @@ def test_an_endless_read_of_files_some_empty_reads_the_rows_the_others_hold(tmp_
         stream.close()
     assert len(read_ids) == 40 and set(read_ids) <= set(range(64))
 
+
+def test_an_endless_read_of_one_share_of_empty_files_is_refused(tmp_path):
+    """One share of two of an endless read of eight header-only CSV files, whose store counts no rows, is
+    refused once it has found empty every place it can read, which a seed deals each pass its own order of
+    (`dew.data.shards._ShardPass.reachable`; row 6700)."""
+    paths = []
+    for index in range(8):
+        path = tmp_path / f"empty{index}.csv"
+        path.write_text("id\n")
+        paths.append(str(path))
+    (outcome,) = _first_read(compile(Files(tuple(paths)).repeat().batch(2), read="streamed",
+                                     loading=Loading(workers=0, threads=1, read_buffer=1)),
+                             DataPartition(0, 2))
+    assert isinstance(outcome, ValueError), outcome
+

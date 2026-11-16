@@ -23,6 +23,8 @@ no use of (a delta net has no gated product, bias or gate multiplier) takes its 
 `none` or `plain`, and no other.
 """
 
+import contextlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -136,3 +138,44 @@ def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
     unnamed = sorted(pair for pair in recorded
                      if pair[0] not in CHOICES and pair[1] != UNFUSED.get(pair[0], "xla"))
     assert (combination["join"], "joined") in recorded and not unnamed, (sorted(recorded), unnamed)
+
+
+def per_shard(choice: str, kernel: str) -> dict:
+    """`kernel`'s per-shard cells (`sharded.Shard`, tests/test_per_shard.py): `choice`'s layer of its first
+    16-bit case (`CASES`) over rows a two-device data axis splits, its parameters whole, its two projections
+    joined into one product the GEMM template launches (`grouped_matmul` named `mosaic`, interpreted on the
+    CPU's devices) per device on its own rows (`joined.py`'s map), its other kernels unfused (`UNFUSED`): the
+    output and every gradient on par with one device's from the layer in float64. The fsdp placement of the
+    joined product's weights is the GEMM's cells' (`gemm_matrix.per_shard`, joined cases)."""
+    from flax import linen as nn
+    from jax.sharding import PartitionSpec
+    from sharded import Shard
+
+    from dew.distributed.placement import Layout
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.sharding import placing
+
+    del kernel
+    # A 16-bit case: the template multiplies no fp32 product above the default precision (the lane's).
+    narrow = next(case for case in CASES if case[1] == choice and case[-1] != "float32")
+    case = dict(zip(AXES["join"], narrow, strict=True))
+    layer = _layer(case)
+    dtype = jnp.dtype(case["dtype"])
+    params = layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype))
+
+    def scope():
+        # The trainer's step traces under its layout (`placing`), which a joined product's map reads.
+        stack = contextlib.ExitStack()
+        for context in (generation.chosen(**{**UNFUSED, "grouped_matmul": "mosaic"}),
+                        nn.logical_axis_rules(DEFAULT_RULES), placing(Layout(min_shard=1))):
+            stack.enter_context(context)
+        return stack
+
+    def truth(*operands):
+        # The layer in float64 through XLA's products, which a float64 product runs on.
+        with generation.chosen(grouped_matmul="xla"):
+            return with_gradients(layer.clone(dtype=jnp.float64).apply)(*operands)
+
+    return {"data": Shard(with_gradients(layer.apply), drawing(params, (*ROWS, FEATURES), dtype),
+                          lambda mesh: [PartitionSpec(), PartitionSpec("data"), PartitionSpec("data")], truth,
+                          SEEDS, "data", context=scope)}

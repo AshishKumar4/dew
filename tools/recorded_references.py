@@ -42,6 +42,8 @@ from dew.parity import (
     example_worst,
     heavy_masks,
     leaf_summaries,
+    log_errors,
+    log_mean_square,
     recorded_kinds,
     rows_summary,
     seeds_resolving,
@@ -519,8 +521,9 @@ def record_distances(label: str, draw, distances: Mapping[str, np.ndarray], trut
     count's (1 + REDRAW) times kept, each kept seed's evidence read from its rows (`rows_summary`) beside
     its truth's sketch."""
     names = list(distances)
-    # A leaf of no rows is exact, its error zero.
-    errors = np.stack([np.mean(np.square(rows), axis=1) if rows.shape[1] else np.zeros(rows.shape[0])
+    # Each seed's squared error's log, its rows' mean square (`rows_summary`'s); a leaf of no rows is exact.
+    errors = np.stack([np.asarray([float(log_mean_square(seed)) for seed in rows]) if rows.shape[1]
+                       else np.full(rows.shape[0], -np.inf)
                        for rows in (np.asarray(distances[name], np.float64) for name in names)], axis=1)
     confirmed = seeds_resolving(errors, names, label)
     kept = staged_units(confirmed)
@@ -556,8 +559,8 @@ def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict
     joined = _joined(label, verdict, 0)
     drawn = joined[f"{label}.drawn"]
     names = [key.removeprefix(f"{label}.mse.") for key in joined if key.startswith(f"{label}.mse.")]
-    confirmed = seeds_resolving(np.stack([joined[f"{label}.mse.{name}"] for name in names], axis=1),
-                                names, label)
+    logs = log_errors(np.stack([joined[f"{label}.mse.{name}"] for name in names], axis=1))
+    confirmed = seeds_resolving(logs, names, label)
     kept = staged_units(confirmed)
     if len(drawn) < kept:
         raise ValueError(f"{label}: {confirmed} seeds resolve, and their redraw needs {kept} seeds; the "
@@ -645,6 +648,19 @@ def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
                           (_row(seed, record) for seed, record in zip(seeds, records, strict=True)))
 
 
+def _recorded_mse(label: str, name: str, logs) -> np.ndarray:
+    """Leaf `name`'s squared errors, from their logs (`RecordedLeaf.log_mse`), as a recording keeps them
+    (`mse`): refused where an error is nonzero and its square underflows float64 (testing.md: a
+    recording's limit), which a recording would read back as exact."""
+    logs = np.asarray(logs, np.float64)
+    errors = np.exp(logs)
+    if (lost := np.flatnonzero((logs > -np.inf) & (errors == 0))).size:
+        raise ValueError(f"{label}: leaf {name}'s squared error on seed rows {lost[:4].tolist()} is nonzero "
+                         f"(its log {logs[lost[0]]:.1f}) but below float64's least, which a recording keeps "
+                         "as exact; a recording holds no such error")
+    return errors
+
+
 def _rows_evidence(label: str, seeds: range, rows) -> dict[str, np.ndarray]:
     """`rows`' evidence (`_Row`), one a seed of `seeds`: each leaf's summary (its rows of float64 zero
     joined, with their count a seed) and its truth's sketch, and each seed's input digest."""
@@ -658,7 +674,7 @@ def _rows_evidence(label: str, seeds: range, rows) -> dict[str, np.ndarray]:
     evidence = {f"{label}.drawn": np.asarray(seeds, np.int64), f"{label}.input_digest": np.asarray(digests)}
     for name, summaries in leaves.items():
         evidence.update({
-            f"{label}.mse.{name}": np.asarray([leaf.mse for leaf in summaries]),
+            f"{label}.mse.{name}": _recorded_mse(label, name, [leaf.log_mse for leaf in summaries]),
             f"{label}.worst.{name}": np.asarray([leaf.worst for leaf in summaries]),
             # Each worst row's largest element's share of it, which the gate's row factor reads; a leaf read
             # from its rows' distances alone has none (`rows_summary`), and its recording keeps none.

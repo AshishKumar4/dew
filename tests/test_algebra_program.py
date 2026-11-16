@@ -192,6 +192,70 @@ def test_a_scale_lifted_past_a_product_is_priced_at_its_shape():
     assert graph.check_bool(eq(algebra.rules.shape(broadcast)).to(Vec[i64](i64(64), i64(16))))
 
 
+def _distributed(root):
+    """`a x + a y`'s factored form, `a (x + y)`."""
+    from egglog import get_callable_args
+
+    left, _, right, added = get_callable_args(root, terms.Term.binary)
+    a, _, x, multiplied = get_callable_args(left, terms.Term.binary)
+    _, _, y, _ = get_callable_args(right, terms.Term.binary)
+    return a.binary("mul", x.binary("add", y, added), multiplied)
+
+
+def _summed_out(root):
+    """`sum(a[:, None] x, 1)`'s factored form, `a sum(x, 1)`."""
+    from egglog import get_callable_args
+
+    product, monoid, axes, summed = get_callable_args(root, terms.Term.reduce)
+    laid, _, x, multiplied = get_callable_args(product, terms.Term.binary)
+    a, _, _ = get_callable_args(laid, terms.Term.shaped)
+    return a.binary("mul", x.reduce(monoid, axes, summed), multiplied)
+
+
+def _lifted_out(root, graph):
+    """`(x s[:, None]) @ y`'s factored form, `s (x @ y)`, its scale laid to the product's extent."""
+    from egglog import Vec, get_callable_args, i64
+
+    scaled, y, params = get_callable_args(root, terms.Term.dot)
+    x, _, laid, multiplied = get_callable_args(scaled, terms.Term.binary)
+    s, _, _ = get_callable_args(laid, terms.Term.shaped)
+    lift = graph.extract(algebra.rules.lifted(Vec[i64](i64(64), i64(16)), i64(0)))
+    return s.shaped("broadcast_in_dim", lift).binary("mul", x.dot(y, params), multiplied)
+
+
+FACTORED = {
+    "distributivity": (lambda x, y, a: a * x + a * y, ((64, 32), (64, 32), (64, 32)), _distributed),
+    "a row scalar out of a sum": (lambda x, y, a: jnp.sum(a[:, None] * x, axis=1),
+                                  ((64, 32), (64, 32), (64,)), _summed_out),
+    "a row scale out of a product": (lambda x, y, a: (x * a[:, None]) @ y, ((64, 32), (32, 16), (64,)),
+                                     _lifted_out),
+}
+"""Each rule that factors a scale out of a sum or a product: its program over `(x, y, a)`, their shapes, and
+the factored form of its root (`a (x + y)`, `a sum(x)`, `a (x @ y)`)."""
+
+
+@pytest.mark.parametrize("name", list(FACTORED))
+def test_a_factored_product_is_admitted_only_under_the_reach(name):
+    """A rule's factored product rounds the sum it factors before multiplying it, so it may pass float32's
+    largest where the written terms each round to it (float32's `a x + a y` at `a = (2**24 - 4) 2**104`,
+    `x = 1`, `y = 3 2**-24`; §6.3). Each rule admits the value it gives under the program's reach alone
+    (`rules.dominated` of it): over operands of magnitude one, a scale of magnitude one makes the factored
+    form one with the program's root, and a scale of float32's largest magnitude does not."""
+    from egglog import eq
+
+    program_of, shapes, factored_of = FACTORED[name]
+    closed = jax.make_jaxpr(program_of)(*rows(1, *shapes))
+    largest = float(np.finfo(np.float32).max)
+    held = {}
+    for scale in (1.0, largest):
+        region = terms.region(closed, {0: 1.0, 1: 1.0, 2: scale})
+        graph, _, (root,) = program.graphed(region)
+        program.saturate(graph, region, (algebra.rules.RULES["linear"],), algebra.SATURATION)
+        factored = factored_of(root, graph) if name == "a row scale out of a product" else factored_of(root)
+        held[scale] = graph.check_bool(eq(root).to(factored))
+    assert held == {1.0: True, largest: False}
+
+
 @pytest.mark.parametrize("fn", [
     lambda x, y, s: jnp.max(jnp.tanh(x) * 0.5, axis=1),
     lambda x, y, s: jnp.min(0.5 * jnp.tanh(x), axis=1),
@@ -452,6 +516,28 @@ def two_products_summed(a, x, y):
     """`sum(a * x) + sum(a * y)` over the last axis: two sums of products that share a factor, which the
     program bounds none of."""
     return jnp.sum(a * x, axis=-1) + jnp.sum(a * y, axis=-1)
+
+
+def test_a_deep_computation_traced_twice_is_on_par_with_the_function():
+    """A chain of 40 steps reading each value twice (`a cos(a)`, which stays normal) traced twice over one
+    input (JAX merges no equal values, so the two are apart), its results added (a distributivity head, so
+    the pass bounds the whole program's values, `program._held`): rewritten, on par with the function by
+    check 1. Its skeletons are one object for each form (`terms.Skeleton.made`): compared as nested tuples,
+    each equal pair walked every path through their sharing, 2**40 of them, past the test's deadline (train
+    902 F1)."""
+    def doubled(x):
+        a = b = x
+        for _ in range(40):
+            a = a * jnp.cos(a)
+        for _ in range(40):
+            b = b * jnp.cos(b)
+        return a + b
+
+    def draw(seed):
+        return rows(seed, (8, 64))
+
+    assert_as_exact(jax.jit(algebra.rewritten(doubled)), jax.jit(doubled), draw, "two equal deep chains",
+                    seeds=16)
 
 
 def test_a_region_no_rule_may_fire_in_is_recorded_unpriced():

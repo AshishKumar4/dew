@@ -819,9 +819,12 @@ def _scan_backward(scan: Scan, residuals, grads):
         """A gradient `[R, ..., T]` back as `[R, T, ...]`, the padding's tokens dropped."""
         return jnp.moveaxis(t[..., :scan.length], -1, 1)
 
-    return (trailing(dx).astype(x.dtype), trailing(ddt).astype(dt.dtype), da.sum(0).T.astype(A.dtype),
-            trailing(db).astype(B.dtype), trailing(dc).astype(C.dtype), dd.sum(0).astype(D.dtype), dstate,
-            None, *(() if not table else (dgiven, None, None)))
+    # `A`'s and `D`'s gradients formed in their dtypes before the inputs' cotangents leave (row 6027).
+    inputs = (trailing(dx).astype(x.dtype), trailing(ddt).astype(dt.dtype), trailing(db).astype(B.dtype),
+              trailing(dc).astype(C.dtype), dstate, dgiven)
+    (dx, ddt, db, dc, dstate, dgiven), (da, dd) = derivatives.with_gradients_formed(
+        inputs, (da.sum(0).T.astype(A.dtype), dd.sum(0).astype(D.dtype)))
+    return (dx, ddt, da, db, dc, dd, dstate, None, *(() if not table else (dgiven, None, None)))
 
 
 _scan = derivatives.contracted("test_the_selective_scan_holds_its_orders")(

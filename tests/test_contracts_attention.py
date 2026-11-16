@@ -134,3 +134,39 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
 
     assert_contract(paged, primals, direction, cotangent, f"the paged decode kernel {edge} {kernel}",
                     truth_fn=plain, plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_sink_softmax_holds_every_order(edge):
+    """The sink softmax (`attention_sinks.sink_softmax`: its reverse mode returning the logits' cotangent
+    only with the sinks' gradient formed): every order, forward and reverse, under a nested jit and a scan,
+    in the logits and the sinks, finite wherever float64 is a normal float32 and wherever its plain softmax
+    (`_weights`, its float64 run the truth) is, at logits near float32's ends."""
+    from dew.nn.attention_sinks import _weights, sink_softmax
+
+    primals = normal_draw(6175, (2, 4, 8, 16), (4,), scale=EDGES[edge])
+    direction = normal_draw(6176, (2, 4, 8, 16), (4,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(6177, (2, 4, 8, 16))
+    assert_contract(sink_softmax, primals, direction, cotangent, f"a sink softmax {edge}",
+                    plain_fn=lambda logits, sinks: _weights(logits, sinks, None))
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_finished_merges_mean_holds_every_order(edge):
+    """The finished merge's mean of its states' outputs by their masses (`attention_algebra._mean`, a
+    declared tangent: the mean's own derivative, its coefficients formed at a scale that passes fp32 only
+    where they do, row 6827): every order, forward and reverse, finite wherever float64 is a normal float32
+    and the plain mean, sum(w o) / sum(w), is, its outputs at `edge` over masses of every size."""
+    from dew.nn.kernels.templates.attention_algebra import _mean
+
+    weights, outputs = normal_draw(6827, (3, 4), (3, 4, 8))
+    primals = (jnp.abs(weights) + 0.25, outputs * EDGES[edge])
+    direction = normal_draw(6828, (3, 4), (3, 4, 8))
+    direction = (direction[0], direction[1] * EDGES[edge])
+    (cotangent,) = normal_draw(6829, (4, 8))
+
+    def plain(weights, outputs):
+        return jnp.sum(weights[..., None] * outputs, axis=0) / jnp.sum(weights, axis=0)[..., None]
+
+    assert_contract(lambda weights, outputs: _mean(weights, outputs, 0), primals, direction, cotangent,
+                    f"the finished merge's mean {edge}", plain_fn=plain)

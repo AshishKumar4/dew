@@ -43,6 +43,12 @@ FORK_SEEDS = 64
 the Mamba-2 hybrid's site, its A_log gradient a sum over every token of each head's, at 64 with sixteen
 heads (at four it resolves within no count up to MOST_SEEDS, at thirty-two at 256; armada, 11-09)."""
 
+KIND_SEEDS = {"engram": 512}
+"""The sites `seeds_for` sizes past `FORK_SEEDS`, paired from it: engram's, whose hyper-connection head's
+gradients read the final norm's input cotangent, rounded to its dtype where its reverse mode returns it only
+with the norm's weight formed (row 6027: the forks' error over the rows' laid out whole 1.17 to 1.22 in
+`hc_head.hc_scale`, 160 seeds), at 512 (armada, 11-15)."""
+
 RECURRENT = {
     "gated_delta_net": {"linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
                         "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4},
@@ -129,7 +135,7 @@ def test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole(kind):
 
     assert_as_exact(scored(objective, shared), scored(objective, whole),
                     lambda seed: (nn.unbox(initialized(jax.random.key(seed))),), f"{kind} over forks",
-                    seeds=FORK_SEEDS,
+                    seeds=KIND_SEEDS.get(kind, FORK_SEEDS),
                     truth_fn=scored(LMObjective(float64_twin(model), WIDTH - 1), whole))
 
 

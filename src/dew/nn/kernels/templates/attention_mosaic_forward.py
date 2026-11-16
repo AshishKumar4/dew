@@ -36,6 +36,7 @@ from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     mosaic,
     operands,
+    outputs,
     product,
     rings,
     stores,
@@ -100,37 +101,41 @@ from dew.nn.kernels.templates.cost import estimate
 from dew.nn.kernels.templates.rings import Ref
 
 
-def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype, *, splits: int, peaks: bool,
+def _out_types(query, value, value_width: int | None, out_dtype, *, parts: int, splits: int, peaks: bool,
                training: bool, finishes: bool, certified: int = 0, flags: bool = False,
                in_place: bool = False) -> tuple:
-    """`_launch`'s outputs' types: a peak walk's maxima and anchor keys (`_peak_consumer`); a training walk's
-    status, residual
-    rows, anchor keys and split sums; else its status and output `[B, S·Qp, H, Dv]` (a split launch's slices
-    along its query axis), and its finished rows where it `finishes`. A launch `in_place` into the plain
-    launch's outputs (`_Read.into`) writes them in place and declares none of its own: a masked launch's
-    programs that walk nothing write nothing, and an output they could leave unwritten (its rows' status,
-    which none reads) is uninitialized memory (NSNAN-2)."""
+    """`_launch`'s outputs' types, each stated as its operands' axes (`outputs.Output`): the query's batch
+    rows (an fp32 call's `parts` stacked along them), queries and heads, and the value's columns, or a block's
+    `value_width` where the launch walks one: a peak walk's maxima and anchor keys (`_peak_consumer`); a
+    training walk's status, residual rows, anchor keys and split sums; else its status and output
+    `[B, S·Qp, H, Dv]` (a split launch's slices along its query axis), and its finished rows where it
+    `finishes`. A launch `in_place` into the plain launch's outputs (`_Read.into`) writes them in place and
+    declares none of its own: a masked launch's programs that walk nothing write nothing, and an output they
+    could leave unwritten (its rows' status, which none reads) is uninitialized memory (NSNAN-2)."""
     if in_place:
         return ()
-    rows_out = splits * queries
+    batch = outputs.axis(query, 0) // parts if parts > 1 else outputs.axis(query, 0)
+    queries, heads = outputs.axis(query, 1), outputs.axis(query, 2)
+    columns = outputs.axis(value, -1) if value_width is None else value_width
+    rows_out = queries * splits
     # Its rows' maxima, which the fold's guard reads; a plain launch that `flags` its rows states their
     # rewalk and their block's beside them (`_Flags`).
-    status_type = jax.ShapeDtypeStruct((3 if flags else 1, batch, heads, rows_out), jnp.float32)
+    status_type = outputs.output(jnp.float32, 3 if flags else 1, batch, heads, rows_out)
     if peaks:
         # Its rows' maxima and anchor keys.
-        return (jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32),
-                jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32))
+        return (outputs.output(jnp.float32, batch, heads, queries),
+                outputs.output(jnp.int32, batch, heads, queries))
     if training:
-        return (status_type, jax.ShapeDtypeStruct((5, batch, heads, queries), jnp.float32),
-                jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32),
-                jax.ShapeDtypeStruct((batch, heads, queries, value_width), jnp.float32))
-    out_type = (status_type, jax.ShapeDtypeStruct((batch, rows_out, heads, value_width), out_dtype))
+        return (status_type, outputs.output(jnp.float32, 5, batch, heads, queries),
+                outputs.output(jnp.int32, batch, heads, queries),
+                outputs.output(jnp.float32, batch, heads, queries, columns))
+    out_type = (status_type, outputs.output(out_dtype, batch, rows_out, heads, columns))
     if finishes:
-        out_type += (jax.ShapeDtypeStruct((2, batch, heads, rows_out), jnp.float32),)
+        out_type += (outputs.output(jnp.float32, 2, batch, heads, rows_out),)
     if certified:
         # The certify form's state after each of its `certified` key tiles (`certified_walk`).
-        out_type += (jax.ShapeDtypeStruct((2, batch, heads, certified, rows_out), jnp.float32),
-                     jax.ShapeDtypeStruct((batch, heads, certified, rows_out, value_width), jnp.float32))
+        out_type += (outputs.output(jnp.float32, 2, batch, heads, certified, rows_out),
+                     outputs.output(jnp.float32, batch, heads, certified, rows_out, columns))
     return out_type
 
 
@@ -628,11 +633,16 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
 def _whole(array: jax.Array, parts: int) -> jax.Array:
     """An fp32 call's operand `[P·B, ...]` from its bf16 `parts` stacked along the batch axis
-    (`MosaicForward.parts`), summed exactly in fp32 (`product.formed`'s parts are its remainders); itself
-    where it enters whole."""
+    (`MosaicForward.parts`), the largest first, summed exactly in fp32 (`product.formed`'s parts are its
+    remainders) from the smallest up: at fp32's largest the leading two parts sum past it, the third's
+    negative remainder taking it back (row 6842); itself where it enters whole."""
     if parts == 1:
         return array
-    return jnp.sum(array.astype(jnp.float32).reshape(parts, -1, *array.shape[1:]), axis=0)
+    stacked = array.astype(jnp.float32).reshape(parts, -1, *array.shape[1:])
+    whole = stacked[parts - 1]
+    for part in range(parts - 2, -1, -1):
+        whole = stacked[part] + whole
+    return whole
 
 
 def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -1349,7 +1359,8 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         else:
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
                                                           output_mod=hooks.output_mod,
-                                                          output_params=out_params)
+                                                          output_params=out_params,
+                                                          held=program.parts > 1)
             out_stage(lambda stage: family.stored((_kept_rows(family, keep, output, out_view),), (out_view,),
                                                   smem=stage))
         finished = stored().finished
@@ -1892,7 +1903,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                          certified=certified, codes=_codes_of(key, read.hooked.scales),
                                          parts=parts, interpret=bool(interpret), params=params,
                                          in_key=value_columns is not None)
-    out_type = _out_types(batch, queries, heads, value_width, out_dtype, splits=splits,
+    out_type = _out_types(query, value, column_width, out_dtype, parts=parts, splits=splits,
                           peaks=peaks, training=training, finishes=finishes,
                           certified=steps if certified else 0, flags=flags,
                           in_place=read.into is not None)

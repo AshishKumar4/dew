@@ -138,7 +138,7 @@ def block_of(family: mosaic.Family) -> int:
 
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, repr=False)
 class Tiles:
     """A forward's tiles, the recurrence template's config, derived from the call's shape and the device's
     and its bundle's facts (`templates.recurrence.template.Mosaic.derived`): the value block the states
@@ -159,6 +159,18 @@ class Tiles:
     producers: resources.Producers = dataclasses.field(default_factory=resources.Producers, kw_only=True)
     """The registers its launches lower their producers to where a compile found them spilling at fewer
     (`template.Mosaic._raised`), every other launch's at the least."""
+    residents: resources.Residents = dataclasses.field(default_factory=resources.Residents, kw_only=True)
+    """The most programs a multiprocessor holds of its launches where a compile found them spilling with
+    their producers' ladders run out (`template.Mosaic._fewer`), every other launch's as many as its plan
+    holds."""
+
+    def __repr__(self) -> str:
+        # Its fields as a dataclass names them, its residents only where a rung set them: a config's repr is
+        # its identity in every store (its certification's program, `report._compiled_launch`; the kernels'
+        # names, `report.named`), which a config without them keeps as it was before they were a field.
+        fields = [field for field in dataclasses.fields(self)
+                  if field.name != "residents" or self.residents.held_to]
+        return f"{type(self).__name__}({', '.join(f'{f.name}={getattr(self, f.name)!r}' for f in fields)})"
 
     @property
     def output_block(self) -> int:
@@ -285,6 +297,8 @@ class Call:
     (`_merging`)."""
     producers: resources.Producers = dataclasses.field(default_factory=resources.Producers)
     """Its tiles' (`Tiles.producers`)."""
+    residents: resources.Residents = dataclasses.field(default_factory=resources.Residents)
+    """Its tiles' (`Tiles.residents`)."""
 
     def producer(self, launching: Callable) -> int | None:
         """The registers the producer of the launch `launching` makes (`launch_kernel`'s, named for it)
@@ -746,8 +760,8 @@ def _planned_launch(call: Call, launch: resources.Launch) -> resources.LaunchPla
 
 
 def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, tiles: int, *,
-          stages: int | tuple[int, int] | None, consumers: int = 1,
-          entry: int = 0) -> tuple[resources.LaunchPlan | None, int, resources.Launch]:
+          stages: int | tuple[int, int] | None, consumers: int = 1, entry: int = 0,
+          most_programs: int | None = None) -> tuple[resources.LaunchPlan | None, int, resources.Launch]:
     """A launch's plan, its programs and what its plan read (`resources.Launch`, its streams `scope`d at each
     depth and its stated `registers`): a persistent launch's (`stages` None) as many as a multiprocessor
     holds at once, at most its `tiles`, its rings up to two deep where they run on across its tiles (a
@@ -759,20 +773,23 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
     any other a program a tile at its `stages`, or at the depth `resources.plan` takes between a `(floor,
     most)` pair's; None where no multiprocessor holds it (`_planned_launch`), a persistent launch then a
     program a multiprocessor; planned at setmaxnreg's least producer, its programs launching with `entry`
-    registers a thread at least (`resources.Launch.entry`)."""
+    registers a thread at least (`resources.Launch.entry`), at most `most_programs` of them a
+    multiprocessor (its tiles' `Residents`)."""
     if stages is None:
         most = 1 if call.family.walks_scoped else 2
-        launch = resources.Launch(scope, 1, registers, floor=1, most=most, entry=entry)
+        launch = resources.Launch(scope, 1, registers, floor=1, most=most, entry=entry,
+                                  most_programs=most_programs)
         found = _planned_launch(call, launch)
         held = (call.target.multiprocessors or 1) * (found.programs if found else 1)
         return found, min(tiles, held), launch
     floor, most = stages if isinstance(stages, tuple) else (stages, stages)
-    launch = resources.Launch(scope, consumers, registers, floor=floor, most=most, entry=entry)
+    launch = resources.Launch(scope, consumers, registers, floor=floor, most=most, entry=entry,
+                              most_programs=most_programs)
     return _planned_launch(call, launch), tiles, launch
 
 
 def _walk_laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, grid: tuple, *,
-               persistent: bool, stages, consumers: int, entry: int) -> tuple:
+               persistent: bool, stages, consumers: int, entry: int, most_programs: int | None) -> tuple:
     """`_laid`'s plan of a launch over `grid` and its stated registers: a `persistent` program walking more
     tiles than the launch's programs carries its next tile across the walk (`_persisted`), its index, its
     coordinates a grid axis each and its liveness, a register each, and is planned again with them.
@@ -781,11 +798,11 @@ def _walk_laid(call: Call, scope: Callable[[int], resources.Scope], registers: i
     SASS 56 SYNCS and 50 branches against 32 and 15; row 6495)."""
     tiles = math.prod(grid)
     found, programs, planning = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
-                                      consumers=consumers, entry=entry)
+                                      consumers=consumers, entry=entry, most_programs=most_programs)
     if persistent and tiles > programs:
         registers += len(grid) + 2
         found, programs, planning = _laid(call, scope, registers, tiles, stages=None, consumers=consumers,
-                                          entry=entry)
+                                          entry=entry, most_programs=most_programs)
     return found, programs, planning, registers
 
 
@@ -860,7 +877,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     # assembler's to certify (`template.Mosaic._raised`), not the model's.
     found, programs, planning, registers = _walk_laid(call, scope, registers, grid, persistent=persistent,
                                                       stages=stages, consumers=consumers,
-                                                      entry=held.entry(family))
+                                                      entry=held.entry(family),
+                                                      most_programs=call.residents.of(name))
     # Where no multiprocessor holds the launch, its record says so (`Launch.resident` zero), which the
     # template's legality refuses, and it builds at its shallowest depth, as a probe of the config compiles
     # it.

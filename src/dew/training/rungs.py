@@ -30,10 +30,10 @@ from dew import _cache
 from dew._devices import device_memory
 from dew._files import write_atomically
 from dew._records import JSON, json_value, record
+from dew._stated import Unestablished, stated
 from dew.nn.kernels.generation import assumption, gpu_target
 from dew.nn.sharding import trace_context
 from dew.telemetry.instrumentation import StepFlops, step_flops
-from dew.training.identity import Unestablished, stated
 
 _log = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`) and a custom `step`, as an identity states them
-    (`dew.training.identity.stated`), the code that builds them
+    (`dew._stated.stated`), the code that builds them
     (`dew._cache.package_digest`), the step's `arguments` (their tree's structure and each leaf's
     abstract value and placement, stated alike), the `splits` its plan chooses among (one where the run
     pins it), the mesh and its devices' kind and allocator limit, the kernels their

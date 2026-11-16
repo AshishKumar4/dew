@@ -119,6 +119,7 @@ from dew.parity import (
     _Draws,
     _enough_seeds,
     _evidence,
+    _exact,
     _example_ratios,
     _example_worst_rows,
     _interval,
@@ -132,6 +133,7 @@ from dew.parity import (
     _term_leaves,
     _verdict,
     heavy_masks,
+    log_errors,
     recorded_kinds,
 )
 from dew.parity_stages import REDRAW, staged_units
@@ -1715,10 +1717,11 @@ def _moved(draws: _Draws, stage: int) -> tuple[list[str], list[str], bool]:
         if not draws.finite[:, index].all():
             kept.append(f"{name}: a value not finite, which moves nothing a ratio can show")
             unresolved = True
-        elif np.sum(theirs) == 0:
+        elif _exact(theirs):
             # The original holds the float64 truth exactly: any move off it is past its rounding.
-            (moved if np.sum(mine) > 0 else kept).append(
-                f"{name}: {'moved off' if np.sum(mine) > 0 else 'kept'} the original's exact value")
+            off = not _exact(mine)
+            (moved if off else kept).append(
+                f"{name}: {'moved off' if off else 'kept'} the original's exact value")
         else:
             ratio = _pooled(mine, theirs)
             low, high = _interval(mine, theirs, tails=(tail, UPPER_TAIL))
@@ -2131,7 +2134,7 @@ def _recorded_leaf(evidence, dtype: str, name: str, row: int) -> RecordedLeaf:
     # A recording made before its worst rows' shares were kept holds none: the gate then reads the row by
     # its width's factor (`_Draws.factor`).
     share = float(evidence["share"][name][row]) if name in evidence["share"] else None
-    return RecordedLeaf(float(evidence["mse"][name][row]), float(evidence["worst"][name][row]),
+    return RecordedLeaf(float(log_errors(evidence["mse"][name][row])), float(evidence["worst"][name][row]),
                         evidence["zero_rows"][name][start:stop], evidence["zero_errors"][name][start:stop],
                         finite=bool(evidence["finite"][name][row]), dtype=dtype, share=share,
                         **{field: None if np.isnan(value).all() else value

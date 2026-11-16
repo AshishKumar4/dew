@@ -47,25 +47,43 @@ NAMED = frozenset(get_args(attention.AttentionImpl))
 its own."""
 
 
-def _step(case: dict[str, str], kernel: str):
-    """`case`'s training step through the public call on `kernel`: the output, and the gradients of
-    `sum(out * dout)` of its query, key and value."""
+def _attended(case: dict[str, str], kernel: str):
+    """`case`'s public call on `kernel`, a function of its query, key and value."""
     segments = None
     if case["mask"] == "documents":
         segments = jnp.asarray(np.repeat(np.arange(DOCUMENTS, dtype=np.int32), LENGTH // DOCUMENTS)[None])
 
-    def step(query, key, value, dout):
-        def attended(query, key, value):
+    def attended(query, key, value):
+        with contextlib.nullcontext() if kernel in NAMED else generation.chosen(**{CHOICE: kernel}):
             return attention.scaled_dot_product_attention(
                 query, key, value, implementation=kernel if kernel in NAMED else "auto",
                 causal=case["mask"] != "full", segment_ids=segments,
                 max_segments=None if segments is None else DOCUMENTS)
 
-        with contextlib.nullcontext() if kernel in NAMED else generation.chosen(**{CHOICE: kernel}):
-            out, pull = jax.vjp(attended, query, key, value)
-            return (out, *pull(dout.astype(out.dtype)))
+    return attended
+
+
+def _step(case: dict[str, str], kernel: str):
+    """`case`'s training step through the public call on `kernel`: the output, and the gradients of
+    `sum(out * dout)` of its query, key and value."""
+    attended = _attended(case, kernel)
+
+    def step(query, key, value, dout):
+        out, pull = jax.vjp(attended, query, key, value)
+        return (out, *pull(dout.astype(out.dtype)))
 
     return step
+
+
+def _forward(case: dict[str, str], kernel: str):
+    """`case`'s call on `kernel` no derivative is taken of, as `_step`'s operands: its output alone."""
+    attended = _attended(case, kernel)
+
+    def forward(query, key, value, dout):
+        del dout
+        return attended(query, key, value)
+
+    return forward
 
 
 def _spec(case: dict[str, str]) -> tuple:
@@ -156,3 +174,44 @@ def a_kernels_training_step_is_on_par(case: tuple[str, ...]) -> None:
                         terms=terms_of(keep, heads))
     recorded = {found.kernel for found in routes if found.choice == CHOICE}
     assert recorded == {named["kernel"], REFERENCE}, sorted(recorded)
+
+
+def heads_shard(case: dict[str, str], kernel: str):
+    """A per-shard cell (`sharded.Shard`) of `case` through the public call on `kernel` over its heads a
+    two-device tensor axis splits, as the attention layer maps them (`attention.on_attention_shards`, under
+    the default logical axis rules), against one device's from the reference path in float64, as the
+    case's generation: its training step (the output and the gradients of the
+    query, key and value), or, for the kernel of a call no derivative is taken of
+    (`attention_kernels.INFERENCE`, whose differentiated call is xla's), its forward alone."""
+    from flax import linen as nn
+    from jax.sharding import PartitionSpec
+    from sharded import Shard
+
+    from dew.mesh import DEFAULT_RULES
+
+    heads, kv_heads, width, dtype = head_shapes(case, HEADS)
+    run = _forward if kernel == attention_kernels.INFERENCE.name else _step
+
+    def specs(mesh) -> list:
+        del mesh
+        return [PartitionSpec(None, None, "tensor")] * 4
+
+    return Shard(run(case, kernel), operands(width, heads, kv_heads, dtype), specs, run(case, REFERENCE),
+                 SEEDS, "tensor", context=lambda: nn.logical_axis_rules(DEFAULT_RULES),
+                 target=case["generation"])
+
+
+def per_shard(choice: str, kernel: str) -> dict:
+    """`kernel`'s per-shard cells (tests/test_per_shard.py): its first case (`CASES`) the kernel launches in
+    (a full-attention one where it has one; for a call no derivative is taken of, one whose forward the
+    template takes, `attention_kernels.template_infers`), as `heads_shard` runs it."""
+    del choice
+    cases = [dict(zip(AXES["attention_kernels"], case, strict=True)) for case in CASES if case[1] == kernel]
+    if kernel == attention_kernels.INFERENCE.name:
+        cases = [case for case in cases
+                 if attention_kernels.template_infers(jnp.dtype(case["dtype"]), int(case["width"]),
+                                                      case["mask"] != "full")]
+    if not cases:
+        return {}
+    case = next((case for case in cases if case["heads"] == "mha"), cases[0])
+    return {"tensor": heads_shard(case, kernel)}

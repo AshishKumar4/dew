@@ -58,7 +58,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 
 from dew.nn.attention_kernels import SPLASH_BLOCK, SPLASH_LANES
-from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
+from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates import attention_algebra, product
@@ -1219,6 +1219,7 @@ def _attention_bwd(blocks: BlockSizes, call: _Call, residuals: tuple, do: jax.Ar
         # sums them closer than one float32 reduction (row 1331).
         sinks_exp = -_weights(sinks[..., None].astype(jnp.float32), peak, inverse)
         dsinks = compensated_sum(sinks_exp * di, (sinks_exp.ndim - 1,)).astype(sinks.dtype)
+    (dq, dk, dv), dsinks = with_gradients_formed((dq, dk, dv), dsinks)
     return None, None, None, dq, dk, dv, None, dsinks
 
 

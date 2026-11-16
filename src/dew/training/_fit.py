@@ -71,6 +71,7 @@ from dew.training.selection import Best, HeldBest
 
 if TYPE_CHECKING:
     from dew.objectives.base import Objective
+    from dew.training.distributed import StartBuild
     from dew.training.startup import Startup
 
 _log = logging.getLogger(__name__)
@@ -1203,6 +1204,16 @@ class Start:
     held: Mapping[int, int]
     """Each device's bytes of the state, by its id, as the layout validates its placement
     (`Validation.device_bytes`): its own memory's alone, none of a field kept in the host's."""
+
+    @functools.cached_property
+    def placing(self) -> StartBuild:
+        """How a fresh state is built and placed (`dew.training.distributed.start_build`), its program built
+        once, whether its start is compiled beside the step (`start_compiling`) or as it is placed: made
+        where a fresh start is placed or compiled, never for a host-master run's, which places its own
+        (`placed_host`)."""
+        from dew.training.distributed import start_build
+
+        return start_build(self.build, self.initializer, self.shardings, self.through)
 
 
 def _rollout_admitted(rollout: Rollout | None) -> Rollout | None:

@@ -637,12 +637,6 @@ SCENARIOS: Mapping[str, Scenario] = {
 }
 """Every scenario of docs/design/testing.md's table this file runs, by its name there."""
 
-ELSEWHERE: Mapping[str, str] = {"Structured prediction": "tests/test_decision_workflow.py",
-                                "Decision ablation workflow": "tests/test_decision_workflow.py"}
-"""The scenarios of testing.md's table another file runs, by their names there, each with its file: a decision
-task trained through `dew train` and served in each cell of its own covering set, held to the conservation
-contract and the claims a run of their own shows (tests/test_decision_workflow.py)."""
-
 
 def _named(cell: Mapping) -> str:
     return ",".join(f"{axis}={value}" for axis, value in cell.items())

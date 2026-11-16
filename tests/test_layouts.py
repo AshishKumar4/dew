@@ -138,25 +138,28 @@ def test_a_routed_or_hybrid_model_writes_its_release_from_its_own_fields_and_rea
 
 def test_a_decoders_layout_traces_its_parameters_once_a_record():
     """Every writer asks `source_layout` of the model it writes (a decision format, a bundle, its export,
-    each draw of a parity rule): a decoder's parameter tree is traced once whatever module holds its
-    record (each trace a miss of `_abstract_variables`, whose body is the trace), a decoder of another
-    record traces its own, and one no record carries is traced uncached."""
-    from dew.interop import layouts
+    each draw of a parity rule): a decoder's draw of its variables (`drawn.initialized`) is traced once,
+    as JAX reports its traces (`Compiles`), whatever module holds its record; a decoder of another record
+    traces its own, and one no record carries (a NumPy scalar field) is traced at each ask."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.telemetry.compiles import Compiles
 
-    layouts._abstract_variables.cache_clear()
-    fields = {"vocab_size": 32, "emb_features": 16, "num_layers": 3, "num_heads": 2, "num_kv_heads": 2,
-              "head_dim": 8, "mlp_features": 32, "max_seq_len": 16}
+    def traces(*models) -> int:
+        with Compiles("initialized") as heard:
+            for model in models:
+                assert source_layout(model)
+        return sum(program.kind == "traced" for program in heard.programs)
+
+    # Widths of this test's own, so no other test's decoder of the record is traced before it.
+    fields = {"vocab_size": 32, "emb_features": 24, "num_layers": 3, "num_heads": 2, "num_kv_heads": 2,
+              "head_dim": 12, "mlp_features": 40, "max_seq_len": 16}
     decoder = CausalTransformer(**fields)
-    for model in (decoder, decoder.clone(), CausalTransformer(**fields)):
-        assert source_layout(model)
-    assert layouts._abstract_variables.cache_info().misses == 1
-    deeper = source_layout(decoder.clone(num_layers=4))
-    assert deeper and deeper.config["num_hidden_layers"] == 4
-    assert layouts._abstract_variables.cache_info().misses == 2
-    # A decoder no run record carries (a NumPy scalar field) has no record to key it by: traced uncached.
-    assert source_layout(decoder.clone(dropout_rate=np.float32(0.1)))
-    assert layouts._abstract_variables.cache_info().misses == 2
+    assert traces(decoder, decoder.clone(), CausalTransformer(**fields)) == 1
+    deeper = decoder.clone(num_layers=5)
+    assert traces(deeper, deeper.clone()) == 1
+    assert source_layout(deeper).config["num_hidden_layers"] == 5
+    unrecorded = decoder.clone(dropout_rate=np.float32(0.1))
+    assert traces(unrecorded, unrecorded.clone()) == 2
 
 
 def test_a_model_its_layout_cannot_hold_is_unwritable_with_its_reason():

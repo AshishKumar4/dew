@@ -70,11 +70,12 @@ import numpy as np
 from flax import core, linen as nn
 from flax.core import meta
 from flax.traverse_util import flatten_dict, unflatten_dict
+from jax.custom_derivatives import SymbolicZero
 
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
 from dew.nn.dense import _contractions, _linear_site
-from dew.nn.derivatives import contracted, surrogate
+from dew.nn.derivatives import contracted, surrogate, with_tangents_formed
 from dew.nn.fake_quant import (
     E2M1_MAX,
     E4M3_MAX,
@@ -1310,6 +1311,11 @@ def _grouped_convolution_gradient() -> type:
                 lhs.astype(dtype), rhs.astype(dtype), window_strides, padding, lhs_dilation, rhs_dilation,
                 dimension_numbers, feature_group_count, batch_group_count)
 
+        # The rule's dual (`with_tangents_formed`): the input's cotangent leaves only with the kernel's. An
+        # operand no derivative moves takes zeros past it.
+        tangents = with_tangents_formed(*tangents)
+        tangents = tuple(jnp.zeros_like(operand) if isinstance(tangent, SymbolicZero) else tangent
+                         for operand, tangent in zip(operands, tangents, strict=True))
         return jax.jvp(convolve, tuple(operands), tuple(tangents))[1], jax.jvp(quantize, tuple(primals),
                                                                               tuple(tangents))[1]
 
@@ -1317,7 +1323,7 @@ def _grouped_convolution_gradient() -> type:
     # whose value carries the quantized operands so the forward quantizes once (a static-scale
     # activation's running statistics update once a step).
     quantized_training = contracted("test_a_quantized_convolution_holds_every_order_it_takes")(
-        surrogate(_qt_forward, straight_through, nondiff_argnums=tuple(range(2, 11))))
+        surrogate(_qt_forward, straight_through, nondiff_argnums=tuple(range(2, 11)), symbolic_zeros=True))
 
     class GroupedConvolutionGradient(qwix.QtProvider):
         """Differentiates a quantized grouped convolution, which Qwix's

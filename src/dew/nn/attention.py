@@ -22,7 +22,7 @@ import tokamax
 from flax.linen.dtypes import promote_dtype
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
+from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed_at
 from dew.nn.residuals import Residual
 
 from .attention_kernels import (
@@ -931,7 +931,9 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
         # held 1.53 times the folded attention's error (the composed tier at 475913063).
         kernel_precision = "highest" if query.dtype == jnp.float32 else None
         out = forward_differentiable(decoded, decoded_reference, query, key, value, key_value_seq_lengths,
-                                     *rest.values(), precision=kernel_precision)
+                                     *rest.values(), precision=kernel_precision,
+                                     parameters=tuple(4 + index for index, name in enumerate(rest)
+                                                      if name == "sinks"))
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
         # kernel takes the call the two forms agree bitwise. Its derivative is the reference path's, as
@@ -1071,7 +1073,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
 
             primal = 'template' if template_infers(query.dtype, query.shape[-1], causal) else 'xla'
             return forward_differentiable(on(primal), on('xla'), query, key, value, bias, sinks,
-                                          primal_alone=True)
+                                          primal_alone=True, parameters=(3, 4))
 
         def fused(query, key, value, bias, sinks):
             return call(query, key, value, bias=bias, sinks=sinks, implementation=kernel, mask_fill=fill)
@@ -1082,7 +1084,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         def reference(query, key, value, bias, sinks):
             return call(query, key, value, bias=bias, sinks=sinks, implementation='reference', mask_fill=fill)
 
-        return forward_differentiable(fused, reference, query, key, value, bias, sinks)
+        return forward_differentiable(fused, reference, query, key, value, bias, sinks, parameters=(3, 4))
 
     if mask_fill is None:
         return _read_nothing(ran(), live)
@@ -1095,7 +1097,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
                    precision=precision, dropping=dropout_seed is not None)
 
 
-def forward_differentiable(value, tangent, *arrays, precision: str | None = None, primal_alone: bool = False):
+def forward_differentiable(value, tangent, *arrays, precision: str | None = None, primal_alone: bool = False,
+                           parameters: tuple[int, ...] = ()):
     """`value(*arrays)`, whose JVP is `tangent`'s: a kernel that defines only
     its reverse-mode derivative, or none, takes its derivatives from a
     reference computing the same function, reverse mode as the transposed JVP.
@@ -1106,7 +1109,9 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
     out of its derivative, where a product's own derivative (`dew.nn.precision.accumulated`'s on a
     CPU) takes its moving operands alone. With `primal_alone`, `value` runs a call no derivative is taken
     of, and a differentiated call's output is `tangent`'s too: its forward and its derivatives one
-    kernel's (an fp32 inference call's template beside xla's training, `attention_kernels.DECLARED`)."""
+    kernel's (an fp32 inference call's template beside xla's training, `attention_kernels.DECLARED`). The
+    arrays at `parameters` are the call's parameters (a bias, the sinks), whose gradients reverse mode
+    forms with the others' cotangents (`derivatives.with_tangents_formed_at`)."""
     from jax.custom_derivatives import SymbolicZero
 
     def attending(*arrays):
@@ -1124,9 +1129,12 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
                 arrays[index] = array
             return tangent(*arrays)
 
+        # The live tangents through the rule's dual (`with_tangents_formed_at`, the arrays at `parameters`
+        # the call's parameters): reverse mode returns the others' cotangents only with theirs formed.
+        held = with_tangents_formed_at(tuple(tangents), parameters)
         with contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision):
             taken, differentiated = jax.jvp(moved, tuple(primals[index] for index in live),
-                                            tuple(tangents[index] for index in live))
+                                            tuple(held[index] for index in live))
         return (taken if primal_alone else attend(*primals)), differentiated
 
     attend = contracted("test_a_fused_attention_call_in_forward_mode_holds_every_order")(
@@ -1220,7 +1228,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     # forward mode differentiates them as written. A stated default is a floor the run's configured
     # precision meets, and a kernel that states its own keeps it.
     if reverse_only(implementation) and not asks_default_precision(precision):
-        return at_precision(precision)(fused)(query, key, value, bias, sinks)
+        return at_precision(precision, parameters=(3, 4))(fused)(query, key, value, bias, sinks)
     with configured_precision(precision):
         return fused(query, key, value, bias, sinks)
 

@@ -17,6 +17,7 @@ import hashlib
 import threading
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
+from concurrent import futures
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
 
@@ -29,7 +30,7 @@ from jax.sharding import Sharding
 
 from dew import _cache, algebra
 from dew._devices import xla_flag
-from dew.nn.kernels.generation import backend, gpu_target, traced_fact
+from dew.nn.kernels.generation import backend, gpu_target, stated, traced_fact
 from dew.nn.nested import staged
 from dew.telemetry.benchmark import UNGRAPHED_FLAG, options_of
 
@@ -243,11 +244,14 @@ def keeping(kept: Kept) -> Iterator[None]:
 
 @dataclasses.dataclass(frozen=True)
 class Compiling:
-    """A program's first compile running in a thread of its own (`compiling`), by its lowering's digest
-    (`program_digest`): what the program's compile through Dew's compile point takes in its place where it
-    lowers the same program (`attempting`)."""
+    """A program's first compile running in a thread of its own (`compiling`): the program, what its call
+    lowered from (`OuterProgram.abstract_of`, None for a plain jit) and its lowering, which the program's
+    compile through Dew's compile point takes where it compiles the same program over the same, lowering
+    nothing again, else where it lowers the same program (`program_digest`) (`attempting`)."""
 
-    digest: str
+    program: Callable
+    abstract: Hashable | None
+    lowered: jax.stages.Lowered
     attempt: Future
 
 
@@ -255,8 +259,9 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
     """`program` over these arguments (arrays or shapes) lowered here and its first compile begun in a
     daemon thread of its own (`report.attempted`: XLA's compile alone, which releases the GIL), so it
     compiles while this thread runs on: a run's start beside its step's planning, which does not read it.
-    Only `attempting` waits for it: a run refused before its start is taken exits without waiting for a
-    compile no one reads (row 5966), where an executor's worker held the interpreter's exit for it."""
+    `attempting` takes it; the process's exit waits for it where it still runs (`_exit_waits`), so a run
+    refused before its start is taken exits with its refusal once the compile ends, never through a
+    compile XLA's exit tears down under it."""
     from dew.nn.kernels.templates import report
 
     lowered = program.lower(*args, **kwargs)
@@ -271,9 +276,40 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
         except BaseException as error:
             # Its reader raises it (`attempting`).
             attempt.set_exception(error)
+        finally:
+            with _IN_FLIGHT_GUARD:
+                _IN_FLIGHT.discard(attempt)
 
+    with _IN_FLIGHT_GUARD:
+        _IN_FLIGHT.add(attempt)
+    _exit_waits()
     threading.Thread(target=attempted, name="dew-compile-ahead", daemon=True).start()
-    return Compiling(program_digest(lowered), attempt)
+    abstract = program.abstract_of(args, kwargs) if isinstance(program, OuterProgram) else None
+    return Compiling(program, abstract, lowered, attempt)
+
+
+_IN_FLIGHT: set[Future] = set()
+"""The compiles `compiling` began that have not ended."""
+_IN_FLIGHT_GUARD = threading.Lock()
+
+
+@functools.cache
+def _exit_waits() -> None:
+    """The process's exit waits for every compile `compiling` began that still runs, registered once one
+    begins, after JAX is imported, so it runs before JAX's own exit cleanup (`atexit` runs the last
+    registered first): neither JAX's clearing of its backends nor the C runtime's exit, which destroys
+    XLA's static objects, meets a running compile. A run refused while its start compiles exits with its
+    refusal, the compile's remaining time later; it ended by a segmentation fault in 12 of 48 such exits
+    (row 6837). Its cost falls on a refusal that comes after the start's compile begins, which only one that
+    needs what runs beside it is (`dew.training.trainer.Trainer._compiled_fresh`)."""
+    import atexit
+
+    def waited() -> None:
+        with _IN_FLIGHT_GUARD:
+            running = list(_IN_FLIGHT)
+        futures.wait(running)
+
+    atexit.register(waited)
 
 
 _ATTEMPTING: contextvars.ContextVar[Compiling | None] = _cache.untraced(
@@ -284,7 +320,8 @@ _ATTEMPTING: contextvars.ContextVar[Compiling | None] = _cache.untraced(
 def attempting(begun: Compiling | None) -> Iterator[None]:
     """Within the block, a program compiled through Dew's compile point whose lowering is `begun`'s takes
     its first compile from that thread (`compiling`), waiting for it there, and keeps it as one it compiled
-    itself (`report.compiled`'s `first`); any other compiles as it would. None begins nothing."""
+    itself (`report.compiled`'s `first`): the same program over the same abstract inputs takes the begun
+    lowering too, tracing nothing again; any other compiles as it would. None begins nothing."""
     token = _ATTEMPTING.set(begun)
     try:
         yield
@@ -634,13 +671,20 @@ class OuterProgram:
         from dew.nn.kernels.templates import report
 
         relowered: Relowered = []
-        lowered = self.lower(*args, **kwargs)
+        # A call whose first compile was begun in a thread of its own (`compiling`), the same program over
+        # the same abstract inputs, lowers nothing again: the begun lowering is its.
+        begun = _ATTEMPTING.get()
+        if begun is not None and begun.program is self and begun.abstract == self.abstract_of(args, kwargs):
+            lowered = begun.lowered
+        else:
+            lowered = self.lower(*args, **kwargs)
         # A program compiled ahead for this target runs as it was compiled (`taking`).
         if (taken := _TAKEN.get()) and (ahead := taken.get(program_digest(lowered))) is not None:
             return ahead()
-        # Its first compile begun in a thread of its own where it was (`compiling`).
-        begun, first = _ATTEMPTING.get(), None
-        if begun is not None and begun.digest == program_digest(lowered):
+        # Its first compile from that thread, where it lowers the program begun there.
+        first = None
+        if begun is not None and (lowered is begun.lowered
+                                  or program_digest(begun.lowered) == program_digest(lowered)):
             first = begun.attempt.result()
         executable = report.compiled(lowered,
                                      relower=functools.partial(self._relowered, args, kwargs, relowered),
@@ -665,9 +709,20 @@ class OuterProgram:
         ones dropped. It holds what jit keys on: the trace context, with its abstract mesh, and the
         concrete mesh in place (`jax.sharding.get_mesh`), so a mesh of the same shape over other devices
         compiles its own executable."""
+        return self._keyed(args, kwargs, _signature)
+
+    def abstract_of(self, args: tuple, kwargs: dict) -> Hashable:
+        """What a call over these arguments lowers from, arrays or their shapes alike: `key_of`'s key with
+        each array or shape as its shape, dtype, weak type and sharding (`shapes_of`). Two calls of the
+        program alike in it lower one program, so a begun compile's lowering serves both (`attempting`)."""
+        return self._keyed(args, kwargs, _abstract_signature)[0]
+
+    def _keyed(self, args: tuple, kwargs: dict, signature: Callable[..., Hashable]
+               ) -> tuple[Hashable, tuple, dict]:
+        """`key_of`'s key with each dynamic leaf as `signature` states it."""
         if not self.numbers and not self.names:
             leaves, structure = jax.tree.flatten((args, kwargs))
-            return (len(args), ((), ()), structure, tuple(map(_signature, leaves)),
+            return (len(args), ((), ()), structure, tuple(map(signature, leaves)),
                     jax_config.trace_context(), jax.sharding.get_mesh()), args, kwargs
         numbers = {number % len(args) for number in self.numbers if -len(args) <= number < len(args)}
         dynamic = tuple(arg for number, arg in enumerate(args) if number not in numbers)
@@ -677,7 +732,7 @@ class OuterProgram:
         statics = (tuple((number, type(args[number]), args[number]) for number in sorted(numbers)),
                    tuple(sorted(((name, type(value), value) for name, value in kwargs.items()
                                  if name in self.names), key=lambda static: static[0])))
-        return (len(args), statics, structure, tuple(map(_signature, leaves)),
+        return (len(args), statics, structure, tuple(map(signature, leaves)),
                 jax_config.trace_context(), jax.sharding.get_mesh()), dynamic, named
 
 
@@ -687,11 +742,39 @@ def _given_tuple(given) -> tuple:
 
 
 def trace_context() -> Hashable:
-    """What JAX keys a trace on beside its arguments (its configuration's traced states, Dew's own run
-    precision among them, and the abstract mesh), and the concrete mesh in place: what a call's executable
-    is kept under beside its arguments (`OuterProgram.key_of`), for a cache of traces kept outside the
-    compile point (`dew.training._candidates`)."""
-    return jax_config.trace_context(), jax.sharding.get_mesh()
+    """What a trace reads of this thread's context beside its function and its arguments' types: the key a
+    trace kept outside the compile point is held by (a step's candidates, `dew.training._candidates`; a
+    fused region's written program, `dew.algebra.fusion`). What JAX keys a trace on (its configuration's
+    traced states, Dew's own run precision among them, its meshes and contexts, and Dew's contexts but those
+    a trace records into, `_cache.RECORDING`), and the concrete mesh in place, read as it stands within a
+    trace too (where `jax.sharding.get_mesh` refuses); what a model reads from the step's own entry, by value
+    (`dew.nn.sharding.trace_context` and the declared axes' table frozen, in place of the variables that
+    entry sets anew, `sharding.STATED`); every other context variable set in this context but those no trace
+    reads (`_cache.untraced`, and Python's decimal context); the logical axis rules Flax holds; and the
+    environment's variables of Dew's own, each value by its contents (`generation.stated`). The process's
+    facts a trace reads (`generation.TRACED_FACTS`) are no part of it: each is answered where a trace asks
+    it, under the trace's own target, and one read outside a trace may have no answer (a compile-only GPU
+    mesh's devices hold no memory statistics); a caller whose trace reads one names it beside this key (the
+    compiles' refusals, `report.refused_launches`). A value it leaves out costs a trace, never a program
+    traced under other state."""
+    import decimal
+    import os
+
+    from flax import linen as nn
+    from jax._src import mesh as mesh_lib
+
+    from dew.nn import sharding
+
+    with _cache.KERNEL_SEEN(None), _cache.KERNEL_ROUTES(()):
+        traced = jax_config.trace_context()
+    variables = sorted(((variable, stated(value)) for variable, value in contextvars.copy_context().items()
+                        if variable not in _cache.UNTRACED | sharding.STATED
+                        and not isinstance(value, decimal.Context)),
+                       key=lambda pair: (pair[0].name, id(pair[0])))
+    entry = sharding.trace_context(), tuple(sorted(sharding.current_boxes().items(), key=repr))
+    return (traced, mesh_lib.get_concrete_mesh(), entry, tuple(variables),
+            stated(nn.get_logical_axis_rules()),
+            tuple(sorted((name, value) for name, value in os.environ.items() if name.startswith("DEW_"))))
 
 
 def _signature(leaf) -> Hashable:
@@ -703,6 +786,20 @@ def _signature(leaf) -> Hashable:
     if isinstance(leaf, jax.Array):
         # A typed key array states no format: its placement is its sharding.
         return leaf.aval, leaf.sharding, leaf.committed
+    return type(leaf), np.shape(leaf), np.result_type(leaf)
+
+
+def _abstract_signature(leaf) -> Hashable:
+    """What a lowering reads of an argument (`OuterProgram.abstract_of`): an array's or a shape's shape,
+    dtype and weak type (its abstract value, a key array's among them) and its sharding, which a call over
+    arrays and one over their shapes (`shapes_of`) share; another value's type, shape and dtype. An array
+    no one committed to its devices (a fresh `jax.random.key`) lowers as an unplaced shape does: jit places
+    it, so its sharding is none here, as an unplaced shape's is."""
+    if isinstance(leaf, jax.Array):
+        placed = leaf.sharding if leaf.committed else None
+        return leaf.aval.shape, leaf.aval.dtype, leaf.aval.weak_type, placed
+    if isinstance(leaf, jax.ShapeDtypeStruct):
+        return leaf.shape, leaf.dtype, leaf.weak_type, leaf.sharding
     return type(leaf), np.shape(leaf), np.result_type(leaf)
 
 

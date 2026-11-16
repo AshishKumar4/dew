@@ -480,7 +480,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
     from arm_arithmetic import unrewritten
     from reference_error import _drawn
 
-    from dew.parity import NO_ZERO_ROWS, _Draws, _staged, _verdict
+    from dew.parity import NO_ZERO_ROWS, _Draws, _staged, _verdict, log_errors
     from dew.parity_stages import staged_units
 
     # The same draws under either procedure, so their verdicts compare run by run.
@@ -494,12 +494,14 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
         names, values = pool.names, np.asarray(pool.mine)
     verdicts = []
     for _ in range(runs):
+        # Each seed's squared errors' logs (`_Draws`): Dew's the reference's law times ratio squared.
         if law in CLASSES:
-            mine = ratio ** 2 * values[rng.integers(0, len(values), span)]
+            mine = 2 * np.log(ratio) + values[rng.integers(0, len(values), span)]
             theirs = values[rng.integers(0, len(values), span)]
         else:
             names = ["leaf"]
-            mine, theirs = ratio ** 2 * _law(law, rng, span)[:, None], _law(law, rng, span)[:, None]
+            mine = 2 * np.log(ratio) + log_errors(_law(law, rng, span))[:, None]
+            theirs = log_errors(_law(law, rng, span))[:, None]
         leaves = mine.shape[1]
 
         def drawn(start, stop, mine=mine, theirs=theirs, leaves=leaves, names=names):
@@ -552,7 +554,7 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int, ampli
 
         def drawn(start, stop, worst=worst, shares=shares):
             count = stop - start
-            return _Draws(["rows"], np.ones((count, 1)), np.ones((count, 1)), np.log(worst[start:stop]),
+            return _Draws(["rows"], np.zeros((count, 1)), np.zeros((count, 1)), np.log(worst[start:stop]),
                           [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (width,),
                           shares=shares[start:stop])
 
@@ -633,7 +635,7 @@ def main(argv: list[str]) -> int:
                       2 * OFFSET * 1024 + (options.chunk + 1) * options.draws)
         draws = _drawn(reference, reference, draw, seeds, truth)
         print(json.dumps({"class": options.name, "chunk": options.chunk, "names": draws.names,
-                          "mse": np.asarray(draws.mine).tolist(),
+                          "mse": np.exp(np.asarray(draws.mine)).tolist(),
                           "log_worst": np.asarray(draws.worst[..., 0]).tolist()}), flush=True)
         return 0
     def twin(*inputs):

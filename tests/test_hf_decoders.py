@@ -158,14 +158,16 @@ def fixture_config(name):
 
 
 def test_the_metadata_fields_are_transformers_and_reading_a_config_imports_none_of_it():
-    """The fields a translator leaves out as metadata (`HF_METADATA`) are as tools/gen_hf_metadata.py writes
-    them from the pinned transformers' base config, and `torch_dtype`; a fresh process that translates a
+    """The fields a translator leaves out as metadata (`HF_METADATA`) are the ones tools/gen_hf_metadata.py
+    derives from the pinned transformers' base config, and `torch_dtype` (the file's text is the
+    generator's to check, `--check`); a fresh process that translates a
     released config imports no transformers, whose import took 6.6 s on armada (row 3895)."""
     from process_support import assert_exits_cleanly
 
+    from dew.interop.config_records import HF_METADATA
     from tools import gen_hf_metadata
 
-    assert gen_hf_metadata.written() == gen_hf_metadata.RECORDS.read_text()
+    assert frozenset(gen_hf_metadata.metadata()) == HF_METADATA
     assert_exits_cleanly(
         "import json, sys\nfrom dew.interop.hf_decoders import translate_config\n"
         f"translate_config(json.loads(open({str(FIXTURES / 'llama-tiny' / 'config.json')!r}).read()))\n"

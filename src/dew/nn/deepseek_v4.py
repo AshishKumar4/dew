@@ -296,9 +296,9 @@ class CompressedEntries(FakeQuantizing):
         dense = functools.partial(Dense, use_bias=False, dtype=projected, precision=self.precision,
                                   dot_general=float32_dot_general)
         # The entry width or twice it: nothing to shard on the output side.
-        self.kv_proj = dense(series * self.width, name='kv_proj', kernel_axes=('embed', None))
+        self.kv_proj = dense(series * self.width, name='kv_proj', kernel_axes=('embed', 'head_dim'))
         if self.gated:
-            self.gate_proj = dense(series * self.width, name='gate_proj', kernel_axes=('embed', None))
+            self.gate_proj = dense(series * self.width, name='gate_proj', kernel_axes=('embed', 'head_dim'))
             if self.position_bias:
                 self.bias = self.param(
                     'position_bias', nn.initializers.zeros, (self.rate, series * self.width), jnp.float32)
@@ -672,7 +672,7 @@ class DeepseekV4Attention(FakeQuantizing):
         self.q_b_proj = dense(self.num_heads * self.head_dim, name='q_b_proj',
                               kernel_axes=('qlora', 'attention'))
         # One shared key/value head: nothing to shard on the output side.
-        self.kv_proj = dense(self.head_dim, name='kv_proj', kernel_axes=('embed', None))
+        self.kv_proj = dense(self.head_dim, name='kv_proj', kernel_axes=('embed', 'head_dim'))
         self.kv_norm = norm(name='kv_norm')
         # Block-diagonal over the head groups: one `[g, in, o_lora_rank]` kernel, the group its
         # batch dim (`DeepseekV4GroupedLinear`, modeling_deepseek_v4.py:294-323, whose weight

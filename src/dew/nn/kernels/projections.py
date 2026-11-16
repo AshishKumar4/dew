@@ -13,7 +13,13 @@ from flax.typing import PrecisionLike
 
 from dew import _cache
 from dew.mesh import mesh_axes
-from dew.nn.derivatives import KernelGlue, Surrogate, contracted, declared_derivative
+from dew.nn.derivatives import (
+    Surrogate,
+    contracted,
+    declared_derivative,
+    portable_formed,
+    with_gradients_formed,
+)
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.formats import MxFp8, NvFp4Block
 from dew.nn.kernels.gemm import (
@@ -21,7 +27,6 @@ from dew.nn.kernels.gemm import (
     blockwise_fp8_product,
     gemm,
     gemm_t,
-    in_layer,
     mxfp8_product,
     nvfp4_block_product,
 )
@@ -190,7 +195,7 @@ def _projection_backward(out_dtype, interpret, residuals, cotangent):
     dy_t, dy_t_scales = rows_quantized(cotangent.T)
     d_w = blockwise_fp8_kernel_gradient(rows_t, dy_t, group_blocks, rows_t_scales.T, dy_t_scales.T,
                                         out_dtype=w.dtype, interpret_on_cpu=interpret)
-    return d_x, d_w, None
+    return (*with_gradients_formed(d_x, d_w), None)
 
 # The recipe's gradient (`blockwise_fp8_projection`): a derivative of Dew's choosing (`Surrogate`).
 _blockwise_projection = contracted("test_a_blockwise_fp8_projection_holds_every_reverse_order")(
@@ -243,7 +248,7 @@ def _mx_backward(out_dtype, interpret, residuals, cotangent):
     cotangents = MxFp8.quantized(cotangent.T).decoded().T.astype(jnp.bfloat16)
     d_w = gemm_t(rows, cotangents, sizes, out_dtype=w.dtype, precision=jax.lax.Precision.DEFAULT,
                  interpret_on_cpu=interpret)
-    return d_x, d_w, None
+    return (*with_gradients_formed(d_x, d_w), None)
 
 # The MXFP8 recipe's gradient (`mxfp8_projection`): a derivative of Dew's choosing (`Surrogate`).
 _mx_projection = contracted("test_an_mxfp8_projection_holds_every_reverse_order")(
@@ -282,7 +287,7 @@ def _nvfp4_backward(out_dtype, interpret, residuals, cotangent):
     d_w = gemm_t((rows.decoded() * rows.scale).T.astype(jnp.float32),
                  (cotangents.decoded() * cotangents.scale).T.astype(jnp.float32), sizes, out_dtype=w.dtype,
                  precision=jax.lax.Precision.HIGHEST, interpret_on_cpu=interpret)
-    return d_x, d_w, None
+    return (*with_gradients_formed(d_x, d_w), None)
 
 # The NVFP4 recipe's gradient (`nvfp4_projection`): a derivative of Dew's choosing (`Surrogate`).
 _nvfp4_projection = contracted("test_an_nvfp4_projection_holds_every_reverse_order")(
@@ -321,28 +326,21 @@ def dot_general(xla, path: tuple | None = None):
             if launched(rows, rhs, out_dtype, precision):
                 out = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
                 return out.reshape(*lhs.shape[:-1], rhs.shape[1])
-            return _in_layer_product(xla, dimension_numbers, precision, preferred_element_type)(lhs, rhs)
-        return xla(lhs, rhs, dimension_numbers, precision=precision,
-                   preferred_element_type=preferred_element_type, **kwargs)
+        taken = _in_layer_product(xla, dimension_numbers, precision, preferred_element_type, **kwargs)
+        return taken(lhs, rhs)
 
     return product
 
 
-def _in_layer_product(xla, dimension_numbers, precision, preferred_element_type):
-    """A projection's product no launch takes, XLA's own (`xla`), its reverse mode's cotangents leaving
-    together (`gemm.in_layer`), as the template's do: XLA's dot of its kernel gradient put off to the step's
-    end held its layer's cotangent to it (row 6027), whichever route the product's neighbours take. Its
-    forward and every derivative's value are `xla`'s, differentiated through it (`linear_tangent`)."""
+def _in_layer_product(xla, dimension_numbers, precision, preferred_element_type, **kwargs):
+    """A projection's product no launch takes, XLA's own (`xla`, any of its forms: a batched one's, DeepSeek
+    V4's grouped `o_a_proj`), through the rule as the template's is (`derivatives.portable_formed`): the
+    input's cotangent returned only with the kernel's gradient formed."""
     def portable(lhs, rhs):
         return xla(lhs, rhs, dimension_numbers, precision=precision,
-                   preferred_element_type=preferred_element_type)
+                   preferred_element_type=preferred_element_type, **kwargs)
 
-    def backward(saved, operands, cotangent):
-        del saved
-        return in_layer(*jax.vjp(portable, *operands)[1](cotangent))
-
-    return contracted("test_an_xla_projection_in_its_layer_holds_every_order")(generation.linear_tangent(
-        lambda lhs, rhs: (portable(lhs, rhs), ()), backward, portable, kind=KernelGlue()))
+    return portable_formed(portable)
 
 
 def rows_split(lhs: jax.Array) -> jax.sharding.PartitionSpec | None:

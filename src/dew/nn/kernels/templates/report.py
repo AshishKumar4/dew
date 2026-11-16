@@ -452,15 +452,6 @@ def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
     return bool(refused_at(op, arguments, config))
 
 
-def refused_state() -> frozenset:
-    """Every launch config this context's compiles refused (`refused`), with the kernels refused at it
-    (`Binary.refused`: spilling, or their warpgroup MMAs serialized): what a template's legality reads as it
-    traces, so a trace held by its state (`dew._cache.traced_state`) is traced again once a compile refuses
-    another config."""
-    with _GUARD:
-        return frozenset(_registry().refused.items())
-
-
 def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable) -> frozenset[str]:
     """The names of `op`'s kernels a compile of this process refused at `config` for `arguments`
     (`Binary.refused`: spilling, or their warpgroup MMAs serialized): a launch of several kernels (a
@@ -495,6 +486,8 @@ class Certification:
     round: int
     """The round of certification it was compiled or read in (`certified_together`): configs certified at once
     share one."""
+    device: Hashable
+    """The GPU it was certified on (`_certifying_device`, a `jax.Device`), whose assembler's answer it is."""
 
     @property
     def refused(self) -> tuple["Binary", ...]:
@@ -590,7 +583,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
         if stored is not None:
             tuning.store_verdict(device.device_kind, stored, kernels)
     found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None,
-                          next(_ROUNDS) if round is None else round)
+                          next(_ROUNDS) if round is None else round, device)
     with _GUARD:
         _CERTIFIED[key] = found
     return found.refused
@@ -600,15 +593,18 @@ def certified_together(op, arguments: tokamax.BoundArguments, configs: Sequence[
                        ) -> list[tuple["Binary", ...] | None]:
     """Each of `configs` certified (`certified`) in one round, all at once on as many threads, each tracing
     under this thread's states (`dew._cache.carried`: the assumed GPU, the kernel choices, JAX's per-thread
-    settings) in a copy of this context: a search's rungs, which the assembler answers only one yes or no each
-    (`rung_round` bounds a round by the host's cores)."""
+    settings) in a copy of this context, on the device this thread certifies on: a search's rungs, which the
+    assembler answers only one yes or no each (`rung_round` bounds a round by the host's cores)."""
     round = next(_ROUNDS)
-    if len(configs) < 2:
+    # The device this thread certifies on, named to each thread: one read of this thread's mesh, which JAX
+    # holds per thread (`jax.set_mesh`), and no other thread sees (row 6791; train 909's review F4).
+    device = _certifying_device()
+    if len(configs) < 2 or device is None:
         return [certified(op, arguments, config, round=round) for config in configs]
     entered = _cache.carried()
 
     def asked(config: Hashable) -> tuple["Binary", ...] | None:
-        with entered():
+        with entered(), certifying(device):
             return certified(op, arguments, config, round=round)
 
     with ThreadPoolExecutor(len(configs), thread_name_prefix="dew-certify") as pool:
@@ -666,19 +662,25 @@ def missed(op, arguments: tokamax.BoundArguments, config: Hashable, refused: Seq
 
 
 def _certifying_device():
-    """The device a launch is certified on (`certified`): a block's (`certifying`), else this process's GPU
-    where it compiles for that GPU's own generation (`generation.device_target`, whatever `assumed` says: an
-    A100 tracing for an assumed sm90 compiled the sm90 launch on itself, and Mosaic refused its TMA copies,
-    rows 6677 and 6678), else none."""
+    """The device a launch is certified on (`certified`): a block's (`certifying`), else the GPU the trace's
+    program runs on, the concrete mesh's (`jax.set_mesh`: a compile-only GPU's where a run's start compiles
+    ahead for one, `dew.training.ahead`), else this process's own GPU; either where it compiles for that
+    GPU's own generation (`generation.device_target`, whatever `assumed` says: an A100 tracing for an
+    assumed sm90 compiled the sm90 launch on itself, and Mosaic refused its TMA copies, rows 6677 and 6678),
+    else none. A trace under a compile-only GPU's mesh certified on the host's own GPU certified each launch a
+    second time, apart, where the start's compile certified it on the mesh's (row 6791)."""
+    from jax._src import mesh as mesh_lib
+
     named = _CERTIFYING.get()
     if named is not None:
         return named
-    if jax.default_backend() != "gpu":
+    placed = mesh_lib.get_concrete_mesh()
+    devices = jax.local_devices() if placed.empty else [
+        device for device in placed.devices.flat if device.process_index == jax.process_index()]
+    # A device of another generation (a CPU's, an A100's under an assumed sm90) certifies nothing.
+    if not devices or generation.device_target(devices[0]).generation != generation.gpu_target().generation:
         return None
-    device = jax.local_devices()[0]
-    if generation.device_target(device).generation != generation.gpu_target().generation:
-        return None
-    return device
+    return devices[0]
 
 
 def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, device,

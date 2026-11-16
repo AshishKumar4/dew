@@ -26,7 +26,7 @@ A region's written program is Dew's call traced over the region's inputs' types 
 step's own trace does not hold (the template's launch, Dew's attention or norm), which only a trace of that
 call makes. It is traced once a process for the region's identity (`Written.key`: its structure, the values
 of the constants its call reads, and which call writes it) under the state the trace reads
-(`_cache.traced_state`), and written into every later lowering of a program holding it: a step's
+(`options.trace_context`), and written into every later lowering of a program holding it: a step's
 relowerings, its planner's candidates and every layer of a stack share one trace, which reports its kernels'
 routes and launches where each program is written as it did when it traced.
 """
@@ -36,7 +36,7 @@ from __future__ import annotations
 import collections
 import threading
 from collections.abc import Callable, Hashable, Sequence
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -46,6 +46,9 @@ from jax.extend import core as jcore
 from dew.nn.kernels import generation
 from dew.nn.nested import nested
 from dew.nn.programs import RaggedLayout, entrywise, ragged_layout
+
+if TYPE_CHECKING:
+    from dew.nn.kernels import tuning
 
 CAPTURED = (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p)
 """The layout equations a region takes of a captured operand only it reads (a bias broadcast over rows), so
@@ -351,13 +354,13 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
 
 class _Trace(NamedTuple):
     """A region's written program (`_traced`): its one equation, the inputs it reads them by, and the routes
-    and launches (each its op and keyed arguments, `tuning.Seen`'s) its trace reported, which each program
-    it is written into reports."""
+    and launches (each its op and keyed arguments, and the config it took, `tuning.Seen.held`) its trace
+    reported, which each program it is written into reports."""
 
     equation: jcore.JaxprEqn
     invars: tuple[jcore.Var, ...]
     routes: tuple
-    launches: tuple
+    launches: tuning.Seen
 
 
 _traces: collections.OrderedDict[Hashable, _Trace] = collections.OrderedDict()
@@ -366,13 +369,15 @@ _TRACES_LOCK = threading.Lock()
 
 def _traced(region: Written) -> _Trace:
     """`region`'s call traced as one nested program over its inputs' types (`nested`), once a process for
-    its identity (`Written.key`) under the state a trace reads (`_cache.traced_state`), the latest
-    `DECISIONS_HELD` held; its routes and launches reported where it is written, as its trace reported them
-    (`generation.reported`, `tuning.noted`)."""
-    from dew import _cache
+    its identity (`Written.key`) under the state a trace reads (`options.trace_context`) and the launches
+    the compiles refused, which a template's legality reads as the call traces (`report.refused_launches`),
+    the latest `DECISIONS_HELD` held; its routes and launches reported where it is written, as its trace
+    reported them (`generation.reported`, `tuning.noted`)."""
     from dew.nn.kernels import tuning
+    from dew.nn.kernels.options import trace_context
+    from dew.nn.kernels.templates import report
 
-    key = (region.key, _cache.traced_state())
+    key = (region.key, trace_context(), report.refused_launches())
     with _TRACES_LOCK:
         held = _traces.get(key)
         if held is not None:
@@ -381,7 +386,7 @@ def _traced(region: Written) -> _Trace:
         with generation.routes(alone=True) as routes, tuning.seen() as seen:
             traced = jax.make_jaxpr(nested(region.call))(*_shapes(region.inputs))
         (equation,) = traced.jaxpr.eqns
-        held = _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), tuple(seen))
+        held = _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), seen.held())
         with _TRACES_LOCK:
             _traces[key] = held
             if len(_traces) > DECISIONS_HELD:

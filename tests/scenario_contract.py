@@ -215,9 +215,9 @@ def assert_resumes_onto_its_uninterrupted_run(prepared: Recorded | Called, root:
     (`checkpointed`), bit for bit; and its process, to its end (its final validation and checkpoint too),
     compiles no program the runs before it did not: it writes nothing to the cache (`written`), and found
     programs there. A checkpoint that holds an average (`TrainState.ema`) restores it from its difference to
-    the weights, one program a leaf signature (`dew.checkpoints`' delta planes) that no run before the first
-    resume ran: there, the run resumed again from the same pause, in a fresh process, is held to compile
-    nothing, and to end where the first resume and the uninterrupted run end."""
+    the weights, a program the save that wrote it compiles (`dew.checkpoints._state_trees.decoded_ahead`):
+    the run resumed again from the same pause, in a fresh process, is held alike, each resume against the
+    cache the runs before the first left, and each ends where the uninterrupted run ends."""
     whole_phase, paused_phase, resumed_phase = resumption(root)
     cache = Path(str(resumed_phase.cache))
     # Two processes of their own, run side by side: each its own run directory, one cache, compiling alike.
@@ -229,19 +229,19 @@ def assert_resumes_onto_its_uninterrupted_run(prepared: Recorded | Called, root:
     held = checkpointed(whole)
     kept = paused.with_name(f"{paused.name}-paused")
     shutil.copytree(paused, kept)
+    before = written(cache)
     for resume in range(2 if averaged else 1):
         if resume:
             shutil.rmtree(paused)
             shutil.copytree(kept, paused)
-        before = written(cache)
         resumed, counts = prepared.trained(resumed_phase)
         assert Checkpoints(str(resumed)).latest == end
         ran = checkpointed(resumed)
         assert held.keys() == ran.keys(), set(held) ^ set(ran)
         off = [path for path, value in held.items() if value != ran[path]]
         assert not off, f"the resumed run's leaves off the uninterrupted run's: {off}"
-    compiled = written(cache) - before
-    assert not compiled and counts["train/cache_hits"] > 0, (sorted(compiled), counts)
+        compiled = written(cache) - before
+        assert not compiled and counts["train/cache_hits"] > 0, (resume, sorted(compiled), counts)
 
 
 def cached(cache: str, module: str, function: str, *arguments) -> dict:

@@ -32,7 +32,8 @@ the network's parameters, a traced carry. Each head's network is this layer's ch
 whose parameters are its W_0, and every application runs that child at its own scope over the weights
 the step holds, read-only (`_substituted`), so the layer composes with a scanned layer stack and remat,
 and a method interceptor the model computes under finds each head's sites at their paths, as at any
-child; the chunk's carry is named (`CARRY`) for a remat policy. The heads run one after another, each
+child; the chunk's carry is named (`CARRY`) for a remat policy, and is all the scan keeps of a chunk for
+its derivative, which recomputes the chunk from it. The heads run one after another, each
 vectorized over its rows and tokens, and may hold different trees (an adapter on one head alone).
 
 An adapter on an inner kernel (`dew.lora`) adds its branch, s drop(x) A B, at every application, as it
@@ -698,7 +699,12 @@ class InContextMemory(LinearProducts):
         count = laid.real.shape[0]
         rows = tuple(_rows(head.initial, steps.real) for head in heads)
         carry = (rows, jax.tree.map(jnp.zeros_like, rows))
-        _, reads = jax.lax.scan(functools.partial(self._chunk, heads=heads), carry, laid)
+        # Each chunk's work recomputed from the carry it entered with where a derivative reads it, the chunked
+        # recurrences' way: the scan stacks a chunk's carry alone, not every value of its gradients and steps
+        # (row 6577: 46 of them a chunk, 26 MiB a layer at 512 chunks, whose zero-filled stacks XLA merges
+        # across layers into one buffer held through the backward).
+        chunk = jax.checkpoint(functools.partial(self._chunk, heads=heads), prevent_cse=False)
+        _, reads = jax.lax.scan(chunk, carry, laid)
         reads = jnp.moveaxis(reads, 0, 1).reshape(batch, count * self.chunk, *reads.shape[3:])[:, :length]
         inverse = jnp.argsort(order, axis=1)
         return jnp.take_along_axis(reads, inverse.reshape(*inverse.shape, 1, 1), axis=1)

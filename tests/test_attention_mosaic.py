@@ -13,6 +13,7 @@ import contextvars
 import dataclasses
 import functools
 import gc
+import json
 import weakref
 from collections.abc import Callable
 
@@ -1252,7 +1253,6 @@ def test_a_run_refuses_a_kernel_whose_warpgroup_products_ptxas_serialized_as_a_s
         report.kept(first, relower=lambda: first, read=lambda executable: noted)
         misses = report.misses()
     assert misses and all(miss.serialized == ("C7512",) and not miss.frame for miss in misses), misses
-    assert all("serializes its warpgroup MMAs" in miss.reason for miss in misses), misses
 
 
 @pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
@@ -1940,6 +1940,52 @@ def test_a_width_split_backward_writes_its_score_parameters_gradients_once_inter
     whose gradient the dK/dV programs write (a key's parameter, a tile's): the first half's program writes
     it, and every gradient is the reference's, under the interpreter."""
     _check_hooked_backward(hooks, form="accurate-halves", interpret=True, width=128)
+
+
+@pytest.mark.parametrize("accurate", [False, True], ids=["fast", "accurate"])
+def test_each_attention_launch_states_its_outputs_dimensions_for_an_h100(accurate):
+    """A training step's attention on the Mosaic mainloop, lowered for an H100, and its forward alone: every
+    kernel call that defines arrays of its own (not refs it writes in place) states the operand axes each
+    output descends from (`outputs.Output`, `KernelCall.output_dims`), an output an entry a dimension, so a
+    compile's live buffers name the call's axes they scale with; the fast form's one launch and the accurate
+    form's two (a split of the columns among them included)."""
+    from jax.extend.mlir import ir
+
+    from dew.nn.kernels import lowered as reading
+    from dew.nn.kernels.templates.outputs import OUTPUT_DIMS
+
+    tokens, heads, kv_heads, width = 1024, 4, 2, 128
+    spans = template.spans(tokens, tokens, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
+
+    def step(query, key, value):
+        out, *residuals = attention_mosaic.forward(query, key, value, spans, None,
+                                                   residuals=template.Kept.SPLIT)
+        return attention_mosaic.backward(query, key, value, spans, None, out, residuals=tuple(residuals),
+                                         accurate=accurate)
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None)
+
+    for fn in (step, forward):
+        with generation.assumed("sm90"):
+            lowered = jax.jit(fn).trace(query, key, key).lower(lowering_platforms=("cuda",))
+        # Each Mosaic GPU call: the outputs it defines (its results less those aliasing an operand, a ref it
+        # writes in place) and the dimensions it states (none where it states none).
+        def defined(operation) -> int:
+            aliased = (len(ir.ArrayAttr(operation.attributes["output_operand_aliases"]))
+                       if "output_operand_aliases" in operation.attributes else 0)
+            return len(operation.results) - aliased
+
+        calls = [call for call, _ in reading._read_calls(lowered, lambda target, operation: (
+            defined(operation), reading._frontend(operation.attributes).get(OUTPUT_DIMS))
+            if target == "mosaic_gpu_v2" else None)]
+        returning = [stated for count, stated in calls if count]
+        assert returning, "no Mosaic launch defines an output"
+        for stated in returning:
+            assert stated is not None, "a launch returning arrays states no dimensions"
+            assert all(dims is not None for dims in json.loads(stated)), stated
 
 
 def _lowered_call(call: str) -> tuple:

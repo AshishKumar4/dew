@@ -2136,9 +2136,9 @@ class Kind(NamedTuple):
     is its cell (`DECLARED`): dense (one matrix, every row) or grouped, what it makes, the operands no
     receipt of a 16-bit call times: FP8 ones (XLA's dot of them sums narrower than the FP8 contract holds,
     row 1625), rows gathered through a table or stored through one (no old route reads them); and, for a
-    dense product whose matrix a receipt timed on its family (`MEASURED`), that matrix's `[in, out]` extents,
-    a cell of its own, which the receipt's winner for it holds (None for every other product, the kind's
-    cell)."""
+    dense product a receipt timed on its family (`MEASURED`: its matrix, over the rows it timed), that
+    matrix's `[in, out]` extents, a cell of its own, which the receipt's winner for it holds (None for every
+    other product, the kind's cell)."""
 
     dense: bool
     made: Made
@@ -2278,11 +2278,29 @@ FOUR_B = ((2560, 9216), (9216, 2560), (2560, 1024), (2560, 64))
 """Qwen3.5-4B's dense projections' matrices `[in, out]`: its MLP's up and down, its attention's key, its
 gated delta net's gates, which M-EM-36-gh200 and em35d timed at 24,576 tokens, each product of each."""
 
-MEASURED: dict[tuple[str | None, Made], frozenset[tuple[int, int]]] = {
-    (family, made): frozenset(FOUR_B) for family in ('wgmma', 'tcgen05')
+class Timed(NamedTuple):
+    """The dense products a kind's receipts timed (`MEASURED`): of these `matrices` `[in, out]`, over `rows`
+    from `fewest` to `most` tokens. A receipt is evidence for the products it measured alone: a product of
+    another matrix, or of one of these over rows outside them, takes its kind's cell (row 6794: the 4B
+    key's cells, timed at 24,576 tokens, took a fine-tune's key and value products at 2,048, whose 216
+    template launches a step ran 6.57 ms, the step's dense products 1.75 ms slower than cuBLAS's alone)."""
+
+    matrices: frozenset[tuple[int, int]]
+    fewest: int
+    most: int
+
+    def holds(self, matrix: tuple[int, int], rows: int) -> bool:
+        """Whether a product of `matrix` over `rows` tokens is one these receipts timed."""
+        return matrix in self.matrices and self.fewest <= rows <= self.most
+
+
+MEASURED: dict[tuple[str | None, Made], Timed] = {
+    (family, made): Timed(frozenset(FOUR_B), 24576, 49152) for family in ('wgmma', 'tcgen05')
     for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT)}
-"""The dense matrices each instruction family's receipts timed, by what the product makes: a product of one is
-a cell of its own (`Kind.matrix`), which its receipt's winner holds; every other product its kind's."""
+"""The dense products each instruction family's receipts timed, by what the product makes: one of them is a
+cell of its own (`Kind.matrix`), which its receipt's winner holds; every other product its kind's. The
+receipts timed 24,576 tokens (M-EM-36, M-EM-52, em35d); the 4B step's 49,152 (four rows) held the same
+cells at parity with cuBLASLt (M-EM-54, interleaved in one session: 3,418.7 against 3,416.9 ms)."""
 
 M_EM_36 = ("M-EM-36-gh200 (a GH200, base/kernels df82480cb5c, CUPTI medians of 5 rounds, cuBLASLt autotuned "
            "at run, 24,576 tokens)")
@@ -2358,9 +2376,9 @@ call) to (that route's kernel, the receipt). A product of a matrix a receipt tim
 its own, which that receipt's winner holds: the template's where it won (on Hopper, over its kind's XLA
 cell), XLA's where it lost (on Blackwell, where the template is the kind's default); one timed whose cell is
 undeclared takes the template. A cell leaves the list once the template measures at least as fast on it.
-A cell's route holds no more of a step's memory than the template's: each product's reverse mode leaves its
-rows' cotangent only with its kernel gradient formed (`gemm.in_layer`, row 6027), whichever route forms it
-(tests/test_declared_cells_memory.py). Nothing is ranked at runtime. A
+A cell's route holds no more of a step's memory than the template's: each product's reverse mode returns
+its rows' cotangent only with its kernel gradient formed (`derivatives.with_gradients_formed`, row 6027),
+whichever route forms it (tests/test_declared_cells_memory.py). Nothing is ranked at runtime. A
 call the template cannot run (its legality) takes the next route in `GROUPED`'s order, which is no cell of
 this list."""
 
@@ -2397,14 +2415,15 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     scattered = launches is not _TGMMS and len(arguments) > 8 and arguments[8] is not None
     call = base.call(launches, *arguments, **options)
     matrix = _matrix_of(launches, arguments) if options['dense'] else None
-    timed = matrix in MEASURED.get((generation.family(call.target.generation), made), ())
+    rows = _rows_of(launches, arguments)
+    measured = MEASURED.get((generation.family(call.target.generation), made))
+    timed = matrix is not None and measured is not None and measured.holds(matrix, rows)
     kind = Kind(bool(options['dense']), made, fp8=fp8, gathered=gathered, scattered=scattered,
                 matrix=matrix if timed else None)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor
     paired = any(bound.arguments.get('paired') is not None for _, bound in call.bound.values())
-    rows = _rows_of(launches, arguments)
     return GroupedCase(placed, whole, product, rows, call, kind, paired=paired)
 
 

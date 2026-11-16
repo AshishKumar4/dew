@@ -17,6 +17,7 @@ from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
 
 from .dense import Dense
+from .derivatives import portable_formed
 from .kernels import norm_swiglu
 from .precision import at_least_fp32, float32_dot_general, rms_statistics, rms_weighted, rounded_to
 from .sharding import LogicalAxes, declared
@@ -144,7 +145,10 @@ def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset:
         return norm_swiglu.stream_rms_norm(x, branch, scale, epsilon, dtype, scale_offset, scale_after_cast,
                                            portable, axes=axes, weight_first=weight_first,
                                            epilogue=activation)
-    return portable(x, branch, scale)
+    # The weight's gradient, a reduction over every row, through the rule (`derivatives.portable_formed`):
+    # XLA otherwise put it off to the step's end, each layer's normalized rows held to it (DeepSeek V4's
+    # `q_a_norm`, an fp32 `[rows, 1024]` a layer, row 6027).
+    return portable_formed(portable)(x, branch, scale)
 
 
 def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str, *,
@@ -166,7 +170,7 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
     chosen = norm_swiglu.gated_rms_kernel(implementation, x, gate, scale, dtype, activation, axes=axes)
     if chosen == 'pallas':
         return norm_swiglu.gated_rms_norm(x, gate, scale, epsilon, dtype, activation, portable, axes=axes)
-    return portable(x, gate, scale)
+    return portable_formed(portable)(x, gate, scale)
 
 
 @functools.partial(normalized_in_fp32, static_argnums=(3, 4, 5, 6, 7))
