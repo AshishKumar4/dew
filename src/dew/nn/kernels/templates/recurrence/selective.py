@@ -541,6 +541,7 @@ class DocumentsBack:
         mosaic.synced(interpret)
 
 
+@tuning.lowered_once(("scan",))
 def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, table: tuple = ()):
     """The scan's gradients from `forward`'s operands, channels leading: `x`, `dt`, `dy` `[R, D, T]`, `b`,
     `c` `[R, N, T]`, `parameters` (`forward`'s), its blocks' entering states `entered` `[R, blocks, N, D]`

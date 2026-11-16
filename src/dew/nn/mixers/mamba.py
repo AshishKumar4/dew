@@ -125,17 +125,18 @@ def _forked_scan(scanned, x, dt, B, C, loads, stores, given, *, documents: int, 
     document and carried where it ends the chunk. Its operands a row's chunks `[NC, C, ...]`, each token's
     load and store `[NC, C]` (`Forked.tokens`), its table's given states `[S', D, N]`; `(outputs [NC, C, D],
     the row's last state)`. The segments are at most the chunks and the documents, each a chunk's work, as
-    many as a row laid a chunk a document took, each checkpointed: its residuals the states entering it and
-    the table, each segment's reads leaving it as the scan's own outputs, laid into their chunks after it
-    (segments of a chunk hold disjoint tokens), never a carry the scan's derivative saves a segment."""
+    many as a row laid a chunk a document took, each segment's scan checkpointed (its residual the state
+    entering it; the table's reads and writes selects, whose derivatives keep their slots alone), and its
+    reads leaving it as the scan's own outputs, laid into their chunks after it (segments of a chunk hold
+    disjoint tokens): no table nor row of outputs a segment the scan's derivative saves."""
     chunks, count = loads.shape
     place = jnp.arange(count)
     marks = ((loads >= 0) | (place == 0)).reshape(-1)
     origins = jnp.nonzero(marks, size=chunks + documents, fill_value=chunks * count)[0]
     following = jnp.concatenate([origins[1:], jnp.full((1,), chunks * count, origins.dtype)])
     zero = jnp.zeros_like(given[0])
+    checkpointed = jax.checkpoint(scanned)
 
-    @jax.checkpoint
     def segment(carried, at):
         (memory_in, held_chunk, leaving), table = carried
         first, after = at
@@ -148,7 +149,7 @@ def _forked_scan(scanned, x, dt, B, C, loads, stores, given, *, documents: int, 
         inside = (place >= origin) & (place <= through)
         step = (x[chunk], jnp.where(inside[:, None], dt[chunk], 0.0), B[chunk], C[chunk],
                 jnp.zeros((count,), bool))
-        left, read = scanned(memory[None], tuple(t[None] for t in step))
+        left, read = checkpointed(memory[None], tuple(t[None] for t in step))
         table = recurrence_chunk.table_stored(table, jnp.where(real, stores[chunk, through], 0), left[0])
         leaving = jnp.where(real & (through == count - 1), left[0], leaving)
         reads = jnp.where((inside & real)[:, None], read[0], 0.0)
