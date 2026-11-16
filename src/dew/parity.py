@@ -807,12 +807,12 @@ def _computed_here(program, *trees):
         return program(*trees, xp=np)
 
     def placed(leaf):
-        # Uncommitted, so the program lays it beside the arrays a GPU already holds, sharded or not, on
-        # a device this process addresses.
+        # Its host values put uncommitted on this process's first GPU, so the program lays them beside the
+        # arrays a GPU already holds, sharded or not: a CPU array's own put would keep it on the CPU.
         on_gpu = isinstance(leaf, jax.Array) and all(device.platform == "gpu" for device in leaf.devices())
-        return leaf if leaf is None or on_gpu else jax.device_put(leaf)
+        return leaf if leaf is None or on_gpu else jax.device_put(np.asarray(leaf))
 
-    with jax.enable_x64(new_val=True):
+    with jax.enable_x64(new_val=True), jax.default_device(jax.local_devices(backend="gpu")[0]):
         held = jax.tree.map(placed, trees, is_leaf=lambda leaf: leaf is None)
         return jax.device_get(_compiled(program)(*held))
 
