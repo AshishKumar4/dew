@@ -60,3 +60,27 @@ def test_explain_matrix(mode, monkeypatch):
         if not supported:
             failed.append(label)
     assert not failed, failed
+
+
+@pytest.mark.parametrize("cell,name", [("attention forward 128", "sm90"),
+                                     ("attention backward 64", "sm80"),
+                                     ("attention backward 64", "sm100")])
+def test_certified_deepest(cell, name):
+    base._DERIVED.clear()
+    selected = []
+    with generation.assumed(name):
+        op, ba, config = CELLS[cell][0]()
+        _, shapes = op.lowering(ba, config)
+
+        def routed(*arrays):
+            chosen = op.taken(ba)
+            assert chosen is not None
+            at = deepest(op, ba, chosen, generation.gpu_target())
+            selected.append((repr(chosen), repr(at)))
+            fn, _ = op.lowering(ba, at)
+            return fn(*arrays)
+
+        found = compile_mosaic_kernels([KernelCase(cell, lambda: (routed, shapes))], name)
+    print("CERTIFIED " + json.dumps({"cell": cell, "generation": name, "chosen": selected,
+                                     "failures": mosaic_failures(found)}, default=str), flush=True)
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)
