@@ -463,7 +463,7 @@ def tokenizer_name(tokenizer: str | SavedTokenizer) -> str:
         return tokenizer
     with tempfile.TemporaryDirectory() as saved:
         tokenizer.save_pretrained(saved)
-        files, _ = pin_files(saved, _TOKENIZER_FILES)
+        files = PinnedTokenizer(*pin_files(saved, _TOKENIZER_FILES)).files
         return cached_tokenizer(epath.Path(saved), files)
 
 

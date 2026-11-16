@@ -744,7 +744,8 @@ class Decide(SavedRunTask, InItsForm):
                 # The releases of saved runs its paths lie within mapped to the runs they hold, as a
                 # trainer's checkpoint carries them (`with_release_sources`).
                 record = with_release_sources(DecisionObjective(self).inference_record())
-            checkpoints.save(self.weights.step, state, artifact=record, weights_only=True, tokenizer=self.tokenizer)
+            checkpoints.save(self.weights.step, state, artifact=record, weights_only=True,
+                             tokenizer=self.tokenizer)
             checkpoints.wait()
 
     @overload

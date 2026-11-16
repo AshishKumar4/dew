@@ -2228,7 +2228,8 @@ class Trainer(Generic[Loss, Effects]):
         envelope = self._checkpoint_envelope(state, position, interval, run, weights_only=weights_only)
         # The run holds the tokenizer its declaration states the files of (`Checkpoints.save`).
         write = functools.partial(checkpoints.save, step, metrics=metadata, ranking=ranking,
-                                  weights_only=weights_only, tokenizer=self.objective.run_tokenizer(), **envelope)
+                                  weights_only=weights_only, tokenizer=self.objective.run_tokenizer(),
+                                  **envelope)
         with run.outside_window(), run.held():
             self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step, resumable=not weights_only)
