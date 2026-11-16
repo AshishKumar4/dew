@@ -228,13 +228,11 @@ class Template[Config: Hashable](tuning.KernelOp):
             return super().exhausted(ba)
         return self.unfitted(ba, self.launch_target())
 
-    def holds(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
-        """Whether a config of the launch holds the call `ba` on `target`, which its implementation's
-        eligibility reads: where a device certifies launches (`report.certified`), the call's own taking
-        (`taken`) finds one, so a call certification refuses every config of takes another route before
-        its call, its misses in the report; elsewhere one fits (`fits`)."""
-        if report._certifying_device() is None:
-            return bool(self.offering(ba, target))
+    def holds(self, ba: tokamax.BoundArguments) -> bool:
+        """Whether a config of the launch holds the call `ba`, which its implementation's eligibility reads:
+        the call's own taking (`taken`) finds one, a pin, a tuned pick or the derived config certification
+        holds where a device certifies launches (`report.certified`), so a call certification refuses every
+        config of takes another route before its call, its misses in the report."""
         return self.taken(ba) is not None
 
     def neighbours(self, ba: tokamax.BoundArguments, config: Config) -> Sequence[Config]:

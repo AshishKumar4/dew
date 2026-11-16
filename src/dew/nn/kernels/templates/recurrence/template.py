@@ -1008,7 +1008,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         # (`recurrence_chunk.TEMPLATE_SUPPORTS`): a certification of its pullback raises in the rule's
         # gradient (`mosaic_rule`).
         if report.pulling() and self.trains(ba, target):
-            return self.holds(ba, target)
+            return self.holds(ba)
         return bool(self.fits(ba, target))
 
     def launch_target(self) -> generation.GpuTarget:

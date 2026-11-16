@@ -40,7 +40,7 @@ from jax._src.thunky import thunky
 from jax.extend.mlir import ir
 
 from dew import _cache, communicators
-from dew._devices import deviceless, xla_flag
+from dew._devices import deterministic_ops_requested, deviceless, xla_flag
 from dew.nn.kernels import generation
 
 if TYPE_CHECKING:
@@ -433,10 +433,12 @@ def traced(digest: str) -> Launch | None:
 def derivation_inputs(op, arguments: tokamax.BoundArguments, target) -> Hashable:
     """What a launch's derivation of its config for `arguments` on `target` reads of the launch and its
     compiles: the launch's identity (`_identity`: the op, its arguments' shapes and dtypes, its hooks), the
-    whole target, whose facts price its schedules, and each config this context's compiles refused it
-    (`refused`), so a refusal recorded after a derivation derives it again."""
+    whole target, whose facts price its schedules, each config this context's compiles refused it
+    (`refused`), so a refusal recorded after a derivation derives it again, and whether the run asked XLA for
+    deterministic ops, which a launch's legality reads (a fused attention backward's atomic dQ sums,
+    `attention_mosaic.MosaicBackward`), so a flag flipped within a process derives it again."""
     identity = _identity(op, arguments)
-    return identity, target, refusals_of(identity)
+    return identity, target, refusals_of(identity), deterministic_ops_requested()
 
 
 @generation.traced_fact
