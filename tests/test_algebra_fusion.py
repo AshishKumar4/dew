@@ -1,7 +1,7 @@
 """The fusion search (docs/design/algebra.md §2 "Fusion", `dew.algebra.fusion`): a program's products and
-their elementwise consumers fused into the GEMM template's epilogue by the compile-time pass, where the
-template takes the product and its price says fused wins. Every program computes what it does as written,
-its gradients too, whatever the pass fuses."""
+their elementwise producers and consumers fused into the GEMM template's prologue and epilogue by the
+compile-time pass, where the template takes the product and its price says fused wins. Every program
+computes what it does as written, its gradients too, whatever the pass fuses."""
 
 import contextlib
 
@@ -168,6 +168,56 @@ def test_a_plain_programs_product_runs_the_template_its_call_names(layer, forms)
             jax.jit(algebra.rewritten(layer, kernels=True)).trace(*operands)
     assert not any(route.choice == "grouped_matmul" for route in written)
     assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in passed)
+
+
+def _normalized(x, scale):
+    """An RMSNorm's rows of `x`, widened, by their inverse root mean square and `scale`, cast back."""
+    wide = x.astype(jnp.promote_types(x.dtype, jnp.float32))
+    inverse = jax.lax.rsqrt(jnp.mean(jnp.square(wide), axis=-1, keepdims=True) + 1e-6)
+    return (wide * inverse * scale.astype(wide.dtype)).astype(x.dtype)
+
+
+def normed(x, w):
+    """An RMSNorm's rows projected: the normalization the projection's prologue."""
+    return _normalized(x, w[:, 0]) @ w
+
+
+def normed_twice(x, w):
+    """One RMSNorm's rows read by two projections (a block's q and k), each its own prologue."""
+    rows = _normalized(x, w[:, 0])
+    return rows @ w, rows @ w[:, ::-1]
+
+
+@pytest.mark.parametrize("layer", [normed, normed_twice], ids=lambda layer: layer.__name__)
+def test_a_norms_normalization_runs_in_its_projections_prologue(layer):
+    """An RMSNorm's rows projected, under the pass on an H100 whose template a call names: each product's
+    prologue is the normalization (the row statistic outside it), which the template runs on each loaded
+    tile (its 'gemm_prologue' route the fused kernel's), each projection of one normalized row its own,
+    where the pass took the normalized row as a given operand; and the program computes as written,
+    gradients too (check 1)."""
+    from contract_support import normal_drawn
+    from reference_error import assert_as_exact, with_gradients
+
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16))
+    products = len(jax.tree.leaves(jax.eval_shape(layer, *shapes)))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        with generation.routes() as found:
+            jax.jit(algebra.rewritten(layer, kernels=True)).trace(*shapes)
+        fused = [route for route in found if route.choice == "gemm_prologue" and route.kernel == "fused"]
+        assert len(fused) == products, [(route.choice, route.kernel) for route in found]
+
+        outputs = jax.eval_shape(layer, *shapes)
+        operands = normal_drawn(5096, (256, 512), (512, 256), dtype=jnp.bfloat16)
+        cotangents = normal_drawn(5097, *(leaf.shape for leaf in jax.tree.leaves(outputs)),
+                                  dtype=jnp.bfloat16)
+        # Each projection's own output and gradient, a cotangent of its own: two outputs swapped or one
+        # returned twice fail where their sum would not.
+        assert_as_exact(jax.jit(with_gradients(algebra.rewritten(layer, kernels=True))),
+                        jax.jit(with_gradients(layer)),
+                        lambda seed: (*operands(seed), jax.tree.unflatten(jax.tree.structure(outputs),
+                                                                          list(cotangents(seed)))),
+                        f"{layer.__name__} under the pass", seeds=8,
+                        truth_fn=with_gradients(lambda *x: layer(*(a.astype(jnp.float64) for a in x))))
 
 
 def test_a_starts_forward_nothing_reads_is_never_written_as_a_kernel():

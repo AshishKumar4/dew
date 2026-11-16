@@ -858,9 +858,9 @@ def test_a_stack_of_layers_holds_no_launchs_accumulator_past_its_own_layer():
 def test_each_attention_launch_states_its_outputs_dimensions_for_an_h100(accurate):
     """A training step's attention on the Mosaic mainloop, lowered for an H100, and its forward alone: every
     kernel call that defines arrays of its own (not refs it writes in place) states the operand axes each
-    output descends from (`outputs.Output`, `KernelCall.output_dims`), an output an entry a dimension, so a
-    compile's live buffers name the call's axes they scale with; the fast form's one launch and the accurate
-    form's two (a split of the columns among them included)."""
+    output descends from (`outputs.Output`, its call's `outputs.OUTPUT_DIMS` frontend attribute), an output
+    an entry a dimension, so a compile's live buffers name the call's axes they scale with; the fast form's
+    one launch and the accurate form's two (a split of the columns among them included)."""
     from jax.extend.mlir import ir
 
     from dew.nn.kernels import lowered as reading

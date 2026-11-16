@@ -188,8 +188,15 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path):
     assert [run.count("jit(step)") for run in (cold, warm)] == [1, 1], (cold, warm)
     certified = [name for name in cold if name.startswith("jit(certified_")]
     assert len(set(certified)) == len(certified), certified
-    configs = collections.Counter(name.rsplit("_c", 1)[0] for name in set(certified))
-    assert max(configs.values()) >= 2, certified
+    # The configs certified a launch in each direction: a forward's and its reverse's certification of one
+    # config are one config, not the two a step down is.
+    configs = collections.defaultdict(set)
+    for name in certified:
+        name = name.removeprefix("jit(").removesuffix(")")
+        reverse = name.endswith("_reverse")
+        launch, config = name.removesuffix("_reverse").rsplit("_c", 1)
+        configs[launch, reverse].add(config)
+    assert max(map(len, configs.values())) >= 2, certified
     assert not [name for name in warm if name.startswith("jit(certified_")], warm
 
 
