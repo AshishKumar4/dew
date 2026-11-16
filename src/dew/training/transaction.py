@@ -35,7 +35,7 @@ from dew.data.dataset import rows_of
 from dew.gauss_newton import solves_equations
 from dew.held_updates import holds_back, holds_state, input_taken, refuse_untold, update_applied
 from dew.nn import in_backward
-from dew.nn.finite import all_finite, leaf_finite, zeroed_unless
+from dew.nn.finite import all_finite, bounded, leaf_finite, zeroed_unless
 from dew.nn.inspection import (
     PROBES,
     Watched,
@@ -1097,7 +1097,10 @@ class Transaction:
         # commit gathered every parameter and moment back each step (row 3697).
         gradient = gradient if self.placed is None else placed_as(gradient, self.placed)
         native = jax.tree.map(_descending, gradient, current.variables["params"])
-        native_finite = all_finite(native)
+        # A gradient finite throughout with no magnitude past the bound (`bounded`, one max-reduction, which
+        # holds the finiteness check) forms a finite update with every optimizer Dew builds but a
+        # Gauss-Newton solve: every square of it is finite where a moment is stored.
+        native_finite = bounded(native)
         norm = optax.global_norm(native)
         norm = norm.astype(at_least_fp32(norm.dtype))
         if applied is not None:

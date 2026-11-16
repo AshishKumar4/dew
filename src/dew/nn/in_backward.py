@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.derivatives import Surrogate, contracted, declared_derivative, with_gradients_formed
-from dew.nn.finite import all_finite, zeroed_unless
+from dew.nn.finite import bounded, zeroed_unless
 from dew.nn.programs import holes
 
 type Tree = Mapping[str, object]
@@ -175,20 +175,14 @@ def _passed_down(dx, tripped: jax.Array):
 
 
 def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments, bad: jax.Array):
-    """One layer's update in a step that may not be finite (`gated`): where `ok` (the loss and the layer's
-    gradient finite) by its gradient, else by a zero gradient, its weights kept as they were. Finite inputs
-    can still form a value that is not finite (a moment past its dtype): a layer whose candidate weights or
-    moments are not takes the zero gradient's update too, formed only then, and counts not finite (`bad`), so
-    the step does. The layer's moved weights, moments and non-finite count, and whether it was written."""
+    """One layer's update in a step that may not be finite (`gated`): where `ok` (the loss finite, the
+    layer's gradient finite and bounded, `dew.nn.finite.bounded`) by its gradient, else by a
+    zero gradient, its weights kept as they were. The layer's moved weights, moments and non-finite count,
+    and whether it was written."""
     gradient = zeroed_unless(ok, gradient)
     moved, moved_moments = update(gradient, held, moments)
-    formed = all_finite((moved, moved_moments))
-    zero = jax.tree.map(jnp.zeros_like, gradient)
-    moved_moments = jax.lax.cond(ok & ~formed, lambda: update(zero, held, moments)[1],
-                                 lambda: moved_moments)
-    written = ok & formed
-    moved = jax.tree.map(lambda new, old: jnp.where(written, new, old), moved, held)
-    return moved, moved_moments, bad + (ok & ~formed).astype(bad.dtype), written
+    moved = jax.tree.map(lambda new, old: jnp.where(ok, new, old), moved, held)
+    return moved, moved_moments, bad, ok
 
 
 def _pulled(back: Callable, dx):
@@ -286,6 +280,9 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
             if finite is None:
                 moved, moved_moments = current.update(path, index, gradient, held, held_moments)
             else:
+                # A gradient past the magnitude bound (`bounded`) forms an update that is not finite: it is
+                # held as a non-finite one is, and counted so.
+                bad = bad + (~bounded(gradient)).astype(bad.dtype)
                 moved, moved_moments, bad, written = _gated_layer(
                     functools.partial(current.update, path, index), finite & (bad == 0) & ~tripped,
                     gradient, held, held_moments, bad)
