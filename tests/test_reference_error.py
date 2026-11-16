@@ -663,12 +663,12 @@ def test_a_recordings_measured_errors_size_its_site_as_seeds_for_would():
 
     count = seeds_for(_product, _draw, "product")
     draws = _drawn(_product, _product, _draw, range(4 * count))
-    assert seeds_resolving(draws.theirs, draws.names, "product", widths=draws.widths) == count
+    assert seeds_resolving(draws.theirs, draws.names, "product") == count
     with pytest.raises(AssertionError):
-        seeds_resolving(draws.theirs[:count], draws.names, "product", widths=draws.widths, start=count)
+        seeds_resolving(draws.theirs[:count], draws.names, "product", start=count)
     # Past its ceiling it refuses, as seeds_for does, however many seeds are recorded.
     with pytest.raises(AssertionError):
-        seeds_resolving(draws.theirs, draws.names, "product", widths=draws.widths, most=count // 2)
+        seeds_resolving(draws.theirs, draws.names, "product", most=count // 2)
 
 
 def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():

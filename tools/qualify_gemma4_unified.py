@@ -61,10 +61,11 @@ def workload(site, directory, device):
 
 
 def backward_recording(device, seeds=None):
-    """The backward site's summarized recording, BACKWARD_WINDOW draws a seed (`windows`): whole
-    (`record_case`), or the shard of `seeds` a merge joins (`record_shard`), a pilot shard's (seeds from
-    SIZING_FROM) with Dew's errors on its draws, Dew's arm run as check 1 runs it (`summed_as_run`), which
-    the merge sizes the count paired by and keeps none of."""
+    """The backward site's summarized recording, BACKWARD_WINDOW draws a seed (`windows`), its count sized
+    paired with Dew's arm run as check 1 runs it (`summed_as_run`): whole (`record_case(..., dew=)`, which
+    runs Dew on its sizing draws), or the shard of `seeds` a merge joins (`record_shard`), a pilot shard's
+    (seeds from SIZING_FROM) holding Dew's errors on its draws, which the merge sizes the count by and keeps
+    none of."""
     import jax
     from recorded_references import record_case, record_shard
     from reference_error import (
@@ -114,7 +115,7 @@ def backward_recording(device, seeds=None):
     if seeds is not None:
         pilots = seeds.start >= SIZING_FROM
         return record_shard("backward", windowed, evaluate, seeds, dew=dew if pilots else None), FIXTURE
-    return record_case("backward", windowed, evaluate, store_inputs=False, summary=True), FIXTURE
+    return record_case("backward", windowed, evaluate, store_inputs=False, summary=True, dew=dew), FIXTURE
 
 
 ENVIRONMENT = "environment"
@@ -140,7 +141,7 @@ def record_site(site, output, device, *, shards=()):
     import jax
     import numpy as np
     from recorded_references import merge_shards, provenance, record_case, save
-    from reference_error import widened
+    from reference_error import SIZING_FROM, widened
 
     with tempfile.TemporaryDirectory() as directory:
         if site == "backward" and shards:
@@ -154,6 +155,14 @@ def record_site(site, output, device, *, shards=()):
                                  f"{sorted(environments)}")
             made = json.loads(environments.pop())
             stored, source = merge_shards("backward", held), ROOT / RECORDINGS
+            # Pilots, where any shard held Dew's errors on their draws (`record_shard`'s `dew`).
+            pilots = any(key.startswith("backward.dew_mse.") for shard in held for key in shard)
+            command = (f"PYTHONPATH=src:tests:tools python tools/qualify_gemma4_unified.py backward --device "
+                       f"{device} --shard START:STOP --output SHARD.npz, over seeds 0 to "
+                       f"{len(stored['backward.input_digest'])} "
+                       + (f"and pilots from {SIZING_FROM} (Dew's errors on their draws beside the "
+                          "reference's) " if pilots else "")
+                       + f"in shards, then --merge SHARD.npz... --output {RECORDINGS}/backward.npz")
         elif site == "backward":
             stored, source = backward_recording(device)
         else:
@@ -179,16 +188,12 @@ def record_site(site, output, device, *, shards=()):
             stored = record_case(site, drawn, evaluate, store_inputs=False, summary=site != "bfloat16")
         if not (site == "backward" and shards):
             made = environment(device)
+            command = (f"PYTHONPATH=src:tests:tools python tools/qualify_gemma4_unified.py {site} --device "
+                       f"{device} --record --output {RECORDINGS}/{site}.npz")
         stored["precision"] = "ieee"
         stored["provenance"] = provenance(
             "transformers Gemma4UnifiedForConditionalGeneration", made["packages"]["transformers"],
-            made["device"],
-            (f"PYTHONPATH=src:tests:tools python tools/qualify_gemma4_unified.py backward --device {device} "
-             f"--shard START:STOP --output SHARD.npz, over seeds 0 to {len(stored['backward.input_digest'])} "
-             f"and pilots from 1048576 (Dew's errors on their draws beside the reference's) in shards, then "
-             f"--merge SHARD.npz... --output {RECORDINGS}/backward.npz" if shards else
-             f"PYTHONPATH=src:tests:tools python tools/qualify_gemma4_unified.py {site} --device {device} "
-             f"--record --output {RECORDINGS}/{site}.npz"),
+            made["device"], command,
             generator_revision=made["revision"],
             model_sha256=hashlib.sha256((source / "model.safetensors").read_bytes()).hexdigest(),
             config_sha256=hashlib.sha256((source / "config.json").read_bytes()).hexdigest(),

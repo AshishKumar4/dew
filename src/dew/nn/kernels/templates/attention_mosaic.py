@@ -352,15 +352,19 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
                      and change.get("consumers", 1) <= most_consumers(family, config))
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
-        target = generation.gpu_target()
-        query = ba.arguments["query"]
-        family = self._bundle(target.generation, query.dtype)
-        if family is not None and (reason := self.refusal(ba, family)):
-            raise NotImplementedError(reason)
-        config = self.derived(ba, target)
+        config = self.remaining(ba)
         if config is None:
+            target = generation.gpu_target()
             raise Unfitted(type(self).__name__, None, generation.shared_budget(target), target.generation)
         return config
+
+    def remaining(self, ba: tokamax.BoundArguments) -> Config | None:
+        # Its derived config, none where it derives none; a call it refuses refused (`refusal`).
+        target = generation.gpu_target()
+        family = self._bundle(target.generation, ba.arguments["query"].dtype)
+        if family is not None and (reason := self.refusal(ba, family)):
+            raise NotImplementedError(reason)
+        return self.derived(ba, target)
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         """Why the launch takes no call of `ba` on `family`, or None (`refused`)."""

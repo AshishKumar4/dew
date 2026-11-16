@@ -24,6 +24,7 @@ import numpy as np
 import optax
 import pytest
 from certified import assert_certified
+from contract_support import normal_float32
 from flax import linen as nn
 from model_support import moved
 from recording import RecordingTracker
@@ -1218,22 +1219,16 @@ def _kl_derivatives(mean, reference, variance, mean_tangent, reference_tangent, 
     return {"KL": value, "JVP": moved, "VJP to the mean": to_mean, "VJP to the variance": to_variance}
 
 
-EDGE = 2.0**-16
-"""How near float32's least normal or its largest an exact value lies, relatively, where a few
-roundings may take a computed one across that bound (to a flushed subnormal or an infinity)."""
-
-
 def _kinds(exact):
-    """Each float64 value's place in float32's range: "normal" from a few roundings above the least
-    normal, its whole lowest binade [2**-126, 2**-125) but that sliver, to a few below the largest;
-    "over" from 2**128, past every float32; "below" zero or under half the least normal, which rounds
-    to zero or a subnormal; and "edge" the slivers between, where a few roundings may cross a bound
-    (`EDGE`)."""
+    """Each float64 value's place in float32's range: "normal" a normal float32 (`normal_float32`, the
+    derivative contracts' one range, tests/contract_support.py); "over" from 2**128, past every float32;
+    "below" zero or under half the least normal, which rounds to zero or a subnormal; and "edge" between:
+    from half the least normal to it, where a value rounds to a subnormal or the least normal, and past
+    the largest float32 short of 2**128, where it rounds to the largest or to an infinity."""
     size = np.abs(exact)
-    tiny, largest = float(np.finfo(np.float32).tiny), float(np.finfo(np.float32).max)
-    return np.where(size >= 2.0**128, "over", np.where(
-        (size >= tiny * (1 + EDGE)) & (size <= largest * (1 - EDGE)), "normal", np.where(
-            (size == 0) | (size < tiny / 2), "below", "edge")))
+    normal = normal_float32(exact) & (size > 0)
+    return np.where(size >= 2.0**128, "over", np.where(normal, "normal", np.where(
+        (size == 0) | (size < float(np.finfo(np.float32).tiny) / 2), "below", "edge")))
 
 
 def _below_normal(values):

@@ -35,8 +35,7 @@ from egglog import eq
 from jax._src import core as jax_core
 from jax.extend import core as jcore
 
-from dew import _cache
-from dew.algebra import SATURATION, derive, forms, fusion, normal_form, program, rules, terms
+from dew.algebra import SATURATION, forms, fusion, normal_form, program, rules, terms
 from dew.algebra.forms import aval
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Choice
@@ -87,15 +86,10 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, families: Sequence[Famil
     half of one equation, for no region, 37 of its seconds, row 5556)."""
     if _bound(jaxpr).isdisjoint(family.anchor for family in families):
         return []
-    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families), derive.context(),
-           _cache.KERNEL_CHOICES.value)
-    if key not in _HELD_BODIES:
-        _HELD_BODIES[key] = [_positioned(jaxpr, written)
-                             for written in _recognizing(jaxpr, index, held, families)]
-        if len(_HELD_BODIES) > fusion.DECISIONS_HELD:
-            _HELD_BODIES.popitem(last=False)
-    _HELD_BODIES.move_to_end(key)
-    return [_placed(jaxpr, written) for written in _HELD_BODIES[key]]
+    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families), fusion.choice_context())
+    found = fusion.holding(_HELD_BODIES, key, lambda: [_positioned(jaxpr, written)
+                                                 for written in _recognizing(jaxpr, index, held, families)])
+    return [_placed(jaxpr, written) for written in found]
 
 
 _HELD_BODIES: collections.OrderedDict[Hashable, list] = collections.OrderedDict()
@@ -175,14 +169,12 @@ def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[
         regions.setdefault(places, []).append(candidate)
     for places, members in regions.items():
         key = _region_key(jaxpr, index, places, members[0].outputs, accurate)
-        if key not in _HELD_REGIONS:
+
+        def chose(places=places, members=members):
             # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
             with generation.routes(alone=True):
-                _HELD_REGIONS[key] = _chosen(index, places, members, accurate)
-            if len(_HELD_REGIONS) > fusion.DECISIONS_HELD:
-                _HELD_REGIONS.popitem(last=False)
-        _HELD_REGIONS.move_to_end(key)
-        chosen = _HELD_REGIONS[key]
+                return _chosen(index, places, members, accurate)
+        chosen = fusion.holding(_HELD_REGIONS, key, chose)
         if chosen is not None:
             candidate = members[chosen]
             # Its call's identity: the region's (its structure and its constants' values) and the candidate.
@@ -200,11 +192,11 @@ def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...]
                 outputs: Sequence[jcore.Var], accurate: bool) -> Hashable:
     """What a region's choice reads: its structure (`program.structure`, every value it reads an input), the
     values of the constants among them (`_digest`: a statistic's divisor, an epsilon held as an array), the
-    numerics' forms and the context its kernels are chosen in."""
+    numerics' forms and the context its kernels are chosen in (`fusion.choice_context`)."""
     inputs = fusion.region_inputs(jaxpr, places)
     window = jcore.Jaxpr([], list(inputs), list(outputs), [jaxpr.eqns[place] for place in places])
     held = tuple(_digest(index.consts[var]) if var in index.consts else None for var in inputs)
-    return program.structure(window), held, accurate, derive.context(), _cache.KERNEL_CHOICES.value
+    return program.structure(window), held, accurate, fusion.choice_context()
 
 
 def _digest(value) -> Hashable:
@@ -221,21 +213,14 @@ def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Cand
             accurate: bool) -> int | None:
     """The first of one region's candidates whose call takes a kernel and which the e-graph proves equal to
     the region (`_equalities`, of the taken ones alone), its place among `members`; None where none is.
-    Each in order, whether its call takes a kernel asked as it is reached (`Candidate.taken` traces the
-    kernel's call: an attention's 48 candidates over 2,048 keys, each asked before any was compared, 17.8 s
-    of one region's recognition, row 6799), and one that does compared alone, where its results are its
-    declaration's own values; the e-graph only where none is, over every candidate that takes one."""
-    asked: dict[int, bool] = {}
-
-    def takes(number: int) -> bool:
-        if number not in asked:
-            asked[number] = members[number].taken()
-        return asked[number]
-
+    Each in order, whether its call takes a kernel asked as it is reached (`Candidate.taken`: an attention's
+    48 candidates over 2,048 keys, each asked before any was compared, 17.8 s of one region's recognition,
+    row 6799), and one that does compared alone, where its results are its declaration's own values; the
+    e-graph only where none is, over every candidate that takes one."""
     for number, candidate in enumerate(members):
-        if takes(number) and _equalities(index, [(candidate, places)], accurate, saturating=False)[0]:
+        if candidate.taken() and _equalities(index, [(candidate, places)], accurate, saturating=False)[0]:
             return number
-    taken = [number for number in range(len(members)) if takes(number)]
+    taken = [number for number, candidate in enumerate(members) if candidate.taken()]
     if not taken:
         return None
     equal = _equalities(index, [(members[number], places) for number in taken], accurate)
@@ -410,16 +395,14 @@ def _declaration(candidate: Candidate) -> Callable:
     keywords = tuple(sorted((function.__kwdefaults__ or {}).items()))
     key = (function.__code__, _typed(function.__defaults__), _typed(keywords), _typed(cells),
            _typed(tuple(sorted(declared.keywords.items()))), _typed(tuple(candidate.operands)))
-    if key not in _DECLARATIONS:
+
+    def traced() -> Callable:
         # Dew's own choices by the platform read as their default branch (`forms.inlined`): its product under
         # a wide arithmetic is the product a program writes; a program's own choices stay as written.
-        traced = jax.make_jaxpr(lambda *values: jax.tree.leaves(forms.inlined(declared)(*values)))(
+        written = jax.make_jaxpr(lambda *values: jax.tree.leaves(forms.inlined(declared)(*values)))(
             *(_shape(var) for var in candidate.operands))
-        _DECLARATIONS[key] = jcore.jaxpr_as_fun(traced)
-        if len(_DECLARATIONS) > fusion.DECISIONS_HELD:
-            _DECLARATIONS.popitem(last=False)
-    _DECLARATIONS.move_to_end(key)
-    return _DECLARATIONS[key]
+        return jcore.jaxpr_as_fun(written)
+    return fusion.holding(_DECLARATIONS, key, traced)
 
 
 def _typed(value) -> Hashable:
@@ -878,8 +861,9 @@ def _attention_candidates(q: jcore.Var, k: jcore.Var, v: jcore.Var, output: jcor
                 mask=extra_ if boolean else None, bias=None if boolean else extra_).astype(dtype)
 
         operands = (q, k, v, *([extra] if extra is not None else []))
+        options = (causal, softcap, wide, after, fill, window, boolean, dtype)
         yield Candidate(operands, (output,), attend, functools.partial(attend, implementation='reference'),
-                        functools.partial(_attention_taken, attend, operands))
+                        functools.partial(_attention_taken, attend, operands, options))
 
 
 def _selections(index: fusion.Index, operands: Sequence[jcore.Var], places: Sequence[int],
@@ -945,10 +929,23 @@ KEPT = frozenset({"xla", "reference"})
 """The attention routes that are no kernel of Dew's."""
 
 
-def _attention_taken(attend: Callable, operands: Sequence[jcore.Var]) -> bool:
+def _attention_taken(attend: Callable, operands: Sequence[jcore.Var], options: Hashable) -> bool:
     """Whether Dew's selector gives the call a kernel of its own (the template, FlashAttention, cuDNN; none
-    of `KEPT`): the call traced over its operands' shapes, its attention route read (`generation.routes`);
-    not where a kernel a call names refuses it (`KernelRefused`)."""
+    of `KEPT`), asked once by what it reads (`_TAKEN`): its operands' shapes and dtypes, the call's
+    `options` and the context its kernels are chosen in (`fusion.choice_context`)."""
+    key = (tuple((aval(var).shape, aval(var).dtype) for var in operands), options, fusion.choice_context())
+    return fusion.holding(_TAKEN, key, lambda: _traced_taken(attend, operands))
+
+
+_TAKEN: collections.OrderedDict[Hashable, bool] = collections.OrderedDict()
+"""Whether an attention call takes a kernel (`_attention_taken`), the latest `fusion.DECISIONS_HELD` held:
+each shape and option asked of the selector once, however many regions and programs offer it (a Dory step's
+recognition traced the call 832 times for 113 regions, 37 of its 46 s, row 6799)."""
+
+
+def _traced_taken(attend: Callable, operands: Sequence[jcore.Var]) -> bool:
+    """`_attention_taken`'s answer: the call traced over its operands' shapes, its attention route read
+    (`generation.routes`); not where a kernel a call names refuses it (`KernelRefused`)."""
     from dew.nn.kernels.selection import KernelRefused
 
     with generation.routes(alone=True) as found:

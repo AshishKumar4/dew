@@ -37,6 +37,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - Block-selected attention's other selections as mixers. [6301]
 - Mosaic has no float32 forward at width 256 on Hopper. [6508]
+- The attention backward's derivation proposes a spilling attention_dkv_fused at width 64 on sm100 and sm80. [6944]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Exact on every path, every edge and every derivative order. [2656]
 - MoE transport, role-aware low precision and observability. [4515]
@@ -57,9 +58,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
 - Stacks, scans and looped models. [1568]
-- Saved runs carried across. [1622, 1641, 2791, 2792]
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
-- Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
 
 ## Training and parallelism
@@ -82,9 +81,12 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - Training and serving efficiency. [3330, 1880, 5292]
+- A recurrent layer's fused decode token (the template's fused step. [6963]
 - Dory: the release qualified and its tests' oracles. [596]
+- Serving and RL measured where users run them. [5315, 5321]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
-- A dtype=None hybrid over narrower weights whose recurrent layers are GatedDeltaNet, Kimi Delta Attention or lightning attention can still widen the residual…. [6935]
+- A decoder computing in no dtype of its own (dtype=None) over parameters of mixed dtypes, e.g. [6215]
+- The in-context memory reads no forks. [6969]
 
 ## Algebra
 
@@ -99,6 +101,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Released checkpoints judged on GPUs. [1703, 1549]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Every model comparison on check 1. [2300, 3722, 5212]
+- Saved runs carried across. [2791, 2792]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 - The saved data plan as recorded rules, one last version, and the resume modes. [6861]
 

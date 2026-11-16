@@ -247,12 +247,15 @@ class Compiling:
     """A program's first compile running in a thread of its own (`compiling`): the program, what its call
     lowered from (`OuterProgram.abstract_of`, None for a plain jit) and its lowering, which the program's
     compile through Dew's compile point takes where it compiles the same program over the same, lowering
-    nothing again, else where it lowers the same program (`program_digest`) (`attempting`)."""
+    nothing again, else where it lowers the same program (`program_digest`) (`attempting`), and whether
+    a call has taken its lowering (`taken`): a start that lowered again, its algebra passed twice, says
+    so."""
 
     program: Callable
     abstract: Hashable | None
     lowered: jax.stages.Lowered
     attempt: Future
+    taken: threading.Event = dataclasses.field(default_factory=threading.Event, compare=False)
 
 
 def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
@@ -685,6 +688,7 @@ class OuterProgram:
         begun = _ATTEMPTING.get()
         if begun is not None and begun.program is self and begun.abstract == self.abstract_of(args, kwargs):
             lowered = begun.lowered
+            begun.taken.set()
         else:
             lowered = self.lower(*args, **kwargs)
         # A program compiled ahead for this target runs as it was compiled (`taking`).
@@ -759,8 +763,11 @@ def trace_context() -> Hashable:
     trace too (where `jax.sharding.get_mesh` refuses); what a model reads from the step's own entry, by value
     (`dew.nn.sharding.trace_context` and the declared axes' table frozen, in place of the variables that
     entry sets anew, `sharding.STATED`); every other context variable set in this context but those no trace
-    reads (`_cache.untraced`, and Python's decimal context); the logical axis rules Flax holds; and the
-    environment's variables of Dew's own, each value by its contents (`generation.stated`). The process's
+    reads (`_cache.untraced`, and Python's decimal context); the logical axis rules Flax holds; the
+    environment's variables of Dew's own, each value by its contents (`generation.stated`); and whether
+    XLA's flags ask for deterministic operations (`_devices.deterministic_ops_requested`), which no `DEW_`
+    variable holds and kernel selection reads where it selects (FlashAttention's and cuDNN's eligibility),
+    not under the trace's target, so a trace kept under one setting would serve the other. The process's
     facts a trace reads (`generation.TRACED_FACTS`) are no part of it: each is answered where a trace asks
     it, under the trace's own target, and one read outside a trace may have no answer (a compile-only GPU
     mesh's devices hold no memory statistics); a caller whose trace reads one names it beside this key (the
@@ -772,6 +779,7 @@ def trace_context() -> Hashable:
     from flax import linen as nn
     from jax._src import mesh as mesh_lib
 
+    from dew._devices import deterministic_ops_requested
     from dew.nn import sharding
 
     with _cache.KERNEL_SEEN(None), _cache.KERNEL_ROUTES(()):
@@ -783,7 +791,8 @@ def trace_context() -> Hashable:
     entry = sharding.trace_context(), tuple(sorted(sharding.current_boxes().items(), key=repr))
     return (traced, mesh_lib.get_concrete_mesh(), entry, tuple(variables),
             stated(nn.get_logical_axis_rules()),
-            tuple(sorted((name, value) for name, value in os.environ.items() if name.startswith("DEW_"))))
+            tuple(sorted((name, value) for name, value in os.environ.items() if name.startswith("DEW_"))),
+            deterministic_ops_requested())
 
 
 def _signature(leaf) -> Hashable:

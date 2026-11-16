@@ -282,8 +282,9 @@ fitted to them, and a rule set ships only with measured receipts.
   point where its selector gives the template the launch, its consumers into the epilogue where fused prices
   less; so a plain JAX program compiled through Dew runs the templates its products match (row 3450). A
   region's written program, Dew's call traced over its inputs' types, is traced once a process for the region's
-  identity under the state a trace reads (`dew.nn.kernels.options.trace_context`, complete by default: a value it leaves out
-  costs a trace, never a stale program), and written into each later lowering holding the region, reporting the
+  identity in the context a kernel is chosen in (`fusion.choice_context`: the state a trace reads,
+  `dew.nn.kernels.options.trace_context`, XLA's deterministic-ops flag among it, complete by default: a value it leaves
+  out costs a trace, never a stale program; and the compiles' refused launches), and written into each later lowering holding the region, reporting the
   kernels' routes and launches its trace reported: a step's relowerings and its planner's candidates traced
   every region again, 1,724 traces and 144 seconds of a Qwen3.5-4B decision step's start on a GH200.
 - **Recognition (compile time, row 4783):** a region of a program is written as one of Dew's calls (its

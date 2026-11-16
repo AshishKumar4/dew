@@ -336,6 +336,43 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_until_one_fi
 
 
 
+class OnlyItsWidest(Uncounted):
+    """The grouped forward offered its widest paired tile alone (128 x 256, two accumulators of 128
+    registers a thread), which spills in every compile: a launch certification refuses every config of."""
+
+    def candidate(self, ba, config, target):
+        return super().candidate(ba, config, target) and config.block_n == 256
+
+
+@lowers("sm90")
+def test_a_launch_certification_refuses_every_config_of_holds_no_call_and_its_route_moves_on():
+    """A launch whose every offered config spills as a compile-only H100 assembles it, certified there
+    (`report.certifying`): its call's taking finds none (`tuning.KernelOp.taken` None), so its eligibility
+    reads that it holds no call (`Template.holds`) and its route takes another implementation before the
+    call, where the call raised mid-trace (an A100's gated delta net flow, its scores backward
+    spilling 8 bytes at every config). Asked again, as the call asks after its route, it compiles nothing and
+    records each miss once; a call made anyway refuses with `report.Exhausted`."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    forward, shapes = _spilling_forward(OnlyItsWidest(), 4096, devices)
+    x, gate, up, sizes = shapes
+    op = OnlyItsWidest()
+    with (report.refusals(), generation.assumed("sm90"), report.certifying(devices.devices.flat[0]),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        ba = op.bind(x, gate, sizes, paired=up, hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u),
+                     out_dtype="bfloat16", trans_rhs=False, interpret=False)
+        assert op.taken(ba) is None
+        assert not op.holds(ba, generation.gpu_target())
+        misses = report.misses()
+        assert misses and all(not miss.stepped for miss in misses[-1:]), misses
+        certified = len(report.certifications())
+        assert op.taken(ba) is None
+        assert report.misses() == misses and len(report.certifications()) == certified
+        with pytest.raises(report.Exhausted):
+            jax.jit(forward).trace(*shapes)
+
+
 @lowers("sm90")
 def test_programs_compiled_at_once_sharing_a_spilling_launch_keep_what_compiles_in_turn_keep():
     """Two programs sharing a template launch whose first config spills, compiled at once

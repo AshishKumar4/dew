@@ -195,8 +195,15 @@ def stale(session, own: dict[str, float], observed: dict[str, float], seconds: f
     the target as its tests ran, setup included, and those it would cut from what they took run their
     heaviest shorter. A cut that fits is kept whatever its tests' times drift, as the plan keeps it, and so
     is one whose heaviest group no cut shortens (a test heavier than the budget, which runs alone either
-    way): a fold rewrites a file only where its plan changes for the better."""
+    way): a fold rewrites a file only where its plan changes for the better, or where its tests together
+    took more than `session.KEPT` times what its record sums or less than that sum over it, either past a
+    quarter of `target`: the record is what the plan weighs each task by and the slow list reads, and one
+    kept only because its cut still fits read a test of 15 s as 200 s (2026-11-16: test_moe_exchange.py's
+    record summed 601 s against 213 s observed), while a light file's noise rewrites nothing."""
     if own.keys() != observed.keys():
+        return True
+    listed, ran_whole = sum(own.values()), sum(observed.values())
+    if max(listed, ran_whole) > session.KEPT * min(listed, ran_whole) and max(listed, ran_whole) > target / 4:
         return True
     if seconds <= target or not own:
         return sum(own.values()) > target
