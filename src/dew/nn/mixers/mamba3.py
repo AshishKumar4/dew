@@ -44,7 +44,7 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels.recurrence import Hooks, skip_added
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
-from dew.nn.linear import forked_scan
+from dew.nn.linear import as_projected, forked_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.mixers.mamba2 import MambaRMSNormGated
@@ -616,7 +616,7 @@ class Mamba3(nn.Module):
             out = out * nn.silu(z.astype(wide))
         if self.mimo_rank > 1:
             out = jnp.einsum('bsrhp,hrp->bshp', out, self.mimo_o)
-        out = out.reshape(batch, length, self.intermediate_size).astype(projected.dtype)
+        out = as_projected(out.reshape(batch, length, self.intermediate_size), projected.dtype)
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
         return self.out_proj(out)
