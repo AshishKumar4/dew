@@ -58,7 +58,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
 - Stacks, scans and looped models. [1568]
-- Saved runs carried across. [1622, 1641, 2791, 2792]
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
@@ -101,6 +100,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Released checkpoints judged on GPUs. [1703, 1549]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Every model comparison on check 1. [2300, 3722, 5212]
+- Saved runs carried across. [2791, 2792]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 - The saved data plan as recorded rules, one last version, and the resume modes. [6861]
 
