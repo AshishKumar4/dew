@@ -324,13 +324,15 @@ def test_a_bidirectional_encoder_offered_as_a_causal_lm_is_refused_by_its_progra
     causality); its decoder twin, the same model but for the direction its attention reads, loads."""
     import transformers
 
-    from dew.interop import Pretrained, torchax_fallback
+    from dew.interop import Pretrained, torchax_fallback, verify
 
     for decoder in (False, True):
         transformers.BertLMHeadModel(tiny_config("bert", is_decoder=decoder)).save_pretrained(
             tmp_path / str(decoder))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as refused:
         Pretrained.load(tmp_path / "False", dtype="float32")
+    # Refused by its admission, not for a probe that could not run.
+    assert not isinstance(refused.value, verify.ProbeUnavailable)
     with pytest.warns(torchax_fallback.TransformersTierWarning):
         Pretrained.load(tmp_path / "True", dtype="float32")
 

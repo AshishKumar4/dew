@@ -72,7 +72,7 @@ from jax.typing import DTypeLike
 from typing_extensions import Format, get_annotations, is_protocol
 
 from dew import _records
-from dew._records import JSON
+from dew._records import JSON, boolean, integer, json_value, real, strings_of, text
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -253,18 +253,11 @@ def import_trusted(record: object, trust: Sequence[str]) -> None:
     load reads it (`trusts_source`)."""
     _TRUSTED.update(trust)
     trust_sources(trust)
-    if isinstance(record, str):
-        module, colon, name = record.partition(":")
+    # Only JSON a record holds (`json_value` refuses any other), its every string read once.
+    for named in strings_of(json_value(record, "record")):
+        module, colon, name = named.partition(":")
         if colon and name and module.split(".")[0] in trust and module.replace(".", "").isidentifier():
             importlib.import_module(module)
-    elif isinstance(record, Mapping):
-        for value in record.values():
-            import_trusted(value, trust)
-    elif isinstance(record, list):
-        for value in record:
-            import_trusted(value, trust)
-    elif record is not None and not isinstance(record, (bool, int, float)):
-        raise ValueError(f"{record!r} is not JSON a record holds")
 
 
 class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
@@ -733,7 +726,17 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
         rebuilt = [_rebuilt(entry, record, dtypes=dtypes)
                    for entry, record in zip(entry_types(annotation, len(value)), value, strict=True)]
         return tuple(rebuilt) if wants_tuple(annotation) else type(value)(rebuilt)
+    if isinstance(annotation, type) and annotation in _SCALARS and isinstance(value, (bool, int, float, str)):
+        # A record's scalar is of the type its field declares (`dew._records`' readers), kept as written; a
+        # NumPy scalar, which a module built in Python may hold, is the field's as built.
+        _SCALARS[annotation](value, name or annotation.__name__)
+        return value
     return configured(value)
+
+
+_SCALARS: Mapping[type, Callable[[object, str], object]] = {
+    bool: boolean, int: integer, float: real, str: text}
+"""The reader of each scalar type a field declares (`_rebuilt`), each refusing a value of another."""
 
 
 def class_record(value: Mapping[str, object] | Mapping[RecordKey, object]

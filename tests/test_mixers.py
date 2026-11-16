@@ -19,6 +19,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
@@ -351,24 +352,30 @@ seventeen, the third's one."""
 @pytest.mark.parametrize("compressor", sorted(COMPRESSED))
 def test_deepseek_v4s_projections_are_matrices_muon_steps(compressor):
     """Every DeepSeek V4 projection is a matrix by its declared axes, a contracted side and an output side,
-    which Muon orthogonalizes (`dew.optim.muon_weight_dimension_numbers`): its attention's and its
-    compressor's key/value projection and the compressor's gate among them (row 6654), where their output
-    side declared no axis and Muon refused the decoder."""
-    from flax.traverse_util import flatten_dict
-
+    which Muon orthogonalizes and steps (`OptimConfig(optimizer="muon")`, its partition by the run's table of
+    the draw's axes): its attention's and its compressor's key/value projection and the compressor's gate
+    among them (row 6654), where their output side declared no axis and Muon refused the decoder."""
     from dew.batch import unboxed
     from dew.nn.sharding import boxed, boxed_axes
-    from dew.optim import muon_weight_dimension_numbers
+    from dew.optim import OptimConfig, muon_partition
 
     fields, overrides = KIND_FIELDS["deepseek_v4"]
     model = tiny(mixer=mixers.build("deepseek_v4", **fields, **COMPRESSED[compressor]), max_seq_len=64,
                  **overrides)
-    draw = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 16), jnp.int32))
+    draw = model.init(jax.random.key(0), jnp.zeros((1, 16), jnp.int32))
+    params = unboxed(draw)["params"]
+    # The run's table of the draw's axes, which a trainer holds while its optimizer steps.
     with boxed(boxed_axes(draw)):
-        numbers = flatten_dict(muon_weight_dimension_numbers(unboxed(draw)))
-    projections = {path for path in numbers if path[-2] in ("kv_proj", "gate_proj") and path[-1] == "kernel"}
-    assert {path[-2] for path in projections} >= {"kv_proj"}
-    assert all(numbers[path] is not None for path in projections), sorted(projections)
+        split = muon_partition(params)
+        solver = OptimConfig(optimizer="muon", learning_rate=1e-3).build(4)
+        gradients = jax.tree.map(lambda leaf: jnp.ones_like(leaf) / leaf.size, params)
+        updates, _ = solver.update(gradients, solver.init(params), params)
+    projections = {path: reason for path, reason in split.items()
+                   if path.endswith("['kernel']") and ("kv_proj" in path or "gate_proj" in path)}
+    assert any("kv_proj" in path for path in projections)
+    assert set(projections.values()) == {"muon"}, projections
+    for leaf in jax.tree.leaves(optax.apply_updates(params, updates)):
+        assert np.all(np.isfinite(np.asarray(leaf)))
 
 
 @pytest.mark.parametrize("compressor", sorted(COMPRESSED))

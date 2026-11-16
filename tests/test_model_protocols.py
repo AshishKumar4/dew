@@ -428,12 +428,18 @@ def _greedy(programs: _Served, variables, tokens, forced=None, decided=None):
 def _margined_prompts(name: str, call: tuple) -> jax.Array:
     """`ROWS` prompts of `LENGTH` tokens in `name`'s vocabulary whose float64 greedy walk through its cache
     (the `wide` programs) selects each of its `STEPS` tokens by more than `MARGIN` of its logits' scale
-    (`top_margin`), the first such draw from seed 0 (`clearing`): a float32 run of either cache shape
-    selects as it does (testing.md, a selection compared across programs)."""
+    (`top_margin`), and whose every discontinuous selection over the prompt and its draws (a mixture's
+    routing, a lightning indexer's top-k, `selection_margins.margin` of the float64 forward over them,
+    each position's as its decode step selects it) clears `MARGIN` too: the first such draw from seed 0
+    (`clearing`), so a float32 run of either cache shape selects as it does (testing.md, a selection
+    compared across programs)."""
+    import selection_margins
     from selection_margins import MARGIN, clearing, top_margin
 
     source = loaded(name)
     wide, variables = _programs(name, "wide", call), widened(source.variables)
+    captured = (selection_margins.capture(float64_twin(source.model))
+                if selection_margins.selects(source.model_config) else None)
 
     def draw(key):
         rng = np.random.default_rng([0x6693, key])
@@ -441,9 +447,14 @@ def _margined_prompts(name: str, call: tuple) -> jax.Array:
 
     def clears(prompts) -> bool:
         with jax.enable_x64(new_val=True):
-            _, _, scores, _ = _greedy(wide, variables, prompts)
-        return all(float(np.min(top_margin(np.asarray(score[:, -1], np.float64), 1))) > MARGIN
-                   for score in scores[:STEPS])
+            _, drawn, scores, _ = _greedy(wide, variables, prompts)
+            walked = jnp.concatenate([jnp.asarray(prompts), drawn[:, :-1]], axis=1)
+            selections = None if captured is None else captured(variables, walked)
+        if not all(float(np.min(top_margin(np.asarray(score[:, -1], np.float64), 1))) > MARGIN
+                   for score in scores[:STEPS]):
+            return False
+        return selections is None or selection_margins.margin(
+            source.model_config, selections, f"{name} greedy walk") > MARGIN
 
     return jnp.asarray(clearing(draw, clears)(0))
 

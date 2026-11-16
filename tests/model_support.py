@@ -421,3 +421,28 @@ def memory_limited_to(limit: int) -> int:
     memory = math.ceil(limit / pool_share())
     assert allocator_limit(memory) == limit, (limit, memory)
     return memory
+
+
+def kept_by_slot(cache) -> dict[tuple[str, ...], np.ndarray]:
+    """Each leaf of an attention's decode `cache` by its path, what a slot keeps as `[rows, capacity,
+    ...]`: a pool's leaf (`[heads, pages, page_size, ...]`, `kv_cache.POOLED`) read through each row's pages
+    (`kv_cache.TABLE`), a compact cache's scales and bounds (head-major, `kv_cache.scale_shape`) by slot
+    first, and every other leaf as it is (the cursor, the indexer's keys, which a paged cache keeps
+    compact too)."""
+    from dew.nn.kv_cache import BOUND, POOLED, SCALES, TABLE
+
+    flat = {path: np.asarray(leaf) for path, leaf in flatten_dict(nn.unbox(cache)).items()}
+    tables = {path[:-1]: leaf for path, leaf in flat.items() if path[-1] == TABLE}
+    kept = {}
+    for path, leaf in flat.items():
+        table = tables.get(path[:-1])
+        if path[-1] == TABLE:
+            continue
+        if table is not None and path[-1] in POOLED:
+            rows, pages = table.shape
+            leaf = np.moveaxis(leaf[:, table].reshape(leaf.shape[0], rows, pages * leaf.shape[2],
+                                                      *leaf.shape[3:]), 0, 2)
+        elif table is None and path[-1] in {*SCALES, BOUND}:
+            leaf = np.swapaxes(leaf, 1, 2)
+        kept[path] = leaf
+    return kept
