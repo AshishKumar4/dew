@@ -398,6 +398,9 @@ class _Counting:
             return _folded(equation, values)
         if (placed := _placed(primitive, values)) is not None:
             return [placed]
+        if primitive is pallas.multiple_of_p:
+            # A divisibility hint: its operand's value, nothing computed.
+            return [values[0]]
         if (primitive is lax.select_n_p and _scalar(values[0])
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]

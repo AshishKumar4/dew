@@ -57,8 +57,8 @@ class Operation:
     89j)` is 2.2e38), one no larger than its operand's (`keeps_magnitude`), an integer it rounds to, no
     larger than its operand's or 1 (`integral`: `ceil(2**-126)` is 1), a bitwise result, a boolean's at most
     1 and an integer's any value of its dtype (`bitwise`: int32's `not(-2**31)` is `2**31 - 1`), a value at
-    most 0 where its operand is (`keeps_sign`; a conversion where it keeps the sign, `_keeps_sign`); and
-    whether its work is the special-function units' (`exponential`, `cost.work`)."""
+    most 0 where its operand is (`keeps_sign`; a conversion where it keeps the sign, `_keeps_sign`). Which
+    units an operation's work is the kernels' counter states (`emission.SPECIAL_FUNCTIONS`, `cost.work`)."""
 
     symbol: str
     kind: str
@@ -68,7 +68,6 @@ class Operation:
     integral: bool = False
     bitwise: bool = False
     keeps_sign: bool = False
-    exponential: bool = False
 
 
 OPERATIONS: dict[jcore.Primitive, Operation] = {}
@@ -88,15 +87,15 @@ def _speaks(kind: str, *primitives: jcore.Primitive, **facts) -> None:
 
 _speaks("binary", jax.lax.add_p, jax.lax.sub_p, jax.lax.mul_p, jax.lax.div_p, jax.lax.max_p, jax.lax.min_p,
         jax.lax.atan2_p, jax.lax.rem_p, jax.lax.nextafter_p)
-_speaks("binary", jax.lax.pow_p, exponential=True)
+_speaks("binary", jax.lax.pow_p)
 _speaks("binary", jax.lax.and_p, jax.lax.or_p, jax.lax.xor_p, bitwise=True)
 _speaks("unary", jax.lax.sign_p, jax.lax.integer_pow_p, jax.lax.square_p, jax.lax.erf_inv_p,
         jax.lax.is_finite_p, jax.lax.optimization_barrier_p)
 _speaks("unary", jax.lax.neg_p, jax.lax.abs_p, keeps_magnitude=True)
 _speaks("unary", jax.lax.exp_p, jax.lax.exp2_p, jax.lax.log_p, jax.lax.log2_p, jax.lax.log1p_p,
-        jax.lax.expm1_p, jax.lax.sqrt_p, jax.lax.rsqrt_p, exponential=True)
+        jax.lax.expm1_p, jax.lax.sqrt_p, jax.lax.rsqrt_p)
 _speaks("unary", jax.lax.tanh_p, jax.lax.logistic_p, jax.lax.sin_p, jax.lax.cos_p, jax.lax.erf_p,
-        bounded=True, exponential=True)
+        bounded=True)
 _speaks("unary", jax.lax.floor_p, jax.lax.ceil_p, jax.lax.round_p, integral=True)
 _speaks("unary", jax.lax.not_p, bitwise=True)
 _speaks("comparison", jax.lax.lt_p, jax.lax.le_p, jax.lax.eq_p, jax.lax.ne_p, jax.lax.ge_p, jax.lax.gt_p)
@@ -667,9 +666,7 @@ KEEPING_MAGNITUDE = _symbols(lambda operation: operation.keeps_magnitude)
 INTEGRAL = _symbols(lambda operation: operation.integral)
 BITWISE = _symbols(lambda operation: operation.bitwise)
 KEEPING_SIGN = _symbols(lambda operation: operation.keeps_sign)
-EXPONENTIALS = _symbols(lambda operation: operation.exponential)
-"""The symbols whose operations' values prove each fact of their operand's, and those the special-function
-units evaluate (`Operation`)."""
+"""The symbols whose operations' values prove each fact of their operand's (`Operation`)."""
 UNIT = 0
 
 

@@ -20,10 +20,10 @@ from egglog import DagCostModel, EGraph, get_callable_args
 from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
 from dew.algebra.rules import CONTRACTED, shape
-from dew.algebra.terms import EXPONENTIALS, RESCALE, Region, Term, integer, key, text
+from dew.algebra.terms import OPERATIONS, RESCALE, Region, Term, integer, key, text
 from dew.nn import programs
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import cost as kernel_cost
+from dew.nn.kernels.templates import cost as kernel_cost, emission
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.product import eight, half
 from dew.nn.precision import asks_default_precision
@@ -106,7 +106,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         return Work(conversions=made(graph, args[:1], held))
     if (args := get_callable_args(node, Term.unary)) is not None:
         elements = made(graph, args[:1], held)
-        special = text(args[1]) in EXPONENTIALS
+        special = text(args[1]) in _SPECIAL_FUNCTIONS
         return Work(exponentials=elements) if special else Work(operations=elements)
     if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == RESCALE:
         # A declaration's own rescale of two anchors (`derive.Reduction.rescale`): an exponential an element.
@@ -119,6 +119,11 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
             return Work(operations=made(graph, [args[index] for index in operands], held))
     return Work()
 
+
+_SPECIAL_FUNCTIONS = frozenset(operation.symbol for primitive, operation in OPERATIONS.items()
+                               if primitive in emission.SPECIAL_FUNCTIONS)
+"""The symbols of the operations the special-function units evaluate, by the kernels' counter's one rule
+(`emission.SPECIAL_FUNCTIONS`)."""
 
 _MODES = {"16bit": "flops", "tf32": "tf32_flops", "8bit": "fp8_flops", "fp32": "operations"}
 """The `Work` field a product's mode's FLOPs are told in (`generation.Architecture`'s modes; IEEE fp32 is

@@ -118,6 +118,18 @@ def test_a_projection_followed_by_an_elementwise_function_traces_through_dew_jit
     assert traced.out_info.shape == (256, 256)
 
 
+def test_a_regions_analysis_reads_a_divisibility_hint_as_its_value():
+    """A projection's product rounded to int32 under a divisibility hint (`pl.multiple_of`), analysed for an
+    H100: the hint is its operand's value and no work, so the region analyses (`fused_gemm.analysis`), where
+    the counter priced no rule for it and refused the region (base review 05bd9f77b F1)."""
+    from jax.experimental import pallas as pl
+
+    x = jax.ShapeDtypeStruct((256, 512), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((512, 256), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        fused_gemm.analysis(lambda x, w: pl.multiple_of(fused_gemm.product(x, w).astype(jnp.int32), 1), x, w)
+
+
 def test_an_integer_regions_product_is_xlas_own_dot_with_nothing_to_analyse():
     """`fused_gemm.product` of int8 operands (a quantized dot's, int32 out) is XLA's own dot, nothing fused:
     `fused_gemm.analysis` of its region reports no stage and no price, and `fused` gives XLA's value."""
