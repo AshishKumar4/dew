@@ -67,7 +67,7 @@ from dew.held_updates import waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
-from dew.nn.kernels.options import Compiling, attempting, owned_program
+from dew.nn.kernels.options import Compiling, attempting, owned_program, shapes_of
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, tracing
 from dew.objectives.base import (
@@ -1655,7 +1655,7 @@ class Trainer(Generic[Loss, Effects]):
         to end (`options.compiling`)."""
         if self._compiler.ahead is not None or self.host_master or pgle_runs():
             return None
-        key = jax.ShapeDtypeStruct(fresh.key.shape, fresh.key.dtype)
+        key = shapes_of(fresh.key)
         begun = start_compiling(fresh.placing, fresh.initializer, key, fresh.abstract, fresh.shardings,
                                 self.device_mesh)
         self.phase_passes.at(first)

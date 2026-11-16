@@ -335,9 +335,14 @@ _COLLECTED: contextvars.ContextVar[dict[str, jax.stages.Compiled] | None] = _cac
 
 def shapes_of(tree):
     """`tree`'s arrays or shapes as their shapes, dtypes, shardings and weak types, the layouts left the
-    arrays' own, as a call over arrays of those shardings lowers (`collecting`)."""
-    return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding,
-                                                          weak_type=leaf.weak_type), tree)
+    arrays' own, as a call over arrays of those shardings lowers (`collecting`): an array no one committed
+    to its devices (a fresh `jax.random.key`) as an unplaced shape, which jit places as it places the
+    array (JAX's `pjit` lowers an uncommitted array's sharding as unspecified)."""
+    def shaped(leaf):
+        placed = leaf.sharding if not isinstance(leaf, jax.Array) or leaf.committed else None
+        return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=placed, weak_type=leaf.weak_type)
+
+    return jax.tree.map(shaped, tree)
 
 
 @contextlib.contextmanager
@@ -791,15 +796,12 @@ def _signature(leaf) -> Hashable:
 
 def _abstract_signature(leaf) -> Hashable:
     """What a lowering reads of an argument (`OuterProgram.abstract_of`): an array's or a shape's shape,
-    dtype and weak type (its abstract value, a key array's among them) and its sharding, which a call over
-    arrays and one over their shapes (`shapes_of`) share; another value's type, shape and dtype. An array
-    no one committed to its devices (a fresh `jax.random.key`) lowers as an unplaced shape does: jit places
-    it, so its sharding is none here, as an unplaced shape's is."""
-    if isinstance(leaf, jax.Array):
-        placed = leaf.sharding if leaf.committed else None
-        return leaf.aval.shape, leaf.aval.dtype, leaf.aval.weak_type, placed
-    if isinstance(leaf, jax.ShapeDtypeStruct):
-        return leaf.shape, leaf.dtype, leaf.weak_type, leaf.sharding
+    dtype and weak type (its abstract value, a key array's among them) and its sharding, each as its shape
+    (`shapes_of`), so a call over arrays and one over their shapes share it, an array no one committed to
+    its devices lowering as an unplaced shape does; another value's type, shape and dtype."""
+    if isinstance(leaf, jax.Array | jax.ShapeDtypeStruct):
+        shaped = shapes_of(leaf)
+        return shaped.shape, shaped.dtype, shaped.weak_type, shaped.sharding
     return type(leaf), np.shape(leaf), np.result_type(leaf)
 
 
