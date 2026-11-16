@@ -2246,7 +2246,8 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     task by and the slow list reads, and a record kept only because its cut still fits read a test of 15 s as
     200 s (2026-11-16: test_moe_exchange.py's record summed 601 s against 213 s observed). A group's key holds
     its tests, not their seconds (`cache_key`), and its cut stays as stored while its groups hold
-    (`session.stored_bounds`), so a refreshed file reruns only the groups whose tests move. A file with a red
+    (`session.stored_bounds`), so a refreshed file reruns only the groups whose tests move, and every group of
+    it where its group count changes (a file crossing the target runs whole, or cut, anew). A file with a red
     or missing row keeps its entries, as does a file the verdict did not run, and one the checkout has changed
     since the verdict's commit, whose rows observed tests it may no longer hold (2026-10-31: train 370's fold
     replaced a head's 66 renamed test ids with main's old ones); a file the checkout no longer has loses them.
