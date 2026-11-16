@@ -721,7 +721,8 @@ def test_a_run_whose_tokenizer_this_host_cannot_resolve_is_refused_before_its_fi
     data = Pipeline(Memory({"text": rows})).repeat().batch(8)
     with LocalTracker(tmp_path / "tracking") as tracker:
         trainer = Trainer(LMObjective(model, seq_len=6, processor=processor), optax.sgd(0.1),
-                          key=jax.random.key(0), checkpoints=Checkpoints(str(tmp_path / "run")), tracker=tracker)
+                          key=jax.random.key(0), checkpoints=Checkpoints(str(tmp_path / "run")),
+                          tracker=tracker)
         with pytest.raises(ValueError):
             trainer.fit(data, steps=2, checkpoint_every=1)
     records = tmp_path / "tracking" / "records.jsonl"
