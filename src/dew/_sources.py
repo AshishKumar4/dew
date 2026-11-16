@@ -370,15 +370,17 @@ def generated_fields(held: type) -> list[GeneratedField]:
     return []
 
 
-def generated_members(held: type) -> list[tuple[str, object]]:
+def generated_members(held: type) -> list[tuple[str, types.FunctionType | tuple[str, ...]]]:
     """The members a class generator wrote into `held` itself, by name, in order: each function whose code no
     file holds (made at run time, as a dataclass's and attrs' `__init__`, comparisons and `__setattr__`
     are), and its `__match_args__`, which `members` leaves out as machinery. A class whose generator's
     options or fields change them is stated otherwise by them (the evening audit of 2026-11-16)."""
-    found = []
+    found: list[tuple[str, types.FunctionType | tuple[str, ...]]] = []
     for name, member in sorted(vars(held).items()):
         member = wrapped(member)
-        if name == "__match_args__" or (isinstance(member, types.FunctionType)
-                                        and member.__code__.co_filename.startswith("<")):
-            found.append((name, member))
+        match member:
+            case tuple() if name == "__match_args__":
+                found.append((name, tuple(str(held) for held in member)))
+            case types.FunctionType() if member.__code__.co_filename.startswith("<"):
+                found.append((name, member))
     return found
