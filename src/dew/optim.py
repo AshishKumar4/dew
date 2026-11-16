@@ -1825,16 +1825,23 @@ def unbounded(params: optax.Params) -> list[float | None]:
     return [None] * len(jax.tree.leaves(params))
 
 
+def solved(params: optax.Params) -> list[float | None]:
+    """A Gauss-Newton solve's leaves, whose update a step reads finite as it is formed whatever its bound
+    (`dew.gauss_newton.solves_equations`): none is past a bound of zero beyond that read, so its state is
+    never marked read (`UpdatesRead`) and stays the solver's own, as runs saved before the mark hold it."""
+    return [0.0] * len(jax.tree.leaves(params))
+
+
 def update_bounds(optimizer: Optimizer | str, opts: Mapping[str, object], *, quantized: bool = False
                   ) -> LeafBounds | None:
     """Each parameter's bound on the unit-rate update `optimizer` forms (before its learning rate and decay)
     from a gradient within `MAGNITUDE_BOUND`, by leaf of the parameters it is handed, from its constants
     `opts` over its factory's defaults (`bounded_updates`); a leaf's None where Dew states none: a guard of
     zero (0/0 where a parameter's moments are), a decay of one or more (its bias correction divides by zero),
-    moments in float16, Muon's options its bound does not cover, a Gauss-Newton solve (which a step reads
-    whatever its bound, `solves_equations`). None for a factory Dew does not build, whose bound it cannot
-    read. Moments stored in 8 bits (`quantized`, `dew._moments.int8_moments`) may hold a second moment of
-    zero beside a first that is not, which only the guard bounds.
+    moments in float16, Muon's options its bound does not cover. A Gauss-Newton solve's are `solved`'s,
+    its update read as it is formed whatever its bound. None for a factory Dew does not build, whose bound
+    it cannot read. Moments stored in 8 bits (`quantized`, `dew._moments.int8_moments`) may hold a second
+    moment of zero beside a first that is not, which only the guard bounds.
 
     Adam's `|m^| / (sqrt(v^) + eps)` is at most `1/sqrt((1 - b2)(1 - b1^2/b2))` where b1 squared is under b2
     (Cauchy-Schwarz over the moments' weights), Nesterov's adding `1/sqrt(1 - b2)`, `ROUNDING_ROOM` times
@@ -1867,7 +1874,9 @@ def update_bounds(optimizer: Optimizer | str, opts: Mapping[str, object], *, qua
             1 / math.sqrt((1 - b2) * (1 - b1 * b1 / b2)) + 1 / math.sqrt(1 - b2))
         return ROUNDING_ROOM * ratio * max(1.0, UNDERFLOW_BOUND / guard)
 
-    if any(str(values.get(name)) == 'float16' for name in ('mu_dtype', 'nu_dtype')) or make is gauss_newton:
+    if make is gauss_newton:
+        return solved
+    if any(str(values.get(name)) == 'float16' for name in ('mu_dtype', 'nu_dtype')):
         held = None
     elif make is _muon_groups:
         return _muon_bounds(values, bounded(values['adam_b1'], values['adam_b2'], values['eps'],
