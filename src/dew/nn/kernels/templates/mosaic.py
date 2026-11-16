@@ -1221,6 +1221,14 @@ class Issuer[Accumulator](abc.ABC):
         unless `accumulate`, the accumulator started from zero (a walk's own fresh product, `read` once
         done)."""
 
+    def products_unless(self, idle: jax.Array, acc: Accumulator, lhs, rhs) -> Accumulator:
+        """`products`, none issued where `idle` (traced, one value across the issuing warpgroup): `acc` as it
+        was, a consumer whose share of a tile's rows lies outside its group multiplying nothing (row 5623: an
+        A100's grouped forward padded each ragged group to whole 128-row tiles, 14% more products than its
+        rows). A value accumulator's (mma.sync's, an interpreted walk's) by a branch on `idle`; an issuer
+        whose accumulator is a place its instructions write states its own (`WgmmaIssuer`)."""
+        return lax.cond(idle, lambda: acc, lambda: self.products(acc, lhs, rhs))
+
     def looped_products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True) -> Accumulator:
         """`products`, its instruction steps issued in a loop of their own where the issuer reads its
         operands' fragments in registers, each step's loaded within it, so a product beside others holds no

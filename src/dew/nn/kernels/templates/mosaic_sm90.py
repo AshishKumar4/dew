@@ -97,6 +97,15 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         plgpu.wgmma(acc, lhs, rhs)
         return acc
 
+    def products_unless(self, idle, acc, lhs, rhs):
+        # The warpgroup's accumulator its MMAs write in place: issued under a branch on `idle`, the group
+        # counted either way (`Issuer.settled` waits until at most so many are in flight, which fewer meet).
+        if bodies.interpreting():
+            return super().products_unless(idle, acc, lhs, rhs)
+        mosaic.committed()
+        pl.when(~idle)(lambda: plgpu.wgmma(acc, lhs, rhs))
+        return acc
+
     def read(self, acc, *, first: int = 0, columns: int | None = None, pending: int = 0) -> jax.Array:
         # A scoped warpgroup accumulator read once at most `pending` of the warpgroup's product groups are in
         # flight (`wgmma_accumulator_load`'s wait), the later ones running on; interpreted, its value.

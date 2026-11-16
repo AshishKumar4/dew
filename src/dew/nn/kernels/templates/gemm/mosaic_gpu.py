@@ -713,15 +713,15 @@ def _joined(joined, lhs, paired, epilogue: tuple, *, parts: tuple, transpose_lhs
             packed_rows: bool) -> tuple:
     """Dew: `gmm`'s `epilogue` (the hook, its axes and side operands) as a call with `joined` rows runs it:
     refused but as `_joined_refused` takes them, with no epilogue of its own, its two sums added at the
-    finish (`_joined_sum`); the call's own where it joins none."""
+    finish (`joined_sum`); the call's own where it joins none."""
     if joined is None:
         return epilogue
     _joined_refused(joined, lhs, paired, parts=(*parts, epilogue[0]), transpose_lhs=transpose_lhs,
                     packed_rows=packed_rows)
-    return _joined_sum, (), ()
+    return joined_sum, (), ()
 
 
-def _joined_sum(acc, paired_acc):
+def joined_sum(acc, paired_acc):
     """Dew: a joined pair's finish (`gmm`'s `joined`): its two fp32 accumulators added, once."""
     return acc + paired_acc
 
@@ -731,7 +731,7 @@ def _joined_refused(joined, lhs, paired, *, parts: tuple, transpose_lhs: bool, p
     prologue, scales, step or block scales, gather or epilogue (`parts`, in that order), transposed or packed
     rows.
     Joined, each step multiplies `lhs`'s block by `rhs`'s and `joined`'s by `paired`'s, each into its own
-    accumulator, the two added at the finish and rounded once (`_joined_sum`): no partial of one product
+    accumulator, the two added at the finish and rounded once (`joined_sum`): no partial of one product
     meets the other's before either is whole, so each sum stays as finite as the product's alone (base
     review F2), and each product's promotion window is its own: a paired product's input gradient, the
     gate's and the up projection's cotangents through their matrices, one launch (row 6783)."""
@@ -823,8 +823,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     first step (`tail.Tail`, `mosaic.Family.fixed_up`), which runs the epilogue and stores it; lowered once a
     configuration."""
     family = family_of(tiles, _products_dtype(lhs, {'matrix': rhs}, packed_rows))
-    prologue, prologue_axes, epilogue, epilogue_axes = hooks
-    prologue_operands, epilogue_operands = sides
+    (prologue, prologue_axes, epilogue, epilogue_axes), (prologue_operands, epilogue_operands) = hooks, sides
     (m, n, k, g), block_m, block_n, block_k = shape, tiles.block_m, tile_columns(tiles, family), tiles.block_k
     consumers, pair, share, part = tiles.warpgroups, tiles.cluster, tiles.share, (tiles.share, block_n)
     # The side operands streamed with the steps, read from global memory, or loaded once a tile (`_stepped`).
@@ -860,6 +859,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             rows = pl.ds(tiles.share_row(wg), share)
             return functools.partial(
                 _gmm_step, family=family, prologue=prologue, prologue_axes=prologue_axes, mine_rows=rows,
+                idle=_idle(tiles, tile[0], tile[1], wg),
                 transpose_rhs=transpose_rhs, matrices=matrices, interpret=bool(interpret), first=tile[3],
                 transpose_lhs=transpose_lhs, block_scaled=mx_scales is not None, packed_rows=packed_rows,
                 scaling=_gmm_scaling(step_scales is not None, scale_per, block_n, tile[2], rows), **refs)
@@ -1665,10 +1665,22 @@ def _walked_products(family: mosaic.Family, walk, step, shape: tuple, count: int
     return running
 
 
+def _idle(tiles: Tiles, group: "row_tiles.GroupInfo", row_start, consumer) -> jax.Array | None:
+    """Dew: whether consumer `consumer`'s share of the tile at `row_start` (`Tiles.share_row`) lies wholly
+    outside its group's rows (`GroupInfo`'s actual ones: a ragged group's last tile past its end, a tile its
+    group starts within before its start), so its products multiply nothing (`Issuer.products_unless`); None
+    where one consumer takes the tile's rows (`Tiles.sharing`: mma.sync's, ping-pong's, tcgen05's), whose
+    tile a walk takes only where its group holds rows."""
+    if tiles.sharing == 1:
+        return None
+    first = row_start + tiles.share_row(consumer)
+    return (first >= group.actual_end) | (first + tiles.share <= group.actual_start)
+
+
 def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, prologue, prologue_axes: tuple,
               fixed_tiles: dict, read_tiles: dict, mine_rows, transpose_rhs: bool, matrices: dict,
               interpret: bool, first=0, summed: bool = False, transpose_lhs: bool = False,
-              decoded=None, scaling=None, block_scaled: bool = False, packed_rows: bool = False):
+              decoded=None, scaling=None, block_scaled: bool = False, packed_rows: bool = False, idle=None):
     """Dew: a consumer's step of the cooperative `gmm` (`mosaic.Family.walk`): its half of the rows' slot,
     transformed by the prologue on its side tiles (the streamed ones' slots, the fixed ones' `fixed_tiles`, a
     depth vector the family does not copy read at step `index` from global memory: `read_tiles`), times each
@@ -1682,7 +1694,8 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
     its products read it as the matrix's stage. With `packed_rows`, its rows' slots hold a packed matrix's
     words and scales, its half of them decoded in registers into the products' left operand
     (`packed.rows_decoded`), as a prologue's value. `matrices` maps each matrix's stream to its rows' (the
-    rows', or the joined rows' for a joined pair's paired matrix: `gmm`'s `joined`)."""
+    rows', or the joined rows' for a joined pair's paired matrix: `gmm`'s `joined`). With `idle` (`_idle`),
+    its products issued only where its rows meet its group's."""
     read = {name: slots[name] for name in matrices if decoded is None}
     if decoded is not None:
         read['matrix'] = decoded.decode(index, slots, interpret)
@@ -1723,7 +1736,9 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
         return nothing, tuple(family.scaled_products(acc, mine, oriented[name],
                                                      (slots['a_scales'], slots['b_scales']))
                               for acc, name in zip(accumulators, matrices, strict=True))
-    return nothing, tuple(family.products(acc, rows_of[name], oriented[name])
+    # A consumer whose rows lie outside its group issues none (`_idle`).
+    issued = family.products if idle is None else functools.partial(family.products_unless, idle)
+    return nothing, tuple(issued(acc, rows_of[name], oriented[name])
                           for acc, name in zip(accumulators, matrices, strict=True))
 
 
