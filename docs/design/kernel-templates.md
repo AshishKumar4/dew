@@ -157,6 +157,8 @@ Auxiliary scans (a normalizer z, LSE pre-passes) are an algebra extension point,
 
 A recurrence's memory is read through its decays within a stated range, within 2^100 of its values: there every form is on par with the recurrence a token at a time (check 1). Past it fp32's own token recurrence holds no such read (4e-6 from float64 at 2^110, 6e-2 at 2^124, its decays subnormal), and no form loses the read to zero: under a decay a head every form reads the memory output-side, `(q S) exp2(g)`, each within 2.5 times the fp32 recurrence's distance from float64 (row 2344); no form carries an exponent past fp32's range. A decay a key dimension's read past the range is unmeasured.
 
+**A form's numbers are its release's.** Under the run's fast forms a form takes its upstream release's rounding and is held to that release's own code (testing.md): the delta rule fla's, Mamba-2's rated scan mamba_ssm's, and a decay a head without the delta rule or a write gate fla's simple GLA (lightning attention's, `recurrence_chunk.simple_gla`): its states and scores bf16 at each product, its sums fp32. Held whole in fp32's three parts there, lightning ran 4.9 times fla's forward and 2.6 times its training on a GH200 (row 6823). Under the accurate forms every form keeps its intermediates whole, its bar the recurrence a token at a time: a user who needs the portable math's accuracy declares them. A form no release holds (a write gate without the delta rule, Mamba-3's) keeps them whole under either.
+
 ### GEMM
 
 **Product declaration**, the same for every product in every template:
