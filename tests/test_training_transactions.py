@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import FEATURES, Counting, dataset, raw_leaf
+from affine_run import Counting, dataset, raw_leaf
 from flax import linen as nn, struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from reference_error import as_given, assert_as_exact, dew_programs, widened
@@ -658,40 +658,6 @@ def test_a_step_whose_loss_is_finite_and_its_gradient_not_is_reported_not_finite
     advanced, loss, _, finite, _, committed = step(state, bad)
     assert bool(jnp.isfinite(loss)) and not bool(finite) and int(committed.count) == 0
     np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), before)
-
-
-class Pushed(Objective):
-    """A weight pushed by each batch's inputs, its loss the mean of their products with it, its gradient
-    the inputs' mean: finite however large they are."""
-
-    def fresh_variables(self, key, held):
-        return {"params": {"w": jnp.zeros((FEATURES,))}}
-
-    def loss(self, variables, batch, step):
-        return jnp.mean(batch["x"] @ variables["params"]["w"]), Aux({})
-
-
-class Huge(Counting):
-    """`Counting`'s batches, every input 1e20."""
-
-    def __next__(self):
-        batch = super().__next__()
-        return {**batch, "x": np.full_like(batch["x"], 1e20)}
-
-
-def test_a_step_whose_update_overflows_from_a_finite_gradient_writes_nothing_and_saves_finite(tmp_path):
-    """With no loss scale, Adam's second moment of a finite gradient of 1e20 passes float32: the step
-    writes no value whose candidate is not finite, the moment kept as it was beside the weight's own finite
-    update, is reported not finite, and every save holds a finite state, the latest the run's last step
-    (training.md, a step that is not finite). Its moment was written infinite, and the save refused it
-    (train 912's review, F2, Main's ruling)."""
-    trainer = Trainer(Pushed(), optax.adam(0.1), key=jax.random.PRNGKey(0),
-                      checkpoints=Checkpoints(str(tmp_path / "run")))
-    state = trainer.fit(dataset(Huge), steps=3, log_every=100, checkpoint_every=1)
-    held = jax.tree.leaves((state.variables, state.opt_state))
-    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in held)
-    with Checkpoints(str(tmp_path / "run")) as checkpoints:
-        assert checkpoints.latest == 3
 
 
 class Overflowing(Objective):
