@@ -803,6 +803,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def rungs(self, ba, config):
         return producers.rungs(self, ba, config) if isinstance(config, mosaic_gpu.Tiles) else iter(())
 
+    def pinnable(self, ba, config) -> bool:
+        # A pin or a stored pick a compile refused is none: `legal` reads a tile's refusal at the rung its
+        # producer's ladder settles on (`_refused`), past the pinned one. A stored pick stating no producer
+        # registers (stored before tiles stated them) is in no space of the launch's (`tuning._pick`).
+        return super().pinnable(ba, config) and not report.refused(self, ba, config)
+
     def _refused(self, ba, config: mosaic_gpu.Tiles) -> bool:
         # Refused past its producer's ladder: spilling at the rung it settles on (`producers.settled`).
         return report.refused(self, ba, producers.settled(self, ba, config))
@@ -922,10 +928,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # A family rewriting the staged rows in a role of its own runs it beside the consumers
         # (`mosaic_gpu.tgmm`'s `roles`).
         roles = config.warpgroups + self.rewritten(ba, family)
-        # Its producer at the registers its tile states, the least where unraised (`rungs`), as its kernel
-        # lowers it.
+        # Its producer at the registers its tile states, or where it states none its ladder's first rung
+        # (`producers.started`), as its derived tile's kernel lowers it.
         return resources.Launch(scope, roles, self.registers(ba, config), most=most,
-                                producer=config.producers.of(self.KERNEL))
+                                producer=producers.started(self, ba, config).producers.of(self.KERNEL))
 
     def rewritten(self, ba, family: mosaic.Family) -> bool:
         """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`): its
@@ -1671,7 +1677,8 @@ class MosaicTgmm(_Mosaic):
             rhs_dtype=ba.arguments['cotangent'].dtype, prologue_axes=ba.arguments['hooks'].prologue_axes,
             prologue_dtypes=tuple(side.dtype for side in ba.arguments['prologue_operands']),
             out_dtype=ba.arguments['out_dtype'], k_major=self.K_MAJOR, step_scaled=self.K_MAJOR,
-            unstaged=self.unstaged(ba), gathered=ba.arguments.get('gather') is not None)
+            unstaged=self.unstaged(ba),
+            gathered=tuple(table is not None for table in ba.arguments.get('gather') or (None, None)))
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         # A gradient tile's rows are the tokens' width; its steps run over a group's rows, padded to whole
