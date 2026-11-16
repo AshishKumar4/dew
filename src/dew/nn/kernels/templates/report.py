@@ -189,6 +189,10 @@ class _Registry:
     passes: collections.deque[float] = dataclasses.field(
         default_factory=lambda: collections.deque(maxlen=RECORDS_HELD))
     """Each program's whole pass, in seconds: its walks of its bodies and windows beside its regions'."""
+    by_launch: dict[str, frozenset] = dataclasses.field(default_factory=dict)
+    """`refusals_of`'s answers by launch identity, each dropped as a refusal of its launch is recorded: read
+    for every config a derivation weighs, each answer gathered from every launch's refusals took 426 of a
+    refusal walk's 685 profiled seconds, 250,267 reads over its 355 derivations (row 6551)."""
 
 
 @dataclasses.dataclass
@@ -441,8 +445,12 @@ def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[str]]]:
     refused at it: what a launch's derivation and legality read of the refusals, the one way a trace reads
     them (`traced_fact`), so a trace kept past a refusal of another launch holds."""
     with _GUARD:
-        return frozenset((config, kernels) for (launch, config), kernels in _registry().refused.items()
-                         if launch == identity)
+        registry = _registry()
+        if (found := registry.by_launch.get(identity)) is None:
+            found = registry.by_launch[identity] = frozenset(
+                (config, kernels) for (launch, config), kernels in registry.refused.items()
+                if launch == identity)
+        return found
 
 
 def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
@@ -450,6 +458,14 @@ def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
     spilled or serialized its warpgroup MMAs (`refused_at`). A template's legality reads it, so its derivation
     takes the next config."""
     return bool(refused_at(op, arguments, config))
+
+
+def refusals_at(op, arguments: tokamax.BoundArguments
+                ) -> tuple[str, frozenset[tuple[Hashable, frozenset[str]]]]:
+    """`op`'s launch of `arguments` by its identity (`_identity`), and each config a compile of this process
+    refused it at, with the kernels refused there (`refusals_of`)."""
+    identity = _identity(op, arguments)
+    return identity, refusals_of(identity)
 
 
 def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable) -> frozenset[str]:
@@ -510,6 +526,11 @@ _PULLED: contextvars.ContextVar = contextvars.ContextVar("certified_pulled", def
 """Whether a launch traced here runs as reverse mode runs it (`pulled`)."""
 
 
+def pulling() -> bool:
+    """Whether a launch traced here runs as reverse mode runs it (`pulled`)."""
+    return _PULLED.get()
+
+
 @contextlib.contextmanager
 def pulled() -> Iterator[None]:
     """Within the block, a gradient's product is traced: a launch whose call carries its own derivative
@@ -542,7 +563,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
     alone before its program is: its kernels' binaries (`binaries`) as the plugin's own compiler makes them
     for the device the process compiles for (`_certifying_device`: its own GPU, or a compile-only one a
     block names), which the program's compile then reuses (Mosaic compiles a module once a process). A
-    launch's derivation refuses a config that spills and takes its next (`tuning`'s `_chosen`), with no
+    launch's derivation refuses a config that spills and takes its next (`tuning.KernelOp.taken`), with no
     program retraced, where a compile's refusal retraces the whole program (`settled`): a B200's 4B step
     stepped its attention forward 19 times that way, 42 minutes, every rewalk a step's trace. None on a
     process compiling for no GPU or an interpreted launch; None, read nowhere, for a launch XLA or the GPU's
@@ -855,13 +876,19 @@ def _add(**records: Iterable) -> None:
 
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
-            kernels: frozenset[str] = frozenset()) -> None:
+            kernels: frozenset[str] = frozenset()) -> bool:
+    """`refusal` and `miss` recorded; whether `miss` is new. A miss is recorded once: a launch's derivation
+    asked again (its route's eligibility, then its call, `tuning.KernelOp.taken`) reads its certification
+    back and finds the same misses."""
     registry = _registry()
     with _GUARD:
         if refusal is not None:
             registry.refused[refusal] = registry.refused.get(refusal, frozenset()) | kernels
-        if miss is not None:
-            _add(missed=(miss,))
+            registry.by_launch.pop(refusal[0], None)
+        if miss is None or miss in registry.missed:
+            return False
+        _add(missed=(miss,))
+        return True
 
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
@@ -1366,9 +1393,9 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
 def _missed_block(kernel: str, launch: Launch, asked: int, *, stepped: bool) -> None:
     """A Triton launch's shared-memory miss recorded and logged (`_unblocked`), under its first kernel's
     name: XLA's refusal names none."""
-    _record(None, Miss(kernel, launch.op, launch.config, None, None, stepped, shared=asked))
-    _log.warning("a program asks %d shared bytes past its block; Triton kernel %s (%s at %s): %s", asked,
-                 kernel, launch.op, launch.config, "its launch steps down" if stepped else "no step-down")
+    if _record(None, Miss(kernel, launch.op, launch.config, None, None, stepped, shared=asked)):
+        _log.warning("a program asks %d shared bytes past its block; Triton kernel %s (%s at %s): %s", asked,
+                     kernel, launch.op, launch.config, "its launch steps down" if stepped else "no step-down")
 
 
 def _misses_of(refused: list["Binary"]
@@ -1390,10 +1417,10 @@ def _recorded(found: list, *, stepped: bool) -> None:
                     None if launch is None else launch.config, report.registers, report.frame,
                     stepped and launch is not None,
                     serialized=tuple(note.code for note in report.notes if note.code in SERIALIZED))
-        _record(None, miss)
-        _log.warning("kernel %s %s at %s registers (%s at %s); %s", miss.kernel, miss.reason,
-                     miss.registers, miss.op, miss.config,
-                     "its launch steps down" if miss.stepped else "no step-down")
+        if _record(None, miss):
+            _log.warning("kernel %s %s at %s registers (%s at %s); %s", miss.kernel, miss.reason,
+                         miss.registers, miss.op, miss.config,
+                         "its launch steps down" if miss.stepped else "no step-down")
 
 
 def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,

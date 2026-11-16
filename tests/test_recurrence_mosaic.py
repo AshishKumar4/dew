@@ -1655,13 +1655,16 @@ def _reverse_walk_certified(op=None) -> list:
                'rounded': True}
     before = {id(certified) for certified in report.certifications()}
     with (report.refusals(), generation.assumed('sm100'), generation.chosen(gated_delta_rule='mosaic_gpu'),
-          report.certifying(compile_only_gpus('sm100')[0]), report.pulled()):
-        if op is None:
-            jax.jit(jax.grad(_route_loss(options), argnums=(0, 1, 2))).trace(*operands).lower(
-                lowering_platforms=('cuda',))
-        else:
-            bound = op.bind(*operands, None, bound=1.0, rounded=True)
-            op._certified(bound, op.derived(bound, generation.gpu_target()))
+          report.certifying(compile_only_gpus('sm100')[0])):
+        # The template's rule called as the route's training product calls it, under reverse mode's
+        # certification (`recurrence_chunk._per_product`'s `training`): `_route_loss` takes the rule itself.
+        with report.pulled():
+            if op is None:
+                jax.jit(jax.grad(_route_loss(options), argnums=(0, 1, 2))).trace(*operands).lower(
+                    lowering_platforms=('cuda',))
+            else:
+                bound = op.bind(*operands, None, bound=1.0, rounded=True)
+                op._certified(bound, op.derived(bound, generation.gpu_target()))
         refused = [config for _, config, _ in report.refused_launches()]
     return [each for each in report.certifications()
             if id(each) not in before and each.op == type(op or template.MOSAIC).__name__], refused
@@ -1699,8 +1702,7 @@ def test_a_launch_past_its_ladders_foot_is_certified_at_a_program_fewer():
                      beta=shape((2, 256, heads), jnp.float32), rate=shape((heads,), jnp.float32),
                      skip=shape((heads,), jnp.float32))
     before = {id(certified) for certified in report.certifications()}
-    with (report.refusals(), generation.assumed('sm90'), report.certifying(compile_only_gpus('sm90')[0]),
-          report.pulled()):
+    with report.refusals(), generation.assumed('sm90'), report.certifying(compile_only_gpus('sm90')[0]):
         jax.jit(jax.grad(lambda given: jnp.sum(chunk(hooks, given, dtype=jnp.float32)[0]))).trace(
             operands).lower(lowering_platforms=('cuda',))
     walked = [each for each in report.certifications() if id(each) not in before and any(
@@ -1727,8 +1729,7 @@ def test_lightning_attentions_training_step_starts_unspilled_asking_each_rung_on
     given = shape((2, 256, 4, 128), jnp.bfloat16)
     operands = Chunk(given, given, given, log_decay=shape((2, 256, 4), jnp.float32))
     before = {id(certified) for certified in report.certifications()}
-    with (report.refusals(), generation.assumed('sm90'), report.certifying(compile_only_gpus('sm90')[0]),
-          report.pulled()):
+    with report.refusals(), generation.assumed('sm90'), report.certifying(compile_only_gpus('sm90')[0]):
         jax.jit(jax.grad(lambda given: jnp.sum(chunk(hooks, given, chunk_size=64)[0].astype(jnp.float32)))
                 ).trace(operands).lower(lowering_platforms=('cuda',))
     certified = [each for each in report.certifications() if id(each) not in before]
@@ -1743,6 +1744,60 @@ def test_lightning_attentions_training_step_starts_unspilled_asking_each_rung_on
             held[binary.kernel] |= not binary.refused
     assert held and all(held.values()), held
     assert len(set(spilled)) == len(spilled), certified
+
+
+@lowers('sm80')
+def test_a_training_step_no_config_holds_moves_past_the_template_after_one_compile():
+    """The gated delta net's training step at its GPU flow's widths (tests/model_flows.py's Qwen3-Next-tiny: 2
+    key heads and 4 value heads of 128, 2 rows of 256 tokens, bf16) on a compile-only A100: its scores'
+    backward spills 8 bytes at 255 registers at every tiles the derivation offers, which plan it alike, so
+    one compile refuses them all (`Mosaic._refused`); the route's launch requirement reads the certified
+    answer (`Mosaic.holds`) and its gradient lowers by the next kernel, the template's start one
+    certification. It certified 32 tiles, 819 s, and raised Unfitted from inside the call (row 6816; row
+    6860 the coverage gap)."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    shape = jax.ShapeDtypeStruct
+    qk, v = shape((2, 256, 2, 128), jnp.bfloat16), shape((2, 256, 4, 128), jnp.bfloat16)
+    operands = Chunk(qk, qk, v, beta=shape((2, 256, 4), jnp.bfloat16), gate=shape((2, 256, 4), jnp.bfloat16),
+                     log_a=shape((4,), jnp.float32), bias=shape((4,), jnp.float32))
+    before = {id(certified) for certified in report.certifications()}
+    # Lowered on the A100's compile-only devices: the next kernel the route takes is no Mosaic one.
+    with report.refusals(), report.certifying(compile_only_gpus('sm80')[0]):
+        lowered_for(jax.grad(lambda given: jnp.sum(chunk(FORMED[0], given)[0].astype(jnp.float32))),
+                    (operands,), 'sm80')
+    # The training call's launch, certified as reverse mode runs it; its forward alone no step runs.
+    certified = [each for each in report.certifications()
+                 if id(each) not in before and each.op == type(template.MOSAIC).__name__]
+    assert len(certified) == 1 and certified[0].refused and certified[0].pulled, certified
+
+
+@lowers('sm90')
+def test_a_training_step_the_fast_backward_does_not_take_certifies_no_gradient():
+    """A training step of a form the template's fast backward does not take (a write gate with a decay a key
+    dimension and no delta rule, `mainloop_backward.fast_backward_form`) on a compile-only H100 lowers by the
+    next kernel and certifies none of the template's launches: its eligibility asks no compile of a gradient
+    its rule refuses, which raised NotImplementedError from the rule's gradient once the route's launch
+    requirement read certification (`Mosaic.eligible`)."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    hooks = next(hooks for hooks in TAKEN if hooks.decay == 'vector' and hooks.write_gate)
+    drawn = hooked_draw(hooks, packed=False, seed=0)[0]
+    # Its queries, keys and values bf16, as a 16-bit training step's.
+    shaped = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), drawn)
+    halved = {name: jax.ShapeDtypeStruct(getattr(drawn, name).shape, jnp.bfloat16)
+              for name in ('query', 'key', 'value')}
+    operands = dataclasses.replace(shaped, **halved)
+    before = {id(certified) for certified in report.certifications()}
+    with report.refusals(), report.certifying(compile_only_gpus('sm90')[0]):
+        lowered_for(jax.grad(lambda given: jnp.sum(chunk(hooks, given)[0].astype(jnp.float32))),
+                    (operands,), 'sm90')
+    assert not [each for each in report.certifications()
+                if id(each) not in before and each.op == type(template.MOSAIC).__name__]
 
 
 TOP_RUNG_LOWERED = """

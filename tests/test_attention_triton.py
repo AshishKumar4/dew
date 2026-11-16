@@ -1116,6 +1116,27 @@ def test_a_float32_call_compiles_spill_free_for_an_h100(width, packed):
     assert not spilled, spilled
 
 
+def test_a_triton_forward_every_config_of_which_spills_hands_its_call_to_the_next_mainloop():
+    """The Triton forward's certified refusal (`attention_triton._holding`): an fp32 call 512 wide on a
+    compile-only A100, every config its derivation offers spilling as the assembler builds it, makes the route
+    take the plain-JAX mainloop (`attention_route._mainloop`) and lowers, where reading the refusal as a
+    raise (`Unfitted`) its certification no longer makes left the Triton launch taken and the call raising
+    Exhausted from inside its trace (train 934's F2)."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.templates import report
+
+    query = jax.ShapeDtypeStruct((1, 512, 16, 512), jnp.float32)
+    key = jax.ShapeDtypeStruct((1, 512, 4, 512), jnp.float32)
+
+    def forward(query, key, value):
+        return scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
+
+    with report.refusals(), report.certifying(compile_only_gpus("sm80")[0]):
+        lowered_for(forward, (query, key, key), "sm80")
+
 @pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT],
                          ids=["plain", "output", "split"])
 def test_a_forward_at_its_own_config_compiles_within_an_a100s_block(kept):
