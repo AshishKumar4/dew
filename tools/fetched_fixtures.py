@@ -312,9 +312,8 @@ def fetch(root: Path = REPO_ROOT) -> None:
             from huggingface_hub import hf_hub_download
 
             kind = ORIGINS[pin.get("origin", "store")]
-            downloaded = Path(hf_hub_download(pin["repo"], pin["path"], repo_type=kind,
-                                              revision=pin["revision"]))
-            data = _checked(downloaded.read_bytes(), pin, name)
+            cached = Path(hf_hub_download(pin["repo"], pin["path"], repo_type=kind, revision=pin["revision"]))
+            data = _checked(cached.read_bytes(), pin, name)
         stored.parent.mkdir(parents=True, exist_ok=True)
         partial = stored.with_name(f".{stored.name}.partial")
         partial.write_bytes(data)
