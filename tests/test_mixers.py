@@ -553,19 +553,17 @@ def test_a_mamba2_of_a_stated_dtype_projects_its_scan_in_it():
                                   np.asarray(layer.apply(variables, x.astype(jnp.float32))))
 
 
-RECURRENT = ("gated_delta_net", "kimi_delta_attention", "lightning_attention", "mamba2", "mamba3")
-"""The registered recurrent kinds whose scan output their references cast back to the input's dtype, each
-beside attention in a hybrid."""
+RECURRENT = ("gated_delta_net", "kimi_delta_attention", "lightning_attention", "mamba", "mamba2", "mamba3")
+"""The registered recurrent kinds, each beside attention in a hybrid."""
 
 
 @pytest.mark.parametrize("kind", RECURRENT)
 def test_a_hybrid_of_no_compute_dtype_over_bfloat16_weights_decodes(kind):
     """A hybrid of a recurrent kind beside full attention, computing in no dtype of its own over bfloat16
-    weights, decodes: each recurrent layer's scan output is read back in its input's dtype where its
-    reference casts it (`dew.nn.linear.in_input_dtype`), so the stream stays the weights' dtype and the
-    attention layer's keys come to its cache in the dtype the cache states, where a gated delta net's,
-    Kimi's or lightning's fp32 scan widened the stream and the keys were refused by the leaf's name (row
-    6935)."""
+    weights, decodes: the stream stays the weights' dtype, each recurrent layer's scan output read back
+    in its input's dtype where its reference casts it (`dew.nn.linear.in_input_dtype`), so the attention
+    layer's keys come to its cache in the dtype the cache states, where a gated delta net's, Kimi's or
+    lightning's fp32 scan widened the stream and the keys were refused by the leaf's name (row 6935)."""
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
     model = tiny(max_seq_len=32, num_layers=2, layer_types=("recurrent", "full_attention"),
                  kinds={"recurrent": {"mixer": {"class": kind, "fields": fields}}},
