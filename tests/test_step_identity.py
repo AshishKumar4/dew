@@ -441,6 +441,11 @@ class Piped:
         attrs.Converter(lambda value: value * {pipe})))
 
 
+@attrs.define(frozen=True)
+class Holder:
+    count: int = 1
+
+
 @attrs.define
 class Unset:
     late: int = attrs.field(init=False)
@@ -458,7 +463,7 @@ class Keyed:
 
 @dataclasses.dataclass(frozen=True)
 class Shifting:
-    ranged: object = Ranged()
+    held: object = Holder()
 
     def __call__(self, row):
         hooked, classhooked = Hooked(), ClassHooked()
@@ -467,7 +472,7 @@ class Shifting:
                  + Plain.by * Plain.scale + Ranged().span + Ranged().marks[0] + Ranged().scaled
                  + hooked.scaled + int(Keyed(1) == Keyed(3)) + int(Keyed(1) < Keyed(3)) + Keyed(1).checked
                  + classhooked.scaled + int(Flagged(1) == Flagged(3)) + int(HELD is not None)
-                 + Piped().value + self.ranged.span)
+                 + Piped().value + self.held.count)
         return {{**row, "id": row["id"] + total}}
 """
 """A class step of the user's file building classes generators made, each with a default or a factory its
