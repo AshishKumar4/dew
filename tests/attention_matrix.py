@@ -11,7 +11,9 @@ launches at the derivation's where it takes two, else (a call whose derivation t
 deterministic mode's) at the dK/dV launch on the layout whose consumers feed their rings (`FED`).
 """
 
+import concurrent.futures
 import functools
+import multiprocessing
 
 import jax
 import jax.numpy as jnp
@@ -130,18 +132,40 @@ def _backward_op(case: dict[str, str]):
     return op, op.bind(*args, interpret=False), generation.gpu_target()
 
 
+_ROUTE_WORKERS: dict[str, concurrent.futures.ProcessPoolExecutor] = {}
+"""A CPU census certifies each architecture in its own process, as the compile gates do."""
+
+
 @functools.cache
 def _route(call: tuple[tuple[str, str], ...]):
+    """The certified route, keeping different CUDA architectures in separate CPU workers."""
+    if jax.default_backend() != "cpu":
+        return _certified_route(call)
+    name = dict(call)["generation"]
+    if name not in _ROUTE_WORKERS:
+        _ROUTE_WORKERS[name] = concurrent.futures.ProcessPoolExecutor(
+            max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+    return _ROUTE_WORKERS[name].submit(_certified_route, call).result()
+
+
+def _certified_route(call: tuple[tuple[str, str], ...]):
     """What the Mosaic backward does with a call (`case` but its launch): whether it declines it, and else the
     config it derives and the two launches' pin (`FED`) where that is legal, under the call's generation."""
     case = dict(call)
-    with generation.assumed(case["generation"]):
+    from dew.nn.kernels.templates import report
+
+    with (generation.assumed(case["generation"]),
+          report.certifying(generation.compile_only_gpus(case["generation"])[0])):
         op, ba, target = _backward_op(case)
         if op.declined(ba, target) is not None:
             return True, None, None
+        config = op.taken(ba)
+        if config is None:
+            return True, None, None
         two = attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2 if case["width"] == "256" else 1,
                                              family=WGMMA, **FED)
-        return False, op.derived(ba, target), two if op.legal(ba, two, target) else None
+        two = two if op.legal(ba, two, target) and report.certified(op, ba, two) == () else None
+        return False, config, two
 
 
 def pin_of(case: dict[str, str]) -> attention_mosaic.BackwardTiles | None:
