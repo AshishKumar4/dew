@@ -780,8 +780,8 @@ def test_a_step_rejected_for_its_update_steps_its_optimizer_by_the_zero_gradient
     gradient of 1e10, within the magnitude bound, forms an update past float32, and the step is rejected,
     its weight as it was, and its momentum the zero gradient's, zero, not the rejected gradient's 1e10
     (training.md, a step that is not finite); the next step, over a gradient of 1e-32, is taken, its momentum
-    that gradient's alone. The rejected step stored the momentum its gradient formed, so every later update
-    was formed past float32 again until it decayed (Main, theme-15's P0)."""
+    that gradient's alone, as a run's that began there. The rejected step stored the momentum its gradient
+    formed, so every later update was formed past float32 again until it decayed (Main, theme-15's P0)."""
     (first, first_finite, first_state), (second, second_finite, second_state) = _configured_steps(
         optax.sgd(learning_rate=1e30, momentum=0.9), [1e10, 1e-32], states=True)
 
@@ -793,7 +793,9 @@ def test_a_step_rejected_for_its_update_steps_its_optimizer_by_the_zero_gradient
 
     assert not first_finite and np.all(first == 0) and np.all(momentum(first_state) == 0)
     assert second_finite and np.all(np.isfinite(second)) and np.all(second < 0)
-    assert np.all(np.abs(momentum(second_state)) < 1e-31)
+    # The momentum a run that began at the second step holds after it: the rejected step left none.
+    (_, _, alone), = _configured_steps(optax.sgd(learning_rate=1e30, momentum=0.9), [1e-32], states=True)
+    np.testing.assert_array_equal(momentum(second_state), momentum(alone))
 
 
 def test_an_update_its_bound_cannot_cover_is_skipped_only_where_it_is_not_finite():
