@@ -29,6 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.derivatives import Surrogate, contracted, declared_derivative, with_gradients_formed
+from dew.nn.finite import all_finite, zeroed_unless
 from dew.nn.programs import holes
 
 type Tree = Mapping[str, object]
@@ -69,6 +70,10 @@ _PLAN: contextvars.ContextVar[InBackward | None] = contextvars.ContextVar("dew_i
 _GATE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_in_backward_gate", default=None)
 _FINITE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_in_backward_finite",
                                                                           default=None)
+_LATCH: contextvars.ContextVar[list[jax.Array] | None] = contextvars.ContextVar("dew_in_backward_latch",
+                                                                                default=None)
+"""The walk's latch across a step's runs (`gated`): whether a layer the backward reached in an earlier run,
+in walk order, was held, which holds every layer of the runs walked after it."""
 
 
 @contextlib.contextmanager
@@ -87,13 +92,15 @@ def gated(due: jax.Array, finite: jax.Array | None = None) -> Iterator[None]:
     as it was elsewhere: whether the step commits, known once its forward is. Given `finite`, whether the
     step's loss is finite, a layer whose loss or own gradient is not takes the update of a zero gradient:
     its weights as they were, its optimizer one step on (training.md, a step that is not finite), as every
-    layer of a step with no loss scale that is not finite does; a layer the walk reached before is moved."""
-    tokens = _GATE.set(due), _FINITE.set(finite)
+    layer of a step with no loss scale that is not finite does; a layer the walk reached before is moved.
+    Once a layer is held, every layer after it in walk order is, across the step's runs (`_LATCH`)."""
+    tokens = _GATE.set(due), _FINITE.set(finite), _LATCH.set([])
     try:
         yield
     finally:
         _GATE.reset(tokens[0])
         _FINITE.reset(tokens[1])
+        _LATCH.reset(tokens[2])
 
 
 PERIOD_NORMS = "layers_0"
@@ -164,28 +171,34 @@ def _norms(gradient) -> tuple[jax.Array, jax.Array]:
     return squares, jnp.sum(jnp.stack([jnp.sum(~jnp.isfinite(leaf)) for leaf in leaves])).astype(jnp.float32)
 
 
+def _latched() -> jax.Array:
+    """Whether a run walked before this one in the step's backward held a layer (`_LATCH`), which holds
+    every layer this one walks: the latch a run's walk starts from."""
+    latch = _LATCH.get()
+    return latch[-1] if latch else jnp.asarray(a=False)
+
+
+def _latch(tripped: jax.Array) -> None:
+    """Leave this run's latch, `tripped`, to the runs the walk takes after it (`_latched`)."""
+    if (latch := _LATCH.get()) is not None:
+        latch.append(tripped)
+
+
 def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments, bad: jax.Array):
     """One layer's update in a step that may not be finite (`gated`): where `ok` (the loss and the layer's
     gradient finite) by its gradient, else by a zero gradient, its weights kept as they were. Finite inputs
     can still form a value that is not finite (a moment past its dtype): a layer whose candidate weights or
     moments are not takes the zero gradient's update too, formed only then, and counts not finite (`bad`), so
     the step does. The layer's moved weights, moments and non-finite count, and whether it was written."""
-    gradient = jax.tree.map(lambda leaf: jnp.where(ok, leaf, jnp.zeros_like(leaf)), gradient)
+    gradient = zeroed_unless(ok, gradient)
     moved, moved_moments = update(gradient, held, moments)
-    formed = _finite((moved, moved_moments))
+    formed = all_finite((moved, moved_moments))
     zero = jax.tree.map(jnp.zeros_like, gradient)
     moved_moments = jax.lax.cond(ok & ~formed, lambda: update(zero, held, moments)[1],
                                  lambda: moved_moments)
     written = ok & formed
     moved = jax.tree.map(lambda new, old: jnp.where(written, new, old), moved, held)
     return moved, moved_moments, bad + (ok & ~formed).astype(bad.dtype), written
-
-
-def _finite(tree) -> jax.Array:
-    """Whether every inexact leaf of `tree` is finite throughout."""
-    flags = [jnp.isfinite(leaf).all() for leaf in jax.tree.leaves(tree)
-             if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)]
-    return jnp.logical_and.reduce(jnp.stack(flags)) if flags else jnp.asarray(a=True)
 
 
 def _pulled(back: Callable, dx):
@@ -283,7 +296,6 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
             if finite is None:
                 moved, moved_moments = current.update(path, index, gradient, held, held_moments)
             else:
-                # Once a layer the walk reached is held, every layer after it is too (`tripped`).
                 moved, moved_moments, bad, written = _gated_layer(
                     functools.partial(current.update, path, index), finite & (bad == 0) & ~tripped,
                     gradient, held, held_moments, bad)
@@ -299,9 +311,10 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
 
         start = (cotangent, masters if narrow else weights, moments, jnp.zeros((count,), jnp.float32),
                  jnp.zeros((count,), jnp.float32), tuple(jnp.zeros_like(leaf) for leaf in flowing(shared)),
-                 jnp.asarray(a=False))
-        (dx, moved, moments, sumsq, nonfinite, dshared, _), _ = jax.lax.scan(body, start, jnp.arange(count),
-                                                                            reverse=True)
+                 _latched())
+        (dx, moved, moments, sumsq, nonfinite, dshared, tripped), _ = jax.lax.scan(
+            body, start, jnp.arange(count), reverse=True)
+        _latch(tripped)
         written_norms = {"sumsq": sumsq.astype(norms["sumsq"].dtype),
                          "nonfinite": nonfinite.astype(norms["nonfinite"].dtype)}
         # The copies' cotangent is nothing the step reads (`Transaction.split_planned` takes the masters').

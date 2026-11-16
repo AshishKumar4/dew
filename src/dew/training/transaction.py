@@ -35,6 +35,7 @@ from dew.data.dataset import rows_of
 from dew.gauss_newton import solves_equations
 from dew.held_updates import holds_back, holds_state, input_taken, refuse_untold, update_applied
 from dew.nn import in_backward
+from dew.nn.finite import all_finite, leaf_finite, zeroed_unless
 from dew.nn.inspection import (
     PROBES,
     Watched,
@@ -159,16 +160,6 @@ def dropped_window(state):
         return state
     microstep, window = window_dropped(state.microstep, state.accumulation)
     return dataclasses.replace(state, microstep=microstep, accumulation=window)
-
-
-def _gated(finite: jax.Array, tree):
-    """`tree` where the step is `finite`, its every floating leaf zero otherwise: an elementwise select
-    against a constant, which the computation reading it fuses, so no second copy of the tree is held."""
-    def gate(leaf):
-        if not isinstance(leaf, jax.Array) or not jnp.issubdtype(leaf.dtype, jnp.inexact):
-            return leaf
-        return jnp.where(finite, leaf, jnp.zeros((), leaf.dtype))
-    return jax.tree.map(gate, tree)
 
 
 def window_dropped(microstep: jax.Array, acc: Accumulation) -> tuple[jax.Array, Accumulation]:
@@ -585,26 +576,13 @@ def _numerical(opt_state: optax.OptState) -> optax.OptState:
     return jax.tree.map(numerical, opt_state, is_leaf=lambda node: isinstance(node, INJECTED))
 
 
-def _finite(leaf: jax.Array) -> jax.Array:
-    """Whether `leaf` is finite throughout."""
-    return jnp.isfinite(leaf).all()
-
-
-def _all_finite(tree) -> jax.Array:
-    """Whether every leaf of `tree` is finite (`_finite`), within a traced program."""
-    finite = jnp.asarray(a=True)
-    for leaf in jax.tree.leaves(tree):
-        finite = finite & _finite(leaf)
-    return finite
-
-
 def _finite_each(leaves: list[jax.Array]) -> list[jax.Array]:
     """Whether each of `leaves` is finite throughout, one program over them."""
-    return [_finite(leaf) for leaf in leaves]
+    return [leaf_finite(leaf) for leaf in leaves]
 
 
 def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
-    """Whether each of `leaves`, arrays placed anywhere, is finite throughout (`_finite`), read outside a
+    """Whether each of `leaves`, arrays placed anywhere, is finite throughout (`leaf_finite`), read outside a
     step: one program for each placement the leaves share (their devices and memory kind), as no one
     program spans two meshes (a CPU-owned run's host companion and its accelerator); a leaf in host memory
     (a layout's pinned-host field) brought to its devices' memory one leaf at a time (`fetched`)."""
@@ -617,7 +595,7 @@ def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
         if memory not in (None, "device"):
             for index in members:
                 leaf = leaves[index]
-                flags[index] = bool(program(_finite)(fetched(leaf, leaf.sharding)))
+                flags[index] = bool(program(leaf_finite)(fetched(leaf, leaf.sharding)))
             continue
         read = jax.device_get(program(_finite_each)([leaves[index] for index in members]))
         for index, finite in zip(members, read, strict=True):
@@ -950,7 +928,7 @@ class Transaction:
         due = (fill + 1) == self.size
         if closing is not None:
             due = due | closing
-        local_finite = _all_finite((loss, stats, gradient, aux.variables, aux.effects))
+        local_finite = all_finite((loss, stats, gradient, aux.variables, aux.effects))
         local_ok = jnp.asarray(a=True) if state.scale is None else local_finite
         qk = compact_qk(aux.qk_stats)
         effects = tuple(jax.tree.leaves(aux.effects))
@@ -1110,7 +1088,7 @@ class Transaction:
         # commit gathered every parameter and moment back each step (row 3697).
         gradient = gradient if self.placed is None else placed_as(gradient, self.placed)
         native = jax.tree.map(_descending, gradient, current.variables["params"])
-        native_finite = _all_finite(native)
+        native_finite = all_finite(native)
         norm = optax.global_norm(native)
         norm = norm.astype(at_least_fp32(norm.dtype))
         if applied is not None:
@@ -1127,11 +1105,11 @@ class Transaction:
         # and close it, where the step's rejection keeps the inputs it holds.
         gated = current.scale is None and not holds_back(current.opt_state)
         if gated:
-            native_finite = native_finite & _all_finite((qk, statistics, effects))
+            native_finite = native_finite & all_finite((qk, statistics, effects))
             # The attempt's own finiteness (its loss, its collections, its microbatch), as its acceptance
             # reads it (`finish_attempt`): one gate for every write.
             native_finite = native_finite if attempted is None else native_finite & attempted
-            native, qk, statistics, effects = (_gated(native_finite, value)
+            native, qk, statistics, effects = (zeroed_unless(native_finite, value)
                                                for value in (native, qk, statistics, effects))
 
         def apply(current):
@@ -1141,7 +1119,7 @@ class Transaction:
             update, opt_state = optimizer_update(
                 self.optimizer, native, current.opt_state, stored, qk=qk, statistics=statistics,
                 progress=None if self.bound is None else self.progress(current))
-            update = _gated(native_finite, update) if gated else update
+            update = zeroed_unless(native_finite, update) if gated else update
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
             # rescale, a bounded group's clamp) acts on them (`stepped`).
             params = {**current.variables, "params": stepped(stored, update, current.opt_state, opt_state,
@@ -1262,7 +1240,7 @@ class Transaction:
         """
         scale, previous = state.scale, state.accumulation
         effects, qk, loss = pending.effects, pending.qk, pending.loss
-        finite = pending.local_finite & _all_finite((loss, gradient, effects, qk, aux.variables))
+        finite = pending.local_finite & all_finite((loss, gradient, effects, qk, aux.variables))
         # A step with no loss scale is gated in its commit (`commit`), but one whose optimizer holds updates
         # back is rejected whole, its optimizer state kept, as a scaled step's is.
         holding = holds_back(state.opt_state)
@@ -1276,7 +1254,7 @@ class Transaction:
         # attempt's loss and its collections. A microbatch's own gradient (`local_finite`) is in the pooled
         # one; read here, its reduction would hold the window's step back (a tenth more of a split step's
         # need in test_plan's tight start).
-        attempted = _all_finite((loss, aux.variables))
+        attempted = all_finite((loss, aux.variables))
 
         def commit(current):
             return self.commit(current, gradient, effects, qk, pending.pooled, pending.applied, attempted)
@@ -1313,7 +1291,7 @@ class Transaction:
         if scale is None and not holding:
             numerical = _collections_kept(finite, numerical, state, aux.variables)
         if scale is not None:
-            accepted = finite & _all_finite(checked(numerical))
+            accepted = finite & all_finite(checked(numerical))
         elif holding:
             accepted = finite
         if previous is not None:

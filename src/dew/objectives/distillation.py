@@ -46,7 +46,7 @@ from dew.batch import Batch, Variables, without
 from dew.nn import categorical
 from dew.nn.kernels.options import Held
 from dew.nn.precision import accumulated, at_least_fp32
-from dew.nn.protocols import Bounded
+from dew.nn.protocols import StatesVocabulary
 from dew.objectives.base import (
     OMITTED,
     TEACHER,
@@ -164,9 +164,9 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         if tokenizers is not None:
             _refuse_other_tokenizers(*tokenizers)
         # The selected term holds no logits whose widths the step compares, so the models' declared
-        # vocabularies are (`Bounded`).
+        # vocabularies are (`StatesVocabulary`).
         models = (student.model, teacher.model)
-        if divergence == "selected" and all(isinstance(model, Bounded) for model in models) and (
+        if divergence == "selected" and all(isinstance(model, StatesVocabulary) for model in models) and (
                 models[0].vocab_size != models[1].vocab_size):
             raise ValueError(f"the selected term reads one id's likelihood on both sides, so the teacher and "
                              f"the student share a vocabulary; the student scores {models[0].vocab_size} ids "
@@ -436,6 +436,6 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         return self.student.preview(self.student_variables(params), batch, self._student_step(step),
                                     scored=scored)
 
-    def build_task(self, variables: Variables, *, processor: Processor | None | Omitted = OMITTED):
+    def build_task(self, variables: Variables, *, processor: Processor | Omitted | None = OMITTED):
         """Return the student's task, without the teacher."""
         return self.student.build_task(self.student_variables(variables), processor=processor)

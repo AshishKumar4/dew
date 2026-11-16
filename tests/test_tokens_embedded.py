@@ -63,7 +63,7 @@ def test_an_lm_run_whose_rows_hold_an_id_outside_its_models_table_is_refused_at_
 
 def test_a_model_that_states_its_vocabulary_and_no_cache_bounds_its_runs_ids():
     """A model that states its vocabulary and no cache's capacity (no `max_seq_len`) bounds the ids a run
-    reads by it all the same (`dew.nn.protocols.Vocabulary`): a run of rows past its table is refused at
+    reads by it all the same (`dew.nn.protocols.StatesVocabulary`): a run of rows past its table is refused at
     the batch that holds one. Its run's first step made its parameters NaN, and main saved them (row
     6758: a chain's SFT stage over a tokenizer of more ids than its model's table)."""
     from rl_support import TinyHead

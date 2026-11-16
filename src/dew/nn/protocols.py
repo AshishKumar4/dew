@@ -1127,7 +1127,7 @@ class PositionCapacity(Protocol):
 
 
 @runtime_checkable
-class Vocabulary(Protocol):
+class StatesVocabulary(Protocol):
     """A model that declares its vocabulary, the rows of the table its token ids index, which the host
     checks read to refuse an id outside it (`dew.nn.blocks.token_table`), whether or not it declares a
     cache's capacity (`Bounded`)."""
@@ -1137,7 +1137,7 @@ class Vocabulary(Protocol):
 
 
 @runtime_checkable
-class Bounded(Vocabulary, Protocol):
+class Bounded(StatesVocabulary, Protocol):
     """A model that declares its vocabulary and cache capacity, which the host
     checks read to refuse an id outside the vocabulary or a request that would
     overflow the cache; a model that declares neither is checked for neither."""
