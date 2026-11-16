@@ -1127,9 +1127,10 @@ print(json.dumps(runs))
 def test_a_run_resumed_at_another_rate_steps_at_it_on_the_compiled_step(tmp_path, grouped):
     """A run trained at one peak rate, resumed from its checkpoint at a
     second and then a third: each resumed step moves the parameters by its
-    configured rate, not the checkpoint's, and the third compiles nothing:
-    the rate is an operand of the optimizer's state, so the step it runs is
-    the executable the persistent cache holds. The second resume pays for the
+    configured rate, not the checkpoint's, and the third compiles and reads
+    back nothing: the rate is an operand of the optimizer's state, so the
+    step it runs is the executable the process holds from the second's
+    (`dew.nn.kernels.options.hold`). The second resume pays for the
     restore's own programs, which the first run never compiled. In a fresh
     process, with a cache of its own."""
     root = Path(__file__).resolve().parents[1]
@@ -1139,7 +1140,7 @@ def test_a_run_resumed_at_another_rate_steps_at_it_on_the_compiled_step(tmp_path
         env=environment, capture_output=True, text=True, timeout=600)
     assert done.returncode == 0, done.stderr[-3000:]
     runs = json.loads(done.stdout.splitlines()[-1])
-    assert runs["fast"]["misses"] == 0 and runs["fast"]["hits"] >= 1
+    assert (runs["fast"]["misses"], runs["fast"]["hits"]) == (0, 0)
     for start, slow, fast in zip(*(runs[name]["params"] for name in ("first", "slow", "fast")), strict=True):
         start, slow, fast = (np.asarray(leaf, np.float32) for leaf in (start, slow, fast))
         assert np.all(slow != start)

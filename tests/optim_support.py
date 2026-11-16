@@ -1,10 +1,13 @@
 """What the optimizer tests share: the learning rate they build at, the small decoder whose parameter
-tree they step, the axes its modules draw it in, its tree drawn afresh for a seed, and a float64 truth's
-numerics (`in_float64`)."""
+tree they step, the axes its modules draw it in, its tree drawn afresh for a seed, a float64 truth's
+numerics (`in_float64`), and an optimizer whose state is a class its factory makes (`counting`)."""
+
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from optax.contrib import _muon
 
 from dew.batch import unboxed
@@ -22,6 +25,19 @@ FLOAT64 = Numerics(dtypes=Dtypes(params="float64", compute="float64", output="fl
 WIDE_MOMENTS = {"mu_dtype": None, "nu_dtype": None}
 """An optimizer's `optimizer_opts` keeping its moments in its parameters' dtype, a float64 truth's, where
 `OptimConfig.state_dtype`'s float32 holds them in float32 whatever the parameters'."""
+
+
+def counting(rate: float) -> optax.GradientTransformation:
+    """Plain descent at `rate` counting its steps in a state of a class this factory makes at each call, as
+    an optax-style factory may: a node no process names, which no file of programs states."""
+    class Counted(NamedTuple):
+        steps: jax.Array
+
+    def update(updates, state, params=None):
+        del params
+        return jax.tree.map(lambda update: -rate * update, updates), Counted(state.steps + 1)
+
+    return optax.GradientTransformation(lambda params: Counted(jnp.zeros((), jnp.int32)), update)
 
 
 def in_float64(fn):
