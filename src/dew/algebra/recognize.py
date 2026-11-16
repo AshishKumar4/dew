@@ -220,12 +220,22 @@ def _digest(value) -> Hashable:
 def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Candidate],
             accurate: bool) -> int | None:
     """The first of one region's candidates whose call takes a kernel and which the e-graph proves equal to
-    the region (`_equalities`, of the taken ones alone), its place among `members`; None where none is."""
-    taken = [number for number, candidate in enumerate(members) if candidate.taken()]
-    # Each alone first, where its results are its declaration's own values; the e-graph only where none is.
-    for number in taken:
-        if _equalities(index, [(members[number], places)], accurate, saturating=False)[0]:
+    the region (`_equalities`, of the taken ones alone), its place among `members`; None where none is.
+    Each in order, whether its call takes a kernel asked as it is reached (`Candidate.taken` traces the
+    kernel's call: an attention's 48 candidates over 2,048 keys, each asked before any was compared, 17.8 s
+    of one region's recognition, row 6799), and one that does compared alone, where its results are its
+    declaration's own values; the e-graph only where none is, over every candidate that takes one."""
+    asked: dict[int, bool] = {}
+
+    def takes(number: int) -> bool:
+        if number not in asked:
+            asked[number] = members[number].taken()
+        return asked[number]
+
+    for number, candidate in enumerate(members):
+        if takes(number) and _equalities(index, [(candidate, places)], accurate, saturating=False)[0]:
             return number
+    taken = [number for number in range(len(members)) if takes(number)]
     if not taken:
         return None
     equal = _equalities(index, [(members[number], places) for number in taken], accurate)
@@ -912,14 +922,19 @@ def _band(mask: np.ndarray) -> int | None:
     leading index: key `j` kept for query `i` exactly where `0 <= i - j < w`; None where it keeps another
     pattern, or every key at or before its query (plain causality)."""
     queries, keys = mask.shape[-2:]
+    # One plane for every leading index, or no band (`terms.compact`: the mask the same along each leading
+    # axis), so the band's distances read one plane, never a batch's and heads' copies (a 2048-token causal
+    # mask over a step's heads, 0.73 s a call, row 6799).
+    if terms.compact(mask).shape[:-2] != (1,) * (mask.ndim - 2):
+        return None
+    plane = mask[(0,) * (mask.ndim - 2)]
     distance = np.arange(queries)[:, None] - np.arange(keys)[None, :]
     # The one width a band of these entries can have, one past the farthest key any query keeps, held to
-    # the whole mask once (each width from 1 compared with it cost a square mask its keys' count again).
-    width = int(np.max(np.where(mask, distance, 0), initial=0)) + 1
+    # the plane once (each width from 1 compared with it cost a square mask its keys' count again).
+    width = int(np.max(np.where(plane, distance, 0), initial=0)) + 1
     if not 1 <= width < keys:
         return None
-    band = np.broadcast_to((distance >= 0) & (distance < width), mask.shape)
-    return width if np.array_equal(band, mask) else None
+    return width if np.array_equal((distance >= 0) & (distance < width), plane) else None
 
 
 KEPT = frozenset({"xla", "reference"})

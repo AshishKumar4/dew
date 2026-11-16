@@ -1366,9 +1366,34 @@ def _literals[Node: (Term, Skeleton)](forms: type[Node], literals: list, shapes:
 def literal_key(atom: jcore.Literal) -> Hashable:
     """A literal's identity in a region: its dtype, shape and bits, so two literals are one term where they
     are the same constant, and never where they round apart. Its weak type is no part of it: an equation's
-    types are settled where it is traced, so a weak and a strong literal of one dtype compute alike."""
+    types are settled where it is traced, so a weak and a strong literal of one dtype compute alike. A
+    constant held as a broadcast (`normal_form.compact`: the recognition's folded masks and fills) is read
+    by its values once, with the axes it is broadcast along, never its every entry's bytes."""
     dtype, array = held_bits(atom.val)
-    return dtype, array.shape, array.tobytes()
+    held = compact(array)
+    return dtype, array.shape, held.shape, np.ascontiguousarray(held).tobytes()
+
+
+def compact(value: np.ndarray) -> np.ndarray:
+    """`value` with each axis along which every entry holds the same bits one element long: the values it
+    holds, each once, in its rank, which with its shape is the value (a broadcast of it). One form whatever
+    holds the value, a broadcast's view or every entry written (`dew.algebra.normal_form`'s folded masks and
+    fills): what a literal is keyed by (`literal_key`) and folded arithmetic computes over. The axes a view
+    repeats are read off its strides; every other is compared, bit for bit, over what is left."""
+    value = np.asarray(value)
+
+    def first(held: np.ndarray, axis: int) -> np.ndarray:
+        return held[(slice(None),) * axis + (slice(0, 1),)]
+
+    for axis, (stride, size) in enumerate(zip(value.strides, value.shape, strict=True)):
+        if stride == 0 and size > 1:
+            value = first(value, axis)
+    for axis, size in enumerate(value.shape):
+        if size > 1:
+            bits = np.ascontiguousarray(value).view(f"V{value.dtype.itemsize}")
+            if bool(np.all(bits == first(bits, axis))):
+                value = first(value, axis)
+    return value
 
 
 def typed_key(value) -> bool:

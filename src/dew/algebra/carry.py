@@ -138,7 +138,8 @@ def _carried():
 
 CARRYING = _carrying()
 CARRIED = rules.armed(rules.Rules("carried", "reorders", _carried(), receipt="docs/design/algebra.md §6.9; "
-                                  "tests/test_algebra_scan.py"))
+                                  "tests/test_algebra_scan.py; measurement M-DC-4 (the recurrence flows with "
+                                  "it and without, pending: row 6106)"))
 """The split's rules, never among the engine's sets (`rules.admitted`), which a receipt's arm may leave out
 (`rules.ARMS`): the split then extracts its traced forms."""
 
@@ -228,12 +229,16 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     began, sized = time.perf_counter(), program.node_count(graph)
     admitted = (CARRIED,) if rules.admits(CARRIED) else ()
     saturated = program.saturate(graph, region, admitted, saturation, facts)
-    kernel_report.record_rewrite(program.reported(graph, sized, saturated, began))
     schedule = cost.fused(cost.target())
     # The extractor oracle where it is on (`Passes.checked`), as every derivation's (`derive._derived`).
     checked = ALGEBRA.value.checked
-    carry_forms, _ = program.extracted(graph, sequential, _carry_priced(region, schedule), checked=checked)
+    carry_forms, carried_price = program.extracted(graph, sequential, _carry_priced(region, schedule),
+                                                   checked=checked)
     emit_forms, _ = program.extracted(graph, others, cost.model(region, schedule), checked=checked)
+    # Recorded with its carry's price, its extraction's (each value it shares once): the work that reads the
+    # state in sequence and the rest, a chunk's; the emitted outputs, extracted apart, are none of it.
+    after = carried_price.sequential.value + carried_price.parallel.value
+    kernel_report.record_rewrite(program.reported(graph, sized, saturated, began, after))
     prepared = list({terms.key(term): term for form in (*carry_forms, *emit_forms)
                      for term in _free(form, reading)}.values())
     # Each prepared value's products named by the forms that read it: an emitted output's a local readout's,
