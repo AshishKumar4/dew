@@ -614,7 +614,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             atom = (config.block_k, swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES))
             tiles = [((config.block_k, config.block_m // config.warpgroups), dtype)] + [(atom, dtype)] * 3
             rewritten = family.scalar_registers(tiles) - family.scalar_registers()
-            staged = max(0, words - family.held_registers) + rewritten
+            staged = max(0, words - family.scalar_registers()) + rewritten
         prologue = self._prologue_registers(ba, config)
         prologue += rewritten if prologue else 0
         # A dense call's last wave balanced over the programs merges a slice of another program's partial at a
@@ -691,7 +691,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             widest = max(jnp.dtype(dtype).itemsize for dtype in stored)
             staging = -(-share * chunk * widest // (4 * resources.THREADS)) + resources.CONTROL_REGISTERS
         if hooks.epilogue is None:
-            return max(0, staging - family.held_registers)
+            return max(0, staging - family.scalar_registers())
         # Column vectors beside the accumulator, in its column layout (`Family.column_registers`), and a
         # paired product's combination of its two accumulators, which holds a row of its results, one fp32
         # column vector's worth (its SwiGLU spilled 32 bytes at 128 x 192 at 232, PAIRED-9, and fit 224 at
@@ -708,7 +708,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         held = sum(-(-accumulator * jnp.dtype(dtype).itemsize // 4)
                    for dtype in (hooks.out_dtypes or ())[:-1])
         stage = max(staging, resources.CONTROL_REGISTERS) + vectors
-        return max(0, stage - family.held_registers) + tiles + held
+        return max(0, stage - family.scalar_registers()) + tiles + held
 
     def register_budget(self, config: mosaic_gpu.Tiles) -> int:
         # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`); none on a

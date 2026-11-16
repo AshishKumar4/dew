@@ -2041,11 +2041,10 @@ def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, valu
     hook's parameters beside its pullback (`held`) and its products' fragments where they read registers."""
     block_q, block_k = config.block_q, config.block_k
     logits = (block_q, block_k, jnp.float32)
-    # dQ's anchor select priced as its SASS holds it (`_anchor_registers`), within the family's held
-    # scalars where they are a measured whole (`Family.scalars_whole`); its hook's parameters and
+    # dQ's anchor select priced as its SASS holds it (`_anchor_registers`); its hook's parameters and
     # gradients beside its pullback, not its products: they stream in and out of its entries (dQ under
     # a tile bias at 64 x 64, width 128: S's and dP's accumulators the only float tiles at its peak).
-    anchor = _anchor_registers(family, block_q, block_k) if not family.scalars_whole else 0
+    anchor = _anchor_registers(family, block_q, block_k)
     products = products[:2]
     pullback = products[1:] + [(block_q, block_k, jnp.float32)] * slopes + held
     carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
