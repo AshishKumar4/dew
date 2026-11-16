@@ -313,7 +313,8 @@ class AttentionTerms:
             heads, width = queries.shape[2:]
             dout = jnp.einsum("bsf,hdf->bshd", cotangents[path], kernel.reshape(heads, width, -1))
             _, query_terms, key_terms, value_terms = attention_terms(queries, keys, values, dout, keep)
-            carried[place] = {name: (np.asarray(into, np.float64), terms) for name, into, terms in (
+            # `into` stays on the device: `with_attention_terms` widens it there, at float64 under x64.
+            carried[place] = {name: (into, terms) for name, into, terms in (
                 (query_name, into_queries, query_terms), (key_name, into_keys, key_terms),
                 (value_name, into_keys, value_terms))}
         return carried
