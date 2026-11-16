@@ -14,6 +14,7 @@ import contextvars
 import dataclasses
 import functools
 import hashlib
+import json
 import threading
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
@@ -180,9 +181,19 @@ def program_digest(lowered: jax.stages.Lowered) -> str:
     arguments' types: two lowerings of one program agree, whichever devices of one target they were
     lowered over, and two whose texts agree only as JAX prunes an argument neither reads, which their
     executables take in other trees, do not (a step's commit with its sample's summaries and without)."""
+    # Its trees node by node, each node's data by value as an identity states it (`dew._stated.stated`), never
+    # as JAX prints them, which holds a node's data by its printed form: a checkified program's error tree
+    # holds a traceback printed by its address, another in every process. A handed executable gives its
+    # results in its own output tree, so a node's data that labels its leaves (a key of no plain form) is
+    # part of the program.
+    from dew._stated import stated
+
     types = jax.tree.map(lambda aval: (aval.shape, str(aval.dtype), aval.weak_type), lowered.in_avals)
-    called = f"{lowered.in_tree}\n{lowered.out_tree}\n{types}"
+    trees = json.dumps([stated(lowered.in_tree, "a program's arguments' tree"),
+                        stated(lowered.out_tree, "a program's results' tree")], sort_keys=True)
+    called = f"{trees}\n{types}"
     return hashlib.sha256(f"{lowered.as_text()}\n{called}".encode()).hexdigest()
+
 
 
 @contextlib.contextmanager

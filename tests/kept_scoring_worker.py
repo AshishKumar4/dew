@@ -46,7 +46,8 @@ elif mode == "verify":
     responses = served(server)
 else:
     with Compiles("logits") as compiles:
-        with kept(path):
+        # The identity alone trusted: the server's programs are handed with no trace or lowering.
+        with kept(path, verify=False):
             server = ScoringServer.from_task(*task.scoring())
         responses = served(server)
     found = {"programs": len(server.programs),
