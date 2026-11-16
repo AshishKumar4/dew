@@ -430,15 +430,15 @@ class Trainer(Generic[Loss, Effects]):
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
             updates=jnp.zeros((), jnp.int32),
-            # A state of its own, the given scale's leaves copied: the step donates the state.
-            scale=None if self._loss_scale is None else jax.tree.map(
-                lambda leaf: jnp.array(leaf, copy=True), self._loss_scale),
+            # A state of its own, the given scale's leaves copied by the transfer, compiling no program: the
+            # step donates the state.
+            scale=None if self._loss_scale is None else jax.tree.map(transferred_copy, self._loss_scale),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
             variables=params,
             opt_state=opt_state,
-            # The average starts equal to the parameters but as its own buffers: the step donates
-            # the state, and a buffer can be donated once.
-            ema=None if ema is None else jax.tree.map(jnp.copy, select(params, ema.select)),
+            # The average starts equal to the parameters but as its own buffers, copied by the transfer: the
+            # step donates the state, and a buffer can be donated once.
+            ema=None if ema is None else jax.tree.map(transferred_copy, select(params, ema.select)),
             key=run_key,
             consumed=None if self._shape.examples is None else jnp.zeros((), jnp.int32),
             deferred=waiting(opt_state))

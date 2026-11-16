@@ -366,8 +366,9 @@ def transferred_copy(leaf: jax.Array, target: Sharding | None = None) -> jax.Arr
     a buffer the target shares with the source, which a step's donation would free, and `jax.Array.copy`
     compiles a program for each shape and placement, so a run handed its programs compiled ahead would
     compile at its start (row 4779). Dew's JAX build copies a resharded source too (from post77; JAX's own
-    reshard path dropped the forced copy). The one copy of a held array a state takes over (`placed_held`;
-    `Trainer.initial_state`, whose arrays a step then places as it places any uncommitted one)."""
+    reshard path dropped the forced copy). The one copy a state takes of an array it does not own: a held
+    array (`placed_held`; `Trainer.initial_state`, whose arrays a step then places as it places any
+    uncommitted one), and the parameters its average starts from and the loss scale it is given."""
     return jax.device_put(leaf, target, may_alias=False)
 
 
