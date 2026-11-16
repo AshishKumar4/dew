@@ -29,7 +29,7 @@ def dots(function, *args) -> int:
     return sum(equation.primitive.name == "dot_general" for equation in equations(graph, platform="cuda"))
 
 
-JOINED_SEEDS = {("gate_up", jnp.float32, False): 8, ("gate_up", jnp.float32, True): 8,
+JOINED_SEEDS = {"recipe gates": 8, ("gate_up", jnp.float32, False): 8, ("gate_up", jnp.float32, True): 8,
                 ("gate_up", jnp.bfloat16, False): 8, ("gate_up", jnp.bfloat16, True): 8,
                 ("delta_gates", jnp.float32): 8, ("delta_gates", jnp.bfloat16): 8, "promoted bias": 8,
                 "gate multiplier": 8}
@@ -298,20 +298,36 @@ def test_a_gate_multiplier_keeps_gate_and_up_joined():
                            seeds=JOINED_SEEDS["gate multiplier"])
 
 
-def test_a_recipe_that_takes_neither_of_a_delta_nets_gates_keeps_them_joined():
-    """Under a run's low-precision recipe (each preset's: blockwise FP8, MXFP8, NVFP4), a gated delta net's b
-    and a projections, 4 wide each, hold no whole block of the recipe's, so it takes neither
-    (`projections.recipe_refusal`, the one decision `recipe_projection` reads): their row still joins them,
-    one dot fewer, as without a recipe (train 925 F3: the join decided by role alone ran them apart)."""
+@pytest.mark.parametrize("recipe", ["blockwise_fp8", "mxfp8", "nvfp4"])
+def test_a_delta_nets_gates_joined_under_a_recipe_are_as_exact_as_apart_from_float64(recipe):
+    """Under each preset's low-precision recipe, a gated delta net of Qwen3.5-0.8B's 16 value heads, its b
+    and a gates 16 wide each and 32 joined, whose row joins them: as exact as the layer with them apart,
+    output and every gradient, from float64 (check 1), every arm quantized as the gates are apart. A join
+    whose product the recipe would quantize where neither gate is (MXFP8's 32-wide blocks), or would not
+    where both are (NVFP4's 16), runs them apart (train 928 F1: joined, MXFP8 took the gates' product
+    on the GPUs whose cells join them); where the recipe takes neither and not their join (the blockwise
+    recipe's 128-wide blocks), they join, one dot fewer."""
     from dew.nn.precision import NUMERICS_PRESETS, projection_role
 
-    layer = GatedDeltaNet(emb_features=128, num_k_heads=2, num_v_heads=4, head_k_dim=32, head_v_dim=32,
+    numerics = next(each for each in NUMERICS_PRESETS.values()
+                    if each.low_precision is not None and each.low_precision.recipe == recipe)
+    layer = GatedDeltaNet(emb_features=128, num_k_heads=4, num_v_heads=16, head_k_dim=32, head_v_dim=32,
                           dtype=jnp.bfloat16)
-    params = layer.init(jax.random.key(9), jnp.zeros((2, 128, 128), jnp.bfloat16))
-    x = jnp.zeros((2, 128, 128), jnp.bfloat16)
-    for numerics in (each for each in NUMERICS_PRESETS.values() if each.low_precision is not None):
-        with generation.run_precision(numerics), projection_role("mixer"):
-            with row_joins("delta_gates", joins=False):
-                apart = dots(layer.apply, params, x)
-            with row_joins("delta_gates"):
-                assert dots(layer.apply, params, x) == apart - 1, numerics.low_precision.recipe
+    params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(23), leaf.shape),
+                          layer.init(jax.random.key(22), jnp.zeros((2, 32, 128), jnp.bfloat16)))
+    draw = drawing(params, (2, 32, 128), jnp.bfloat16)
+
+    def under(run):
+        def recipe_run(*operands):
+            with generation.run_precision(numerics), projection_role("mixer"):
+                return run(*operands)
+        return recipe_run
+
+    x = draw(0)[1]
+    with row_joins("delta_gates", joins=False):
+        apart = dots(under(layer.apply), params, x)
+    with row_joins("delta_gates"):
+        assert dots(under(layer.apply), params, x) == apart - (recipe == "blockwise_fp8")
+    assert_joined_as_exact("delta_gates", under(with_gradients(layer.apply)), draw,
+                           with_gradients(layer.clone(dtype=jnp.float64).apply),
+                           f"the delta net's gates joined under {recipe}", seeds=JOINED_SEEDS["recipe gates"])

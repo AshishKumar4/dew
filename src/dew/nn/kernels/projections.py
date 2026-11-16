@@ -59,13 +59,14 @@ def blockwise_fp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array
 
 def recipe_refusal(depth: int, width: int) -> selection.Refusal | None:
     """Why the run's low-precision recipe (`dew.nn.precision.recipe_role`) does not take a `depth` x `width`
-    projection traced in its role, None where it takes it or the run trains in none: the role keeps the
-    run's dtypes (a router's, a head's), or the widths hold no whole blocks of the recipe's. The one
-    decision `recipe_projection` and a join of projections (`dew.nn.joined.Projections.recipe`) read."""
+    projection traced in its role, None where it takes it: the run trains in none, its role keeps the run's
+    dtypes (a router's, a head's), or the widths hold no whole blocks of the recipe's. The one decision
+    `recipe_projection` and a join of projections (`recipe_takes`, `dew.nn.joined.Projections.recipe`)
+    read."""
     from dew.nn.precision import recipe_role
 
     if (held := recipe_role()) is None:
-        return None
+        return selection.Refusal("no_recipe", "the run trains in no low-precision recipe", kind="handoff")
     recipe, role = held
     block = RECIPES[recipe.recipe].block
     if role not in recipe.roles:
@@ -75,6 +76,12 @@ def recipe_refusal(depth: int, width: int) -> selection.Refusal | None:
         return selection.Refusal("block_shape", f"a {depth} x {width} projection holds no whole "
                                  f"{block}-wide blocks", kind="handoff")
     return None
+
+
+def recipe_takes(depth: int, width: int) -> bool:
+    """Whether the run's low-precision recipe takes a `depth` x `width` projection traced in its role
+    (`recipe_refusal`)."""
+    return recipe_refusal(depth, width) is None
 
 
 def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None = None, *,
@@ -90,14 +97,14 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     reported with the reason."""
     from dew.nn.precision import recipe_role
 
-    held = recipe_role()
-    if held is None:
+    held, refusal = recipe_role(), recipe_refusal(*matrix.shape[-2:])
+    if held is None or refusal is not None:
+        if held is not None:  # a run's recipe that leaves this projection: its route reported
+            generation.route(RECIPES[held[0].recipe].choice, kernel="unquantized", preferred=held[0].recipe,
+                             refusal=refusal)
         return None
     recipe = held[0]
     taken = RECIPES[recipe.recipe]
-    if (refusal := recipe_refusal(*matrix.shape[-2:])) is not None:
-        generation.route(taken.choice, kernel="unquantized", preferred=recipe.recipe, refusal=refusal)
-        return None
     edge = SCALE_DEPTH
     # Rows an Explicit axis splits, or the mesh's automatic axes alone (a data-parallel run's, row 6719):
     # each device's rows its own projection; a launch reads its operands whole.
