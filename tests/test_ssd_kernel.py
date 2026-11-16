@@ -368,22 +368,23 @@ def documents_draw(seed: int):
 
 
 def documents_on_the_kernel(x, b, c, a, given, key, value, weight):
-    """The kernel over a forked call, each document laid from a chunk's edge and taking its table slot's
-    memory up there with its entry write added (`recurrence_chunk._ported_documents`): the output and the
+    """The kernel over a forked call, its documents walked in place, each taking its table slot's memory up
+    at its first token with its entry write added (`recurrence_chunk._tpu_documents`): the output and the
     row's last memory."""
-    from dew.nn.kernels.chunked_launch import AlignedDocuments, Forked
-    from dew.nn.kernels.recurrence_chunk import _ported_documents
+    from dew.nn.kernels.chunked_launch import Forked
+    from dew.nn.kernels.recurrence_chunk import _tpu_documents
 
     loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
     forked = Forked(jnp.asarray(DOCUMENTS, jnp.int32), loads, stores, (key, value, weight), 2)
+    length = x.shape[1]
     # The table's memories as a chunk's call holds them, `[N, P]`, the SSD's transposed.
-    aligned, documents = _ported_documents(jnp.swapaxes(given, -1, -2), forked, x.shape[1], 64, jnp.float32,
-                                           (16, 16))
-    assert isinstance(aligned, AlignedDocuments)
-    laid = aligned.laid(x, b, c, a)
+    documents = _tpu_documents(jnp.swapaxes(given, -1, -2), forked, length, 64, jnp.float32, (16, 16))
+    # Whole chunks, a padded step the identity (no input, read or write, a unit decay).
+    padding = -length % 64
+    x, b, c, a = (jnp.pad(t, ((0, 0), (0, padding)) + ((0, 0),) * (t.ndim - 2)) for t in (x, b, c, a))
     start = jnp.zeros((x.shape[0], *given.shape[2:]), jnp.float32)
-    y, final = _chunk_scan(*laid, start, documents, 64, "tpu", 2)
-    return aligned.unlaid(y), final
+    y, final = _chunk_scan(x, b, c, a, start, documents, 64, "tpu", 2)
+    return y[:, :length], final
 
 
 def documents_one_by_one(x, b, c, a, given, key, value, weight):
@@ -412,8 +413,8 @@ def documents_one_by_one(x, b, c, a, given, key, value, weight):
 
 def test_documents_entering_their_own_states_scan_as_each_alone():
     """The TPU kernel over a forked call (a request's questions over its shared prefix's state, a chain's
-    each over its predecessor's, `Chunk.loads`): each document laid from a chunk's edge, the kernel's carry
-    taking its table slot's state up there with its entry write added (`Chunk.entry_key`) and its resident
+    each over its predecessor's, `Chunk.loads`): its documents walked in place, each taking its table slot's
+    state up at its first token mid-chunk with its entry write added (`Chunk.entry_key`) and its resident
     table keeping the finals its documents store; its output, the row's last state and every operand's
     gradient, the given states' and the entry writes' included, as each
     document scanned alone a step at a time in the row's order, from float64 (check 1)."""

@@ -47,7 +47,7 @@ from dew.nn.residuals import Residual
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, shard_shapes, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
-from .chunked_launch import AlignedDocuments, Forked, zero_padded
+from .chunked_launch import Forked, zero_padded
 from .generation import INHERENT, Choice, triton_runs
 from .selection import Kernel, KernelRefused, Op, Refusal, Requirement, select, selected
 from .ssd import _chunk_scan, ssd_kernel_platform
@@ -335,6 +335,11 @@ PORT_FORKED = Refusal('forked', "a forked call, whose documents enter earlier do
                       "call (`Chunk.loads`): the port runs a call's documents as sequences of their own in "
                       "parallel (fla's varlen), which no document's memory can wait on", row=INHERENT)
 """Why fla's port takes no forked call, inherently: its documents run in parallel."""
+
+SSD_PORT_FORKED = Refusal('forked', "a forked call (`Chunk.loads`), whose documents take their memories up "
+                          "mid-chunk, where mamba_ssm's state passing takes a memory at a sequence's first "
+                          "chunk alone: the template and the portable math walk it", row=INHERENT)
+"""Why mamba_ssm's port takes no forked call, inherently: it takes memories at chunks' edges alone."""
 
 PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
     Requirement('gated', lambda case: case.delta and case.decayed,
@@ -1380,8 +1385,9 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     6.89 ms a forward against mamba_ssm's 0.89 (SE-ssd-mamba-h100-0428aad7b). Returns the output in `work`,
     rounded to no narrower than `dtype`, the caller's (unrounded where it asks it wide, Mamba-2's mixer for
     the earlier shards' state it adds), and the memory `[B, Hv, Dk, Dv]`; a forked call (`forked`,
-    `Chunk.loads`) on the portable math's walk and the ports' state passing, each laid from chunks' edges
-    (`_ported_documents`), their table's given memories `state` `[B, S', Hv, Dk, Dv]`."""
+    `Chunk.loads`) walks its documents in place on the portable math and the TPU's scan, each taking its
+    memory up at its first token (`_tpu_documents`), their table's given memories `state` `[B, S', Hv, Dk,
+    Dv]`; mamba_ssm's port takes none (`SSD_SUPPORTS`)."""
     rate = given['rate'].astype(work)
     skip = given['skip'].astype(work) if hooks.skip else jnp.zeros(rate.shape, work)
     # The skip the template's own (`chunk_forward.forward`) and its gradient's (`mainloop_backward._reverse`),
@@ -1420,12 +1426,11 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
         if kernel in ('pallas', 'tpu'):
             # The SSD's memory is `[P, N]`, values by keys: the template's `[N, P]` transposed.
             columns, rows = _scan_widths(head_dim), _scan_widths(state_size)
-            documents = aligned = None
+            documents = None
             if forked is not None and state is not None:
-                # Each document laid from a chunk's edge, taking its table slot's memory up there.
-                aligned, documents = _ported_documents(state, forked, x.shape[1], chunk_size, work,
-                                                       (columns, rows))
-                x, B, C, beta = aligned.laid(x, B, C, beta)
+                # The TPU's scan walks each document in place, taking its memory up at its first token (the
+                # port takes no forked call, `SSD_SUPPORTS`).
+                documents = _tpu_documents(state, forked, x.shape[1], chunk_size, work, (columns, rows))
                 carried = rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x)
                 starts = None
             else:
@@ -1434,17 +1439,14 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
             wide_x = zero_padded(x, 3, columns)
             wide_B, wide_C = zero_padded(B, 3, rows), zero_padded(C, 3, rows)
             wide_state = zero_padded(zero_padded(carried, 2, columns), 3, rows)
-            held = 0 if forked is None else forked.held
             if kernel == 'pallas':
                 out, final = _ssd_ported(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size,
-                                         starts, documents, held)
+                                         starts)
             else:
                 out, final = _ssd_tpu(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size,
                                       starts, scan_case(x, B, chunk_size, padded=True).tpu, work, documents,
-                                      held)
+                                      0 if forked is None else forked.held)
             out, final = out.astype(work)[..., :head_dim], final.astype(work)
-            if aligned is not None:
-                out = aligned.unlaid(out)
             return out, jnp.swapaxes(final[..., :head_dim, :state_size], -1, -2)
         # The values widened once for the mainloop and the skip, their gradients summed before they round.
         wide = value.astype(work)
@@ -1484,8 +1486,8 @@ def _ssd_tpu(x, dt, A, B, C, D, carried, chunk_size: int, starts, platform, work
              held: int = 0):
     """The rated scan on a TPU's Pallas kernel (`dew.nn.kernels.ssd`), on its operands in `work`
     (`ssd_operands`), per shard of rows and heads (`manual_map`). The skip `D x` is added after. Returns
-    the output and the memory `[B, H, P, N]`; a forked call's chunks take their table's memories up
-    (`documents`, `_ported_documents`, `held` stored)."""
+    the output and the memory `[B, H, P, N]`; a forked call's documents walked in place (`documents`,
+    `_tpu_documents`, `held` stored)."""
     length = x.shape[1]
     x, B, C = (jnp.asarray(t, work) for t in (x, B, C))
     skip = D[None, None, :, None] * x
@@ -1497,7 +1499,7 @@ def _ssd_tpu(x, dt, A, B, C, D, carried, chunk_size: int, starts, platform, work
     # The groups are expanded, so any split of the heads divides them.
     rows, split = grouped_heads(scaled.shape, scaled.shape[2])
     four, state = P(rows, None, split, None), P(rows, split, None, None)
-    specs = (four, four, four, P(rows, None, split), state, _ported_specs(documents, rows, split))
+    specs = (four, four, four, P(rows, None, split), state, _tpu_specs(documents, rows, split))
     scanned, final = manual_map(kernel, specs, (four, state))(scaled, B, C, a, carried, documents)
     return scanned[:, :length] + skip, final
 
@@ -1537,13 +1539,14 @@ SSD_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
                 "no GPU Dew's Triton kernels run on (sm80 or later): off one the port's kernels interpret, "
                 "as the CPU suite runs them where a call names the port", row=INHERENT, kind='measured'),
     Requirement('precision', _port_precision, _PORT_PRECISION, row=INHERENT, kind='handoff'),
+    Requirement('forked', lambda case: not case.forked, SSD_PORT_FORKED.detail, row=INHERENT),
 )
 """What mamba_ssm's kernels (`mamba_ssd.ssd_scan`) need of a scan: no caller's `shard_map` that checks
 varying axes over operands that vary,
 where a Pallas call, which states no varying type for its results, cannot run; no float64 operands,
 whose scan is the reference math itself; head widths, state widths and chunks that are powers of
 two of at least 16, the smallest block Triton's dot takes (a call's head and state widths padded to them,
-`_rated_scan`); and a GPU Dew's Triton kernels run on, any of them."""
+`_rated_scan`); a GPU Dew's Triton kernels run on, any of them; and no forked call."""
 
 TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
     Requirement('geometry', lambda case: case.tpu is not None,
@@ -1680,58 +1683,54 @@ covers the geometry, else the portable math (a GPU no row named took it, 103 ms 
 Nemotron-H 30B's where the port took 2.58, template review 2026-10-26 P1-1)."""
 
 
-def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts, documents=None, held: int = 0):
+def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
     """The scan on mamba_ssm's kernels, each token's document counted from
-    `starts` (mamba_ssm's `seq_idx`), or a forked call's chunks taking their
-    table's memories up (`documents`, `_ported_documents`, `held` stored). On a
-    mesh it runs per shard (`manual_map`): rows where the rules split them, and
-    heads with their groups where the head split divides the groups, the time
-    axis whole; off a GPU its kernels interpret, as the CPU suite runs them."""
+    `starts` (mamba_ssm's `seq_idx`). On a mesh it runs per shard
+    (`manual_map`): rows where the rules split them, and heads with their
+    groups where the head split divides the groups, the time axis whole; off a
+    GPU its kernels interpret, as the CPU suite runs them."""
     interpret = not triton_runs()
     seq = None if starts is None else jnp.cumsum(starts, axis=1, dtype=jnp.int32)
     rows, heads = grouped_heads(x.shape, B.shape[2])
     four, carried = P(rows, None, heads, None), P(rows, heads, None, None)
-    if documents is not None:
-        def scan_documents(x, dt, A, B, C, D, state, documents):
-            return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, documents, chunk_size, interpret, held)
-
-        specs = (four, P(rows, None, heads), P(heads), four, four, P(heads), carried,
-                 _ported_specs(documents, rows, heads))
-        return manual_map(scan_documents, specs, (four, carried))(x, dt, A, B, C, D, state, documents)
 
     def scan(x, dt, A, B, C, D, state, *seq):
-        return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, *(seq or (None,)), None, chunk_size, interpret, 0)
+        return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, *(seq or (None,)), chunk_size, interpret)
 
     operands = (x, dt, A, B, C, D, state, *([] if seq is None else [seq]))
     specs = (four, P(rows, None, heads), P(heads), four, four, P(heads), carried, P(rows, None))
     return manual_map(scan, specs[:len(operands)], (four, carried))(*operands)
 
 
-def _ported_documents(state, forked: Forked, length: int, chunk_size: int, work, widths: tuple[int, int]):
-    """A forked call's documents (`forked`, `Chunk.loads`) as the SSD ports take them: laid from chunks'
-    edges (`AlignedDocuments`), and `(given [B, S', H, P, N] float32, loads [B, NC], stores [B, NC],
-    entries [B, NC, H, P, N] float32 or None)`: the table's given memories (`state` `[B, S', H, N, P]`, the
-    SSD's `[P, N]` transposed), the table slot each chunk takes up (-1 none, zero a zero memory), the stored
-    slot it leaves its memory in (zero none), and each chunk's entry write added to the memory it takes up
-    (`AlignedDocuments.entries`, None where the call gives none), `held` stored slots (`forked.held`); the
-    memories padded with zero columns to the ports' `widths` (`_scan_widths`), heads' then states'."""
-    aligned = AlignedDocuments.of(forked, length, chunk_size)
-    entries = aligned.entries(forked, transposed=True)
+def _tpu_documents(state, forked: Forked, length: int, chunk_size: int, work, widths: tuple[int, int]):
+    """A forked call's documents as the TPU's Pallas scan walks them in place (`ssd._ssd_scan`'s `forked`):
+    `(given [B, S', H, P, N] float32, tokens, entry)`, the table's given memories (`state` `[B, S', H, N, P]`,
+    the SSD's `[P, N]` transposed), each token's load, store and document (`Forked.tokens`, a padded token
+    taking up none) and the entry write's operands each value head's (its keys `[B, D, R, H, N]`, values
+    `[B, D, R, H, P]` and weights `[B, D, H]`; None where the call gives none); the memories and the entry
+    write padded with zero columns to the scan's `widths` (`_scan_widths`), heads' then states'."""
+    padding = -length % chunk_size
+    tokens = tuple(jnp.pad(t, ((0, 0), (0, padding)), constant_values=fill)
+                   for t, fill in zip(forked.tokens(length), (-1, 0, 0), strict=True))
+    given = zero_padded(zero_padded(jnp.swapaxes(state, -1, -2).astype(work), 3, widths[0]), 4, widths[1])
+    entry = None
+    if forked.entry is not None:
+        key, value, weight = forked.entry
+        heads = value.shape[3]
+        key = jnp.repeat(key, heads // key.shape[3], axis=3)
+        entry = (zero_padded(key.astype(work), 4, widths[1]), zero_padded(value.astype(work), 4, widths[0]),
+                 weight.astype(work))
+    return given.astype(jnp.float32), tokens, entry
 
-    def wide(memory):
-        return zero_padded(zero_padded(memory.astype(work), 3, widths[0]), 4, widths[1]).astype(jnp.float32)
 
-    return aligned, (wide(jnp.swapaxes(state, -1, -2)), aligned.loads, aligned.stores,
-                     None if entries is None else wide(entries))
-
-
-def _ported_specs(documents, rows, heads):
-    """`_ported_documents`' placements on a shard map (`manual_map`): the memories `[B, ., H, P, N]` by
-    rows and heads, the slots `[B, NC]` by rows, None for absent entries or documents."""
+def _tpu_specs(documents, rows, heads):
+    """`_tpu_documents`' placements on a shard map (`manual_map`): the memories `[B, S', H, P, N]` and the
+    entry write's operands by rows and heads, the tokens `[B, T]` by rows, None for absent ones."""
     if documents is None:
         return None
-    memories = P(rows, None, heads, None, None)
-    return memories, P(rows, None), P(rows, None), None if documents[3] is None else memories
+    _, tokens, entry = documents
+    each = (P(rows, None, None, heads, None), P(rows, None, None, heads, None), P(rows, None, heads))
+    return P(rows, None, heads, None, None), (P(rows, None),) * len(tokens), None if entry is None else each
 
 
 @dataclasses.dataclass(frozen=True)

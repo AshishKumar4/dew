@@ -540,17 +540,17 @@ def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alo
                     truth_fn=truth)
 
 
-@pytest.mark.check1_shards(seeds=80, per_task=8)
-@pytest.mark.parametrize('hooks', [FORMED[4], FORMED[5]], ids=str)
-def test_the_ssd_ports_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
-    """The port of mamba_ssm's kernels over a forked call, each document laid from a chunk's edge and the
-    state passing taking up its table slot's memory there with its entry write added (`Chunk.entry_key`),
-    keeping the finals its documents store (`_ported_documents`), as the port's call over each document
-    alone from its slot's memory and entry write (`assert_forked_on_par`). The port's own numbers
-    (mamba_ssm's) are tests/test_mamba_ssd.py's."""
-    assert_forked_on_par('pallas', hooks, functools.partial(entered_draw, hooks, entries=True),
-                         f'pallas {hooks} a forked call\'s documents, against each alone', seeds=80,
-                         alone=True)
+def test_the_ssd_port_refuses_a_forked_call_named_to_it():
+    """mamba_ssm's state passing takes a memory at a sequence's first chunk alone, so no forked call
+    (`Chunk.loads`), whose documents take their memories up mid-chunk, is one its port takes (inherently): a
+    forked call naming it is refused, the selector's typed refusal and its reason, never a shape's error."""
+    from dew.nn.kernels.selection import KernelRefused
+
+    hooks = FORMED[4]
+    operands = entering_documents(entered_draw(hooks, 0, entries=True)[0])
+    with pytest.raises(KernelRefused) as named:
+        chunk_on('pallas', hooks, operands, chunk_size=CHUNK)
+    assert recurrence_chunk.SSD_PORT_FORKED in named.value.refusals
 
 
 def narrowed_draw(hooks, seed: int):
