@@ -1563,7 +1563,7 @@
 "tests/test_inspection.py::test_a_path_glob_selects_the_layer_its_log_names[pipelined]",
 "tests/test_inspection.py::test_a_pipelined_language_models_watched_layers_read_none_of_its_padding",
 "tests/test_inspection.py::test_a_run_watching_a_trained_component_alone_logs_its_activations_and_cotangents[decision]",
-"tests/test_inspection.py::test_a_watched_cotangent_is_the_updates_loss_whatever_its_split",
+"tests/test_inspection.py::test_a_sampled_steps_summaries_are_its_commits_arrays",
 "tests/test_inspection.py::test_every_kinds_run_logs_the_activations_its_command_line_watches[diffusion]",
 "tests/test_inspection.py::test_every_objectives_watched_cotangents_reach_its_model_calls[dpo]",
 "tests/test_inspection.py::test_every_objectives_watched_cotangents_reach_its_model_calls[lm]"
@@ -1765,6 +1765,9 @@
 ],
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp4]"
+],
+"tests/test_level_stacking.py": [
+"tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[slower-first-layers]"
 ],
 "tests/test_lfm3.py": [
 "tests/test_lfm3.py::test_an_lfm3_vl_trunk_read_or_built_resolves_its_defaults_and_cadence_one_way"
@@ -2642,6 +2645,9 @@
 "tests/test_recurrence_witness.py": [
 "tests/test_recurrence_witness.py::test_a_grouped_backwards_records_lie_in_their_key_heads_enclosures[keys gated-sm80]",
 "tests/test_recurrence_witness.py::test_an_amperes_inference_forward_is_witnessed_as_its_states_and_output_launches"
+],
+"tests/test_recurrent_sequence_split.py": [
+"tests/test_recurrent_sequence_split.py::test_a_delta_rule_split_over_the_sequence_runs_its_rows_as_whole_ones[gated delta net-right_padded]"
 ],
 "tests/test_reference_runs.py": [
 "tests/test_reference_runs.py::test_lm_fine_tune_steps_are_as_exact_as_torch",
