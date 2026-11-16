@@ -626,7 +626,8 @@ def ran_expanded(row: Mapping) -> list[dict]:
 def test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes(read, pool, stage):
     """A record stage declaring its pool (data.md §10's offline execution contract) runs its step there,
     on the stage's threads or in processes other than the reader's, and the read delivers what the
-    in-process stage delivers, in its order, its plan the same; in a streamed or indexed read a position
+    in-process stage delivers, in its order, its plan the same but where an indexed read is cut per share on
+    the pool's account; in a streamed or indexed read a position
     saved part way restores to the same remaining records; and a closed reader leaves no thread of its pool
     and no process (each ended as the reader closes, `Running.stop`). An indexed read on a pool read every
     record again past a restore and every share the whole order (the head review of theme 16, F1)."""
@@ -642,7 +643,8 @@ def test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes(re
         return [int(value) for batch in batches for value in batch["id"]]
 
     data = built(pool)
-    assert data.plan.identity() == built(None).plan.identity()
+    # An indexed read through a pool is cut per share, which its plan states; any other read's is the same.
+    assert (data.plan.identity() == built(None).plan.identity()) is (read != "indexed")
     plain = built(None).train(DataPartition())
     reader = data.train(DataPartition())
     try:
@@ -723,7 +725,7 @@ def test_a_cached_stage_on_a_pool_fills_its_cache_there_or_is_refused_where_it_c
     catalog = Memory([{"id": index} for index in range(9)], shard_rows=9)
 
     def reader(cache):
-        chain = Pipeline(catalog).map(ran_where, pool=pool)
+        chain = Pipeline(catalog).map(ran_where, pool=pool, identity="ran_where@1")
         chain = chain if cache is None else chain.cache(cache)
         return compile(chain.batch(3), read=read, loading=READ).train(DataPartition())
 
