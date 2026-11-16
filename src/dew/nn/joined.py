@@ -21,7 +21,7 @@ from dew.nn.dense import Dense, _biased, _plain_dense, _promoted, _rounds_once, 
 from dew.nn.precision import float32_dot_general, recipe_role
 
 from .kernels.generation import INHERENT, Choice, device_generation
-from .kernels.projections import kernel_path, mapped_shards
+from .kernels.projections import kernel_path, mapped_shards, recipe_refusal
 from .kernels.selection import Kernel, Op, Requirement, select
 from .sharding import on_shards
 
@@ -31,8 +31,9 @@ class Projections:
     """A layer's projections as a selector that stands in for their own calls reads them (the join's, the
     fused gated MLP's, `dew.nn.gated_mlp`): whether each is a plain Dense (`dense`) on the default product
     (`dot_general`), whether a wrapper intercepts their own calls (`intercepted`), whether each holds
-    its own kernel (`held`), and whether the run's low-precision recipe takes their products by the role
-    they are traced in (`recipe`, `precision.recipe_role`), each quantized as its own."""
+    its own kernel (`held`), and whether the run's low-precision recipe takes any one's product apart
+    (`recipe`: its role and its widths' whole blocks, `projections.recipe_refusal`), each quantized as its
+    own, which a join of them would not be."""
 
     dense: bool
     dot_general: bool
@@ -52,7 +53,15 @@ def projections_of(projections: Sequence[nn.Module]) -> Projections:
         intercepted=(any(projection.product_owned() for projection in projections) if dense
                      else intercepted()),
         held=all(projection.has_variable('params', 'kernel') for projection in projections),
-        recipe=(taken := recipe_role()) is not None and taken[1] in taken[0].roles)
+        recipe=recipe_role() is not None and any(_recipe_takes(projection) for projection in projections))
+
+
+def _recipe_takes(projection: nn.Module) -> bool:
+    """Whether the run's low-precision recipe takes `projection`'s product apart (`projections.
+    recipe_refusal`, the one decision `recipe_projection` reads): its role, and whole blocks of its kernel's
+    widths."""
+    kernel = projection.get_variable('params', 'kernel')
+    return kernel is not None and recipe_refusal(*meta.unbox(kernel).shape[-2:]) is None
 
 
 def projection_requirements[C](of: Callable[[C], Projections], stands_in: str) -> tuple[Requirement[C], ...]:

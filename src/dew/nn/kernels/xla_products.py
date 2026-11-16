@@ -14,7 +14,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.custom_derivatives import SymbolicZero
 
 from ..derivatives import Protected, contracted, declared_tangent
-from ..precision import accumulated, at_least_fp32, rounded_operand
+from ..precision import accumulated, at_least_fp32, rounded_operand, twice_scaled
 from . import generation
 from .templates.product import SCALE_DEPTH, eight
 
@@ -161,7 +161,9 @@ def step_scaled(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, ro
         partial = xla_ragged_dot(lhs, rhs, group_sizes, precision=precision,
                                  preferred_element_type=jnp.float32)
         columns = jnp.repeat(column_scales[:, index][owner], width // scaled, axis=1)
-        return total + partial * row_scales[index][:, None].astype(jnp.float32) * columns.astype(jnp.float32)
+        # Each scale in the order that keeps the intermediate normal (`twice_scaled`, ledger 2715).
+        return total + twice_scaled(partial, row_scales[index][:, None].astype(jnp.float32),
+                                    columns.astype(jnp.float32))
 
     return jax.lax.fori_loop(0, blocks, block, jnp.zeros((rows, width), jnp.float32))
 
