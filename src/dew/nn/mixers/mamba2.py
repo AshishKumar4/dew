@@ -75,8 +75,8 @@ from dew.nn.linear import (
     decode_step,
     fused_token,
     held_scan,
+    in_input_dtype,
     over_sequence,
-    projected_read,
     scan_cache,
     sequence_conv,
 )
@@ -418,7 +418,7 @@ class Mamba2(nn.Module):
                                 ((taps, bias, *heads),))
             if valid is not None:
                 out = jnp.where(valid[:, :, None], out, 0)
-            return self.out_proj(projected_read(self, self._gated(out, gate), x))
+            return self.out_proj(in_input_dtype(self, self._gated(out, gate), x))
         state = (self.num_heads, self.state_size, self.head_dim)
         token = None
         # An initialization runs the general path, where the layer makes its parameters.
@@ -431,7 +431,7 @@ class Mamba2(nn.Module):
                         state_dtype=wide, conv_dtype=wide, dtype=compute, token=token)
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
-        return self.out_proj(projected_read(self, self._gated(out, gate), x))
+        return self.out_proj(in_input_dtype(self, self._gated(out, gate), x))
 
 
 

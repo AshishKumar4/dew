@@ -377,11 +377,11 @@ class KPoolSparseAttentionMixer(MixerBase):
 
     def fork_refusal(self) -> str | None:
         """Why the layer reads no forks (`MixerBase.fork_refusal`): its indexer scores pools of
-        `index_kpool` consecutive keys counted from a row's first real key, so a fork's document, placed
-        after its parent's tokens and other documents, would score pools that straddle another document's
-        keys where its own row's pools hold its keys alone."""
-        return (f"a k-pool sparse layer's indexer pools {self.index_kpool} consecutive keys of a row, "
-                "which a fork's documents do not keep as their own rows do")
+        `index_kpool` keys, each document's own (`document_windows`), so a fork's document would need its
+        pools and its visibility to continue over its ancestors' keys, its parent's partial pool among
+        them, which no path builds."""
+        return ("a k-pool sparse layer's indexer pools each document's own keys, which no path continues "
+                "over a fork's ancestors")
 
     q_lora_rank: int = 1536
     kv_lora_rank: int = 512

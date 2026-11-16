@@ -401,12 +401,12 @@ def scan_cache(rows: int, taps: int, width: int, state: str, state_shape: tuple[
             state: Opened((rows, *state_shape), state_dtype)}
 
 
-def projected_read(module: nn.Module, out, x):
-    """A recurrent layer's output as its output projection reads it: with no compute dtype of the layer's
-    own, in the layer input's dtype, as transformers' recurrent mixers cast it (Mamba2Mixer's
-    `self.out_proj(scan_output.to(dtype))`, Qwen3-Next's and Kimi's gated delta rules' output cast to
-    the query's dtype before their gated norm), where a projection of no dtype would carry the scan's
-    fp32 into the residual stream; with one, as it is, the projection computing in it."""
+def in_input_dtype(module: nn.Module, out, x):
+    """A recurrent layer's scan output `out` where its reference casts it back to the layer input's dtype,
+    with no compute dtype of the layer's own: Mamba2Mixer's gated, normed output before its projection
+    (`self.out_proj(scan_output.to(dtype))`), and the gated delta rules' (Qwen3-Next's, Kimi's) and
+    MiniMax's lightning attention's raw scan output before their norms (cast to the query's dtype), where
+    the scan's fp32 would otherwise reach the residual stream; with a compute dtype, as it is."""
     return out.astype(x.dtype) if module.dtype is None else out
 
 
@@ -1334,13 +1334,13 @@ class GatedDeltaNet(nn.Module):
                             state='recurrent_state', state_dtype=stored, conv_dtype=conv,
                             parts=heads, dtype=operand if ported else wide, token=token)
         if token is not None:
-            # The fused step gated and normalized its output (`_fused_hooks`).
-            return self.out_proj(projected_read(self, out, x))
+            # The fused step gated and normalized its output (`_fused_hooks`), in its epilogue's dtype.
+            return self.out_proj(in_input_dtype(self, out, x))
 
         gate = z.reshape(B, S, -1, self.head_v_dim)
-        out = self.norm(out, gate)  # the norm scales, then the activation gates
+        out = self.norm(in_input_dtype(self, out, x), gate)  # the norm scales, then the activation gates
         out = out.reshape(B, S, self.value_features)
-        return self.out_proj(projected_read(self, out, x))
+        return self.out_proj(out)
 
 
 class DepthwiseConv1d(nn.Module):

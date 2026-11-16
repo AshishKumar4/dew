@@ -52,8 +52,8 @@ from .linear import (
     decode_kernel,
     fused_token,
     held_scan,
+    in_input_dtype,
     over_sequence,
-    projected_read,
     scan_cache,
     split_delta_rule,
 )
@@ -259,10 +259,10 @@ class KimiDeltaAttention(nn.Module):
                             state_dtype=wide, conv_dtype=wide, parts=heads,
                             dtype=projected.dtype if ported else wide, token=token)
         if token is not None:
-            # The fused step gated and normalized its output (`FUSED`).
-            return self.o_proj(projected_read(self, out, x))
-        out = self.o_norm(out, gate).reshape(B, S, self.qkv_features)
-        return self.o_proj(projected_read(self, out, x))
+            # The fused step gated and normalized its output (`FUSED`), in its epilogue's dtype.
+            return self.o_proj(in_input_dtype(self, out, x))
+        out = self.o_norm(in_input_dtype(self, out, x), gate).reshape(B, S, self.qkv_features)
+        return self.o_proj(out)
 
     def _fused_token(self, taps, g, beta, gate, valid, starts):
         """A decode token's conv, update and gated norm in one launch (`linear.fused_token` under
