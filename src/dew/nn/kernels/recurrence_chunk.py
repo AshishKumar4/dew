@@ -1837,9 +1837,9 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, load
     scan, interpreted off a GPU (where a call names it), per shard of rows on a mesh (`manual_map`: B and C
     serve every channel, so the channels stay whole); or `portable(x, dt, A, B, C, D, state, starts)`,
     the portable math. A forked call (`loads`, `stores`, `held`, as `Chunk.loads` takes them, `state` `[B,
-    S', D, N]` its table's given states) lays each document from a chunk's edge and takes its state up
-    there (`AlignedDocuments`) on either: the template's walk over its table (`selective.Documents`) or
-    the portable math's (`portable`'s `forked`); its final state is the row's last.
+    S', D, N]` its table's given states) walks each document in place, taking its state up at its first
+    token, on either: the template's walk over its table (`selective.Documents`) or the portable math's
+    (`portable`'s `forked`); its final state is the row's last.
     """
     forked = None
     if loads is not None:

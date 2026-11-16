@@ -70,22 +70,14 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     whose entering state drops. A call shorter than a chunk scans its own
     length, so a decode step is the recurrence's one step. A forked call
     (`forked`, `recurrence_chunk.Chunk.loads`; `state` `[B, S', D, N]` its
-    table's given states) lays each document from a chunk's edge, and the scan
-    takes each one's state up there from its table, the given ones then those
-    it stores at documents' last chunks (`AlignedDocuments`); the final state is
+    table's given states) walks its documents in place, each taking its state
+    up at its first token from its table, the given ones then those its
+    documents store at their last tokens (`_forked_scan`); the final state is
     the row's last.
     """
     dtype, work = x.dtype, at_least_fp32(x.dtype)
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, channels = x.shape
-    # A forked call's documents: their layout from each chunk's edge, and the skip each token adds at its
-    # own slot.
-    entered = None
-    if forked is not None:
-        aligned = chunked_launch.AlignedDocuments.of(forked, length, chunk_size)
-        entered = (aligned, x * D)
-        x, dt, B, C = aligned.laid(x, dt, B, C)
-        starts, length = None, aligned.length
     chunk_size = min(chunk_size, length)
     pad = (chunk_size - length % chunk_size) % chunk_size
 
@@ -108,29 +100,62 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         return states[:, -1], read
 
     steps = tuple(chunks(t) for t in (x, dt, B, C, resets))
-    if entered is None:
+    if forked is None:
         carried = (rows_like(jnp.zeros((batch, channels, A.shape[-1]), work), x) if state is None
                    else jnp.asarray(state, work))
         final, out = jax.lax.scan(scanned, carried, steps)
         out = jnp.moveaxis(out, 0, 1).reshape(batch, length + pad, channels)[:, :length] + x * D
         return out.astype(dtype), final.astype(dtype)
-    aligned, skipped = entered
-    given = jnp.asarray(state, work)
-    assert forked is not None
+    loads, stores, _ = (jnp.pad(t, ((0, 0), (0, pad)), constant_values=fill).reshape(batch, -1, chunk_size)
+                        for t, fill in zip(forked.tokens(length), (-1, 0, 0), strict=True))
+    walk = functools.partial(_forked_scan, scanned, documents=forked.loads.shape[1], held=forked.held)
+    out, last = jax.vmap(walk)(*(jnp.moveaxis(t, 0, 1) for t in steps[:4]), loads, stores,
+                               jnp.asarray(state, work))
+    out = out.reshape(batch, length + pad, channels)[:, :length] + x * D
+    return out.astype(dtype), last.astype(dtype)
 
-    def loading(carried, step):
-        h, table = carried
-        step, load, store = step
-        # A chunk that takes a document up enters its table slot's state; each row's documents in turn.
-        taken = jax.vmap(recurrence_chunk.table_read)(given, table, load)
-        after, read = scanned(jnp.where((load >= 0)[:, None, None], taken, h), step)
-        return (after, jax.vmap(recurrence_chunk.table_stored)(table, store, after)), read
 
-    table = jnp.zeros((batch, forked.held, *given.shape[2:]), work)
-    (last, _), out = jax.lax.scan(loading, (jnp.zeros_like(given[:, 0]), table),
-                                  (steps, *(jnp.moveaxis(t, 1, 0) for t in (aligned.loads, aligned.stores))))
-    out = jnp.moveaxis(out, 0, 1).reshape(batch, length, channels)
-    return (aligned.unlaid(out) + skipped).astype(dtype), last.astype(dtype)
+def _forked_scan(scanned, x, dt, B, C, loads, stores, given, *, documents: int, held: int):
+    """A forked row's selective scan (`selective_scan`'s), its documents walked in place: its segments in
+    token order, a segment a document's tokens within one chunk, each from the state entering it, the
+    chunk's own where its document continued from the chunk before, else its document's, taken up from the
+    table at its first token (the stored slots as the segments before left them, so a document stores and a
+    later one of the same chunk loads); each segment its chunk's scan with every other token the identity
+    step (dt zero: a unit decay, no write), its state stored in its document's slot where it ends a storing
+    document and carried where it ends the chunk. Its operands a row's chunks `[NC, C, ...]`, each token's
+    load and store `[NC, C]` (`Forked.tokens`), its table's given states `[S', D, N]`; `(outputs [NC, C, D],
+    the row's last state)`. The segments are at most the chunks and the documents, each a chunk's work, as
+    many as a row laid a chunk a document took, each checkpointed: its residual the state entering it."""
+    chunks, count = loads.shape
+    place = jnp.arange(count)
+    marks = ((loads >= 0) | (place == 0)).reshape(-1)
+    origins = jnp.nonzero(marks, size=chunks + documents, fill_value=chunks * count)[0]
+    following = jnp.concatenate([origins[1:], jnp.full((1,), chunks * count, origins.dtype)])
+    zero = jnp.zeros_like(given[0])
+
+    @jax.checkpoint
+    def segment(carried, at):
+        (memory_in, held_chunk, leaving), table, outputs = carried
+        first, after = at
+        real = first < chunks * count
+        chunk, origin = jnp.minimum(first // count, chunks - 1), first % count
+        through = jnp.where(after // count == chunk, after % count - 1, count - 1)
+        memory_in = jnp.where(chunk != held_chunk, leaving, memory_in)
+        load = loads[chunk, origin]
+        memory = jnp.where(load < 0, memory_in, recurrence_chunk.table_read(given, table, load))
+        inside = (place >= origin) & (place <= through)
+        step = (x[chunk], jnp.where(inside[:, None], dt[chunk], 0.0), B[chunk], C[chunk],
+                jnp.zeros((count,), bool))
+        left, read = scanned(memory[None], tuple(t[None] for t in step))
+        outputs = outputs.at[chunk].set(jnp.where((inside & real)[:, None], read[0], outputs[chunk]))
+        table = recurrence_chunk.table_stored(table, jnp.where(real, stores[chunk, through], 0), left[0])
+        leaving = jnp.where(real & (through == count - 1), left[0], leaving)
+        return ((memory_in, jnp.where(real, chunk, held_chunk), leaving), table, outputs), None
+
+    table = jnp.zeros((held, *zero.shape), zero.dtype)
+    start = ((zero, jnp.asarray(-1), zero), table, jnp.zeros((chunks, count, x.shape[-1]), x.dtype))
+    ((_, _, last), _, outputs), _ = jax.lax.scan(segment, start, (origins, following))
+    return outputs, last
 
 
 class Mamba(nn.Module):
