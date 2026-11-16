@@ -1228,19 +1228,22 @@ class GatedDeltaNet(nn.Module):
         sigmoid write gate and the softplus step's log decay (`recurrence.gated`)."""
         return recurrence.Gates()
 
-    def _fused_hooks(self) -> recurrence.Hooks:
+    def _fused_hooks(self, operand) -> recurrence.Hooks:
         """The decode token whole in the recurrence's step: the conv and its silu, the queries' and
-        keys' l2 norm, the gates from their pre-activations, the delta rule and the gated norm."""
+        keys' l2 norm, the gates from their pre-activations, the delta rule and the gated norm, its output
+        read back first in `operand`, the input projection's dtype (`as_projected`)."""
         return recurrence.Hooks(conv=recurrence.Conv('silu'), l2norm=True, decay='scalar',
                                 gates=self._gates,
-                                output=recurrence.OutputNorm(self.norm_eps, self.gate_activation))
+                                output=recurrence.OutputNorm(self.norm_eps, self.gate_activation,
+                                                             read_in=jnp.dtype(operand).name))
 
-    def _fused_token(self, z, b, a, valid):
+    def _fused_token(self, z, b, a, valid, operand):
         """A decode token's conv, gates, update and gated norm in one launch (`fused_token`): the
-        layer's gate pre-activations and output gate a row's, its decay's rate and bias a head's."""
+        layer's gate pre-activations and output gate a row's, its decay's rate and bias a head's, its
+        output read back in `operand` before the norm, as the unfused token's."""
         B = z.shape[0]
         return fused_token(
-            self._fused_hooks(), self.conv1d()[0],
+            self._fused_hooks(operand), self.conv1d()[0],
             heads=(self.num_k_heads, self.num_k_heads, self.num_v_heads),
             widths=(self.head_k_dim, self.head_k_dim, self.head_v_dim),
             per_row={'gate': a[:, 0], 'beta': b[:, 0], 'z': z[:, 0].reshape(B, self.num_v_heads, -1)},
@@ -1261,7 +1264,7 @@ class GatedDeltaNet(nn.Module):
         # An initialization runs the general path, where the layer makes its parameters.
         if decode and S == 1 and not forked and not self.is_initializing():
             kernel = self._decode_kernel(x, operand)
-            token = self._fused_token(z, b, a, valid) if kernel == 'fused' else None
+            token = self._fused_token(z, b, a, valid, operand) if kernel == 'fused' else None
             stepped = kernel == 'step'
 
         # fp32 on purpose, as the reference notes: an fp16 A can make exp
