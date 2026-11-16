@@ -1623,12 +1623,8 @@ class Trainer(Generic[Loss, Effects]):
         self._refusal = None
         if not complete and (pending or not plan.ended(current, interval.real_tokens, interval.consumed)):
             partition = self._stream_partition()
-            primed, run.primed = run.primed, None
-            # The stream the start read its first batch from, where this run reads it from its beginning.
-            handed = primed is not None and primed[0] == partition and position is None
-            if primed is not None and not handed:
-                _closed(primed[1])
-            run.source = primed[1] if handed else plan.dataset.train(partition)
+            opened, ahead = self._source_opened(plan, run, partition, position)
+            run.source = opened
             run.unworked = isinstance(run.source, ReadsInProcess) and run.source.in_process
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None and run.restarted is None else None)
@@ -1645,8 +1641,7 @@ class Trainer(Generic[Loss, Effects]):
                                                   for stage, after in pairwise(stages))))
 
             run.partition = partition
-            run.train = self._prefetched(plan, run, run.source, position,
-                                         primed[2:] if handed and primed is not None else None)
+            run.train = self._prefetched(plan, run, opened, position, ahead)
             run.source = None  # Lifetime transferred to the prefetch worker.
             if abstract is not None and self.rollout is None:
                 # Read on the host before the state is placed, and agreed: a process whose read failed
@@ -1740,6 +1735,20 @@ class Trainer(Generic[Loss, Effects]):
             except LayoutRefused as refused:
                 refusals.append(refused)
         raise refusals[-1]
+
+    @staticmethod
+    def _source_opened(plan: FitPlan, run: FitRun, partition: DataPartition, position: bytes | None
+                       ) -> tuple[Iterator[Batch], tuple[Batch, object] | None]:
+        """The training stream of `partition`'s share the run reads, and the first batch it read already
+        with the stream's position after it (`FitRun.primed`, the start's read for its input's shape), where
+        the run reads its stream from its beginning: that stream, handed on; else a stream opened now, the
+        primed one closed."""
+        primed, run.primed = run.primed, None
+        if primed is not None and primed[0] == partition and position is None:
+            return primed[1], (primed[2], primed[3])
+        if primed is not None:
+            _closed(primed[1])
+        return plan.dataset.train(partition), None
 
     def _prefetched(self, plan: FitPlan, run: FitRun, source: Iterator[Batch], position: bytes | None,
                     primed: tuple[Batch, object] | None = None) -> DevicePrefetchIterator:

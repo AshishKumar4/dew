@@ -18,8 +18,8 @@ from dew.data.pipeline import BatchStage, Mixture, Pipeline, Repeat, TokenBudget
 
 
 def held_records(pipeline: Pipeline, build: _Build) -> int | None:
-    """The records `pipeline` holds through its stages as `build` builds them by index (an epoch); None
-    where they come back as a stream."""
+    """The records `pipeline` holds through its stages as `build` builds them by index (an epoch, a mix
+    member's length, `_Build.member_records`); None where they come back as a stream."""
     cache = build.lowering.cache
     if cache is not None and cache >= len(pipeline.stages):
         # A cache after the stages counted, as a preset's cache follows the order written before

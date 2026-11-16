@@ -1005,6 +1005,31 @@ class Plan:
             raise rules
         return changes
 
+    def _reached_changed(self, saved: Mapping[str, object], steps, rewritten: list[str],
+                         resume: DataResume) -> list[str]:
+        """The steps besides `rewritten` whose reached code (`Manifest.held`, `dew._stated.stated`) the
+        position `saved` holds otherwise, or proves nothing of: one it states as this plan does
+        (`REACHED_AS`) compared; one saved before Dew saved it so (none of it, or since train 901 a class's
+        text alone under `held`) proves no step that holds such code unchanged, its module digests no part of
+        a position since row 5862, so an exact resume is refused rather than read as unchanged."""
+        stated_alike = "reached" in saved and saved.get("reached_as") == REACHED_AS
+        if stated_alike:
+            saved_reached = listed(saved["reached"], "saved data reached code", read=json_value,
+                                   what="each step's reached code")
+            reached = zip(steps, saved_reached, self.manifest.held(), strict=False)
+            return [step.name for step, before, now in reached
+                    if before != now and step.name not in rewritten]
+        unproven = [step.name for step, held in zip(steps, self.manifest.held(), strict=False)
+                    if held and step.name not in rewritten]
+        if unproven and resume != "relaxed":
+            raise PlanChanged(
+                tuple(f"code.{name}" for name in unproven),
+                f"the position was saved before Dew saved the code a data step's own code reaches as it "
+                f"states it now, so nothing it holds proves the code of {', '.join(unproven)} unchanged; "
+                "declare the step's identity (identity='name@version') to resume exactly, or resume relaxed "
+                "(`data_resume='relaxed'`)")
+        return unproven
+
     def _compared(self, saved: Mapping[str, object], current: Mapping[str, JSON], resume: DataResume
                   ) -> tuple[str, ...]:
         """`check` of all but the version and the rules, the changed environment and members returned; the
@@ -1081,33 +1106,7 @@ class Plan:
                                                                 strict=False)
                          if before is not None and before != now
                          and not (appended and list(before)[:len(now)] == list(now))]
-            # The code a step's own code reaches beside its module's (`Manifest.held`, `dew._stated.stated`),
-            # where its position holds it (`reached`).
-            # Reached code a position states as this plan does (`REACHED_AS`); one stated otherwise proves
-            # nothing either way, so it reads as unsaved, below.
-            stated_alike = "reached" in saved and saved.get("reached_as") == REACHED_AS
-            if stated_alike:
-                saved_reached = listed(saved["reached"], "saved data reached code", read=json_value,
-                                       what="each step's reached code")
-                reached = zip(steps, saved_reached, self.manifest.held(), strict=False)
-                rewritten += [step.name for step, before, now in reached
-                              if before != now and step.name not in rewritten]
-            # A position saved before Dew saved the code a step's own code reaches holds none of it (or, saved
-            # since train 901 as `held`, its class's text alone), and nothing it saved proves that code
-            # unchanged (its module digests are no part of a position since row 5862): a step that holds such
-            # code (a function or a callable object of the user's, a class or one a field holds) is refused an
-            # exact resume rather than read as unchanged.
-            unproven = [step.name for step, held in zip(steps, self.manifest.held(), strict=False)
-                        if not stated_alike and held and step.name not in rewritten]
-            if unproven and resume != "relaxed":
-                raise PlanChanged(
-                    tuple(f"code.{name}" for name in unproven),
-                    f"the position was saved before Dew saved the code a data step's own code reaches as it "
-                    f"states it now, so nothing it holds proves the code of {', '.join(unproven)} unchanged; "
-                    "declare the step's identity (identity='name@version') to resume exactly, or resume "
-                    "relaxed "
-                    "(`data_resume='relaxed'`)")
-            rewritten += unproven
+            rewritten += self._reached_changed(saved, steps, rewritten, resume)
             if rewritten and resume != "relaxed":
                 raise PlanChanged(
                     tuple(f"code.{name}" for name in rewritten),

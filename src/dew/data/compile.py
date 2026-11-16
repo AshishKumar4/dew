@@ -1231,29 +1231,34 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
         # A field's windows laid out by the read unless a step over a pack's windows lays them out itself.
         laid[ids] = laid.get(ids, True) and laid_out
 
-    def walk(pipeline: Pipeline, *, packed: bool) -> None:
+    def walk(pipeline: Pipeline, *, packed: bool, itself: bool = False) -> None:
         nonlocal unseen
+        # A window step of the objective's that lays its windows out (`LaysOutWindows`), after the pack, a
+        # memory read's packed plan or a source's own pack alike.
+        itself = itself or any(isinstance(stage, Map) and isinstance(stage.step, LaysOutWindows)
+                               for stage in pipeline.stages)
         for at, stage in enumerate(pipeline.stages):
             if isinstance(stage, Pack):
                 floor = _floor(pipeline, at, stage)
-                itself = any(isinstance(after, Map) and isinstance(after.step, LaysOutWindows)
-                             for after in pipeline.stages[at + 1:])
                 declare(stage, stage.segments if floor is None else min(
                     stage.segments or stage.seq_len, max(1, stage.seq_len // floor)), not itself)
                 packed = True
         source = pipeline.source
         if isinstance(source, Combined):
             for child in source.pipelines:
-                walk(child, packed=packed)
+                walk(child, packed=packed, itself=itself)
             return
         documents = _packed_documents(source)
-        for stage in _written(source, ()):
+        written = _written(source, ())
+        itself = itself or any(isinstance(stage, Map) and isinstance(stage.step, LaysOutWindows)
+                               for stage in written)
+        for stage in written:
             if isinstance(stage, Pack):
-                declare(stage, stage.segments if documents is None else documents)
+                declare(stage, stage.segments if documents is None else documents, not itself)
                 packed = True
         *_, source = beneath(source, ("read", "materialized"))
         if isinstance(source, PackedSource):
-            declare(source.plan.pack, source.plan.most_documents)
+            declare(source.plan.pack, source.plan.most_documents, not itself)
             packed = True
         unseen = unseen or not packed
 

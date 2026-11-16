@@ -85,7 +85,16 @@ from dew.data.handoff import (
     draws_after_expansion,
     record_stage_of,
 )
-from dew.data.mixing import Accepted, Chunked, CorpusCounts, KeyedMix, TokenDeficit, mixed_indexed, rewound
+from dew.data.mixing import (
+    Accepted,
+    Chunked,
+    CorpusCounts,
+    KeyedMix,
+    TokenDeficit,
+    mix_end,
+    mixed_indexed,
+    rewound,
+)
 from dew.data.ordering import Skipping, place_of
 from dew.data.packing import packed_documents
 from dew.data.pipeline import (
@@ -1434,10 +1443,32 @@ class _Build:
                 labels=[_label(child) for child in source.pipelines],
                 stamped=self.stamped,
             )
-        # Only a member that can end is read one record ahead (`KeyedMix`): one read on without end (a
-        # training read's repeated member) never ends the mix.
-        ending = tuple(not build.lowering.unending for build in builds)
-        return KeyedMix(streams, source.weights, keys, source.seed, stamped=self.stamped, ending=ending)
+        # An unseeded mix's end is its members' share-spans (`mix_end`), which its indexed read ends at:
+        # read as a stream, each member's length is counted at the start (data.md §3). A seeded mix ends
+        # before a member is read past its records, where its read's failed pull ends it, so it counts none.
+        lengths = ([self.member_records(child, index) for index, child in enumerate(children(pipeline))]
+                   if source.seed is None and partition.count == 1 else [None])
+        known = [length for length in lengths if length is not None]
+        end = mix_end(known, source) if len(known) == len(lengths) else None
+        return KeyedMix(streams, source.weights, keys, source.seed, stamped=self.stamped, end=end)
+
+    def member_records(self, member: Pipeline, index: int) -> int | None:
+        """The records the `index`th member of a mix, `member`, reads before it ends (`dew.data.epochs`),
+        counted by an indexed read of it, which opens a file member's index (a JSON lines or CSV file's
+        scan); None for one read on without end or of no indexed read, which ends its mix at its first
+        failed pull."""
+        analyzed = self.lowering.children[index]
+        if (isinstance(member.source, Combined) or not member.source.supports("indexed") or analyzed.unending
+                or any(isinstance(stage, Repeat) for stage in member.stages)):
+            return None
+        from dew.data.epochs import held_records
+
+        child = self.child(index)
+        # Counted by index in one order, as an epoch is, whatever order the member is read in.
+        counting = dataclasses.replace(child, read="indexed", training=False,
+                                       lowering=dataclasses.replace(child.lowering, per_share=False),
+                                       loading=dataclasses.replace(self.loading, workers=0))
+        return held_records(member, counting)
 
     def counted_members(self, pipeline: Pipeline) -> tuple[tuple[str, str, str], ...]:
         """The members of `pipeline`'s mixture, each's key (`_member_keys`), name and label, where a read
