@@ -221,3 +221,59 @@ def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper():
           generation.routes() as routes):
         jax.jit(jax.grad(loss, argnums=range(len(drawn)))).trace(*drawn).lower(lowering_platforms=("cuda",))
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
+
+
+@lowers("sm90")
+def test_a_paired_products_input_gradient_is_one_launch_over_its_joined_depths():
+    """A gate and an up projection's paired product with its two bf16 outputs (a mixture of experts' pair,
+    `moe.paired_projections`) differentiated for its rows on an H100, the template named: its input gradient,
+    the two cotangents through their matrices, traces one launch, the two products summed in its one
+    accumulator over their joined depths (`gemm`'s `joined`), where it traced two, the second adding the
+    first's wide product in its epilogue: lm-moe's start certified and built both, at two tiles (row 6783)."""
+    from dew.nn.kernels import tuning
+
+    rows, depth, width = 256, 128, 256
+    shapes = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
+              *(jax.ShapeDtypeStruct((depth, width), jnp.bfloat16) for _ in range(2)))
+
+    def loss(x, gate, up):
+        gated, upped = gemm.gemm(x, gate, None, paired=up, out_dtype=jnp.bfloat16,
+                                 out_dtypes=(jnp.bfloat16, jnp.bfloat16))
+        return jnp.sum(swiglu(gated, upped).astype(jnp.float32))
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with (generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh),
+          jax.default_matmul_precision("default"), generation.chosen(grouped_matmul="mosaic"),
+          tuning.seen() as launches):
+        jax.jit(jax.grad(loss)).trace(*shapes).lower(lowering_platforms=("cuda",))
+    input_gradients = [bound for _, bound in launches.taken
+                       if bound.arguments.get("trans_rhs") and bound.arguments.get("kernel") is not None]
+    assert len(input_gradients) == 1, len(input_gradients)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm90"))
+def test_a_joined_input_gradient_is_as_finite_as_its_two_products(generation_name):
+    """A paired product's input gradient over its joined depths (`gemm`'s `joined`) sums each product apart
+    and adds the two at the finish: where each product's terms cancel to zero inside fp32's range, the joined
+    gradient is zero too, never a sum of the two products' partials past the range (base review F2: +2^126
+    terms of the gate's and the up projection's, each product's own cancelled by its -2^126 ones a depth step
+    later, would meet at 2^128 in one running sum)."""
+    rows, depth, width = 128, 128, 256
+    big = 2.0 ** 63
+    matrix = np.zeros((depth, width), np.float32)
+    matrix[0, [0, 1]], matrix[0, [128, 129]] = big, -big
+    cotangent = np.zeros((rows, width), np.float32)
+    cotangent[:, [0, 1, 128, 129]] = big
+    x = jnp.zeros((rows, depth), jnp.bfloat16)
+    gate = up = jnp.asarray(matrix, jnp.bfloat16)
+    cotangents = (jnp.asarray(cotangent, jnp.bfloat16),) * 2
+
+    def paired(x):
+        return gemm.gemm(x, gate, None, paired=up, out_dtype=jnp.bfloat16,
+                         out_dtypes=(jnp.bfloat16, jnp.bfloat16), interpret_on_cpu=True)
+
+    with (generation.assumed(generation_name), jax.default_matmul_precision("default"),
+          generation.chosen(grouped_matmul="mosaic")):
+        _, pullback = jax.vjp(paired, x)
+        (d_x,) = pullback(cotangents)
+    assert np.all(np.asarray(d_x, np.float32) == 0), np.asarray(d_x, np.float32)[0, :4]

@@ -438,10 +438,11 @@ class Gmm(_Triton):
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
              first: jax.Array | None = None, gather: jax.Array | None = None,
-             scatter: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+             scatter: jax.Array | None = None, joined: jax.Array | None = None, *, out_dtype: str,
+             trans_rhs: bool, interpret: bool,
              hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: Tile, return_residuals: bool = False):
-        del paired, gather, scatter  # a second matrix and table rows are Mosaic GPU's alone (`tables`)
+        del paired, gather, scatter, joined  # a second matrix, joined rows, tables: Mosaic GPU's (`tables`)
         # Imported at first use: the kernels need jax's Pallas Triton backend,
         # which jax 0.11.2 deprecates, and importing a model must not load it.
         if dense:
@@ -1130,7 +1131,7 @@ class MosaicGmm(_Mosaic):
     exact sums too: an FP8 product's running sum promoted into fp32 every step (`product.eight`)."""
 
     PRODUCER_GATHERS: ClassVar[bool] = True
-    ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
+    ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'joined')
     EXACT_SUMS: ClassVar[bool] = True
     FP8: ClassVar[bool] = True
     STEP_SCALED: ClassVar[bool] = False
@@ -1157,7 +1158,7 @@ class MosaicGmm(_Mosaic):
             dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],),
             paired=ba.arguments.get('paired') is not None, step_scaled=self.STEP_SCALED,
             block_scaled=self.BLOCK_SCALED, gathered=ba.arguments.get('gather') is not None,
-            interpret=bool(ba.arguments['interpret']))
+            interpret=bool(ba.arguments['interpret']), joined=ba.arguments.get('joined') is not None)
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         # A group's rows on average over the call's groups, which a stack read from its `first` matrix
@@ -1308,6 +1309,8 @@ class MosaicGmm(_Mosaic):
                             {'columns': 'width'}))]
         if ba.arguments.get('paired') is not None:
             dims.append(('paired', ba.arguments['paired'], matrix))
+        if ba.arguments.get('joined') is not None:
+            dims.append(('joined', ba.arguments['joined'], {1: 'depth'}))
         return dims
 
     BLOCKS: ClassVar[dict[str, str]] = {'rows': 'block_m', 'depth': 'block_k', 'columns': 'block_n'}
@@ -1468,17 +1471,19 @@ class MosaicGmm(_Mosaic):
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
              first: jax.Array | None = None, gather: jax.Array | None = None,
-             scatter: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+             scatter: jax.Array | None = None, joined: jax.Array | None = None, *, out_dtype: str,
+             trans_rhs: bool, interpret: bool,
              hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
         del return_residuals
         return self._forward(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                             gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret,
-                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config, formats={})
+                             gather, scatter, joined, out_dtype=out_dtype, trans_rhs=trans_rhs,
+                             interpret=interpret, hooks=hooks, exact_sums=exact_sums, dense=dense,
+                             config=config, formats={})
 
     def _forward(self, tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first, gather,
-                 scatter, *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks, exact_sums: bool,
-                 dense: bool, config: mosaic_gpu.Tiles, formats: dict):
+                 scatter, joined=None, *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks,
+                 exact_sums: bool, dense: bool, config: mosaic_gpu.Tiles, formats: dict):
         """`_fwd`'s one forward, every product launch's: the call as the launch runs it, its depth and width
         padded to whole tiles (`_aligned`), its outputs sliced back; `formats` the format operands a
         subclass's binding takes (`MosaicStepScaledGmm`'s step scales, `MosaicMxGmm`'s block scales), passed
@@ -1486,12 +1491,13 @@ class MosaicGmm(_Mosaic):
         width = kernel.shape[1] if trans_rhs else kernel.shape[2]
         call = (bound := self._aligned(self.bind(
             tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first, gather, scatter,
-            out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret, hooks=hooks, exact_sums=exact_sums,
-            dense=dense))).arguments
+            joined, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret, hooks=hooks,
+            exact_sums=exact_sums, dense=dense))).arguments
         tokens, kernel, paired, hooks = call['tokens'], call['kernel'], call.get('paired'), call['hooks']
+        joined = call.get('joined')
         prologue_operands, epilogue_operands = call['prologue_operands'], call.get('epilogue_operands', ())
         out, residuals = self._launched_call(tokens, kernel, sizes, prologue_operands, epilogue_operands,
-                                             paired, first, gather, scatter, out_dtype=out_dtype,
+                                             paired, first, gather, scatter, joined, out_dtype=out_dtype,
                                              trans_rhs=trans_rhs, interpret=interpret, hooks=hooks,
                                              exact_sums=exact_sums, dense=dense, config=config,
                                              formats={**formats, **self._stated(bound, config)})
@@ -1513,8 +1519,8 @@ class MosaicGmm(_Mosaic):
         return bool(ba.arguments['trans_rhs']) or eight(ba.arguments['kernel'].dtype)
 
     def _launched_call(self, tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                       gather, scatter, *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks,
-                       exact_sums: bool, dense: bool, config: mosaic_gpu.Tiles, formats: dict):
+                       gather, scatter, joined=None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+                       hooks: Hooks, exact_sums: bool, dense: bool, config: mosaic_gpu.Tiles, formats: dict):
         """`_fwd`'s launch of the call as it runs it (`_aligned`), `formats` its mainloop's keywords."""
         if config.swapped:
             return self._swapped_launch(kernel[0], tokens, sizes, out_dtype=out_dtype, interpret=interpret,
@@ -1525,7 +1531,7 @@ class MosaicGmm(_Mosaic):
                               out_dtype=out_dtype, multiprocessors=self._launched(config, interpret),
                               interpret=INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
-                              dense=dense, paired=paired, exact_sums=exact_sums, gather=gather,
+                              dense=dense, paired=paired, joined=joined, exact_sums=exact_sums, gather=gather,
                               scatter=scatter, **stages, **formats, **hooks.kernel_options()), None
 
 
@@ -1552,14 +1558,16 @@ class MosaicPackedGmm(MosaicGmm):
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
              first: jax.Array | None = None, gather: jax.Array | None = None,
-             scatter: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+             scatter: jax.Array | None = None, joined: jax.Array | None = None, *, out_dtype: str,
+             trans_rhs: bool, interpret: bool,
              hooks: Hooks = NO_HOOKS, exact_sums: bool = False, dense: bool = False,
              config: mosaic_gpu.Tiles, return_residuals: bool = False, packed_rows: bool = False):
         # `packed_rows` states the swapped call's orientation (`_swapped`), which its derivation reads: the
         # call itself runs as `config` says (`_launched_call`).
         del packed_rows
         return super()._fwd(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                            gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret,
+                            gather, scatter, joined, out_dtype=out_dtype, trans_rhs=trans_rhs,
+                            interpret=interpret,
                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config,
                             return_residuals=return_residuals)
 
@@ -1615,11 +1623,11 @@ class MosaicPackedGmm(MosaicGmm):
         return family.layout == plgpu.Layout.WGMMA
 
     def _launched_call(self, tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                       gather, scatter, *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks,
-                       exact_sums: bool, dense: bool, config: mosaic_gpu.Tiles, formats: dict):
+                       gather, scatter, joined=None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+                       hooks: Hooks, exact_sums: bool, dense: bool, config: mosaic_gpu.Tiles, formats: dict):
         if not config.swapped:
             return super()._launched_call(tokens, kernel, sizes, prologue_operands, epilogue_operands,
-                                          paired, first, gather, scatter, out_dtype=out_dtype,
+                                          paired, first, gather, scatter, joined, out_dtype=out_dtype,
                                           trans_rhs=trans_rhs, interpret=interpret, hooks=hooks,
                                           exact_sums=exact_sums, dense=dense, config=config, formats=formats)
         # The matrix's words and scales the rows, decoded in registers (`_swaps_on`).
@@ -1846,15 +1854,16 @@ class _ScaledGmm(MosaicGmm):
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array, prologue_operands: tuple = (),
              epilogue_operands: tuple = (), paired: jax.Array | None = None, first: jax.Array | None = None,
-             gather: jax.Array | None = None, scatter: jax.Array | None = None, *, out_dtype: str,
-             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
-             dense: bool = False, scales: tuple = (), config: mosaic_gpu.Tiles,
+             gather: jax.Array | None = None, scatter: jax.Array | None = None,
+             joined: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+             hooks: Hooks = NO_HOOKS, exact_sums: bool = False, dense: bool = False, scales: tuple = (),
+             config: mosaic_gpu.Tiles,
              return_residuals: bool = False):
         del return_residuals
         return self._forward(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                             gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret,
-                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config,
-                             formats={self.SCALES: tuple(scales)})
+                             gather, scatter, joined, out_dtype=out_dtype, trans_rhs=trans_rhs,
+                             interpret=interpret, hooks=hooks, exact_sums=exact_sums, dense=dense,
+                             config=config, formats={self.SCALES: tuple(scales)})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2040,13 +2049,14 @@ class CutlassGmm(_Cutlass):
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
              first: jax.Array | None = None, gather: jax.Array | None = None,
-             scatter: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+             scatter: jax.Array | None = None, joined: jax.Array | None = None, *, out_dtype: str,
+             trans_rhs: bool, interpret: bool,
              hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
         # No hooks, side operands, second matrix, stack read from a first matrix or exact sums: the launch is
         # not eligible for them (`_Cutlass.eligible`); a dense call is one group, as any.
         del prologue_operands, epilogue_operands, paired, first, gather, scatter, interpret, hooks, exact_sums
-        del dense, config
+        del dense, config, joined
         importlib.import_module('dew_cutlass').registered()
         width = kernel.shape[1] if trans_rhs else kernel.shape[2]
         out = jax.ShapeDtypeStruct((tokens.shape[0], width), jnp.dtype(out_dtype))
@@ -2431,8 +2441,8 @@ def launched(launches, arguments, options, *, product: Product, whole: bool):
 
 def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),
              paired: jax.Array | None = None, first: jax.Array | None = None, gather: jax.Array | None = None,
-             scatter: jax.Array | None = None, *, out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS,
-             interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
+             scatter: jax.Array | None = None, joined: jax.Array | None = None, *, out_dtype, trans_rhs: bool,
+             hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
     """The launches, arguments and options of each group's rows of `tokens` times its matrix of `kernel`,
     both of one dtype, with the template's hooks (`gemm.gemm`). `promoted`,
     the declared product's (`templates.product.Product`), adds each depth step's partial apart
@@ -2443,8 +2453,9 @@ def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_oper
     banked layer's experts, `gemm.gemm`'s `layer`); `gather`, int32 `[rows]`, the rows of `tokens` the
     product's rows are, in order (a mixture of experts' tokens read where they lie, row 1376); `scatter`,
     int32 `[rows]` a permutation, the output row each product row lands at (its slots written in token
-    order); Mosaic GPU's launch alone takes either."""
-    optional = (paired, first, gather, scatter)
+    order); Mosaic GPU's launch alone takes either; `joined`, rows of `tokens`' shape that `paired` multiplies
+    into the one product (`mosaic_gpu.gmm`'s `joined`: a paired product's input gradient, row 6783)."""
+    optional = (paired, first, gather, scatter, joined)
     last = max((place for place, value in enumerate(optional) if value is not None), default=-1)
     arguments = (tokens, kernel, sizes, tuple(prologue_operands), tuple(epilogue_operands),
                  *optional[:last + 1])
