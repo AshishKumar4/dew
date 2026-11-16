@@ -1951,4 +1951,5 @@ def test_a_rate_injected_inside_an_injected_factory_reports_the_factorys():
     state = wrapped.init(params)
     for _ in range(2):
         _, state = wrapped.update({"w": jnp.ones(3)}, state, params)
-    np.testing.assert_allclose(np.asarray(learning_rate(state)), 1e-2 + 2 * (1e-3 - 1e-2) / 10, rtol=1e-6)
+    # The rate the second update stepped at: the schedule after one update.
+    np.testing.assert_allclose(np.asarray(learning_rate(state)), 1e-2 + (1e-3 - 1e-2) / 10, rtol=1e-6)
