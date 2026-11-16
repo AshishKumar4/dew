@@ -79,9 +79,9 @@ static void caught(int signum) {
        worker) waits here, so the process lives until it is read, and dies with it as the first re-raises:
        with the handler reset once taken, a second fault ended the process before pystack attached, and no
        stack was read (train 928, 2026-11-16). It waits for the collector's word (or as long as the first
-       waits for it) and a second more for the first to re-raise, then dies by its own signal: a signal nested
-       in the reporting thread's handler ends there once the stacks are read. The election is the process's own,
-       so a child forked meanwhile reports its own signal (review). */
+       waits for it) and a second more for the first to re-raise, then dies by its own signal: a signal
+       nested in the reporting thread's handler ends there once the stacks are read. The election is the
+       process's own, so a child forked meanwhile reports its own signal (review). */
     int self = (int)getpid();
     if (__atomic_exchange_n(&reporting, self, __ATOMIC_SEQ_CST) == self) {
         char done[4200];

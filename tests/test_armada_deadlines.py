@@ -302,14 +302,16 @@ threads = [threading.Thread(target=faults, args=(second,)) for second in (False,
 [thread.start() for thread in threads]
 [thread.join() for thread in threads]
 """
-"""A process two of whose threads fault: the second once the first's handler has marked it seen (`natives.SHIM`)."""
+"""A process two of whose threads fault: the second once the first's handler has marked it seen
+(`natives.SHIM`)."""
 
 
 def test_a_process_two_threads_of_which_a_signal_ends_keeps_its_native_stacks(ci):
-    """A process whose second thread faults while its first's fault is being reported lives until the collector
-    has read every thread's stacks, then dies by the signal: the second waits in its handler rather than ending the
-    process before the read (train 928, 2026-11-16: an XLA compile's SIGSEGV left no stack read). The collector is
-    held stopped until both threads are inside their handlers (SIGSEGV blocked in each), so the two overlap."""
+    """A process whose second thread faults while its first's fault is being reported lives until the
+    collector has read every thread's stacks, then dies by the signal: the second waits in its handler rather
+    than ending the process before the read (train 928, 2026-11-16: an XLA compile's SIGSEGV left no stack
+    read). The collector is held stopped until both threads are inside their handlers (SIGSEGV blocked in
+    each), so the two overlap."""
     capture = ci.natives.Capture(Path(sys.executable).with_name("py-spy"))
     assert capture.variables, capture.why
     os.kill(capture.collector.pid, signal.SIGSTOP)
