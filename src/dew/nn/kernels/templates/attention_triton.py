@@ -207,7 +207,7 @@ def _holding(op: Template, ba: tokamax.BoundArguments, launch: str, *, certified
                        "registers")
     # The launch's certified answer (`Template.holds`: its call's own taking, none where every config spills),
     # the one decision its call reads back.
-    if certified and not op.holds(ba, target):
+    if certified and not op.holds(ba):
         return Refusal('resources', f"every config of the Triton mainloop's {launch} spills as "
                        f"{target.generation}'s assembler builds it")
     return None

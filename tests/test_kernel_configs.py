@@ -363,7 +363,7 @@ def test_a_launch_certification_refuses_every_config_of_holds_no_call_and_its_ro
         ba = op.bind(x, gate, sizes, paired=up, hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u),
                      out_dtype="bfloat16", trans_rhs=False, interpret=False)
         assert op.taken(ba) is None
-        assert not op.holds(ba, generation.gpu_target())
+        assert not op.holds(ba)
         misses = report.misses()
         assert misses and all(not miss.stepped for miss in misses[-1:]), misses
         certified = len(report.certifications())

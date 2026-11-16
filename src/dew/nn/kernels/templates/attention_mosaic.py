@@ -106,7 +106,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     walked_layouts,
     whole_tiles,
 )
-from dew.nn.kernels.templates.base import Template, Unfitted
+from dew.nn.kernels.templates.base import Template
 
 
 def _column_blocks_of(family: mosaic.Family, dtype, value_width: int) -> list[int | None]:
@@ -350,13 +350,6 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
                      if all(value > 0 for value in change.values())
                      and change.get("stages", 2) >= 2
                      and change.get("consumers", 1) <= most_consumers(family, config))
-
-    def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
-        config = self.remaining(ba)
-        if config is None:
-            target = generation.gpu_target()
-            raise Unfitted(type(self).__name__, None, generation.shared_budget(target), target.generation)
-        return config
 
     def remaining(self, ba: tokamax.BoundArguments) -> Config | None:
         # Its derived config, none where it derives none; a call it refuses refused (`refusal`).
