@@ -234,6 +234,12 @@ def _placement(path: jax.tree_util.KeyPath, param,
         sides = _matrix_sides(named)
         if sides is not None:
             return _shifted(optax.contrib.MuonDimensionNumbers(*sides), stacked), "muon"
+        # Its stacking axes set aside (`BATCH_AXES`: a group stack), two dimensions declared on one side
+        # (('groups', 'attention', None), DeepSeek V4's grouped output projection) are each stacked
+        # matrix as its two dimensions make it, as an undeclared one is: contracted into the output side.
+        matrix = [dimension for dimension, name in enumerate(named) if name not in BATCH_AXES]
+        if len(matrix) == 2 and len(matrix) < len(named):
+            return _shifted(optax.contrib.MuonDimensionNumbers((matrix[0],), (matrix[1],)), stacked), "muon"
     if rank == 3 and param.shape[stacked + 1] == 1:
         return None, "adamw: a per-channel filter, [channels, 1, taps], a vector a channel"
     # A matrix whose declaration names one side (`('embed', None)`, a projection the rules shard on one

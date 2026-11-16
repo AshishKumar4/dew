@@ -726,11 +726,14 @@ def test_a_matrix_declared_on_one_side_is_orthogonalized_as_one_matrix(declared)
                           f"a matrix declared {declared}")
 
 
-def test_a_group_stack_is_orthogonalized_one_group_at_a_time():
-    """A block-diagonal kernel's groups, declared ('groups', 'embed', 'mlp'), are stacked matrices, as an
-    expert stack's are: Muon steps each group's [embed, mlp] alone, where reading the groups as part of
-    a side would orthogonalize one [groups * embed, mlp] matrix (row 6746, DeepSeek V4's grouped output
-    projection)."""
+@pytest.mark.parametrize("declared", [('groups', 'embed', 'mlp'), ('groups', 'attention', None)],
+                         ids=["two sides", "one side"])
+def test_a_group_stack_is_orthogonalized_one_group_at_a_time(declared):
+    """A block-diagonal kernel's groups, declared ('groups', 'embed', 'mlp') or on one side
+    ('groups', 'attention', None) as DeepSeek V4's grouped output projection is, are stacked matrices, as
+    an expert stack's are: Muon steps each group's matrix alone, where reading the groups as part of a side
+    would orthogonalize one [groups * embed, mlp] matrix, and a one-sided group stack was refused (row 6746;
+    the models lane's DeepSeek V4)."""
     embed, mlp = 8, 16
     path = ('params', 'layers_0', 'o_a_proj', 'kernel')
     draw = scaled_stack_draw([1.0, 16.0, 0.25], embed, mlp)
@@ -741,7 +744,7 @@ def test_a_group_stack_is_orthogonalized_one_group_at_a_time():
         return {'params': {'layers_0': {'o_a_proj': {'kernel': value}}}}
 
     def stepped(params, grads):
-        with boxed({path: ('groups', 'embed', 'mlp')}):
+        with boxed({path: declared}):
             updates, _ = solver.update(tree(grads), solver.init(tree(params)), tree(params))
         return np.asarray(node(updates, path))
 
@@ -752,6 +755,7 @@ def test_a_group_stack_is_orthogonalized_one_group_at_a_time():
 
     assert_as_exact(as_given(stepped), reference, draw, "a group stack", seeds=UPDATE_SEEDS,
                     truth_fn=reference)
+
 
 def test_the_router_gate_takes_the_adamw_update():
     """A router gate is declared ('embed', 'exp'): one column per expert, so
