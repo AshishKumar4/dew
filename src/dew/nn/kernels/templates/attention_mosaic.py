@@ -62,7 +62,6 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _forward_allocations,
     _plain_forward,
     _trained_forward,
-    _whole,
     certified_walk,
     forward_products,
     logits_ahead,
@@ -474,7 +473,7 @@ class MosaicForward(_Mainloop[Tiles]):
         # A call some row of which can be scaled (`algebra.may_scale`) launches the scaled op's kernels (its
         # own config, `scaled`), every other call, every ordinary input's, this op's unscaled ones, bit for
         # bit the scaled walk's there.
-        may = algebra.may_scale(_whole(value, self.parts), keys_axis=1,
+        may = algebra.may_scale(product.joined(value, self.parts), keys_axis=1,
                                 initial=None if initial is None else initial.acc,
                                 amplified=1.0 if drop is None else drop.bound)
         arguments = (query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
