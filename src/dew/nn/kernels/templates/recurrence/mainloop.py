@@ -274,8 +274,9 @@ class Operand:
         return jnp.concatenate(product.formed(x.astype(jnp.float32), self.parts), 0)
 
     def joined(self, x):
-        """Its stacked parts `x` as the value `[rows, columns]` they sum to, fp32 (`split`'s inverse)."""
-        return x.astype(jnp.float32).reshape(self.parts, -1, x.shape[-1]).sum(0)
+        """Its stacked parts `x` as the value `[rows, columns]` they sum to, fp32 (`split`'s inverse,
+        `product.whole`)."""
+        return product.whole(list(x.reshape(self.parts, -1, x.shape[-1])))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1738,7 +1739,7 @@ def _last_write(call: Call, keys: Operand, k_ref, row, final_token, key_columns,
 
     def key_rows(i):
         views = keys.vectors(k_ref, row + final_token, key_columns + i * call.block, call.block)
-        return functools.reduce(jnp.add, (family.rows_of(view).astype(jnp.float32) for view in views))
+        return product.whole([family.rows_of(view) for view in views])
 
     ends = family.iota(gated.shape, 0) == final_token
     return key_rows, columns(jnp.where(ends, gated, 0.0)), final_token

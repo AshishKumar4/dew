@@ -17,7 +17,7 @@ from jax.sharding import Mesh
 from kernel_compile import gate_generations
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import across, handoffs, mosaic, outputs, rings, stores, swizzling
+from dew.nn.kernels.templates import across, handoffs, mosaic, outputs, product, rings, stores, swizzling
 
 pytestmark = pytest.mark.kernel
 
@@ -1974,3 +1974,13 @@ def test_a_cp_async_walk_refuses_a_once_stream():
     x, w = _persisted_operands(family.rows)
     with generation.assumed("sm80"), pytest.raises(NotImplementedError):
         _walked_once(x[:family.rows], w, family=family, interpret=INTERPRETED)
+
+
+def test_a_values_parts_sum_back_to_it_exactly_fp32s_largest_among_them():
+    """An fp32 value's three bf16 parts (`product.formed`) sum back to it exactly (`product.whole`), the
+    largest finite values among them: fp32's largest, and bf16's largest past by `2^120 - 2^111`, whose
+    leading two parts summed first reach `2^128`, past fp32's largest, to infinity (rows 6842, 6866)."""
+    largest = float(np.finfo(np.float32).max)
+    past = 2.0**128 - 2.0**111
+    x = jnp.asarray([largest, past, -largest, -past, 1.0 + 2.0**-23], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(product.whole(product.formed(x, 3))), np.asarray(x))
