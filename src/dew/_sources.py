@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import abc
 import dataclasses
+import enum
 import functools
 import importlib.metadata
 import inspect
@@ -279,22 +280,40 @@ ATTRS_DEFAULTS = {"eq": True, "order": False}
 """What `attrs.define` makes a class with unless told otherwise, of `ATTRS_COMPARISONS`."""
 
 
-def generation_options(held: type) -> tuple[tuple[str, bool], ...]:
-    """How a class generator made `held` itself where that departs from its defaults, each by its name: a
-    dataclass's options apart from `DATACLASS_OPTIONS` (eq, order, frozen, unsafe_hash, ...); an attrs
-    class's equality and ordering by the methods it holds (`ATTRS_COMPARISONS`) apart from `ATTRS_DEFAULTS`.
-    Empty for a
-    class made as its generator makes one by default, or by none, so its statement is what it was (base
-    review of 67fd128db: an eq=False went unstated, and a step comparing its instances read other rows; train
-    963's review: every attrs class stated its comparisons, a class made by default among them)."""
+ATTRS_PROPS_UNSTATED = frozenset({"on_setattr_hook", "field_transformer"})
+"""The parts of attrs' record of how it made a class (`__attrs_props__`, attrs 25.4 and later) whose effect
+its fields state: the hook each field's setter runs (`generated_fields`' effective hook) and the fields a
+transformer made."""
+
+
+def generation_options(held: type) -> tuple[tuple[str, bool | str], ...]:
+    """How a class generator made `held` itself, each option by its name, as the generator records it, which
+    with its fields (`generated_fields`) is what the methods it wrote are written from: a dataclass's options
+    apart from `DATACLASS_OPTIONS` (eq, order, frozen, unsafe_hash, ...); an attrs class's every recorded
+    option (`__attrs_props__`: frozen, slotted, hashability, ...) but `ATTRS_PROPS_UNSTATED`, or under an
+    attrs that records none, its equality and ordering by the methods it holds (`ATTRS_COMPARISONS`) apart
+    from `ATTRS_DEFAULTS`. The code it wrote is stated by none of them: attrs writes a process's salted
+    string hash into a hashable class's `__hash__` (train 974's review). Empty for a dataclass made as
+    `dataclasses.dataclass` makes one by default, or a class no generator made (base review of 67fd128db:
+    an eq=False went unstated, and a step comparing its instances read other rows)."""
     params = vars(held).get("__dataclass_params__")
     if params is not None:
         return tuple((name, getattr(params, name)) for name, default in DATACLASS_OPTIONS.items()
                      if getattr(params, name) != default)
+    props = vars(held).get("__attrs_props__")
+    if props is not None:
+        return tuple((name, _option(getattr(props, name))) for name in vars(type(props))["__slots__"]
+                     if name not in ATTRS_PROPS_UNSTATED)
     if "__attrs_attrs__" in vars(held):
         given = {name: vars(held).get(method) is not None for name, method in ATTRS_COMPARISONS.items()}
         return tuple((name, value) for name, value in given.items() if value != ATTRS_DEFAULTS[name])
     return ()
+
+
+def _option(value: bool | enum.Enum) -> bool | str:
+    """An option attrs records of a class (`__attrs_props__`) as an identity states it: a flag as it is, a
+    choice of its (`KeywordOnly`, `Hashability`) by its value's name."""
+    return value.name if isinstance(value, enum.Enum) else value
 
 
 def annotation_text(annotation: Hashable) -> str:
@@ -322,9 +341,10 @@ def _field_value[Value](name: str, value: Value) -> Value | str | dict:
     return value
 
 
-ATTRS_UNSTATED = frozenset({"name", "default"})
-"""An attrs field's parts its `Attribute` records that `generated_fields` states apart: its name, and its
-default, split into a default and a factory."""
+ATTRS_UNSTATED = frozenset({"name", "default", "on_setattr"})
+"""An attrs field's parts its `Attribute` records that `generated_fields` states apart: its name, its
+default, split into a default and a factory, and its setter hook, which the hook its class's setter runs on
+it states (`attrs.setters.NO_OP` among them, a bare sentinel no identity names; train 974's review)."""
 
 DATACLASS_UNSTATED = frozenset({"name", "default", "default_factory"})
 """A dataclass field's parts its `dataclasses.Field` records that `generated_fields` states apart."""
@@ -368,19 +388,3 @@ def generated_fields(held: type) -> list[GeneratedField]:
                                         tuple(parts)))
         return found
     return []
-
-
-def generated_members(held: type) -> list[tuple[str, types.FunctionType | tuple[str, ...]]]:
-    """The members a class generator wrote into `held` itself, by name, in order: each function whose code no
-    file holds (made at run time, as a dataclass's and attrs' `__init__`, comparisons and `__setattr__`
-    are), and its `__match_args__`, which `members` leaves out as machinery. A class whose generator's
-    options or fields change them is stated otherwise by them (the evening audit of 2026-11-16)."""
-    found: list[tuple[str, types.FunctionType | tuple[str, ...]]] = []
-    for name, member in sorted(vars(held).items()):
-        member = wrapped(member)
-        match member:
-            case tuple() if name == "__match_args__":
-                found.append((name, tuple(str(held) for held in member)))
-            case types.FunctionType() if member.__code__.co_filename.startswith("<"):
-                found.append((name, member))
-    return found

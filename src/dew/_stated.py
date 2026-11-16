@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import functools
 import hashlib
-import inspect
 import logging
 import os
 import sys
@@ -347,26 +346,9 @@ def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, .
             if _sources.own_source(maker.__module__) else None)
     entry: list[JSON] = [_coded(held.__module__, at), held.__qualname__, _members(held, at, known, walking),
                          fields, made]
-    # How its generator made it where that departs from the generator's defaults (eq=False, order=True),
-    # and the members it wrote by what they are (`_generated`).
+    # How its generator made it, as it records its options (`generation_options`).
     options = _sources.generation_options(held)
-    generated = {name: _generated(member) for name, member in _sources.generated_members(held)}
-    return [*entry, dict(options), generated] if options or generated else entry
-
-
-def _generated(member: types.FunctionType | tuple[str, ...]) -> JSON:
-    """A member a class generator wrote (`dew._sources.generated_members`) by what it is: a function by its
-    parameters (each one's name, kind, annotation as text and whether it has a default) and its code, which
-    the generator wrote from the class's fields and options; `__match_args__` by its names."""
-    if not isinstance(member, types.FunctionType):
-        return json_value(member, "a generated member")
-    parameters: list[JSON] = [
-        [parameter.name, parameter.kind.name, _sources.annotation_text(parameter.annotation)
-         if parameter.annotation is not inspect.Parameter.empty else None,
-         parameter.default is not inspect.Parameter.empty]
-        for parameter in inspect.signature(member).parameters.values()]
-    stated: list[JSON] = ["generated", parameters, _code(member.__code__)]
-    return stated
+    return [*entry, dict(options)] if options else entry
 
 
 def _converter(value, at: str, again: Callable[..., JSON]) -> JSON | None:
