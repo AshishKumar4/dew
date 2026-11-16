@@ -1155,3 +1155,44 @@ def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read
     (found,) = kc.reports({}, [unread])
     assert "machine code" in found.unread
     assert found.failure(232448, 0) is not None
+
+
+class SpillingFirst(Uncounted):
+    """`Uncounted` with the grouped forward's own candidates, its space the tile its derivation takes and a
+    paired product's widest, 128 x 256 at two stages, which spills in every compile (two accumulators of 128
+    registers a thread): a launch whose tuner meets a spilling candidate beside one that holds."""
+
+    def candidate(self, ba, config, target):
+        return super(Uncounted, self).candidate(ba, config, target)
+
+    def _get_autotuning_configs(self, ba):
+        return {ba.heuristics_config, widest(ba.heuristics_config)}
+
+
+def widest(derived):
+    """`derived`'s paired product at its widest, 128 x 256 at two stages (`SpillingFirst`)."""
+    columns = derived.grid_block_n * derived.block_n
+    return dataclasses.replace(derived, block_n=256, grid_block_n=columns // 256, stages=2)
+
+
+@lowers("sm90")
+def test_a_tuner_times_no_candidate_the_gpus_assembler_refuses():
+    """The configs a measuring tuner times (`tuning._candidates`) are those its launch's certification holds
+    (`report.certified`, as a run's derivation certifies its config): a paired launch's widest tile, which
+    spills in every compile, is never timed nor chosen, where uncertified it was timed as slow as its spills
+    and could be picked; the tile its derivation takes, which holds, is."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    op = SpillingFirst()
+    operands = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
+        ((ROWS, FEATURES), jnp.bfloat16), ((EXPERTS, FEATURES, WIDTH), jnp.bfloat16),
+        ((EXPERTS,), jnp.int32))]
+    with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]), report.refusals():
+        bound = op.bind(*operands, paired=jax.ShapeDtypeStruct((EXPERTS, FEATURES, WIDTH), jnp.bfloat16),
+                        out_dtype="bfloat16", trans_rhs=False, interpret=False,
+                        hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u))
+        derived = bound.heuristics_config
+        # The widest is a config a pin may name, which uncertified the tuner timed.
+        assert op.pinnable(bound, widest(derived))
+        assert tuning._candidates(op, bound) == [derived]
