@@ -34,7 +34,15 @@ from multimodal_families import (
 )
 from one_draw import assert_as_exact_as_the_reference
 from recorded_truths import assert_truths_as_recorded
-from reference_error import GateFailure, Inconclusive, UnrecordedTruth, recording as read_recording, widened
+from reference_error import (
+    GateFailure,
+    Inconclusive,
+    UnrecordedTruth,
+    as_given,
+    assert_as_exact,
+    recording as read_recording,
+    widened,
+)
 from reference_runs import assert_arms_as_recorded
 from safetensors.numpy import load_file
 
@@ -63,7 +71,9 @@ def source():
 
 
 def test_public_processor_and_native_forward_match_conditional_model(source):
-    """Valid-slot fp32 logit error 5.96e-6; tolerance 1e-4, identical argmax."""
+    """The public processor encodes the reference's ids and the native forward picks the reference's argmax
+    at every valid slot; its logits' numerics are the drawn site's (`multimodal-gemma3`,
+    `test_a_drawn_site_is_on_par_with_its_reference`), and its images attend each other both ways."""
     loaded, inputs = source
     np.testing.assert_array_equal(inputs.tokens, np.load(FIXTURE / "input_ids.npy"))
     model = loaded.model
@@ -72,7 +82,6 @@ def test_public_processor_and_native_forward_match_conditional_model(source):
     )
     valid = np.asarray(inputs.token_fields["attention_mask"])
     reference = np.load(FIXTURE / "logits.npy")
-    np.testing.assert_allclose(np.asarray(output)[valid], reference[valid], atol=1e-4, rtol=0)
     np.testing.assert_array_equal(np.asarray(output)[valid].argmax(-1), reference[valid].argmax(-1))
     from reference_error import assert_moves
 
@@ -101,10 +110,9 @@ def test_public_processor_and_native_forward_match_conditional_model(source):
 
 
 def test_objective_pixel_gradient_matches_reference(source):
-    """Pixel-gradient max error 2.05e-7 and CE error 4.77e-7 against Torch.
-
-    The gradient crosses image encoder, projection, decoder and shifted loss.
-    """
+    """The objective's pixel gradient crosses the image encoder, projection, decoder and shifted loss, and a
+    padded image slot takes none of it, to the bit. Its loss and gradient's numerics are the drawn site's,
+    whose step is this objective's (`_stepped`, `multimodal-gemma3`)."""
     loaded, inputs = source
     objective = LMObjective(loaded, inputs.tokens.shape[1] - 1,
                             ema_decay=None, pad_id=0)
@@ -115,16 +123,17 @@ def test_objective_pixel_gradient_matches_reference(source):
         statistics, _ = objective.loss(loaded.variables, {"text": prepared}, step)
         return objective.reduce_loss(statistics)[0]
 
-    value, gradient = jax.jit(jax.value_and_grad(loss))(inputs.conditioning["pixel_values"])
-    reference = json.loads((FIXTURE / "training.json").read_text())
-    np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
-    real_images = jnp.stack([gradient[0, 0], gradient[1, 0], gradient[1, 1]])
-    np.testing.assert_allclose(real_images, np.load(FIXTURE / "pixel_gradient.npy"), atol=1e-5, rtol=1e-4)
+    _, gradient = jax.jit(jax.value_and_grad(loss))(inputs.conditioning["pixel_values"])
+    for image in (gradient[0, 0], gradient[1, 0], gradient[1, 1]):
+        assert np.any(np.asarray(image))
     np.testing.assert_array_equal(gradient[0, 1], jnp.zeros_like(gradient[0, 1]))
 
 
 def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path):
-    """One real Trainer update agrees with the reference's all-parameter SGD."""
+    """One real Trainer update is the all-parameter SGD step the drawn site holds to the reference's
+    (`multimodal-gemma3`): its logits after the step on par with the step's own (`_stepped`, `_trained`)
+    over drawn pixels by check 1, the step in float64 the truth; and the trained model exports and reloads
+    to the bit."""
     loaded, inputs = source
     objective = LMObjective(loaded, inputs.tokens.shape[1] - 1,
                             ema_decay=None, pad_id=0)
@@ -138,8 +147,7 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
     state = trainer.fit(data, steps=1, log_every=1)
     output = loaded.model.apply(state.variables, inputs.tokens, **inputs.kwargs())
     valid = np.asarray(inputs.token_fields["attention_mask"])
-    expected = np.load(FIXTURE / "updated_logits.npy")
-    np.testing.assert_allclose(np.asarray(output)[valid], expected[valid], atol=1e-4, rtol=0)
+    assert_trainer_takes_the_plain_step(loaded, inputs, trainer)
     # The step moved Dew's own logits: an update is a structural change, exact inequality says enough.
     untrained = loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs())
     assert not np.array_equal(np.asarray(output)[valid], np.asarray(untrained)[valid])
@@ -149,10 +157,57 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
                               strict=True):
         np.testing.assert_array_equal(actual, wanted)
     restored = reloaded.model.apply(reloaded.variables, inputs.tokens, **inputs.kwargs())
-    np.testing.assert_allclose(np.asarray(restored)[valid], expected[valid], atol=1e-4, rtol=0)
+    np.testing.assert_array_equal(np.asarray(restored)[valid], np.asarray(output)[valid])
     assert reloaded.processor is not None
     assert loaded.processor is not None
     assert reloaded.processor.decode(inputs.tokens) == loaded.processor.decode(inputs.tokens)
+
+
+TRAINER_STEP_SEEDS = 8
+"""The trainer's step against the plain step's declared draws (check 1), sized by `seeds_for` on armada."""
+
+
+def assert_trainer_takes_the_plain_step(loaded, inputs, trainer) -> None:
+    """`trainer`'s compiled step (`Trainer.compile`) over `inputs`' rows, from its first state, on par with
+    the plain SGD step (`_stepped`, `_trained`) by check 1 over drawn pixels near the source draw's: the
+    logits after each step at every valid slot, the plain step in float64 the truth. The trainer takes
+    `inputs`' rows each repeated to its batch, which leaves the step's mean loss and so its gradient the
+    same."""
+    rows = 2 * jax.device_count()
+    valid = jnp.asarray(inputs.token_fields["attention_mask"], bool)[..., None]
+    first = trainer.initial_state()
+
+    def with_pixels(pixels):
+        return dataclasses.replace(inputs, conditioning={**inputs.conditioning, "pixel_values": pixels})
+
+    step = trainer.compile(first, {"text": with_pixels(inputs.conditioning["pixel_values"]).take_rows(
+        jnp.arange(rows) % 2)})
+
+    @as_given
+    def trained(pixels):
+        # A fresh copy of the first state a draw: a step takes its state's buffers.
+        given = with_pixels(jnp.asarray(pixels))
+        state, *_ = step(jax.tree.map(jnp.copy, first), {"text": given.take_rows(jnp.arange(rows) % 2)})
+        return jnp.where(valid, loaded.model.apply(state.variables, given.tokens, **given.kwargs()), 0)
+
+    def plain(model, variables):
+        @jax.jit
+        def run(pixels):
+            given = with_pixels(pixels.astype(model.dtype))
+            _, gradient, _ = _stepped(model, variables, given)
+            return jnp.where(valid, model.apply(_trained(variables, gradient), given.tokens,
+                                                **given.kwargs()), 0)
+        return run
+
+    exact = ModelConfig.from_model(loaded.model).with_dtype("float64").build()
+    pixels = np.asarray(inputs.conditioning["pixel_values"])
+
+    def draw(seed):
+        rng = np.random.default_rng([1305, seed])
+        return (pixels + rng.standard_normal(pixels.shape).astype(np.float32) * 0.01,)
+
+    assert_as_exact(trained, plain(loaded.model, loaded.variables), draw, "gemma3 trainer step",
+                    seeds=TRAINER_STEP_SEEDS, truth_fn=plain(exact, widened(loaded.variables)))
 
 
 def test_model_inputs_alignment_preserves_media_identity(source):
@@ -344,6 +399,10 @@ def _wrong_inputs(family: str, inputs: ModelInputs, text: bool = False) -> Model
         # Text-only rotary coordinates instead of the interleaved spatial ones.
         return dataclasses.replace(inputs, token_fields={
             name: value for name, value in inputs.token_fields.items() if name != "rotary_positions"})
+    if family == "gemma3":
+        # Image tokens attend each other both ways; reading them causally keeps every shape.
+        return dataclasses.replace(inputs, token_fields={
+            name: value for name, value in inputs.token_fields.items() if name != "image_groups"})
     if family == "gemma3n":
         # The reference hands its audio encoder the inverted mask; getting
         # the polarity wrong keeps every shape.
@@ -621,7 +680,7 @@ def test_source_trained_export_and_frozen_buffers_match_reference(family_source,
                 np.testing.assert_array_equal(actual, original)
 
 
-SEEDS = {"llama4": 512}
+SEEDS = {"gemma3": 256, "llama4": 512}
 """Each drawn site's declared seeds (multimodal_families.DRAWN), sized by `seeds_for` paired as its recording
 confirmed them."""
 

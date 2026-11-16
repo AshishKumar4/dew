@@ -36,7 +36,8 @@ def run(family: str, text: bool, cases: dict[str, np.ndarray]) -> dict[str, np.n
 
     references, checkpoint = FAMILIES[family]
     source = ROOT / checkpoint
-    processor = AutoProcessor.from_pretrained(source, local_files_only=True)
+    processor = AutoProcessor.from_pretrained(source, local_files_only=True,
+                                              **PROCESSOR_OPTIONS.get(family, {}))
     prompts = json.loads((ROOT / references / "prompts.json").read_text())
     out = {}
     for name, inputs in draws(cases).items():
@@ -63,7 +64,7 @@ if __name__ == "__main__":
     if len(sys.argv) != 2 or not sys.argv[1].startswith("multimodal-"):
         raise SystemExit(__doc__)
     sys.path[:0] = [str(ROOT.parents[2]), str(ROOT.parents[1]), str(ROOT.parents[2] / "src")]
-    from multimodal_families import FAMILIES, text_rows
+    from multimodal_families import FAMILIES, PROCESSOR_OPTIONS, text_rows
 
     torch.set_num_threads(1)
     family, _, kind = sys.argv[1].removeprefix("multimodal-").partition("-")
