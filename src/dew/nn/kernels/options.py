@@ -247,12 +247,15 @@ class Compiling:
     """A program's first compile running in a thread of its own (`compiling`): the program, what its call
     lowered from (`OuterProgram.abstract_of`, None for a plain jit) and its lowering, which the program's
     compile through Dew's compile point takes where it compiles the same program over the same, lowering
-    nothing again, else where it lowers the same program (`program_digest`) (`attempting`)."""
+    nothing again, else where it lowers the same program (`program_digest`) (`attempting`), and whether
+    a call has taken its lowering (`taken`): a start that lowered again, its algebra passed twice, says
+    so."""
 
     program: Callable
     abstract: Hashable | None
     lowered: jax.stages.Lowered
     attempt: Future
+    taken: threading.Event = dataclasses.field(default_factory=threading.Event, compare=False)
 
 
 def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
@@ -685,6 +688,7 @@ class OuterProgram:
         begun = _ATTEMPTING.get()
         if begun is not None and begun.program is self and begun.abstract == self.abstract_of(args, kwargs):
             lowered = begun.lowered
+            begun.taken.set()
         else:
             lowered = self.lower(*args, **kwargs)
         # A program compiled ahead for this target runs as it was compiled (`taking`).
