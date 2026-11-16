@@ -721,7 +721,7 @@ def test_a_pool_is_declared_on_a_record_step_alone(batched):
 def test_a_stage_on_processes_before_a_cache_is_refused_and_one_on_threads_fills_it(tmp_path, read):
     """A stage declaring processes before a cache is refused as the read is compiled: a cache fills in its
     reading process, writing each input as its steps make it, so the processes would be unread; after the
-    cache it reads. One declaring threads, which run in the reading process, fills the cache on them. The
+    cache it reads. One declaring threads, which run in the reading process, fills the cache there. The
     fill ran the step in the reading process, the declared pool unread (the head review of theme 16, F5),
     and then threads were refused too (train 967's review, F5)."""
     catalog = Memory([{"id": index} for index in range(9)], shard_rows=9)
@@ -741,7 +741,7 @@ def test_a_stage_on_processes_before_a_cache_is_refused_and_one_on_threads_fills
     filled = first(Pipeline(catalog).map(ran_where, pool="threads", identity="ran_where@1")
                    .cache(str(tmp_path / "c")))
     assert [int(value) for value in filled["id"]] == [0, 1, 2]
-    assert all(str(thread).startswith("dew-step") for thread in filled["thread"])
+    assert all(int(pid) == os.getpid() for pid in filled["pid"])
 
 
 def first_where(row: Mapping) -> dict:

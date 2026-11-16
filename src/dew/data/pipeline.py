@@ -743,10 +743,10 @@ class _MainNames(pickle.Pickler):
         super().__init__(file)
         self.named: list[str] = []
 
-    def persistent_id(self, obj) -> None:
+    def persistent_id(self, pickled) -> None:
         # Every object pickled passes here first; None pickles it as pickle would.
-        if isinstance(obj, type | types.FunctionType) and obj.__module__ == "__main__":
-            self.named.append(obj.__qualname__)
+        if isinstance(pickled, type | types.FunctionType) and pickled.__module__ == "__main__":
+            self.named.append(pickled.__qualname__)
 
 
 def _main_named(step: _Step) -> list[str]:
