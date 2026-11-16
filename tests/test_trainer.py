@@ -174,8 +174,8 @@ def test_a_run_records_where_its_optimizers_split_sent_each_parameter():
 def test_a_runs_start_reports_each_phase_it_took_once():
     """A run's start reports the seconds each phase took (the data's preparation, the step's compile, the
     evaluations' warming) once, beside its first logged step's scalars, none after; and a fresh start that
-    took the compile begun beside its step's says so (`startup/start_overlapped`): its algebra passed once,
-    not again only to match the begun compile (train 914's F1, row 6847)."""
+    took the lowering begun beside its step's compile says so (`startup/start_overlapped`): its algebra
+    passed once, not again only to match the begun compile (train 914's F1, row 6847)."""
     tracker = RecordingTracker()
     trainer = make_trainer(objective=Features(), tracker=tracker)
     trainer.fit(dataset(val=val_batches(3)), steps=3, log_every=1, eval_every=2)

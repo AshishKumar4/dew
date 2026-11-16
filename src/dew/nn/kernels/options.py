@@ -248,7 +248,8 @@ class Compiling:
     lowered from (`OuterProgram.abstract_of`, None for a plain jit) and its lowering, which the program's
     compile through Dew's compile point takes where it compiles the same program over the same, lowering
     nothing again, else where it lowers the same program (`program_digest`) (`attempting`), and whether
-    one has taken it (`taken`): a start that compiled again, its begun compile wasted, says so."""
+    a call has taken its lowering (`taken`): a start that lowered again, its algebra passed twice, says
+    so."""
 
     program: Callable
     abstract: Hashable | None
@@ -687,6 +688,7 @@ class OuterProgram:
         begun = _ATTEMPTING.get()
         if begun is not None and begun.program is self and begun.abstract == self.abstract_of(args, kwargs):
             lowered = begun.lowered
+            begun.taken.set()
         else:
             lowered = self.lower(*args, **kwargs)
         # A program compiled ahead for this target runs as it was compiled (`taking`).
@@ -697,7 +699,6 @@ class OuterProgram:
         if begun is not None and (lowered is begun.lowered
                                   or program_digest(begun.lowered) == program_digest(lowered)):
             first = begun.attempt.result()
-            begun.taken.set()
         executable = report.compiled(lowered,
                                      relower=functools.partial(self._relowered, args, kwargs, relowered),
                                      first=first)

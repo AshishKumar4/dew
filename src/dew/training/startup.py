@@ -34,8 +34,8 @@ _log = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class Startup:
-    """The seconds each phase of a run's start took, by its name, and whether its start took the compile
-    begun beside its step's (`options.Compiling.taken`; None where none was begun), reported once
+    """The seconds each phase of a run's start took, by its name, and whether its start took the lowering
+    begun beside its step's compile (`options.Compiling.taken`; None where none was begun), reported once
     (`scalars`)."""
 
     seconds: dict[str, float] = dataclasses.field(default_factory=dict)
@@ -61,8 +61,8 @@ class Startup:
 
     def scalars(self) -> dict[str, float]:
         """Each phase's seconds as `startup/<name>_seconds`, and `startup/start_overlapped` 1 where the start
-        took the compile begun beside its step's and 0 where it compiled again, the first time they are
-        asked for; none after."""
+        took the lowering begun beside its step's compile (its algebra passed once) and 0 where it lowered
+        again, the first time they are asked for; none after."""
         if self.reported:
             return {}
         self.reported = True
