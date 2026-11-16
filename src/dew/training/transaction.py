@@ -420,8 +420,10 @@ def _held_in_copies(opt_state, params) -> bool:
 def _without(tree, cut):
     """`tree` without the leaves `cut` holds, a tree of some of its branches: its other branches as they
     are."""
-    if not isinstance(tree, Mapping) or not isinstance(cut, Mapping):
+    if not isinstance(cut, Mapping):
         return {}
+    if not isinstance(tree, Mapping):
+        return tree
     return {name: _without(value, cut[name]) if name in cut else value for name, value in tree.items()}
 
 

@@ -1732,8 +1732,9 @@ def _claims(modules: Sequence[str], leaves: Sequence[str]) -> tuple[str, ...]:
     return (*(f"{glob.escape(module)}/*" for module in modules), *map(glob.escape, leaves))
 
 
-FLOAT32_MAX = float(np.finfo(np.float32).max)
-"""The largest float32, past which a value is not finite."""
+UPDATE_CEILING = float(np.finfo(np.float16).max) / 4
+"""The largest update a step takes unread (`OptimConfig.checks_updates`): within the narrowest float a
+parameter is stored in, float16's, with room for the parameter it moves."""
 
 
 MUON_BOUND = 1e4
@@ -2093,8 +2094,9 @@ class OptimConfig:
         `dew.nn.finite.MAGNITUDE_BOUND`, the step's own gate) cannot form a value that is not finite, as
         Dew's defaults (Adam's eps of 1e-8, b1 squared under b2), no check runs and the update costs
         nothing more; where its update's bound cannot cover that gradient (a tiny eps, b2 at most b1
-        squared, a rate past what the bound allows, an Optax factory or a solve whose bound Dew does not
-        state), the formed update is read finite, a step skipped only where it is (`update_bound`)."""
+        squared, a rate whose update could pass `UPDATE_CEILING`, an Optax factory or a solve whose bound
+        Dew does not state), the formed update is read finite, a step skipped only where it is
+        (`update_bound`)."""
         constants = {name: value for name, value in (('b1', self.b1), ('b2', self.b2)) if value is not None}
         bound = update_bound(self.optimizer, {**constants, **self.optimizer_opts},
                              quantized=self.state_dtype == 'int8')
@@ -2104,8 +2106,7 @@ class OptimConfig:
         # A schedule takes no value past its peak (`ScheduleBase.peak`).
         peak = max(abs(rate.peak() if isinstance(rate, ScheduleBase) else float(rate)) * multiplier
                    for rate, multiplier in self.grouped_rates().values())
-        # The parameter's own step, within the largest float with room for the parameter it moves.
-        return not (peak * bound <= FLOAT32_MAX / 4)
+        return not (peak * bound <= UPDATE_CEILING)
 
     def grouped_rates(self) -> dict[str | None, tuple[float | ScheduleBase, float]]:
         """Each of `build`'s solvers' rate and its multiplier, by param group, or under None for the one

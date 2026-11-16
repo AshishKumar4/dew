@@ -1921,7 +1921,7 @@ def test_adams_default_first_moment_keeps_its_promoted_dtype():
     (OptimConfig(optimizer="adam", learning_rate=1.0, b2=0.0, optimizer_opts={"eps": 1e-20}), True),
     (OptimConfig(optimizer="adam", learning_rate=1e-3, optimizer_opts={"eps": 0.0}), True),
     (OptimConfig(optimizer="laprop", learning_rate=1e-3, optimizer_opts={"eps": 0.0}), True),
-    (OptimConfig(optimizer="adamw", learning_rate=1e37), True),
+    (OptimConfig(optimizer="adamw", learning_rate=100.0), True),
     (OptimConfig(optimizer="muon", learning_rate=2e-2, optimizer_opts={"adaptive": True}), True),
     (OptimConfig(optimizer="gauss_newton", learning_rate=1.0), True),
     (OptimConfig(optimizer="optax:sgd", learning_rate=1e-3), True),
