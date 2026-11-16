@@ -466,6 +466,9 @@
 "tests/test_attention_route.py::test_a_row_that_sees_no_key_weighs_each_value_before_summing_them",
 "tests/test_attention_route.py::test_narrowed_operands_hand_back_their_gradients_unrounded"
 ],
+"tests/test_attention_splash.py": [
+"tests/test_attention_splash.py::test_splash_agrees_with_the_reference_the_oracle_holds[packed-window]"
+],
 "tests/test_attention_stability.py": [
 "tests/test_attention_stability.py::test_a_score_cotangent_past_bf16s_largest_keeps_the_gradients_finite[accurate]",
 "tests/test_attention_stability.py::test_an_unseen_keys_value_past_fp32s_largest_takes_no_part_in_a_gradient[bfloat16]",
@@ -1384,6 +1387,9 @@
 "tests/test_fresh_rate.py::test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one",
 "tests/test_fresh_rate.py::test_under_muon_a_fresh_groups_rate_reaches_its_vector_and_its_matrix"
 ],
+"tests/test_gemm_formed.py": [
+"tests/test_gemm_formed.py::test_a_composed_mlps_training_step_compiles_within_its_resources[sm90]"
+],
 "tests/test_gemm_gather.py": [
 "tests/test_gemm_gather.py::test_a_gathered_kernel_gradient_lowers_for_cuda"
 ],
@@ -1760,9 +1766,6 @@
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp4]"
 ],
-"tests/test_level_stacking.py": [
-"tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[slower-first-layers]"
-],
 "tests/test_lfm3.py": [
 "tests/test_lfm3.py::test_an_lfm3_vl_trunk_read_or_built_resolves_its_defaults_and_cadence_one_way"
 ],
@@ -2088,9 +2091,6 @@
 "tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[pallas-8-1-False-False-None-geglu]",
 "tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[xla-2-2-data2-True-True-0.7-swiglu]",
 "tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[xla-8-1-True-True-0.7-geglu]"
-],
-"tests/test_mosaic_toolkit.py": [
-"tests/test_mosaic_toolkit.py::test_a_quantized_stage_converts_into_the_tile_its_products_read[sm80-int8-unscaled]"
 ],
 "tests/test_multimodal_model.py": [
 "tests/test_multimodal_model.py::test_a_drawn_site_is_on_par_with_its_reference[llama4]",
@@ -2771,10 +2771,6 @@
 "tests/test_samplers.py::test_heun_walks_edms_algorithm_2_with_its_churn[deterministic]",
 "tests/test_samplers.py::test_solver_matches_diffusers_latents_and_gradient[deis.3_short]"
 ],
-"tests/test_saved_models.py": [
-"tests/test_saved_models.py::test_a_dreamer_run_exports_its_world_model_and_agent_whole",
-"tests/test_saved_models.py::test_a_jepa_run_exports_and_loads_as_its_encoder"
-],
 "tests/test_saved_runs.py": [
 "tests/test_saved_runs.py::test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_from_its_record[decision]",
 "tests/test_saved_runs.py::test_a_diffusion_runs_release_stores_its_encoders_parameters_in_the_dtype_a_load_asks[495ef4e0eacb-diffusion]",
@@ -3260,10 +3256,6 @@
 ],
 "tests/test_weighed_check.py": [
 "tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
-],
-"tests/test_weighed_recording.py": [
-"tests/test_weighed_recording.py::test_a_weighed_site_is_judged_from_its_evidence_alone_as_from_its_outputs[one row]",
-"tests/test_weighed_recording.py::test_a_weighed_site_is_judged_from_its_evidence_alone_as_from_its_outputs[rows]"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",
