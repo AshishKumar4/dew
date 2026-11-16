@@ -769,30 +769,49 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
                for record in found)
 
 
-def test_a_b200s_gathered_input_gradient_fits_its_derived_resources():
-    """The expert down projection's input gradient from the hybrid compile-ahead step (row 5358), its
-    rows gathered by the load warp's TMA gathers, compiles at its derived tile without spilling and in the
-    shared memory its plan sized: its producer lowered to the registers its gathers hold
-    (`Transport.gathering_producer`, tcgen05's 40; at the floor's 24 it spilled 56 bytes), its gathered
-    stream's barriers as its family allocates them (`Allocations.gathered`; planned as plain ones, 976 bytes
-    short)."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+GATHERED_ON_A_B200 = {
+    "input gradient, its rows gathered": ("gmm", (4096, 1024), (4, 8192, 1024), (4096,)),
+    "kernel gradient, its tokens gathered": ("tgmm", (2048, 1024), (4096, 8192), "tokens"),
+    "kernel gradient, its cotangent gathered": ("tgmm", (4096, 8192), (4096, 1024), "cotangent"),
+}
+"""The expert down projection's gathered launches of a mixture of experts' step on a B200 (tests/test_compile_
+ahead's every-template cell, the hybrid compile-ahead step's: 4 experts of 8192 by 1024), each its operands'
+shapes and what its table gathers."""
 
-    launch = grouped_matmul.MosaicGmm()
+
+@lowers("sm100")
+@pytest.mark.parametrize("name", GATHERED_ON_A_B200)
+def test_a_b200s_gathered_launch_certifies_its_tcgen05_tile_on_its_second_compile(name):
+    """Each of the B200's gathered launches, certified on a compile-only B200 as a run takes it
+    (`tuning.KernelOp.taken`): its load warp's TMA gathers spill its producer at setmaxnreg's least, so its
+    certification raises the producer to its ladder's top (`grouped_matmul._Mosaic.rungs`, the program's
+    entry share) and takes its derived tcgen05 128 x 128 tile there, two certifications, nothing spilling.
+    Where its tile alone could step (row 6783), the kernel gradients stepped to 128 x 64 and then to
+    mma.sync, three certifications each."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    kind, rows, matrix, gathered = GATHERED_ON_A_B200[name]
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    arguments = launch.bind(
-        shaped((4096, 1024)), shaped((4, 8192, 1024)), jax.ShapeDtypeStruct((4,), jnp.int32),
-        gather=jax.ShapeDtypeStruct((4096,), jnp.int32),
-        out_dtype="bfloat16", trans_rhs=True, interpret=False)
-    with report.refusals(), generation.assumed("sm100"):
-        tile = launch.derived(arguments, generation.gpu_target())
-        assert tile is not None
-        cases = [support.KernelCase("gathered input gradient",
-                                    lambda: launch.lowering(arguments, tile),
-                                    {"dew_gmm": _model(launch, arguments, tile)})]
-        found = compile_mosaic_kernels(cases, "sm100")
-    failed = failures(found) + mosaic_failures(found)
-    assert not failed, "\n".join(failed)
+    table = jax.ShapeDtypeStruct((4096,), jnp.int32)
+    sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+    [device] = compile_only_gpus("sm100", 1)
+    with report.refusals(), generation.assumed("sm100"), report.certifying(device):
+        if kind == "gmm":
+            launch = grouped_matmul.MosaicGmm()
+            arguments = launch.bind(shaped(rows), shaped(matrix), sizes, gather=jax.ShapeDtypeStruct(gathered,
+                                    jnp.int32), out_dtype="bfloat16", trans_rhs=True, interpret=False)
+        else:
+            launch = grouped_matmul.MosaicTgmm()
+            tables = (table, None) if gathered == "tokens" else (None, table)
+            arguments = launch.bind(shaped(rows), shaped(matrix), sizes, gather=tables, out_dtype="float32",
+                                    interpret=False)
+        before = len(report.certifications())
+        tile = launch.taken(arguments)
+        certified = report.certifications()[before:]
+    assert (tile.family.startswith("tcgen05"), tile.block_m, tile.block_n) == (True, 128, 128), tile
+    assert tile.producers.of(launch.KERNEL) is not None, tile
+    assert len(certified) == 2, [(each.config, [b.frame for b in each.refused]) for each in certified]
+    assert not certified[-1].refused
 
 
 def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():
@@ -894,9 +913,8 @@ def libtpu_shared(monkeypatch):
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
 def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
     """The GEMM template's launches on a TPU core (the MXU's bundle: `MosaicGmm` forward and input gradient,
-    `MosaicTgmm`), at the tile each derives from the TPU's facts, compiled by libtpu for a compile-only TPU
-    of the generation on this CPU; a generation whose scoped VMEM no measurement states takes none of them
-    (`MosaicGmm.eligible`)."""
+    `MosaicTgmm`), at the tile each derives from the TPU's facts (its scoped VMEM a measurement's: v5e 16 MiB,
+    v6e 32 MiB, M-EM-37), compiled by libtpu for a compile-only TPU of the generation on this CPU."""
     from kernel_compile import compile_tpu_kernels
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -923,9 +941,6 @@ def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
             taken.add(name)
             cases.append(support.KernelCase(f"{name} {config}",
                                             lambda configured=configured, args=args: (configured, args)))
-    if not cases:
-        assert generation.gpu_target(tpu).scoped_vmem is None
-        pytest.skip(f"no measurement states {tpu}'s scoped VMEM, which the TPU launches fit their blocks to")
     forms = {"forward", "input gradient", "kernel gradient"}
     assert taken == forms
     found = compile_tpu_kernels(cases, tpu)
