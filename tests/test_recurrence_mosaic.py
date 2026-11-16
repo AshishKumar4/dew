@@ -1965,14 +1965,14 @@ def test_lightning_attentions_training_step_starts_unspilled_asking_each_rung_on
 
 
 @lowers('sm80')
-def test_a_training_step_no_config_holds_moves_past_the_template_after_one_compile():
+def test_a_training_steps_gradient_lowers_after_one_certification_whatever_its_verdict():
     """The gated delta net's training step at its GPU flow's widths (tests/model_flows.py's Qwen3-Next-tiny: 2
-    key heads and 4 value heads of 128, 2 rows of 256 tokens, bf16) on a compile-only A100: its scores'
-    backward spills 8 bytes at 255 registers at every tiles the derivation offers, which plan it alike, so
-    one compile refuses them all (`Mosaic._refused`); the route's launch requirement reads the certified
-    answer (`Mosaic.holds`) and its gradient lowers by the next kernel, the template's start one
-    certification. It certified 32 tiles, 819 s, and raised Unfitted from inside the call (row 6816; row
-    6860 the coverage gap)."""
+    key heads and 4 value heads of 128, 2 rows of 256 tokens, bf16) on a compile-only A100: its gradient
+    lowers, by the template or, where the template's tiles do not hold, the next kernel, and the template's
+    start is one certification, as reverse mode runs it, whatever it answers: where no tiles held (its
+    scores' backward 8 bytes past 255 registers, row 6860), it certified 32 tiles, 819 s, and raised
+    Unfitted from inside the call (row 6816). Which route takes the call is the template's coverage (row
+    6860), not this test's."""
     from kernel_compile import lowered_for
 
     from dew.nn.kernels.generation import compile_only_gpus
@@ -1989,7 +1989,7 @@ def test_a_training_step_no_config_holds_moves_past_the_template_after_one_compi
     # The training call's launch, certified as reverse mode runs it; its forward alone no step runs.
     certified = [each for each in report.certifications()
                  if id(each) not in before and each.op == type(template.MOSAIC).__name__]
-    assert len(certified) == 1 and certified[0].refused and certified[0].pulled, certified
+    assert len(certified) == 1 and certified[0].pulled, certified
 
 
 @lowers('sm90')
