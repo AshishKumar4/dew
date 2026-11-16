@@ -1713,6 +1713,53 @@ def test_a_launch_past_its_ladders_foot_is_certified_at_a_program_fewer():
 
 
 @lowers('sm90')
+def test_a_packed_training_step_certifies_the_launch_it_runs_once():
+    """A delta rule's training step over packed rows that carry their documents' first slots (a packed
+    layer's, `dew.batch.Coordinates.firsts`), lowered for a compile-only H100 through the call's route:
+    each config its training launch certifies is certified once, its selector's call bound as the launch
+    binds on each shard (`recurrence_chunk.template_call`). Bound without the firsts, the selector certified
+    a launch the step never ran beside the one it did (train 942's F2)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    shape = jax.ShapeDtypeStruct
+    hooks = recurrence.Hooks(decay='scalar', delta=True)
+    given = shape((2, 512, 4, 128), jnp.bfloat16)
+    operands = (given, given, given, shape((2, 512, 4), jnp.float32), shape((2, 512, 4), jnp.bfloat16),
+                shape((2, 512), jnp.bool_), shape((2, 4), jnp.int32))
+
+    def loss(query, key, value, g, beta, starts, firsts):
+        called = Chunk(query, key, value, log_decay=g, beta=beta, starts=starts, firsts=firsts)
+        return jnp.sum(chunk(hooks, called, max_segments=4)[0].astype(jnp.float32))
+
+    before = {id(certified) for certified in report.certifications()}
+    with report.refusals(), generation.assumed('sm90'), report.certifying(compile_only_gpus('sm90')[0]):
+        jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4))).trace(*operands).lower(lowering_platforms=('cuda',))
+    pulled = [each.config for each in report.certifications() if id(each) not in before and each.pulled]
+    assert pulled and len(set(pulled)) == len(pulled), pulled
+
+
+@lowers('sm90')
+def test_a_trace_no_gradient_reaches_certifies_no_training_launch():
+    """Lightning attention's call at its GPU flow's widths, lowered forward alone (a prefill's, a
+    generation's) for a compile-only H100 through the call's route: it certifies its forward's launches and
+    none of its training call's (`recurrence_chunk._per_product` selects the training product in reverse
+    mode alone): selected at the call, its training launches were certified in every trace, a gradient or
+    none (train 934's F4, row 6951)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    shape = jax.ShapeDtypeStruct
+    hooks = recurrence.Hooks(decay='scalar', delta=False)
+    given = shape((2, 256, 4, 128), jnp.bfloat16)
+    operands = Chunk(given, given, given, log_decay=shape((2, 256, 4), jnp.float32))
+    before = {id(certified) for certified in report.certifications()}
+    with report.refusals(), generation.assumed('sm90'), report.certifying(compile_only_gpus('sm90')[0]):
+        jax.jit(lambda given: chunk(hooks, given, chunk_size=64)).trace(operands).lower(
+            lowering_platforms=('cuda',))
+    certified = [each for each in report.certifications() if id(each) not in before]
+    assert certified and not any(each.pulled for each in certified), certified
+
+
+@lowers('sm90')
 def test_lightning_attentions_training_step_starts_unspilled_asking_each_rung_once():
     """Lightning attention's training step at its GPU flow's widths (tests/model_flows.py's `LIGHTNING`: 4
     heads of 128, 2 rows of 256 tokens, bf16, chunk 64), lowered for a compile-only H100 through the call's
