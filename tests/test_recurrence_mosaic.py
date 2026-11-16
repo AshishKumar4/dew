@@ -795,7 +795,8 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
 
 
 LIGHTNING_SEEDS = 32
-"""Lightning attention's fast forms' declared draws (`lightning_fast_forms_are_as_exact_as`)."""
+"""Lightning attention's fast forms' declared draws (`lightning_fast_forms_are_as_exact_as`), its interpreted
+cell's shards too (`check1_shards` marks a literal count)."""
 
 
 def lightning_fast_forms_are_as_exact_as(reference) -> None:
@@ -823,7 +824,7 @@ def lightning_fast_forms_are_as_exact_as(reference) -> None:
                     truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
 
 
-@pytest.mark.check1_shards(seeds=LIGHTNING_SEEDS, per_task=4)
+@pytest.mark.check1_shards(seeds=32, per_task=4)
 def test_lightning_attentions_fast_forms_are_as_exact_as_flas_rounding_interpreted():
     """`lightning_fast_forms_are_as_exact_as` fla's rounding stated (`simple_gla_support.fla_rounding`),
     interpreted off a GPU."""
