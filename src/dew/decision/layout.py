@@ -1366,7 +1366,7 @@ class SegmentLayout(Layout):
         """The joint row's segments: its own, which its checks hold to the joint row's parts
         (`JOINT_KINDS`, `_joint_post_init`), or `JOINT_SEGMENTS` where it states none."""
         segments = JOINT_SEGMENTS if self.segments is None else self.segments
-        return tuple(segment for segment in segments if isinstance(segment, JOINT_KINDS))
+        return tuple(segment for segment in segments if isinstance(segment, (Text, Media, State, Schema)))
 
     def _joint_post_init(self) -> None:
         """The joint row's own checks (`joint_row`): its question-row fields refused, its turn's segments and
