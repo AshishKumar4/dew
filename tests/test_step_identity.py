@@ -179,6 +179,39 @@ def test_an_exact_resume_refuses_an_external_step_whose_code_changed(tmp_path, m
     assert changed.startswith("code.")
 
 
+SLOTTED = """import dataclasses
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Adding:
+    by: int
+
+    def __call__(self, row):
+        return {**row, "id": row["id"] + self.by}
+"""
+
+
+@pytest.mark.parametrize("read", ["indexed", "memory"])
+def test_an_exact_resume_holds_a_slotted_steps_fields_not_its_slots_descriptors(tmp_path, monkeypatch, read):
+    """A step of a frozen, slotted dataclass of the user's file resumes exactly where nothing of it changed:
+    the descriptors its slots make are Python's machinery, whose values its fields state, not the user's code
+    (the base review of 826882bbf: read as code, the step was inexact and its unchanged exact resume
+    refused); a step of another field's value is refused an exact resume."""
+    module = tmp_path / f"slotted_{uuid4().hex}.py"
+    module.write_text(SLOTTED)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    slotted = importlib.import_module(module.stem)
+
+    def reader(by):
+        pipeline = Pipeline(ROWS).map(slotted.Adding(by)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read=read, loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(lambda: reader(1))
+    assert resumed_changes(reader(1), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(2), state)
+
+
 def test_a_function_step_that_declares_its_identity_resumes_exactly_over_a_change_to_its_code(
         tmp_path, monkeypatch):
     """A function step that declares what it computes (`identity=`) is that identity, as a configured step's
