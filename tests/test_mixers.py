@@ -542,6 +542,13 @@ RECURRENT = ("gated_delta_net", "kimi_delta_attention", "lightning_attention", "
 """The registered recurrent kinds, each beside attention in a hybrid."""
 
 
+CONTINUUM = InContextMemory(network=MLPMemory(hidden=(16,)), heads=1, head_features=None, chunk=4,
+                            project_query=False, project_key=False, project_value=False, output=False,
+                            normalize=False, learning_rate=Gate(scale=0.01))
+"""A continuum-memory level's form (Nested Learning Sec 7.1, tests/memory_support.py's `cms`): its views the
+stream itself, unprojected, and no output projection, so its read is the layer's output."""
+
+
 @pytest.mark.parametrize("dtype", [None, jnp.float32])
 @pytest.mark.parametrize("kind", RECURRENT)
 def test_a_recurrent_layer_reads_its_scan_in_its_projections_dtype(kind, dtype):
@@ -560,6 +567,20 @@ def test_a_recurrent_layer_reads_its_scan_in_its_projections_dtype(kind, dtype):
     # The same values given in float32, which its input projections take exactly.
     np.testing.assert_array_equal(np.asarray(layer.apply(variables, x, call)),
                                   np.asarray(layer.apply(variables, x.astype(jnp.float32), call)))
+
+
+def test_a_continuum_memory_reads_in_its_stated_dtype():
+    """A continuum memory, its views the stream itself and no output projection (`CONTINUUM`), computing in
+    float32 over bfloat16 activations, reads in its float32, its output what the same values in float32
+    give, in float32: an unprojected view computes in the layer's dtype (`dew.nn.linear.as_projected`)."""
+    layer = mixers.build("memory", memory=CONTINUUM).build(MixerContext(
+        emb_features=32, num_heads=1, num_kv_heads=1, head_dim=32, max_seq_len=16, dtype=jnp.float32))(
+        name="mixer")
+    x = jax.random.normal(jax.random.key(0), (1, 8, 32), jnp.bfloat16)
+    variables = layer.init(jax.random.key(1), x)
+    out = layer.apply(variables, x)
+    assert out.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(layer.apply(variables, x.astype(jnp.float32))))
 
 
 @pytest.mark.parametrize("kind", RECURRENT)

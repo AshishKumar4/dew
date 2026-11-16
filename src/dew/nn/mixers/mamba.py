@@ -252,7 +252,7 @@ class Mamba(nn.Module):
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
         gated = out * nn.silu(gate.astype(wide))
-        return self.out_proj(as_projected(gated, gate))
+        return self.out_proj(as_projected(gated, gate.dtype))
 
     def _scan(self, convolved, *, starts, valid, held, forked=None):
         """The selective scan of the convolved `[B, S, D]` inner channels:

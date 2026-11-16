@@ -260,8 +260,8 @@ class KimiDeltaAttention(nn.Module):
                             dtype=projected.dtype if ported else wide, token=token)
         if token is not None:
             # The fused step gated and normalized its output (`FUSED`), in its epilogue's dtype.
-            return self.o_proj(as_projected(out, projected))
-        out = self.o_norm(as_projected(out, projected), gate).reshape(B, S, self.qkv_features)
+            return self.o_proj(as_projected(out, projected.dtype))
+        out = self.o_norm(as_projected(out, projected.dtype), gate).reshape(B, S, self.qkv_features)
         return self.o_proj(out)
 
     def _fused_token(self, taps, g, beta, gate, valid, starts):

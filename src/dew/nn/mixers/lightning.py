@@ -181,7 +181,7 @@ class LightningAttention(nn.Module):
             start = fork_start(None if held is None else held.value,
                                (batch, self.num_heads, self.head_dim, self.head_dim), wide)
             out = forked_scan((query, key, value), forked_rule, tokens, start)
-            out = self.norm(as_projected(out.reshape(batch, length, self.features), qkv))
+            out = self.norm(as_projected(out.reshape(batch, length, self.features), qkv.dtype))
             return self.out_proj(nn.sigmoid(self.output_gate(x)) * out)
         if held is not None and length == 1:
             out, _, final = recurrence.step_reference(LIGHTNING, recurrence.Step(
@@ -198,7 +198,7 @@ class LightningAttention(nn.Module):
             kept(held, final.astype(held.value.dtype), STATE)
         # The recurrence's output under both names a remat policy reads it by (`RESIDUALS`).
         out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
-        out = self.norm(as_projected(out.reshape(batch, length, self.features), qkv))
+        out = self.norm(as_projected(out.reshape(batch, length, self.features), qkv.dtype))
         return self.out_proj(nn.sigmoid(self.output_gate(x)) * out)
 
 

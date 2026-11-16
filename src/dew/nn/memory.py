@@ -440,7 +440,8 @@ class InContextMemory(LinearProducts):
             read = self._chunked(heads, steps)
         if counted is not None:
             counted()
-        read = as_projected(read, query)
+        # An unprojected query is the stream itself, read in the layer's dtype or the stream's.
+        read = as_projected(read, query.dtype if self.project_query else self.dtype or x.dtype)
         if self.output:
             read = Dense(x.shape[-1], use_bias=False, dtype=self.dtype, precision=self.precision,
                          kernel_axes=("attention", "embed"), name="o_proj")(read.reshape(batch, length, -1))

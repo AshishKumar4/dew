@@ -616,7 +616,7 @@ class Mamba3(nn.Module):
             out = out * nn.silu(z.astype(wide))
         if self.mimo_rank > 1:
             out = jnp.einsum('bsrhp,hrp->bshp', out, self.mimo_o)
-        out = as_projected(out.reshape(batch, length, self.intermediate_size), projected)
+        out = as_projected(out.reshape(batch, length, self.intermediate_size), projected.dtype)
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
         return self.out_proj(out)

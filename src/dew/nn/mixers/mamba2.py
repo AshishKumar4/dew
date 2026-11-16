@@ -418,7 +418,7 @@ class Mamba2(nn.Module):
                                 ((taps, bias, *heads),))
             if valid is not None:
                 out = jnp.where(valid[:, :, None], out, 0)
-            return self.out_proj(as_projected(self._gated(out, gate), gate))
+            return self.out_proj(as_projected(self._gated(out, gate), gate.dtype))
         state = (self.num_heads, self.state_size, self.head_dim)
         token = None
         # An initialization runs the general path, where the layer makes its parameters.
@@ -431,7 +431,7 @@ class Mamba2(nn.Module):
                         state_dtype=wide, conv_dtype=wide, dtype=compute, token=token)
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
-        return self.out_proj(as_projected(self._gated(out, gate), gate))
+        return self.out_proj(as_projected(self._gated(out, gate), gate.dtype))
 
 
 
