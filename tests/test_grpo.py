@@ -494,7 +494,7 @@ def counting_prompts(seed) -> dict:
 
 
 # Its 21 runs (about 9 s each on armada's CPU) trained as map tasks of seven (`learning_gate.assert_learns`).
-@pytest.mark.shards(units=COUNT_RUNS, per_task=7)
+@pytest.mark.shards(units=21, per_task=7)
 def test_a_grpo_policy_rewarded_for_its_language_learns_it():
     """Language RL's scenario (docs/design/testing.md: collect rollouts, score them, update a policy): a
     policy drawing completions of two-token prompts, rewarded for each token that follows the counting
