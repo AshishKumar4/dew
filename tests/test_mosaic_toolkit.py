@@ -776,7 +776,8 @@ def _carried_sums(a, b, c, d, *, once: bool = False):
             left = iter([a_gmem[...]]).__next__ if once else a_gmem[...]
             products = (("registered", left, operands.Parts((b_smem,), jnp.bfloat16)),
                         ("plain", c_gmem[...], operands.Parts((d_smem,), jnp.bfloat16)))
-            out_gmem[...] = issuer.summed(products, retired=True, into=family.zeros((ISSUED, ISSUED)))
+            out_gmem[...] = issuer.summed(products, (ISSUED, ISSUED), retired=True,
+                                          into=family.zeros((ISSUED, ISSUED)))
 
         pl.run_scoped(scoped, *(plgpu.SMEM((ISSUED, ISSUED), jnp.bfloat16) for _ in range(3)),
                       collective_axes="wg")
