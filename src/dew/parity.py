@@ -1831,27 +1831,32 @@ def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = 
     return wide
 
 
-def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWEST_SEEDS,
-                    most: int = MOST_SEEDS) -> int:
-    """`seeds_for`'s count for the reference compared with itself, from its errors already measured:
-    `errors` holds its squared errors' logs (`log_errors`) a seed (rows, from seed 0) and a leaf (columns),
-    such as a recording's merged shards, and the count is the fewest, doubling from `start` to `most`, that
-    resolves every leaf on its own block and the next (`_confirmed`), as `seeds_for` doubles. Fails past
-    `most`, as `seeds_for` does, and where the rows held run out first: the recording then holds too
-    few seeds."""
-    count, wide = max(start, FEWEST_SEEDS), []
-    while count <= most and 4 * count <= len(errors):
-        wide = _confirmed(names, errors, count)
-        if not wide:
-            return count
-        count *= 2
-    if count > most:
-        raise _unresolved(label, count / most, f"{label}: the reference compared with itself does not "
-                          f"resolve {PARITY} within {most} seeds at {wide[:4]}; give the site larger inputs "
-                          f"or fewer shared factors")
-    raise _unresolved(label, 4 * count / max(len(errors), 1), f"{label}: the reference compared with "
-                      f"itself does not resolve {PARITY} within the {len(errors)} seeds recorded, "
-                      f"{len(errors) // 4} a half of each block")
+def seeds_resolving(errors: np.ndarray, names, label: str, *, widths: Sequence[int],
+                    mine: np.ndarray | None = None, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS) -> int:
+    """`seeds_for`'s count from errors already measured, by its own sizing (`_sized_count`): `errors` holds
+    the reference's squared errors' logs (`log_errors`) a seed (rows, from seed 0) and a leaf (columns),
+    such as a recording's merged shards, each leaf's row width `widths` (`_width`), and `mine`, where given,
+    Dew's on the same draws, so the count is the paired sizing's (Dew against the reference, `seeds_for`'s
+    `dew_fn`, its stubborn leaves by their typical draw: testing.md's sizing, for a site whose errors are
+    heavy-tailed across draws alike in both arms), else the reference compared with itself's. Fails past
+    `most`, as `seeds_for` does, and where the rows held run out first: the recording then holds too few
+    seeds."""
+    paired = mine is not None
+    names = list(names)
+
+    def drawn(first: int, stop: int) -> _Draws:
+        if stop > len(errors):
+            sizing = "Dew paired with the reference" if paired else "the reference compared with itself"
+            raise _unresolved(label, stop / max(len(errors), 1), f"{label}: {sizing} does not resolve "
+                              f"{PARITY} within the {len(errors)} seeds recorded")
+        held = slice(first, stop)
+        count, leaves = stop - first, len(names)
+        ours = errors if mine is None else mine
+        return _Draws(names, ours[held], errors[held], np.zeros((count, leaves, 2)),
+                      [[NO_ZERO_ROWS] * leaves for _ in range(count)], np.ones((count, leaves), bool),
+                      tuple(widths))
+
+    return _sized_count(drawn, label, start=start, most=most, paired=paired)
 
 
 def _unresolved(label: str, measure: float, message: str) -> Inconclusive:

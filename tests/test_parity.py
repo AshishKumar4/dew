@@ -54,4 +54,4 @@ def test_a_site_its_sizing_cannot_resolve_is_inconclusive():
         parity.seeds_for(swinging, "swinging", most=parity.FEWEST_SEEDS)
     # A recording that holds no seeds resolves no count either.
     with pytest.raises(parity.Inconclusive):
-        parity.seeds_resolving(np.empty((0, 1)), ["x"], "nothing recorded")
+        parity.seeds_resolving(np.empty((0, 1)), ["x"], "nothing recorded", widths=(2,))
