@@ -757,9 +757,10 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
     compute = canonicalize_dtype(tokens, *(_held(kernel.stack if isinstance(kernel, Layered) else kernel)
                                            for kernel in (first, second)), dtype=dtype)
     if (isinstance(first, Layered) or isinstance(second, Layered) or isinstance(first, formats.NvFp4)
-            or isinstance(second, formats.NvFp4) or recipe_role() is not None):
+            or isinstance(second, formats.NvFp4) or projections.recipe_takes(*first.shape[-2:])):
         # A stack's layer, a packed bank (its product the NVFP4 one, which pairs with none), or a run's
-        # low-precision recipe, takes each product apart (`expert_projection`).
+        # low-precision recipe that takes the experts (`recipe_refusal`), takes each product apart
+        # (`expert_projection`); experts the recipe leaves pair as without one.
         return (expert_projection(x, first, group_sizes, compute, implementation, precision),
                 expert_projection(x, second, group_sizes, compute, implementation, precision))
     with _named(implementation):
