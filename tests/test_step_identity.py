@@ -769,3 +769,54 @@ def test_an_exact_resume_holds_the_code_a_steps_methods_reach(tmp_path, monkeypa
         resumed_changes(reader(), state)
     (changed,) = resumed_changes(reader("relaxed"), state)
     assert changed.startswith("code.")
+
+
+REMAPPED = """import attrs
+import dataclasses
+
+import numpy as np
+
+
+@attrs.define(frozen=True, eq=False)
+class Remap:
+    table: np.ndarray
+
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + int(self.table[int(row["id"])])}}
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class Holding:
+    remap: Remap
+
+    def __call__(self, row):
+        return self.remap(row)
+
+
+def step(changed, held):
+    table = np.arange(2000)
+    if changed:
+        table[1000] = -1
+    return Holding(Remap(table)) if held else Remap(table)
+"""
+
+
+@pytest.mark.parametrize("held", [False, True], ids=["attrs step", "dataclass holding an attrs instance"])
+def test_an_exact_resume_refuses_an_attrs_step_whose_long_array_changed(tmp_path, monkeypatch, held):
+    """An attrs step holding an array of 2000 entries, or a dataclass step holding it, is stated by its
+    fields, each array by its content: one entry changed past its repr's elision refuses an exact resume,
+    and the unchanged step resumes exactly. Its repr, which elides an array's middle past 1000 entries,
+    stated it and the changed step resumed (train 963's review)."""
+    module = tmp_path / f"remapped_{uuid4().hex}.py"
+    module.write_text(REMAPPED.format())
+    monkeypatch.syspath_prepend(str(tmp_path))
+    remapped = importlib.import_module(module.stem)
+
+    def reader(changed=False):
+        pipeline = Pipeline(ROWS).map(remapped.step(changed, held)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(changed=True), state)
