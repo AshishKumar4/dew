@@ -645,6 +645,33 @@ def test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100
     assert found and all(binary.frame == 0 for binary in found), found
 
 
+@COMPILES_ON_CPU
+def test_a_decode_step_launches_only_kernels_its_certification_held():
+    """A decode step through the public route (`attention_route.attend`: fp16, one query row of four heads over
+    two key heads 128 wide and 1024 keys) compiled for an H100 (`kernel_compile.compile_mosaic_kernels`): each
+    Mosaic kernel it launches is one certification compiled alone and held (`report.certified`), its plan's
+    config the one certified at the key tile its walk streams at, where the plan pinned its derived config
+    uncertified and its kernels met the assembler first in the program's compile (row 7259)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_route
+
+    query = jax.ShapeDtypeStruct((1, 1, 4, 128), jnp.float16)
+    key = jax.ShapeDtypeStruct((1, 1024, 2, 128), jnp.float16)
+    spans = template.spans(1, 1024, 1, causal=False)
+
+    def decode(query, key, value):
+        return attention_route.attend(query, key, value, spans, natural=False)
+
+    with generation.assumed("sm90"):
+        assert attention_decode.serves(query, key, None, natural=False, target=generation.gpu_target())
+        found = compile_mosaic_kernels([KernelCase("decode", lambda: (decode, (query, key, key)))], "sm90")
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)
+    (record,) = found
+    assert record["modules"] and record["modules"].items() <= record["certified"].items(), record
+
+
 @pytest.mark.parametrize("slices", [1, 3, 7])
 def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices):
     """Slices of a row's keys, each its output normalized, its maximum and its denominator, a slice of no
