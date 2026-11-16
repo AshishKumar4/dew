@@ -694,7 +694,7 @@ class SegmentLayout(Layout):
     follows the options continues after the longest one.
     """
 
-    form: Form = "marker"
+    form: Form = dataclasses.field(default="marker", metadata={"derived": "head and backbone"})
     """Which of the three rows it writes (`Form`): Laya's marker row, a state-first row, each a row a
     question, or the joint row of every question; built by its constructor (`marker`, `state_first`,
     `joint`), which gives each its own defaults."""

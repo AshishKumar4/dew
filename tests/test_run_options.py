@@ -176,8 +176,8 @@ def test_a_process_option_the_process_does_not_carry_is_refused_before_training(
 
 WITNESSED_ON = {"DecideSettings": {
     "decision": ("context_encoder", "layout", "layout.form", "layout.framing", "layout.head_max_len",
-                 "layout.option_text", "layout.option_tokens", "layout.order", "layout.parallel", "layout.reads",
-                 "options"),
+                 "layout.option_text", "layout.option_tokens", "layout.order", "layout.parallel",
+                 "layout.reads", "options"),
     "blocked": ("layout.blocks", "layout.segments", "layout.split", "specials"),
     "lettered": ("layout.labels",),
     "merged": ("layout.unit",),
