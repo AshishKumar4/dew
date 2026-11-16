@@ -321,3 +321,22 @@ def test_a_joint_row_keeps_a_conversations_end_where_its_state_keeps_a_conversat
 
     assert row("end_if_conversation", conversation) == row("end", conversation) != row("start", conversation)
     assert row("end_if_conversation", record) == row("start", record) != row("end", record)
+
+
+@pytest.mark.parametrize(("earlier", "fields", "now"), [
+    ("MarkerLayout", {"max_len": 96, "parallel": True}, SegmentLayout.marker_row(max_len=96, parallel=True)),
+    ("StateFirstLayout", {"max_len": 96}, SegmentLayout.state_first_row(max_len=96)),
+    ("QuestionLayout", {"order": "re_read"}, SegmentLayout.state_first_row(order="re_read")),
+    ("JointLayout", {"max_state_tokens": 7}, SegmentLayout.joint_row(max_state_tokens=7)),
+    ("JointLayout", {"max_len": 2048, "segments": [{"class": "dew.decision.layout:Schema"}]},
+     SegmentLayout.joint_row(max_len=2048, segments=(Schema(),)))],
+    ids=["marker", "state first", "their base", "joint by default", "joint of its own"])
+def test_a_record_of_an_earlier_layout_class_reads_as_the_segment_layout_it_is_now(earlier, fields, now):
+    """A step's declaration that records its layout by one of the three classes an earlier Dew had, or
+    their base, which wrote its rows state first, reads through the pinned boundary (`earlier_shapes`) as
+    the segment layout of that row, its own fields over the defaults its class held (a joint row's 16384
+    tokens, its turn's segments and framing)."""
+    from dew.inference.tasks import earlier_shapes
+
+    record = earlier_shapes({"layout": {"class": f"dew.decision.layout:{earlier}", "fields": fields}})
+    assert from_record(Layout, record["layout"], dtypes=False) == now

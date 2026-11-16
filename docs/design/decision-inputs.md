@@ -18,7 +18,7 @@ each stream attends to. Ownership is PLAN.md's.
 
 ## Today
 
-A layout is one of three classes (`SegmentLayout.marker_row`, `SegmentLayout.state_first_row`, `SegmentLayout.joint_row` in `src/dew/decision/layout.py`, each recorded, as a decision head is, as a registry class record by import path, `{"class", "fields"}`, an earlier run's `{"name"}` read once at the pinned run boundary). Each takes its row's parts as data, its `segments`, which a run names (`DecisionRunConfig.segments`), so an arrangement is a tuple of segments, not a class. A context beside the state (`Example.context`) has one path of its own: the backbone's token table embeds it, and the backbone's cross-attention reads it.
+A layout is one class, `SegmentLayout` (`src/dew/decision/layout.py`), whose `form` names the row it writes: Laya's marker row, a state-first row, or the joint row, each built by its constructor (`marker_row`, `state_first_row`, `joint_row`), which gives that row its own defaults. It is recorded, as a decision head is, as a registry class record by import path, `{"class", "fields"}`; an earlier run's `{"name"}`, and a record naming one of the three classes it was before (`MarkerLayout`, `StateFirstLayout`, `JointLayout`, or their base `QuestionLayout`), are read once at the pinned boundaries (`dew._records.earlier_layout`) as the segment layout of that row. Each takes its row's parts as data, its `segments`, which a run names (`DecisionRunConfig.segments`), so an arrangement is a tuple of segments, not a class. A context beside the state (`Example.context`) has one path of its own: the backbone's token table embeds it, and the backbone's cross-attention reads it.
 
 ## 1. A layout is data: segments
 
@@ -26,7 +26,7 @@ A row is an ordered tuple of segments and a row budget (`max_len`), each segment
 
 A layout is either joint (every question in one row) or per question (one row a question, the schema segment rendering that question alone). Its record is its segment tuple, each segment a frozen dataclass, recorded and rebuilt by its import path through `dew.registry`'s typed records (`to_record`, `from_record`), with no closed registry. A composition a user writes reloads as written.
 
-Not built: the three classes as three configurations of one segment layout. Its proof would be each configuration laying out the existing fixtures' rows byte for byte as its class does: tokens, spans, positions and option slots, the parallel layout and the cut cases among them, a test that lands before the classes go.
+Built: the three classes are three configurations of one segment layout. Its proof is each configuration laying out the rows its class laid out byte for byte (`tests/test_decision_layout_parity.py`, written against the three classes before they went): every row's tokens, spans, positions, option slots, parallel positions and cuts, and its refusal, over 52 configurations (lengths that cut, parallel and sequential options, markers and labels, each row order, option and question budgets, blocks, the joint row's own segments and state cap) and their states and question sets. A layout's fields that only a row a question reads are refused on the joint row.
 
 ## 2. A segment goes to a stream
 
