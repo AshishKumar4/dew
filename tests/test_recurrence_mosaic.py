@@ -29,7 +29,7 @@ import pytest
 from fla_sites import RECORDED, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU, lowers
 from kernel_compile import gate_generations
-from reference_error import assert_as_exact, declared_seeds
+from reference_error import assert_as_exact, declared_seeds, with_gradients
 from test_recurrence_chunk import (
     FORMED,
     HOOKS,
@@ -46,7 +46,7 @@ from test_recurrence_chunk import (
     unit,
 )
 
-from dew.nn.kernels import chunked_launch, generation, recurrence
+from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, chunk_rounding, fast_rounding, recomputed_memory
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
@@ -781,8 +781,11 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
     (the delta rule's fla, the rated scan's mamba_ssm) under the accurate forms, its fast forms' two parts
     (`mainloop.FAST_PARTS`) held to the recorded port instead
     (`the_mosaic_forward_is_as_exact_as_its_reference`): there they put the template 42 to 83 times the
-    fp32 recurrence's distance from float64, interpreted and on an H100 alike (flow-cells-cpu, gpuflow-a)."""
-    forms = 'accurate' if hooks.delta or hooks.rated else generation.numerics().forms
+    fp32 recurrence's distance from float64, interpreted and on an H100 alike (flow-cells-cpu, gpuflow-a);
+    and fla's simple GLA, lightning attention's, whose fast forms take fla's rounding
+    (`test_lightning_attentions_fast_forms_are_as_exact_as_flas_rounding_interpreted`)."""
+    upstream = hooks.delta or hooks.rated or recurrence_chunk.simple_gla(hooks)
+    forms = 'accurate' if upstream else generation.numerics().forms
     (sample,) = hooked_draw(hooks, packed, 0)
     if not formed(forms, taken)(sample, hooks):
         with pytest.raises(REFUSED):
@@ -794,6 +797,46 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
                     f'the mosaic forward, {hooks} packed={packed} under the {forms} forms',
                     seeds=HOOK_SEEDS[hooks, packed])
 
+
+
+LIGHTNING_SEEDS = 32
+"""Lightning attention's fast forms' declared draws (`lightning_fast_forms_are_as_exact_as`), its interpreted
+cell's shards too (`check1_shards` marks a literal count)."""
+
+
+def lightning_fast_forms_are_as_exact_as(reference) -> None:
+    """Lightning attention's form (`recurrence_chunk.simple_gla`) at bf16 under the run's fast forms, which
+    take fla's rounding (`recurrence_chunk.chunk_rounding`), on the template: its output, final memory and
+    every operand's gradient on par from float64 with `reference(operands, cotangents)`, fla's (its own code
+    on a GPU tier, `simple_gla_support.fla_simple_gla`, an arm run as given; its rounding stated off one,
+    `fla_rounding`, whose gradients are the statement's own, not fla's backward's), the
+    truth the recurrence a token at a time in float64. Held whole there in fp32's three parts, lightning ran
+    4.9 times fla's forward on a GH200 (row 6823); rounded, each leaf was 0.43 to 1.15 times fla's
+    rounding's distance interpreted (jsf-lround5)."""
+    from test_recurrence_chunk import cotangents
+
+    hooks = recurrence.Hooks(decay='scalar', delta=False)
+
+    def drawn(seed):
+        (operands,) = hooked_draw(hooks, packed=False, seed=seed)
+        operands = dataclasses.replace(operands, **{name: getattr(operands, name).astype(jnp.bfloat16)
+                                                    for name in ('query', 'key', 'value')})
+        return operands, cotangents(operands, seed)
+
+    dew = jax.jit(formed('fast', with_gradients(functools.partial(chunk_on, 'mosaic_gpu', hooks,
+                                                                  chunk_size=64))))
+    assert_as_exact(dew, reference, drawn, "lightning attention's fast forms on the template",
+                    seeds=LIGHTNING_SEEDS,
+                    truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
+
+
+@pytest.mark.check1_shards(seeds=32, per_task=4)
+def test_lightning_attentions_fast_forms_are_as_exact_as_flas_rounding_interpreted():
+    """`lightning_fast_forms_are_as_exact_as` fla's rounding stated (`simple_gla_support.fla_rounding`),
+    interpreted off a GPU."""
+    from simple_gla_support import fla_rounding
+
+    lightning_fast_forms_are_as_exact_as(jax.jit(with_gradients(functools.partial(fla_rounding, chunk=64))))
 
 HOOK_CELLS = [(hooks, packed) for hooks in TAKEN for packed in (False, True)]
 """The mainloop's hook cells, each hook combination over one sequence and packed documents."""
