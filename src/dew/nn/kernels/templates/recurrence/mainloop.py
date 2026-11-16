@@ -2036,13 +2036,12 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
             tile = stream_tile(slots, "values", values, columns=pl.ds(role * bv, bv))
             # The chunk's own pairs' scores staged for its local product (`output_launch`'s first step's).
             scores = algebra.chunk_scores(queries.__getitem__, keyed.__getitem__, slices, gate, low,
-                                          held.dtype, Issuer(call).summed, laid=laid,
-                                          column_scale=column_scale)
+                                          held.dtype, Issuer(call), laid=laid, column_scale=column_scale)
             operands.staged(family, scores, scored)
             corrected = _scan_corrected(call, slots, tile, bv, state, (gate, low), betas, issue)
             # The memory the chunk enters, in its registers, staged as the memories' form for its product.
             out = algebra.chunk_output(queries.__getitem__, state.__getitem__, slices, gate, low,
-                                       Parts(scored, held.dtype), corrected, scale, issue.summed)
+                                       Parts(scored, held.dtype), corrected, scale, issue)
             if skip_ref:
                 out = out + skip_ref[0][h] * tile.value().astype(jnp.float32)
             before_store()

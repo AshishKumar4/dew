@@ -869,14 +869,9 @@ def _query_key_held(call: Call, vq: int) -> Held:
     # beside them: unstated, Qwen3.5's fp32 training claimed 3 programs an H100 at 136 registers, whose cap
     # spilled 36 bytes (jsf-owncap).
     rows = [f32(chunk, 4)] * 2 if call.family.products_overlap and held.parts > 1 else []
-    # A sum of three-part products adds each whole (`operands.Issuer._apart`): its own sum and its term's
-    # beside the running one where products overlap. Unstated, the unrounded write gate's forked training
-    # query/key walk spilled 144 bytes at 255 registers on an H100 (jsf-onmain-r8).
-    whole = ([f32(chunk, call.block)] if call.family.products_overlap
-             and max(given.parts, memories.parts, held.parts) > 2 else [])
     return Held(phases=(
-        [f32(chunk, call.block)] * 4 + rows + whole + read(chunk, given, memories.parts)
-        + read(chunk, held, 0), summed))
+        [f32(chunk, call.block)] * 4 + rows + read(chunk, given, memories.parts) + read(chunk, held, 0),
+        summed))
 
 
 def _query_key_landing(call: Call, splits: int) -> dict:

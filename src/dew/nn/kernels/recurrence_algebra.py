@@ -591,20 +591,19 @@ def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
     return corrected_values * range_decay(last, last_lo, gate, gate_lo)[:, None]
 
 
-def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype,
-                 summed: Callable[[list], jax.Array], *, laid: tuple | None = None, column_scale=None):
+def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issue: Issue, *,
+                 laid: tuple | None = None, column_scale=None):
     """A chunk's own pairs' scores `[C, C]` under a decay a head, `tril((q k^T) exp2(g_s - g_t))`, the key
-    column blocks `queries(c)` and `keys(c)` summed into one fp32 accumulator ('scores', `summed`, the
-    mainloop's: a list of `(name, left, right)`; a fresh one a block, a walk's two blocks' accumulators were
-    live with their running sum, 224 registers at its peak against 184 at one, lightning attention's 128-wide
-    keys on an H100), in `dtype` for `chunk_output`'s
+    column blocks `queries(c)` and `keys(c)` summed into fp32 ('scores'), in `dtype` for `chunk_output`'s
     'local', which every value block of the chunk takes. `laid` is the prefix's halves `(gate, low)` as a
     column's vectors where a mainloop's layouts keep them apart from a row's (`system`'s). The pairs' decays
     come before the products, their exponents' working tiles done before the products' sum is live.
     `column_scale` `[C]`, where given, scales each key token's column before the scores are rounded (the
     write gate on the keys' side, mamba_ssm's `CB exp(dA_i - dA_j) dt_j`, `_chunk_scan_fwd`)."""
     decay = decayed(gate, low, *((gate, low) if laid is None else laid))
-    scores = summed([("scores", queries(c), keys(c).T) for c in range(columns)])
+    scores = jnp.zeros((gate.shape[0], gate.shape[0]), jnp.float32)
+    for c in range(columns):
+        scores += issue("scores", queries(c), keys(c).T)
     scales = jnp.ones((gate.shape[0],), jnp.float32) if column_scale is None else column_scale
     # The tile's algebra over its products and decays its declaration's derived forms (`scores_of`).
     return derived_tile("scores").mapped({"products": scores, "decays": decay, "scales": scales}).astype(
@@ -612,13 +611,16 @@ def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype,
 
 
 def chunk_output(queries: Load, entered: Load, columns: int, gate, low, scores, value, scale: float,
-                 summed: Callable[[list], jax.Array]):
+                 issue: Issue):
     """A chunk's output `[C, BV]`, fp32, a decay a head: `scale ((q S) exp2(g) + scores v)`, the key column
-    blocks `queries(c)` and `entered(c)` (the memory the chunk entered) summed into one fp32 accumulator
-    ('memory', `summed`, as `chunk_scores`), and the chunk's own pairs' `scores` (`chunk_scores`, registers
-    or a tile in the values' dtype) against the value block ('local')."""
-    out = summed([("memory", queries(c), entered(c)) for c in range(columns)]) * raised(gate, low)[:, None]
-    return out * scale + summed([("local", scores, value)]) * scale
+    blocks `queries(c)` and `entered(c)` (the memory the chunk entered) summed into fp32 ('memory'), and the
+    chunk's own pairs' `scores` (`chunk_scores`, registers or a tile in the values' dtype) against the value
+    block ('local')."""
+    out = jnp.zeros((gate.shape[0], value.shape[-1]), jnp.float32)
+    for c in range(columns):
+        out += issue("memory", queries(c), entered(c))
+    out = out * raised(gate, low)[:, None]
+    return out * scale + issue("local", scores, value) * scale
 
 
 def _laid_references(at: Callable[[int], tuple], index: jax.Array, chunk: int, sub: int) -> tuple:
