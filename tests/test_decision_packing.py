@@ -18,7 +18,7 @@ from decision_support import decision_rows
 from float64_terms import float64_terms
 from optim_support import in_float64
 from recording import RecordingTracker
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, dew_path
 from torch_layout import node
 
 from dew.batch import VALID_ROWS
@@ -483,6 +483,8 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 
         logits, grads = decide(variables, batch)
         return asked(batch, logits), grads
 
+    # One of Dew's own paths: packing invariance, both arms one `decide` under one rewrite, one program.
+    @dew_path
     @as_given
     def alone(variables):
         return rows_alone(lambda one: decide(variables, one), batch)

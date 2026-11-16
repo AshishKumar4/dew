@@ -341,7 +341,15 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
   The truth is the unrewritten program at float64 in both. The gate holds `passes(on=False)` by default for the
   reference arm and the float64 truth alone; the candidate runs as users run it, the pass on, priced at the gate's
   lowering target, as an arm is measured as its users run it (testing.md). A site that compares a program with its
-  unrewritten self passes one function as both arms. The pass prices for the named target's facts (the generation
+  unrewritten self passes one function as both arms. A reference that is one of Dew's own paths
+  (`reference_error.dew_path`: the same model packed against alone, under a remat policy against none) claims
+  invariance under what differs, not the rewrite, and runs under the rewrite as the candidate does, so one
+  function at one shape is one program; the rewrite is held by the sites whose references are written apart.
+  Only a site whose claim is invariance (Dew's model run two ways) may declare its reference so: a declaration
+  anywhere else drops the reference's independence, and the head review checks each declaring site against
+  that. The gate cannot derive it: the same function passed as both arms is the rewrite's own check, its
+  reference unrewritten, and an invariance site's arms are different programs (a packed run and a host loop
+  over rows) that call one function inside. The pass prices for the named target's facts (the generation
   the gate's lowering traces for), so a CPU lane checks the form a GPU of that target extracts.
 - **Rewritten backwards:** `rewritten(jax.grad(fn))` under check 1 against `jax.grad(fn)`: a rule that only
   fires on a backward's patterns is caught there, as JAX's derivative of a rewritten forward never exercises

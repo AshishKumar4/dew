@@ -27,6 +27,7 @@ from reference_error import (
     assert_moves,
     assert_same_artifact,
     declared_seeds,
+    dew_path,
     distance,
     indexed_recording,
     input_digest,
@@ -2413,3 +2414,25 @@ def test_errors_whose_squares_float64_holds_as_zero_keep_their_ratio():
     assert raised.type is GateFailure
     assert_as_exact(off_by(1e-200), off_by(1e-200), draw, "as far below squares", seeds=8,
                     truth_fn=as_given(lambda x: {"y": x}))
+
+
+def test_one_of_dews_own_paths_as_the_reference_is_one_program_with_dews_arm():
+    """A reference declared one of Dew's own paths (`dew_path`), both arms one jitted function run as given
+    (a decision head's `decide`, packed against alone): the gate runs it under the rewrite as Dew's arm, so
+    the function is traced and compiled once for both, where an unrewritten reference traced it again under
+    the pass switched off."""
+    traced = []
+
+    @jax.jit
+    def decide(x):
+        traced.append(x.shape)
+        return jnp.tanh(x) * 2
+
+    def draw(seed):
+        return (np.random.default_rng(seed).standard_normal(8).astype(np.float32),)
+
+    assert_as_exact(as_given(lambda x: decide(x)), dew_path(as_given(lambda x: decide(x))), draw,
+                    "one function as both arms, a path of Dew's own", seeds=8,
+                    truth_fn=as_given(lambda x: np.tanh(np.asarray(x, np.float64)) * 2))
+    assert len(traced) == 1
+
