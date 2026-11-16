@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import tempfile
+import typing
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -31,9 +32,9 @@ from dew._builds import dew_cache_dir
 from dew._cache import package_digest
 from dew._coordination import agreed_same, from_every_process, reading_home, seen_by_every_process
 from dew._files import staged, write_atomically
-from dew._records import JSON, json_value
+from dew._records import JSON, json_value, mapped_strings
 from dew.checkpoints import RUN_FILE
-from dew.registry import trust_sources, trusts_source
+from dew.registry import from_record, to_record, trust_sources, trusts_source
 
 if TYPE_CHECKING:
     from flax import linen as nn
@@ -239,7 +240,6 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
     from dew.inference.images import ImageSettings, TextToImage, restored_tree
     from dew.inference.tasks import saved_settings
     from dew.objectives.diffusion.objective import without_loss_heads
-    from dew.registry import from_record
 
     if not samples_images(run):
         raise ValueError(f"{checkpoint} is a {run.objective.__name__} run, which Pretrained.load reads; a "
@@ -320,6 +320,14 @@ class Held:
     step: int
     ema: bool | None
 
+    def __post_init__(self) -> None:
+        # Each field of the type it declares: a release's record names a step, never a moving selection
+        # ('latest'), and an EMA choice, never a word for one.
+        for name, declared in typing.get_type_hints(Held).items():
+            value, kinds = getattr(self, name), typing.get_args(declared) or (declared,)
+            if (isinstance(value, bool) and bool not in kinds) or not isinstance(value, kinds):
+                raise ValueError(f"a release's record holds {name}={value!r}, which is no {declared}")
+
     @classmethod
     def of(cls, run: SavedRun, ema: bool | None) -> Held:
         """What `run`'s release with `ema` holds, its directory absolute where it is local."""
@@ -327,16 +335,13 @@ class Held:
 
     @classmethod
     def read(cls, value: JSON) -> Held:
-        """A release's record `value` (`record`), refused where it is not one."""
-        match value:
-            case {"run": str(run), "step": int(step), "ema": bool() | None as ema}:
-                return cls(run, step, ema)
-            case _:
-                raise ValueError(f"{value!r} is no record of the saved run a release holds")
+        """A release's record `value` (`record`), read by its fields' declarations (`registry.from_record`),
+        refused where it is not one."""
+        return from_record(cls, value)
 
-    def record(self) -> dict[str, JSON]:
-        """This as a release's record (`read`)."""
-        return {"run": self.run, "step": self.step, "ema": self.ema}
+    def record(self) -> JSON:
+        """This as a release's record (`registry.to_record`, which `read` reads)."""
+        return to_record(self, Held)
 
 
 def _write_held(release: Path, run: SavedRun, ema: bool | None) -> None:
@@ -414,33 +419,23 @@ def releases_here(record: Mapping[str, object], *, mesh: MeshSpec | Mesh | None 
         if str(here) != root:
             renamed.update({name: str(here / Path(name).relative_to(root)) for name in names
                             if Path(name).is_relative_to(root)})
-    return {**{key: _renamed(field, renamed) for key, field in fields.items()}, RELEASE_SOURCES: sources}
+    def here_named(text: str) -> str:
+        return renamed.get(text, text)
+
+    return {**{key: mapped_strings(field, here_named) for key, field in fields.items()},
+            RELEASE_SOURCES: sources}
 
 
 def _strings(record: JSON) -> list[str]:
-    """Every string `record` holds at any depth."""
-    match record:
-        case str():
-            return [record]
-        case dict():
-            return [held for field in record.values() for held in _strings(field)]
-        case list():
-            return [held for element in record for held in _strings(element)]
-        case _:
-            return []
+    """Every string `record` holds at any depth, in the order `mapped_strings` walks them."""
+    held: list[str] = []
 
+    def kept(text: str) -> str:
+        held.append(text)
+        return text
 
-def _renamed(record: JSON, names: Mapping[str, str]) -> JSON:
-    """`record` with each string `names` holds at any depth replaced by its new name."""
-    match record:
-        case str():
-            return names.get(record, record)
-        case dict():
-            return {key: _renamed(field, names) for key, field in record.items()}
-        case list():
-            return [_renamed(element, names) for element in record]
-        case _:
-            return record
+    mapped_strings(record, kept)
+    return held
 
 
 def pooled_export(run: SavedRun, destination: Path, *, ema: bool | None = None,
@@ -500,7 +495,7 @@ def native_source[Loaded: Pretrained](kind: type[Loaded], source: str | Path, *,
     from dew.inference.tasks import cache_sized, saved_model
     from dew.interop.pretrained import Pretrained
     from dew.objectives.base import ReleasedTask
-    from dew.registry import ModelConfig, to_record
+    from dew.registry import ModelConfig
 
     built = [name for name, value in building.items() if value is not None and value is not False]
     if built:
