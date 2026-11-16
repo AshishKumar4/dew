@@ -38,7 +38,7 @@ from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
-from dew.nn.kernels.options import OuterProgram, compiler_options, owned_program, program_digest
+from dew.nn.kernels.options import OuterProgram, compiler_options, owned_program, program_key
 from dew.nn.kernels.templates import report
 from dew.objectives.base import RECORD, Objective, Pooled
 from dew.state import TrainState, apart, together
@@ -177,9 +177,9 @@ class Relowered:
 
 class SampledStep(NamedTuple):
     """A step that also summarizes what the run inspects (`Candidate.sampled`): the program it compiled
-    from (`dew.nn.kernels.options.program_digest`) and its executable."""
+    from (its lowering) and its executable."""
 
-    program: str
+    lowered: jax.stages.Lowered
     executable: jax.stages.Compiled
 
 
@@ -570,11 +570,11 @@ class Trials:
         return self.run(profile)
 
 
-def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None) -> tuple[str, str]:
+def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None) -> Hashable:
     """A search's key of the executable it compiles from `lowered` under `options` (`FitSearch.compiled`):
-    the program's digest (`program_digest`), one for a lowering over a state's shapes before it is placed
-    and over the placed state, and the options as text."""
-    return program_digest(lowered), repr(sorted((options or {}).items()))
+    the program within this process (`program_key`), one for a lowering over a state's shapes before it is
+    placed and over the placed state, and the options as text."""
+    return program_key(lowered), repr(sorted((options or {}).items()))
 
 
 def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch,
@@ -733,7 +733,7 @@ class FitSearch[LossT, EffectsT]:
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
     is that program (`AheadOfTime.taken`), lowered as its own compile lowered it (`handed`: within its
     refusals, for its GPU, `fits_here`)."""
-    compiled: dict[tuple[str, str], jax.stages.Compiled] = dataclasses.field(default_factory=dict)
+    compiled: dict[Hashable, jax.stages.Compiled] = dataclasses.field(default_factory=dict)
     """Each executable this search, or one before it over the same candidates, compiled, by its program and
     its options (`compiled_key`): one a search before the state was placed compiled is taken
     here in place of compiling it again (`dew.training.compiler.StepCompiler.planned_unplaced`), judged on
@@ -927,8 +927,7 @@ class FitSearch[LossT, EffectsT]:
                     # (`handed`), which its target compiles none of.
                     with handed(ahead):
                         sampled = candidate.sampled()
-                    self.sampled = SampledStep(ahead.sampled.program,
-                                               ahead.sampled.taken(sampled, jax.devices()))
+                    self.sampled = SampledStep(sampled, ahead.sampled.taken(sampled, jax.devices()))
                 else:
                     # The one compiled beside the step's, but where the step was lowered afresh past a spill,
                     # which its sampled step is then too, as one lowered after the step's compile would be.
@@ -945,7 +944,7 @@ class FitSearch[LossT, EffectsT]:
                     compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled,
                                                    first=None if beside is None else firsts[1])
                     self.sampled = (None if compiled is None
-                                    else SampledStep(program_digest(lowered[-1]), compiled))
+                                    else SampledStep(lowered[-1], compiled))
                 # Admitted by the plan whichever compiled it, ahead or here (training.md: the sampled step is
                 # admitted by the same memory plan).
                 fit, headroom = self.fitting(None if self.sampled is None else self.sampled.executable,
