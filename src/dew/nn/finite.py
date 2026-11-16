@@ -3,6 +3,7 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 def _inexact(leaf) -> bool:
@@ -28,3 +29,18 @@ def zeroed_unless(ok: jax.Array, tree):
         return jnp.where(ok, leaf, jnp.zeros((), leaf.dtype)) if _inexact(leaf) else leaf
 
     return jax.tree.map(gate, tree)
+
+
+MAGNITUDE_BOUND = float(np.sqrt(np.float64(jnp.finfo(jnp.bfloat16).max)))
+"""The largest gradient magnitude an update is formed from finite: below it every square is finite in the
+narrowest dtype a moment is stored in (bf16, a hair under float32's own), so no second moment (Adam's,
+LaProp's, LAMB's: an average of past squares, never above their largest) passes it."""
+
+
+def bounded(tree) -> jax.Array:
+    """Whether every floating leaf of `tree` is finite with no magnitude past `MAGNITUDE_BOUND`: one
+    max-reduction, which cannot overflow and is false for a value that is not a number, so it holds the
+    finiteness check too (training.md, a step that is not finite)."""
+    flags = [jnp.max(jnp.abs(leaf)) <= MAGNITUDE_BOUND for leaf in jax.tree.leaves(tree)
+             if _inexact(leaf) and leaf.size]
+    return jnp.logical_and.reduce(jnp.stack(flags)) if flags else jnp.asarray(a=True)
