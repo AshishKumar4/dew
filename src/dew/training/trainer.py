@@ -68,6 +68,7 @@ from dew.inputs import Field, InputSpec
 from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.options import Compiling, attempting, owned_program, shapes_of
+from dew.nn.kernels.templates import report
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, tracing
 from dew.objectives.base import (
@@ -712,7 +713,9 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             from dew.distributed.host import transfer
             key = transfer(key, NamedSharding(self.state_mesh, P()))
-        abstract, through, build = traced_start(self._staged_start, initializer, key)
+        # Its kernels certified on the GPU the run targets, outside the mesh its step traces under (row 6824).
+        with report.targeting(self.device_mesh):
+            abstract, through, build = traced_start(self._staged_start, initializer, key)
         checkpoints = self.checkpoints
         # Each process lists the checkpoints itself, and on a shared filesystem one listing can lag
         # another's: every process resumes from one step or none does.
@@ -1461,7 +1464,7 @@ class Trainer(Generic[Loss, Effects]):
     def _starting(self, run: FitRun, dataset: Loader, initial: TrainState | None, resume: Resume
                   ) -> tuple[int, bytes | None,
                              Callable[[Compiling | None], tuple[TrainState, Placement[TrainState]]],
-                             TrainState | None, Start | None]:
+                             TrainState, Start | None]:
         """Where `fit` starts, before it places anything: the step, the data position a resume reads
         alone (`Checkpoints.position`), so the data opens where the run left it, the placement still
         to make (handed the start's compile where one began, `attempting`), the state's shapes it checks
@@ -1534,7 +1537,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _opened(self, plan: FitPlan, run: FitRun, interval: Interval, current: int, position,
                 placed: Callable[[Compiling | None], tuple[TrainState, Placement[TrainState]]],
-                abstract: TrainState | None, *, resumed: bool, fresh: Start | None = None,
+                abstract: TrainState, *, resumed: bool, fresh: Start | None = None,
                 ) -> tuple[TrainState, Placement[TrainState], bool]:
         """Start `fit` at step `current`: refuse a run already past its steps, a checkpoint cadence
         with no checkpointer or a resume its stream cannot continue; open the training stream on its
@@ -1547,8 +1550,6 @@ class Trainer(Generic[Loss, Effects]):
         checkpoint at its last step having been written, so there is nothing to do."""
         mesh, checkpoints, steps = self.device_mesh, self.checkpoints, plan.steps
         begun: Compiling | None = None
-        # Whether the run's cooldown branches were checked before its state was placed.
-        branched = False
         if steps is not None and current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
         bound = self._shape.examples
@@ -1564,6 +1565,9 @@ class Trainer(Generic[Loss, Effects]):
             "cooldown record", lambda: checkpoints.cooldown(current) if jax.process_index() == 0 else None)
         run.cooling = broadcast_from_process_zero(kept)
         pending = run.cooling is not None
+        # Refused before the stream opens and the start's program begins to compile: what branches read is
+        # the optimizer state's structure.
+        check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(rated(abstract)))
         complete = (plan.ended(current, interval.real_tokens, interval.consumed) and checkpoints is not None
                     and checkpoints.latest is not None and not pending)
         # The step the run reads from, as the pre-read's empty-stream check reads it, and the FLOP
@@ -1591,7 +1595,7 @@ class Trainer(Generic[Loss, Effects]):
             run.partition = partition
             run.train = self._prefetched(plan, run, run.source, position)
             run.source = None  # Lifetime transferred to the prefetch worker.
-            if abstract is not None and self.rollout is None:
+            if self.rollout is None:
                 # Read on the host before the state is placed, and agreed: a process whose read failed
                 # stops its peers before any of them places one. The prefetcher places it at the first step.
                 first = waited_read(run, interval, agree=True, peek=True)
@@ -1601,11 +1605,6 @@ class Trainer(Generic[Loss, Effects]):
                     # a compile refuses it, before the state it would check is traced from that batch.
                     agreed_same("training batch layout", lambda: batch_layout(split_fields(placed_first)[0]))
                     self._fitting(abstract, placed_first)
-                    # Refused before the start's program begins to compile, as every refusal that needs
-                    # nothing the planning beside it finds: its state's structure states what branches read.
-                    check_branches(bool(plan.branches) or pending, plan.suites,
-                                   settable=settable_rates(rated(abstract)))
-                    branched = True
                     if fresh is not None:
                         begun = self._compiled_fresh(run, fresh, first, placed_first)
             elif position is not None:
@@ -1617,8 +1616,6 @@ class Trainer(Generic[Loss, Effects]):
             run.startup.overlapped = begun.taken.is_set()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
-        if not branched:
-            check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(rated(state)))
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
@@ -1657,10 +1654,10 @@ class Trainer(Generic[Loss, Effects]):
         program begun beside it in a thread of its own (`start_compiling`), the key lowered unplaced as the
         start compiled ahead takes it: both once the whole state is checked, so a refused run compiles
         neither. None where the step is not compiled here (one compiled ahead, a host-master's, a profile
-        guided run's), the start then compiling as it is placed. The one refusal that can come while the
-        start's program compiles is its step's planning's (`PlanRefused`, a compile that fails), which runs
-        beside it, the overlap the start is begun for; the process's exit then waits for the start's compile
-        to end (`options.compiling`)."""
+        guided run's), the start then compiling as it is placed. What can stop the run while the start's
+        program compiles is its step's planning, which runs beside it, the overlap the start is begun for (a
+        refusal of it, `PlanRefused` or `LayoutRefused`, a compile that fails, an interrupt); the process's
+        exit then waits, saying so, for the start's compile to end (`options.compiling`)."""
         if self._compiler.ahead is not None or self.host_master or pgle_runs():
             return None
         key = shapes_of(fresh.key)
@@ -2182,8 +2179,8 @@ class Trainer(Generic[Loss, Effects]):
                 # Its empty window binds no split: the new step's window is built over it.
                 self._compiler.afresh = True
             if self._later is not None:
-                # What the phase's plan off the loop compiled, which its plan here takes (`LaterPlans`).
-                self._compiler.taken_executables(self._later.taken(self.phase_passes.current))
+                # The phase's plan off the loop waited for, its executables the process's (`LaterPlans`).
+                self._later.waited(self.phase_passes.current)
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
         trials = Trials(state, batch)
         if signature not in compiled:

@@ -111,9 +111,14 @@ def unrewritten(fn):
     (`reference_error._compiled`) and float64 truth (`reference_error._truth_program`, `Truth`) the gate
     runs: the programs they trace or run are Dew's as written, never a rewrite the candidate's check judges
     (docs/design/algebra.md §3). A recorded arm, which replays values and runs no program, is as it is, and
-    so is one unrewritten already."""
+    so is one unrewritten already. A window loop (`over_windows`) stays the outer layer, the arm it runs
+    unrewritten inside it, so what the gate reads of that arm (its `trace`, `_of_float64`) is the arm's."""
+    from arm_forms import _Windowed
+
     if fn is None or getattr(fn, "recorded", False) or isinstance(fn, Unrewritten):
         return fn
+    if isinstance(fn, _Windowed):
+        return _Windowed(unrewritten(fn.fn))
     return Unrewritten(fn)
 
 

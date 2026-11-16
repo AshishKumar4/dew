@@ -323,6 +323,16 @@ def release_compilations():
 
 
 @pytest.fixture(autouse=True)
+def fresh_held_steps():
+    """Each test plans its steps as a fresh process does: the step executables an earlier test's trainers
+    compiled, which the process holds across trainers (`dew.nn.kernels.options.hold`), are dropped as it
+    begins, so what a test's start compiles is its own."""
+    from dew.nn.kernels import options
+
+    options.unhold()
+
+
+@pytest.fixture(autouse=True)
 def released_past_budget():
     """A test that leaves the process past `MAPPINGS_BUDGET` mappings releases them as it ends, so no file
     compiles its way to the limit: test_serving.py alone reached 64,581 of armada's 65,530 and failed its

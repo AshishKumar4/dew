@@ -1923,9 +1923,7 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     if paired and dew_fn is None:
         raise ValueError("a paired null run takes its other implementation, `dew_fn`")
     # The reference and the truth run their programs unrewritten, as a site's do (`_arms`, `_truth_program`).
-    reference_fn = (_Windowed(unrewritten(reference_fn.fn)) if isinstance(reference_fn, _Windowed)
-                    else unrewritten(reference_fn))
-    truth_fn = unrewritten(truth_fn)
+    reference_fn, truth_fn = unrewritten(reference_fn), unrewritten(truth_fn)
     verdicts = []
     # Each run's draws: both budgets whole, the unweighted check's and the weighed one's, and the
     # reference's own beside them where unpaired, so no two runs share a draw.
