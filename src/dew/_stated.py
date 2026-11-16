@@ -26,7 +26,7 @@ from jax.experimental.layout import Format, Layout
 from jaxlib import xla_client
 
 from dew import _hashing, _sources
-from dew._records import JSON, json_value
+from dew._records import JSON
 from dew.algebra import terms
 
 

@@ -514,7 +514,8 @@ class Shifting:
                  + classhooked.scaled + int(Flagged(1) == Flagged(3)) + int(HELD is not None)
                  + int(Compared() == Compared()) + int(Fielded(1) == Fielded(3)) + int(Ranged() == Ranged())
                  + Piped().value + self.held.count + len(KeywordOnly.__match_args__) + SelfMade().made[0]
-                 + Typed().value + Aliased(**{{Aliased.__attrs_attrs__[0].alias: 4}}).value + Untouched().value)
+                 + Typed().value + Aliased(**{{Aliased.__attrs_attrs__[0].alias: 4}}).value
+                 + Untouched().value)
         return {{**row, "id": row["id"] + total}}
 """
 """A class step of the user's file building classes generators made, each with a default or a factory its
