@@ -317,7 +317,7 @@ def _field(held: type, field: _sources.GeneratedField, at: str, known: Mapping[i
            walking: tuple[int, ...]) -> JSON:
     """A generated field (`dew._sources.generated_fields`) as an identity states it: its name, default and
     default factory, and for an attrs field the rest of what attrs recorded of it
-    (`dew._sources.attrs_parts`), each by its part's name. A dataclass's field is stated as it was before
+    (`dew._sources.generated_fields`), each by its part's name. A dataclass's field is stated as it was before
     them, so a position saved then holds (train 953's review)."""
     stated: list[JSON] = [field.name,
                           _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking),
