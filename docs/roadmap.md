@@ -86,6 +86,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Serving and RL measured where users run them. [5315, 5321]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
 - A decoder computing in no dtype of its own (dtype=None) over parameters of mixed dtypes, e.g. [6215]
+- The in-context memory reads no forks. [6969]
 
 ## Algebra
 
