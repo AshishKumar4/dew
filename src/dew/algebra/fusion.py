@@ -427,14 +427,16 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
 
 
 class _Trace(NamedTuple):
-    """A region's written program (`_traced`): its one equation, the inputs it reads them by, and the routes
-    and launches (each its op and keyed arguments, and the config it took, `tuning.Seen.held`) its trace
-    reported, which each program it is written into reports."""
+    """A region's written program (`_traced`): its one equation, the inputs it reads them by, the routes and
+    launches (each its op and keyed arguments, and the config it took, `tuning.Seen.held`) its trace
+    reported, which each program it is written into reports, and the facts its trace read
+    (`generation.recording`), which each program it is written into reads again (`generation.replay`)."""
 
     equation: jcore.JaxprEqn
     invars: tuple[jcore.Var, ...]
     routes: tuple
     launches: tuning.Seen
+    reads: dict
 
 
 _traces: collections.OrderedDict[Hashable, _Trace] = collections.OrderedDict()
@@ -443,20 +445,24 @@ _traces: collections.OrderedDict[Hashable, _Trace] = collections.OrderedDict()
 def _traced(region: Written) -> _Trace:
     """`region`'s call traced as one nested program over its inputs' types (`nested`), once a process for
     its identity (`Written.key`) in the context a kernel is chosen in (`choice_context`), held
-    (`_cache.holding`);
-    its routes and launches reported where it is written, as its trace reported them
-    (`generation.reported`, `tuning.noted`)."""
+    (`_cache.holding`) while each fact its trace read answers alike (`generation.still`); its routes and
+    launches reported where it is written, as its trace reported them (`generation.reported`,
+    `tuning.noted`), and the facts it read read again there (`generation.replay`), so a recording around the
+    program that writes it holds them as one around its trace did (row 6708)."""
     from dew.nn.kernels import tuning
 
     def traced_once() -> _Trace:
-        with generation.routes(alone=True) as routes, tuning.seen() as seen:
+        with (generation.routes(alone=True) as routes, tuning.seen() as seen,
+              generation.recording() as reads):
             traced = jax.make_jaxpr(nested(region.call))(*_shapes(region.inputs))
         (equation,) = traced.jaxpr.eqns
-        return _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), seen.held())
+        return _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), seen.held(), reads)
 
-    held = _cache.holding(_traces, (region.key, choice_context()), traced_once, DECISIONS_HELD)
+    held = _cache.holding(_traces, (region.key, choice_context()), traced_once, DECISIONS_HELD,
+                          still=lambda trace: generation.still(trace.reads))
     generation.reported(held.routes)
     tuning.noted(held.launches)
+    generation.replay(held.reads)
     return held
 
 
