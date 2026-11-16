@@ -823,9 +823,12 @@ class SegmentLayout(Layout):
 
     @property
     def written(self) -> "tuple[QuestionSegment, ...]":
-        """The row's parts in order: its own `segments`, or the layout's built-in row (`built_in`)."""
+        """The row's parts in order: its own `segments`, which its checks hold to a question row's parts
+        (`QUESTION_KINDS`, `__post_init__`), or the layout's built-in row (`built_in`)."""
         if self.segments is not None:
-            return self.segments
+            return tuple(segment for segment in self.segments
+                         if isinstance(segment, (Text, Special, State, Instructions, OptionLines, AnswerCue,
+                                                 RequestSummary, Again)))
         return built_in(self.labels, self.order or ("state_first" if self._state_first else "question_first"))
 
     @property
