@@ -125,7 +125,9 @@ def _forked_scan(scanned, x, dt, B, C, loads, stores, given, *, documents: int, 
     document and carried where it ends the chunk. Its operands a row's chunks `[NC, C, ...]`, each token's
     load and store `[NC, C]` (`Forked.tokens`), its table's given states `[S', D, N]`; `(outputs [NC, C, D],
     the row's last state)`. The segments are at most the chunks and the documents, each a chunk's work, as
-    many as a row laid a chunk a document took, each checkpointed: its residual the state entering it."""
+    many as a row laid a chunk a document took, each checkpointed: its residuals the states entering it and
+    the table, each segment's reads leaving it as the scan's own outputs, laid into their chunks after it
+    (segments of a chunk hold disjoint tokens), never a carry the scan's derivative saves a segment."""
     chunks, count = loads.shape
     place = jnp.arange(count)
     marks = ((loads >= 0) | (place == 0)).reshape(-1)
@@ -135,7 +137,7 @@ def _forked_scan(scanned, x, dt, B, C, loads, stores, given, *, documents: int, 
 
     @jax.checkpoint
     def segment(carried, at):
-        (memory_in, held_chunk, leaving), table, outputs = carried
+        (memory_in, held_chunk, leaving), table = carried
         first, after = at
         real = first < chunks * count
         chunk, origin = jnp.minimum(first // count, chunks - 1), first % count
@@ -147,14 +149,15 @@ def _forked_scan(scanned, x, dt, B, C, loads, stores, given, *, documents: int, 
         step = (x[chunk], jnp.where(inside[:, None], dt[chunk], 0.0), B[chunk], C[chunk],
                 jnp.zeros((count,), bool))
         left, read = scanned(memory[None], tuple(t[None] for t in step))
-        outputs = outputs.at[chunk].set(jnp.where((inside & real)[:, None], read[0], outputs[chunk]))
         table = recurrence_chunk.table_stored(table, jnp.where(real, stores[chunk, through], 0), left[0])
         leaving = jnp.where(real & (through == count - 1), left[0], leaving)
-        return ((memory_in, jnp.where(real, chunk, held_chunk), leaving), table, outputs), None
+        reads = jnp.where((inside & real)[:, None], read[0], 0.0)
+        return ((memory_in, jnp.where(real, chunk, held_chunk), leaving), table), (chunk, reads)
 
     table = jnp.zeros((held, *zero.shape), zero.dtype)
-    start = ((zero, jnp.asarray(-1), zero), table, jnp.zeros((chunks, count, x.shape[-1]), x.dtype))
-    ((_, _, last), _, outputs), _ = jax.lax.scan(segment, start, (origins, following))
+    ((_, _, last), _), (placed, reads) = jax.lax.scan(segment, ((zero, jnp.asarray(-1), zero), table),
+                                                      (origins, following))
+    outputs = jnp.zeros((chunks, count, x.shape[-1]), reads.dtype).at[placed].add(reads)
     return outputs, last
 
 
