@@ -34,9 +34,12 @@ _log = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class Startup:
-    """The seconds each phase of a run's start took, by its name, reported once (`scalars`)."""
+    """The seconds each phase of a run's start took, by its name, and whether its start took the compile
+    begun beside its step's (`options.Compiling.taken`; None where none was begun), reported once
+    (`scalars`)."""
 
     seconds: dict[str, float] = dataclasses.field(default_factory=dict)
+    overlapped: bool | None = None
     reported: bool = False
 
     @contextlib.contextmanager
@@ -57,11 +60,16 @@ class Startup:
             _log.info("%s took %.1f s", doing, took)
 
     def scalars(self) -> dict[str, float]:
-        """Each phase's seconds as `startup/<name>_seconds`, the first time they are asked for; none after."""
+        """Each phase's seconds as `startup/<name>_seconds`, and `startup/start_overlapped` 1 where the start
+        took the compile begun beside its step's and 0 where it compiled again, the first time they are
+        asked for; none after."""
         if self.reported:
             return {}
         self.reported = True
-        return {f"startup/{name}_seconds": seconds for name, seconds in self.seconds.items()}
+        phases = {f"startup/{name}_seconds": seconds for name, seconds in self.seconds.items()}
+        if self.overlapped is None:
+            return phases
+        return {**phases, "startup/start_overlapped": float(self.overlapped)}
 
 
 class DataObjective(Protocol):
