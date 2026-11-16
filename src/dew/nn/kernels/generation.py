@@ -855,11 +855,12 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
-    # One TensorCore a chip, of four 128 x 128 MXUs, each 16K multiply-adds a cycle, and 800 GiB/s of HBM
-    # (cloud.google.com/tpu/docs/v5e, /tpu/docs/system-architecture-tpu-vm); the clock is 197e12 / 131072,
-    # derived from the peak, no stated clock. Its scoped VMEM and MXU rate are its family's (`_TPUS`).
+    # One TensorCore a chip, of four 128 x 128 MXUs, each 16K multiply-adds a cycle, 197 TF of bf16 and 819
+    # GB/s of HBM (cloud.google.com/tpu/docs/v5e, /tpu/docs/system-architecture-tpu-vm); the clock is
+    # 197e12 / 131072, derived from the peak, no stated clock. Its scoped VMEM and MXU rate are its family's
+    # (`_TPUS`).
     GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, multiprocessors=1,
-              clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30),
+              clock_hz=197e12 / 131072, memory_bandwidth=819e9),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
 )}
