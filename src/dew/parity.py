@@ -805,11 +805,12 @@ def _computed_here(program, *trees):
     arrays = [leaf for leaf in jax.tree.leaves(trees) if leaf is not None]
     if not arrays or jax.default_backend() != "gpu":
         return program(*trees, xp=np)
-    gpu = jax.devices()[0]
 
     def placed(leaf):
+        # Uncommitted, so the program lays it beside the arrays a GPU already holds, sharded or not, on
+        # a device this process addresses.
         on_gpu = isinstance(leaf, jax.Array) and all(device.platform == "gpu" for device in leaf.devices())
-        return leaf if leaf is None or on_gpu else jax.device_put(leaf, gpu)
+        return leaf if leaf is None or on_gpu else jax.device_put(leaf)
 
     with jax.enable_x64(new_val=True):
         held = jax.tree.map(placed, trees, is_leaf=lambda leaf: leaf is None)
