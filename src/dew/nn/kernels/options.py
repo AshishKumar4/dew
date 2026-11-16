@@ -41,8 +41,6 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from flax import linen as nn
 
-_log = logging.getLogger(__name__)
-
 
 class QuantizedDtypes(Protocol):
     """What the options read of a run's quantization (`dew.quantization.Quantization`, above the kernels):
@@ -183,13 +181,23 @@ _TAKEN: contextvars.ContextVar[Taken | None] = _cache.untraced(
 
 def program_key(lowered: jax.stages.Lowered) -> Hashable:
     """A program as `lowered` holds it, within this process: its text's digest, its arguments' and results'
-    trees as JAX holds them (a node's type the class itself, its data by equality) and its arguments'
-    types. Two lowerings of one program agree, whichever devices of one target they were lowered over, and
-    two whose texts agree only as JAX prunes an argument neither reads do not; any tree has one, a class
-    made inside a function among its nodes. The key of every match within a process (a search's compiled
-    executables, a begun compile's lowering); `program_digest` is the one a file of programs holds."""
+    trees as JAX holds them (a node's type the class itself, its data by equality), its arguments' types and
+    the host callbacks it calls, the objects themselves (`host_callbacks`). Two lowerings of one program
+    agree, whichever devices of one target they were lowered over, and two whose texts agree only as JAX
+    prunes an argument neither reads do not, nor two that call other callbacks from one text (an Optax
+    update's `jax.pure_callback` over another closure); any tree has one, a class made inside a function
+    among its nodes. The key of every match within a process (the executables it holds across trainers, a
+    begun compile's lowering); `program_digest` is the one a file of programs holds."""
     types = tuple((aval.shape, str(aval.dtype), aval.weak_type) for aval in jax.tree.leaves(lowered.in_avals))
-    return _text_digest(lowered), lowered.in_tree, lowered.out_tree, types
+    return _text_digest(lowered), lowered.in_tree, lowered.out_tree, types, host_callbacks(lowered)
+
+
+def host_callbacks(lowered: jax.stages.Lowered) -> tuple:
+    """The host callbacks `lowered` calls (`jax.pure_callback`, `jax.debug.callback`, an `io_callback`), the
+    objects its executable calls, as JAX's own compile reads them from the lowering: its text names each by
+    its place in the program alone, so two programs of one text may call other callbacks. JAX's jit keys
+    them by the function traced, and its persistent cache keeps no program that calls one."""
+    return tuple(lowered._lowering.compile_args.get("host_callbacks", ()))
 
 
 def _text_digest(lowered: jax.stages.Lowered) -> str:
@@ -203,9 +211,13 @@ def program_digest(lowered: jax.stages.Lowered) -> str:
     two whose texts agree only as JAX prunes an argument neither reads, which their executables take in
     other trees, do not (a step's commit with its sample's summaries and without). Refused
     (`dew._stated.Unestablished`) where a tree holds a node no process names (a class made inside
-    a function): no file can hold that program, and each reader of a file's programs takes it as one the
-    file holds none of (`taken`, `dew.training.ahead.kept`), or refuses it, naming the tree, where it
-    must keep it (a step compiled ahead)."""
+    a function), or the program calls a host callback (`host_callbacks`), an object of this process its text
+    names by place alone: no file can hold that program, and each reader of a file's programs takes it as one
+    the file holds none of (`taken`, `dew.training.ahead.kept`), or refuses it, naming why, where it must
+    keep it (a step compiled ahead)."""
+    if called := host_callbacks(lowered):
+        raise Unestablished(f"the program calls {len(called)} host callbacks, objects of this "
+                                    "process its text names by place alone")
     # Its trees node by node, each node's data by value as an identity states it (`dew._stated.stated`), never
     # as JAX prints them, which holds a node's data by its printed form: a checkified program's error tree
     # holds a traceback printed by its address, another in every process. A handed executable gives its

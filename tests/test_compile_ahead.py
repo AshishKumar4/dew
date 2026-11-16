@@ -434,8 +434,10 @@ def attempted(lowered, held):
 
 report.attempted = attempted
 # Registered before the compile begins, so the exit runs it after its wait for the compile and before JAX's
-# own cleanup: 3 where the compile had ended by then, 5 where the exit went on with it running.
-atexit.register(lambda: os._exit(3 if ended.is_set() else 5))
+# own cleanup: 3 where the compile had ended by then, 5 where the exit went on with it running, and 4 where
+# it had ended before the refusal, whose exit then says nothing of the wait.
+early = threading.Event()
+atexit.register(lambda: os._exit(4 if early.is_set() else 3 if ended.is_set() else 5))
 
 
 def long(x):
@@ -447,8 +449,10 @@ def long(x):
 options.compiling(jax.jit(long), jnp.ones(2))
 begun.wait()
 # Refused before its start was taken, its compile still running (else the exit's timing says nothing of it,
-# and the run says so by another status).
-raise SystemExit(4 if ended.wait(0.5) else 3)
+# and the exit hook says so by its own status).
+if ended.wait(0.5):
+    early.set()
+raise SystemExit(1)
 """
 """A run that begins its start's compile beside its planning and is refused before it takes the start."""
 
