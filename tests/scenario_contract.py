@@ -85,10 +85,14 @@ def covering(axes: Mapping[str, Sequence]) -> list[dict]:
 def in_fresh_process(module: str, devices: int, function: str, *arguments):
     """`module`'s `function` called on `arguments` (JSON's values) in a fresh process that sees `devices` CPU
     devices (`process_support.device_flags`, the one way a worker of the suite sets its count): what it
-    returns (JSON's). A run's device count is its process's, fixed as its backend opens."""
-    script = (f"import json, sys\nimport {module}\n"
+    returns (JSON's). A run's device count is its process's, fixed as its backend opens. Dew is imported
+    first, as `dew train` imports it, so a run whose record asks XLA for flags this process lacks runs the
+    process again with them before jaxlib loads (`_devices.hold_xla_flags`); faulthandler prints a native
+    crash's Python stacks, as the suite's other workers do (`process_support.worker_env`)."""
+    script = (f"import json, sys\nimport dew\nimport {module}\n"
               f"print(json.dumps(getattr({module}, sys.argv[1])(*json.loads(sys.argv[2]))))")
-    return fresh(script, function, json.dumps(arguments), flags=device_flags(devices), platforms="cpu")
+    return fresh(script, function, json.dumps(arguments), flags=device_flags(devices), platforms="cpu",
+                 variables={"PYTHONFAULTHANDLER": "1"})
 
 
 PAUSE = 1 / 3
@@ -142,8 +146,8 @@ def resumption(root: Path) -> tuple[Phase, Phase, Phase]:
 @dataclass(frozen=True)
 class Recorded:
     """A scenario cell's run as `dew train` replays it in a fresh process that sees `devices` CPU devices
-    (`run_kinds.trained_record`): its saved record, the settings its command line sets (`--set`,
-    `run_kinds.cli_settings`), and the packages outside Dew its record imports, which it trusts."""
+    (`run_kinds.trained_record`, `recorded_run`): its saved record, the settings its command line sets
+    (`--set`, `run_kinds.cli_settings`), and the packages outside Dew its record imports, which it trusts."""
 
     record: Path
     settings: Mapping[str, str]
@@ -151,15 +155,23 @@ class Recorded:
     trust: tuple[str, ...] = ()
 
     def trained(self, phase: Phase = CELL) -> tuple[Path, dict[str, float]]:
-        """The run trained in `phase`: its run directory, and the persistent-cache counts its last logged step
-        reports (`compilation_cache_counts`, every program its process compiled until then)."""
-        from run_kinds import scalars, trained_record
+        """The run trained in `phase`: its run directory, and the persistent-cache counts of its process once
+        it has ended (`recorded_run`): every program it compiled, a final validation's and a checkpoint's
+        after its last logged step among them, as a `Called` run's are."""
+        ran = in_fresh_process("scenario_contract", self.devices, "recorded_run", str(self.record),
+                               {**self.settings, **phase.settings()}, list(self.trust))
+        return Path(ran["run"]), ran["counts"]
 
-        run = trained_record(self.record, {**self.settings, **phase.settings()}, devices=self.devices,
-                             trust=self.trust)
-        logged = scalars(run)
-        return run, {name: value for name, value in logged[max(logged)].items()
-                     if name.startswith("train/cache_")}
+
+def recorded_run(record: str, settings: Mapping[str, str], trust: Sequence[str]) -> dict:
+    """The run `dew train` replays from `record` with `settings` set and `trust` trusted, in this process
+    (`run_kinds.trained_record`; a fresh one, `Recorded.trained`): its run directory, and this process's
+    persistent-cache counts once it has ended (`compilation_cache_counts`)."""
+    from run_kinds import trained_record
+
+    count_compilation_cache()
+    run = trained_record(Path(record), settings, trust=tuple(trust))
+    return {"run": str(run), "counts": compilation_cache_counts()}
 
 
 @dataclass(frozen=True)

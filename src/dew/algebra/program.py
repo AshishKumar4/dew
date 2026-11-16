@@ -25,6 +25,7 @@ from jax._src.interpreters import partial_eval
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
 
+from dew import _cache
 from dew._cache import ALGEBRA, KERNEL_CHOICES
 from dew.algebra import cost, extract, fusion, rules, terms
 from dew.algebra.extract import Linear
@@ -261,7 +262,7 @@ distinct windows of the steps it compiles (161 of the 2,799 a UNet's planner tra
 33 ms on average to derive again; row 3764)."""
 
 _DERIVED: collections.OrderedDict[Hashable, Rewrite] = collections.OrderedDict()
-"""Each window's rewrite by what derived it (`_derived`, held through `fusion.holding`), the least recently
+"""Each window's rewrite by what derived it (`_derived`, held through `_cache.holding`), the least recently
 read first."""
 
 
@@ -335,7 +336,7 @@ def _derived(window: jcore.Jaxpr, accurate: bool, saturation: Saturation, derivi
     def deriving_once() -> Rewrite:
         derived.append(True)
         return _region(window, accurate=accurate, saturation=saturation, ranges=ranges)
-    done = fusion.holding(_DERIVED, key, deriving_once, held=WINDOWS_HELD)
+    done = _cache.holding(_DERIVED, key, deriving_once, WINDOWS_HELD)
     return done, not derived
 
 

@@ -817,6 +817,19 @@ def trace_context() -> Hashable:
             deterministic_ops_requested())
 
 
+def held_context() -> Hashable:
+    """The key a trace kept outside the compile point is held by, beside what it is of: the state a trace
+    reads of this thread's context (`trace_context`) and the launches the compiles refused, which a
+    template's legality reads as the call traces (`report.refused_launches`, a process's fact a trace reads
+    and a caller names beside the trace's state). A step's candidates (`dew.training._candidates`) and the
+    algebra's held kernel decisions (`fusion.choice_context`, the derivation's context beside it) are each
+    held by it, so a fact added to it reaches both; a launch's derived config is keyed by what its
+    derivation reads (`report.derivation_inputs`, `templates.base`)."""
+    from dew.nn.kernels.templates import report
+
+    return trace_context(), report.refused_launches()
+
+
 def _signature(leaf) -> Hashable:
     """What jit keys an argument on: an array's abstract value (shape, dtype, weak type), placement
     and layout (its `format`, which holds its sharding; a key array's sharding), another value's type,
