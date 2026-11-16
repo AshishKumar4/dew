@@ -220,12 +220,55 @@ class GeneratedField(NamedTuple):
     default factory, each `MISSING` where it has none, and the callables attrs runs on its value beside them
     (`hooks`: its converter and validator, which its generated `__init__` holds in its globals; its
     `on_setattr`, which its generated `__setattr__` closes over; its eq and order keys, which its generated
-    comparisons hold), each by its part's name where it has one; none for a dataclass's."""
+    comparisons hold), each by its part's name where it has one; for a dataclass's, its flags where they
+    depart from `FIELD_FLAGS` (compare, hash, init, repr, metadata)."""
 
     name: str
     default: Any
     factory: Any
     hooks: tuple[tuple[str, Any], ...] = ()
+
+
+DATACLASS_OPTIONS = {name: parameter.default for name, parameter
+                     in inspect.signature(dataclasses.dataclass).parameters.items() if name != "cls"}
+"""What `dataclasses.dataclass` makes a class with unless told otherwise (eq, order, frozen, ...), read from
+its signature: a class's departures from it are part of what it is (`generation_options`)."""
+
+FIELD_FLAGS = {name: parameter.default
+               for name, parameter in inspect.signature(dataclasses.field).parameters.items()
+               if name not in ("default", "default_factory", "kw_only")}
+"""What `dataclasses.field` gives a field unless told otherwise (compare, hash, init, repr, metadata), read
+from its signature: a field's departures from it are its parts (`GeneratedField.hooks`). Its keyword-only
+flag is its class's unless set, and names only how `__init__` is called."""
+
+COMPARISONS = ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__", "__hash__")
+"""The comparisons a class generator writes into a class, whose presence an attrs class's options decide."""
+
+
+def generation_options(held: type) -> tuple[tuple[str, bool], ...]:
+    """How a class generator made `held` itself where that departs from its defaults, each by its name: a
+    dataclass's options apart from `DATACLASS_OPTIONS` (eq, order, frozen, unsafe_hash, ...); an attrs
+    class's comparisons by whether it holds each (`COMPARISONS`, a hash set to None not held). Empty for a
+    class made as its generator makes one by default, or by none, so its statement is what it was (base
+    review of 67fd128db: an eq=False went unstated, and a step comparing its instances read other rows)."""
+    params = vars(held).get("__dataclass_params__")
+    if params is not None:
+        return tuple((name, getattr(params, name)) for name, default in DATACLASS_OPTIONS.items()
+                     if getattr(params, name) != default)
+    if "__attrs_attrs__" in vars(held):
+        return tuple((name, vars(held).get(name) is not None) for name in COMPARISONS)
+    return ()
+
+
+def _field_departures(field: dataclasses.Field) -> tuple[tuple[str, Any], ...]:
+    """A dataclass field's flags that depart from `FIELD_FLAGS`, each by its name (an empty metadata is the
+    default's none)."""
+    departures = []
+    for name, default in FIELD_FLAGS.items():
+        value = getattr(field, name)
+        if not (name == "metadata" and not value) and value != default:
+            departures.append((name, value))
+    return tuple(departures)
 
 
 def generated_fields(held: type) -> list[GeneratedField]:
@@ -234,7 +277,7 @@ def generated_fields(held: type) -> list[GeneratedField]:
     are no fields, apart) or an attrs class's (`__attrs_attrs__`, a default `attrs.Factory`'s factory its
     factory, its hooks where set). Empty for a class no generator made itself."""
     if "__dataclass_fields__" in vars(held):
-        return [GeneratedField(field.name, field.default, field.default_factory)
+        return [GeneratedField(field.name, field.default, field.default_factory, _field_departures(field))
                 for field in dataclasses.fields(held)]
     if "__attrs_attrs__" in vars(held):
         # attrs is loaded where a class of it exists; its sentinel and factory type are its own.
