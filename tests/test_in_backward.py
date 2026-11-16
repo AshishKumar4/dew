@@ -13,6 +13,7 @@ from token_support import token_rows
 
 from dew.distributed.batches import shard_batch
 from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.options import program
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig, ParamGroup
 from dew.registry import models
@@ -268,7 +269,9 @@ def _walked(e, *, scale: float = 1.0, finite: bool = True, top: float = 1.0, run
     copies = [weights] * runs, [moments] * runs, [norms] * runs
     with in_backward.planned(in_backward.InBackward(update=update, moments=("mu", "nu", "count"))), \
             in_backward.gated(jnp.asarray(a=True), jnp.asarray(finite)):
-        walked = jax.grad(loss, argnums=(0, 1, 2))(*copies)
+        # Compiled, as a step is: each run's backward traced on its own (`marked`), so the latch crosses
+        # runs as data the walk carries, not as a value one trace leaves another.
+        walked = program(jax.grad(loss, argnums=(0, 1, 2)))(*copies)
     return walked if runs > 1 else tuple(each[0] for each in walked)
 
 
@@ -300,20 +303,27 @@ def test_a_layer_walked_past_a_gradient_that_is_not_finite_keeps_its_weights_and
 
 def test_a_walk_names_the_first_layer_it_met_not_finite_across_its_stage_axis():
     """The first layer a backward walk met a gradient not finite at, of runs whose counts lie on a stage axis
-    and a layer axis (one stage): the highest-numbered layer holding one, numbered across the runs in order.
-    The stage axis was read as the layers, naming layer 0 (the round-2 review's F2)."""
+    and a slot axis (one stage): the top layer of the highest slot holding one, a periodic run's slot its
+    period's layers, numbered across the runs in order. The stage axis was read as the layers, naming
+    layer 0 (the round-2 review's F2), and a period's slot as one layer (the head review's F6)."""
     from dew.training.transaction import _unfinite_layer
 
-    assert int(_unfinite_layer([jnp.asarray([[1.0, 1.0, 0.0]])])) == 1
-    assert int(_unfinite_layer([jnp.asarray([[0.0, 0.0]]), jnp.asarray([[1.0, 0.0, 0.0]])])) == 2
-    assert int(_unfinite_layer([jnp.asarray([[0.0, 0.0, 0.0]])])) == -1
+    assert int(_unfinite_layer([(jnp.asarray([[1.0, 1.0, 0.0]]), 1)])) == 1
+    assert int(_unfinite_layer([(jnp.asarray([[0.0, 0.0]]), 1), (jnp.asarray([[1.0, 0.0, 0.0]]), 1)])) == 2
+    assert int(_unfinite_layer([(jnp.asarray([[0.0, 0.0, 0.0]]), 1)])) == -1
+    # A periodic run of two repeats of a six-layer period, its upper repeat holding the count: layers 6 to 11,
+    # topped by 11; a run after it numbered past its twelve layers.
+    assert int(_unfinite_layer([(jnp.asarray([[0.0, 1.0]]), 6)])) == 11
+    assert int(_unfinite_layer([(jnp.asarray([[0.0, 0.0]]), 6), (jnp.asarray([[1.0]]), 1)])) == 12
 
 
 def test_a_layer_held_in_an_upper_run_holds_every_layer_of_the_runs_walked_after_it():
-    """A step of two in-backward runs, one after the other, whose upper run's top layer, the walk's first,
-    forms a candidate past float32 from a finite gradient: every layer of both runs keeps its weights, each
-    count stepping alike, as one run's layers after a held one do (training.md, a step that is not finite).
-    The latch started anew in each run, so the lower run's layers moved (train 921's review, F1)."""
+    """A compiled step of two in-backward runs, one after the other, whose upper run's top layer, the walk's
+    first, forms a candidate past float32 from a finite gradient: every layer of both runs keeps its
+    weights, each count stepping alike, as one run's layers after a held one do (training.md, a step that
+    is not finite). The latch started anew in each run, so the lower run's layers moved (train 921's
+    review, F1), and carried as a value between runs it escaped the compiled backward's own trace (the
+    head review's F1)."""
     weights, moments, _ = _walked([1.0, 1.0, 1.0], top=1e20, runs=2)
     for run in range(2):
         np.testing.assert_array_equal(np.asarray(weights[run]["a"]), [0.5, 0.5, 0.5])

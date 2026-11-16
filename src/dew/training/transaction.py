@@ -488,17 +488,26 @@ def _collections_kept(finite: jax.Array, numerical: TrainState, state: TrainStat
     return dataclasses.replace(numerical, variables={**numerical.variables, **kept})
 
 
-def _unfinite_layer(runs: Sequence[jax.Array]) -> jax.Array:
-    """The highest-numbered layer whose gradient held a non-finite value, of `runs`' per-layer counts in
-    the model's order, the layers numbered across them: the first the backward's walk met; -1 for none."""
+def _unfinite_layer(runs: Sequence[tuple[jax.Array, int]]) -> jax.Array:
+    """The model layer that tops the first scanned slot the backward's walk met a gradient not finite in,
+    of `runs`' per-slot counts in the model's order (their stage and slot axes, one stage), each slot of a
+    run that many layers (`_period`: one, or a repeated period's): the layer itself for a run of layers, the
+    top of the period for a periodic one, whose positions share one count; numbered across the runs. -1 for
+    none."""
     first, offset = jnp.asarray(-1, jnp.int32), 0
-    for counts in runs:
-        # A run's counts lie on its stage and layer axes (one stage), its layers in order.
+    for counts, period in runs:
         counts = counts.reshape(-1)
-        places = jnp.arange(counts.size, dtype=jnp.int32) + offset
-        first = jnp.maximum(first, jnp.max(jnp.where(counts > 0, places, -1)))
-        offset += counts.size
+        tops = jnp.arange(counts.size, dtype=jnp.int32) * period + period - 1 + offset
+        first = jnp.maximum(first, jnp.max(jnp.where(counts > 0, tops, -1)))
+        offset += counts.size * period
     return first
+
+
+def _period(run: Mapping) -> int:
+    """The layers each scanned slot of `run` (its tree in the state) holds: a repeated period's positions
+    (`layers_0`, `layers_1`, ...), one each, or one for a run of single layers."""
+    keys = [str(key) for key in run]
+    return len(keys) if keys and all(key.startswith("layers_") for key in keys) else 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1427,8 +1436,8 @@ class Transaction:
                       jnp.zeros((), jnp.float32)),
             nonfinite=sum((jnp.sum(in_backward.norms_of(_at(norms, path))["nonfinite"]) for path in handled),
                           jnp.zeros((), jnp.float32)),
-            unfinite_layer=_unfinite_layer([in_backward.norms_of(_at(norms, path))["nonfinite"]
-                                            for path in handled]))
+            unfinite_layer=_unfinite_layer([(in_backward.norms_of(_at(norms, path))["nonfinite"],
+                                             _period(_at(gradient, path))) for path in handled]))
         zeros = functools.reduce(merge, [_nested(path, jax.tree.map(jnp.zeros_like, _at(gradient, path)))
                                          for path in handled], {})
         return merge(gradient, zeros), applied

@@ -70,10 +70,6 @@ _PLAN: contextvars.ContextVar[InBackward | None] = contextvars.ContextVar("dew_i
 _GATE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_in_backward_gate", default=None)
 _FINITE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_in_backward_finite",
                                                                           default=None)
-_LATCH: contextvars.ContextVar[list[jax.Array] | None] = contextvars.ContextVar("dew_in_backward_latch",
-                                                                                default=None)
-"""The walk's latch across a step's runs (`gated`): whether a layer the backward reached in an earlier run,
-in walk order, was held, which holds every layer of the runs walked after it."""
 
 
 @contextlib.contextmanager
@@ -93,14 +89,14 @@ def gated(due: jax.Array, finite: jax.Array | None = None) -> Iterator[None]:
     step's loss is finite, a layer whose loss or own gradient is not takes the update of a zero gradient:
     its weights as they were, its optimizer one step on (training.md, a step that is not finite), as every
     layer of a step with no loss scale that is not finite does; a layer the walk reached before is moved.
-    Once a layer is held, every layer after it in walk order is, across the step's runs (`_LATCH`)."""
-    tokens = _GATE.set(due), _FINITE.set(finite), _LATCH.set([])
+    Once a layer is held, every layer after it in walk order is, across the step's runs: a run that held one
+    hands the run below a cotangent that is not finite (`_passed_down`), whose layers its gate then holds."""
+    tokens = _GATE.set(due), _FINITE.set(finite)
     try:
         yield
     finally:
         _GATE.reset(tokens[0])
         _FINITE.reset(tokens[1])
-        _LATCH.reset(tokens[2])
 
 
 PERIOD_NORMS = "layers_0"
@@ -171,17 +167,11 @@ def _norms(gradient) -> tuple[jax.Array, jax.Array]:
     return squares, jnp.sum(jnp.stack([jnp.sum(~jnp.isfinite(leaf)) for leaf in leaves])).astype(jnp.float32)
 
 
-def _latched() -> jax.Array:
-    """Whether a run walked before this one in the step's backward held a layer (`_LATCH`), which holds
-    every layer this one walks: the latch a run's walk starts from."""
-    latch = _LATCH.get()
-    return latch[-1] if latch else jnp.asarray(a=False)
-
-
-def _latch(tripped: jax.Array) -> None:
-    """Leave this run's latch, `tripped`, to the runs the walk takes after it (`_latched`)."""
-    if (latch := _LATCH.get()) is not None:
-        latch.append(tripped)
+def _passed_down(dx, tripped: jax.Array):
+    """The cotangent a run hands the layers below it: not finite where it held a layer (`tripped`), so the
+    walk's latch holds across runs as data the backward carries, every layer below gated on its own
+    gradient, which is then not finite (`gated`)."""
+    return jax.tree.map(lambda leaf: jnp.where(tripped, jnp.full_like(leaf, jnp.nan), leaf), dx)
 
 
 def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments, bad: jax.Array):
@@ -311,10 +301,10 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
 
         start = (cotangent, masters if narrow else weights, moments, jnp.zeros((count,), jnp.float32),
                  jnp.zeros((count,), jnp.float32), tuple(jnp.zeros_like(leaf) for leaf in flowing(shared)),
-                 _latched())
+                 jnp.asarray(a=False))
         (dx, moved, moments, sumsq, nonfinite, dshared, tripped), _ = jax.lax.scan(
             body, start, jnp.arange(count), reverse=True)
-        _latch(tripped)
+        dx = _passed_down(dx, tripped)
         written_norms = {"sumsq": sumsq.astype(norms["sumsq"].dtype),
                          "nonfinite": nonfinite.astype(norms["nonfinite"].dtype)}
         # The copies' cotangent is nothing the step reads (`Transaction.split_planned` takes the masters').

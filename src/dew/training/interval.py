@@ -680,8 +680,9 @@ def checked_streak(streak: int, step: int, display: TrainingDisplay, layer: int 
     detection is late by at most that many steps, never missed.
     """
     # A step updating in its backward moved the layers its walk reached before a gradient not finite.
-    walked = (f"; its backward walk first met a gradient not finite at layer {layer}, the layers above it "
-              "updated" if layer >= 0 else "")
+    walked = (f"; its backward walk first met a gradient not finite in the scanned slot topped by layer "
+              f"{layer} (the layer itself, or a repeated period's), the layers above it updated"
+              if layer >= 0 else "")
     if streak >= BAD_LOSS_STEPS:
         raise RuntimeError(
             f"Loss has been non-finite for {streak} consecutive steps "
