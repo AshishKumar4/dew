@@ -36,7 +36,7 @@ from dew import registry
 from dew._cli.main import main
 from dew._records import annotations_of
 from dew.config import RunConfig
-from dew.decision.layout import QuestionSegment, Reads, built_in
+from dew.decision.layout import RowSegment, Reads, built_in
 from dew.registry import objectives
 
 
@@ -74,7 +74,7 @@ def members_of(annotation: type, base=None) -> list[object]:
 
 
 WITNESSES = {Reads: (Reads((("row", "self", "whole"),)), Reads((("row", "self", "causal"),))),
-             tuple[QuestionSegment, ...]: (built_in(None, "question_first"),)}
+             tuple[RowSegment, ...]: (built_in(None, "question_first"),)}
 """Values of Dew's classes that build from no defaults, and of tuples of them, each one a run here trains
 with: a row's reads of its streams (`Reads`), here its one stream reading its whole document both ways,
 or up to each token (a bidirectional backbone's rows read so apart), and a question layout's own row
