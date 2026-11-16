@@ -299,13 +299,14 @@ def _own(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) ->
 
 def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
     """One class of a user's own class's MRO, completely: its module and name, its members (`_members`), its
-    dataclass fields with their defaults and default factories (`dew._sources.dataclass_fields`), and its
+    generated fields with their defaults and default factories (`dew._sources.generated_fields`: a
+    dataclass's or an attrs class's), and its
     metaclass where that is the user's own code too (which runs as the class is made and may set what it
     holds)."""
     fields: list[JSON] = [
         [field.name, _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking),
-         _field_part(field.default_factory, f"{at} ({held.__name__}.{field.name} factory)", known, walking)]
-        for field in _sources.dataclass_fields(held)]
+         _field_part(field.factory, f"{at} ({held.__name__}.{field.name} factory)", known, walking)]
+        for field in _sources.generated_fields(held)]
     maker = type(held)
     made = (_stated(maker, f"{at} ({held.__name__}'s metaclass)", known, walking)
             if _sources.own_source(maker.__module__) else None)
@@ -315,9 +316,9 @@ def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, .
 
 
 def _field_part(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
-    """A dataclass field's default or default factory as an identity states it, `"missing"` where it has
-    none (`dataclasses.MISSING`)."""
-    return "missing" if value is dataclasses.MISSING else _stated(value, at, known, walking)
+    """A generated field's default or default factory as an identity states it, `"missing"` where it has
+    none (`dew._sources.MISSING`)."""
+    return "missing" if value is _sources.MISSING else _stated(value, at, known, walking)
 
 
 def _again(value, walking: tuple[int, ...]) -> JSON:

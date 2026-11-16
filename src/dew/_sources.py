@@ -16,7 +16,7 @@ import sysconfig
 import types
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 
 def source_file(held: Callable | type) -> Path | None:
@@ -193,25 +193,53 @@ def members(held) -> list[tuple]:
     `__annotations__`) only the methods the user wrote (`__call__`), which a call runs; the rest are its
     machinery's, the methods a dataclass makes among them, which the class's description states, the
     state `abc.ABCMeta` writes into every class it makes (`_ABC_STATE`), a Grain transform's among them, the
-    descriptor Python makes for each of a class's own slots (mangled or not), and a dataclass's fields, a
-    plain one's default its class attribute: a dataclass's fields are stated whole, each with its default
-    and its default factory, by `dataclass_fields`, which a slotted class's and a child overriding a
-    default hold where its class attributes do not (train 947's review: a slotted child's override and a
-    factory went unstated, the base review of 826882bbf: a slot's descriptor read as code)."""
-    fields = vars(held).get("__dataclass_fields__", {})
+    descriptor Python makes for each of a class's own slots (mangled or not), and a generated field's
+    default where the class attribute still holds it, which `generated_fields` states with its factory:
+    a slotted class's and a child overriding a default hold it where their class attributes do not (train
+    947's review), and a value set on the class at run time, or a class variable, stays a member (train
+    950's review: skipping every field name left them unstated)."""
+    defaults = {field.name: field.default for field in generated_fields(held)}
     found = []
     for name, member in sorted(vars(held).items()):
         member = wrapped(member)
         if ((name.startswith("__") and name.endswith("__") and not hand_written(member))
-                or isinstance(member, _ABC_STATE) or name in fields
+                or isinstance(member, _ABC_STATE)
+                or (name in defaults and member is defaults[name])
                 or (isinstance(member, types.MemberDescriptorType) and member.__objclass__ is held)):
             continue
         found.append((name, member))
     return found
 
 
-def dataclass_fields(held: type) -> list[dataclasses.Field]:
-    """A dataclass's fields as its decorator recorded them on `held` itself (`__dataclass_fields__`, its
-    bases' among them, an override's default its own), in order, each with its name, default and default
-    factory (`dataclasses.MISSING` where it has none). Empty for a class that is no dataclass of its own."""
-    return list(vars(held).get("__dataclass_fields__", {}).values())
+class GeneratedField(NamedTuple):
+    """A field a class generator (`dataclasses`, attrs) recorded on a class: its name, its default and its
+    default factory, each `MISSING` where it has none."""
+
+    name: str
+    default: Any
+    factory: Any
+
+
+MISSING = dataclasses.MISSING
+"""What a `GeneratedField` holds where its field has no default or no factory."""
+
+
+def generated_fields(held: type) -> list[GeneratedField]:
+    """The fields a class generator recorded on `held` itself, in order, its bases' among them and an
+    override's default its own: a dataclass's (`dataclasses.fields`, its class and init variables, which
+    are no fields, apart) or an attrs class's (`__attrs_attrs__`, a default `attrs.Factory`'s factory its
+    factory). Empty for a class no generator made itself."""
+    if "__dataclass_fields__" in vars(held):
+        return [GeneratedField(field.name, field.default, field.default_factory)
+                for field in dataclasses.fields(held)]
+    if "__attrs_attrs__" in vars(held):
+        # attrs is loaded where a class of it exists; its sentinel and factory type are its own.
+        attr = sys.modules["attr"]
+        found = []
+        for field in vars(held)["__attrs_attrs__"]:
+            default, factory = field.default, MISSING
+            if isinstance(default, attr.Factory):
+                default, factory = MISSING, default.factory
+            found.append(GeneratedField(field.name, MISSING if default is attr.NOTHING else default, factory))
+        return found
+    return []
