@@ -265,8 +265,8 @@ def signature_digest(signature: Hashable) -> str:
 
 
 
-def reads_every_update(objective: Objective, built: optax.GradientTransformation,
-                       composed: optax.GradientTransformation) -> bool:
+def reads_every_update[L, E](objective: Objective[L, E], built: optax.GradientTransformation,
+                             composed: optax.GradientTransformation) -> bool:
     """Whether a run's steps read every update (`Transaction.reads_all`) of `composed`, the optimizer
     `objective` made of `built` (`Objective.optimizer`): unless Dew built it (`dew.optim.Bounded`, whose
     state says where its bound fails) and the objective handed it back as it is, or composed it in Dew's own

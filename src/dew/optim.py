@@ -1902,8 +1902,11 @@ def _direction_bound(values: Mapping[str, object], dtype, *, quantized: bool, mo
     stored = {str(values.get(name)) for name in ('mu_dtype', 'nu_dtype')}
     if 'float16' in stored:
         return None
-    # The arithmetic's narrowest normal: the parameter's dtype's and float32's.
-    smallest = max(float(jnp.finfo(dtype).tiny), float(jnp.finfo(jnp.float32).tiny))
+    # The arithmetic's smallest normal: float32's where both moments are stored in it (Dew's Adam widens a
+    # narrower gradient before either reads it, `dew._moments.scale_by_adam`), else the parameter's dtype's
+    # too.
+    widened = stored == {'float32'}
+    smallest = max(float(jnp.finfo(jnp.float32).tiny), 0.0 if widened else float(jnp.finfo(dtype).tiny))
     guard = max(float(eps), math.sqrt(max(float(eps_root), 0.0)))
     if guard < smallest or not (0 <= b1 < 1 and 0 <= b2 < 1):
         return None
@@ -1923,15 +1926,16 @@ def _muon_bounds(values: Mapping[str, object], quantized: bool) -> LeafBounds:
     ns_steps, eps, beta = values['ns_steps'], values['eps'], values['beta']
     decay = values['weight_decay']
     adam_decay = decay if values['adam_weight_decay'] is None else values['adam_weight_decay']
-    if not all(isinstance(value, int | float) for value in (ns_steps, eps, beta, decay, adam_decay)):
+    if not (isinstance(ns_steps, int) and isinstance(eps, int | float) and isinstance(beta, int | float)
+            and isinstance(decay, int | float) and isinstance(adam_decay, int | float)):
         return unbounded
     covered = (values['preconditioning'] == 'frobenius' and not values['adaptive'] and 0 <= beta < 1
                and values['neuron_beta2'] is None and values['per_head'] is None
                and values['adam_learning_rate'] is None)
     # The coefficients are the build's constants, made where a trace may be open (an injected factory's).
     with jax.ensure_compile_time_eval():
-        rows = np.asarray(_coefficients(values['ns_coeffs'], int(ns_steps)), np.float64).reshape(-1, 3)
-    spectral = spectral_bound(np.repeat(rows, int(ns_steps), axis=0) if len(rows) == 1 else rows)
+        rows = np.asarray(_coefficients(values['ns_coeffs'], ns_steps), np.float64).reshape(-1, 3)
+    spectral = spectral_bound(np.repeat(rows, ns_steps, axis=0) if len(rows) == 1 else rows)
     rms = values['consistent_rms']
     rms = float(rms) if isinstance(rms, int | float) else None
     adam = {**values, 'b1': values['adam_b1'], 'b2': values['adam_b2'], 'eps_root': values['adam_eps_root']}

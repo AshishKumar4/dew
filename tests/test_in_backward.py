@@ -313,11 +313,12 @@ def test_a_layer_walked_past_a_gradient_that_is_not_finite_keeps_its_weights_and
     unmoved, _, _ = _walked([1.0, 1.0, 1.0], finite=False)
     np.testing.assert_array_equal(np.asarray(unmoved["a"]), [0.5, 0.5, 0.5])
     # An update that does not form (a rate set infinite) moves no layer; each count steps, and each is
-    # counted not finite, so the step is reported and rejected by its counts (the round-3 review's F9).
+    # the walk's first counted not finite, so the step is reported and rejected by its counts, the layers
+    # its latch then holds not counted (the round-3 review's F9).
     unformed, stepped_counts, counted_norms = _walked([1.0, 1.0, 1.0], rate=np.inf)
     np.testing.assert_array_equal(np.asarray(unformed["a"]), [0.5, 0.5, 0.5])
     np.testing.assert_array_equal(np.asarray(stepped_counts["count"]["a"]), [1.0, 1.0, 1.0])
-    assert bool(jnp.all(counted_norms["nonfinite"] > 0))
+    np.testing.assert_array_equal(np.asarray(counted_norms["nonfinite"] > 0), [False, False, True])
 
 
 def test_a_walk_names_the_first_layer_it_met_not_finite_across_its_stage_axis():
@@ -382,7 +383,7 @@ class Counted(LMObjective):
 
     def loss(self, variables, batch, step):
         stats, aux = super().loss(variables, batch, step)
-        seen = jnp.exp(jnp.mean(batch["tokens"][..., 0].astype(jnp.float32)) * self.scale)
+        seen = jnp.exp(jnp.mean(batch["text"][..., 0].astype(jnp.float32)) * self.scale)
         return stats, dataclasses.replace(aux, variables={**(aux.variables or {}), "seen": {"value": seen}})
 
 
