@@ -803,7 +803,8 @@ def _computed_here(program, *trees):
     sites' statistics in NumPy for half an hour, ledger 6795); else in numpy, on a CPU (XLA:CPU reads a
     subnormal float64 as zero, `1e-310 != 0` false there, and a TPU has no float64)."""
     arrays = [leaf for leaf in jax.tree.leaves(trees) if leaf is not None]
-    if not arrays or jax.default_backend() != "gpu":
+    gpu = next((device for device in jax.local_devices() if device.platform == "gpu"), None)
+    if not arrays or gpu is None:
         return program(*trees, xp=np)
 
     def placed(leaf):
@@ -812,7 +813,7 @@ def _computed_here(program, *trees):
         on_gpu = isinstance(leaf, jax.Array) and all(device.platform == "gpu" for device in leaf.devices())
         return leaf if leaf is None or on_gpu else jax.device_put(np.asarray(leaf))
 
-    with jax.enable_x64(new_val=True), jax.default_device(jax.local_devices(backend="gpu")[0]):
+    with jax.enable_x64(new_val=True), jax.default_device(gpu):
         held = jax.tree.map(placed, trees, is_leaf=lambda leaf: leaf is None)
         return jax.device_get(_compiled(program)(*held))
 
