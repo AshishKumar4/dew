@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import inspect
 import logging
 import os
 import sys
@@ -26,7 +27,7 @@ from jax.experimental.layout import Format, Layout
 from jaxlib import xla_client
 
 from dew import _hashing, _sources
-from dew._records import JSON
+from dew._records import JSON, json_value
 from dew.algebra import terms
 
 
@@ -346,9 +347,24 @@ def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, .
             if _sources.own_source(maker.__module__) else None)
     entry: list[JSON] = [_coded(held.__module__, at), held.__qualname__, _members(held, at, known, walking),
                          fields, made]
-    # How its generator made it where that departs from the generator's defaults (eq=False, order=True).
+    # How its generator made it where that departs from the generator's defaults (eq=False, order=True),
+    # and the members it wrote by what they are (`_generated`).
     options = _sources.generation_options(held)
-    return [*entry, dict(options)] if options else entry
+    generated = {name: _generated(member) for name, member in _sources.generated_members(held)}
+    return [*entry, dict(options), generated] if options or generated else entry
+
+
+def _generated(member: object) -> JSON:
+    """A member a class generator wrote (`dew._sources.generated_members`) by what it is: a function by its
+    parameters (each one's name, kind, annotation as text and whether it has a default) and its code, which
+    the generator wrote from the class's fields and options; `__match_args__` by its names."""
+    if not isinstance(member, types.FunctionType):
+        return json_value(member, "a generated member")
+    parameters = [[parameter.name, parameter.kind.name, _sources.annotation_text(parameter.annotation)
+                   if parameter.annotation is not inspect.Parameter.empty else None,
+                   parameter.default is not inspect.Parameter.empty]
+                  for parameter in inspect.signature(member).parameters.values()]
+    return ["generated", parameters, _code(member.__code__)]
 
 
 def _converter(value, at: str, again: Callable[..., JSON]) -> JSON | None:
@@ -366,10 +382,7 @@ def _converter(value, at: str, again: Callable[..., JSON]) -> JSON | None:
 def _field(held: type, field: _sources.GeneratedField, at: str, known: Mapping[int, JSON],
            walking: tuple[int, ...]) -> JSON:
     """A generated field (`dew._sources.generated_fields`) as an identity states it: its name, default and
-    default factory, and the rest of what its generator recorded of it (`dew._sources.generated_fields`),
-    each by its part's name: an attrs field's every part, a dataclass field's flags where they depart from
-    `dataclasses.field`'s. A dataclass field of default flags is stated as it was before them, so a
-    position saved then holds (train 953's review)."""
+    default factory, and every other part its generator recorded of it, each by its part's name."""
     stated: list[JSON] = [field.name,
                           _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking),
                           _field_part(field.factory, f"{at} ({held.__name__}.{field.name} factory)", known,
