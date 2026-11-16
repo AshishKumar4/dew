@@ -178,7 +178,8 @@ RECORDS_HELD = 4096
 search's own takes them in a `recording` scope."""
 Refused = tuple[str, tuple[str, ...] | None]
 """A kernel a compile refused, by its name, and the roles its spill stood in where the compile read them
-(`Binary.spilled_in`; None where it states none): one record of both, so whatever keys, copies or hands on a
+(`Binary.spilled_in`: `()` read and spilling none, its warpgroup MMAs serialized alone; None unread): one
+record of both, a kernel once a refusal (`_record` joins its roles), so whatever keys, copies or hands on a
 refusal (`derivation_inputs`, `_proposing`, `refused_launches`) carries what a launch's ladder steps by."""
 
 
@@ -491,9 +492,10 @@ def names(kernels: Iterable[Refused]) -> frozenset[str]:
 def spilled_in(op, arguments: tokamax.BoundArguments, config: Hashable) -> dict[str, tuple[str, ...]]:
     """The roles each of `op`'s kernels a compile refused at `config` for `arguments` spilled in, as its
     refusal states them (`Refused`), by kernel name: what a launch's ladder steps it by (row 6744). A kernel
-    refused with no roles stated is absent."""
+    whose roles its compile left unread is absent; one read and spilling none (its warpgroup MMAs serialized
+    alone) states `()`."""
     found = dict(refusals_of(_identity(op, arguments))).get(config, ())
-    return {kernel: roles for kernel, roles in sorted(found, key=repr) if roles is not None}
+    return {kernel: roles for kernel, roles in found if roles is not None}
 
 
 def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kernels,
@@ -911,6 +913,19 @@ def _add(**records: Iterable) -> None:
                 getattr(held, name).extend(entries)
 
 
+def _joined(kernels: frozenset[Refused]) -> frozenset[Refused]:
+    """Refused `kernels` (`Refused`) a kernel once: each kernel's roles every record of it read, joined, None
+    where none read them."""
+    roles: dict[str, set[str] | None] = {}
+    for kernel, read in kernels:
+        if read is not None:
+            roles[kernel] = (roles.get(kernel) or set()) | set(read)
+        else:
+            roles.setdefault(kernel, None)
+    return frozenset((kernel, None if read is None else tuple(sorted(read)))
+                     for kernel, read in roles.items())
+
+
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
             kernels: frozenset[Refused] = frozenset()) -> bool:
     """`refusal` and `miss` recorded; whether `miss` is new. A miss is recorded once: a launch's derivation
@@ -919,7 +934,7 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
     registry = _registry()
     with _GUARD:
         if refusal is not None:
-            registry.refused[refusal] = registry.refused.get(refusal, frozenset()) | kernels
+            registry.refused[refusal] = _joined(registry.refused.get(refusal, frozenset()) | kernels)
             registry.by_launch.pop(refusal[0], None)
         if miss is None or miss in registry.missed:
             return False
