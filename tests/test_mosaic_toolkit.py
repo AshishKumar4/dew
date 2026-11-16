@@ -610,7 +610,8 @@ def _termwise_operands():
 def test_a_sum_of_three_part_products_is_as_accurate_as_fp32():
     """Interpreted: the sum over two slices of fp32 products whose operands each take three parts, one a
     shared tile's parts and one staged from registers: within an fp32 reduction's bound of the float64 sum,
-    where a product of the parts' leading terms alone is bfloat16's."""
+    where a product of the parts' leading terms alone is bfloat16's; and finite where the whole products' sum
+    is, float32's largest."""
     from reference_error import assert_fp32_reduction_bound
 
     a, b = _termwise_operands()
@@ -618,6 +619,13 @@ def test_a_sum_of_three_part_products_is_as_accurate_as_fp32():
     # Each output an fp32 sum of six terms a product, over two slices of ISSUED products.
     assert_fp32_reduction_bound(_termwise_sums(a, b, interpret=INTERPRETED), np.einsum("cij,cjk->ik", *wide),
                                 np.einsum("cij,cjk->ik", *map(np.abs, wide)), terms=2 * ISSUED * 6)
+    # Two slices each giving half of float32's largest, 2^127 - 2^103 (its parts 2^127 and -2^103): their sum
+    # float32's largest, which their leading terms summed alone, 2^128, leave (base review 0dac2d104 F1).
+    half = np.float32(2.0 ** 127 - 2.0 ** 103)
+    a = jnp.zeros((2, ISSUED, ISSUED), jnp.float32).at[:, :, 0].set(half)
+    b = jnp.zeros((2, ISSUED, ISSUED), jnp.float32).at[:, 0, :].set(1.0)
+    np.testing.assert_array_equal(np.asarray(_termwise_sums(a, b, interpret=INTERPRETED)),
+                                  np.full((ISSUED, ISSUED), np.finfo(np.float32).max))
 
 
 def _accumulator(equation) -> bool:
@@ -627,8 +635,8 @@ def _accumulator(equation) -> bool:
 
 
 def test_a_sum_of_three_part_products_holds_one_accumulator_a_term_one_at_a_time():
-    """Traced for an H100: a sum over two slices of three-part products issues each of their terms
-    (`product.terms`, six of three parts each) into an accumulator of its own across both slices, one
+    """Traced for an H100: a sum over two slices of three-part products issues each slice's terms
+    (`product.terms`, six of three parts each) into an accumulator of its own, a slice at a time, one
     accumulator scoped at a time: a tensor core's truncating accumulation keeps each term's last bit, and one
     accumulator is live, where one a term held at once spilled an fp32 solve on an H100."""
     from reference_error import equations
@@ -638,7 +646,7 @@ def test_a_sum_of_three_part_products_holds_one_accumulator_a_term_one_at_a_time
         traced = jax.make_jaxpr(lambda a, b: _termwise_sums(a, b, interpret=False))(a, b)
 
     scopes = [equation for equation in equations(traced.jaxpr) if _accumulator(equation)]
-    assert len(scopes) == 6, len(scopes)
+    assert len(scopes) == 2 * 6, len(scopes)
     assert not any(_accumulator(inner) for scope in scopes for inner in equations(scope.params["jaxpr"]))
 
 
