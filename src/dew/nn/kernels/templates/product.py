@@ -206,7 +206,7 @@ def joined(x: jax.Array, count: int) -> jax.Array:
     up. The parts sum to the value exactly, each the last's remainder (`formed`); summed largest first, a
     finite value past bf16's largest by `2^120 - 2^111` or more took its leading two parts past fp32's, to
     infinity, before the third's negative remainder brought it back (rows 6842, 6866)."""
-    parts = x.astype(jnp.float32).reshape(count, -1, *x.shape[1:])
+    parts = x.astype(jnp.float32).reshape(count, x.shape[0] // count, *x.shape[1:])
     whole = parts[count - 1]
     for part in range(count - 2, -1, -1):
         whole = parts[part] + whole
