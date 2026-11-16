@@ -211,17 +211,20 @@ def members(held) -> list[tuple]:
     return found
 
 
+MISSING = dataclasses.MISSING
+"""What a `GeneratedField` holds where its field has no default, factory, converter or validator."""
+
+
 class GeneratedField(NamedTuple):
-    """A field a class generator (`dataclasses`, attrs) recorded on a class: its name, its default and its
-    default factory, each `MISSING` where it has none."""
+    """A field a class generator (`dataclasses`, attrs) recorded on a class: its name, its default, its
+    default factory, and the converter and validator its generated `__init__` runs on the value it is
+    handed (attrs'), each `MISSING` where it has none."""
 
     name: str
     default: Any
     factory: Any
-
-
-MISSING = dataclasses.MISSING
-"""What a `GeneratedField` holds where its field has no default or no factory."""
+    converter: Any = MISSING
+    validator: Any = MISSING
 
 
 def generated_fields(held: type) -> list[GeneratedField]:
@@ -240,6 +243,9 @@ def generated_fields(held: type) -> list[GeneratedField]:
             default, factory = field.default, MISSING
             if isinstance(default, attr.Factory):
                 default, factory = MISSING, default.factory
-            found.append(GeneratedField(field.name, MISSING if default is attr.NOTHING else default, factory))
+            # What the generated `__init__` runs on a value: held in its globals alone, which no member is.
+            found.append(GeneratedField(field.name, MISSING if default is attr.NOTHING else default, factory,
+                                        MISSING if field.converter is None else field.converter,
+                                        MISSING if field.validator is None else field.validator))
         return found
     return []
