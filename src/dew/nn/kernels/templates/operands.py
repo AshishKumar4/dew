@@ -319,6 +319,7 @@ class Issuer:
         where an accumulator a term held at once spilled an fp32 solve 576 bytes a thread on an H100
         (fast32d-sm90 at 83b47d66f6)."""
         family = self.call.family
+        assert not isinstance(entry, product.Blocks)  # a block of tiles counts no parts (`_counted`)
         name, lhs, rhs = entry
         shape = shape or (lhs.shape[0], rhs.shape[1])
 
