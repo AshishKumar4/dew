@@ -107,8 +107,8 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
             identities[found] = identity
         elif found.prologue and weighed.launchable:
             # A region its prologue keeps from fusing is weighed without it, its product and its epilogue:
-            # unless its launch is XLA's for a reason no prologue enters (`_xla_whatever_its_prologue`, every
-            # dense cell's measurement), on which the region without it fails too, a second analysis wasted.
+            # unless its launch is XLA's for a reason no prologue enters (`_xla_whatever_its_prologue`, the
+            # call's naming it), on which the region without it fails too, a second analysis wasted.
             bare = _bare(jaxpr, found)
             identity = _identity(jaxpr, bare)
             if _decided(identity, lambda bare=bare: _takes(fused_gemm, jaxpr, bare)).taken:
@@ -473,10 +473,11 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
 
 def _xla_whatever_its_prologue(launch) -> bool:
     """Whether a product's `launch` (a `generation.Route`) is XLA's for a reason its region's prologue does
-    not enter: its cell's measurement, the template's refusal a `measured` one (`selection._old_route`, a
-    dense cell's `grouped_matmul.DECLARED`), or the call's naming XLA's."""
-    return launch is not None and launch.kernel == "xla" and (
-        launch.forced == "xla" or (launch.refusal is not None and launch.refusal.kind == "measured"))
+    not enter: the call's naming XLA's. A cell's measurement is no such reason: a product's cell is keyed by
+    whether its prologue forms its operand (`grouped_matmul`'s formed cells), so the product without it may
+    be another cell's, the template's (a 4B normed projection's on an H100: its formed call XLA's, the call
+    without its prologue FOUR_B's Mosaic, train 977's F1)."""
+    return launch is not None and launch.kernel == "xla" and launch.forced == "xla"
 
 
 class _Trace(NamedTuple):
