@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import functools
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -509,6 +510,27 @@ class Gated(str):
     """A generation a compile gate's cell compiles for (`gate_generations`): the typed fact a process of its
     own gathers the session's cells of one capability by (`compiled_apart`)."""
 
+
+
+def stated_outputs(lowered: jax.stages.Lowered, target: str | None = None) -> list[tuple[int, list | None]]:
+    """Each custom call of `lowered` (of the call target `target`, every one where None), in the order JAX
+    lowered them: the outputs it defines (its results less those aliasing an operand, a ref it writes in
+    place) and the dimensions it states them by (`outputs.OUTPUT_DIMS`, parsed; None where it states none),
+    as XLA's compiler reads its frontend attribute."""
+    from jax.extend.mlir import ir
+
+    from dew.nn.kernels import lowered as reading
+    from dew.nn.kernels.templates.outputs import OUTPUT_DIMS
+
+    def read(called: str, operation) -> tuple[int, list | None] | None:
+        if target is not None and called != target:
+            return None
+        aliased = (len(ir.ArrayAttr(operation.attributes["output_operand_aliases"]))
+                   if "output_operand_aliases" in operation.attributes else 0)
+        stated = reading._frontend(operation.attributes).get(OUTPUT_DIMS)
+        return len(operation.results) - aliased, None if stated is None else json.loads(stated)
+
+    return [call for call, _ in reading._read_calls(lowered, read)]
 
 def gate_generations(dtype=jnp.bfloat16, *, stated: bool = False, scoped: bool = False, tpu: bool = False,
                      needs: Callable[[Any, Any], bool] | None = None) -> tuple[Gated, ...]:
