@@ -153,7 +153,8 @@ class Issuer:
         products before and after it each summed in one. An operand may be a callable forming it then, where
         `shape`, the sum's, is given. A register left operand whose product takes it in registers (its buffers
         a count) is issued so (`Family.register_products`). Products whose operands take three parts (an fp32
-        call's accurate forms) are summed a product at a time, each a term at a time (`_termwise`), added to
+        call's accurate forms) are summed whole, a product at a time, its terms added a term at a time
+        (`_termwise`), added to
         the rest's sum. `into`, an accumulator the walk carries (its home, a warpgroup accumulator ref or a
         register array), takes every unscaled product in place and is
         returned, no value read; a scaled operand's product its own accumulator, restored and added into it
@@ -294,17 +295,17 @@ class Issuer:
 
     def _termwise(self, groups: dict[tuple[int, int], list], shape: tuple[int, int] | None, *,
                   retired: bool) -> Iterator[jax.Array]:
-        """`groups`' products of three parts (a group a form, its operands' parts, `_counted`) a product at a
-        time, each term of it (`product.terms`, smallest first, as `Family.apart` sums one product's) issued
-        into a fresh fp32 accumulator, which its caller adds into its own sum as it comes: whole products join
-        the sum in turn, each partial sum the products' before it and a prefix of one product's terms,
-        smallest first, so no products' leading terms meet before their smaller ones (two products' leading
-        terms summed alone left float32's range where the whole products' sum stayed in it, base review
-        0dac2d104 F1). Its operands are staged again for each term (none where they are tiles in memory, or a
-        value held in a list of buffer sets), so one accumulator is live beside the caller's where an
-        accumulator a term held at once spilled an fp32 solve 576 bytes a thread on an H100 (fast32d-sm90 at
-        83b47d66f6), and a product's terms summed apart before joining the caller's held a third (MiniMax's
-        lightning training query/key walk on an H100 spilled 200 bytes, jsf-lightning-fs)."""
+        """`groups`' products of three parts (a group a form, its operands' parts, `_counted`), each whole, a
+        product at a time: its terms (`product.terms`, smallest first, as `Family.apart` sums one product's)
+        each issued into a fresh fp32 accumulator and added into the product's sum as it comes, which its
+        caller adds into its own sum once complete. A sum takes whole products, as the per-product path
+        (`__call__`) adds them, so it leaves float32's range only where the products' own sums do: a
+        product's terms added into the caller's sum one at a time took a later product's small remainder
+        onto a sum already at float32's largest before its leading term took it back (base reviews
+        0dac2d104 F1, 60efbe75f F1). Its operands are staged again for each term (none where they are tiles
+        in memory, or a value held in a list of buffer sets), so one term's accumulator is live beside the
+        product's sum and the caller's, where an accumulator a term held at once spilled an fp32 solve 576
+        bytes a thread on an H100 (fast32d-sm90 at 83b47d66f6)."""
         family = self.call.family
         for counts, entries in groups.items():
             for name, lhs, rhs in entries:
@@ -321,8 +322,8 @@ class Issuer:
                         family.settled(0)
                     return acc
 
-                for i, j in product.terms(*counts):
-                    yield family.summed(shape, functools.partial(term, i, j))
+                yield functools.reduce(jnp.add, (family.summed(shape, functools.partial(term, i, j))
+                                                 for i, j in product.terms(*counts)))
 
     def summed_together(self, groups: list) -> tuple[Callable[[], jax.Array], ...]:
         """Readers of `groups`' sums (each a list `summed` takes), none of which reads another's: issued
