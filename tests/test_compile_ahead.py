@@ -362,14 +362,18 @@ print(json.dumps({"digest": program_digest(owned_program(checked_module.checked)
 
 def test_a_programs_digest_is_one_in_every_process_and_its_trees_part_programs(tmp_path):
     """A program's digest (`program_digest`) states its trees node by node: a checkified program, whose error
-    tree holds a traceback JAX prints by its address, digests the same in two processes, as its lowered
-    text is the same; and two programs of one text whose trees differ (a mapping of other keys, or of one
+    tree holds a traceback JAX prints by its address and whose frames name where its code is installed,
+    digests the same in two processes of the code installed in two places, as its lowered text is the same;
+    and two programs of one text whose trees differ (a mapping of other keys, or of one
     enumeration's members labelling its results the other way round) digest apart, since an executable
     takes and gives its leaves by its trees."""
     from dew.nn.kernels.options import owned_program, program_digest
 
-    (tmp_path / "checked_module.py").write_text(CHECKED_MODULE)
-    first, second = (process_support.fresh(DIGESTED, cwd=tmp_path)["digest"] for _ in range(2))
+    places = [tmp_path / "one", tmp_path / "other" / "install"]
+    for place in places:
+        place.mkdir(parents=True)
+        (place / "checked_module.py").write_text(CHECKED_MODULE)
+    first, second = (process_support.fresh(DIGESTED, cwd=place)["digest"] for place in places)
     assert first == second
     values = jnp.ones(3)
     one = owned_program(lambda tree: tree["a"] * 2).lower({"a": values})

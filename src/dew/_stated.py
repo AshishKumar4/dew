@@ -217,12 +217,11 @@ def _data(value, at: str) -> JSON | None:
 
 
 def _traceback(value) -> JSON | None:
-    """A traceback of JAX's by its frames, as a file of programs holds one
-    (`dew.training.ahead.HeldTraceback`): a checkified program's error tree holds each check's in its node
-    data, which prints by its address; None for any other value."""
-    if isinstance(value, xla_client.Traceback):
-        return ["traceback", [str(frame) for frame in value.frames]]
-    return None
+    """A traceback of JAX's by its kind alone: a checkified program's error tree holds each check's in its
+    node data, which labels no leaf its executable takes or gives, and whose frames name the files where
+    the run is installed (a file of programs holds them, `dew.training.ahead.HeldTraceback`); None for any
+    other value."""
+    return ["traceback"] if isinstance(value, xla_client.Traceback) else None
 
 
 def _parts(value, at: str, again: Callable[..., JSON]) -> JSON | None:

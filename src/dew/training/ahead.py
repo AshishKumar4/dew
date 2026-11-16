@@ -289,7 +289,7 @@ class AheadProgram:
         """The executable, loaded onto `devices`, for a run whose program lowered as `lowered`: refused
         where that is another program than this one, and admitted as a compiled one is
         (`dew.communicators.admit`)."""
-        if program_digest(lowered) != self.program:
+        if _stated_digest(lowered) != self.program:
             raise NotTheStepCompiledAhead(
                 "the sampled step compiled ahead is another program than the one this run compiles: compile "
                 "it ahead from this run's config, with its inspection")
@@ -484,7 +484,7 @@ class AheadOfTime:
         """The executable, loaded (`loaded`), for a run whose step lowered as `lowered`: refused where
         that is another program than the one compiled ahead, a config, a data shape, a rung or a Dew
         that differs, which the executable would not run as the run's step."""
-        if program_digest(lowered) != self.program:
+        if _stated_digest(lowered) != self.program:
             raise NotTheStepCompiledAhead(
                 "the step compiled ahead is another program than the one this run compiles first: compile it "
                 "ahead from this run's config and data (--trainer.compile-ahead), with this Dew, and no plan "
@@ -757,7 +757,13 @@ class Keeping:
                                   "outside the process's default backend"
             return
         devices = tuple(device.id for device in ran)
-        program_kept = AheadProgram(program_digest(lowered), serialized)
+        try:
+            digest = program_digest(lowered)
+        except Unestablished as refusal:
+            # A tree of a node no process names: no file holds the program, which compiles where it is handed.
+            self.refused[named] = f"its program is stated by no file: {refusal}"
+            return
+        program_kept = AheadProgram(digest, serialized)
         self.kept[identity.digest(call)] = KeptProgram(call, program_kept, devices)
 
     def save(self, path: str | Path) -> AheadPrograms:
@@ -794,6 +800,16 @@ def keeping() -> Iterator[Keeping]:
     with uncached(), options.keeping(kept.heard):
         yield kept
 
+
+
+def _stated_digest(lowered: jax.stages.Lowered) -> str | None:
+    """`lowered`'s digest as a file of programs holds it (`program_digest`), None where its trees hold a node
+    no process names: a program no file holds, so none it is compared with."""
+    try:
+        return program_digest(lowered)
+    except Unestablished as refusal:
+        _log.info("a program no file of programs states is none a file holds: %s", refusal)
+        return None
 
 @contextlib.contextmanager
 def kept(path: str | Path, *, verify: bool = True) -> Iterator[AheadPrograms]:
@@ -833,7 +849,14 @@ def kept(path: str | Path, *, verify: bool = True) -> Iterator[AheadPrograms]:
             return None
         if found is None:
             return None
-        if verify and program_digest(program.lower(*args, **kwargs)) != found.program.program:
+        if not verify:
+            return found.loaded()
+        digest = _stated_digest(program.lower(*args, **kwargs))
+        if digest is None:
+            # A program whose trees no file states is none a file holds: it compiles, as a call the file
+            # holds no program for does.
+            return None
+        if digest != found.program.program:
             raise NotTheKeptProgram(
                 f"{identity.called(program)} lowers here to another program than the one kept at "
                 f"{path} for the same identity: something its trace reads is outside the identity "
@@ -1416,7 +1439,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
     except Unlowerable as refused:
         raise refused.refusing("step") from refused
     # The sampled step as the search compiled it, its program what it lowered then.
-    sampled = None if planned.sampled is None else AheadProgram.of(*planned.sampled)
+    sampled = (None if planned.sampled is None
+               else AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable))
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     memory = compiled_memory(compiled)
