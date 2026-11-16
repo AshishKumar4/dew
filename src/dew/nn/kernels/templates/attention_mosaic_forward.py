@@ -633,11 +633,16 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
 def _whole(array: jax.Array, parts: int) -> jax.Array:
     """An fp32 call's operand `[P·B, ...]` from its bf16 `parts` stacked along the batch axis
-    (`MosaicForward.parts`), summed exactly in fp32 (`product.formed`'s parts are its remainders); itself
-    where it enters whole."""
+    (`MosaicForward.parts`), the largest first, summed exactly in fp32 (`product.formed`'s parts are its
+    remainders) from the smallest up: at fp32's largest the leading two parts sum past it, the third's
+    negative remainder taking it back (row 6842); itself where it enters whole."""
     if parts == 1:
         return array
-    return jnp.sum(array.astype(jnp.float32).reshape(parts, -1, *array.shape[1:]), axis=0)
+    stacked = array.astype(jnp.float32).reshape(parts, -1, *array.shape[1:])
+    whole = stacked[parts - 1]
+    for part in range(parts - 2, -1, -1):
+        whole = stacked[part] + whole
+    return whole
 
 
 def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -1347,7 +1352,8 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         else:
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
                                                           output_mod=hooks.output_mod,
-                                                          output_params=out_params)
+                                                          output_params=out_params,
+                                                          held=program.parts > 1)
             out_stage(lambda stage: family.stored((_kept_rows(family, keep, output, out_view),), (out_view,),
                                                   smem=stage))
         finished = stored().finished
