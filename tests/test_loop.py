@@ -599,7 +599,9 @@ def _unrolled_passes(module, ids):
     ("a block before a coda with a z-loss", (1, 3), {}, 1e-2, 0.0, 4.0, 4),
     ("a block before a coda exiting at a threshold", (1, 3), {"exit_threshold": 0.5}, 0.0, 0.0, 4.0, 4),
     ("the last pass trained", (1, 3), {"backprop_steps": 1}, 0.0, 0.0, 4.0, 4),
-    ("a saturated gate", (1, 3), {}, 0.0, 30.0, 0.5, 32)],
+    # Its 512 seeds at 32 rows (184 s whole on armada) drawn as map tasks of 64 (`check1_shards`).
+    pytest.param("a saturated gate", (1, 3), {}, 0.0, 30.0, 0.5, 32, id="saturated",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=64))],
     ids=["whole stack", "coda", "z-loss", "threshold", "the last trained", "saturated"])
 def test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy(name, layers, loop, z_loss, shift,
                                                                            spread, rows):
