@@ -71,7 +71,6 @@ from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kv_cache import Opened, compute_dtype
 from dew.nn.linear import (
     DepthwiseConv1d,
-    as_projected,
     decode_kernel,
     decode_step,
     fused_token,
@@ -418,7 +417,7 @@ class Mamba2(nn.Module):
                                 ((taps, bias, *heads),))
             if valid is not None:
                 out = jnp.where(valid[:, :, None], out, 0)
-            return self.out_proj(as_projected(self._gated(out, gate), gate.dtype))
+            return self.out_proj(self._gated(out, gate).astype(gate.dtype))
         state = (self.num_heads, self.state_size, self.head_dim)
         token = None
         # An initialization runs the general path, where the layer makes its parameters.
@@ -431,7 +430,7 @@ class Mamba2(nn.Module):
                         state_dtype=wide, conv_dtype=wide, dtype=compute, token=token)
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
-        return self.out_proj(as_projected(self._gated(out, gate), gate.dtype))
+        return self.out_proj(self._gated(out, gate).astype(gate.dtype))
 
 
 
