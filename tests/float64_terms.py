@@ -658,8 +658,12 @@ def scanned_steps(equation, inputs: list[tuple], body, lanes: int) -> list[tuple
                          inputs[constants + carries:])
     ys = []
     steps = range(params["length"])
+    # Each lane's steps sliced once, a dispatch for them all (an array's iteration unstacks it), where a
+    # step's slice of each lane was a gather of its own: on a GPU the walk's every step paid one a lane,
+    # host-bound (ledger 6795).
+    held = [tuple(None if lane is None else list(lane) for lane in x) for x in xs]
     for step in reversed(steps) if params["reverse"] else steps:
-        sliced = [tuple(None if lane is None else lane[step] for lane in x) for x in xs]
+        sliced = [tuple(None if lane is None else lane[step] for lane in x) for x in held]
         outputs = body(step, [*consts, *carry, *sliced])
         carry = outputs[:carries]
         ys.append(outputs[carries:])
