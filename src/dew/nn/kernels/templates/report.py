@@ -24,7 +24,7 @@ import struct
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, overload
@@ -1532,6 +1532,12 @@ class AssemblerNote:
     message: str
 
 
+def refuses(frame: int, codes: Collection[str]) -> bool:
+    """Whether a kernel the assembler built with a `frame`-byte stack frame, noting `codes`
+    (`ASSEMBLER_NOTES`' codes), is refused for its config: it spills, or its warpgroup MMAs were serialized
+    (`SERIALIZED`). Certification's verdict (`Binary.refused`) and the compile gate's alike."""
+    return bool(frame) or bool(SERIALIZED & set(codes))
+
 @dataclasses.dataclass(frozen=True)
 class Binary:
     """A Mosaic GPU or Pallas-Triton kernel's binary as its executable carries it (`binaries`): its name less
@@ -1561,9 +1567,8 @@ class Binary:
 
     @property
     def refused(self) -> bool:
-        """Whether its config is refused for it: it spills (`frame`), or the assembler serialized its
-        warpgroup MMAs (`SERIALIZED`)."""
-        return bool(self.frame) or any(note.code in SERIALIZED for note in self.notes)
+        """Whether its config is refused for it (`refuses`)."""
+        return refuses(self.frame, [note.code for note in self.notes])
 
 
 def binaries(executable: jax.stages.Compiled, *, decoded: bool = False) -> list[Binary]:
