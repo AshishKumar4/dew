@@ -830,8 +830,7 @@ def _structured_families() -> dict[str, Family]:
     families["two finite slices whose merge overflows"] = Family(_slices, _kept(1, 64), splits=2,
                                                                  folded=False, overflows=True)
     families["values at fp32's largest across a split decode's slices"] = Family(
-        _split_at_the_limit, _kept(1, SPLIT_KEYS, rows=2), splits=4, folded=False, overflows=True,
-        decode_only=True)
+        _split_at_the_limit, _kept(1, SPLIT_KEYS, rows=2), splits=4, overflows=True, decode_only=True)
 
     families["a resumed state of a large denominator"] = Family(_resumed, np.ones((RESUMED, 1, 1, 2), bool),
                                                                 folded=False)
