@@ -7,7 +7,7 @@ template's own parts move onto it."""
 import functools
 import itertools
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import Protocol
+from typing import Any, NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -17,6 +17,16 @@ from dew.nn.kernels.templates import mosaic, product
 
 # A product `Issuer.summed` takes: a block of tiles in memory, or its name and its two operands.
 Entry = product.Blocks | tuple
+
+
+class _Whole(NamedTuple):
+    """A listed sum's product of three parts (`Issuer._runs`): its name, its operands and how many parts each
+    takes, summed whole in its place (`Issuer._whole`)."""
+
+    name: str
+    lhs: Any
+    rhs: Any
+    counts: tuple[int, int]
 
 
 class Issuing(Protocol):
@@ -166,9 +176,9 @@ class Issuer:
         family, interpret = self.call.family, self.call.interpret
         if isinstance(products, Sequence):
             runs = self._runs(products)
-            if any(whole for whole, _ in runs):
+            if any(isinstance(run, _Whole) for run in runs):
                 return self._summed_runs(runs, shape, retired=retired, into=into)
-            products = runs[0][1] if runs else []
+            products = runs[0] if runs else []
         rest = iter(self._entries(products))
         first = next(rest, None)
         if first is None:
@@ -244,21 +254,23 @@ class Issuer:
             total = total + summed_group()
         return total
 
-    def _runs(self, products: Sequence[Entry]) -> list[tuple[bool, list[Entry]]]:
-        """A listed sum's products (`summed`'s) in their order, each of three parts alone, whole (`_whole`),
-        the others' runs between them each one run: `(whole, entries)`. Each operand its caller formed before
-        the call, which every term of a whole product reads where it stands."""
-        runs: list[tuple[bool, list[Entry]]] = []
+    def _runs(self, products: Sequence[Entry]) -> list["_Whole | list[Entry]"]:
+        """A listed sum's products (`summed`'s) in their order, each of three parts alone, whole (`_Whole`,
+        `_whole`), the others' runs between them each one list. Each operand its caller formed before the
+        call, which every term of a whole product reads where it stands."""
+        runs: list[_Whole | list[Entry]] = []
         for entry in self._entries(products):
-            counts = self._counted(entry)
-            whole = counts is not None and max(counts) == 3
-            if whole or not runs or runs[-1][0]:
-                runs.append((whole, [entry]))
+            if (not isinstance(entry, product.Blocks) and (counts := self._counted(entry)) is not None
+                    and max(counts) == 3):
+                name, lhs, rhs = entry
+                runs.append(_Whole(name, lhs, rhs, counts))
+            elif runs and isinstance(runs[-1], list):
+                runs[-1].append(entry)
             else:
-                runs[-1][1].append(entry)
+                runs.append([entry])
         return runs
 
-    def _summed_runs(self, runs: list[tuple[bool, list[Entry]]], shape: tuple[int, int] | None, *,
+    def _summed_runs(self, runs: list["_Whole | list[Entry]"], shape: tuple[int, int] | None, *,
                      retired: bool, into):
         """`runs`' sum (`_runs`), in their order: each whole product's own sum (`_whole`), each other run
         summed as `summed` sums it (into the carried accumulator `into` in place, where given), each added in
@@ -267,14 +279,14 @@ class Issuer:
         670386203 F1)."""
         family, interpret = self.call.family, self.call.interpret
         total = into
-        for whole, entries in runs:
-            if not whole:
-                if into is not None:
-                    total = self.summed(entries, shape, retired=retired, into=total)
-                    continue
-                value = self.summed(entries, shape, retired=retired)
+        for run in runs:
+            if isinstance(run, _Whole):
+                value = self._whole(run, shape, retired=retired)
+            elif into is not None:
+                total = self.summed(run, shape, retired=retired, into=total)
+                continue
             else:
-                value = self._whole(entries[0], shape, retired=retired)
+                value = self.summed(run, shape, retired=retired)
             if total is None:
                 total = value
             elif into is not None:
@@ -309,7 +321,7 @@ class Issuer:
         buffers = self.buffers[name]
         return len(buffers[0] if isinstance(buffers, list) else buffers)
 
-    def _whole(self, entry: Entry, shape: tuple[int, int] | None, *, retired: bool) -> jax.Array:
+    def _whole(self, whole: "_Whole", shape: tuple[int, int] | None, *, retired: bool) -> jax.Array:
         """A product of three parts' own sum (`_runs`), as `__call__` sums one: its terms (`product.terms`,
         smallest first, as `Family.apart` sums one product's) each issued into a fresh fp32 accumulator and
         added into the product's sum as it comes, its caller adding the sum once complete, so it leaves
@@ -319,8 +331,7 @@ class Issuer:
         where an accumulator a term held at once spilled an fp32 solve 576 bytes a thread on an H100
         (fast32d-sm90 at 83b47d66f6)."""
         family = self.call.family
-        assert not isinstance(entry, product.Blocks)  # a block of tiles counts no parts (`_counted`)
-        name, lhs, rhs = entry
+        name, lhs, rhs, counts = whole
         shape = shape or (lhs.shape[0], rhs.shape[1])
 
         def term(i: int, j: int, acc):
@@ -333,8 +344,6 @@ class Issuer:
                 family.settled(0)
             return acc
 
-        counts = self._counted(entry)
-        assert counts is not None
         return functools.reduce(jnp.add, (family.summed(shape, functools.partial(term, i, j))
                                           for i, j in product.terms(*counts)))
 
