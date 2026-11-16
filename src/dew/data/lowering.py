@@ -84,6 +84,7 @@ from dew.data.handoff import (
     _Spread,
     _Ungrouped,
     _Unspread,
+    declared_pool,
     draws_after_expansion,
     pool_of,
     record_stage_of,
@@ -512,8 +513,9 @@ def _run(
     The run's one random stage draws from the rng Grain hands its operator, keyed by the record's
     place in what that operator reads, as it would lowered alone: so a stage before it that drops
     records (counted out by `Accepted`, unless they go on `marked`) or expands them ends the run,
-    as does a second random stage. A stage on a pool of its own (a fetch's threads, a declared pool,
-    `pool_of`) runs alone on it.
+    as does a second random stage. A fetch with threads of its own runs alone on them (`pool_of`); a run
+    of stages that declare one pool (`Map.pool`) runs on one pool of it, each record crossing to it once,
+    and a stage that declares none, or another, ends it.
     Over `indexed` rows the steps before an expansion run by index, on the read's threads, and the
     expansion and the steps after it read them as a stream (`_expanded`)."""
     run: list[RecordStage] = []
@@ -521,7 +523,10 @@ def _run(
     for stage in stages[start:stop]:
         if not record_stage_of(stage):
             break
-        if pool_of((stage,)) is not None:
+        if run and declared_pool(stage) != declared_pool(run[0]):
+            break
+        if declared_pool(stage) is None and pool_of((stage,)) is not None:
+            # A fetch on threads of its own.
             return tuple(run) or (stage,)
         if isinstance(stage, RandomMap):
             if drawn or counted:
