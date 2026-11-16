@@ -170,7 +170,10 @@ def _asset(pin: dict, name: str) -> str:
     """The asset of GitHub's store holding the file pinned at the fixture `name`: named by its sha256, and a
     release file by its own name after it, so no name ever holds two files' bytes."""
     if pin.get("kind") == RELEASE:
-        return f"{_sha(pin)}-{_file_name(name)}"
+        # GitHub renames an asset with other characters, and a URL reads a space, `#` or `?` as its own.
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", file := _file_name(name)):
+            raise ValueError(f"{name}: {file!r} is no name GitHub keeps for an asset ([A-Za-z0-9._-])")
+        return f"{_sha(pin)}-{file}"
     return f"{_sha(pin)}.npz"
 
 
@@ -357,7 +360,10 @@ def upload_github(due: dict[str, dict], root: Path = REPO_ROOT) -> None:
     counts = {release["tag_name"]: len(release["assets"]) for release in releases}
     with tempfile.TemporaryDirectory() as directory:
         for name, pin in sorted(due.items()):
-            asset = pin["path"]
+            # The asset's name is the pin's content's, never a path the pin carries (review).
+            asset = _asset(pin, name)
+            if pin["path"] != asset:
+                raise SystemExit(f"{name}: its pin names {pin['path']!r}, not its asset {asset!r}")
             if asset in held:
                 release, said = held[asset]
                 if said != f"sha256:{pin['sha256']}":
@@ -366,7 +372,9 @@ def upload_github(due: dict[str, dict], root: Path = REPO_ROOT) -> None:
             else:
                 release = next((tag for tag, count in counts.items() if count < ASSETS_PER_RELEASE), None)
                 if release is None:
-                    release = f"store-{len(counts) + 1}"
+                    # After the highest, whatever releases were removed between (review).
+                    highest = max((int(tag.removeprefix("store-")) for tag in counts), default=0)
+                    release = f"store-{highest + 1}"
                     _gh("release", "create", release, "--repo", GITHUB, "--title", release, "--notes",
                         "Dew's recorded test fixtures (https://github.com/AshishKumar4/dew): each asset is "
                         "named by its SHA-256, pinned beside the fixture it stands for in Dew's "
@@ -466,10 +474,14 @@ def check(root: Path = REPO_ROOT) -> list[str]:
                             + (" (its upload is due)" if "revision" in missing else ""))
             continue
         released, github = pin.get("origin") == "release", pin.get("origin") == "github"
-        # A file kept at its release's origin is the release's own file there, its reference's.
-        where = ((pin["repo"], pin["revision"], pin["path"]) == _released(pin["reference"]) if released
-                 else (pin["repo"], pin["path"]) == (GITHUB, _asset(pin, name)) if github
-                 else pin["path"] == _store_path(pin, name) and pin["repo"] == STORE)
+        # A file kept at its release's origin is the release's own file there, its reference's; one of
+        # GitHub's store its asset, of a sha256 and a name GitHub keeps (`_asset`).
+        try:
+            where = ((pin["repo"], pin["revision"], pin["path"]) == _released(pin["reference"]) if released
+                     else (pin["repo"], pin["path"]) == (GITHUB, _asset(pin, name)) if github
+                     else pin["path"] == _store_path(pin, name) and pin["repo"] == STORE)
+        except ValueError:
+            where = False
         if (not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"]) or pin.get("kind") not in (None, RELEASE)
                 or pin.get("origin", "store") not in ORIGINS or (released and pin.get("kind") != RELEASE)
                 or not where):
