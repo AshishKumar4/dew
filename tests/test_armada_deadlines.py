@@ -285,6 +285,24 @@ def test_a_signalled_process_the_collector_never_read_leaves_its_rows_natives_un
     assert capture.evidence(capture.stacks()) == {"capture": "armed", "natives": "unread"}
 
 
+def test_a_process_two_threads_of_which_a_signal_ends_keeps_its_native_stacks(ci):
+    """A process whose second thread takes a fatal signal while its first's is being reported lives until the
+    collector has read every thread's stacks: the second waits in its handler rather than ending the process
+    before the read (train 928, 2026-11-16: an XLA compile's SIGSEGV left no stack read, and a probe of a
+    second fault 50 ms after the first ended the process unread)."""
+    capture = ci.natives.Capture(Path(sys.executable).with_name("py-spy"))
+    assert capture.variables, capture.why
+    code = ("import ctypes, faulthandler, threading, time\nfaulthandler.enable()\nlibc = ctypes.CDLL(None)\n"
+            "def die(delay):\n    time.sleep(delay)\n    getattr(libc, 'raise')(11)\n"
+            "threads = [threading.Thread(target=die, args=(delay,)) for delay in (0.2, 0.25)]\n"
+            "[thread.start() for thread in threads]\n[thread.join() for thread in threads]\n")
+    died = subprocess.run([sys.executable, "-c", code], env={**os.environ, **capture.variables}, check=False,
+                          capture_output=True, timeout=120)
+    stacks = capture.stacks()
+    assert died.returncode == -11
+    assert capture.evidence(stacks) == {"capture": "armed", "natives": "read"}, stacks
+
+
 def test_a_worker_a_signal_ends_keeps_its_native_stacks_though_pytest_exits_red(ci, tmp_path):
     """A process a test starts (a worker, here in another directory) that a signal ends keeps its native
     stacks with the run's whole output, though pytest itself exits red rather than by the signal (review,
