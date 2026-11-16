@@ -828,5 +828,5 @@ def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
             report.refuse_launch(op, launch, refused, {"attention_forward"})
             again = attention_decode.planned(query, key, value, spans, template.Hooks())[0][walk]
             with tuning.pinned({attention_mosaic.MosaicForward: again.config}):
-                chosen = op._chosen(launch)
+                chosen = op.taken(launch)
     assert chosen != refused

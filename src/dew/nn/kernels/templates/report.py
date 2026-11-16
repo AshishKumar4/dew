@@ -563,7 +563,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
     alone before its program is: its kernels' binaries (`binaries`) as the plugin's own compiler makes them
     for the device the process compiles for (`_certifying_device`: its own GPU, or a compile-only one a
     block names), which the program's compile then reuses (Mosaic compiles a module once a process). A
-    launch's derivation refuses a config that spills and takes its next (`tuning`'s `_chosen`), with no
+    launch's derivation refuses a config that spills and takes its next (`tuning.KernelOp.taken`), with no
     program retraced, where a compile's refusal retraces the whole program (`settled`): a B200's 4B step
     stepped its attention forward 19 times that way, 42 minutes, every rewalk a step's trace. None on a
     process compiling for no GPU or an interpreted launch; None, read nowhere, for a launch XLA or the GPU's
