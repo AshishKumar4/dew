@@ -19,7 +19,6 @@ import logging
 import threading
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
-from concurrent import futures
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
 
@@ -41,6 +40,8 @@ from dew.telemetry.benchmark import UNGRAPHED_FLAG, options_of
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from flax import linen as nn
+
+_log = logging.getLogger(__name__)
 
 
 class QuantizedDtypes(Protocol):
@@ -316,15 +317,24 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
     """`program` over these arguments (arrays or shapes) lowered here and its first compile begun in a
     daemon thread of its own (`report.attempted`: XLA's compile alone, which releases the GIL), so it
     compiles while this thread runs on: a run's start beside its step's planning, which does not read it.
-    `attempting` takes it; the process's exit waits for it where it still runs (`_exit_waits`), so a run
-    refused before its start is taken exits with its refusal once the compile ends, never through a
-    compile XLA's exit tears down under it."""
+    `attempting` takes it; the process's exit waits for it where it still runs, saying so
+    (`dew._coordination.stop_at_exit`), so a run refused or stopped before it takes its start exits once the
+    compile ends, never through a compile XLA's exit tears down under it."""
     from dew.nn.kernels.templates import report
 
     lowered = program.lower(*args, **kwargs)
     attempt: Future = Future()
     # In this thread's context: the compile's target reads it (`report.for_devices`).
     context = contextvars.copy_context()
+
+    # Its compile runs inside jaxlib: the process's exit waits for it (`stop_at_exit`), so neither JAX's exit
+    # cleanup nor the C runtime's exit tears XLA down under it (row 6837: 12 of 48 refused runs' exits ended
+    # by a segmentation fault).
+    from dew._coordination import stop_at_exit
+
+    def said() -> None:
+        _log.warning("the process waits to exit for a program's compile it began beside its work, still "
+                     "running")
 
     def attempted() -> None:
         attempt.set_running_or_notify_cancel()
@@ -334,39 +344,13 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
             # Its reader raises it (`attempting`).
             attempt.set_exception(error)
         finally:
-            with _IN_FLIGHT_GUARD:
-                _IN_FLIGHT.discard(attempt)
+            withdraw()
 
-    with _IN_FLIGHT_GUARD:
-        _IN_FLIGHT.add(attempt)
-    _exit_waits()
-    threading.Thread(target=attempted, name="dew-compile-ahead", daemon=True).start()
+    thread = threading.Thread(target=attempted, name="dew-compile-ahead", daemon=True)
+    withdraw = stop_at_exit(thread, said, timeout=None)
+    thread.start()
     abstract = program.abstract_of(args, kwargs) if isinstance(program, OuterProgram) else None
     return Compiling(program, abstract, lowered, attempt)
-
-
-_IN_FLIGHT: set[Future] = set()
-"""The compiles `compiling` began that have not ended."""
-_IN_FLIGHT_GUARD = threading.Lock()
-
-
-@functools.cache
-def _exit_waits() -> None:
-    """The process's exit waits for every compile `compiling` began that still runs, registered once one
-    begins, after JAX is imported, so it runs before JAX's own exit cleanup (`atexit` runs the last
-    registered first): neither JAX's clearing of its backends nor the C runtime's exit, which destroys
-    XLA's static objects, meets a running compile. A run refused while its start compiles exits with its
-    refusal, the compile's remaining time later; it ended by a segmentation fault in 12 of 48 such exits
-    (row 6837). Its cost falls on a refusal that comes after the start's compile begins, which only one that
-    needs what runs beside it is (`dew.training.trainer.Trainer._compiled_fresh`)."""
-    import atexit
-
-    def waited() -> None:
-        with _IN_FLIGHT_GUARD:
-            running = list(_IN_FLIGHT)
-        futures.wait(running)
-
-    atexit.register(waited)
 
 
 _ATTEMPTING: contextvars.ContextVar[Compiling | None] = _cache.untraced(
