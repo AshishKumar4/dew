@@ -302,13 +302,16 @@ def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, .
     dataclass fields with their defaults and default factories (`dew._sources.dataclass_fields`), and its
     metaclass where that is the user's own code too (which runs as the class is made and may set what it
     holds)."""
-    fields = [[name, _field_part(default, f"{at} ({held.__name__}.{name})", known, walking),
-               _field_part(factory, f"{at} ({held.__name__}.{name} factory)", known, walking)]
-              for name, default, factory in _sources.dataclass_fields(held)]
+    fields: list[JSON] = [
+        [field.name, _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking),
+         _field_part(field.default_factory, f"{at} ({held.__name__}.{field.name} factory)", known, walking)]
+        for field in _sources.dataclass_fields(held)]
     maker = type(held)
     made = (_stated(maker, f"{at} ({held.__name__}'s metaclass)", known, walking)
             if _sources.own_source(maker.__module__) else None)
-    return [_coded(held.__module__, at), held.__qualname__, _members(held, at, known, walking), fields, made]
+    entry: list[JSON] = [_coded(held.__module__, at), held.__qualname__, _members(held, at, known, walking),
+                         fields, made]
+    return entry
 
 
 def _field_part(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:

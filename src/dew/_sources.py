@@ -6,6 +6,7 @@ or an installed distribution's, which its version states. One statement, which a
 from __future__ import annotations
 
 import abc
+import dataclasses
 import functools
 import importlib.metadata
 import inspect
@@ -209,10 +210,8 @@ def members(held) -> list[tuple]:
     return found
 
 
-def dataclass_fields(held: type) -> list[tuple[str, object, object]]:
+def dataclass_fields(held: type) -> list[dataclasses.Field]:
     """A dataclass's fields as its decorator recorded them on `held` itself (`__dataclass_fields__`, its
-    bases' among them, an override's default its own), by name in order: each field's name, its default and
-    its default factory, `dataclasses.MISSING` where it has none. Empty for a class that is no dataclass of
-    its own."""
-    fields = vars(held).get("__dataclass_fields__", {})
-    return [(name, field.default, field.default_factory) for name, field in fields.items()]
+    bases' among them, an override's default its own), in order, each with its name, default and default
+    factory (`dataclasses.MISSING` where it has none). Empty for a class that is no dataclass of its own."""
+    return list(vars(held).get("__dataclass_fields__", {}).values())

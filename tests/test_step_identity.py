@@ -407,8 +407,9 @@ class Shifting:
 @pytest.mark.parametrize(("edit", "slots"), [({"by": 300, "value": 3}, ""), ({"by": 20, "value": 55}, ""),
                                              ({"by": 20, "value": 55}, ", slots=True")],
                          ids=["slotted child's override", "factory", "slotted factory"])
+@pytest.mark.parametrize("read", ["indexed", "memory"])
 def test_an_exact_resume_refuses_a_step_whose_classs_field_default_or_factory_changed(
-        tmp_path, monkeypatch, edit, slots):
+        tmp_path, monkeypatch, read, edit, slots):
     """A step of a class of the user's file whose code builds dataclasses of the file reads their fields'
     defaults and default factories as its code: a slotted child overriding its base's default
     (`Child().by`), and a default factory, plain or slotted (`Listed().values`), each edited, refuse an exact
@@ -421,7 +422,7 @@ def test_an_exact_resume_refuses_a_step_whose_classs_field_default_or_factory_ch
 
     def reader():
         pipeline = Pipeline(ROWS).map(fielded.Shifting()).shuffle(0).repeat().batch(2)
-        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+        return compile(pipeline, read=read, loading=READ, resume="exact").train(DataPartition())
 
     state = saved_after_one(reader)
     assert resumed_changes(reader(), state) == ()
