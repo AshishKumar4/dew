@@ -175,6 +175,42 @@ def test_a_projection_no_kernel_launches_per_shard_is_on_par_with_one_device(nam
 
 
 @pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axis", ["data", "fsdp"])
+def test_a_projection_read_apart_from_its_layer_runs_per_shard_as_its_layer_does(axis):
+    """A projection read apart from its layer (`protocols.Projection`, as a vocabulary head reads
+    `project_out`, through `dense.plain_product`), its kernel the parameter at its layer's path, on a
+    two-device mesh splitting its rows, the template's kernel named and interpreted as an H100's: each
+    device's launch on its own rows, on par with one device's (check 1) from float64, its compiled step
+    moving no operand between devices but an fsdp weight's gather (row 6047: it went to the partitioner)."""
+    from dew.nn.protocols import Projection
+
+    path = tuple(jax.tree_util.DictKey(key) for key in ("params", "first", "kernel"))
+    mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
+
+    def call(x, kernel):
+        return Projection(kernel, path=path)(x)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(ROWS, LENGTH, FEATURES)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(FEATURES, WIDTH)) / 8, jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(ROWS, LENGTH, WIDTH)), jnp.bfloat16))
+
+    def truth(x, kernel, cotangent):
+        return with_gradients(lambda x, kernel: x @ kernel)(
+            *(argument.astype(jnp.float64) for argument in (x, kernel, cotangent)))
+
+    with (jax.sharding.use_abstract_mesh(mesh.abstract_mesh), nn.logical_axis_rules(DEFAULT_RULES),
+          _declared()):
+        kernel = _kernel("first", (FEATURES, WIDTH), jnp.bfloat16)
+    with (generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic"),
+          nn.logical_axis_rules(DEFAULT_RULES), placing(LAYOUT), _declared()):
+        assert_runs_per_shard(with_gradients(call), draw, [PartitionSpec(axis), kernel, PartitionSpec(axis)],
+                              mesh, f"a projection apart from its layer {axis}", seeds=SEEDS, truth_fn=truth,
+                              moves=("all-gather",) if axis == "fsdp" else ())
+
+
+@pytest.mark.mesh(devices=2)
 def test_a_projection_on_an_explicit_mesh_with_replicated_rows_runs():
     """A bf16 Dense under an Explicit two-device data mesh whose input is replicated (its type carrying its
     placement): it runs, on par with one device's from float64, the product the partitioner's as before."""

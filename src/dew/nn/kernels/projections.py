@@ -6,6 +6,8 @@ launch takes any of its products, else XLA's own program."""
 
 import functools
 import math
+from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -30,7 +32,7 @@ from dew.nn.kernels.gemm import (
     mxfp8_product,
     nvfp4_block_product,
 )
-from dew.nn.kernels.templates.product import SCALE_DEPTH, declared
+from dew.nn.kernels.templates.product import MXFP8 as MX_BLOCKS, NVFP4 as NVFP4_BLOCKS, SCALE_DEPTH, declared
 from dew.nn.sharding import (
     RESIDUAL,
     automatic_axes,
@@ -61,31 +63,37 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     projection's role takes it: a dense projection's (`matrix` `[in, out]`, every row its one group's) or
     experts' (`[groups, in, out]`, `group_sizes` counting each group's leading rows, any past their sum
     outside every group), each group's rows padded with zero rows to whole 128-row blocks, multiplied by
-    `blockwise_fp8_projection` and the padding dropped, a row outside every group zero; `bias`, each group's
-    `[groups, out]`, added to its rows' fp32 sums, the output rounded once after. None where the run trains
-    in no recipe or the recipe does not take the projection: its role keeps the run's dtypes (a router's, a
-    head's) or its widths hold no whole 128-wide blocks, each such projection's route reported with the
-    reason."""
+    the recipe's projection (`RECIPES`) and the padding dropped, a row outside every group zero; `bias`, each
+    group's `[groups, out]`, added to its rows' fp32 sums, the output rounded once after. None where the run
+    trains in no recipe or the recipe does not take the projection: its role keeps the run's dtypes (a
+    router's, a head's) or its widths hold no whole blocks of the recipe's, each such projection's route
+    reported with the reason."""
     from dew.nn.precision import recipe_role
 
     held = recipe_role()
     if held is None:
         return None
     recipe, role = held
-    edge = SCALE_DEPTH
+    taken = RECIPES[recipe.recipe]
     depth, width = matrix.shape[-2:]
     refusal = (None if role in recipe.roles else
                selection.Refusal("kept_role", f"a {role or 'role-less'} projection keeps the run's dtypes "
                                  f"under {recipe.recipe}", kind="handoff"))
-    if refusal is None and (depth % edge or width % edge):
+    if refusal is None and (depth % taken.block or width % taken.block):
         refusal = selection.Refusal("block_shape", f"a {depth} x {width} projection holds no whole "
-                                    f"{edge}-wide blocks", kind="handoff")
+                                    f"{taken.block}-wide blocks", kind="handoff")
     if refusal is not None:
-        generation.route(generation.Choice.BLOCKWISE_FP8, kernel="unquantized", preferred=recipe.recipe,
-                         refusal=refusal)
+        generation.route(taken.choice, kernel="unquantized", preferred=recipe.recipe, refusal=refusal)
         return None
+    edge = SCALE_DEPTH
+    # Rows an Explicit axis splits, or the mesh's automatic axes alone (a data-parallel run's, row 6719):
+    # each device's rows its own projection; a launch reads its operands whole.
     if (placed := explicit_spec(rows)) is not None and placed.spec[0] is not None:
-        return _projected_apart(rows, matrix, group_sizes, out_dtype=out_dtype, bias=bias, placed=placed)
+        along = placed.spec[0]
+    else:
+        along = None if (split := rows_split(rows)) is None else split[0]
+    if along is not None:
+        return _projected_apart(rows, matrix, group_sizes, out_dtype=out_dtype, bias=bias, along=along)
     stacked = matrix if matrix.ndim == 3 else matrix[None]
     groups, count = stacked.shape[0], rows.shape[0]
     sizes = (jnp.full((1,), count, jnp.int32) if group_sizes is None
@@ -104,38 +112,32 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     # A biased product's sums stay fp32 through the bias, as the template's epilogue adds it (moe's
     # `_biased`): one rounding of the whole.
     summed_dtype = out_dtype if bias is None else jnp.float32
-    product = blockwise_fp8_projection(laid, stacked, group_blocks, out_dtype=summed_dtype)
+    product = taken.projection(laid, stacked, group_blocks, out_dtype=summed_dtype)
     out = product.at[place].get(mode="fill", fill_value=0)
     if bias is not None:
         out = jnp.where((group < groups)[:, None], out + bias[held_group].astype(jnp.float32), out)
     return out.astype(out_dtype)
 
 
-def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, placed) -> jax.Array:
-    """`recipe_projection` of rows an Explicit mesh axis splits (rows 4854, 4859): each device's rows its own
-    projection (`jax.shard_map` over the axes splitting the rows), laid in whole 128-row blocks of its own
-    as a data-parallel recipe quantizes them, the matrices and bias whole on every device and their
-    gradients summed over the devices (shard_map's transpose). Experts' sizes count every device's rows
-    together, each group's after the last's: a device's groups are its share of each (`_local_sizes`)."""
+def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, along) -> jax.Array:
+    """`recipe_projection` of rows the mesh's axes `along` split, Explicit (rows 4854, 4859) or automatic
+    alone (row 6719): each device's rows its own projection (`on_shards`, whose map is unchecked as a Pallas
+    launch's must be), laid in whole 128-row blocks of its own as a data-parallel recipe quantizes them, the
+    matrix, the groups' sizes and the bias whole on every device and the matrix's and bias's gradients
+    summed over the devices (the map's transpose). Experts' sizes count every device's rows together, each
+    group's after the last's: a device's groups are its share of each (`_local_sizes`)."""
     from dew.mesh import mesh_axes
 
-    names = mesh_axes(placed.spec[0])
-    split = jax.sharding.PartitionSpec(placed.spec[0], None)
-    whole = jax.sharding.PartitionSpec()
-    extra = tuple(each for each in (group_sizes, bias) if each is not None)
+    names = mesh_axes(along)
 
-    def projected(rows, matrix, *extra):
-        sizes = None if group_sizes is None else _local_sizes(extra[0], rows.shape[0], names)
-        held = extra[1:] if group_sizes is not None else extra
-        out = recipe_projection(rows, matrix, sizes, out_dtype=out_dtype, bias=held[0] if held else None)
+    def projected(rows, matrix, group_sizes, bias):
+        sizes = None if group_sizes is None else _local_sizes(group_sizes, rows.shape[0], names)
+        out = recipe_projection(rows, matrix, sizes, out_dtype=out_dtype, bias=bias)
         assert out is not None, "the recipe takes the projection on every device as on the whole"
         return out
 
-    # The recipe's own loops start their sums typed for no device (`xla_products.step_scaled`'s carry), so
-    # the program is not checked for the devices' varying values (`check_vma`); each device's rows are its
-    # own by the specs, and the whole operands' gradients sum over the devices as shard_map transposes them.
-    return jax.shard_map(projected, mesh=placed.mesh, in_specs=(split, whole, *(whole,) * len(extra)),
-                         out_specs=split, axis_names=frozenset(names), check_vma=False)(rows, matrix, *extra)
+    return on_shards(projected, jax.sharding.PartitionSpec(along, None), (rows, matrix, group_sizes, bias),
+                     whole=(1, 2, 3))
 
 
 def _local_sizes(group_sizes: jax.Array, count: int, names: tuple) -> jax.Array:
@@ -271,6 +273,26 @@ def _nvfp4_value(x, w, group_blocks, out_dtype, interpret):
     return _recipe_value(NvFp4Block, nvfp4_block_product, x, w, group_blocks, out_dtype, interpret)
 
 
+class Recipe(NamedTuple):
+    """A low-precision recipe's projection (`recipe_projection`): `projection(x, w, group_blocks, out_dtype=)`
+    over whole 128-row blocks, the width `block` its operands' scales cover along each product's
+    contraction (each of a projection's depth and width), and the `choice` its products' routes report."""
+
+    projection: Callable
+    block: int
+    choice: generation.Choice
+
+
+RECIPES = {"blockwise_fp8": Recipe(blockwise_fp8_projection, SCALE_DEPTH, generation.Choice.BLOCKWISE_FP8),
+           "mxfp8": Recipe(mxfp8_projection, MX_BLOCKS.depth, generation.Choice.MXFP8),
+           "nvfp4": Recipe(nvfp4_projection, NVFP4_BLOCKS.depth, generation.Choice.NVFP4_BLOCK)}
+"""The low-precision recipes a run's projections train in (`dew.nn.precision.LowPrecision.recipe`), by name:
+the one declaration of them, each product's sums fp32 and its gradients the recipe's own products of
+requantized operands. DeepSeek-V3's blockwise FP8, its operands E4M3 by 1 x 128 activation tiles and 128 x
+128 weight blocks under power-of-two scales; MXFP8 (OCP MX), E4M3 under a power-of-two scale every 32 of
+each product's contraction; NVFP4, E2M1 under an E4M3 scale every 16 of it and a tensor scale."""
+
+
 def _nvfp4_forward(x, w, group_blocks, out_dtype, interpret):
     return _recipe_forward(_nvfp4_value, x, w, group_blocks, out_dtype, interpret)
 
@@ -310,7 +332,7 @@ def dot_general(xla, path: tuple | None = None):
         (contracted, against), batch = dimension_numbers
         out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
         # The run's low-precision recipe takes the product where the projection's role takes it.
-        if not kwargs and (recipe := _recipe_general(lhs, rhs, dimension_numbers, out_dtype)) is not None:
+        if not kwargs and (recipe := recipe_general(lhs, rhs, dimension_numbers, out_dtype)) is not None:
             return recipe
         plain = (not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
@@ -408,7 +430,7 @@ def kernel_path(layer) -> tuple:
     return tuple(jax.tree_util.DictKey(name) for name in ('params', *layer.scope.path, 'kernel'))
 
 
-def _recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype) -> jax.Array | None:
+def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype) -> jax.Array | None:
     """A layer's product (`jax.lax.dot_general`'s `dimension_numbers`) in the run's low-precision recipe
     (`recipe_projection`), as matrices: a dense projection's free rows against its kernel's contracted
     axes, a batched one's (a grouped output projection's, DeepSeek V4's `o_a_proj`) each batch member a

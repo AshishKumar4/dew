@@ -1855,7 +1855,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     unstaged = not k_major and rows_unstaged(dense=dense or whole_steps, prologue=prologue,
                                              tabled=any(table is not None for table in tables))
     _pair_refused(tiles, family, transpose_lhs=False, exact_sums=exact_sums, scaled=step_scales is not None,
-                  parts=(prologue, gather), rewritten=rewrites(family, k_major, tables, unstaged))
+                  parts=(prologue, gather), rewritten=rewrites(family, k_major, unstaged))
     group_sizes = group_sizes.astype(jnp.int32)
     out_dtype = jnp.dtype(out_dtype)
     if tiles.splits > 1:
@@ -1952,13 +1952,15 @@ def prologue_rewritten(family: mosaic.Family, prologue) -> bool:
     return prologue is not None and family.rewrites_in_persist
 
 
-def rewrites(family: mosaic.Family, k_major: bool, tables: tuple, unstaged: bool) -> bool:
+def rewrites(family: mosaic.Family, k_major: bool, unstaged: bool) -> bool:
     """Dew: whether `tgmm`'s stage is rewritten by its family's own role (`mosaic.Family.rewrites_in_persist`,
-    a role beside its consumers): its loads' rows, never rows its tables gather, a k-major launch's whole
-    steps of one group, nor a stage read as loaded (`rows_unstaged`). The one decision: the kernel's role
-    and its planning's (`grouped_matmul._Mosaic.rewritten`)."""
-    return (family.rewrites_in_persist and not k_major and all(table is None for table in tables)
-            and not unstaged)
+    a role beside its consumers): its loads' rows, gathered by its load warp's tables or not
+    (`gathered.Committed`, whose slots hand off as any ring's), never a k-major launch's whole steps of one
+    group, nor a stage read as loaded (`rows_unstaged`); its products' warp reads no tile, so a gathered
+    stage's neighbouring groups' rows are masked there (row 1376: masked in the products' warp, a gathered
+    B200 gradient failed to lower). The one decision: the kernel's role and its planning's
+    (`grouped_matmul._Mosaic.rewritten`)."""
+    return family.rewrites_in_persist and not k_major and not unstaged
 
 
 def _gradient_unrolled(family: mosaic.Family, *, unstaged: bool, exact_sums: bool, scaled: bool) -> bool:
@@ -2035,7 +2037,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     `operands` are padded, then each one's gather table (or None); `groups` `_group_blocks`' (`tgmm`)."""
     lhs, rhs, tables = operands[0], operands[1], tuple(operands[2:])
     family = family_of(tiles, lhs.dtype)
-    rewritten = rewrites(family, k_major, tables, unstaged)
+    rewritten = rewrites(family, k_major, unstaged)
     k, m, n, g = shape
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     consumers, depth_half = tiles.warpgroups, block_m // tiles.warpgroups

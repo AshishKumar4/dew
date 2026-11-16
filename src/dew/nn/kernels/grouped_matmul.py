@@ -917,11 +917,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def rewritten(self, ba, family: mosaic.Family) -> bool:
         """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`): its
-        own loads' rows, never rows its tables gather (`mosaic_gpu.tgmm`'s `gather`, which a consumer's
-        cp.async gather stages: the fed rings'), nor rows read as loaded (`unstaged`); or a product's rows
-        its prologue rewrites there (`_prologue_rewritten`)."""
-        tables = (ba.arguments.get('gather'), ba.arguments.get('scatter'))
-        return ((self.STAGED_ROWS and mosaic_gpu.rewrites(family, self.K_MAJOR, tables, self.unstaged(ba)))
+        own loads' rows, gathered or not (`mosaic_gpu.rewrites`), never rows read as loaded (`unstaged`); or a
+        product's rows its prologue rewrites there (`_prologue_rewritten`)."""
+        return ((self.STAGED_ROWS and mosaic_gpu.rewrites(family, self.K_MAJOR, self.unstaged(ba)))
                 or self._prologue_rewritten(ba, family))
 
     def _prologue_rewritten(self, ba, family: mosaic.Family) -> bool:
