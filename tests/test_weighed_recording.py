@@ -48,7 +48,12 @@ def at(narrow, layout: str):
     return dew
 
 
-RAN = {layout: jax.jit(leafed(reference, layout)) for layout in LAYOUTS}
+LEAFED = {layout: leafed(reference, layout) for layout in LAYOUTS}
+"""The reference as the site's leaf, one function a layout: its rounding scale's program is compiled once for
+it (`rounding_bound.SCALES`, keyed by the function), where a function made anew each draw compiled each draw's
+(7,168 of them, 267 of the run's 302 s)."""
+
+RAN = {layout: jax.jit(LEAFED[layout]) for layout in LAYOUTS}
 """The reference compiled, once a precision and a layout: a recording asks it of thousands of draws."""
 
 
@@ -65,9 +70,15 @@ def evaluated(layout: str):
 
 
 def scaled(layout: str):
-    """The reference program's rounding scale at a draw (tests/rounding_bound.py), its recorder's own."""
+    """The reference program's rounding scale at a draw (tests/rounding_bound.py), its recorder's own, each
+    seed's once: the two recordings of a layout are of the same draws (`inputs_of(seed)`), so the second
+    reads the first's."""
+    held = {}
+
     def scale(inputs, seed):
-        return rounding_scale(leafed(reference, layout), *(inputs[name] for name in NAMES), seed=seed)[1]
+        if seed not in held:
+            held[seed] = rounding_scale(LEAFED[layout], *(inputs[name] for name in NAMES), seed=seed)[1]
+        return held[seed]
     return scale
 
 
@@ -78,11 +89,11 @@ def recordings(request, tmp_path_factory):
     layout = request.param
     recorder, directory = load("recorded_references"), tmp_path_factory.mktemp("weighed")
     dew = jax.jit(lambda inputs: at(reformulated, layout)(jnp.float32, inputs))
-    saved = {"layout": layout}
+    saved, scale = {"layout": layout}, scaled(layout)
     with jax.enable_x64(new_val=True):
         for name, options in (("whole", {}), ("summary", {"summary": True})):
-            recorded = recorder.record_case("site", inputs_of, evaluated(layout), dew=dew,
-                                            scale=scaled(layout), store_inputs=False, **options)
+            recorded = recorder.record_case("site", inputs_of, evaluated(layout), dew=dew, scale=scale,
+                                            store_inputs=False, **options)
             np.savez(directory / f"{name}.npz", **recorded)
             saved[name] = (directory / f"{name}.npz", recorded)
     return saved
