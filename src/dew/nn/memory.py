@@ -484,6 +484,12 @@ class InContextMemory(LinearProducts):
         hooks = self._recurrence()
         return (*(DELTA_RESIDUALS if hooks is not None and hooks.delta else ()), *MEMORY_RESIDUALS)
 
+    @property
+    def recurrent(self) -> bool:
+        """Whether its configuration is a row of the shared linear recurrence (`_recurrence`), the one path
+        of it that reads a call's forks; a call's wrappers may still take its heads off it (`_route`)."""
+        return self._recurrence() is not None
+
     def _route(self) -> recurrence.Hooks | None:
         """This call's row of the shared linear recurrence (`_recurrence`), or None where its
         configuration is none or a head computes other than the linear map of its input by the kernel

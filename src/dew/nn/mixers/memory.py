@@ -22,13 +22,13 @@ class InContextMemoryMixer(MixerBase):
 
     def fork_refusal(self) -> str | None:
         """Why the layer reads no forks (`MixerBase.fork_refusal`), None where it does: a memory on the
-        shared recurrence (`InContextMemory._recurrence`) continues a fork's document from the state its
+        shared recurrence (`InContextMemory.recurrent`) continues a fork's document from the state its
         parent's tokens leave, through the forks' table (`dew.nn.linear.forked_scan`, as lightning's), and
         from the share of W_0 they kept; the general path steps each document's weights from its own
         start, its chunks counted per document, which no fork continues. A call's wrappers that take a
         recurrent memory's heads off the recurrence (a quantized or nonlinear product) are refused where
         the call reads forks (`InContextMemory.__call__`)."""
-        if self.memory._recurrence() is not None:
+        if self.memory.recurrent:
             return None
         return ("an in-context memory off its shared recurrence continues no fork's document from its "
                 "parent: its general path steps each document's weights from its own start")
