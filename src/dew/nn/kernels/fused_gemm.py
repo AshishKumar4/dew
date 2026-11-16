@@ -260,15 +260,14 @@ def _chain(consumer, values, acc) -> cost.Work:
 
 
 def _work(eqns) -> cost.Work:
-    """`eqns`' elementwise work: each equation an operation an element of its result, one the special-function
-    units evaluate on them (the algebra's declaration of it, `dew.algebra.terms.Operation.exponential`), a
+    """`eqns`' elementwise work: each equation an operation an element of its result, one the
+    special-function units evaluate on them (the kernels' counter's rule, `emission.SPECIAL_FUNCTIONS`), a
     conversion's apart."""
     work = cost.Work()
     for eqn in eqns:
         elements = float(sum(math.prod(shape) for var in eqn.outvars
                              if (shape := getattr(var.aval, 'shape', None)) is not None))
-        spoken = algebra.terms.OPERATIONS.get(eqn.primitive)
-        work = work + (cost.Work(exponentials=elements) if spoken is not None and spoken.exponential
+        work = work + (cost.Work(exponentials=elements) if eqn.primitive in emission.SPECIAL_FUNCTIONS
                        else cost.Work(conversions=elements) if eqn.primitive is jax.lax.convert_element_type_p
                        else cost.Work(operations=elements))
     return work
