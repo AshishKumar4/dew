@@ -36,7 +36,7 @@ from dew import registry
 from dew._cli.main import main
 from dew._records import annotations_of
 from dew.config import RunConfig
-from dew.decision.layout import RowSegment, Reads, built_in
+from dew.decision.layout import Reads, RowSegment, built_in
 from dew.registry import objectives
 
 
