@@ -1185,20 +1185,47 @@ def _checked(
     return per_share
 
 
-def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) -> None:
-    missing = _unsupported(pipelines, read)
+def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool,
+                  ending: Sequence[Pipeline] = ()) -> None:
+    """Refuse a read the sources under `pipelines` cannot take, provisioning each where `provision` asks;
+    and of a streamed read of `ending` (the reads that end, no training read's), the indexed read whose
+    length each member of an unseeded mix needs (`_measured_members`), which ends the mix at its members'
+    share-spans (data.md §3)."""
+    missing = [(source, read) for source in _unsupported(pipelines, read)]
+    if read == "streamed":
+        measured = [source for pipeline in ending for source in _measured_members(pipeline)]
+        missing += [(source, "indexed") for source in measured if not source.supports("indexed")]
     if provision:
-        for source in missing:
-            preparer = provisioner(source, read)
+        for source, needed in missing:
+            preparer = provisioner(source, needed)
             if preparer is not None:
                 preparer.provision()
     refused: dict[str, list[str]] = {}
-    for source in missing:
-        if not source.supports(read):
-            refused.setdefault(_refusal(source, read, provision=provision), []).append(source.describe())
+    for source, needed in missing:
+        if not source.supports(needed):
+            why = _refusal(source, needed, provision=provision)
+            if needed != read:
+                why = f"an unseeded mix's end needs its length, from an indexed read: {why}"
+            refused.setdefault(why, []).append(source.describe())
     if refused:
         raise ValueError(f"read={read!r} is unavailable: "
                          + "; ".join(f"{', '.join(names)}: {why}" for why, names in refused.items()))
+
+
+def _measured_members(pipeline: Pipeline) -> list[Source]:
+    """The sources of `pipeline`'s unseeded mixes (by records) whose lengths their end needs: each member
+    read once, one record a record (no repeat, nothing dropped or made), its source's own length its
+    length. A member of unknown length (one a step changes) ends its mix at its first failed pull."""
+    found: list[Source] = []
+    source = pipeline.source
+    if isinstance(source, Combined):
+        for child in source.pipelines:
+            found += _measured_members(child)
+    if isinstance(source, Mixture) and source.seed is None and source.tokens is None:
+        found += [child.source for child in source.pipelines
+                  if not isinstance(child.source, Combined)
+                  and not any(isinstance(stage, Repeat) or _drops(stage) for stage in child.stages)]
+    return found
 
 
 def _refusal(source: Source, read: Read, *, provision: bool) -> str:

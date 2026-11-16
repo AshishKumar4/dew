@@ -668,7 +668,8 @@ def _measure(
     branches = tuple(_promoted(branch) for branch in branches)
     for branch, scored in zip(branches, held, strict=True):
         _analyzed(branch, read, validation=scored)
-    _capabilities(branches, read, provision)
+    _capabilities(branches, read, provision,
+                  [branch for branch, scored in zip(branches, held, strict=True) if scored])
     branches = _pin_sources(branches, read)
     _tokenizer_contract(branches)
     branches = tuple(_automatic(branch, read, automatic) for branch in branches)
