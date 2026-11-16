@@ -365,27 +365,6 @@ def budget_lm_trainer(tmp_path=None, **kwargs) -> Trainer:
     return make_trainer(tmp_path, objective=LMObjective(model, seq_len=LM_CONTEXT), **kwargs)
 
 
-def test_a_run_whose_tokenizer_this_host_cannot_resolve_is_refused_before_its_first_step(tmp_path):
-    """An LM run's checkpoints state its tokenizer's files and hold them (`Checkpoints.save`), so the run
-    resolves it before it places anything: one whose directory is gone is refused before its fit starts,
-    where it trained to its first checkpoint and died there (train 972's review)."""
-    from dew.data.text import tokenizer_for
-    from dew.inference.tasks import RunProcessor
-    from dew.training import LocalTracker
-
-    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                              mlp_features=32, max_seq_len=12, dtype="float32")
-    processor = RunProcessor(tokenizer_for(str(tmp_path / "gone")))
-    with LocalTracker(tmp_path / "tracking") as tracker:
-        trainer = make_trainer(tmp_path, objective=LMObjective(model, seq_len=LM_CONTEXT, processor=processor),
-                               tracker=tracker)
-        with pytest.raises(ValueError):
-            trainer.fit(lm_data(), steps=2, checkpoint_every=1)
-    records = tmp_path / "tracking" / "records.jsonl"
-    written = records.read_text().splitlines() if records.exists() else []
-    assert [record for record in map(json.loads, written) if record["type"] == "FitStarted"] == []
-
-
 def test_a_batch_of_other_rows_than_its_loader_states_is_refused_before_it_is_placed():
     """A loader that states batches of BATCH rows and hands its third step twice as many (a step after the
     batch that joined two) is refused at that batch, before it is placed (row 5724), where it once compiled

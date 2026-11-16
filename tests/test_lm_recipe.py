@@ -684,8 +684,8 @@ def test_a_run_whose_tokenizer_is_gone_exports_and_starts_a_run_from_the_copy_it
     source = export_tiny_decoder(tmp_path / "source", tokenizer=tokenizer_for(str(vocabulary)),
                                  vocab_size=len(HFTokenizer(str(vocabulary)).tokenizer))
     own = write_token_files(tmp_path / "own", 40 * SEQ, 8 * SEQ, tokenizer=str(source), eos_id=0)
-    pretrained_config(own, source, "--tokenizer", str(source), "--trainer.steps", "1", "--max-new-tokens", "0",
-                      "--trainer.name", "first").run()
+    pretrained_config(own, source, "--tokenizer", str(source), "--trainer.steps", "1",
+                      "--max-new-tokens", "0", "--trainer.name", "first").run()
     source.rename(tmp_path / "moved")
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "fresh"))
     first = tmp_path / "runs" / "first"
@@ -699,6 +699,34 @@ def test_a_run_whose_tokenizer_is_gone_exports_and_starts_a_run_from_the_copy_it
     started = pretrained_config(tokens, first, "--tokenizer", str(vocabulary), "--trainer.steps", "1",
                                 "--max-new-tokens", "0", "--trainer.name", "started").run()
     assert int(started.updates) == 1
+
+
+def test_a_run_whose_tokenizer_this_host_cannot_resolve_is_refused_before_its_first_step(tmp_path):
+    """An LM run's checkpoints state its tokenizer's files and hold them (`Checkpoints.save`), so the run
+    resolves it before it places anything: one whose directory is gone is refused before its fit starts,
+    where it trained to its first checkpoint and died there (train 972's review)."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.data.sources import Memory
+    from dew.data.text import tokenizer_for
+    from dew.inference.tasks import RunProcessor
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.training import LocalTracker, Trainer
+
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=12, dtype="float32")
+    processor = RunProcessor(tokenizer_for(str(tmp_path / "gone")))
+    rows = (np.arange(16 * 7, dtype=np.int32) % 13).reshape(-1, 7)
+    data = Pipeline(Memory({"text": rows})).repeat().batch(8)
+    with LocalTracker(tmp_path / "tracking") as tracker:
+        trainer = Trainer(LMObjective(model, seq_len=6, processor=processor), optax.sgd(0.1),
+                          key=jax.random.key(0), checkpoints=Checkpoints(str(tmp_path / "run")), tracker=tracker)
+        with pytest.raises(ValueError):
+            trainer.fit(data, steps=2, checkpoint_every=1)
+    records = tmp_path / "tracking" / "records.jsonl"
+    written = records.read_text().splitlines() if records.exists() else []
+    assert [record for record in map(json.loads, written) if record["type"] == "FitStarted"] == []
 
 
 def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
