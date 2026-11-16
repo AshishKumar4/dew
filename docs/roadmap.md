@@ -22,7 +22,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
 - Convolution repairs above their owner. [5665]
 - The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
-- Kernel-templates.md section 10. [6473]
 - The resource gate, now compiling a training case's forward with its kept memories as Mosaic.launches(backward=True) plans. [6553]
 - XLA:GPU's Triton nested-GEMM fusion of a residual add into a dot inside a while body rounds worse than the separate add cuBLAS's program keeps. [6759]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
@@ -95,7 +94,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Algebra
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235, 5239]
-- Spec alignment 2026-11-15 §3 (algebra.md §6.1:425 context is every derivation's key. [6673]
 - Bit-level synthesis in dew.algebra. [3733]
 - Py `_holds_regions`: 'any other holder of a program. [6578]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
@@ -108,6 +106,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
+- The saved data plan as recorded rules, one last version, and the resume modes. [6861]
 
 ## Tutorials and docs
 
