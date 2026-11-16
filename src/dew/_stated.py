@@ -110,8 +110,9 @@ def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
 
 
 def _stated(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) -> JSON:
-    """`stated`, within the functions `walking` whose reads are being stated: one of them met again (a
-    function that names itself) is that function, stated once."""
+    """`stated`, within the functions and containers `walking` whose reads or parts are being stated: a
+    function among them met again (one that names itself) is that function, stated once; a container
+    among them met again is refused (`Unestablished`)."""
     again = functools.partial(_stated, known=known, walking=walking)
     if id(value) in known:
         return known[id(value)]
@@ -145,6 +146,16 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) 
                                 "function")
         module = _coded(value.__module__, at)
         return ["class", module, value.__qualname__, *_main(module)]
+    if isinstance(value, (tuple, list, set, frozenset, Mapping, functools.partial, types.MethodType)) or (
+            dataclasses.is_dataclass(value) and not isinstance(value, type)):
+        # A container met again within itself (a mapping one of whose values is that mapping) has no finite
+        # statement: refused, so its plan is inexact, where walking it recursed past Python's limit and
+        # crashed the read (the base review of b4cabd6c0). One met twice apart, in two branches, is stated
+        # twice: `walking` is the path's alone.
+        if id(value) in walking:
+            raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} that holds "
+                                "itself")
+        again = functools.partial(_stated, known=known, walking=walking | {id(value)})
     if isinstance(value, (tuple, list)):
         # A named tuple's type names its fields, which its parts take in order.
         return ["sequence", again(type(value), at=at),
@@ -272,9 +283,13 @@ def _own(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) -> 
     it, and its members' reads (`_members`), its bases' of the user's code among them. Such code reaches
     the program through a name alone, and what it reads at run time (a module's setting another module
     assigned) is nothing its source states, so it is walked, through every function, class and module of
-    the user's it names in turn; one met again within its own walk is itself, stated once."""
+    the user's it names in turn; one met again within its own walk is itself, stated once. A class's
+    classes are its MRO's in order, each by its module and name beside its members (keyed by name alone, a
+    base's members replaced its child's of the same name, the child's edit unseen, the base review of
+    201a04c58). No file's digest is part of it: its code and its reads state it, and a script's other bytes
+    are no step's (an unrelated edit of `__main__` refused a class step's exact resume, the same review)."""
     module = _coded(value.__module__, at)
-    stated_name = ["own", module, value.__qualname__, *_main(module)]
+    stated_name = ["own", module, value.__qualname__]
     if id(value) in walking:
         return [*stated_name, "itself"]
     if "<locals>" in value.__qualname__:
@@ -282,8 +297,8 @@ def _own(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) -> 
     if isinstance(value, types.FunctionType):
         return [*stated_name, _code(value.__code__), reads(value, at, known, walking)]
     within = walking | {id(value)}
-    return [*stated_name, {held.__qualname__: _members(held, at, known, within)
-                           for held in _sources.own_classes(value)}]
+    return [*stated_name, [[_coded(held.__module__, at), held.__qualname__, _members(held, at, known, within)]
+                           for held in _sources.own_classes(value)]]
 
 
 def _members(held, at: str, known: Mapping[int, JSON], walking: frozenset[int]) -> JSON:
