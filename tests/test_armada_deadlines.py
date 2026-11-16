@@ -1,9 +1,11 @@
 """A CI task's deadline (tools/armada/ci.py's `tested`): a task past it interrupts its pytest, names every row
 it holds red, and says where every thread of its pytest stood."""
 
+import contextlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -285,22 +287,52 @@ def test_a_signalled_process_the_collector_never_read_leaves_its_rows_natives_un
     assert capture.evidence(capture.stacks()) == {"capture": "armed", "natives": "unread"}
 
 
+SECOND_FAULT = """import ctypes, faulthandler, os, threading, time
+faulthandler.enable()
+seen = os.path.join(os.environ["DEW_NATIVE_DONE"], f"seen.{os.getpid()}")
+
+
+def faults(after_the_first):
+    while after_the_first and not os.path.exists(seen):
+        time.sleep(0.01)
+    ctypes.memset(0, 0, 1)
+
+
+threads = [threading.Thread(target=faults, args=(second,)) for second in (False, True)]
+[thread.start() for thread in threads]
+[thread.join() for thread in threads]
+"""
+"""A process two of whose threads fault: the second once the first's handler has marked it seen (`natives.SHIM`)."""
+
+
 def test_a_process_two_threads_of_which_a_signal_ends_keeps_its_native_stacks(ci):
-    """A process whose second thread takes a fatal signal while its first's is being reported lives until the
-    collector has read every thread's stacks: the second waits in its handler rather than ending the process
-    before the read (train 928, 2026-11-16: an XLA compile's SIGSEGV left no stack read, and a probe of a
-    second fault 50 ms after the first ended the process unread)."""
+    """A process whose second thread faults while its first's fault is being reported lives until the collector
+    has read every thread's stacks, then dies by the signal: the second waits in its handler rather than ending the
+    process before the read (train 928, 2026-11-16: an XLA compile's SIGSEGV left no stack read). The collector is
+    held stopped until both threads are inside their handlers (SIGSEGV blocked in each), so the two overlap."""
     capture = ci.natives.Capture(Path(sys.executable).with_name("py-spy"))
     assert capture.variables, capture.why
-    code = ("import ctypes, faulthandler, threading, time\nfaulthandler.enable()\nlibc = ctypes.CDLL(None)\n"
-            "def die(delay):\n    time.sleep(delay)\n    getattr(libc, 'raise')(11)\n"
-            "threads = [threading.Thread(target=die, args=(delay,)) for delay in (0.2, 0.25)]\n"
-            "[thread.start() for thread in threads]\n[thread.join() for thread in threads]\n")
-    died = subprocess.run([sys.executable, "-c", code], env={**os.environ, **capture.variables}, check=False,
-                          capture_output=True, timeout=120)
-    stacks = capture.stacks()
-    assert died.returncode == -11
-    assert capture.evidence(stacks) == {"capture": "armed", "natives": "read"}, stacks
+    os.kill(capture.collector.pid, signal.SIGSTOP)
+    child = subprocess.Popen([sys.executable, "-c", SECOND_FAULT], env={**os.environ, **capture.variables},
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        def handling() -> int:
+            blocked = 0
+            for status in Path(f"/proc/{child.pid}/task").glob("*/status"):
+                with contextlib.suppress(OSError):
+                    mask = re.search(r"^SigBlk:\s*([0-9a-f]+)", status.read_text(), re.MULTILINE)
+                    blocked += bool(mask and int(mask[1], 16) & 1 << (signal.SIGSEGV - 1))
+            return blocked
+
+        until = time.monotonic() + 60
+        while handling() < 2 and child.poll() is None and time.monotonic() < until:
+            time.sleep(0.05)
+        assert child.poll() is None, "the second fault ended the process before its stacks were read"
+        assert handling() == 2
+    finally:
+        os.kill(capture.collector.pid, signal.SIGCONT)
+    assert child.wait(timeout=120) == -signal.SIGSEGV
+    assert capture.evidence(capture.stacks()) == {"capture": "armed", "natives": "read"}
 
 
 def test_a_worker_a_signal_ends_keeps_its_native_stacks_though_pytest_exits_red(ci, tmp_path):

@@ -41,7 +41,7 @@ SHIM = r"""
 
 static const int SIGNALS[] = {SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE};
 static char pipe_path[4096], done_dir[4096];
-static int armed_waits, reporting;
+static int armed_waits, reporting;  /* the id of the process whose thread reports */
 
 static size_t digits(char *out, long value) {
     char reversed[24];
@@ -78,10 +78,19 @@ static void caught(int signum) {
     /* One thread reports; any other thread a fatal signal reaches meanwhile (an XLA pool's next faulting
        worker) waits here, so the process lives until it is read, and dies with it as the first re-raises:
        with the handler reset once taken, a second fault ended the process before pystack attached, and no
-       stack was read (train 928, 2026-11-16). Bounded past the first's wait, then dies by its own signal. */
-    if (__atomic_exchange_n(&reporting, 1, __ATOMIC_SEQ_CST)) {
+       stack was read (train 928, 2026-11-16). It waits for the collector's word (or as long as the first
+       waits for it) and a second more for the first to re-raise, then dies by its own signal: a signal nested
+       in the reporting thread's handler ends there once the stacks are read. The election is the process's own,
+       so a child forked meanwhile reports its own signal (review). */
+    int self = (int)getpid();
+    if (__atomic_exchange_n(&reporting, self, __ATOMIC_SEQ_CST) == self) {
+        char done[4200];
+        marked(done, "/done.");
         struct timespec pause = {0, 100000000};
-        for (int wait = 0; wait < armed_waits + 50; wait++) nanosleep(&pause, NULL);
+        struct stat held;
+        int wait = 0;
+        while (wait < armed_waits && stat(done, &held) != 0) wait++, nanosleep(&pause, NULL);
+        for (int after = 0; after < 10; after++) nanosleep(&pause, NULL);
         died(signum);
         return;
     }
