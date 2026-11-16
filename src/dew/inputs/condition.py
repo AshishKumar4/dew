@@ -147,7 +147,7 @@ class BackboneCall:
     progress: Progress = END
 
 
-class BackboneEncoder[Raw, Encoded](ConditionEncoder[Raw, Encoded]):
+class BackboneEncoder(ConditionEncoder[Raw, Encoded]):
     """An encoder that reads the backbone: the model it conditions is its tower, so it holds no weights and
     no checkpoint of its own, and a dispatch (`dew.inputs.spec.encode_conditions`) hands it the live model
     (`encode_backbone`), as it hands no other encoder. Its tokens are those its model's data routes to its

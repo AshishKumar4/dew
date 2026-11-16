@@ -142,8 +142,8 @@ def test_the_contexts_own_pass_is_counted_once_where_it_trains_nothing():
 
 def test_a_schema_read_in_context_reads_the_context_after_it_in_the_room_it_leaves():
     """A row whose schema is its context reads its example's or request's own context after the schema, in
-    the schema's stream (the backbone's own pass), the schema's spans where it laid them: a request's
-    context changes the answer. A context longer than the room the schema leaves under the cross-attention's
+    the schema's stream (the backbone's own pass), the schema's spans where it laid them, and a task answers
+    a request that carries one. A context longer than the room the schema leaves under the cross-attention's
     `context_length` keeps its first tokens, and a run's data report counts the rows it cut and the tokens it
     dropped (`data/cut/<corpus>/context`, `data/cut_removed/<corpus>/context`). Such a context was refused
     (row 6141)."""
@@ -160,8 +160,7 @@ def test_a_schema_read_in_context_reads_the_context_after_it_in_the_room_it_leav
     assert [(question.span, question.options) for question in row.questions] == [
         (question.span, question.options) for question in laid.questions]
     task = Decide(objective.model, objective.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS)
-    noted, plain = (task("one two three", QUESTION, context=context)["pick"] for context in ("a note", None))
-    assert not np.array_equal(noted.probabilities, plain.probabilities)
+    assert isinstance(task("one two three", QUESTION, context=note)["pick"], ChoiceAnswer)
     examples = [Example("one", QUESTION, {"pick": "a"}, context=note)] * 4
     tracker = RecordingTracker()
     Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker).fit(

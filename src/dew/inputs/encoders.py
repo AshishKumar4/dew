@@ -23,8 +23,8 @@ from flax.typing import Dtype
 
 from dew.batch import Variables
 from dew.inputs.condition import BackboneCall, BackboneEncoder, ConditionEncoder
-from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.blocks import table_rows
+from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.dit import TextContext
 from dew.nn.flops import ConditionWork
 from dew.registry import dtype_name, resolve_dtype
@@ -120,7 +120,7 @@ __all__ = ["AudioRow", "CharTable", "ConditionEncoder", "char_codes"]
 
 
 @dataclass(frozen=True)
-class BackboneContext(BackboneEncoder[Sequence[int], Mapping[str, jax.Array]]):
+class BackboneContext(BackboneEncoder[Sequence[int]]):
     """A stream of the model's own tokens its cross-attention reads (decision-inputs.md section 2), encoded
     by the model itself (`dew.nn.cross_attention.encode_context`): `table`, each token's row of its own
     token table, or `backbone`, its own final states over the stream in a pass of its own, a forward alone
