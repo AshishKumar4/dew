@@ -440,7 +440,8 @@ class Allocations:
         rewrites = tuple(tiles.stages for _ in self.blocks) if rewritten else ()
         persisted, addresses = family.persist_scratch(consumers, rewrites, pingpong=tiles.pingpong)
         streams = family.streams(self.blocks, tiles.stages, tiles.sharing,
-                                 multicast=multicast(tiles, family, self.shared), gathered=self.gathered)
+                                 multicast=multicast(tiles, family, self.shared), gathered=self.gathered,
+                                 joined=operand_streams(rewritten))
         held, walks = family.lifetimes(streams, steps)
         # A core holding its values in scratch memory holds them beside (`mosaic.Issuer.value_scratch`).
         values = family.value_scratch(self.blocks, self.outputs)
@@ -850,10 +851,9 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             _gmm_scheduled, table_gmem=table_gmem, lhs_gmem=lhs_gmem, splits=tiles.splits, grid=grid,
             matrix_gmems=dict(zip(streamed, matrix_gmems, strict=True)), prologue_gmems=prologue_gmems,
             shape=(m, pl.cdiv(k, block_k), g), tiles=tiles, dense=dense, tail=tail, programs=multiprocessors,
-            transpose_rhs=transpose_rhs, axes_of={i: prologue_axes[i] for i in stepped},
-            interpreted=bool(interpret), transpose_lhs=transpose_lhs, traced=exact_sums,
-            scale_gmems=scale_gmems, scale_per=scale_per, mx_gmems=mx_gmems, gather_gmem=gather_gmem,
-            packed_rows=packed_rows)
+            transpose_rhs=transpose_rhs, axes_of={i: prologue_axes[i] for i in stepped}, traced=exact_sums,
+            interpreted=bool(interpret), transpose_lhs=transpose_lhs, packed_rows=packed_rows,
+            scale_gmems=scale_gmems, scale_per=scale_per, mx_gmems=mx_gmems, gather_gmem=gather_gmem)
 
         def stepped_at(wg, tile, **refs) -> Callable:  # consumer `wg`'s step of `tile` (`_gmm_step`)
             rows = pl.ds(tiles.share_row(wg), share)
@@ -901,8 +901,9 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, tiles.sharing,
                                              multicast=multicast(tiles, family, allocations.shared),
-                                             swizzles=SCALE_SWIZZLES if step_scales is not None
-                                             else None, **_gathered(gather, tiles, lhs.dtype, interpret)))
+                                             swizzles=SCALE_SWIZZLES if step_scales is not None else None,
+                                             joined=operand_streams(rewritten),
+                                             **_gathered(gather, tiles, lhs.dtype, interpret)))
 
     out_type = _declared(m if stored is None else stored, n, tiles.splits, dtypes)
     operands = _gmm_operands(lhs, rhs, paired, scales, step_scales, mx_scales, gather, scatter, joined)
@@ -1239,6 +1240,15 @@ def _gathered(gather, tiles: Tiles, dtype, interpret) -> dict:
         copies = rings.piece_copies((tiles.block_m, tiles.block_k), dtype, None, 1)
         return {'copies': {'rows': tiles.block_m * copies}}
     return {'gathered': GATHERED_STREAMS}
+
+
+def operand_streams(rewritten: bool) -> tuple[str, ...]:
+    """Dew: the streams of `gmm`'s product operands, one barrier pair between them (`Family.streams`'
+    `joined`, CUTLASS's PipelineTmaAsync for A and B): a step's loads of the rows and the matrices awaited
+    once and their slots given back once, where two pairs a step took the consumers two waits and two
+    arrivals (row 5666: a GH200's grouped forward issued 391M instructions to CUTLASS's 265M at equal
+    HGMMA); none where a role of the family's own `rewritten` rewrites a slot, its release its own."""
+    return () if rewritten else ('rows', JOINED, 'matrix', 'paired')
 
 
 GATHERED_STREAMS = ('rows',)
@@ -1668,7 +1678,7 @@ def _walked_products(family: mosaic.Family, walk, step, shape: tuple, count: int
 def _idle(tiles: Tiles, group: "row_tiles.GroupInfo", row_start, consumer) -> jax.Array | None:
     """Dew: whether consumer `consumer`'s share of the tile at `row_start` (`Tiles.share_row`) lies wholly
     outside its group's rows (`GroupInfo`'s actual ones: a ragged group's last tile past its end, a tile its
-    group starts within before its start), so its products multiply nothing (`Issuer.products_unless`); None
+    group starts within before its start), so its products multiply nothing (`Issuer.issued_unless`); None
     where one consumer takes the tile's rows (`Tiles.sharing`: mma.sync's, ping-pong's, tcgen05's), whose
     tile a walk takes only where its group holds rows."""
     if tiles.sharing == 1:
@@ -1716,12 +1726,18 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
                     else read_tiles[i].at[pl.ds((first + index) * depth, depth)] if i in read_tiles
                     else slots[f'side_{i}'] for i in range(len(prologue_axes))}
         left = _transformed(prologue, prologue_axes, stage.at[mine_rows][...], tiles_of, 'rows', mine_rows)
+    # A consumer whose rows lie outside its group issues none, whatever its products' form (`_idle`).
+    def issued(acc, issue):
+        return issue() if idle is None else family.issued_unless(idle, acc, issue)
+
     if left is not None:
         if summed:
-            return nothing, tuple(total + family.registers_product(left, oriented[name])
-                                  for total, name in zip(accumulators, matrices, strict=True))
-        return nothing, tuple(family.register_products(acc, (left,), oriented[name])
-                              for acc, name in zip(accumulators, matrices, strict=True))
+            return nothing, tuple(
+                issued(total, lambda total=total, name=name, left=left:
+                       total + family.registers_product(left, oriented[name]))
+                for total, name in zip(accumulators, matrices, strict=True))
+        return nothing, tuple(issued(acc, lambda acc=acc, name=name, left=left: family.register_products(
+            acc, (left,), oriented[name])) for acc, name in zip(accumulators, matrices, strict=True))
     # This warpgroup's half of the rows, the only half its MMA reads (a `[depth, rows]` stage's, transposed).
     stage = slots['rows']
     mine = stage.at[:, mine_rows].transpose((1, 0)) if transpose_lhs else stage.at[mine_rows]
@@ -1730,16 +1746,17 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
                for name, stream in matrices.items()}
     if summed:
         scale = None if scaling is None else scaling(index, slots)
-        return nothing, tuple(family.summed_apart(total, rows_of[name], oriented[name], scale)
-                              for total, name in zip(accumulators, matrices, strict=True))
+        return nothing, tuple(
+            issued(total, lambda total=total, name=name:
+                   family.summed_apart(total, rows_of[name], oriented[name], scale))
+            for total, name in zip(accumulators, matrices, strict=True))
     if block_scaled:
         return nothing, tuple(family.scaled_products(acc, mine, oriented[name],
                                                      (slots['a_scales'], slots['b_scales']))
                               for acc, name in zip(accumulators, matrices, strict=True))
-    # A consumer whose rows lie outside its group issues none (`_idle`).
-    issued = family.products if idle is None else functools.partial(family.products_unless, idle)
-    return nothing, tuple(issued(acc, rows_of[name], oriented[name])
-                          for acc, name in zip(accumulators, matrices, strict=True))
+    return nothing, tuple(
+        issued(acc, lambda acc=acc, name=name: family.products(acc, rows_of[name], oriented[name]))
+        for acc, name in zip(accumulators, matrices, strict=True))
 
 
 def _transformed(prologue, axes_of: tuple, mine: jax.Array, tiles_of: dict, halved: str, half) -> jax.Array:

@@ -49,13 +49,15 @@ SEGMENT_CASES = [
 
 @functools.cache
 def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: bool,
-           streams: tuple = ("a",), pingpong: bool = False, empty_active: bool = False):
+           streams: tuple = ("a",), pingpong: bool = False, empty_active: bool = False, joined: bool = False):
     """The ring family's persistent walk at the configuration over a ring of each of `streams`, each step
     reading its slot of each, its two consumers taking alternate tiles whole where `pingpong` (each slot
     released by its tile's owner alone), a tile of no steps active where `empty_active` (its turn taken, its
-    walk none): each warpgroup's program and the barriers' arrivals (`ring_protocol.programs`)."""
+    walk none), its streams one barrier pair between them where `joined` (`rings.joined`): each warpgroup's
+    program and the barriers' arrivals (`ring_protocol.programs`)."""
     family = mosaic_sm90.WGMMA
     starts = [sum(tiles[:index]) for index in range(len(tiles))]
+    names = streams  # the streams' names, not their allocations' keys (a joined pair's one)
 
     def at(tile, values):
         # A tile's value of `values`, scalars alone (a kernel closes over no array).
@@ -67,12 +69,12 @@ def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: 
             def schedule(index):
                 tile = index[0]
                 steps = at(tile, tiles)
-                views = {name: (x_gmem, lambda step: (at(tile, starts) + step, 0)) for name in streams}
+                views = {name: (x_gmem, lambda step: (at(tile, starts) + step, 0)) for name in names}
                 return (steps > 0) | empty_active, steps, views, tile
 
             def issue(wg, tile, walk, *, active):
                 def step(index, slots, carry, accumulators):
-                    for name in streams:
+                    for name in names:
                         slots[name][0, 0]
                     return carry, accumulators
 
@@ -86,7 +88,8 @@ def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: 
                            unrolled=unrolled, pingpong=pingpong)
 
         family.scoped(scope, streams=family.streams(dict.fromkeys(streams, (BLOCK, jnp.bfloat16)), stages,
-                                                    1 if pingpong else consumers))
+                                                    1 if pingpong else consumers,
+                                                    joined=streams if joined else ()))
 
     kernel = family.kernel(body, out_type=jax.ShapeDtypeStruct((8, 8), jnp.float32), grid=(1,),
                            grid_names=("programs",), consumers=consumers, interpret=False, name="ring_model")
@@ -102,6 +105,25 @@ def test_the_ring_familys_walk_holds_every_property_in_every_interleaving(case):
     loads' landings explored, each property held (`ring_protocol.explore`)."""
     threads, arrivals = walked(**case)
     assert any(event.kind == "load" for event in threads[-1]), "the producer loads nothing"
+    assert explore(threads, arrivals) > 0
+
+
+@pytest.mark.parametrize("case", TWO_RING_CASES, ids=[
+    f"stages{c['stages']}-consumers{c['consumers']}-tiles{c['tiles']}-inflight{c['in_flight']}"
+    f"-{'unrolled' if c['unrolled'] else 'stepped'}" for c in TWO_RING_CASES])
+def test_two_rings_of_one_barrier_pair_hold_every_property_in_every_interleaving(case):
+    """Two rings joined on one barrier pair (`rings.joined`, a GEMM's operands as CUTLASS's PipelineTmaAsync
+    holds them, row 5666): each step's two loads arriving at one load barrier, awaited once and given back
+    once; every interleaving explored, each property held, both rings loaded every step, and a step's waits
+    and arrivals half of two pairs' (one of each a step a consumer)."""
+    threads, arrivals = walked(**case, joined=True)
+    apart, _ = walked(**case)
+    loads = sum(event.kind == "load" for event in threads[-1])
+    assert loads == len(STREAMS) * sum(case["tiles"])
+    waits = [sum(event.kind == "wait" for event in thread) for thread in threads[:-1]]
+    waited_apart = [sum(event.kind == "wait" for event in thread) for thread in apart[:-1]]
+    halved = zip(waits, waited_apart, strict=True)
+    assert all(2 * joined <= both for joined, both in halved), (waits, waited_apart)
     assert explore(threads, arrivals) > 0
 
 
