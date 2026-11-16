@@ -6,6 +6,7 @@ import dataclasses
 import functools
 import itertools
 import math
+import pickle
 import time
 import types
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -708,17 +709,22 @@ class Map:
 
 def _pooled(steps: Sequence[_Step], pool: PoolKind | None) -> None:
     """Refuse, as the stage is declared, a pool its steps cannot run on: a process pool for a step that
-    does not pickle (`dew.data.concurrent.Pool.checked`), or any pool for a cut into chunks, whose counts
-    the reading process keeps (`Chunked`)."""
-    from dew.data.concurrent import Pool
+    does not pickle, which no process could be handed (a configuration that cannot run), or any pool for a
+    cut into chunks, whose counts the reading process keeps (`Chunked`), or a configured step."""
     from dew.data.text import Chunks
 
     if pool is None:
         return
     for step in steps:
-        if isinstance(step, (Configured, Chunks)) or not callable(step):
+        if isinstance(step, (Configured, Chunks)):
             raise ValueError(f"{_named_step(step)} runs where its read runs; it takes no pool")
-        Pool(pool, 1).checked(step, _named_step(step))
+        if pool == "processes":
+            try:
+                pickle.dumps(step)
+            except (pickle.PicklingError, TypeError, AttributeError) as error:
+                raise ValueError(f"{_named_step(step)} runs on processes (pool='processes'), and it does not "
+                                 f"pickle ({error}); run it on threads (pool='threads'), or define it at a "
+                                 "module's top level") from error
 
 
 def examples_bound(stages: Sequence[object]) -> int | None:

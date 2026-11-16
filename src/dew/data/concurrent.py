@@ -9,7 +9,6 @@ import collections
 import concurrent.futures
 import dataclasses
 import multiprocessing
-import pickle
 from collections.abc import Callable, Mapping
 from typing import Literal
 
@@ -38,18 +37,6 @@ class Pool:
 
         cpus = Host.current().cpus
         return cls(kind, cpus if kind == "processes" else min(32, cpus + 4))
-
-    def checked(self, step: Callable, named: str) -> None:
-        """Refuse a process pool for a `step` (the stage `named`) that does not pickle, which no process
-        could be handed: a configuration that cannot run, so the read never starts."""
-        if self.kind != "processes":
-            return
-        try:
-            pickle.dumps(step)
-        except (pickle.PicklingError, TypeError, AttributeError) as error:
-            raise ValueError(f"{named} runs on processes (pool='processes'), and its step does not pickle "
-                             f"({error}); run it on threads (pool='threads'), or define it at a module's "
-                             "top level") from error
 
     def executor(self) -> concurrent.futures.Executor:
         """The pool itself: threads, or processes started afresh (`spawn`: a process forked from one
