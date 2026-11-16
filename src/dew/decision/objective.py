@@ -20,7 +20,7 @@ from dew.decision.calibration import Temperatures
 from dew.decision.head import DecisionHead, Head
 from dew.decision.inputs import OPTION_TILE, DecisionInputs
 from dew.decision.layout import Bounds, Layout, Specials, default_layout, per_question
-from dew.decision.model import DecisionModel
+from dew.decision.model import DecisionModel, context_streams
 from dew.decision.questions import KINDS, Score
 from dew.decision.rows import (
     ConfigureLayout,
@@ -249,9 +249,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     def _context_lengths(self, batch: Batch) -> np.ndarray | None:
         """Each window row's context length where the backbone reads the context in a pass of its own,
-        as it reads a schema in context (`spans_in_context`) or encodes every context
-        (`DecisionModel.context_encoder`); None where it reads none."""
-        passes = self.spans_in_context or self.model.context_encoder == "backbone"
+        as the stream its context is says (`DecisionModel.own_pass`: a schema in context always, a context
+        where its stream's encoder is the backbone's pass); None where it reads none."""
+        passes = self.model.own_pass(self.spans_in_context)
         if not passes or "context_lengths" not in batch:
             return None
         return self._row_contexts(batch)
@@ -402,7 +402,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             # one its rows are laid out by, which names them where the layout names none.
             head, labels = head.labelled(layout.labels, tokenizer)
             layout = dataclasses.replace(layout, labels=labels)
-        self.model = DecisionModel(module, head, context_encoder or "table")
+        self.model = DecisionModel(module, head, context_streams(context_encoder or "table"))
         if layout is None:
             if not isinstance(module, TokenModel):
                 raise ValueError(
@@ -646,7 +646,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         if weights is None:
             return None
         weights.of_model(self.model.backbone)
-        encoded = self.spans_in_context or self.model.context_encoder == "backbone"
+        encoded = self.model.own_pass(self.spans_in_context)
         if self.context_length is not None and encoded:
             raise ValueError("pass_weights scores each pass's exit as the backbone run that many times "
                              "would, and a row whose context the backbone encodes in its own passes reads "

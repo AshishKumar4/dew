@@ -451,12 +451,12 @@ class Fit(pygrain.MapTransform):
             removed = sum((collections.Counter(row.cuts) for row in laid), collections.Counter())
             return Rejected(refused, cut=removed)
         unread: dict[str, int] = {}
-        contexts = [0] * len(laid)
         if self.context_length is not None:
-            contexts = [len(row.context or ()) for row in with_context(laid, self.tokenizer, example.context,
-                                                                       self.context_length)]
-        elif example.context is not None and (lost := len(context_tokens(self.tokenizer, example.context,
-                                                                           None))):
+            # Its context as its encoding lays it out, a context cut beside a schema counted with its cuts.
+            laid = with_context(laid, self.tokenizer, example.context, self.context_length)
+        contexts = [len(row.context or ()) for row in laid]
+        lost = 0 if self.context_length is not None else len(context_tokens(self.tokenizer, example.context, None))
+        if lost:
             # A backbone that reads no context leaves the example's unread, counted as a cut of it.
             unread["context"] = lost
         self.head.validate_rows(laid)

@@ -7,6 +7,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A decision row whose schema is read as its context (`Schema(stream="context")`) now reads its example's or
+  request's own context too, after the schema, where both were refused together. The schema stays whole; the
+  context keeps its first tokens in the room the schema leaves under the cross-attention's `context_length`,
+  and a context cut there is reported in the run's data report (`data/cut/<corpus>/context` rows,
+  `data/cut_removed/<corpus>/context` tokens) and a server's usage. A decision model's context streams are
+  ordinary `Condition`s encoded by the backbone itself (`dew.inputs.BackboneContext`); records are unchanged.
 - A decision layout is one class, `dew.decision.SegmentLayout`, whose `form` names the row it writes:
   `SegmentLayout.marker_row(...)` (Laya's, formerly `MarkerLayout(...)`), `state_first_row(...)` (formerly
   `StateFirstLayout(...)`) and `joint_row(...)` (formerly `JointLayout(...)`), each laying out the rows its class

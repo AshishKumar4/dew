@@ -140,17 +140,44 @@ def test_the_contexts_own_pass_is_counted_once_where_it_trains_nothing():
     assert objective.training_flops(None, batch) == frozen + context + 3 * (cross + head)
 
 
-def test_a_schema_read_in_context_refuses_what_cannot_read_it():
-    """A request's own context beside a schema read as its context, Laya's marker head, and a backbone
-    without cross-attention layers are each refused, rather than one context read in place of the
-    other or the schema left unread."""
-    objective = read_in_context()
+def test_a_schema_read_in_context_reads_the_context_after_it_in_the_room_it_leaves():
+    """A row whose schema is its context reads its example's or request's own context after the schema, in
+    the schema's stream (the backbone's own pass), the schema's spans where it laid them: a request's
+    context changes the answer. A context longer than the room the schema leaves under the cross-attention's
+    `context_length` keeps its first tokens, and a run's data report counts the rows it cut and the tokens it
+    dropped (`data/cut/<corpus>/context`, `data/cut_removed/<corpus>/context`). Such a context was refused
+    (row 6141)."""
+    from dew.decision.layout import with_context
+
+    [laid] = LAYOUT.rows(TOKENIZER, SPECIALS, "one two three", QUESTION)
+    schema = laid.context
+    assert schema is not None
+    room, note = 8, "a note longer than the room"
+    objective = read_in_context(len(schema) + room)
+    [row] = with_context([laid], TOKENIZER, note, len(schema) + room)
+    assert row.context == (*schema, *TOKENIZER.encode(note, add_special_tokens=False)[:room])
+    assert row.cuts["context"] == len(note) - room
+    assert [(question.span, question.options) for question in row.questions] == [
+        (question.span, question.options) for question in laid.questions]
     task = Decide(objective.model, objective.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS)
-    with pytest.raises(ValueError):
-        task("one two three", QUESTION, context="a note")
-    noted = [Example("one", QUESTION, {"pick": "a"}, context="a note")] * 4
-    with pytest.raises(ValueError):
-        list(itertools.islice(decision_rows(noted, 2, objective=objective.data()).train(DataPartition()), 1))
+    noted, plain = (task("one two three", QUESTION, context=context)["pick"] for context in ("a note", None))
+    assert not np.array_equal(noted.probabilities, plain.probabilities)
+    examples = [Example("one", QUESTION, {"pick": "a"}, context=note)] * 4
+    tracker = RecordingTracker()
+    Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker).fit(
+        decision_rows(examples, 2, objective=objective.data()), steps=1, log_every=1)
+    [logged] = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
+    [rows] = [value for name, value in logged.items()
+              if name.startswith("data/cut/") and name.endswith("/context")]
+    [dropped] = [value for name, value in logged.items()
+                 if name.startswith("data/cut_removed/") and name.endswith("/context")]
+    assert rows > 0 and dropped == rows * (len(note) - room)
+
+
+def test_a_schema_read_in_context_refuses_what_cannot_read_it():
+    """Laya's marker head and a backbone without cross-attention layers are each refused a schema read as
+    the row's context, rather than the schema left unread."""
+    objective = read_in_context()
     width, _ = DecisionModel.head_size(objective.model.backbone)
     marked = read_in_context(head=DecisionHead(width, layers=1))
     with pytest.raises(TypeError):

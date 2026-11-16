@@ -10,7 +10,10 @@ from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
 from dew.decision.head import Head, answer_states
 from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import HOWS
-from dew.nn.cross_attention import ContextEncoder, encode_context
+from dew.inputs.condition import BackboneCall
+from dew.inputs.encoders import BackboneContext, ContextTokens
+from dew.inputs.spec import Condition, encode_conditions
+from dew.nn.cross_attention import ContextEncoder
 from dew.nn.inputs import CONTEXT, ModelInputs
 from dew.nn.inspection import INSPECTED, QK, component, in_parts, observed_maxima
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
@@ -18,6 +21,26 @@ from dew.nn.protocols import EXITS, Looped, TokenModel, VocabularyRows
 from dew.nn.visibility import block_ends, block_starts
 from dew.nn.wrapping import HeadedModel
 from dew.objectives.base import joined
+
+
+def context_streams(context: ContextEncoder) -> tuple[tuple[str, Condition], ...]:
+    """A decision model's conditioning streams (`DecisionModel.conditions`): a row's context encoded as
+    `context` says, and a schema read as the row's context by the backbone's own pass."""
+    return (("context", Condition(BackboneContext(context), field="context")),
+            ("schema", Condition(BackboneContext("backbone"), field="context")))
+
+
+def _encoder_of(condition: Condition) -> ContextEncoder:
+    """How a stream's backbone encodes it (`BackboneContext.encoder`)."""
+    encoder = condition.encoder
+    if not isinstance(encoder, BackboneContext):
+        raise TypeError(f"a decision model's context streams are encoded by its backbone, not "
+                        f"{type(encoder).__name__}")
+    return encoder.encoder
+
+
+TABLE_CONTEXT = context_streams("table")
+"""A decision model's streams with a row's context through the backbone's token table."""
 
 
 @dataclass(frozen=True)
@@ -31,10 +54,27 @@ class DecisionModel(HeadedModel):
     """
 
     head: Head
-    context_encoder: ContextEncoder = "table"
-    """How a row's context becomes the states its cross-attention reads (`encode_context`): `table`, its
-    tokens through the backbone's own embedding table, or `backbone`, the backbone's final states over
-    it in a pass of its own, as a schema read in context always is."""
+    conditions: tuple[tuple[str, Condition], ...] = TABLE_CONTEXT
+    """The conditioning streams its cross-attention reads, by name, each an ordinary `Condition` whose
+    encoder is the backbone itself (`BackboneContext`, decision-inputs.md section 2): `context`, a row's
+    context, through the backbone's own token table or its own pass, and `schema`, a schema read as the
+    row's context, with the example's context in the room after it, always the backbone's own pass,
+    whose states its spans are pooled from (`context_streams`)."""
+
+    def stream(self, spans_in_context: bool) -> Condition:
+        """The stream a row's context is: the schema's where the row reads its schema in its context
+        (`DecisionInputs.spans_in_context`), else the context's."""
+        return dict(self.conditions)["schema" if spans_in_context else "context"]
+
+    def own_pass(self, spans_in_context: bool) -> bool:
+        """Whether the stream a row's context is (`stream`) is the backbone's own pass over it, which a
+        step counts the work of (`dew.decision.DecisionObjective`), rather than its token table."""
+        return _encoder_of(self.stream(spans_in_context)) == "backbone"
+
+    @property
+    def context_encoder(self) -> ContextEncoder:
+        """How the `context` stream's backbone encodes it (`BackboneContext.encoder`), which a run records."""
+        return _encoder_of(dict(self.conditions)["context"])
 
     def reads_progress(self) -> bool:
         """Whether its backbone's computation changes over a run (`dew.nn.progress.ReadsProgress`)."""
@@ -113,14 +153,15 @@ class DecisionModel(HeadedModel):
                 raise TypeError(f"rows carry a context, which a {type(self.backbone).__name__} without "
                                 "cross-attention layers does not read")
             assert inputs.context_lengths is not None, "a row's context comes with its length"
-            # The context's own pass where it holds the schema, whose spans the head pools from that
-            # same pass, else as the model encodes it.
+            # The schema's stream where the context holds it, whose spans the head pools from its pass,
+            # else the context's (`stream`), the backbone handed to it as its encoder.
             # A window's rows each read their own context (`DecisionInputs.context_segments`).
-            conditioning = encode_context(
-                self.backbone, part(variables, "backbone"), inputs.context, inputs.context_lengths,
-                encoder="backbone" if inputs.spans_in_context else self.context_encoder, train=train,
-                rngs=rngs, segments=inputs.context_segments, max_segments=inputs.max_segments,
-                progress=progress)
+            stream = self.stream(inputs.spans_in_context)
+            tokens = ContextTokens(inputs.context, inputs.context_lengths, inputs.context_segments,
+                                   inputs.max_segments)
+            conditioning = encode_conditions(
+                (("stream", stream.encoder),), {}, {"stream": tokens},
+                backbone=BackboneCall(self.backbone, part(variables, "backbone"), train, rngs, progress))["stream"]
             spanned = conditioning[CONTEXT] if inputs.spans_in_context else None
         if media is not None:
             if inputs.slots is not None or inputs.streams is not None:
@@ -367,3 +408,4 @@ def _array(applied: object) -> jax.Array:
     if not isinstance(applied, jax.Array):
         raise TypeError(f"expected an array from the module, got {type(applied).__name__}")
     return applied
+

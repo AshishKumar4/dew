@@ -16,8 +16,12 @@ from typing import TYPE_CHECKING, ClassVar, Generic, Self
 import numpy as np
 from typing_extensions import TypeVar
 
+import jax
+from flax import linen as nn
+
 from dew import _records
 from dew.batch import Variables
+from dew.nn.progress import END, Progress
 from dew.nn.sharding import boxed_axes
 from dew.registry import component, to_record
 
@@ -120,8 +124,49 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
         weights (`from_pretrained`).
         """
         encoder, fields = component(ConditionEncoder, record)
+        if issubclass(encoder, BackboneEncoder):
+            # It holds no weights of its own: the model's own pass is its tower.
+            return encoder(**fields)
         checkpoint = fields.get("checkpoint")
         if not isinstance(checkpoint, str):
             raise ValueError(f"the {record['class']} record names no checkpoint to rebuild from")
         rest = {name: value for name, value in fields.items() if name != "checkpoint"}
         return encoder.from_pretrained(checkpoint, **rest, params=params)
+
+
+@dataclasses.dataclass(frozen=True)
+class BackboneCall:
+    """The live model an encoder that reads the backbone (`BackboneEncoder`) encodes with, as the model's
+    own pass holds it: its module and variables, an adapter's included, whether it trains, its draws and
+    the run's progress (`dew.nn.progress`)."""
+
+    module: nn.Module
+    variables: Variables
+    train: bool = False
+    rngs: dict[str, jax.Array] | None = None
+    progress: Progress = END
+
+
+class BackboneEncoder[Raw, Encoded](ConditionEncoder[Raw, Encoded]):
+    """An encoder that reads the backbone: the model it conditions is its tower, so it holds no weights and
+    no checkpoint of its own, and a dispatch (`dew.inputs.spec.encode_conditions`) hands it the live model
+    (`encode_backbone`), as it hands no other encoder. Its tokens are those its model's data routes to its
+    stream, which the data writes; a record rebuilds it from its fields alone (`ConditionEncoder.bound`)."""
+
+    reads_captions: ClassVar[bool] = False
+
+    @classmethod
+    def from_pretrained(cls, checkpoint: str, *, params: Variables | None = None) -> Self:
+        raise TypeError(f"{cls.__name__} encodes with the model it conditions, which holds its weights; it "
+                        "loads no checkpoint")
+
+    def tokenize(self, texts: Sequence[Raw]) -> Mapping[str, np.ndarray]:
+        raise TypeError(f"{type(self).__name__} reads the tokens its model's data routes to its stream")
+
+    def encode(self, params: Variables, tokens) -> Encoded:
+        raise TypeError(f"{type(self).__name__} encodes with the live model (encode_backbone), which its "
+                        "dispatch hands it")
+
+    @abstractmethod
+    def encode_backbone(self, backbone: BackboneCall, tokens) -> Encoded:
+        """Encode `tokens` with the live model `backbone`, on device."""

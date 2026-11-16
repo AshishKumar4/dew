@@ -28,7 +28,7 @@ import numpy as np
 
 from dew import _records, registry
 from dew.batch import Batch, Variables
-from dew.inputs.condition import ConditionEncoder
+from dew.inputs.condition import BackboneCall, BackboneEncoder, ConditionEncoder
 from dew.nn.inputs import ModelInputs, media_slots
 from dew.nn.precision import at_least_fp32, divided
 from dew.nn.text_checkpoints import DEFAULT_MODEL
@@ -372,8 +372,19 @@ class AudioCondition:
 
 
 def encode_conditions(encoders: Sequence[tuple[str, ConditionEncoder]], weights: Mapping[str, Variables],
-                      tokens: Mapping[str, object]) -> dict:
+                      tokens: Mapping[str, object], *, backbone: BackboneCall | None = None) -> dict:
     """Each of `encoders` (`InputSpec.encoders`) over the tokens under its keyword, with the weights
-    under its keyword: the conditions a model is passed, by keyword. The one encoding a training
-    step (`DiffusionObjective.encode`) and a sampling task (`TextToImage`) run."""
-    return {keyword: encoder.encode(weights[keyword], tokens[keyword]) for keyword, encoder in encoders}
+    under its keyword, or, for an encoder that reads the backbone (`BackboneEncoder`), with the live model
+    `backbone`, which no other encoder is handed: the conditions a model is passed, by keyword. The one
+    encoding a training step (`DiffusionObjective.encode`), a sampling task (`TextToImage`) and a
+    decision model's context streams (`dew.decision.DecisionModel`) run."""
+    def encoded(keyword: str, encoder: ConditionEncoder):
+        match encoder:
+            case BackboneEncoder():
+                if backbone is None:
+                    raise TypeError(f"{type(encoder).__name__} encodes with the model it conditions, which "
+                                    "this encoding was not handed")
+                return encoder.encode_backbone(backbone, tokens[keyword])
+            case _:
+                return encoder.encode(weights[keyword], tokens[keyword])
+    return {keyword: encoded(keyword, encoder) for keyword, encoder in encoders}

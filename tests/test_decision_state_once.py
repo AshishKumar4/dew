@@ -238,7 +238,7 @@ def test_a_row_over_one_state_decides_each_question_as_its_own_row_does():
     initialized = jax.jit(lambda key: unboxed(shared.init(key, variables={})))
     wide = copy.copy(alone)
     wide.model = DecisionModel(alone.model.backbone.clone(dtype=jnp.float64),
-                               alone.model.head.clone(dtype=jnp.float64), alone.model.context_encoder)
+                               alone.model.head.clone(dtype=jnp.float64), alone.model.conditions)
 
     wide_scored = scorer(wide, windows["alone"])
 
@@ -304,7 +304,7 @@ def test_rows_over_one_state_score_the_input_term_each_questions_own_row_scores(
     initialized = jax.jit(lambda key: unboxed(shared.init(key, variables={})))
     wide = copy.copy(alone)
     wide.model = DecisionModel(alone.model.backbone.clone(dtype=jnp.float64),
-                               alone.model.head.clone(dtype=jnp.float64), alone.model.context_encoder)
+                               alone.model.head.clone(dtype=jnp.float64), alone.model.conditions)
     drawn = initialized(jax.random.key(0))
     assert (input_terms(shared, windows["shared"], drawn, requests)[1]
             == input_terms(alone, windows["alone"], drawn, requests)[1])

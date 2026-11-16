@@ -55,7 +55,7 @@ from dew.decision.layout import (
     render,
     with_context,
 )
-from dew.decision.model import DecisionModel
+from dew.decision.model import DecisionModel, context_streams
 from dew.decision.questions import (
     KINDS,
     Answer,
@@ -461,7 +461,7 @@ class Decide(SavedRunTask, InItsForm):
     def released(cls, bundle: "PretrainedDecision", *, name: str | None = None) -> Self:
         """The declared decision task over the bundle's own tree, its projections as the model holds
         them: what a run trains from a release (`DecisionObjective`), where `of` packs them to serve."""
-        model = DecisionModel(bundle.model, bundle.head, bundle.context_encoder)
+        model = DecisionModel(bundle.model, bundle.head, context_streams(bundle.context_encoder))
         variables = joined({"backbone": bundle.variables, "head": bundle.head_variables})
         # A release lays its rows out as it states them, sharing a state only where it says so.
         return cls(model, variables, bundle.layout, bundle.decision_tokenizer, bundle.specials,
@@ -484,7 +484,7 @@ class Decide(SavedRunTask, InItsForm):
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
-                              settings.context_encoder)
+                              context_streams(settings.context_encoder))
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
