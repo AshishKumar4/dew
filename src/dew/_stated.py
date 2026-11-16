@@ -23,6 +23,7 @@ from pathlib import Path
 import jax
 import numpy as np
 from jax.experimental.layout import Format, Layout
+from jaxlib import xla_client
 
 from dew import _hashing, _sources
 from dew._records import JSON
@@ -212,12 +213,23 @@ def _data(value, at: str) -> JSON | None:
     return None
 
 
+def _traceback(value) -> JSON | None:
+    """A traceback of JAX's by its frames, as a file of programs holds one
+    (`dew.training.ahead.HeldTraceback`): a checkified program's error tree holds each check's in its node
+    data, which prints by its address; None for any other value."""
+    if isinstance(value, xla_client.Traceback):
+        return ["traceback", [str(frame) for frame in value.frames]]
+    return None
+
+
 def _parts(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     """One of JAX's values that a call's key holds and the algebra's key does not state, by its parts
     (each through `again`, `stated` as its caller walks): a tree's structure, a format,
     one device's sharding, a device, and any other of JAX's by its attributes where it holds them plainly
-    (an axis environment's sizes and names), the layout XLA chooses (`Layout.AUTO`). None for a value that
-    is none of them."""
+    (an axis environment's sizes and names), the layout XLA chooses (`Layout.AUTO`), a traceback
+    (`_traceback`). None for a value that is none of them."""
+    if (frames := _traceback(value)) is not None:
+        return frames
     if isinstance(value, type(jax.tree.structure(()))):
         return _tree(value, at, again)
     if isinstance(value, Format):

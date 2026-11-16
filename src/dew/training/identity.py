@@ -27,9 +27,9 @@ theirs to state: JAX's through its settings, Dew's through the facts its readers
 (`traced_fact`). Beyond that the identity
 carries JAX's own purity contract across processes: code that changes what a trace computes by assigning
 module state at run time is outside the identity, as it is outside `jax.jit`'s cache, which does not
-retrace when a global a traced function reads is assigned. `dew.training.ahead.kept(path, verify=True)`
-is the proof for a file and a process, at the cost of the trace: it lowers each handed call and holds it
-to the kept program's digest.
+retrace when a global a traced function reads is assigned. `dew.training.ahead.kept` proves each handed
+call by default, at the cost of the trace: it lowers it and holds it to the kept program's digest; its
+`verify=False` trusts this identity alone.
 
 This module is the boundary where Dew reads values it has no type for: any object a call names, any
 module a process loaded. Its private readers ask each what Python's object model says of it (its

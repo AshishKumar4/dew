@@ -784,22 +784,25 @@ def keeping() -> Iterator[Keeping]:
             server = ScoringServer.from_task(task, variables)
         programs.save("scoring.dew-aot")
 
-    A later process of the same target, code and settings hands them back (`kept`) and traces none of
-    them. A program compiled before the block, or handed or taken within it, is not among them. The
-    block compiles with JAX's persistent cache off (`dew._cache.uncached`): an executable XLA loaded
-    from that cache serializes without its kernels (on a CPU it then loads and fails at its first call,
-    "Function ... not found"; plain JAX, 2026-11-09), so each kept one is compiled here."""
+    A later process of the same target, code and settings hands them back (`kept`), compiling none of
+    them: it traces and lowers each to prove it, or with `verify=False` traces none. A program compiled
+    before the block, or handed or taken within it, is not among them. The block compiles with JAX's
+    persistent cache off (`dew._cache.uncached`): an executable XLA loaded from that cache serializes
+    without its kernels (on a CPU it then loads and fails at its first call, "Function ... not found";
+    plain JAX, 2026-11-09), so each kept one is compiled here."""
     kept = Keeping()
     with uncached(), options.keeping(kept.heard):
         yield kept
 
 
 @contextlib.contextmanager
-def kept(path: str | Path, *, verify: bool = False) -> Iterator[AheadPrograms]:
+def kept(path: str | Path, *, verify: bool = True) -> Iterator[AheadPrograms]:
     """Within the block, a call at Dew's compile point whose identity
     (`dew.training.identity.call_identity`) one of the programs kept at `path` was compiled for
-    (`keeping`) runs that executable, loaded onto the devices it was compiled for, and traces, lowers and
-    compiles nothing; a call the file holds no program for compiles as without it.
+    (`keeping`) runs that executable, loaded onto the devices it was compiled for, its own program lowered
+    first and held to the kept one's digest (`program_digest`): it compiles nothing, and a kept program its
+    call no longer lowers to is refused (`NotTheKeptProgram`), never run. A call the file holds no program
+    for compiles as without it.
 
     Refused before any call, naming what differs, where this process is not the one the file was kept in:
     its devices, JAX, jaxlib, XLA flags and host (`BuildTarget.held`), or its Python, Dew's source, a
@@ -809,9 +812,12 @@ def kept(path: str | Path, *, verify: bool = False) -> Iterator[AheadPrograms]:
     it covers is `dew.training.identity`'s to say. Code that changes what a trace computes by assigning
     module state at run time is outside the identity, as it is outside `jax.jit`'s cache.
 
-    With `verify`, each call handed a program also lowers its own and holds the two to one digest
-    (`program_digest`), at the cost of the trace the file saves: the proof, for this file and this
-    process, that the identity covered what the trace read (`NotTheKeptProgram` where it did not)."""
+    With `verify=False`, a handed call traces and lowers nothing, and the file is trusted on its identity
+    alone: what that identity states (above) is all that holds the kept program to the code that calls it,
+    so a change it does not state (an installed distribution's file edited in place, or a wheel rebuilt and
+    reinstalled at the same version, which the identity states by its version alone; a module's state
+    assigned at run time) runs the stale program as the current one, its results wrong with nothing to show
+    it. Only where no such change can have happened."""
     programs = AheadPrograms.load(path)
     if programs.process is None:
         raise ValueError(f"{path} holds programs compiled ahead by name, none kept by its call (`keeping`)")
