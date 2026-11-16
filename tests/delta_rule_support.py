@@ -511,16 +511,14 @@ def fla_math(q, k, v, g, beta, h0, starts=None):
     return math(q, k, v, plain_prefix(g), beta, h0, starts)
 
 
-def fused_step(token, held, taps, gate, beta, log_a, bias, z, weight, state, *, epsilon: float,
-               activation: str, dtype, active=None):
+def fused_step(hooks, token, held, taps, gate, beta, log_a, bias, z, weight, state, *, dtype, active=None):
     """`(output, history', state')` of a gated delta net's decode token whole in the recurrence's step
-    (`dew.nn.kernels.recurrence.step`), the layer's operands in the order its fused token hands them:
-    the conv's token, history and taps, the gates before their activations, A_log and dt_bias, the
-    output gate and the gated norm's weight, and the state."""
+    (`dew.nn.kernels.recurrence.step`) under the layer's own `hooks` (`GatedDeltaNet._fused_hooks`), the
+    layer's operands in the order its fused token hands them: the conv's token, history and taps, the
+    gates before their activations, A_log and dt_bias, the output gate and the gated norm's weight, and the
+    state."""
     from dew.nn.kernels import recurrence
 
-    hooks = recurrence.Hooks(conv=recurrence.Conv('silu'), l2norm=True, decay='scalar',
-                             gates=recurrence.Gates(), output=recurrence.OutputNorm(epsilon, activation))
     operands = recurrence.Step(state, token=token, held=held, taps=taps, gate=gate, beta=beta, log_a=log_a,
                                bias=bias, z=z, weight=weight, active=active)
     return recurrence.step(hooks, operands, dtype=dtype)

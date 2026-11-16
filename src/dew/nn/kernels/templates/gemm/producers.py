@@ -10,14 +10,18 @@ from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
 
 
 def started(op, ba, config: mosaic_gpu.Tiles) -> mosaic_gpu.Tiles:
-    """`config` with its producer at its ladder's top where its producer gathers a step's rows and states no
-    registers of its own yet (`_top`): the rung every gathering producer holds at, so its first compile is
-    its last. At setmaxnreg's least each of a B200's spilled, its issue loop holding each step's row indices
-    (row 6783: the input gradient had held at a constant 40, the kernel gradients spilled there, the tokens'
-    80 bytes); at the top, which every role holds with no register moved, none did. A producer issuing TMA
-    copies alone holds a handful and stays at the least, its consumers raised over it."""
+    """`config` with its producer at its ladder's top (`_top`) where it states no registers of its own yet and
+    its consumers hold their accumulators in tensor memory (`mosaic.Issuer.tensor_columns`), so its first
+    compile is its last: at setmaxnreg's least each of a B200's gathered launches spilled, its issue loop
+    holding each step's row indices (row 6783: the input gradient had held at a constant 40, the kernel
+    gradients spilled there, the tokens' 80 bytes), and at the top none did, its consumers' registers no
+    accumulator's. Where the consumers hold theirs in registers (a warpgroup MMA's) a raise takes registers
+    they hold, and the producer starts at the least: an H100's gathered kernel gradient at its entry share
+    left its consumers 168 registers, which spilled, and certified at its sixth compile (train 952 F2)."""
     top = _top(op, ba, config)
-    if top is None or config.producers.of(op.KERNEL) is not None:
+    family = pricing.family_of(config, ba.arguments['tokens'].dtype)
+    if (top is None or config.producers.of(op.KERNEL) is not None
+            or not family.tensor_columns(pricing.tile_columns(config, family), 1)):
         return config
     return dataclasses.replace(config, producers=config.producers.stepped({op.KERNEL: top}))
 

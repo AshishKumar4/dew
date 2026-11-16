@@ -14,7 +14,6 @@ import contextlib
 import dataclasses
 import functools
 import importlib.util
-import io
 import os
 import re
 import shutil
@@ -37,6 +36,7 @@ from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from sharded import collective_axes
 
+from dew import _cache
 from dew._builds import generation_builds
 from dew.nn.kernels import grouped_matmul
 from dew.nn.kernels.generation import assumed, capability, compile_only_gpus, gpu_target
@@ -86,7 +86,7 @@ def ptxas_read(text: str) -> Assembled:
 class Report:
     """One Mosaic GPU kernel's reports: its name, the shared bytes and tensor memory columns it asks for (its
     binary's launch and Mosaic's resource estimate, respectively), its registers a thread and its spilled
-    bytes as the GPU compiles its PTX (`inherited`, their only source: None until it reads them), what the
+    bytes as the GPU compiles its PTX, else its binary's (`inherited`: None until it reads them), what the
     reports left `unread`: a kernel no binary carries, or a field no report states, is no evidence the kernel
     is within its resources; and its `module`, its kernel hash, which two compiles of one module share: Mosaic
     compiles a module once a process, so a later compile of it prints no PTX of its own; the digest its name
@@ -105,6 +105,10 @@ class Report:
     sass: tuple[str, ...] = ()
     launched: str | None = None
     """The digest of the launch that traced it (`report.Binary.launched`), None where no binary carries it."""
+    binary_registers: int | None = None
+    binary_frame: int | None = None
+    """Its registers a thread and stack frame's bytes as its executable's binary carries them
+    (`report.Binary`): this process's assembly, which `inherited` reads where no PTX of it was dumped."""
 
     @property
     def traced(self) -> str:
@@ -163,7 +167,9 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
             sum(map(int, tmem.groups())) if tmem else None,
             None, None, unread, (modules or {}).get(name), launch,
             sass=tuple(binary.sass or ()) if binary is not None else (),
-            launched=binary.launched if binary is not None else None))
+            launched=binary.launched if binary is not None else None,
+            binary_registers=binary.registers if binary is not None else None,
+            binary_frame=binary.frame if binary is not None else None))
     return found_reports
 
 
@@ -303,9 +309,9 @@ def _compiled(case, generation: str, record: dict,
     (`triton_kernels`), or None, `record` holding why: the error, or the shared bytes of a block XLA
     refused. `record['modules']` holds each Mosaic GPU kernel's module (its kernel hash) by its name and
     launch, and `record['certified']` each one certification compiled alone in the process
-    (`report.certifications`). Given a `directory`, its Mosaic GPU kernels' evidence too (`_printed`):
+    (`report.certifications`). Given a `directory`, its Mosaic GPU kernels' evidence too (`_dumped`):
     `record['estimates']` each one's resource estimate Pallas prints as it lowers, `record['binaries']` each
-    one's binary (`report.binaries`), and in `directory` the PTX Mosaic prints as it compiles, a
+    one's binary (`report.binaries`), and in `directory` the PTX Mosaic dumps as it compiles (`_dumped`), a
     `<kernel>.ptx` each."""
     fn, args = case.call()
     expected = getattr(case, "expected", None)
@@ -313,12 +319,16 @@ def _compiled(case, generation: str, record: dict,
     # (`report.certified`), on a compile-only device of the generation: its kernels compiled then, each
     # module once a process, so their PTX prints as the program lowers, not as it compiles. Here, in the
     # process of the generation's capability (`compile_mosaic_kernels`), never in a bare lowering.
-    estimating = (_printed(MOSAIC_GPU_DUMP_RESOURCES="1", MOSAIC_GPU_DUMP_PTX="1") if directory
-                  else contextlib.nullcontext([]))
+    lowering, compiling = ((Path(directory, "lowering"), Path(directory, "compiling")) if directory
+                           else (None, None))
+    for dumped in (lowering, compiling):
+        if dumped is not None:
+            dumped.mkdir()
+    estimating = _dumped(str(lowering)) if lowering is not None else contextlib.nullcontext()
     uncertified = report.uncertified()
     certifying = len(report.certifications())
     try:
-        with estimating as estimated, report.certifying(compile_only_gpus(generation)[0]):
+        with estimating, report.certifying(compile_only_gpus(generation)[0]):
             lowered = lowered_for(fn, args, generation, expected)
     except Exception as error:  # A case that does not lower is its own failure.
         # One a block's shared memory does not hold asks its bytes, as XLA's refusal of a Triton kernel does.
@@ -347,12 +357,12 @@ def _compiled(case, generation: str, record: dict,
     # a process of its own compiled it (`compiled_apart`) as here.
     record["certifications"] = _certified_since(certifying)
     if directory is not None:
-        record["estimates"] = _estimates(calls, "".join(estimated))
+        record["estimates"] = _estimates(calls, dumps(str(lowering), ".resources.txt"))
     # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
     # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
-    printing = _printed(MOSAIC_GPU_DUMP_PTX="1") if directory else contextlib.nullcontext([])
+    printing = _dumped(str(compiling)) if compiling is not None else contextlib.nullcontext()
     try:
-        with printing as printed:
+        with printing:
             executable = lowered.compile()
     except jax.errors.JaxRuntimeError as error:
         asked = report.shared_asked(error)
@@ -364,7 +374,7 @@ def _compiled(case, generation: str, record: dict,
     if directory is not None:
         record["binaries"] = [dataclasses.asdict(found)
                               for found in report.binaries(executable, decoded=True)]
-        write_modules("".join(estimated), "".join(printed), directory, modules)
+        write_modules(dumps(str(lowering), ".ptx"), dumps(str(compiling), ".ptx"), directory, modules)
     if expected is not None:
         record["route"] = _route(lowered, executable, _device(generation, expected.axes))
     return report.launched_kernels(executable), triton_kernels(lowered)
@@ -471,37 +481,36 @@ def mosaic_kernels(record: dict) -> list[dict]:
             reports(record.get("estimates", {}), binaries, record.get("modules"))]
 
 
-_PRINTING = threading.Lock()
-"""Held while Mosaic's printing is on (`_printed`)."""
+_DUMPING = threading.Lock()
+"""Held while Mosaic's dumps are on (`_dumped`)."""
 
 
 @contextlib.contextmanager
-def _printed(**switches: str):
-    """Mosaic GPU's `switches` on in the block (MOSAIC_GPU_DUMP_RESOURCES, MOSAIC_GPU_DUMP_PTX), which with no
-    MOSAIC_GPU_DUMP_TO print what they dump: a list the block's printed text joins as it ends, Python's
-    prints and the compiler's own output (fd 1) both. MOSAIC_GPU_DUMP_TO turns every dump on, its layout
-    inference's constraint system among them, each variable printing its operation: 47.6 of a Kimi Linear
-    A100 forward cell's 138 seconds (cProfile, armada, 9e65ee222). The gate compiles one case at a time in
-    its process, which sets nothing else, as Mosaic reads these settings in every compile."""
-    printed: list[str] = []
-    with _PRINTING, tempfile.TemporaryFile() as native:
+def _dumped(directory: str):
+    """Mosaic GPU's PTX and resource estimates of each module the block builds or compiles written into
+    `directory`, each module's own files (`<basename>.ptx`, `<basename>.resources.txt`): the dumps a module's
+    options take (`get_or_set_dump_options`, MOSAIC_GPU_DUMP_TO with only these kinds named), read back by
+    `dumps`, never a print. MOSAIC_GPU_DUMP_TO with no kind named turns every dump on, its layout inference's
+    constraint system among them, each variable printing its operation: 47.6 of a Kimi Linear A100 forward
+    cell's 138 seconds (cProfile, armada, 9e65ee222). The gate compiles one case at a time in its process,
+    which sets nothing else, as Mosaic reads these settings in every compile."""
+    switches = {"MOSAIC_GPU_DUMP_TO": directory, "MOSAIC_GPU_DUMP_PTX": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
+    with _DUMPING:
         before = {name: os.environ.get(name) for name in switches}
         os.environ.update(switches)
-        python, saved = io.StringIO(), os.dup(1)
-        os.dup2(native.fileno(), 1)
         try:
-            with contextlib.redirect_stdout(python):
-                yield printed
+            yield
         finally:
-            os.dup2(saved, 1)
-            os.close(saved)
             for name, value in before.items():
                 if value is None:
                     os.environ.pop(name, None)
                 else:
                     os.environ[name] = value
-            native.seek(0)
-            printed += [python.getvalue(), native.read().decode(errors="replace")]
+
+
+def dumps(directory: str, suffix: str) -> str:
+    """The text of every dump of `suffix` in `directory` (`_dumped`), in its files' order."""
+    return "".join(path.read_text() for path in sorted(Path(directory).glob(f"*{suffix}")))
 
 
 _BINARY_CAPABILITY: list[tuple[int, int]] = []
@@ -544,7 +553,7 @@ def gate_generations(dtype=jnp.bfloat16, *, stated: bool = False, scoped: bool =
 def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     """Each Mosaic GPU case (`name`, `call()` giving the kernel and abstract operands) compiled as
     `compile_kernels` compiles Triton's, for a compile-only device of the CUDA `generation`, with Mosaic's
-    own reports printed (`_printed`): its name, the generation's shared-memory and tensor-memory limits
+    own reports dumped (`_dumped`): its name, the generation's shared-memory and tensor-memory limits
     (`GpuTarget.tmem_columns`, 0 where it has none), and each of its kernels' report (`mosaic_kernels`),
     or the error. In a process that compiled Mosaic kernels for another capability
     (`_BINARY_CAPABILITY`) these are the records its process of its own gives (`compiled_apart`)."""
@@ -628,6 +637,11 @@ def inherited(kernel: dict, compiled: dict[str, dict]) -> dict:
         return {**kernel, **compiled[name]}
     if kernel["module"] in COMPILED:
         return {**kernel, **COMPILED[kernel["module"]], "ptxas": "an earlier compile of its module"}
+    if kernel["binary_registers"] is not None:
+        # No PTX of it in this process (its module compiled before the gate's): this process's assembly, its
+        # executable's binary (`report.binaries`), as certification reads it.
+        return {**kernel, "registers": kernel["binary_registers"], "spilled": kernel["binary_frame"],
+                "ptxas": "its executable's binary"}
     unread = [*kernel["unread"], *(field for field in ("registers", "spills")
                                    if field not in kernel["unread"])]
     return {**kernel, "registers": None, "spilled": None, "unread": unread}
@@ -746,7 +760,11 @@ def _compiled_here(cases, generation: str) -> list[dict]:
         record: dict = {"name": case.name, "generation": generation,
                         "limit": gpu_target(generation).shared_limit,
                         "models": {name: model.record() for name, model in models.items()}}
-        with tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory:
+        # Every compile of the case a real one (`dew._cache.uncached`): Mosaic prints a module's PTX, the
+        # gate's evidence, only as it compiles it, and a program JAX's persistent cache loads compiles
+        # nothing, its kernels' records then empty (train 953: three programs loaded from the shared cache
+        # gave a B200's gathered cells no registers, no spills and no producer).
+        with tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory, _cache.uncached():
             _compiled(case, generation, record, directory)
             kernels = mosaic_kernels(record)
             # Each kernel's model its launch stated as it traced (`report.Launch.kernels`), whose producer

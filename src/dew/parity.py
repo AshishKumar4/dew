@@ -795,18 +795,27 @@ def rows_summary(rows, truth, *, finite: bool, dtype: str, log_mse: float | None
 
 
 def _computed_here(program, *trees):
-    """`program(*trees, xp=...)` in float64, its small results on the host: in one compiled program where
-    every array lives on a GPU, whose float64 arithmetic keeps subnormals as numpy does (IEEE's; XLA:CPU
-    reads a subnormal float64 as zero, `1e-310 != 0` false there, and a TPU has no float64), else in numpy,
-    on a CPU the arrays' own memory. Where the arrays live decides it, not the default backend: a program
-    over arrays a GPU host placed on its CPU would run on XLA:CPU."""
+    """`program(*trees, xp=...)` in float64, its small results on the host: in one compiled program on a
+    GPU where the process computes on one, every array placed there that does not live on one already
+    (a host's NumPy truth, a CPU array), whose float64 arithmetic keeps subnormals as numpy does (IEEE's),
+    so a draw's statistics over a model's every parameter run on the GPU's float64 units, not on the host
+    (bible §8: a float64 truth's array math is a GPU's where one is booked; on a GPU host they ran its
+    sites' statistics in NumPy for half an hour, ledger 6795); else in numpy, on a CPU (XLA:CPU reads a
+    subnormal float64 as zero, `1e-310 != 0` false there, and a TPU has no float64)."""
     arrays = [leaf for leaf in jax.tree.leaves(trees) if leaf is not None]
-    if not arrays or not all(isinstance(leaf, jax.Array) and all(device.platform == "gpu"
-                                                                 for device in leaf.devices())
-                             for leaf in arrays):
+    gpu = next((device for device in jax.local_devices() if device.platform == "gpu"), None)
+    if not arrays or gpu is None:
         return program(*trees, xp=np)
-    with jax.enable_x64(new_val=True):
-        return jax.device_get(_compiled(program)(*trees))
+
+    def placed(leaf):
+        # Its host values put uncommitted on this process's first GPU, so the program lays them beside the
+        # arrays a GPU already holds, sharded or not: a CPU array's own put would keep it on the CPU.
+        on_gpu = isinstance(leaf, jax.Array) and all(device.platform == "gpu" for device in leaf.devices())
+        return leaf if leaf is None or on_gpu else jax.device_put(np.asarray(leaf))
+
+    with jax.enable_x64(new_val=True), jax.default_device(gpu):
+        held = jax.tree.map(placed, trees, is_leaf=lambda leaf: leaf is None)
+        return jax.device_get(_compiled(program)(*held))
 
 
 @functools.cache

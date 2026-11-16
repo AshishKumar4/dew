@@ -658,8 +658,12 @@ def scanned_steps(equation, inputs: list[tuple], body, lanes: int) -> list[tuple
                          inputs[constants + carries:])
     ys = []
     steps = range(params["length"])
+    # Each lane's steps sliced once, a dispatch for them all (an array's iteration unstacks it), where a
+    # step's slice of each lane was a gather of its own: on a GPU the walk's every step paid one a lane,
+    # host-bound (ledger 6795).
+    held = [tuple(None if lane is None else list(lane) for lane in x) for x in xs]
     for step in reversed(steps) if params["reverse"] else steps:
-        sliced = [tuple(None if lane is None else lane[step] for lane in x) for x in xs]
+        sliced = [tuple(None if lane is None else lane[step] for lane in x) for x in held]
         outputs = body(step, [*consts, *carry, *sliced])
         carry = outputs[:carries]
         ys.append(outputs[carries:])
@@ -668,9 +672,16 @@ def scanned_steps(equation, inputs: list[tuple], body, lanes: int) -> list[tuple
     if not ys:
         return [*carry, *((jnp.zeros((0, *var.aval.shape), var.aval.dtype), *(None,) * (lanes - 1))
                           for var in jaxpr.outvars[carries:])]
-    return [*carry, *(tuple(None if any(entry is None for entry in lane) else jnp.stack(lane)
+    return [*carry, *(tuple(None if any(entry is None for entry in lane) else _stacked(*lane)
                             for lane in zip(*column, strict=True))
                       for column in zip(*ys, strict=True))]
+
+
+@jax.jit
+def _stacked(*steps):
+    """A scanned output's `steps` stacked in one compiled call, where `jnp.stack` dispatched each step's
+    expansion on its own (a host-bound walk on a GPU, ledger 6795)."""
+    return jnp.stack(steps)
 
 
 def _traced_values(values) -> bool:

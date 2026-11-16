@@ -212,7 +212,7 @@ class KimiDeltaAttention(nn.Module):
         if decode and S == 1 and not forked and not self.is_initializing() and decode_kernel(
                 jax.ShapeDtypeStruct((B, self.num_heads, self.head_dim, self.head_dim), wide),
                 groups=self.num_heads, fuses=True) == 'fused':
-            token = self._fused_token(taps, g, beta, gate, valid, tokens.starts)
+            token = self._fused_token(taps, g, beta, gate, valid, tokens.starts, projected.dtype)
 
         def split(part):
             return part.reshape(B, S, self.num_heads, self.head_dim)
@@ -264,10 +264,12 @@ class KimiDeltaAttention(nn.Module):
         out = self.o_norm(as_projected(out, projected.dtype), gate).reshape(B, S, self.qkv_features)
         return self.o_proj(out)
 
-    def _fused_token(self, taps, g, beta, gate, valid, starts):
+    def _fused_token(self, taps, g, beta, gate, valid, starts, operand):
         """A decode token's conv, update and gated norm in one launch (`linear.fused_token` under
-        `FUSED`): its decay a key dimension, write gate and output gate a row's, as the layer forms them."""
-        hooks = dataclasses.replace(FUSED, output=recurrence.OutputNorm(self.norm_eps, 'sigmoid'))
+        `FUSED`): its decay a key dimension, write gate and output gate a row's, as the layer forms them, its
+        output read back in `operand`, the input projection's dtype, before the norm (`as_projected`)."""
+        hooks = dataclasses.replace(FUSED, output=recurrence.OutputNorm(self.norm_eps, 'sigmoid',
+                                                                        read_in=jnp.dtype(operand).name))
         return fused_token(hooks, taps,
                            heads=(self.num_heads, self.num_heads, self.num_heads),
                            widths=(self.head_dim, self.head_dim, self.head_dim),
