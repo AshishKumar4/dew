@@ -1117,15 +1117,34 @@ def hub_snapshot_of(tokenizer_directory: str, cache: Path, repo: str = "org--tin
     return snapshot
 
 
+def saved_before_runs_held_tokenizers(run: str) -> None:
+    """The run's checkpoints as a run saved before runs held their tokenizers wrote them: each step's
+    declaration names its tokenizer and states no hashes of its files, and the run holds no copy."""
+
+    def unstated(value):
+        match value:
+            case dict():
+                return {key: unstated(entry) for key, entry in value.items() if key != "tokenizer_files"}
+            case list():
+                return [unstated(entry) for entry in value]
+            case _:
+                return value
+
+    for written in Path(run).glob("*/_CHECKPOINT_METADATA"):
+        written.write_text(json.dumps(unstated(json.loads(written.read_text()))))
+    shutil.rmtree(Path(run) / "tokenizer")
+
+
 def test_a_runs_tokenizer_is_held_in_the_run_and_compared_by_its_files(decide, tmp_path, monkeypatch):
     """A decision run holds its tokenizer's files in the run itself, found by their hashes: served with the
     place it read them from gone and this host's cache fresh, it loads them from the run and answers as it
     did, whether it read them from a hub cache snapshot or from a path relative to where it trained
     (`tokenizer/bpe32k`, a name the run's own folder of tokenizers shares); a run started from it holds its
     own, and answers as it did with the first run gone. Two runs whose one tokenizer stood at different
-    places blend; a run whose vocabulary changed in a file does not. A run recorded its training host's
-    directory, which a start or a serve elsewhere handed the hub as a repo id and failed on, and blends of
-    one tokenizer at two paths were refused."""
+    places blend, and so do a run saved before runs held their tokenizers and one saved since; a run whose
+    vocabulary changed in a file does not. A run recorded its training host's directory, which a start or a
+    serve elsewhere handed the hub as a repo id and failed on, and blends of one tokenizer at two paths, or
+    of a run that states its tokenizer's files with one that does not, were refused."""
     from dew.data.text import HFTokenizer, tokenizer_for
 
     def fresh_cache(name: str) -> None:
@@ -1159,6 +1178,11 @@ def test_a_runs_tokenizer_is_held_in_the_run_and_compared_by_its_files(decide, t
     monkeypatch.chdir(tmp_path / "caches")
     fresh_cache("relative")
     assert Decide.from_run(relative[0]).systemone(request) == trained
+    # A run saved before runs held their tokenizers, which states no hashes, blends with one that does: each
+    # is compared by the files it reads.
+    earlier = trained_runs(replace(decide, tokenizer=tokenizer_for(files)), tmp_path, 1, name="earlier")
+    saved_before_runs_held_tokenizers(earlier[0])
+    assert len(Decide.averaged([runs[0], *earlier]).weights.averaged) == 2
     # One tokenizer at other places blends; one whose vocabulary changed does not.
     assert len(Decide.averaged([*runs, *started, *relative]).weights.averaged) == 4
     changed = hub_snapshot_of(files, tmp_path / "second-host", repo="org--changed")

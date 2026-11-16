@@ -669,6 +669,73 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     np.testing.assert_array_equal(np.asarray(scored.weights), ~padding)
 
 
+def masked_run(tmp_path, corpus, name: str, pretrained, tokenizer, *flags: str):
+    """One step of a masked-diffusion run from `pretrained`, encoding with `tokenizer`, over `corpus`'s
+    windows, checkpointed in tmp_path/runs/`name`."""
+    data = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
+        Loading(workers=0))
+    return LMRunConfig.cli([
+        "--pretrained", str(pretrained), "--objective", "masked_diffusion", "--tokenizer", str(tokenizer),
+        "--model.dtype", "float32", "--model.attention-impl", "xla",
+        "--trainer.steps", "1", "--trainer.log-every", "1",
+        "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", name,
+        "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
+        "--objective.ema-decay", "None", "--max-new-tokens", "0", *flags],
+        default=LMRunConfig(data=data)).run()
+
+
+def test_a_run_whose_tokenizer_is_gone_exports_and_starts_a_run_from_the_copy_it_holds(tmp_path, monkeypatch):
+    """A run holds its tokenizer, so with the directory it read it from gone and this host's cache fresh,
+    its bundle (`Pretrained.from_run`) encodes with the run's own copy, its export writes those files,
+    and a run started from it (`--pretrained <run>`) over token files of that vocabulary trains. The
+    bundle carried the name the run recorded, which an export and a start resolved on this host and failed
+    on (train 972's review)."""
+    import shutil
+
+    from dew.data.text import HFTokenizer
+    from dew.interop import Pretrained
+
+    checkpoint = REPO_ROOT / "tests/fixtures/hf/llada-tiny"
+    source = tmp_path / "source"
+    shutil.copytree(checkpoint, source)
+    corpus = write_token_corpus(tmp_path / "tokens", np.random.RandomState(400).randint(4, 100, 400),
+                                tokenizer=str(checkpoint), vocab_size=100, eos_id=1)
+    masked_run(tmp_path, corpus, "first", source, source)
+    text = "a run's own tokenizer"
+    expected = HFTokenizer(str(checkpoint)).encode(text)
+    source.rename(tmp_path / "moved")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "fresh"))
+    first = tmp_path / "runs" / "first"
+    bundle = Pretrained.from_run(str(first))
+    processor = bundle.text_processor
+    assert processor is not None
+    assert processor.encode(text, specials=True) == expected
+    bundle.save(tmp_path / "exported")
+    assert HFTokenizer(str(tmp_path / "exported")).encode(text) == expected
+    started = masked_run(tmp_path, corpus, "started", first, checkpoint)
+    assert int(started.updates) == 1
+
+
+def test_a_run_whose_tokenizer_this_host_cannot_resolve_is_refused_before_its_first_step(tmp_path):
+    """A run whose checkpoints hold its tokenizer (`Checkpoints.save`) resolves it before it places
+    anything: one this host cannot resolve, its directory gone, is refused before the fit starts, where it
+    trained to its first checkpoint and died there (train 972's review)."""
+    import shutil
+
+    source = tmp_path / "source"
+    shutil.copytree(REPO_ROOT / "tests/fixtures/hf/llada-tiny", source)
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, tokenizer=str(source), eos_id=0)
+    shutil.rmtree(source)
+    config = run_config(tokens, "--trainer.name", "gone", "--trainer.steps", "2",
+                        "--trainer.checkpoint-every", "1", "--max-new-tokens", "0")
+    with pytest.raises(ValueError):
+        config.run()
+    records = tmp_path / "runs" / "gone" / "tracking" / "records.jsonl"
+    started = [] if not records.exists() else [
+        line for line in records.read_text().splitlines() if json.loads(line)["type"] == "FitStarted"]
+    assert started == []
+
+
 def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
     """`--pretrained` over a masked-diffusion checkpoint continues from its
     weights. One step at 1e-3 leaves the trained state within 1.1e-3 of the

@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     from flax.training.dynamic_scale import DynamicScale
 
     from dew.data.dataset import DataPartition
+    from dew.data.text import Tokenizer
     from dew.state import Accumulation, TrainState
 
 # One field of the train state as a checkpoint holds it: a scalar array, a
@@ -1338,9 +1339,12 @@ class Checkpoints:
         artifact: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
         rollout: Mapping[str, object] | None = None,
+        tokenizer: Tokenizer | None = None,
     ) -> None:
         """Write `state` under `step`, asynchronously, a train state with its rollout's tree of arrays where
-        it holds one (`rollout`), which `rollout_state` reads back.
+        it holds one (`rollout`), which `rollout_state` reads back, and the run holding `tokenizer`, the one
+        the step's inference declaration (`artifact`) states the files of, before the step is written
+        (`dew.inference.tasks.hold_tokenizer`): a committed step's tokenizer is in its run.
 
         `state` is a run's `TrainState`, or a mapping of arrays in its place
         for a state that is not a training run's, such as a simulation's,
@@ -1378,9 +1382,12 @@ class Checkpoints:
         mapping = isinstance(state, Mapping)
         if not mapping:
             self._identify_run()
+            from dew.inference.tasks import hold_tokenizer
+
+            hold_tokenizer(artifact, self.directory, tokenizer)
         if mapping:
             if (saved is not None or share is not None or weights_only or rung is not None
-                    or artifact is not None or rollout is not None):
+                    or artifact is not None or rollout is not None or tokenizer is not None):
                 raise ValueError("a mapping is saved as it is: it takes no data position, share, "
                                  "weights-only split, rung, artifact or rollout, which a train state's save "
                                  "records")

@@ -808,7 +808,6 @@ class Trainer(Generic[Loss, Effects]):
         `__main__` or a function, or holding what no record carries) still checkpoints: the record says
         why, a loader raises that, and the first checkpoint warns it. Any other error is the record's own
         bug, and raises."""
-        from dew.inference.tasks import hold_tokenizer
         from dew.interop.saved_sources import with_release_sources
 
         artifact: JSON
@@ -817,9 +816,6 @@ class Trainer(Generic[Loss, Effects]):
             # The releases of saved runs its paths lie within, each mapped to the saved run it holds, so a
             # host lacking one writes its own (`dew.interop.saved_sources.with_release_sources`).
             artifact = with_release_sources(self.objective.inference_record())
-            if self.checkpoints is not None:
-                # Its tokenizer's files held in the run itself, which a load reads on any host.
-                hold_tokenizer(artifact, self.checkpoints.directory, self.objective.run_tokenizer())
         except Unrecordable as error:
             reason = f"{type(self.objective).__name__}: {error}"
             artifact = {'unrecorded': reason}
@@ -2103,8 +2099,15 @@ class Trainer(Generic[Loss, Effects]):
         checkpoints its state in a pool (`_rollout_admitted`), and a pipeline's batch, whose placement could
         take minutes or run out of memory before the error. Every other mesh's batch is checked with its
         stream (`check_stream`), a ramp's at each of its stages. The checkpoints learn why no record rebuilds
-        a run of this trainer on the data it was `stated` (`Checkpoints.python_run`)."""
+        a run of this trainer on the data it was `stated` (`Checkpoints.python_run`), and the tokenizer
+        its checkpoints hold (`Checkpoints.save`) resolves, so a host that cannot resolve it refuses before
+        step 0, naming it, not at the first checkpoint."""
         if self.checkpoints is not None:
+            from dew.data.text import HFTokenizer
+
+            tokenizer = self.objective.run_tokenizer()
+            if isinstance(tokenizer, HFTokenizer):
+                tokenizer.dependencies()
             given = {"a rollout (rollout=)": _rollout_admitted(self.rollout),
                      "a custom step (step=)": self.step, "a tracker (tracker=)": self.tracker,
                      "recording each step's draws (record=True)": self.record or None}
@@ -2226,8 +2229,9 @@ class Trainer(Generic[Loss, Effects]):
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         envelope = self._checkpoint_envelope(state, position, interval, run, weights_only=weights_only)
+        # The run holds the tokenizer its declaration states the files of (`Checkpoints.save`).
         write = functools.partial(checkpoints.save, step, metrics=metadata, ranking=ranking,
-                                  weights_only=weights_only, **envelope)
+                                  weights_only=weights_only, tokenizer=self.objective.run_tokenizer(), **envelope)
         with run.outside_window(), run.held():
             self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step, resumable=not weights_only)

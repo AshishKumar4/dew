@@ -89,7 +89,7 @@ if TYPE_CHECKING:
 
     # A run processor's tokenizer is read through its methods alone, so image generation, which builds none,
     # reads no tokenizer library (tests/test_imports.py's optional backends).
-    from dew.data.text import Tokenizer
+    from dew.data.text import ByteTokenizer, HFTokenizer, Tokenizer
     from dew.distributed.placement import Layout, MeshSpec
     from dew.objectives.base import Objective
     from dew.quantization import Quantization
@@ -574,14 +574,13 @@ def saved_artifact(checkpoints: Checkpoints, step: int) -> Mapping[str, object] 
     (`dew.decision.DecisionRunConfig.earlier_checkpointed`). The packages it trusts are imported first, by its
     reader."""
     record = checkpoints.artifact(step)
-    if record is None:
-        return None
-    return earlier_shapes(named_fields(record, 'checkpoint artifact'))
+    return None if record is None else earlier_shapes(named_fields(record, 'checkpoint artifact'))
 
 
 def hold_tokenizer(artifact: JSON, run: str, tokenizer: Tokenizer | None) -> None:
     """Hold `tokenizer`, the objective's own, in the run in `run` (`held_place`), once, where `artifact`, the
-    step's inference declaration a checkpoint of the run carries, records its files (`tokenizer_files`):
+    step's inference declaration a checkpoint of the run carries, records its files (`tokenizer_files`), as
+    the one writer of such a checkpoint does before it writes the step (`Checkpoints.save`):
     copied by the first process from the directory this process pinned it from, each file checked against
     its hash (`dew.data.text.copy_checked`), never resolved by its name again, `HELD_FILES` written last, a
     local run's directory published whole (`dew._files.staged`). The record keeps the tokenizer's name and
@@ -1022,18 +1021,28 @@ def recorded_processor(processor: Processor | None) -> SourceReference | None:
     return processor.source if isinstance(processor, SourceProcessor) else None
 
 
+def saved_tokenizer(name: str, files: Mapping[str, str] | None, run: str) -> ByteTokenizer | HFTokenizer:
+    """The tokenizer a saved run's record names (`name`) and states the files of (`files`, which a record
+    saved before runs held their tokenizers lacks), as every reader of a run builds it: the copy the run in
+    `run` holds where it holds one (`HFTokenizer.held`), its files checked against the record's. A run's
+    task (`_saved_processor`, `dew.decision.Decide.from_run`), the blend of runs that compares them
+    (`dew.decision.Decide.averaged`) and a run's bundle (`dew.interop.Pretrained.from_saved`), which an
+    export writes and a run started from it encodes with."""
+    from dew.data.text import tokenizer_for
+
+    return tokenizer_for(name, files=files, held=run)
+
+
 def _saved_processor(settings: TaskSettings, config: ModelConfig, run: str) -> Processor | None:
     """Build the run's host processor: the checkpoint's own, reloaded from the
-    source it recorded beside `config`'s model, or its run tokenizer, the copy the run in `run` holds
-    where it holds one (`HFTokenizer.held`)."""
-    from dew.data.text import tokenizer_for
+    source it recorded beside `config`'s model, or its run tokenizer (`saved_tokenizer`)."""
     from dew.interop.pretrained import load_processor
 
     if settings.processor is not None:
         return load_processor(settings.processor, config.build())
-    found = None if settings.tokenizer is None else tokenizer_for(
-        settings.tokenizer, files=settings.tokenizer_files, held=run)
-    return None if found is None else RunProcessor(found)
+    if settings.tokenizer is None:
+        return None
+    return RunProcessor(saved_tokenizer(settings.tokenizer, settings.tokenizer_files, run))
 
 
 def resident(model: nn.Module, variables: Variables) -> Variables:
