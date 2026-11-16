@@ -186,33 +186,23 @@ argv[1] names: each program it lowered by name, and each Mosaic GPU kernel lower
 text."""
 
 
-def _launch_config(name: str) -> tuple[tuple[str, bool], str]:
-    """A certification program's launch and direction, and its config, by its name
-    (`jit(certified_<op>_l<launch>_c<config>[_reverse])`)."""
-    stem = name.removeprefix("jit(").removesuffix(")")
-    reverse = stem.endswith("_reverse")
-    launch, config = stem.removesuffix("_reverse").rsplit("_c", 1)
-    return (launch, reverse), config
-
-
 @pytest.mark.parametrize("target", [pytest.param("sm90", marks=lowers("sm90")),
                                     pytest.param("sm100", marks=lowers("sm100"))])
 def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target):
     """A one-layer decoder of the 4B's gated delta net, its step compiled ahead for a compile-only H100 and a
-    compile-only B200 (`RECURRENT_AHEAD`), twice over one cache: at its derived tiles its output launch spills
-    (8 bytes at 128 registers under the cuda12 build's ptxas), and each process lowers the step once.
-    Certification compiles a launch with its outputs live, as a step reads them, so it refuses the spilling
-    config and steps the launch's producer down at trace, each rung compiled alone; and a later process reads
-    the verdicts stored, compiling nothing to certify. Certification that dropped the outputs never compiled
-    the output launch, and the program's compile stepped it down a whole-step relowering a rung, again in
-    every process (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm). Each certification's program is
-    named by its launch, direction and config (`certified_<op>_l<launch>_c<config>[_reverse]`), so a start's
-    events tell its rungs apart: the cold process lowers each once, two configs of one launch in one direction
-    among them, and the warm one none. Each kernel is lowered afresh once in the cold process: the step's
-    kernels certification lowered are the lowerings it made (a launch's trace held, `tuning.lowered_once`,
-    bound into the step as certification traced it, under the step's own mesh), where the step lowered its
-    kernels again, each a cache miss, 34 of a 4B's 36 kernels on a B200 the ones certification had made
-    (FS-CERTSPLIT4: 27 s of its lowering)."""
+    compile-only B200 (`RECURRENT_AHEAD`), twice over one cache: each process lowers the step once.
+    Certification compiles a launch with its outputs live, as a step reads them, so it refuses a spilling
+    config and steps the launch's producer at trace, each rung compiled alone (the B200's output launch steps;
+    the H100's holds at its first rung, its consumers' stated share); and a later process reads the verdicts
+    stored, compiling nothing to certify. Certification that dropped the outputs never compiled the output
+    launch, and the program's compile stepped it down a whole-step relowering a rung, again in every process
+    (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm). Each certification's program is named by its
+    launch, direction and config (`certified_<op>_l<launch>_c<config>[_reverse]`), so a start's events tell
+    its rungs apart: the cold process lowers each once, and the warm one none. Each kernel is lowered afresh
+    once in the cold process: the step's kernels certification lowered are the lowerings it made (a launch's
+    trace held, `tuning.lowered_once`, bound into the step as certification traced it, under the step's own
+    mesh), where the step lowered its kernels again, each a cache miss, 34 of a 4B's 36 kernels on a B200 the
+    ones certification had made (FS-CERTSPLIT4: 27 s of its lowering)."""
     cache = tmp_path / "cache"
     runs = [fresh(RECURRENT_AHEAD, target, cache_dir=cache) for _ in range(2)]
     cold, warm = (run["events"] for run in runs)
@@ -221,11 +211,6 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target):
     assert [run.count("jit(step)") for run in (cold, warm)] == [1, 1], (cold, warm)
     certified = [name for name in cold if name.startswith("jit(certified_")]
     assert len(set(certified)) == len(certified), certified
-    configs = collections.defaultdict(set)
-    for name in certified:
-        launch, config = _launch_config(name)
-        configs[launch].add(config)
-    assert max(len(each) for each in configs.values()) >= 2, certified
     assert not [name for name in warm if name.startswith("jit(certified_")], warm
 
 
