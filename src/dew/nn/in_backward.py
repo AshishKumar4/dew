@@ -56,9 +56,9 @@ class InBackward:
     `update(path, index, gradient, weights, moments)` is the step's optimizer update of one layer: the
     layer `index` of the run at `path` (the run's module path in the model), its `gradient` and
     `weights` (the masters where the step keeps narrow copies), and its `moments` by collection; it returns
-    the moved weights and moments, and whether the update formed (its learning rates finite, and the moved
-    weights where the step reads its formed update, `dew.optim.reads_updates`), the weights
-    kept where it did not. `moments` names the collections of the optimizer's moments the step
+    the moved weights and moments, and whether the update formed: its moved weights finite where the step
+    reads its update (`dew.optim.reads_updates`), the update and moments then formed from the zero gradient
+    where they are not, the weights kept. `moments` names the collections of the optimizer's moments the step
     added. `handled` records each run's path as the model traces it in the plan, so the step reads those
     runs' state off the backward."""
 
@@ -196,8 +196,9 @@ def _layer_update(update: Callable, finite: jax.Array | None, tripped: jax.Array
 def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments, bad: jax.Array):
     """One layer's update in a step that may not be finite (`gated`): where `ok` (the loss finite, the
     layer's gradient finite and bounded, `dew.nn.finite.bounded`) by its gradient, else by a
-    zero gradient, its weights kept as they were, as they are where its update did not form (a learning
-    rate not finite), its moments stepped as a commit's are. The layer's moved weights, moments and
+    zero gradient, its weights kept as they were, as they are where its update did not form (one the step
+    reads, not finite: `InBackward.update` then forms its moments from the zero gradient), its moments
+    stepped as a commit's are. The layer's moved weights, moments and
     non-finite count, and whether it was written."""
     gradient = zeroed_unless(ok, gradient)
     moved, moved_moments, formed = update(gradient, held, moments)
