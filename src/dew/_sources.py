@@ -192,26 +192,26 @@ def members(held) -> list[tuple]:
     descriptor wraps (`wrapped`), anything else as itself. Of Python's own entries (`__dict__`, `__doc__`,
     `__annotations__`) only the methods the user wrote (`__call__`), which a call runs; the rest are its
     machinery's, the methods a dataclass makes among them, which the class's description states, the
-    state `abc.ABCMeta` writes into every class it makes (`_ABC_STATE`), a Grain transform's among them, and
-    the descriptor Python makes for each of a class's own slots (a slotted dataclass's fields), whose values
-    an instance's fields state (`structured`): read as code, a frozen slotted step was inexact, and its
-    unchanged exact resume refused (the base review of 826882bbf). A slotted dataclass's field default,
-    which its slots move off the class to where the dataclass's `__init__` holds it, is stated in its
-    descriptor's place, as a plain dataclass's class attribute states it: code that builds the class reads
-    it (train 942's review: skipped with the descriptor, an edited default resumed exactly)."""
-    defaults = ({field.name: field.default for field in dataclasses.fields(held)
-                 if field.default is not dataclasses.MISSING}
-                if isinstance(held, type) and dataclasses.is_dataclass(held) else {})
+    state `abc.ABCMeta` writes into every class it makes (`_ABC_STATE`), a Grain transform's among them, the
+    descriptor Python makes for each of a class's own slots (mangled or not), and a dataclass's fields, a
+    plain one's default its class attribute: a dataclass's fields are stated whole, each with its default
+    and its default factory, by `dataclass_fields`, which a slotted class's and a child overriding a
+    default hold where its class attributes do not (train 947's review: a slotted child's override and a
+    factory went unstated, the base review of 826882bbf: a slot's descriptor read as code)."""
+    fields = vars(held).get("__dataclass_fields__", {})
     found = []
     for name, member in sorted(vars(held).items()):
         member = wrapped(member)
         if ((name.startswith("__") and name.endswith("__") and not hand_written(member))
-                or isinstance(member, _ABC_STATE)):
+                or isinstance(member, _ABC_STATE) or name in fields
+                or (isinstance(member, types.MemberDescriptorType) and member.__objclass__ is held)):
             continue
-        if isinstance(member, types.MemberDescriptorType) and member.__objclass__ is held:
-            # The class's own slot, mangled or not: its default where a dataclass field has one.
-            if name not in defaults:
-                continue
-            member = defaults[name]
         found.append((name, member))
     return found
+
+
+def dataclass_fields(held: type) -> list[dataclasses.Field]:
+    """A dataclass's fields as its decorator recorded them on `held` itself (`__dataclass_fields__`, its
+    bases' among them, an override's default its own), in order, each with its name, default and default
+    factory (`dataclasses.MISSING` where it has none). Empty for a class that is no dataclass of its own."""
+    return list(vars(held).get("__dataclass_fields__", {}).values())
