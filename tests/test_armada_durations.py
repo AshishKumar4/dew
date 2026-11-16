@@ -213,9 +213,9 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
     file("test_straggler", [381.593, 20.0, 20.0], [[382.0], [20.5, 19.0]])
     file("test_partial", [150.0] * 4, [[400.0, 400.0], [150.0, 150.0]], red=2)
     file("test_empty", [], [[]])  # every test deselected, its collection past the target
+    rows[-2]["seconds"] = 300.0
     # A file whose cut still fits though its tests now take a sixth of what its record says.
     file("test_shrunk", [100.0] * 6, [[15.0, 15.0], [15.0, 15.0], [15.0, 15.0]])
-    rows[-2]["seconds"] = 300.0
     record["tests/test_gone.py::test_x"] = 5.0
     rows.append({"name": "3.12:tests/test_gone.py", "exitCode": 0, "seconds": 5.0,
                  "tests": {"tests/test_gone.py::test_x": 5.0, "tests/test_gone.py::test_y": 1.0}})
