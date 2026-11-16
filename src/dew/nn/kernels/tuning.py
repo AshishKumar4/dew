@@ -855,9 +855,9 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
     operands' types, the trace state (`options.trace_context`, the launch apart, `report.replayed`) and
     the launch (`report.launch_metadata`), whose identity and config its kernels' names read
     (`report.named`), taken where each fact it read answers as it did (`generation.recording`,
-    `generation.still`): a launch given the same traces once however many layers and passes call it,
-    certification's alone and the step's call one trace, and each call binds it carrying the launch
-    (`report.carrying`, its kernels named for it again, `report.renamed`). The `configured` statics are
+    `generation.still`): a launch given the same traces once however many layers and passes call it, each
+    call binding the trace its launch made, its kernels' calls carrying that launch as they were traced
+    (`mosaic.compiler_params`) and named for it again (`report.renamed`). The `configured` statics are
     given narrowed to what the kernels the launch builds read of them (`kernels`, the names a launch's
     builder takes, each config's `at`): a producer's raise leaves every other launch of a config given
     what it was, its trace held (a ladder's rungs traced each of a launch's kernels again, 114 traces of
@@ -869,11 +869,11 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
         held: dict[Hashable, list[_Held]] = {}
 
         @functools.cache
-        def bound(found: _Held, metadata: bytes) -> Callable:
-            # One jit a held trace and the launch it is bound for, which a model's layers' calls share.
-            carried, (outputs,) = report.carrying(found.jaxpr, metadata), found.outputs
-
-            run = jax_core.jaxpr_as_fun(carried)
+        def bound(found: _Held) -> Callable:
+            # One jit a held trace, which a model's layers' calls share: its key holds its launch, so its
+            # kernels' calls carry the launch they are bound for as they were traced.
+            (outputs,) = found.outputs
+            run = jax_core.jaxpr_as_fun(found.jaxpr)
             return owned_program(lambda *operands: jax.tree.unflatten(outputs, run(*operands)))
 
         def calling(arguments: Mapping[str, object]):
@@ -922,7 +922,7 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
                 else:
                     generation.replay(found.reads)
                     report.renamed(found.named)
-                return bound(found, metadata)(*leaves)
+                return bound(found)(*leaves)
 
         return called
 
