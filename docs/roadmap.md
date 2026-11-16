@@ -43,6 +43,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Block-selected attention's other selections as mixers. [6301]
 - Mosaic has no float32 forward at width 256 on Hopper. [6508]
 - The attention backward's derivation proposes a spilling attention_dkv_fused at width 64 on sm100 and sm80. [6944]
+- CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
