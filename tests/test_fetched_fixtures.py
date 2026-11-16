@@ -1,6 +1,8 @@
 """The fetched store of recordings over 1 MiB (tools/fetched_fixtures.py): a recording is committed or
 pinned by its size, read back only as its pin's bytes, fetched and uploaded only as checked, and
-check.sh refuses an oversized recording in git and an incomplete pin."""
+check.sh refuses an oversized recording in git and an incomplete pin. A file whose license lets it be
+re-hosted is kept in GitHub's store, every other in the Hub's; the Hub's tests pin under a license GitHub's
+store does not take (HUB_ONLY)."""
 
 import json
 import subprocess
@@ -11,6 +13,8 @@ import pytest
 from tool_support import load
 
 LARGE, SMALL = "tests/fixtures/site/large.npz", "tests/fixtures/site/small.npz"
+HUB_ONLY = "lfm1.0"
+"""A license GitHub's store does not re-host, so a file under it is kept in the Hub's store."""
 
 
 @pytest.fixture
@@ -55,8 +59,8 @@ def _checkout(root: Path) -> Path:
     return root
 
 
-def _saved(store, root: Path, name: str = LARGE, size: int = 1 << 16) -> Path:
-    return store.save(name, _recorded(size), reference="a reference", license="MIT", root=root)
+def _saved(store, root: Path, name: str = LARGE, size: int = 1 << 16, license: str = HUB_ONLY) -> Path:
+    return store.save(name, _recorded(size), reference="a reference", license=license, root=root)
 
 
 def _uploaded(store, root: Path) -> None:
@@ -206,7 +210,7 @@ def test_a_release_file_is_pinned_whole_read_by_its_sha_and_leaves_recordings_as
     recording = _saved(store, root)
     before = dict(store.pins(root)[LARGE])
     name, code = "tests/fixtures/hf/site/release/modeling_site.py", b"class Site:\n    pass\n"
-    stored = store.pin_release(name, code, reference="org/site@abc/modeling_site.py", license="apache-2.0",
+    stored = store.pin_release(name, code, reference="org/site@abc/modeling_site.py", license=HUB_ONLY,
                                root=root)
     pin = store.pins(root)[name]
     held = f"releases/{pin['sha256']}/modeling_site.py"
@@ -234,11 +238,11 @@ def test_upload_takes_a_release_file_beside_a_recording_each_by_its_own_path(sto
     root = _checkout(tmp_path)
     recording = _saved(store, root)
     name, code = "tests/fixtures/hf/site/release/modeling_site.py", b"class Site:\n    pass\n"
-    released = store.pin_release(name, code, reference="org/site@abc/modeling_site.py", license="apache-2.0",
+    released = store.pin_release(name, code, reference="org/site@abc/modeling_site.py", license=HUB_ONLY,
                                  root=root)
     # The same bytes as another file of another name: two files, each listed.
     twin = "tests/fixtures/hf/site/release/site_twin.py"
-    store.pin_release(twin, code, reference="org/site@abc/site_twin.py", license="apache-2.0", root=root)
+    store.pin_release(twin, code, reference="org/site@abc/site_twin.py", license=HUB_ONLY, root=root)
     # A release file the store listed before by its sha256, which the catalog moves to its path.
     listed = {"fixture": "tests/fixtures/hf/old/release/old.py", "bytes": 3, "license": "MIT",
               "reference": "org/old@abc/old.py", "kind": "release", "path": f"releases/{'1' * 64}/old.py"}
@@ -264,7 +268,7 @@ def test_upload_takes_a_release_file_beside_a_recording_each_by_its_own_path(sto
     assert commits[-1][held["path"]].path_or_fileobj == recording.read_bytes()
     catalog = json.loads(commits[-1][store.CATALOG].path_or_fileobj)
     assert catalog[release["path"]] == {
-        "fixture": name, "bytes": len(code), "reference": release["reference"], "license": "apache-2.0",
+        "fixture": name, "bytes": len(code), "reference": release["reference"], "license": HUB_ONLY,
         "kind": "release", "path": release["path"]}
     assert catalog[pins[twin]["path"]]["fixture"] == twin and pins[twin]["sha256"] == release["sha256"]
     assert set(catalog[held["sha256"]]) == {"fixture", "bytes", "reference", "license"}
@@ -321,3 +325,168 @@ def test_a_release_file_kept_at_its_origin_is_fetched_from_its_release_and_never
         store.fetch(root)
     store._pinned(name, {**pin, "path": "other.py"}, root)
     assert store.check(root)
+
+
+def _github(store, monkeypatch, releases: list[dict], private: bool = False, exists: bool = True) -> list:
+    """GitHub's store stood in for `gh`, its releases `releases` (each its tag and assets), the repository
+    private or missing as told: every `gh` call it is asked appended to the list returned, an upload adding
+    the asset with GitHub's digest of its bytes and a create adding an empty release."""
+    import hashlib
+
+    asked: list[tuple[str, ...]] = []
+    served: dict[str, bytes] = {}
+
+    def gh(*arguments: str) -> str:
+        asked.append(arguments)
+        if arguments[0] == "api" and not exists:
+            raise subprocess.CalledProcessError(1, ["gh", *arguments], stderr="Not Found")
+        if arguments == ("api", f"repos/{store.GITHUB}"):
+            return json.dumps({"private": private})
+        if arguments[:3] == ("api", "--paginate", "--slurp"):
+            return json.dumps([releases])
+        if arguments[:2] == ("release", "create"):
+            releases.append({"tag_name": arguments[2], "assets": []})
+            return ""
+        if arguments[:2] == ("release", "upload"):
+            path = Path(arguments[3])
+            [release] = [release for release in releases if release["tag_name"] == arguments[2]]
+            release["assets"].append({"name": path.name,
+                                      "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"})
+            served[f"{arguments[2]}/{path.name}"] = path.read_bytes()
+            return ""
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(store, "_gh", gh)
+    monkeypatch.setattr(store, "_downloaded", lambda url: served["/".join(url.split("/")[-2:])])
+    return asked, served
+
+
+def test_a_rehostable_file_is_kept_in_githubs_store_and_any_other_in_the_hubs(store, tmp_path):
+    """A recording or release file under a license GitHub's store re-hosts (MIT, Apache-2.0, in any case) is
+    pinned to GitHub's store, its asset named by its sha256 (and a release file's own name); one under any
+    other license to the Hub's store as before. Check refuses a GitHub pin under a license it may not hold,
+    or whose revision is no release of the store."""
+    root = _checkout(tmp_path)
+    _saved(store, root, license="MIT")
+    _saved(store, root, "tests/fixtures/site/other.npz", license=HUB_ONLY)
+    name = "tests/fixtures/hf/site/release/modeling_site.py"
+    store.pin_release(name, b"class Site:\n    pass\n", reference="org/site@abc/modeling_site.py",
+                      license="Apache-2.0", root=root)
+    pins = store.pins(root)
+    recording, hub, release = pins[LARGE], pins["tests/fixtures/site/other.npz"], pins[name]
+    assert (recording["repo"], recording["origin"], recording["path"]) == (
+        store.GITHUB, "github", f"{recording['sha256']}.npz")
+    assert release["path"] == f"{release['sha256']}-modeling_site.py" and release["origin"] == "github"
+    assert (hub["repo"], hub.get("origin"), hub["path"]) == (
+        store.STORE, None, f"recordings/{hub['sha256']}.npz")
+    for fixture in (LARGE, name):
+        store._pinned(fixture, {**pins[fixture], "revision": "store-1"}, root)
+    store._pinned("tests/fixtures/site/other.npz", {**hub, "revision": "a" * 40}, root)
+    assert store.check(root) == []
+    for broken in ({"license": HUB_ONLY}, {"revision": "a" * 40}, {"path": "other.npz"},
+                   {"sha256": "not-a-sha"}):
+        store._pinned(LARGE, {**recording, "revision": "store-1", **broken}, root)
+        assert store.check(root)
+    # A release file of a name GitHub would not keep as an asset is refused as it is pinned there, and taken
+    # where it is kept at its release's origin, which is no asset.
+    for unkept in ("model code.py", "model.py."):
+        with pytest.raises(ValueError):
+            store.pin_release(f"tests/fixtures/hf/site/release/{unkept}", b"x", license="MIT", root=root,
+                              reference=f"org/site@abc/{unkept}")
+    store.pin_release("tests/fixtures/hf/site/release/model code.py", b"x", license="MIT", origin=True,
+                      root=root, reference=f"org/site@{'c' * 40}/model code.py")
+
+
+def test_upload_puts_each_due_file_as_an_asset_reads_it_back_and_never_overwrites_one(store, tmp_path,
+                                                                                       monkeypatch):
+    """Upload to GitHub's store opens its first release where none is, uploads each due file as its asset
+    without overwriting, reads it back anonymously and only then pins the release; an asset of its name
+    already held is taken without an upload only where GitHub's digest is the pin's, and refused otherwise;
+    a full release opens the next. A private or missing repository is refused before anything is uploaded,
+    and none is ever created."""
+    root = _checkout(tmp_path)
+    stored = _saved(store, root, license="MIT")
+    pin = store.pins(root)[LARGE]
+    for private, exists in ((True, True), (False, False)):
+        asked, _ = _github(store, monkeypatch, [], private=private, exists=exists)
+        with pytest.raises(SystemExit):
+            store.upload(root)
+        assert not [call for call in asked if call[0] == "release"] and store.pins(root)[LARGE] == pin
+    releases: list[dict] = []
+    asked, served = _github(store, monkeypatch, releases)
+    # A read back that is not the pin's bytes pins nothing; the next upload takes the asset held, uploading
+    # none.
+    monkeypatch.setattr(store, "_downloaded", lambda url: _flipped(stored.read_bytes()))
+    with pytest.raises(AssertionError):
+        store.upload(root)
+    assert store.pins(root)[LARGE]["revision"] is None
+    [upload] = [call for call in asked if call[:2] == ("release", "upload")]
+    assert "--clobber" not in upload
+    asked, served = _github(store, monkeypatch, releases)
+    served[f"store-1/{pin['path']}"] = stored.read_bytes()
+    store.upload(root)
+    assert store.pins(root)[LARGE]["revision"] == "store-1" and store.check(root) == []
+    assert not [call for call in asked if call[:2] == ("release", "upload")]
+    [asset] = releases[0]["assets"]
+    assert asset["name"] == pin["path"] and served[f"store-1/{pin['path']}"] == stored.read_bytes()
+    releases[0]["assets"][0]["digest"] = "sha256:" + "0" * 64
+    store._pinned(LARGE, pin, root)
+    with pytest.raises(SystemExit):
+        store.upload(root)
+    assert store.pins(root)[LARGE]["revision"] is None
+    # A full release opens the one after the highest, whatever releases are missing between.
+    full = [{"tag_name": "store-2", "assets": [{"name": f"{index}.npz", "digest": ""}
+                                               for index in range(store.ASSETS_PER_RELEASE)]}]
+    _github(store, monkeypatch, full)
+    store.upload(root)
+    assert store.pins(root)[LARGE]["revision"] == "store-3"
+    # A pin whose path is not its asset's name writes nothing anywhere.
+    store._pinned(LARGE, {**pin, "path": "../outside.npz"}, root)
+    asked, _ = _github(store, monkeypatch, [])
+    with pytest.raises(SystemExit):
+        store.upload(root)
+    assert not [call for call in asked if call[0] == "release"] and not (root.parent / "outside.npz").exists()
+
+
+def test_fetch_reads_a_githubs_store_file_anonymously_and_takes_it_only_as_its_pin(store, tmp_path,
+                                                                                    monkeypatch):
+    """A file pinned to GitHub's store is fetched from its release's download URL, read anonymously, and kept
+    only where its bytes are its pin's."""
+    root = _checkout(tmp_path)
+    stored = _saved(store, root, license="MIT")
+    data, pin = stored.read_bytes(), store.pins(root)[LARGE]
+    store._pinned(LARGE, {**pin, "revision": "store-3"}, root)
+    asked = []
+    monkeypatch.setattr(store, "_downloaded", lambda url: asked.append(url) or served[0])
+    served = [data]
+    stored.unlink()
+    store.fetch(root)
+    assert stored.read_bytes() == data
+    assert asked == [f"https://github.com/{store.GITHUB}/releases/download/store-3/{pin['sha256']}.npz"]
+    stored.unlink()
+    served[0] = _flipped(data)
+    with pytest.raises(AssertionError):
+        store.fetch(root)
+    assert not stored.exists()
+
+
+def test_move_pins_the_hubs_rehostable_files_to_githubs_store_and_leaves_the_rest(store, tmp_path):
+    """`moved` re-pins each file of the Hub's store whose license lets GitHub's store re-host it to GitHub's
+    store, its upload due, its sha256 and bytes kept; a file under another license, and a release file kept at
+    its own origin, stay as they were."""
+    root = _checkout(tmp_path)
+    _saved(store, root)
+    _saved(store, root, "tests/fixtures/site/moving.npz")
+    origin = "tests/fixtures/hf/site/release/generation_site.py"
+    store.pin_release(origin, b"def sample():\n    pass\n", license="MIT", origin=True, root=root,
+                      reference=f"org/site@{'c' * 40}/generation_site.py")
+    _uploaded(store, root)
+    store._pinned(origin, {**store.pins(root)[origin], "revision": "c" * 40}, root)
+    moving = "tests/fixtures/site/moving.npz"
+    store._pinned(moving, {**store.pins(root)[moving], "license": "mit"}, root)
+    before = store.pins(root)
+    assert store.moved(root) == [moving]
+    after = store.pins(root)
+    assert after[moving] == {**before[moving], "repo": store.GITHUB, "revision": None, "origin": "github",
+                             "path": f"{before[moving]['sha256']}.npz"}
+    assert after[LARGE] == before[LARGE] and after[origin] == before[origin]

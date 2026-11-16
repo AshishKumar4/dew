@@ -25,6 +25,7 @@ Usage, from the checkout:
   python tools/fetched_fixtures.py fetch
   python tools/fetched_fixtures.py check
   python tools/fetched_fixtures.py upload
+  python tools/fetched_fixtures.py move     # the Hub store's re-hostable pins to GitHub's, their upload due
 """
 
 import argparse
@@ -44,7 +45,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 IN_GIT = 1 << 20
 """The largest recording committed to git, in bytes, as the maintainer set it."""
 STORE = "dewml/fixtures"
-"""The fetched store: a public dataset repo on the Hugging Face Hub."""
+"""The fetched store of a file no license lets GitHub's store re-host (`REHOSTED`): a public dataset repo
+on the Hugging Face Hub."""
+GITHUB = "AshishKumar4/dew-fixtures"
+"""The store on GitHub: a public repository whose releases (`GITHUB_RELEASE`) hold each file whose license
+lets it be re-hosted (`REHOSTED`), an asset named by its content (`_asset`), never overwritten, read
+anonymously over HTTPS (owner, 2026-11-16: GitHub rather than R2)."""
+GITHUB_RELEASE = re.compile(r"store-[1-9][0-9]*")
+"""A release of GitHub's store, `store-N`; a new one opens as the last holds `ASSETS_PER_RELEASE`."""
+ASSETS_PER_RELEASE = 1000
+"""The most assets GitHub keeps in one release."""
+REHOSTED = frozenset({"apache-2.0", "mit", "mit and apache-2.0", "the owner's own code"})
+"""The licenses, as a pin names them in any case, under which GitHub's store re-hosts a file; a file under any
+other stays in the Hub's store or at its release's own origin (`ORIGINS`)."""
 FIXTURES = "tests/fixtures"
 LOCAL = "tests/fixtures/fetched"
 PINNED = ".fetched.json"
@@ -71,10 +84,11 @@ FIELDS = tuple(field for field in Pin.__annotations__ if field in Pin.__required
 RELEASE = "release"
 """The `kind` of a pin that holds a release's own file (`pin_release`); a pin without one is a
 recording's."""
-ORIGINS = {"store": "dataset", "release": "model"}
-"""Where a pinned file is fetched from, by its pin's `origin` (the store where none is named), and that
-repo's type on the Hub: the store (`STORE`), where `upload` puts what it holds, or a release's own repo
-at its commit, for a release file its license keeps from being re-hosted (`pin_release(origin=)`)."""
+ORIGINS = {"store": "dataset", "release": "model", "github": None}
+"""Where a pinned file is fetched from, by its pin's `origin` (the Hub's store where none is named), and that
+repo's type on the Hub: the Hub's store (`STORE`), a release's own repo at its commit, for a release file its
+license keeps from being re-hosted (`pin_release(origin=)`), or GitHub's store (`GITHUB`), no Hub repo, where
+`upload` puts every file whose license lets it (`REHOSTED`)."""
 REDRAWN = ".redraw.npy"
 """The member every recording holds (record_case's `<site>.redraw`, which `indexed_recording` reads),
 which marks an NPZ as one."""
@@ -132,16 +146,50 @@ def _file_name(path: str) -> str:
     return name
 
 
-def _pin(data: bytes, name: str, *, reference: str, license: str, kind: str | None = None) -> Pin:
+def _pin(data: bytes, name: str, *, reference: str, license: str, kind: str | None = None,
+         origin: bool = False) -> Pin:
     """The pin of `data` kept in the store for the fixture `name`, before its upload gives a revision: its
-    sha256 and size, `reference` and `license`, and a release file's `kind`, stored where `_store_path`
-    puts it."""
+    sha256 and size, `reference` and `license`, and a release file's `kind`, stored in GitHub's store where
+    its license lets it be re-hosted (`_asset`) and it is not kept at its release's `origin`, else in the
+    Hub's where `_store_path` puts it."""
     sha = digest(data)
+    held = {"sha256": sha, "kind": kind}
     pin: Pin = {"repo": STORE, "revision": None, "sha256": sha, "bytes": len(data), "reference": reference,
-                "license": license, "path": _store_path({"sha256": sha, "kind": kind}, name)}
+                "license": license, "path": _store_path(held, name)}
+    if rehosted(license) and not origin:
+        pin.update(repo=GITHUB, path=_asset(held, name), origin="github")
     if kind is not None:
         pin["kind"] = kind
     return pin
+
+
+def rehosted(license: str) -> bool:
+    """Whether GitHub's store may re-host a file under `license` (`REHOSTED`)."""
+    return license.strip().lower() in REHOSTED
+
+
+def _asset(pin: dict, name: str) -> str:
+    """The asset of GitHub's store holding the file pinned at the fixture `name`: named by its sha256, and a
+    release file by its own name after it, so no name ever holds two files' bytes."""
+    if pin.get("kind") == RELEASE:
+        # GitHub renames an asset with other characters, and a URL reads a space, `#` or `?` as its own.
+        if not re.fullmatch(r"[A-Za-z0-9._-]*[A-Za-z0-9_-]", file := _file_name(name)):
+            raise ValueError(f"{name}: {file!r} is no name GitHub keeps for an asset ([A-Za-z0-9._-], "
+                             "no trailing period)")
+        return f"{_sha(pin)}-{file}"
+    return f"{_sha(pin)}.npz"
+
+
+def _url(repo: str, release: str, asset: str) -> str:
+    return f"https://github.com/{repo}/releases/download/{release}/{asset}"
+
+
+def _downloaded(url: str) -> bytes:
+    """`url` read anonymously over HTTPS, as every machine a test runs on reads it."""
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=600) as response:
+        return response.read()
 
 
 def _store_path(pin: dict, name: str) -> str:
@@ -163,7 +211,7 @@ def pin_release(path, data: bytes, *, reference: str, license: str, origin: bool
     # Written where it resolves to: a symlink at the place, or above it, may not carry a write out.
     if name is None or not (root / name).resolve().is_relative_to((root / FIXTURES).resolve()):
         raise ValueError(f"{path}: a release file is pinned under {FIXTURES}/, and resolves there")
-    pin = _pin(data, name, reference=reference, license=license, kind=RELEASE)
+    pin = _pin(data, name, reference=reference, license=license, kind=RELEASE, origin=origin)
     if origin:
         repo, revision, file = _released(reference)
         pin.update(repo=repo, revision=revision, path=file, origin="release")
@@ -258,11 +306,15 @@ def fetch(root: Path = REPO_ROOT) -> None:
             continue
         if not pin["revision"]:
             raise SystemExit(f"{name}: pinned with no revision and not in {LOCAL}: its upload is due")
-        from huggingface_hub import hf_hub_download
+        if pin.get("origin") == "github":
+            data = _checked(_downloaded(_url(pin["repo"], pin["revision"], pin["path"])), pin, name)
+        else:
+            from huggingface_hub import hf_hub_download
 
-        kind = ORIGINS[pin.get("origin", "store")]
-        downloaded = Path(hf_hub_download(pin["repo"], pin["path"], repo_type=kind, revision=pin["revision"]))
-        data = _checked(downloaded.read_bytes(), pin, name)
+            kind = ORIGINS[pin.get("origin", "store")]
+            downloaded = Path(hf_hub_download(pin["repo"], pin["path"], repo_type=kind,
+                                              revision=pin["revision"]))
+            data = _checked(downloaded.read_bytes(), pin, name)
         stored.parent.mkdir(parents=True, exist_ok=True)
         partial = stored.with_name(f".{stored.name}.partial")
         partial.write_bytes(data)
@@ -285,17 +337,90 @@ def card(catalog: dict[str, dict]) -> str:
             "|---|---|---|---|---|\n" + rows + "\n")
 
 
-def upload(root: Path = REPO_ROOT) -> None:
-    """Every pin with no revision, uploaded in one commit with the store's catalog, which keeps every
-    file the store has held, and its card; each file is read back anonymously at that commit, as a
-    fetch reads it, and checked before its pin takes the revision."""
-    from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
-    from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
+def _gh(*arguments: str) -> str:
+    return subprocess.run(["gh", *arguments], capture_output=True, text=True, check=True).stdout
 
+
+def upload_github(due: dict[str, dict], root: Path = REPO_ROOT) -> None:
+    """Every pin of `due` (GitHub's store's, with no revision) uploaded as its asset (`_asset`) to the open
+    release of GitHub's store, `store-N`, the next opened once it holds `ASSETS_PER_RELEASE`; an asset of its
+    name already held is taken only where GitHub's digest of it is the pin's sha256, and none is ever
+    overwritten (`gh release upload` without --clobber). Each asset is read back anonymously, as a fetch reads
+    it, and checked before its pin takes its release. The repository is the owner's to create, public: none is
+    created here."""
+    try:
+        if json.loads(_gh("api", f"repos/{GITHUB}"))["private"]:
+            raise SystemExit(f"{GITHUB} is private, and a fetch reads it anonymously")
+        pages = json.loads(_gh("api", "--paginate", "--slurp", f"repos/{GITHUB}/releases"))
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(f"{GITHUB} could not be read ({error.stderr.strip()[-200:]}): the owner creates it, "
+                         "public, before its first upload") from error
+    releases = sorted((release for page in pages for release in page
+                       if GITHUB_RELEASE.fullmatch(release["tag_name"])),
+                      key=lambda release: int(release["tag_name"].removeprefix("store-")))
+    held = {asset["name"]: (release["tag_name"], asset.get("digest") or "")
+            for release in releases for asset in release["assets"]}
+    counts = {release["tag_name"]: len(release["assets"]) for release in releases}
+    with tempfile.TemporaryDirectory() as directory:
+        for name, pin in sorted(due.items()):
+            # The asset's name is the pin's content's, never a path the pin carries (review).
+            asset = _asset(pin, name)
+            if pin["path"] != asset:
+                raise SystemExit(f"{name}: its pin names {pin['path']!r}, not its asset {asset!r}")
+            if asset in held:
+                release, said = held[asset]
+                if said != f"sha256:{pin['sha256']}":
+                    raise SystemExit(f"{name}: {asset} in {GITHUB}'s {release} is not its pin's bytes "
+                                     f"({said})")
+            else:
+                release = next((tag for tag, count in counts.items() if count < ASSETS_PER_RELEASE), None)
+                if release is None:
+                    # After the highest, whatever releases were removed between (review).
+                    highest = max((int(tag.removeprefix("store-")) for tag in counts), default=0)
+                    release = f"store-{highest + 1}"
+                    _gh("release", "create", release, "--repo", GITHUB, "--title", release, "--notes",
+                        "Dew's recorded test fixtures (https://github.com/AshishKumar4/dew): each asset is "
+                        "named by its SHA-256, pinned beside the fixture it stands for in Dew's "
+                        "tests/fixtures/, and licensed as the reference it records, as its pin names.")
+                    counts[release] = 0
+                written = Path(directory) / asset
+                written.write_bytes(_checked(_stored(pin, root).read_bytes(), pin, name))
+                _gh("release", "upload", release, str(written), "--repo", GITHUB)
+                written.unlink()
+                counts[release] += 1
+                held[asset] = (release, f"sha256:{pin['sha256']}")
+            _checked(_downloaded(_url(GITHUB, release, asset)), pin, name)
+            print(f"{pin['sha256']}  {asset} read back at {GITHUB}'s {release}", flush=True)
+            _pinned(name, {**pin, "revision": release}, root)
+
+
+def moved(root: Path = REPO_ROOT) -> list[str]:
+    """Every pin of the Hub's store whose license lets GitHub's store re-host it (`REHOSTED`), pinned to
+    GitHub's store with no revision, its upload due there (`upload`); a release file kept at its origin, and
+    every file under another license, stays as it is. Returns the fixtures moved."""
+    moving = {name: pin for name, pin in pins(root).items()
+              if pin.get("origin", "store") == "store" and pin["repo"] == STORE and rehosted(pin["license"])}
+    for name, pin in moving.items():
+        moving_to = {"repo": GITHUB, "revision": None, "path": _asset(pin, name), "origin": "github"}
+        _pinned(name, {**pin, **moving_to}, root)
+    return sorted(moving)
+
+
+def upload(root: Path = REPO_ROOT) -> None:
+    """Every pin with no revision uploaded: GitHub's store's as its assets (`upload_github`), the Hub's in one
+    commit with the store's catalog, which keeps every file the store has held, and its card; each file is
+    read back anonymously, as a fetch reads it, and checked before its pin takes the revision."""
     due = {name: pin for name, pin in pins(root).items() if not pin["revision"]}
     if not due:
         print("every pin holds its revision")
         return
+    if github := {name: pin for name, pin in due.items() if pin.get("origin") == "github"}:
+        upload_github(github, root)
+    due = {name: pin for name, pin in due.items() if pin.get("origin") != "github"}
+    if not due:
+        return
+    from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
     api = HfApi()
     api.create_repo(STORE, repo_type="dataset", private=False, exist_ok=True)
     if api.repo_info(STORE, repo_type="dataset").private:
@@ -351,17 +476,26 @@ def check(root: Path = REPO_ROOT) -> list[str]:
             problems.append(f"{name}: its pin holds no {', '.join(missing)}"
                             + (" (its upload is due)" if "revision" in missing else ""))
             continue
-        released = pin.get("origin") == "release"
-        # A file kept at its release's origin is the release's own file there, its reference's.
-        where = ((pin["repo"], pin["revision"], pin["path"]) == _released(pin["reference"]) if released
-                 else pin["path"] == _store_path(pin, name) and pin["repo"] == STORE)
+        released, github = pin.get("origin") == "release", pin.get("origin") == "github"
+        # A file kept at its release's origin is the release's own file there, its reference's; one of
+        # GitHub's store its asset, of a sha256 and a name GitHub keeps (`_asset`).
+        try:
+            where = ((pin["repo"], pin["revision"], pin["path"]) == _released(pin["reference"]) if released
+                     else (pin["repo"], pin["path"]) == (GITHUB, _asset(pin, name)) if github
+                     else pin["path"] == _store_path(pin, name) and pin["repo"] == STORE)
+        except ValueError:
+            where = False
         if (not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"]) or pin.get("kind") not in (None, RELEASE)
                 or pin.get("origin", "store") not in ORIGINS or (released and pin.get("kind") != RELEASE)
                 or not where):
             problems.append(f"{name}: its pin's sha256 {pin['sha256']!r} or path {pin['path']!r} is not "
                             f"of its origin's form")
-        if not re.fullmatch(r"[0-9a-f]{40}", pin["revision"]):
-            problems.append(f"{name}: its pin's revision {pin['revision']!r} is not a commit")
+        if github and not rehosted(pin["license"]):
+            problems.append(f"{name}: its license, {pin['license']!r}, keeps it from GitHub's store")
+        form = GITHUB_RELEASE.pattern if github else r"[0-9a-f]{40}"
+        if not re.fullmatch(form, pin["revision"]):
+            problems.append(f"{name}: its pin's revision {pin['revision']!r} is not "
+                            f"{'a release of the store' if github else 'a commit'}")
         if pin["bytes"] <= IN_GIT and pin.get("kind") != RELEASE:
             problems.append(f"{name}: {pin['bytes']:,} bytes, at most {IN_GIT:,}, belongs in git")
         if name in tracked:
@@ -371,8 +505,12 @@ def check(root: Path = REPO_ROOT) -> list[str]:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("fetch", "check", "upload"))
+    parser.add_argument("command", choices=("fetch", "check", "upload", "move"))
     command = parser.parse_args(argv).command
+    if command == "move":
+        moving = moved()
+        print(f"{len(moving)} pins moved to {GITHUB}, their upload due: `upload` once it exists")
+        return 0
     if command == "check":
         problems = check()
         print("\n".join(problems) if problems else "fetched fixtures: every pin whole, no recording over "
