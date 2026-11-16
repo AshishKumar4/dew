@@ -288,7 +288,8 @@ class InContextMemory(LinearProducts):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
-    reads: ClassVar[frozenset[str]] = frozenset()
+    reads: ClassVar[frozenset[str]] = frozenset({"forks"})
+    """A call's forks, which its shared recurrence reads (`_recurrent`) and its general path refuses."""
 
     def __post_init__(self):
         if self.chunk < 1:
