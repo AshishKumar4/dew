@@ -805,6 +805,44 @@ def test_a_launch_traced_under_a_compile_only_gpus_mesh_is_certified_on_that_gpu
 
 
 @lowers("sm90")
+def test_a_runs_launch_traced_outside_its_mesh_is_certified_on_the_gpu_it_targets():
+    """A launch a run traces outside its mesh (its start's, `Trainer._started`) is certified on the GPU the
+    run targets (`report.targeting`, a compile-only H100's mesh) and on no other, on any host. Certified on
+    a host's own GPU, a GH200's start compiling ahead for an H100 certified five launches twice, apart, its
+    step's trace again on the mesh's (row 6824)."""
+    class Targeted(TwoKernels):
+        """`TwoKernels`, a launch of its own: certified here, whatever this process certified before."""
+
+    op = Targeted()
+    devices, lowered = _paired_step(op)
+    before = {id(each) for each in report.certifications()}
+    with generation.assumed("sm90"), report.targeting(devices):
+        lowered()
+    [certified] = [each for each in report.certifications()
+                   if id(each) not in before and each.op == type(op).__name__]
+    assert certified.device == devices.devices.flat[0], certified.device
+
+
+@pytest.mark.gpu(reason="certifies and runs a kernel on this host's GPU")
+def test_a_plain_jit_on_this_gpu_certifies_its_launch_there_and_runs():
+    """A Dew kernel called under a plain jit on this GPU, no mesh and no run naming a target, is certified
+    on the device the call runs on (JAX's default device) and runs there: a target a run names
+    (`report.targeting`) leaves a plain call's certification where it was. Its arithmetic is
+    test_norm_swiglu's."""
+    from dew.nn.norms import stream_rms_normalized
+
+    # Rows of no other test's, so this process certifies the launch here.
+    x = jax.random.normal(jax.random.key(0), (232, 384), jnp.bfloat16)
+    scale = jnp.ones((384,), jnp.bfloat16)
+    before = {id(each) for each in report.certifications()}
+    jax.jit(lambda x, scale: stream_rms_normalized(
+        x, None, scale, 1e-6, jnp.bfloat16, scale_offset=False, scale_after_cast=False, fp32_statistics=True,
+        implementation="pallas")[1])(x, scale).block_until_ready()
+    certified = [each for each in report.certifications() if id(each) not in before]
+    assert certified and {each.device for each in certified} == {jax.devices()[0]}, certified
+
+
+@lowers("sm90")
 def test_a_round_of_rungs_traced_under_a_compile_only_gpus_mesh_is_certified_on_that_gpu():
     """A round of a launch's configs certified at once (`report.certified_together`, a ladder's rounds past
     its first rung) under a compile-only H100's mesh, no device named to certify on: each certified on that

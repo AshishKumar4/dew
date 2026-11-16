@@ -67,7 +67,7 @@ from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
 from dew._devices import COMPILE_ONLY_MEMORY, device_memory
 from dew._records import JSON, boolean, record
-from dew._stated import Unestablished
+from dew._stated import Unestablished, traceback_frames
 from dew.batch import Batch
 from dew.nn.kernels import options
 from dew.nn.kernels.generation import (
@@ -88,6 +88,7 @@ from dew.nn.kernels.options import (
     owned_program,
     program_digest,
     shapes_of,
+    stated_digest,
     taking,
 )
 from dew.nn.kernels.selection import Unlowerable
@@ -212,8 +213,9 @@ class HeldTraceback:
 
 
 def _held_traceback(traceback: Traceback) -> tuple[type[HeldTraceback], tuple[tuple[str, ...]]]:
-    """A traceback of JAX's reduced to its frames (`HeldTraceback`), as a program file holds it."""
-    return HeldTraceback, (tuple(str(frame) for frame in traceback.frames),)
+    """A traceback of JAX's reduced to its frames (`HeldTraceback`, `dew._stated.traceback_frames`), as a
+    program file holds it."""
+    return HeldTraceback, (tuple(traceback_frames(traceback)),)
 
 
 def filed(value: Executable | AheadPrograms | AheadOfTime) -> bytes:
@@ -289,7 +291,7 @@ class AheadProgram:
         """The executable, loaded onto `devices`, for a run whose program lowered as `lowered`: refused
         where that is another program than this one, and admitted as a compiled one is
         (`dew.communicators.admit`)."""
-        if program_digest(lowered) != self.program:
+        if stated_digest(lowered) != self.program:
             raise NotTheStepCompiledAhead(
                 "the sampled step compiled ahead is another program than the one this run compiles: compile "
                 "it ahead from this run's config, with its inspection")
@@ -484,7 +486,7 @@ class AheadOfTime:
         """The executable, loaded (`loaded`), for a run whose step lowered as `lowered`: refused where
         that is another program than the one compiled ahead, a config, a data shape, a rung or a Dew
         that differs, which the executable would not run as the run's step."""
-        if program_digest(lowered) != self.program:
+        if stated_digest(lowered) != self.program:
             raise NotTheStepCompiledAhead(
                 "the step compiled ahead is another program than the one this run compiles first: compile it "
                 "ahead from this run's config and data (--trainer.compile-ahead), with this Dew, and no plan "
@@ -739,10 +741,15 @@ class Keeping:
         named = f"{identity.called(program)} ({len(self.refused)})"
         try:
             call = identity.call_identity(program, key)
-            serialized = Executable.of(executable)
+            # Stated before it is serialized: a tree of a node no process names (a class made inside a
+            # function) is a program no file holds, which pickling its trees refuses by no error of its own
+            # (an AttributeError on Python 3.12).
+            digest = program_digest(lowered)
         except Unestablished as refusal:
             self.refused[named] = str(refusal)
             return
+        try:
+            serialized = Executable.of(executable)
         except (NotImplementedError, ValueError) as refusal:
             # As `compile_programs` reads it: an array a program closed over is a constant of its
             # program, which no executable serializes.
@@ -757,7 +764,7 @@ class Keeping:
                                   "outside the process's default backend"
             return
         devices = tuple(device.id for device in ran)
-        program_kept = AheadProgram(program_digest(lowered), serialized)
+        program_kept = AheadProgram(digest, serialized)
         self.kept[identity.digest(call)] = KeptProgram(call, program_kept, devices)
 
     def save(self, path: str | Path) -> AheadPrograms:
@@ -833,7 +840,11 @@ def kept(path: str | Path, *, verify: bool = True) -> Iterator[AheadPrograms]:
             return None
         if found is None:
             return None
-        if verify and program_digest(program.lower(*args, **kwargs)) != found.program.program:
+        if not verify:
+            return found.loaded()
+        # A program whose trees no file states (None) is none the file kept: its call's identity misses
+        # what changed it.
+        if stated_digest(program.lower(*args, **kwargs)) != found.program.program:
             raise NotTheKeptProgram(
                 f"{identity.called(program)} lowers here to another program than the one kept at "
                 f"{path} for the same identity: something its trace reads is outside the identity "
@@ -1199,7 +1210,7 @@ class LaterPlans:
     own, its objective a copy at its pass count (`PhasePasses.apart`), so the loop's objectives and plan are
     never touched. What each compiled is handed to that phase's boundary (`taken`), whose plan, made there
     against the devices' allocators as they stand, finds each candidate's trace (`candidate_for`) and
-    executable (`FitSearch.compiled`) made: the GPUs no longer idle while it compiles (336 s at a 4B
+    executable (`dew.nn.kernels.options.held`) made: the GPUs no longer idle while it compiles (336 s at a 4B
     decision run's second phase on a GH200, M-MC-3q). One thread, joined: each phase's at its boundary,
     every phase's as the run ends, however it ends. A phase whose plan failed off the loop says so at its
     boundary, which plans it as it would have. A pooled run, a host-master or rollout run, one that tunes
@@ -1233,7 +1244,7 @@ class LaterPlans:
         # hold per thread), its context variables copied.
         entered = carried()
 
-        def planned(phase: int) -> dict:
+        def planned(phase: int) -> None:
             with entered():
                 return _phase_plan(trainer, shapes, split_fields(phase_batch(trainer, batch, phase))[0],
                                    counts[phase])
@@ -1247,18 +1258,18 @@ class LaterPlans:
         _log.info("planning the steps of data phases %s off the loop", begun)
         return cls(futures)
 
-    def taken(self, passes: int | None) -> dict | None:
-        """The executables the phase whose step runs `passes` compiled (`FitSearch.compiled`), its plan
-        waited for; None where none was planned or its plan failed, said."""
+    def waited(self, passes: int | None) -> None:
+        """The plan of the phase whose step runs `passes` waited for, so the executables it compiled, which
+        the process holds (`dew.nn.kernels.options.held`), are there for the boundary's plan; one that
+        failed said, the boundary planning it as it would have."""
         future = self.futures.pop(passes, None) if passes is not None else None
         if future is None:
-            return None
+            return
         try:
-            return future.result()
+            future.result()
         except Exception as error:  # the boundary plans the phase as it would have
             _log.warning("planning the step of %d passes off the loop failed; its boundary plans it: %r",
                          passes, error)
-            return None
 
     def stopped(self) -> None:
         """Every phase's plan waited for as the run ends, a pending one not begun, one that failed said."""
@@ -1271,23 +1282,22 @@ class LaterPlans:
 
 
 def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
-                                 passes: int) -> dict:
-    """The executables a plan of `trainer`'s step at `passes` compiled over `state`'s shapes and `batch`
-    (`LaterPlans`), on a compiler and objective of its own; what it compiled before a refusal where no
-    candidate fit the devices as they stand off the loop, which the boundary judges again."""
+                                 passes: int) -> None:
+    """A plan of `trainer`'s step at `passes` over `state`'s shapes and `batch` (`LaterPlans`), on a compiler
+    and objective of its own, its executables held by the process (`dew.nn.kernels.options.hold`), those it
+    compiled before a refusal where no candidate fit the devices as they stand off the loop among them, which
+    the boundary judges again."""
     from dew.training.compiler import StepCompiler
     from dew.training.planning import PlanRefused
 
     phases = trainer.phase_passes.apart(passes)
     compiler = StepCompiler(phases.base, trainer._compiler.links(trainer.device_mesh), None, phases)
     stepping = dataclasses.replace(trainer._stepping(phases.base, compiler), shape=trainer._afresh_shape())
-    executables: dict = {}
     try:
-        compiler._plan(stepping, state, batch, None, executables=executables)
+        compiler._plan(stepping, state, batch, None)
     except PlanRefused as refused:
         _log.info("the step of %d passes fits no plan off the loop; its boundary plans it: %s", passes,
                   refused)
-    return executables
 
 def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
                                  partition: DataPartition | None = None) -> Batch:
@@ -1416,7 +1426,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
     except Unlowerable as refused:
         raise refused.refusing("step") from refused
     # The sampled step as the search compiled it, its program what it lowered then.
-    sampled = None if planned.sampled is None else AheadProgram.of(*planned.sampled)
+    sampled = (None if planned.sampled is None
+               else AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable))
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     memory = compiled_memory(compiled)

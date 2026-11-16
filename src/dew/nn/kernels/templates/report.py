@@ -24,7 +24,7 @@ import struct
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, overload
@@ -44,8 +44,6 @@ from dew._devices import deterministic_ops_requested, deviceless, xla_flag
 from dew.nn.kernels import generation
 
 if TYPE_CHECKING:
-    from jax.extend import core as jax_core
-
     from dew.nn.kernels.lowered import KernelCall
     from dew.nn.kernels.templates.resources import RegisterModel
 
@@ -170,8 +168,9 @@ def naming() -> Iterator[list[tuple[str | None, "RegisterModel | None", str | No
 @contextlib.contextmanager
 def replayed() -> Iterator[None]:
     """Within the block, no launch traces: the state a held trace is kept under (`tuning.lowered_once`),
-    which reads the launch tracing it only as it names its kernels and carries the launch on their calls,
-    each replayed as it is bound (`renamed`, `carrying`)."""
+    which reads the launch tracing it only as it names its kernels and carries the launch on their calls:
+    its key holds the launch (`launch_metadata`), so a held trace is the launch's own, its names replayed as
+    it is bound (`renamed`)."""
     tracing, form, naming = _TRACING.set(None), _FORM.set(((), None)), _NAMING.set(None)
     try:
         yield
@@ -401,41 +400,6 @@ def _named(name: str | None, model: "RegisterModel | None") -> str | None:
     return launch_name(kernel, own)
 
 
-def carrying(closed: "jax_core.Jaxpr", metadata: bytes) -> "jax_core.Jaxpr":
-    """`closed` with each Mosaic GPU call in it carrying `metadata` (`launch_metadata`), the launch it is
-    bound for: a held trace (`tuning.lowered_once`) bound for another launch than the one it was traced
-    for, whose calls' compiled serializations then name that launch (`Binary.caller`)."""
-    from jax._src.pallas.mosaic_gpu import core as plgpu_core
-
-    from dew.nn import programs
-
-    def carried_jaxpr(jaxpr: "jax_core.Jaxpr") -> "jax_core.Jaxpr":
-        # Its constants with it (`ClosedJaxpr` is `Jaxpr`); itself where no equation's parameters change: a
-        # kernel's body, unchanged, keeps its identity, by which its lowering's cache key is kept.
-        equations = [carried_equation(equation) for equation in jaxpr.eqns]
-        if all(new is old for new, old in zip(equations, jaxpr.eqns, strict=True)):
-            return jaxpr
-        return jaxpr.replace(eqns=equations)
-
-    def carried_equation(equation: "jax_core.JaxprEqn") -> "jax_core.JaxprEqn":
-        params = {key: carried(value) for key, value in
-                  programs.with_bodies(equation.params, carried_jaxpr).items()}
-        if all(params[key] is equation.params[key] for key in params):
-            return equation
-        return equation.replace(params=params)
-
-    def carried(value: Hashable | Mapping) -> Hashable | Mapping:
-        # A Mosaic GPU call's parameters carrying the launch, where they stand alone or by their backend.
-        if isinstance(value, plgpu_core.CompilerParams):
-            return dataclasses.replace(value, metadata=metadata)
-        if isinstance(value, Mapping) and any(isinstance(each, plgpu_core.CompilerParams)
-                                              for each in value.values()):
-            return {key: carried(each) for key, each in value.items()}
-        return value
-
-    return carried_jaxpr(closed)
-
-
 def launch_metadata() -> bytes:
     """The launch tracing (`launching`) as its kernels' calls carry it beside their names (`named`): its
     digest, a Mosaic GPU call's caller metadata (`plgpu.CompilerParams.metadata`, kept in its compiled call's
@@ -575,6 +539,9 @@ _CERTIFYING: contextvars.ContextVar = contextvars.ContextVar("certifying_device"
 """The device a launch's derived config is certified on (`certified`) where a block names one
 (`certifying`)."""
 
+_TARGETED: contextvars.ContextVar = contextvars.ContextVar("certified_target", default=None)
+"""The mesh a run targets (`targeting`), whose GPU a trace of the run outside any mesh certifies on."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Certification:
@@ -643,6 +610,19 @@ def certifying(device) -> Iterator[None]:
         yield
     finally:
         _CERTIFYING.reset(token)
+
+
+@contextlib.contextmanager
+def targeting(mesh: jax.sharding.Mesh) -> Iterator[None]:
+    """Within the block, a trace outside any mesh certifies as one under `mesh` does (`_certifying_device`):
+    a run's trace outside its mesh (its start's, `Trainer._started`) on the GPU the run targets. Certified on
+    the host's own, a GH200's start compiling ahead for a compile-only H100 certified five launches twice,
+    apart, its step's trace again on the mesh's (row 6824)."""
+    token = _TARGETED.set(mesh)
+    try:
+        yield
+    finally:
+        _TARGETED.reset(token)
 
 
 def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round: int | None = None
@@ -781,19 +761,26 @@ def missed(op, arguments: tokamax.BoundArguments, config: Hashable, refused: Seq
 def _certifying_device():
     """The device a launch is certified on (`certified`): a block's (`certifying`), else the GPU the trace's
     program runs on, the concrete mesh's (`jax.set_mesh`: a compile-only GPU's where a run's start compiles
-    ahead for one, `dew.training.ahead`), else this process's own GPU; either where it compiles for that
-    GPU's own generation (`generation.device_target`, whatever `assumed` says: an A100 tracing for an
-    assumed sm90 compiled the sm90 launch on itself, and Mosaic refused its TMA copies, rows 6677 and 6678),
-    else none. A trace under a compile-only GPU's mesh certified on the host's own GPU certified each launch a
-    second time, apart, where the start's compile certified it on the mesh's (row 6791)."""
+    ahead for one, `dew.training.ahead`), else the mesh's its run targets (`targeting`), else, nothing
+    naming a target, JAX's default device, which a call no mesh places runs on (a plain jit's); either where
+    it compiles for that GPU's own generation (`generation.device_target`, whatever `assumed` says: an A100
+    tracing for an assumed sm90 compiled the sm90 launch on itself, and Mosaic refused its TMA copies, rows
+    6677 and 6678), else none. A trace under a compile-only GPU's mesh, or a run's outside it, certified on
+    the host's own GPU certified each launch a second time, apart, where the start's compile certified it on
+    the mesh's (rows 6791, 6824)."""
     from jax._src import mesh as mesh_lib
 
     named = _CERTIFYING.get()
     if named is not None:
         return named
     placed = mesh_lib.get_concrete_mesh()
-    devices = jax.local_devices() if placed.empty else [
-        device for device in placed.devices.flat if device.process_index == jax.process_index()]
+    if placed.empty:
+        placed = _TARGETED.get()
+    if placed is None:
+        default = jax.config.jax_default_device
+        devices = [default if isinstance(default, jax.Device) else jax.devices(default)[0]]
+    else:
+        devices = [device for device in placed.devices.flat if device.process_index == jax.process_index()]
     # A device of another generation (a CPU's, an A100's under an assumed sm90) certifies nothing.
     if not devices or generation.device_target(devices[0]).generation != generation.gpu_target().generation:
         return None
@@ -981,13 +968,14 @@ def _commit(proposal: Recorded) -> None:
     _add(rewritten=proposal.rewritten, passes=proposal.passes)
 
 
-def _add(**records: Iterable) -> None:
+def _add(**records: Sequence) -> None:
     """Each of `records`, a `Recorded` field's entries, added to this context's registry and to every
-    `recording` open in it."""
+    `recording` open in it; a miss once a holder (`_record`), each other record as often as it is made."""
     with _GUARD:
         for held in (_registry(), *_RECORDING.get()):
             for name, entries in records.items():
-                getattr(held, name).extend(entries)
+                found = getattr(held, name)
+                found.extend(entry for entry in entries if name != "missed" or entry not in found)
 
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
@@ -1005,9 +993,7 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
         if miss is None:
             return False
         new = miss not in registry.missed
-        for held in (registry, *_RECORDING.get()):
-            if miss not in held.missed:
-                held.missed.append(miss)
+        _add(missed=(miss,))
         return new
 
 
@@ -1568,6 +1554,12 @@ class AssemblerNote:
     message: str
 
 
+def refuses(frame: int, codes: Collection[str]) -> bool:
+    """Whether a kernel the assembler built with a `frame`-byte stack frame, noting `codes`
+    (`ASSEMBLER_NOTES`' codes), is refused for its config: it spills, or its warpgroup MMAs were serialized
+    (`SERIALIZED`). Certification's verdict (`Binary.refused`) and the compile gate's alike."""
+    return bool(frame) or bool(SERIALIZED & set(codes))
+
 @dataclasses.dataclass(frozen=True)
 class Binary:
     """A Mosaic GPU or Pallas-Triton kernel's binary as its executable carries it (`binaries`): its name less
@@ -1597,9 +1589,8 @@ class Binary:
 
     @property
     def refused(self) -> bool:
-        """Whether its config is refused for it: it spills (`frame`), or the assembler serialized its
-        warpgroup MMAs (`SERIALIZED`)."""
-        return bool(self.frame) or any(note.code in SERIALIZED for note in self.notes)
+        """Whether its config is refused for it (`refuses`)."""
+        return refuses(self.frame, [note.code for note in self.notes])
 
 
 def binaries(executable: jax.stages.Compiled, *, decoded: bool = False) -> list[Binary]:

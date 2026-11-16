@@ -1,13 +1,14 @@
 """The kernel cost vocabulary (`Work`) and the template's tile walk over it (`walked`), from a GPU's facts
-(`generation.GpuTarget`): docs/design/algebra.md §6.5, kernel-templates.md's toolkit. A program of a tile
-walk does tensor-core FLOPs, stages bytes through shared memory (its operand tiles written there and read
-back by its matrix instructions), evaluates special-function exponentials and does fp32 operations on the
-CUDA cores (the algebra between its products); its units overlap, so its time is the longest unit's at its
-rate (`walked`, ties broken by the units in series, `dew.algebra.cost.Walk`). The tensor cores' rate is the
-generation's (`GpuTarget.tensor_rate`), the shared-memory and special-function rates its architecture's
-(`generation.Multiprocessor.shared_bytes_per_clock`, `exponentials_per_clock`), the CUDA cores' the
-generation's fp32 rate. Nothing ranks a launch's configs by it (bible §6: configs are derived); the
-derivation prices a form a template's algebra takes by it (`dew.algebra.derive`, `dew.algebra.carry`)."""
+(`generation.GpuTarget`): docs/design/algebra.md §6.5, kernel-templates.md's toolkit. A program of a tile walk
+does tensor-core FLOPs, stages bytes through shared memory (its operand tiles written there and read back by
+its matrix instructions), evaluates special-function exponentials and does fp32 operations on the vector units
+(the CUDA cores', a TPU's VPU: the algebra between its products); its units overlap, so its time is the
+longest unit's at its rate (`walked`, ties broken by the units in series, `dew.algebra.cost.Walk`). The tensor
+cores' rate is the generation's (`GpuTarget.tensor_rate`), the vector and special-function rates its
+architecture's (`generation.Architecture.vector_per_clock`, `exponentials_per_clock`), shared memory's its
+multiprocessor's (`generation.Multiprocessor.shared_bytes_per_clock`). Nothing ranks a launch's configs by it
+(bible §6: configs are derived); the derivation prices a form a template's algebra takes by it
+(`dew.algebra.derive`, `dew.algebra.carry`)."""
 
 
 import dataclasses
@@ -85,7 +86,8 @@ class Work:
 def rates(target: generation.GpuTarget, *, device: bool) -> tuple[float | None, ...]:
     """`target`'s rate of each unit `units` prices, per second: the tensor cores' 16-bit, TF32 and FP8 modes
     (FP8's the 16-bit one's where the generation states none, its codes unpacked into 16-bit products), the
-    CUDA cores, the special-function units, shared memory and device memory. Each is a multiprocessor's at
+    vector units (the CUDA cores, a TPU's VPU), the special-function units, shared memory and device memory.
+    Each is a multiprocessor's at
     the clock the target holds under a step's tensor-core load (`GpuTarget.loaded_clock_hz`: a B200's
     measured 1.549 GHz, not its 1.965 GHz boost), or with `device` the whole device's (its multiprocessors
     at that clock, the tensor cores at its datasheet's dense peak where it states no clock), where a tile
@@ -100,14 +102,14 @@ def rates(target: generation.GpuTarget, *, device: bool) -> tuple[float | None, 
     def rate(per_clock: float | None) -> float | None:
         return None if per_clock is None or each is None else per_clock * each
 
-    # A TPU has no CUDA multiprocessor, nor its special-function units' or shared memory's rates.
-    held = target.architecture.multiprocessor
+    # A TPU has no CUDA multiprocessor, nor its shared memory's rate.
+    architecture, held = target.architecture, target.architecture.multiprocessor
     tensor = rate(target.tensor_rate("16bit"))
     if tensor is None and device:
         tensor = target.bf16_peak
     eight = rate(target.tensor_rate("8bit")) or tensor
-    return (tensor, rate(target.tensor_rate("tf32")), eight, rate(target.tensor_rate("fp32")),
-            rate(None if held is None else held.exponentials_per_clock),
+    return (tensor, rate(target.tensor_rate("tf32")), eight, rate(architecture.vector_per_clock),
+            rate(architecture.exponentials_per_clock),
             math.inf if device else rate(None if held is None else held.shared_bytes_per_clock),
             target.memory_rate if device else math.inf)
 

@@ -267,7 +267,7 @@ class KimiDeltaAttention(nn.Module):
     def _fused_token(self, taps, g, beta, gate, valid, starts, operand):
         """A decode token's conv, update and gated norm in one launch (`linear.fused_token` under
         `FUSED`): its decay a key dimension, write gate and output gate a row's, as the layer forms them, its
-        output read back in `operand`, the input projection's dtype, before the norm (`as_projected`)."""
+        output read back in `operand`, the input projection's dtype, before the norm."""
         hooks = dataclasses.replace(FUSED, output=recurrence.OutputNorm(self.norm_eps, 'sigmoid',
                                                                         read_in=jnp.dtype(operand).name))
         return fused_token(hooks, taps,

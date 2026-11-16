@@ -41,6 +41,7 @@ from dew.distributed.placement import Layout, MeshSpec, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
+from dew.nn.kernels import options
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
@@ -280,6 +281,38 @@ def lm(split=None, accumulation=1, objective=LMObjective, *, seq=SEQ, width=16, 
                               split=split, accumulation=accumulation))
 
 
+def test_a_step_whose_optimizer_state_is_a_class_made_in_its_factory_plans_and_steps():
+    """A step whose optimizer keeps its state in a class its factory makes, as an optax-style factory may: a
+    node no process names, which no file of programs states, is planned and compiled within this process by
+    the program as JAX holds it (`program_key`), so the run plans and steps, where the plan's key of its
+    executables stated its trees for a file and raised (train 961's F1)."""
+    from optim_support import counting
+
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ)
+    trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), counting(1e-2), key=jax.random.key(0)))
+    state = trained(trainer, steps=2)
+    assert int(state.opt_state.steps) == 2
+
+
+def test_a_second_trainer_of_one_step_plans_on_the_executable_the_first_compiled():
+    """A second trainer of a process, its step the same program on the same devices as an earlier one's,
+    plans on the executable the earlier compiled (`dew.nn.kernels.options.hold`): its plan compiles nothing
+    and reads nothing back from the persistent compilation cache, which the compile telemetry would name
+    (`Compiles`, a backend compile or a cache read alike), where every new trainer read its step back (4.4 s
+    of a small model's 11.9 s start on CPU, row 6995); it steps as the first."""
+    from dew.telemetry.compiles import Compiles
+
+    first = trained(lm(split=1), steps=1)
+    second = lm(split=1)
+    with Compiles(None) as compiles:
+        state = trained(second, steps=1)
+    assert [program.name for program in compiles.programs if program.kind == "compiled"
+            and program.name == "jit(step)"] == []
+    for one, other in zip(jax.tree.leaves(first.variables), jax.tree.leaves(state.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(one), np.asarray(other))
+
+
 def trained(trainer, steps=3, batch=None):
     """The state after `steps` steps of `batch`, BATCH where None."""
     batch = BATCH if batch is None else batch
@@ -309,6 +342,8 @@ def needs(monkeypatch, trainer, run=None):
         trained(trainer, steps=0)
     else:
         run()
+    # Measured as in a process apart: the run a test then counts compiles nothing of it.
+    options.unhold()
     return LIMIT - trainer.plan["probes"][0]["headroom"]
 
 
@@ -1427,6 +1462,8 @@ def test_a_tight_start_compiles_twice_cold_and_once_warm(monkeypatch, tmp_path, 
     with Compiles("step") as compiles:
         trained(cold_run, steps=0)
     assert compiles.count == cold and cold_run.plan["split"] == between[1]
+    # A warm process: the cold one's record, none of its executables.
+    options.unhold()
     with Compiles("step") as compiles:
         trained(warm, steps=0)
     assert compiles.count == 1 and warm.plan["split"] == between[1]

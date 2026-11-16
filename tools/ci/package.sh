@@ -3,8 +3,8 @@
 # and wheel build and pass twine, and name no requirement by URL, which an index refuses and twine passes
 # (tools/check_distribution.py); the wheel installs into an empty environment and runs, its requirements at their newest
 # and at the lower bounds dewml declares (tools/smoke_wheel.py); an install from PyPI alone stops at resolving jax, on
-# which Dew carries fixes; and the accelerator extras resolve against Dew's package index. GitHub's CI runs it for a
-# pull request and a release on a hosted runner (.github/workflows/ci.yml).
+# which Dew carries fixes; and the accelerator extras resolve against the indexes constraints.txt names. GitHub's CI
+# runs it for a pull request and a release on a hosted runner (.github/workflows/ci.yml).
 #
 # Usage: sh tools/ci/package.sh [dist directory]   from the checkout's top, with uv on PATH; the directory (dist by
 #                                                   default) is left holding the sdist and wheel it checked.
@@ -30,11 +30,12 @@ if "$work/plain/bin/python" -m pip install --index-url https://pypi.org/simple "
   cat "$work/plain.txt"; echo "dewml installed from PyPI alone, on a jax without Dew's fixes"; exit 1
 fi
 grep -q "No matching distribution found for jax" "$work/plain.txt" || { cat "$work/plain.txt"; exit 1; }
-# The accelerator extras resolve against Dew's index.
-index=$("$work/build/bin/python" -c "import runpy; print(runpy.run_path('src/dew/_builds.py')['PACKAGE_INDEX'])")
+# The accelerator extras resolve against the indexes constraints.txt names: Dew's, and a release under test's
+# staging, which /simple lists only once the pin's train is green (tools/smoke_wheel.py's INDEXES).
+indexes=$(sed -n 's/^--extra-index-url /--extra-index-url=/p' constraints.txt)
 wheel=$(realpath "$dist"/*.whl)
 for extras in cuda12,quantization,profile cuda13,quantization,profile tpu,quantization,profile; do
-  echo "dewml[$extras] @ file://$wheel" | uv pip compile - --extra-index-url "$index" --python-version "$python" \
+  echo "dewml[$extras] @ file://$wheel" | uv pip compile - $indexes --python-version "$python" \
     --python-platform x86_64-manylinux_2_31 --quiet > /dev/null
 done
 echo "package: green"

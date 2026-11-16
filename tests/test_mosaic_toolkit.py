@@ -10,11 +10,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, declared_outputs
+from generation_support import INTERPRETS
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
-from kernel_compile import gate_generations
+from kernel_compile import gate_generations, stated_outputs
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import across, handoffs, mosaic, outputs, product, rings, stores, swizzling
@@ -816,7 +816,28 @@ def test_a_kernels_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
         lowered = jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(
             x, w).lower(lowering_platforms=("cuda",))
     assert lowered.out_info.shape == (x.shape[0], w.shape[1])
-    assert declared_outputs(lowered) == [[[[[0, 0]], [[1, 1]]]]]
+    assert [dims for _, dims in stated_outputs(lowered) if dims is not None] == [[[[[0, 0]], [[1, 1]]]]]
+
+
+def test_a_pallas_calls_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
+    """A Pallas call (`launches.pallas_call`, Triton's) whose output its operand's axes state, transposed,
+    lowered for an H100 on any host: its shape is theirs, and its call states each dimension's axis
+    (`outputs.OUTPUT_DIMS`), as a Mosaic launch's does."""
+    from dew.nn.kernels import launches
+
+    def copied(x):
+        def body(x_ref, o_ref):
+            o_ref[...] = x_ref[...].T
+
+        transposed = outputs.output(x.dtype, outputs.axis(x, 1), outputs.axis(x, 0))
+        return launches.pallas_call(body, name="copied", grid=(1,), out_shape=transposed)(x)
+
+    x = jax.ShapeDtypeStruct((16, 32), jnp.float32)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(copied).trace(x).lower(lowering_platforms=("cuda",))
+    assert lowered.out_info.shape == (32, 16)
+    assert [dims for _, dims in stated_outputs(lowered) if dims is not None] == [[[[[0, 1]], [[0, 0]]]]]
 
 
 @INTERPRETS
@@ -1735,8 +1756,10 @@ def test_groups_summed_together_stage_no_operand_into_a_tile_a_product_in_flight
         in_flight = (in_flight or event == "tcgen05_mma") and event != "barrier_wait"
 
 
+@pytest.mark.gpu(reason="a tcgen05 product's late operand read is the device's alone")
+@pytest.mark.generations("sm100")
 @pytest.mark.skipif(generation.device_generation() != "sm100",
-                    reason="a tcgen05 product's late operand read is the device's alone")
+                    reason="a tcgen05 product's late operand read is a B200's alone")
 @pytest.mark.parametrize("shared", [True, False], ids=["one tile", "a tile each"])
 def test_groups_summed_together_from_staged_operands_are_each_its_own_sum(shared):
     """On a B200: two groups summed by one issuer on tcgen05's chunks (`operands.Issuer.summed_together`),

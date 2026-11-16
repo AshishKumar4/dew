@@ -308,23 +308,18 @@ SETMAXNREG = RegisterRaises(24, 256, 8)
 @dataclasses.dataclass(frozen=True)
 class Multiprocessor:
     """A CUDA multiprocessor's resources, which the templates' register and resource models read
-    (`templates.resources`, `templates.cost`) and a compile ahead's target describes
-    (`target_config`): the most threads and blocks resident at once
-    (`resident_threads`, `resident_blocks`), its 32-bit `registers`, the most a thread holds
-    (`thread_registers`), a block's limits (`block_registers`, `block_threads`, `block_shared`, the static
-    shared memory a block declares without opting in), the threads of a warp (`warp_threads`), the
-    allocator's `register_step` a thread (256 a warp), the shared memory the driver reserves for each
-    resident block (`reserved_shared`), the bytes its shared memory serves a clock
-    (`shared_bytes_per_clock`), the base-2 exponentials its special-function units return a clock
-    (`exponentials_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
+    (`templates.resources`, `templates.cost`) and a compile ahead's target describes (`target_config`): the
+    most threads and blocks resident at once (`resident_threads`, `resident_blocks`), its 32-bit `registers`,
+    the most a thread holds (`thread_registers`), a block's limits (`block_registers`, `block_threads`,
+    `block_shared`, the static shared memory a block declares without opting in), the threads of a warp
+    (`warp_threads`), the allocator's `register_step` a thread (256 a warp), the shared memory the driver
+    reserves for each resident block (`reserved_shared`), the bytes its shared memory serves a clock
+    (`shared_bytes_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
     (`register_raises`, None before Hopper). The defaults are the facts every CUDA compute capability from 7.5
-    to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; the exponentials the CUDA C++ Best
-    Practices Guide 13's §12.1.1 Table 5, `lg2.approx.f32`'s row, where CUDA 13 moved the throughput table,
-    15.97 measured on an H200, the kernel challenge's MUFU.EX2; 128 bytes a clock measured 126 to 128 on an
-    A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through Microbenchmarking",
-    Table 3) and setmaxnreg's range,
-    which a target of no architecture (the CPU interpreting a launch) reads too, under which every family's
-    launch interprets."""
+    to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; 128 bytes a clock measured 126 to 128
+    on an A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through
+    Microbenchmarking", Table 3) and setmaxnreg's range, which a target of no architecture (the CPU
+    interpreting a launch) reads too, under which every family's launch interprets."""
 
     resident_threads: int = 1536
     resident_blocks: int = 16
@@ -337,7 +332,6 @@ class Multiprocessor:
     register_step: int = 8
     reserved_shared: int = 1024
     shared_bytes_per_clock: int = 128
-    exponentials_per_clock: int = 16
     register_raises: RegisterRaises | None = SETMAXNREG
 
     def raises(self) -> RegisterRaises:
@@ -358,8 +352,11 @@ class Architecture:
     `wgmma`, one of them), the multiprocessors a cluster's TMA multicast reaches (`cluster`), whether its
     tensor instructions read block-scaled operands (`block_scales`), its dense tensor-core FLOPs per clock per
     multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in fp32; 'tf32'; '8bit': FP8
-    operands, E4M3 or E5M2, where the family's tensor instructions multiply them natively; 'fp32': IEEE fp32
-    on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Blackwell's tensor memory columns (PTX ISA,
+    operands, E4M3 or E5M2, where the family's tensor instructions multiply them natively), the elementwise
+    fp32 operations its vector units do a clock (`vector_per_clock`: a CUDA multiprocessor's fp32 lanes'
+    FLOPs, two a lane for its fused multiply-add, which a dot at Precision.HIGHEST takes there too; a TPU's
+    VPU's) and the exponentials its special-function units return a clock (`exponentials_per_clock`: a CUDA
+    multiprocessor's, a TPU's transcendental unit's), Blackwell's tensor memory columns (PTX ISA,
     tcgen05.alloc), and on a TPU the scoped VMEM limit at XLA's default and the VMEM a kernel may raise its
     limit to (`vmem_bytes`). `tma`: JAX's Mosaic GPU pipelines move a block into shared memory by TMA, which
     it picks from compute capability 9.0 on (its `emit_pipeline` and `copy_gmem_to_smem`), where below it they
@@ -370,6 +367,8 @@ class Architecture:
     issuers: tuple[str, ...]
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
     multiprocessor: Multiprocessor | None = Multiprocessor()
+    vector_per_clock: float | None = None
+    exponentials_per_clock: float | None = None
     tma: bool = False
     dependent_launch: bool = False
     tmem_columns: int | None = None
@@ -411,31 +410,41 @@ class Architecture:
 # Resident blocks and threads a multiprocessor holds are the CUDA C++ Programming Guide's (§5.1, Table 33):
 # 7.5 16 and 1024, 8.0 32 and 2048, 8.6 16 and 1536, 8.9 24 and 1536, 9.0 and 10.0 32 and 2048, 12.x 24 and
 # 1536; setmaxnreg is sm_90a's, sm_100f's and sm_120f's (PTX ISA, `SETMAXNREG`).
-_AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024, 'fp32': 128},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None))
-_AMPERE_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, 'fp32': 256},
-                                Multiprocessor(register_raises=None))
-_ADA = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
-                    Multiprocessor(resident_blocks=24, register_raises=None))
+CUDA_EXPONENTIALS = 16
+"""The base-2 exponentials a CUDA multiprocessor's special-function units return a clock, every compute
+capability from 7.5 to 12.x alike (the CUDA C++ Best Practices Guide 13's §12.1.1 Table 5, `lg2.approx.f32`'s
+row, where CUDA 13 moved the throughput table; 15.97 measured on an H200, the kernel challenge's MUFU.EX2)."""
+_AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024},
+                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None),
+                       vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS)
+_AMPERE_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512},
+                                Multiprocessor(register_raises=None),
+                                vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS)
+_ADA = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048},
+                    Multiprocessor(resident_blocks=24, register_raises=None),
+                    vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS)
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
-_TURING = Architecture((), {'16bit': 1024, 'fp32': 128},
-                       Multiprocessor(resident_threads=1024, register_raises=None))
+_TURING = Architecture((), {'16bit': 1024}, Multiprocessor(resident_threads=1024, register_raises=None),
+                       vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS)
 # Hopper issues wgmma (sm_90a) and mma.sync, its TMA multicast to a pair of multiprocessors a cluster (the
 # pair CUTLASS's grouped GEMM and cuBLASLt take on an H100).
-_HOPPER = Architecture(('wgmma', 'mma.sync'), {'16bit': 4096, 'tf32': 2048, '8bit': 8192, 'fp32': 256},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32), tma=True,
+_HOPPER = Architecture(('wgmma', 'mma.sync'), {'16bit': 4096, 'tf32': 2048, '8bit': 8192},
+                       Multiprocessor(resident_threads=2048, resident_blocks=32),
+                       vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS, tma=True,
                        dependent_launch=True, cluster=2)
 # Blackwell's tcgen05 family: tcgen05 (sm_100a) and mma.sync, no wgmma; tensor memory, a pair's 2-CTA
 # products and multicast, block-scaled operands (PTX ISA, tcgen05.mma's kind::mxf8f6f4 and mxf4nvf4).
-_BLACKWELL = Architecture(('tcgen05', 'mma.sync'), {'16bit': 8192, 'tf32': 4096, '8bit': 16384, 'fp32': 256},
-                          Multiprocessor(resident_threads=2048, resident_blocks=32), tmem_columns=512,
+_BLACKWELL = Architecture(('tcgen05', 'mma.sync'), {'16bit': 8192, 'tf32': 4096, '8bit': 16384},
+                          Multiprocessor(resident_threads=2048, resident_blocks=32),
+                          vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS, tmem_columns=512,
                           tma=True, dependent_launch=True, cluster=2, block_scales=True)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates.
 # Its components are those PTX's forward compatibility gives every NVIDIA GPU after it too: mma.sync and
 # cp.async from sm_80, TMA and grid dependency control from sm_90, no arch-specific instruction (wgmma's
 # sm_90a, tcgen05's sm_100a), which no capability implies.
-_BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
-                                   Multiprocessor(resident_blocks=24), tma=True, dependent_launch=True)
+_BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048},
+                                   Multiprocessor(resident_blocks=24), vector_per_clock=256,
+                                   exponentials_per_clock=CUDA_EXPONENTIALS, tma=True, dependent_launch=True)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072) and the scoped VMEM limit at XLA's
 # default, read from a Mosaic kernel's refusal of a scratch it uses whole (a flag such as
 # --xla_tpu_scoped_vmem_limit_kib moves it): v5e 16 MiB ("limit 16.00M"); v6e 32 MiB ("Scoped allocation with
@@ -444,10 +453,19 @@ _BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '
 # over 40 SMs at 1590 MHz -> 1024 and 128.
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
+# Its VPU's fp32 operations and its transcendental unit's exponentials a clock, measured (Google's pages state
+# neither): a Pallas kernel's chain over one VMEM-resident 512 x 1024 fp32 block, the slope of its wall time
+# over 256 to 4096 iterations (the tpu_rates script on Colab TPUs, colab7062's rates2, two rounds each, at
+# most 1% from the line), over the clock its MXU's peak gives. A step bound by the block's
+# VMEM read and write, a lone add's on both (v5e 0.959 us, v6e 0.413), states no unit's rate: the VPU's is a
+# multiply-add's, two operations an element, which outlasts it (v5e 1.278 us, 8.21e11 operations a second;
+# v6e 0.646, 1.62e12), and the v6e's exponentials an exp2's (0.563 us, 9.33e11 a second). A v5e's exp2 took
+# as long as its add, so its own rate waits on a chain of four exp2 an iteration.
 _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
-                             vmem_bytes=128 * 2 ** 20),
+                             vmem_bytes=128 * 2 ** 20, vector_per_clock=8.21e11 / (197e12 / 131072)),
          'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
-                             vmem_bytes=128 * 2 ** 20)}
+                             vmem_bytes=128 * 2 ** 20, vector_per_clock=1.62e12 / (918e12 / 524288),
+                             exponentials_per_clock=9.33e11 / (918e12 / 524288))}
 
 
 def architecture(generation: str) -> Architecture | None:
@@ -560,14 +578,17 @@ class GpuTarget:
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
     (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
     step_seconds: float | None = None
-    """One dependent step's latency on XLA's path: an iteration of a loop XLA lowers, its launches and its
-    predicate, each reading the last (the work-span model's step, `templates.cost.Work.span`), measured per
-    GPU (FS-STEP-SECONDS1's receipts); None where none was, so a form's span there is priced by no time."""
+    """The least one step of a form's dependent chain costs on XLA's path (the work-span model's step,
+    `templates.cost.Work.span`), each step reading the last: the slope over its iterations of a loop XLA
+    lowers, measured per device (FS-STEP-SECONDS1's script). What bounds it is the device's: on a GPU each
+    iteration's launch, a one-element loop's launch and predicate; on a TPU, whose iterations launch nothing
+    (a one-element loop's slope zero within 1e-9 s), the step's body, the chunk's forward-substitution row (64
+    rows of 128 values). None where none was measured, so a form's span there is priced by no time."""
     kernel_step_seconds: float | None = None
     """One dependent step's latency within a kernel: a tile's 128-lane reduction broadcast into the next
     step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
-    measured per GPU as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None where
-    none was."""
+    measured per device as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None
+    where none was."""
 
     @property
     def architecture(self) -> Architecture:
@@ -678,12 +699,11 @@ class GpuTarget:
         """Dense tensor-core FLOPs per clock per multiprocessor in arithmetic `mode`, or None where
         the generation states none: the generation's, lowered where the SKU's catalogued dense bf16 peak
         is below what its multiprocessors and clock give at that rate, as a GeForce part's half-rate
-        fp32 accumulation reads; IEEE fp32 on the CUDA cores keeps its rate. A part reporting fewer
-        multiprocessors than its catalogue counts (a MIG slice) keeps the generation's rate: the
-        catalogue never raises it."""
+        fp32 accumulation reads. A part reporting fewer multiprocessors than its catalogue counts (a MIG
+        slice) keeps the generation's rate: the catalogue never raises it."""
         rate = self.tensor_rates.get(mode)
         peak = self.bf16_peak
-        if rate is None or mode == 'fp32' or not (peak and self.multiprocessors and self.clock_hz):
+        if rate is None or not (peak and self.multiprocessors and self.clock_hz):
             return rate
         return rate * min(1.0, peak / (self.tensor_rates['16bit'] * self.multiprocessors * self.clock_hz))
 
@@ -856,12 +876,23 @@ TARGETS = {target.generation: target for target in (
     # 197e12 / 131072, derived from the peak, no stated clock. Its scoped VMEM and MXU rate are its family's
     # (`_TPUS`).
     GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, multiprocessors=1,
-              clock_hz=197e12 / 131072, memory_bandwidth=819e9),
+              clock_hz=197e12 / 131072, memory_bandwidth=819e9,
+              # A step of a form's chain on XLA's path, 1.77 us: the substitution row's slope over 64 to 1024
+              # iterations (FS-STEP-SECONDS1's script on a Colab v5e, colab7062's steps-v5e1, its two rounds
+              # 1.772 and 1.770, 1.8% from the line); its one-element loop's slopes +-1e-9 s, zero.
+              step_seconds=1.77e-6,
+              # In-kernel: a dependent lane reduction's 133.8 ns (its two rounds 133.78 and 133.70).
+              kernel_step_seconds=133.8e-9),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
     # One TensorCore a chip, of two 256 x 256 MXUs, 918 TF of bf16 and 1638 GB/s of HBM
     # (cloud.google.com/tpu/docs/v6e); the clock is 918e12 / 524288, derived from the peak as v5e's.
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}, multiprocessors=1,
-              clock_hz=918e12 / 524288, memory_bandwidth=1638e9),
+              clock_hz=918e12 / 524288, memory_bandwidth=1638e9,
+              # A step of a form's chain on XLA's path, 2.45 us: the substitution row's slope (colab7062's
+              # steps-v6e1, its two rounds 2.452 and 2.445); its one-element loop's slopes 6e-9 and 2e-10 s.
+              step_seconds=2.45e-6,
+              # In-kernel: a dependent lane reduction's 141.1 ns (its two rounds 141.12 and 141.07).
+              kernel_step_seconds=141.1e-9),
 )}
 
 
@@ -971,7 +1002,7 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
     """The `gpu_device_info` XLA compiles for, from the GPU `target` a build states (`built_target`: its
     CUDA generation's, its multiprocessors its own where stated): its compute capability, the shared memory
     a block may opt into, its multiprocessors, clock and bandwidth, its multiprocessor's and a block's
-    limits (`Multiprocessor`) and its fp32 lanes (`Architecture.tensor_rates`); CUDA's grid limits for the
+    limits (`Multiprocessor`) and its fp32 lanes (`Architecture.vector_per_clock`); CUDA's grid limits for the
     rest. The fields past the capability and shared memory only steer XLA's own fusions, never a Triton
     kernel's code. From Hopper on, its capability states the architecture-specific features (sm_90a,
     sm_100a, sm_120a), which Mosaic GPU's PTX targets: left unspecified, an sm120's assembled for plain
@@ -981,7 +1012,7 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
     shared, multiprocessors = target.shared_limit, target.multiprocessors
     clock, bandwidth = target.clock_hz, target.memory_bandwidth
     # Its fp32 lanes, two FLOPs a clock each (a fused multiply-add), as its architecture states them.
-    fp32 = target.tensor_rates.get("fp32")
+    fp32 = target.architecture.vector_per_clock
     if (version is None or shared is None or multiprocessors is None or clock is None or bandwidth is None
             or fp32 is None):
         raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
@@ -994,7 +1025,7 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
   shared_memory_per_core: {shared + multiprocessor.reserved_shared}
   threads_per_core_limit: {multiprocessor.resident_threads}
   core_count: {multiprocessors}
-  fpus_per_core: {fp32 // 2}
+  fpus_per_core: {int(fp32) // 2}
   block_dim_limit_x: 2147483647
   block_dim_limit_y: 65535
   block_dim_limit_z: 65535
