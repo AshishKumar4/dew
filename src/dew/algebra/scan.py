@@ -67,7 +67,7 @@ thousands of resets in a walk's sum stay far inside fp32's range, and the compen
 difference of two partials exact past them."""
 
 Reads = Literal["after", "before"]
-"""Where a scan's readout reads its state (`Scan.reads`): after its token's update, or the state entering it."""
+"""Where a scan's readout reads its state (`Scan.reads`): after its token's update, or as it enters."""
 
 
 @dataclasses.dataclass(frozen=True)
