@@ -25,8 +25,9 @@ the product's.
 A region's written program is Dew's call traced over the region's inputs' types (`_traced`): a program the
 step's own trace does not hold (the template's launch, Dew's attention or norm), which only a trace of that
 call makes. It is traced once a process for the region's identity (`Written.key`: its structure, the values
-of the constants its call reads, and which call writes it) under the state the trace reads
-(`options.trace_context`), and written into every later lowering of a program holding it: a step's
+of the constants its call reads, and which call writes it) in the context a kernel is chosen in
+(`choice_context`: the state a trace reads, `options.trace_context`, and the compiles' refusals), and written
+into every later lowering of a program holding it: a step's
 relowerings, its planner's candidates and every layer of a stack share one trace, which reports its kernels'
 routes and launches where each program is written as it did when it traced.
 """
@@ -308,27 +309,27 @@ def choice_context() -> Hashable:
     derivation's (`derive.context`: the mesh, the target priced for, the numerics and precision), what a
     trace reads of this thread's context (`options.trace_context`: an assumed generation and whether it is
     interpreted, the kernel choices a call names, a whole-sequence scope, a quantization's owner and rule,
-    Dew's environment), the launches the compiles refused, which a template's legality reads
-    (`report.refused_launches`), and whether XLA's flags ask for deterministic operations, which
-    FlashAttention's eligibility reads (`_devices.deterministic_ops_requested`) and no `DEW_` variable
-    holds."""
-    from dew._devices import deterministic_ops_requested
+    Dew's environment, whether XLA's flags ask for deterministic operations), and the launches the compiles
+    refused, which a template's legality reads (`report.refused_launches`): the key a step's candidates are
+    held by too (`dew.training._candidates`), with the derivation's beside it."""
     from dew.algebra import derive
     from dew.nn.kernels.options import trace_context
     from dew.nn.kernels.templates import report
 
-    return derive.context(), trace_context(), report.refused_launches(), deterministic_ops_requested()
+    return derive.context(), trace_context(), report.refused_launches()
 
 
 def holding[Value](cache: collections.OrderedDict[Hashable, Value], key: Hashable,
-                   made: Callable[[], Value]) -> Value:
+                   made: Callable[[], Value], held: int = DECISIONS_HELD) -> Value:
     """`cache`'s entry at `key`, made (`made()`) where it holds none, outside the lock every held decision
     shares (`_HOLDING`: compiles trace on several threads, and a decision made may hold another), the least
-    recently read dropped past `DECISIONS_HELD`. Two threads missing one key at once each make it, the later
-    kept: a decision is a function of its key, so either is the same. The way the algebra holds a kernel
-    decision (`_decided`, `_traced`, recognition's bodies, regions and attention calls, each keyed by its own
-    and `choice_context()`) and a declaration's trace (`recognize._declaration`, by its call and types
-    alone: no kernel is chosen in it)."""
+    recently read dropped past `held` (`DECISIONS_HELD`). Two threads missing one key at once each make it,
+    the later kept: a held value is a function of its key, so either is the same. The one way the algebra
+    holds what it decides and derives: a kernel decision (`_decided`, `_traced`, recognition's bodies, regions
+    and attention calls, each keyed by its own and `choice_context()`), a declaration's trace
+    (`recognize._declaration`, by its call and types alone: no kernel is chosen in it), a window's derivation
+    (`program._derived`, `program.WINDOWS_HELD` of them) and a scan form's decompositions and splits
+    (`scan`, by the derivation's context, `derive.FORMS_HELD`)."""
     with _HOLDING:
         if key in cache:
             cache.move_to_end(key)
@@ -337,7 +338,7 @@ def holding[Value](cache: collections.OrderedDict[Hashable, Value], key: Hashabl
     with _HOLDING:
         cache[key] = value
         cache.move_to_end(key)
-        if len(cache) > DECISIONS_HELD:
+        if len(cache) > held:
             cache.popitem(last=False)
     return value
 

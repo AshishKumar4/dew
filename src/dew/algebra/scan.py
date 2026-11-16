@@ -47,7 +47,7 @@ from jax import lax
 from jax.extend import core as jcore
 
 from dew._cache import ALGEBRA
-from dew.algebra import carry, cost, derive, linear_scan, program, terms
+from dew.algebra import carry, cost, derive, fusion, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
 from dew.nn.derivatives import Protected, contracted
 from dew.nn.nested import nested
@@ -147,15 +147,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     def affine_of(chunk: Mapping):
         key = (tuple((tuple(chunk[name].shape), str(chunk[name].dtype)) for name in names), derive.context())
-        if key in decomposed:
-            decomposed.move_to_end(key)
-            return decomposed[key]
-        affine = decomposed[key] = linear_scan.parts(_traced(declaration, declaration.update, names, chunk),
-                                                     _traced(declaration, declaration.readout, names, chunk),
-                                                     saturation)
-        if len(decomposed) > derive.FORMS_HELD:
-            decomposed.popitem(last=False)
-        return affine
+        return fusion.holding(decomposed, key, lambda: linear_scan.parts(
+            _traced(declaration, declaration.update, names, chunk),
+            _traced(declaration, declaration.readout, names, chunk), saturation), held=derive.FORMS_HELD)
 
     def parts(chunk: Mapping):
         affine = affine_of(chunk)
@@ -192,13 +186,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         # target, precision, numerics or mesh is none of this one's.
         key = (derive.context(), affine.base2, corrected, affine.values_read,
                *((value.shape, str(value.dtype)) for value in given))
-        split = splits.get(key)
-        if split is None:
-            split = splits[key] = _split(declaration, names, chunk, affine, form, tuple(held), given,
-                                         jax.ShapeDtypeStruct(shape, carried), extents.tokens, saturation)
-            if len(splits) > splits_held:
-                splits.popitem(last=False)
-        splits.move_to_end(key)
+        split = fusion.holding(splits, key, lambda: _split(
+            declaration, names, chunk, affine, form, tuple(held), given, jax.ShapeDtypeStruct(shape, carried),
+            extents.tokens, saturation), held=splits_held)
         prepared = Prepared((natural, split.prepare(*given, issue=issue or _issued)), split, corrected,
                             entering=entering, values_read=affine.values_read)
         if not (corrected and transition):

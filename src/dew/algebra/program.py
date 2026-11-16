@@ -12,7 +12,6 @@ import contextlib
 import dataclasses
 import functools
 import math
-import threading
 import time
 import weakref
 from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping
@@ -262,10 +261,8 @@ distinct windows of the steps it compiles (161 of the 2,799 a UNet's planner tra
 33 ms on average to derive again; row 3764)."""
 
 _DERIVED: collections.OrderedDict[Hashable, Rewrite] = collections.OrderedDict()
-"""Each window's rewrite by what derived it (`_derived`), the least recently read first."""
-
-_HOLDING = threading.Lock()
-"""Held while `_DERIVED` is read or written: compiles trace on several threads."""
+"""Each window's rewrite by what derived it (`_derived`, held through `fusion.holding`), the least recently
+read first."""
 
 
 def structure(window: jcore.Jaxpr) -> Hashable:
@@ -333,17 +330,13 @@ def _derived(window: jcore.Jaxpr, accurate: bool, saturation: Saturation, derivi
     `_deriving`), the process's latest `WINDOWS_HELD` kept. The planner's candidates and a resumed run's
     relowering trace one step's program again and again, each window of it as the last trace's."""
     key = (structure(window), tuple(sorted(ranges.items())), deriving)
-    with _HOLDING:
-        done = _DERIVED.get(key)
-        if done is not None:
-            _DERIVED.move_to_end(key)
-            return done, True
-    done = _region(window, accurate=accurate, saturation=saturation, ranges=ranges)
-    with _HOLDING:
-        _DERIVED[key] = done
-        if len(_DERIVED) > WINDOWS_HELD:
-            _DERIVED.popitem(last=False)
-    return done, False
+    derived = []
+
+    def deriving_once() -> Rewrite:
+        derived.append(True)
+        return _region(window, accurate=accurate, saturation=saturation, ranges=ranges)
+    done = fusion.holding(_DERIVED, key, deriving_once, held=WINDOWS_HELD)
+    return done, not derived
 
 
 def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
