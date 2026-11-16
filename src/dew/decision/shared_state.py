@@ -1,6 +1,6 @@
-"""Rows of a request's questions over one copy of its state (`QuestionLayout.shared_state`).
+"""Rows of a request's questions over one copy of its state (`SegmentLayout.shared_state`).
 
-Each question's own row (`QuestionLayout._written`) writes the state and what precedes the question, then the
+Each question's own row (`SegmentLayout._written`) writes the state and what precedes the question, then the
 question's own part: its instructions, options and cue. A row over one state writes that shared part once,
 its document 1, and each question's own part after it as a document continuing it (`Encoded.forked`,
 `dew.batch.Forks`), each token at the position its own row lays it at, so each question reads the shared
@@ -26,8 +26,9 @@ from dew.decision.layout import (
     Instructions,
     Layout,
     OptionLines,
-    QuestionLayout,
+    SegmentLayout,
     State,
+    per_question,
 )
 from dew.nn.protocols import ForkedCalls
 
@@ -38,7 +39,7 @@ if TYPE_CHECKING:
     from dew.nn.protocols import TokenModel
 
 
-def check_sharing(layout: QuestionLayout) -> None:
+def check_sharing(layout: SegmentLayout) -> None:
     """Refuse `layout`'s sharing where its rows cannot ask questions over one state: siblings or rows in
     streams with no `shared_state`, a `shared_state` under one, or several questions a row it cannot lay
     (`forkable`)."""
@@ -53,11 +54,11 @@ def check_sharing(layout: QuestionLayout) -> None:
                          "tokens read, as parallel options, blocks, reads and a question in context do")
 
 
-def over_one_state(own: Sequence[Encoded], layout: QuestionLayout) -> list[Encoded]:
+def over_one_state(own: Sequence[Encoded], layout: SegmentLayout) -> list[Encoded]:
     """Each question's `own` row, in order, in the first row over one shared part that takes it (`takes`)
     within `layout`'s `max_len` and `shared_state` questions, or a row of its own, where it shares
-    (`QuestionLayout.shares`); with siblings, each question in a row continuing the one before it
-    (`merged`). Rows in streams (`QuestionLayout.streamed`) are merged so at any `shared_state`, one
+    (`SegmentLayout.shares`); with siblings, each question in a row continuing the one before it
+    (`merged`). Rows in streams (`SegmentLayout.streamed`) are merged so at any `shared_state`, one
     question's too, as the plans that laid them did. `own` as it stands where it shares none."""
     if layout.shared_state is None or not (layout.shares or layout.streamed):
         return list(own)
@@ -89,9 +90,9 @@ def merged(rows: Sequence[Encoded], *, chained: bool = False, streamed: bool = F
     """`rows`, each one question's own, as one row: their shared part once (document 1), then each one's own
     part (documents 2...), each token at its own row's position; its cuts its questions', its state's
     once. Each question's document continues the shared part, or where `chained` the question's before it
-    (`Encoded.forked_parents`), which it then reads whole (`QuestionLayout.siblings`). Where `streamed`,
+    (`Encoded.forked_parents`), which it then reads whole (`SegmentLayout.siblings`). Where `streamed`,
     the shared part is the row's stream 0 and each question's own part a stream of its own
-    (`Encoded.streams`), which the layout's `attention` reads (`QuestionLayout.streamed`)."""
+    (`Encoded.streams`), which the layout's `attention` reads (`SegmentLayout.streamed`)."""
     shared = rows[0].questions[0].span[0]
     if not shared and not streamed:
         # Nothing before the question to share (`takes`): the row alone, one document.
@@ -135,17 +136,17 @@ def merged(rows: Sequence[Encoded], *, chained: bool = False, streamed: bool = F
 
 def fork_depth(layout: Layout) -> int:
     """The longest chain of documents `layout`'s rows over one state lay (`Forks.depth`): one, each
-    question continuing the shared part; with `QuestionLayout.siblings` a row's questions, each continuing
+    question continuing the shared part; with `SegmentLayout.siblings` a row's questions, each continuing
     the one before it, so reading them whole."""
-    if isinstance(layout, QuestionLayout) and layout.siblings and layout.shared_state is not None:
+    if per_question(layout) and layout.siblings and layout.shared_state is not None:
         return layout.shared_state
     return 1
 
 
 def joint(layout: Layout) -> bool:
     """Whether `layout`'s rows over one state read their documents together, as its siblings do
-    (`QuestionLayout.siblings`, `Forks.joint`): one row, its dropout drawn once."""
-    return isinstance(layout, QuestionLayout) and layout.siblings and layout.shares
+    (`SegmentLayout.siblings`, `Forks.joint`): one row, its dropout drawn once."""
+    return per_question(layout) and layout.siblings and layout.shares
 
 
 def collated_forks(rows: Sequence[Encoded], documents: np.ndarray, count: int
@@ -181,9 +182,9 @@ def asked_over(documents: jax.Array, parents: jax.Array, depth: int) -> jax.Arra
     return jnp.maximum(asks + over, held.astype(jnp.float32))
 
 
-def stream_reads(layout: QuestionLayout) -> tuple[tuple[tuple[int, ...], ...], int]:
-    """The reads of `layout`'s rows in streams over one state (`QuestionLayout.streamed`), as
-    `QuestionLayout.attention` gives a row's: stream 0, the shared part, reads itself causally; each
+def stream_reads(layout: SegmentLayout) -> tuple[tuple[tuple[int, ...], ...], int]:
+    """The reads of `layout`'s rows in streams over one state (`SegmentLayout.streamed`), as
+    `SegmentLayout.attention` gives a row's: stream 0, the shared part, reads itself causally; each
     question's stream itself causally, the shared part whole and, with `siblings`, the questions' before
     it whole; with the streams' count less one."""
     count = layout.shared_state
@@ -203,7 +204,7 @@ def over_one_state_row(row: Encoded) -> bool:
     return apart and len(row.questions) > 1
 
 
-def forkable(layout: QuestionLayout) -> bool:
+def forkable(layout: SegmentLayout) -> bool:
     """Whether `layout`'s rows can ask several questions over one state: each writes its state before its
     question and the question's instructions first, and sets nothing else its tokens read, as parallel
     options, blocks, reads and a question in its context do."""
@@ -215,14 +216,14 @@ def forkable(layout: QuestionLayout) -> bool:
             and kinds.index(Instructions) == min(asked))
 
 
-def shared_for(layout: QuestionLayout, backbone: nn.Module | TokenModel, head: Head, *,
-               train: bool = False) -> QuestionLayout:
+def shared_for(layout: SegmentLayout, backbone: nn.Module | TokenModel, head: Head, *,
+               train: bool = False) -> SegmentLayout:
     """`layout` as `head` reads rows over `backbone`: its questions over one state where the backbone
     computes each question's documents as its own row does (`ForkedCalls`, in a training step where
     `train`, no dropout drawing) and the head reads each question apart from the others
     (`Head.reads_apart`, one question a row not asked), as many as a row holds where the layout states
-    none (`QuestionLayout.shared_state`); a row a question otherwise. Siblings are no sharing to derive
-    but what a row's questions read (`QuestionLayout.siblings`): kept where the backbone runs forks, as it
+    none (`SegmentLayout.shared_state`); a row a question otherwise. Siblings are no sharing to derive
+    but what a row's questions read (`SegmentLayout.siblings`): kept where the backbone runs forks, as it
     reads one row over one state in training too (its dropout drawn once, as the row's streams drew it),
     and the head reads a row's questions apart; refused otherwise, by the backbone's reason."""
     if layout.siblings and layout.shares:

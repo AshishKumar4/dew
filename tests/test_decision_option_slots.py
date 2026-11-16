@@ -29,12 +29,12 @@ from dew.decision import (
     DecisionInputs,
     DecisionObjective,
     Example,
-    JointLayout,
     JointSchemaHead,
     Question,
     Specials,
 )
 from dew.decision.inputs import compacted
+from dew.decision.layout import SegmentLayout
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -53,7 +53,8 @@ def stored_batch():
     rows = []
     for request in CASES.values():
         questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
-        rows.extend(JointLayout().rows(tokenizer, Specials.of(tokenizer), request["state"], questions))
+        rows.extend(SegmentLayout.joint_row().rows(tokenizer, Specials.of(tokenizer), request["state"],
+                                                   questions))
     inputs = DecisionInputs.collate(rows, 0)
     with np.load(TINY / "states.npz") as states:
         length = inputs.tokens.shape[1]
@@ -145,13 +146,13 @@ def ragged_objective(examples) -> DecisionObjective:
     specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
     # Rows as long as the longest needs, since each attention here holds its
     # whole [rows, heads, queries, keys] score on the CPU.
-    layout = JointLayout(max_len=16384)
+    layout = SegmentLayout.joint_row(max_len=16384)
     length = max(len(row.tokens) for example in examples
                  for row in layout.rows(tokenizer, specials, example.state, example.questions))
     return DecisionObjective(
         CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=1, mlp_features=24,
                           max_seq_len=length, attention_impl="xla"),
-        tokenizer=tokenizer, specials=specials, layout=JointLayout(max_len=length),
+        tokenizer=tokenizer, specials=specials, layout=SegmentLayout.joint_row(max_len=length),
         head=JointSchemaHead(hidden_size=16, width=16, routing_layers=2, layers=1, heads=1, feedforward=24,
                              attention_impl="xla"), shuffle_options=False)
 

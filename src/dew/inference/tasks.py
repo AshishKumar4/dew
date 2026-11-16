@@ -622,7 +622,8 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     question budgets, which it ignored and an earlier record wrote at their defaults (row 2006), and a
     step's attention form, which its numerics' forms hold now (row 2500), and a decision run's count of
     questions a row, which no task reads, and an encoder's or conditioner's class by the import path it
-    has now (`dew._records.moved_paths`, row 5996). A record in today's shapes
+    has now (`dew._records.moved_paths`, row 5996), and a decision layout by the one class the three it
+    was one of are now (`dew._records.earlier_layout`, row 6140). A record in today's shapes
     passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
     from dew._records import moved_record
 
@@ -661,6 +662,10 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
         from dew.data.text import snapshot_here
 
         current["tokenizer"] = snapshot_here(tokenizer)
+    from dew._records import earlier_layout
+
+    # A layout recorded by one of the three classes before them as one class (decision-inputs.md §1).
+    current = {name: earlier_layout(json_value(value, name)) for name, value in current.items()}
     laid = current.get("layout")
     fields = laid.get("fields") if isinstance(laid, Mapping) else None
     if isinstance(laid, Mapping) and isinstance(fields, Mapping) and fields.get("segments") is not None and (
@@ -678,8 +683,8 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
 
         current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
     laid = current.get("layout")
-    if isinstance(laid, Mapping) and isinstance(laid.get("fields"), Mapping):
-        fields = laid["fields"]
+    fields = laid.get("fields") if isinstance(laid, Mapping) else None
+    if isinstance(laid, Mapping) and isinstance(fields, Mapping):
         segments = fields.get("segments")
         if isinstance(segments, list | tuple):
             # The layout's segments, each component in today's fields (`earlier_fields`).

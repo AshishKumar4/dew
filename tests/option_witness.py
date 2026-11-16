@@ -574,7 +574,7 @@ def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere:
 
 UNHELD = ("states a layout's window, budgets and option layout alone",
           "Laya's layout holds a ModernBERT encoder", "the source's format holds no cross-attention layers",
-          "Laya's layout is a MarkerLayout over a Hugging Face tokenizer")
+          "Laya's layout is a marker row over a Hugging Face tokenizer")
 """What `dew export` says refusing a run whose format holds not all it saved, rather than dropping it: a
 release's config (Laya's) its layout's window, budgets and option layout alone, its weights a ModernBERT
 encoder's, and its source's format no cross-attention layer a context reads through."""

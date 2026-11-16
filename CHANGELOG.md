@@ -7,6 +7,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A decision layout is one class, `dew.decision.SegmentLayout`, whose `form` names the row it writes:
+  `SegmentLayout.marker_row(...)` (Laya's, formerly `MarkerLayout(...)`), `state_first_row(...)` (formerly
+  `StateFirstLayout(...)`) and `joint_row(...)` (formerly `JointLayout(...)`), each laying out the rows its class
+  did, byte for byte. A saved run, step declaration or release that names one of the earlier classes reads as
+  the segment layout it is now; code that builds or checks for the earlier classes moves to the constructors
+  and to `layout.joint` and `dew.decision.layout.per_question`.
 - `dew.training.ahead.kept(path)` verifies by default: each handed call's own program is lowered and held to
   the kept one's digest before the kept executable runs, so a kept program its call no longer lowers to is
   refused (`NotTheKeptProgram`), never run; it still compiles nothing. `kept(path, verify=False)` is the
