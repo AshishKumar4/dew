@@ -1704,8 +1704,9 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
         tiles = template.MOSAIC.derived(bound, facts)
     if tiles is None:
         return None, bound, tiles, unforked
-    table, starts, firsts, segments = jax.eval_shape(
+    table, starts, firsts, _ = jax.eval_shape(
         lambda given, forked: template.forked_table(given, forked, *q.shape[:2], tiles.chunk), given, forked)
+    segments = forked.loads.shape[1]
     formed = {key: value for key, value in _form(name, jnp.bfloat16).items() if key != 'wide' or not training}
     cotangents = [jax.ShapeDtypeStruct(v.shape, jnp.bfloat16), h0] if training else []
     tabled, laid_table = jax.tree.flatten(table)

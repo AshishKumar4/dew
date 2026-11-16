@@ -415,10 +415,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
         if forked is not None:
             # A forked call's walks over its documents laid as a packed call's at the config's chunk, and
             # its table.
-            table, starts, _, max_segments = jax.eval_shape(
+            table, starts, _, _ = jax.eval_shape(
                 functools.partial(forked_table, batch=given[0].shape[0], length=given[0].shape[1],
                                   chunk=config.chunk), given[5], forked)
-            shapes = (*shapes[:5], None, starts)
+            shapes, max_segments = (*shapes[:5], None, starts), forked.loads.shape[1]
         return _planned(shapes, config, family, target, max_segments, delta, bool(fast) and backward,
                         arguments.get("rounded", False), arguments.get("wide", False),
                         ranged(dtype, delta, arguments.get("bound")),
