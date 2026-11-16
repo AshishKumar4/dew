@@ -1808,14 +1808,16 @@ def spectral_bound(coefficients: np.ndarray) -> float:
 
 
 def shape_scale(update: jax.Array | jax.ShapeDtypeStruct, numbers: optax.contrib.MuonDimensionNumbers,
-                consistent_rms: float | None) -> jax.Array:
+                consistent_rms: float | None, root: Callable = jnp.sqrt):
     """The factor Muon's shape scaling (`_scale_by_shape`) multiplies a matrix's update by, from its fans
     (optax's `scale_by_shape`): Jordan's width transfer, `sqrt(max(1, fan_out / fan_in))`, or Moonlight's
-    consistent RMS, `consistent_rms * sqrt(max(fan_in, fan_out))`. Read from the update's shape alone."""
+    consistent RMS, `consistent_rms * sqrt(max(fan_in, fan_out))`. Read from the update's shape alone, its
+    square root `root`'s: an array's in the step, as optax's, a number's where the bound reads it
+    (`math.sqrt`)."""
     fan_in, fan_out = _muon._get_shape_products(update, numbers)
     if consistent_rms is None:
-        return jnp.sqrt(jnp.maximum(1, fan_out / fan_in))
-    return jnp.sqrt(jnp.maximum(fan_in, fan_out)) * consistent_rms
+        return root(max(1, fan_out / fan_in))
+    return root(max(fan_in, fan_out)) * consistent_rms
 
 
 def update_bounds(optimizer: Optimizer | str, opts: Mapping[str, object], *, quantized: bool = False
@@ -1886,10 +1888,12 @@ def _muon_bounds(values: Mapping[str, object], adam: float | None) -> LeafBounds
     rms = values['consistent_rms']
     rms = float(rms) if isinstance(rms, int | float) else None
 
+    def matrix(leaf, number) -> float | None:
+        return ROUNDING_ROOM * spectral * shape_scale(leaf, number, rms, math.sqrt) if covered else None
+
     def bounds(params) -> list[float | None]:
         numbers = jax.tree.leaves(muon_weight_dimension_numbers(params), is_leaf=muon_leaf)
-        return [adam if number is None else (ROUNDING_ROOM * spectral * float(shape_scale(leaf, number, rms))
-                                             if covered else None)
+        return [adam if number is None else matrix(leaf, number)
                 for leaf, number in zip(jax.tree.leaves(params), numbers, strict=True)]
     return bounds
 
