@@ -202,11 +202,12 @@ class Region:
 @dataclasses.dataclass(frozen=True)
 class Formed:
     """A prologue's priced parts (`priced`): its element stage's work on the whole operand, which the kernel's
-    prologue does tile by tile (`stage`), the work XLA does whole for the row or depth values it reads beside
-    (`sides`, a norm's statistics), and the bytes those values hold (`side_bytes`)."""
+    prologue does tile by tile (`stage`, counted as a kernel's body is, `emission.emitted`), and the bytes of
+    the row or depth values XLA computes whole beside it (`side_bytes`, a norm's statistics): XLA's pass for
+    them is priced by what it reads and writes, a reduction over the rows, as XLA's fusion of any program is
+    (`algebra.cost.fused`), never by a kernel body's counter, which prices only what a kernel runs."""
 
     stage: cost.Work
-    sides: cost.Work
     side_bytes: float
 
 
@@ -241,8 +242,8 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     prologue, forming, sides = cost.Work(), 0.0, 0.0
     if formed is not None:
         prologue = formed.stage + cost.Work(device_bytes=formed.side_bytes)
-        forming = xla(formed.sides + formed.stage + cost.Work(device_bytes=2 * base, kernels=1.0))
-        sides = xla(formed.sides + cost.Work(device_bytes=base + formed.side_bytes, kernels=1.0))
+        forming = xla(formed.stage + cost.Work(device_bytes=2 * base, kernels=1.0))
+        sides = xla(cost.Work(device_bytes=base + formed.side_bytes, kernels=1.0))
     fused_seconds = sides + launched(product + region.chain + prologue + cost.Work(
         device_bytes=operands + region.captured_bytes + region.output_bytes))
     unfused_seconds = forming + launched(product + cost.Work(device_bytes=operands + written))
@@ -257,20 +258,6 @@ def _chain(consumer, values, acc) -> cost.Work:
     (`emission.emitted`): each operation of the CUDA cores, of the special-function units and each
     conversion an element of its result, each reduction an element of its input."""
     return emission.emitted(jax.make_jaxpr(consumer)(values, acc).jaxpr, 1, None).fixed
-
-
-def _work(eqns) -> cost.Work:
-    """`eqns`' elementwise work: each equation an operation an element of its result, one the
-    special-function units evaluate on them (the kernels' counter's rule, `emission.SPECIAL_FUNCTIONS`), a
-    conversion's apart."""
-    work = cost.Work()
-    for eqn in eqns:
-        elements = float(sum(math.prod(shape) for var in eqn.outvars
-                             if (shape := getattr(var.aval, 'shape', None)) is not None))
-        work = work + (cost.Work(exponentials=elements) if eqn.primitive in emission.SPECIAL_FUNCTIONS
-                       else cost.Work(conversions=elements) if eqn.primitive is jax.lax.convert_element_type_p
-                       else cost.Work(operations=elements))
-    return work
 
 
 def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared: tuple, *fusions):
@@ -454,10 +441,16 @@ def _split(producer, values):
     function = functools.partial(_prologue_tile, whole, tuple(jax.typeof(array) for array in arrays), axes)
     places = tuple(given.get(var) for var in (base, *sides))
     jvp = functools.partial(_whole_jvp, flat, tuple(leaves), places, tuple(array.shape for array in arrays))
-    # Priced (`Formed`): the element stage the prologue runs, the rest XLA runs whole for its sides.
-    staged = {id(eqn) for eqn in stage}
-    formed = Formed(_work(stage), _work(eqn for eqn in jaxpr.eqns if id(eqn) not in staged),
-                    float(sum(array.size * array.dtype.itemsize for array in squeezed)))
+    # Priced (`Formed`): the element stage the prologue runs, counted as a kernel's body is
+    # (`emission.emitted`), and the sides' bytes, which XLA's pass writes. A stage holding an operation the
+    # kernels' counter prices none of is no kernel's: refused (its selector then XLA's, or a call naming
+    # the fused kernel told why), never raised, whichever operation it is (a layout's, a reduction's).
+    staged_program = jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage)
+    try:
+        work = emission.emitted(staged_program, 1, None).fixed
+    except emission.Unpriced as unpriced:
+        return Refusal('unpriced', f"the kernels price no operation of the producer's stage: {unpriced}")
+    formed = Formed(work, float(sum(array.size * array.dtype.itemsize for array in squeezed)))
     return arrays[0], function, squeezed, named, jvp, formed
 
 
