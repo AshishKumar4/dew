@@ -279,11 +279,12 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
     reaches the one after (row 1966's overflow orders). Each token's parts are formed inside its step
     (`_at_token`), as the token's own update forms them: a factor applied to an operand (a reader's scale,
     a write's gate) then meets the operand's cotangent inside the step, so a second derivative applies it
-    before the step's products, never after them, which near float32's largest overflowed (row 5426)."""
+    before the step's products, never after them, which near float32's largest overflowed (row 5426).
+    The chunk's shared operands (`every`) are laid a copy a token, so their cotangents leave the scan a
+    token each and are summed outside it, as fla sums RWKV6's bonus gradient (chunk_rwkv6's du): closed
+    over, the scan's reverse added them a token at a time in its carry, 1.67 times fla's error from
+    float64."""
     along, every = _walked_tokens(declaration, chunk)
-    # The chunk's shared operands (`every`: RWKV6's bonus) a copy a token, so their cotangents leave the
-    # scan a token each and are summed outside it, as fla sums them (chunk_rwkv6's du): closed over, the
-    # scan's reverse added them a token at a time in its carry, 1.67 times fla's error from float64.
     count = next(iter(along.values())).shape[0]
     along.update({name: jnp.broadcast_to(value, (count, *value.shape)) for name, value in every.items()})
 
