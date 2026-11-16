@@ -219,25 +219,42 @@ _DEFAULT_MESH = MeshSpec()
 _DEFAULT_LAYOUT = Layout()
 
 
-def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | None]) -> None:
-    """Refuse to save a `state` whose checked trees (`transaction.checked`: the parameters, optimizer state
-    and averages, and under DiLoCo each replica's inner copy of them, which the next meeting averages into
-    the outer model) hold a non-finite value, on any tier: no checkpoint is written and none rotated out,
-    and the run stops, naming the step and the first such leaf, so the checkpoint a resume finds is the
-    last finite one (`latest`, read only to say so). Read wherever the leaves are placed
-    (`transaction.finite_flags`), the same on every process (training.md, checkpoints and resume)."""
+def first_non_finite(state: TrainState) -> str | None:
+    """The first leaf of `state`'s checked trees (`transaction.checked`: the parameters, every optimizer
+    leaf and the averages, and under DiLoCo each replica's inner copy of them) holding a value that is not
+    finite, by its path; None where none does. Read wherever the leaves are placed, one compiled check a
+    placement (`transaction.finite_flags`), the same on every process."""
     trees = {**checked(state), **({} if state.inner is None else
                                   {f"inner.{name}": tree for name, tree in checked(state.inner).items()})}
     leaves = [(f"{name}{jax.tree_util.keystr(path)}", leaf) for name, tree in trees.items()
               for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
               if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)]
     finite = finite_flags([leaf for _, leaf in leaves])
-    first = next((path for (path, _), held in zip(leaves, finite, strict=True) if not held), None)
+    return next((path for (path, _), held in zip(leaves, finite, strict=True) if not held), None)
+
+
+def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | None]) -> None:
+    """Refuse to save a `state` holding a value that is not finite (`first_non_finite`), on any tier: no
+    checkpoint is written and none rotated out, and the run stops, naming the step and the first such leaf,
+    so the checkpoint a resume finds is the last finite one (`latest`, read only to say so) (training.md,
+    checkpoints and resume)."""
+    first = first_non_finite(state)
     if first is not None:
         kept = latest()
         said = "no checkpoint" if kept is None else f"the latest checkpoint, step {kept}"
         raise RuntimeError(f"step {step}'s state holds a non-finite value at {first}, so no checkpoint of it "
                            f"is written and {said} is the one a resume finds")
+
+
+def stop_non_finite(state: TrainState, step: int) -> None:
+    """Stop a run whose `state` holds a value that is not finite (`first_non_finite`), naming the step and
+    the first such leaf: read at each log step, outside the step's program, so a finite gradient whose
+    update overflowed (an Adam moment past float32, which freezes its parameter while the loss stays
+    finite) stops the run though it saves nothing (training.md, a step that is not finite)."""
+    first = first_non_finite(state)
+    if first is not None:
+        raise RuntimeError(f"step {step}'s state holds a non-finite value at {first}, so the run stops")
+
 
 def program_digest(signature: Hashable) -> str:
     """The digest of a step's batch signature (`batch_signature`, keyed by its phase's passes), which names
@@ -1777,6 +1794,7 @@ class Trainer(Generic[Loss, Effects]):
         logged = plan.falls(plan.log_every, current, counts)
         if logged:
             self._take(plan, run, interval, state)
+            stop_non_finite(state, current)
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
             # The clock is read at the log interval, where the step is already waited on, so a pool's

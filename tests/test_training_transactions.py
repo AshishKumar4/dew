@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import Counting, dataset, raw_leaf
+from affine_run import FEATURES, Counting, dataset, raw_leaf
 from flax import linen as nn, struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from reference_error import as_given, assert_as_exact, dew_programs, widened
@@ -687,3 +687,37 @@ def test_a_step_whose_collection_overflows_moves_no_weight_and_writes_no_collect
     assert not bool(finite) and int(advanced.updates) == 0
     for got, want in zip(jax.tree.leaves(advanced.variables), jax.tree.leaves(before), strict=True):
         np.testing.assert_array_equal(np.asarray(got), want)
+
+
+class Pushed(Objective):
+    """A weight pushed by each batch's inputs, its loss the mean of their products with it, its gradient
+    the inputs' mean: finite however large they are."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.zeros((FEATURES,))}}
+
+    def loss(self, variables, batch, step):
+        return jnp.mean(batch["x"] @ variables["params"]["w"]), Aux({})
+
+
+class Huge(Counting):
+    """`Counting`'s batches, every input 1e20."""
+
+    def __next__(self):
+        batch = super().__next__()
+        return {**batch, "x": np.full_like(batch["x"], 1e20)}
+
+
+def test_a_run_whose_finite_gradient_overflows_its_optimizer_stops_at_its_next_log_step():
+    """A run saving nothing whose finite gradient (inputs of 1e20) puts Adam's second moment past float32
+    stops at its next log step, its state read outside the step (`stop_non_finite`): the moment's update is
+    zero, so its weight froze while its loss stayed finite, and the run went on to its end in silence (Main,
+    on the owner's option B: detection apart from rollback)."""
+    from recording import RecordingTracker
+
+    tracker = RecordingTracker()
+    trainer = Trainer(Pushed(), optax.adam(0.1), key=jax.random.PRNGKey(0), tracker=tracker)
+    with pytest.raises(RuntimeError):
+        trainer.fit(dataset(Huge), steps=4, log_every=1)
+    (logged,) = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
+    assert np.isfinite(logged["train/loss"])
