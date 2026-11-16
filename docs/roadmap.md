@@ -86,6 +86,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
 - A decoder computing in no dtype of its own (dtype=None) over parameters of mixed dtypes, e.g. [6215]
 - A dtype=None hybrid over narrower weights whose recurrent layers are GatedDeltaNet, Kimi Delta Attention or lightning attention can still widen the residual…. [6935]
+- A recurrent layer's fused decode token (the template's fused step. [6963]
 
 ## Algebra
 
