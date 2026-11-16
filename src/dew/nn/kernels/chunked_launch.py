@@ -382,6 +382,28 @@ class Forked:
         """This call's documents from the operands a product's walk was handed (`walked`)."""
         return Forked(firsts, loads, stores, entry or None, self.held)
 
+    def tokens(self, length: int) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Each of a call's `length` tokens' part in its walk, `[B, S]` int each, the documents walked in
+        place (a document's memory taken up at its first token, mid-chunk wherever it falls): the table slot
+        a document's first token takes its memory up from (`Chunk.loads`' one-based, zero a zero memory; -1
+        at every other token), the stored slot its last token leaves its memory in (`Chunk.stores`'; zero
+        elsewhere), and the document a first token begins (its index into `loads`, the entry write's;
+        zero elsewhere). Its sizes are the tokens', none the documents' bound's."""
+        firsts = jnp.asarray(self.firsts, jnp.int32)
+        rows, documents = firsts.shape
+        held = firsts < length
+        lasts = jnp.concatenate([firsts[:, 1:], jnp.full_like(firsts[:, :1], length)], axis=1)
+        lasts = jnp.minimum(lasts, length) - 1
+        lines = jnp.arange(rows)[:, None]
+        began = jnp.where(held, firsts, length)
+        loads = jnp.full((rows, length), -1, jnp.int32).at[lines, began].set(
+            jnp.asarray(self.loads, jnp.int32), mode="drop")
+        stores = jnp.zeros((rows, length), jnp.int32).at[lines, jnp.where(held, lasts, length)].set(
+            jnp.asarray(self.stores, jnp.int32), mode="drop")
+        numbers = jnp.broadcast_to(jnp.arange(documents, dtype=jnp.int32), firsts.shape)
+        begun = jnp.zeros((rows, length), jnp.int32).at[lines, began].set(numbers, mode="drop")
+        return loads, stores, begun
+
 
 @dataclasses.dataclass(frozen=True)
 class AlignedDocuments:

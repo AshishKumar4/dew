@@ -125,7 +125,15 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     the final state; `replay(chunk, h)` the chunk walked token by token from the state `h` entering it, its
     outputs and the state leaving it (`_replayed`), and `backward(chunk, state, d_state, d_outputs)` its
     derivative, the chunk's adjoint: the cotangent of the state entering it and of each operand but the
-    reset's. Refused (`Refused`) where the update or the readout is not of the module's form. `init(shapes)`
+    reset's. `prepare(chunk, window=(origin, through))` prepares a document's segment of the chunk, a
+    memory entering its token `origin` and its state left after `through` (`_windowed`: every other token
+    the identity, its resets cleared), whose `mapped` and `step` from that memory are the segment's
+    outputs and the state it leaves, as a forked walk loads and stores a document's memory mid-chunk: its
+    values differ from the chunk's in content alone, so one split serves both (the split's key is its
+    operands' shapes). `replay` and `backward` take a walk's own hooks around each token (`walked`,
+    `_replayed`), `backward`'s with the cotangent of what the walk carries after the chunk, and give its
+    cotangent before it besides. Refused (`Refused`) where the update or the readout is not of the module's
+    form. `init(shapes)`
     given a chunk's operands (or their shapes and dtypes) starts a walk that merges (`Walk`), its transfer
     carried where its tokens correct the state; given none, one that steps alone. `prepare`, `step`, `mapped`
     and `merge` each take a mainloop's issuer, `issue(role, lhs, rhs)` (`lhs @ rhs`), which makes every matrix
@@ -152,9 +160,17 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             _traced(declaration, declaration.update, names, chunk),
             _traced(declaration, declaration.readout, names, chunk), saturation), derive.FORMS_HELD)
 
-    def parts(chunk: Mapping):
+    def parts(chunk: Mapping, window=None):
         affine = affine_of(chunk)
-        return affine, _token_parts(declaration, names, affine, chunk)
+        if window is None:
+            return affine, _token_parts(declaration, names, affine, chunk)
+        if declaration.reads == "before":
+            raise Refused("a window's memory enters mid-chunk, which a token reading the state entering it "
+                          "reads before the window's first token: no windowed form")
+        # A window holds no reset (its segment ends before the next document's first token): its origin
+        # takes its own exponent, the memory entering it decayed as a row's entering state is.
+        unreset = dataclasses.replace(declaration, reset=None)
+        return affine, _windowed(_token_parts(unreset, names, affine, chunk), window)
 
     # A walk's decay and state carried in its chunks' accumulation (`parts`' float32 at least; a float64
     # state's, float64), the state rounded to its declared dtype once, at the finish: a 16-bit state carried
@@ -170,8 +186,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     splits: collections.OrderedDict = collections.OrderedDict()  # the least recently prepared first
 
-    def prepare(chunk, issue=None, transition: bool = False):
-        affine, (exponent, *values) = parts(chunk)
+    def prepare(chunk, issue=None, transition: bool = False, window=None):
+        affine, (exponent, *values) = parts(chunk, window)
         decays = _decays(exponent, affine.base2)
         natural = _walked(exponent, affine.base2)
         tokens, entering = _read_entering(declaration, chunk, dict(zip(TOKENS, values, strict=True)))
@@ -210,14 +226,24 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         del operands
         return state[1].astype(dtype)
 
-    def replay(chunk, h):
-        return _replayed(declaration, names, affine_of(chunk), chunk, h)
+    def replay(chunk, h, walked=None):
+        if walked is None:
+            return _replayed(declaration, names, affine_of(chunk), chunk, h)
+        # A walk's hooks take its documents' memories up where a reset would have zeroed them.
+        unreset = dataclasses.replace(declaration, reset=None)
+        return _replayed(unreset, names, affine_of(chunk), chunk, h, walked)
 
-    def backward(chunk, state, d_state, d_outputs):
+    def backward(chunk, state, d_state, d_outputs, walked=None):
         # The reset's booleans held, no operand of the derivative.
-        _, pullback = jax.vjp(lambda h, operands: replay({**chunk, **operands}, h), state[1],
-                              {name: chunk[name] for name in names})
-        return pullback((d_outputs, d_state))
+        operands = {name: chunk[name] for name in names}
+        if walked is None:
+            _, pullback = jax.vjp(lambda h, operands: replay({**chunk, **operands}, h), state[1], operands)
+            return pullback((d_outputs, d_state))
+        before, after, carried, d_carried = walked
+        _, pullback = jax.vjp(lambda h, operands, carried: replay({**chunk, **operands}, h,
+                                                                   (before, after, carried)),
+                              state[1], operands, carried)
+        return pullback((d_outputs, d_state, d_carried))
 
     return Derived(init, _stepped, merge, finish, mapped,
                    {"rounding": "compensated prefix", "walked": declaration.walked}, backward, prepare,
@@ -268,7 +294,17 @@ def _token_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping
     return jax.vmap(lambda token: _at_token(declaration, names, affine, {**token, **every}))(along)
 
 
-def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h) -> tuple:
+def _windowed(parts: tuple, window) -> tuple:
+    """A chunk's token parts (`_token_parts`) with every token outside `window` (`(origin, through)`, its
+    first and last, inclusive) the identity token: exponent 0 (a unit decay), no input, correction, reader or
+    free readout, so its update leaves the state as it was and its output is zero."""
+    origin, through = window
+    place = jnp.arange(parts[0].shape[0])
+    inside = (place >= origin) & (place <= through)
+    return tuple(jnp.where(inside.reshape(-1, *([1] * (jnp.ndim(part) - 1))), part, 0) for part in parts)
+
+
+def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h, walked=None) -> tuple:
     """`chunk` walked token by token from the state `h` entering it by the affine map's parts at each token
     (`_at_token`): `(outputs, h)`, each token's output and the state leaving the chunk, in the state's
     carried dtype. A scalar decay follows the transition, so its cotangent reads the corrected state; a
@@ -279,7 +315,12 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
     reaches the one after (row 1966's overflow orders). Each token's parts are formed inside its step
     (`_at_token`), as the token's own update forms them: a factor applied to an operand (a reader's scale,
     a write's gate) then meets the operand's cotangent inside the step, so a second derivative applies it
-    before the step's products, never after them, which near float32's largest overflowed (row 5426)."""
+    before the step's products, never after them, which near float32's largest overflowed (row 5426).
+
+    A walk's own hooks (`walked`, `(before, after, carried)`) take part in the tokens' steps:
+    `before(t, h, carried)` the state token `t` enters and the walk's own values (a forked walk's document
+    taking its memory up from its table), `after(t, h, carried)` its values after the token (a document
+    leaving its memory in a slot); then `(outputs, h, carried)`."""
     along, every = _walked_tokens(declaration, chunk)
 
     def token(h, step):
@@ -309,8 +350,20 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
         return h, output if entering is None else entering
 
     carried = at_least_fp32(h.dtype)
-    h, outputs = lax.scan(token, h.astype(carried), along)
-    return outputs, h
+    if walked is None:
+        h, outputs = lax.scan(token, h.astype(carried), along)
+        return outputs, h
+    before, after, own = walked
+
+    def hooked(state, step):
+        (h, own), (t, step) = state, step
+        h, own = before(t, h, own)
+        h, output = token(h.astype(carried), step)
+        return (h, after(t, h, own)), output
+
+    count = jax.tree.leaves(along)[0].shape[0]
+    (h, own), outputs = lax.scan(hooked, (h.astype(carried), own), (jnp.arange(count), along))
+    return outputs, h, own
 
 
 @functools.partial(jax.tree_util.register_dataclass, data_fields=["values", "transition", "entering"],
