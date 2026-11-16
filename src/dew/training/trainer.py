@@ -699,6 +699,10 @@ class Trainer(Generic[Loss, Effects]):
                                                          dataclasses.replace(shardings, variables=placement)))
         _log.info("the state holds %.2f GiB on its fullest device between steps",
                   max(self.validation.device_bytes.values()) / 2 ** 30)
+        if self.validation.by_shape:
+            # A parameter whose module declares no axes keeps the shape heuristic (training.md, the layout).
+            _log.info("the layout placed %d parameters by their shape, their modules declaring no axes: %s",
+                      len(self.validation.by_shape), ", ".join(self.validation.by_shape))
         return shardings, self.validation
 
     def _validation(self, placed: TrainState) -> Validation:
