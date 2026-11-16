@@ -1830,9 +1830,8 @@ device = _device(target).devices.flat[0]
 # Two rungs of a launch's producer ladder past a training case's tiles (`_ladders`).
 with generation.assumed(facts):
     label, bound, pulled, configs = next(
-        (unit[0], unit[1], unit[4], ladder) for unit in gate._identity_units(target)
-        if unit[3] == 'launch' and unit[4]
-        and len(ladder := gate._walked(unit[1], unit[2], 'launch', unit[5], facts)) >= 3)
+        (unit[0], unit[1], unit[4], unit[6]) for unit in gate._identity_units(target)
+        if unit[3] == 'launch' and unit[4] and len(unit[6]) >= 3)
 rungs = configs[1:3]
 programs = []
 with report.refusals(), generation.assumed(facts), report.certifying(device):
@@ -1955,13 +1954,22 @@ def _rungs_of(bound, tiles, training: bool, facts) -> list:
     return found
 
 
+LADDER_RUNGS = 3
+"""The rungs of a launch's producer ladder the identity test walks past its tiles (`_walked`): its first, the
+consumers' statement's share where it has one, else its top; its top; and the first below it. Each rung's
+cap is one setmaxnreg constant in that launch's producer and in no other launch's kernel, so the rungs past
+them hold no naming another does not: walked to the foot, a ladder of 14 configs of 16 kernels a config
+held one task 171 s (jsf-ideal2)."""
+
+
 def _walked(bound, tiles, kind: str, launch: str, facts) -> list:
-    """A launch's ladder from a case's `tiles`: its tiles and each rung of its producer ladder
-    (`Mosaic._raised`, from its top down), a forward-apart launch's ('forward launch') its forward alone at
-    the case's tiles with that launch's forward producers alone at each rung (a pinned config's, which may set
-    the forward's caps apart from the call's)."""
+    """A launch's ladder from a case's `tiles`: its tiles and its producer ladder's first `LADDER_RUNGS`
+    (`Mosaic._raised`), a forward-apart launch's ('forward launch') its forward alone at the case's tiles
+    with that launch's forward producers alone at each rung (a pinned config's, which may set the forward's
+    caps apart from the call's)."""
     rungs, rung = [], tiles
-    while (up := template.MOSAIC._raised(bound, rung, frozenset({launch}), facts)) is not None:
+    while len(rungs) < LADDER_RUNGS and (
+            up := template.MOSAIC._raised(bound, rung, frozenset({launch}), facts)) is not None:
         rung = template._limited(rung, producers=up, residents=rung.residents)
         rungs.append(rung if kind == 'launch' else dataclasses.replace(
             tiles, forward=dataclasses.replace(tiles.forward, producers=rung.producers)))
@@ -1970,13 +1978,13 @@ def _walked(bound, tiles, kind: str, launch: str, facts) -> list:
 
 @functools.cache
 def _identity_units(target: str) -> tuple:
-    """The identity test's units on `target`: each `(label, bound, tiles, kind, pulled, launch, kernels)`, a
-    launch's ladder unwalked (`_rungs_of`) of every case of the gate's groups that cover every launch and axis
-    the gate reaches there (`_reach`: `GATE_GROUPS` taken in order where a group reaches what none before it
-    did), beside the kernels a config of its case lowers. Derived in each task, as collection cannot afford it
-    (6.0 to 8.0 s a target of the model alone, jsf-cover, in every CI task's collection), and held a process;
-    each task walks its own units' ladders alone (`_walked`): every case's walked in every task took 50 s of
-    each sm100 task (jsf-6547d)."""
+    """The identity test's units on `target`: each `(label, bound, tiles, kind, pulled, launch, configs,
+    lowered)`, a launch's ladder (`_rungs_of`, walked by `_walked`) of every case of the gate's groups that
+    cover every launch and axis the gate reaches there (`_reach`: `GATE_GROUPS` taken in order where a group
+    reaches what none before it did), with the kernels its configs lower, which a task's time follows (0.92
+    correlated over sm90's and sm100's tasks, where the kernels a config lowers alone were 0.29, jsf-ideal2).
+    Derived in each task, as collection cannot afford it (6.0 to 8.0 s a target of the model alone,
+    jsf-cover, in every CI task's collection), and held a process."""
     facts = generation.gpu_target(target)
     held, units = set(), []
     with generation.assumed(facts), report.refusals():
@@ -1988,13 +1996,14 @@ def _identity_units(target: str) -> tuple:
                 for kind, pulled, launch in _rungs_of(bound, tiles, training, facts):
                     walked = tiles.forward if kind == 'forward launch' else tiles
                     kernels = len(template.MOSAIC.launches(bound, walked, facts, backward=pulled))
-                    units.append((label, bound, tiles, kind, pulled, launch, kernels))
+                    configs = tuple(_walked(bound, tiles, kind, launch, facts))
+                    units.append((label, bound, tiles, kind, pulled, launch, configs, kernels * len(configs)))
     return tuple(units)
 
 
 def _dealt(units: list, tasks: int, task: int) -> list:
     """The `task`-th of `tasks` tasks' share of `units` (`_identity_units`'): each case's units kept together
-    in parts of at most a task's even share of the kernels a ladder lowers a config, as every ladder of a case
+    in parts of at most a task's even share of the kernels their ladders lower, as every ladder of a case
     holds its tiles, lowered once a task, the parts packed by those kernels as the CI plan packs files
     (tools/armada/ci.py's `packed`, heaviest first into the lightest task). A name present at a case's tiles
     is compared against one body in every task holding that case; a name absent at the tiles that two parts in
@@ -2053,10 +2062,10 @@ def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target,
     bodies: dict[str, set[str]] = collections.defaultdict(set)
     lowered: dict[tuple, dict[str, str]] = {}
     with generation.assumed(facts), report.refusals():
-        for label, bound, tiles, kind, pulled, launch, _ in _dealt(list(_identity_units(target)),
-                                                                     identity_tasks(target), task):
+        for label, bound, _, _, pulled, _, configs, _ in _dealt(list(_identity_units(target)),
+                                                                 identity_tasks(target), task):
             named = []
-            for config in _walked(bound, tiles, kind, launch, facts):
+            for config in configs:
                 if (label, pulled, config) not in lowered:
                     lowered[label, pulled, config] = _named_bodies(bound, config, target, training=pulled)
                 named.append(lowered[label, pulled, config])
