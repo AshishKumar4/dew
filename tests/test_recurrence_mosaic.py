@@ -373,10 +373,12 @@ def test_the_mosaic_forward_over_a_ragged_length_is_as_exact_as_its_reference():
     """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over a ragged length."""
 
 
-@pytest.mark.check1_shards(seeds=256, per_task=16)
+@pytest.mark.check1_shards(seeds=256, per_task=6)
 @drawn_forward('packed documents', 'bf16')
 def test_the_mosaic_forward_over_packed_documents_is_as_exact_as_its_reference():
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over packed documents."""
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over packed documents: six draws a
+    task, a draw interpreted on sm100 15 to 17 s (sixteen took 236 to 272 s a shard, two of test_recurrence_
+    mosaic's groups past the task deadline, row 6745)."""
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=8)
