@@ -618,7 +618,7 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     from dew._records import earlier_layout
 
     # A layout recorded by one of the three classes before them as one class (decision-inputs.md §1).
-    current = {name: earlier_layout(value) for name, value in current.items()}
+    current = {name: earlier_layout(json_value(value, name)) for name, value in current.items()}
     laid = current.get("layout")
     fields = laid.get("fields") if isinstance(laid, Mapping) else None
     if isinstance(laid, Mapping) and isinstance(fields, Mapping) and fields.get("segments") is not None and (
