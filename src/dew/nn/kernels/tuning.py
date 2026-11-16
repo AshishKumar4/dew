@@ -562,7 +562,10 @@ class KernelOp(tokamax.Op):
         if config is None:
             if (collected := _cache.KERNEL_SEEN.value) is not None:
                 collected.found.append((self, self.keyed(ba)))
-            config = self._chosen(ba)
+            config = self.taken(ba)
+            if config is None:
+                raise report.Exhausted(f"no config of {type(self).__name__} holds this call: none fits, or "
+                                       f"certification refused each that did (report.misses names them)")
             if collected is not None:
                 collected.found.taken.append((config, ba))
         else:
@@ -575,7 +578,12 @@ class KernelOp(tokamax.Op):
         with report.launching(self, ba, config):
             return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
 
-    def _chosen(self, ba: tokamax.BoundArguments) -> Hashable:
+    def taken(self, ba: tokamax.BoundArguments) -> Hashable | None:
+        """The config a call of `ba` takes: a pin, a tuned pick the call's shapes take, else its derived
+        config as certification holds it (`_certified`); None where certification refuses every config the
+        derivation offers, which a template's eligibility reads (`Template.holds`) so its route takes another
+        implementation before the call. Certification is asked once a config a process (`report.certified`'s
+        record), so the call's own taking after its route's asks no compile again."""
         pins = dict(_cache.KERNEL_PINS.value)
         if type(self) in pins:
             pin = self.completed(ba, pins[type(self)])
@@ -586,31 +594,37 @@ class KernelOp(tokamax.Op):
         pick = _pick(self.keyed(ba)) if _READING.get() else None
         # A pick measured at another shape of its key the launch's own shapes cannot take is not taken.
         if pick is None or not self.pinnable(ba, pick.fastest_config):
-            return self._certified(ba, ba.heuristics_config)
+            derived = self.remaining(ba)
+            return None if derived is None else self._certified(ba, derived)
         return pick.fastest_config
 
-    def _certified(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
+    def _certified(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable | None:
         """The derived `config`, or, where its kernels spill as the GPU assembles them alone
         (`report.certified`), each refused (`report.refuse_launch`, so its legality
         refuses it) and its misses recorded (`report.missed`: stepped where the next was derived),
-        and the next derived in turn: the first whose kernels hold. A derivation that offers a
-        refused config again (its legality reads no refusal) has it kept, its program's compile left to read
-        it (`report.settled`). A pinned or a tuned pick is a measured choice, not certified here: its
-        program's compile reads it."""
+        and the next derived in turn (`remaining`): the first whose kernels hold, None where the derivation
+        offers none past the refused. A derivation that offers a refused config again (its legality reads no
+        refusal) has it kept, its program's compile left to read it (`report.settled`). A pinned or a tuned
+        pick is a measured choice, not certified here: its program's compile reads it."""
         seen = set()
         while config not in seen and (spilling := report.certified(self, ba, config)):
             seen.add(config)
             report.refuse_launch(self, ba, config, {binary.kernel for binary in spilling})
-            # Each refused config stepped to the next refused one; the last, to what the derivation takes.
-            refused, stepped = [(config, spilling), *self._climbed(ba, config, spilling, seen)], None
-            try:
-                stepped = self._get_heuristics_config(ba)
-            finally:  # a derivation left with no config raises: the last refused one stepped nowhere
-                for (refusal, its), later in zip(refused, [*refused[1:], None], strict=True):
-                    report.missed(self, ba, refusal, its, stepped=later is not None or (
-                        stepped is not None and stepped not in seen))
+            # Each refused config stepped to the next refused one; the last, to what the derivation offers.
+            refused = [(config, spilling), *self._climbed(ba, config, spilling, seen)]
+            stepped = self.remaining(ba)
+            for (refusal, its), later in zip(refused, [*refused[1:], None], strict=True):
+                report.missed(self, ba, refusal, its, stepped=later is not None or (
+                    stepped is not None and stepped not in seen))
+            if stepped is None:
+                return None
             config = stepped
         return config
+
+    def remaining(self, ba: tokamax.BoundArguments) -> Hashable | None:
+        """The config the launch's derivation offers `ba` now, its refusals read (`_get_heuristics_config`'s);
+        None where it offers none (a template's, `Template.remaining`)."""
+        return self._get_heuristics_config(ba)
 
     def emitted(self, config: Hashable, kernel: str) -> Hashable:
         """What the kernel named `kernel` reads of `config` as it is emitted, its identity's part beside its

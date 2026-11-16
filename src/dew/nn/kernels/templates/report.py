@@ -855,13 +855,18 @@ def _add(**records: Iterable) -> None:
 
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
-            kernels: frozenset[str] = frozenset()) -> None:
+            kernels: frozenset[str] = frozenset()) -> bool:
+    """`refusal` and `miss` recorded; whether `miss` is new. A miss is recorded once: a launch's derivation
+    asked again (its route's eligibility, then its call, `tuning.KernelOp.taken`) reads its certification
+    back and finds the same misses."""
     registry = _registry()
     with _GUARD:
         if refusal is not None:
             registry.refused[refusal] = registry.refused.get(refusal, frozenset()) | kernels
-        if miss is not None:
-            _add(missed=(miss,))
+        if miss is None or miss in registry.missed:
+            return False
+        _add(missed=(miss,))
+        return True
 
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
@@ -1366,9 +1371,9 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
 def _missed_block(kernel: str, launch: Launch, asked: int, *, stepped: bool) -> None:
     """A Triton launch's shared-memory miss recorded and logged (`_unblocked`), under its first kernel's
     name: XLA's refusal names none."""
-    _record(None, Miss(kernel, launch.op, launch.config, None, None, stepped, shared=asked))
-    _log.warning("a program asks %d shared bytes past its block; Triton kernel %s (%s at %s): %s", asked,
-                 kernel, launch.op, launch.config, "its launch steps down" if stepped else "no step-down")
+    if _record(None, Miss(kernel, launch.op, launch.config, None, None, stepped, shared=asked)):
+        _log.warning("a program asks %d shared bytes past its block; Triton kernel %s (%s at %s): %s", asked,
+                     kernel, launch.op, launch.config, "its launch steps down" if stepped else "no step-down")
 
 
 def _misses_of(refused: list["Binary"]
@@ -1390,10 +1395,10 @@ def _recorded(found: list, *, stepped: bool) -> None:
                     None if launch is None else launch.config, report.registers, report.frame,
                     stepped and launch is not None,
                     serialized=tuple(note.code for note in report.notes if note.code in SERIALIZED))
-        _record(None, miss)
-        _log.warning("kernel %s %s at %s registers (%s at %s); %s", miss.kernel, miss.reason,
-                     miss.registers, miss.op, miss.config,
-                     "its launch steps down" if miss.stepped else "no step-down")
+        if _record(None, miss):
+            _log.warning("kernel %s %s at %s registers (%s at %s); %s", miss.kernel, miss.reason,
+                         miss.registers, miss.op, miss.config,
+                         "its launch steps down" if miss.stepped else "no step-down")
 
 
 def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,

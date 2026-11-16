@@ -163,10 +163,16 @@ class Template[Config: Hashable](tuning.KernelOp):
         registers = self.registers(ba, config)
         return registers is None or registers <= self.register_budget(config)
 
+    def offering(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
+        """The configs the launch offers the call `ba` on `target`, in its order, its refusals read: those
+        that fit (`fits`), unless the launch states its own."""
+        return self.fits(ba, target)
+
     def fitting(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
-        """The configs that fit (`fits`). A call none fits raises, naming the least any config stages and
-        the budget: the template's own requirements refuse the call before it reaches a launch."""
-        fits = self.fits(ba, target)
+        """The configs the launch offers (`offering`). A call it offers none raises, naming the least any
+        config stages and the budget: the template's own requirements refuse the call before it reaches a
+        launch."""
+        fits = self.offering(ba, target)
         if not fits:
             # The least any config whose threads hold their registers stages; None where none does (a
             # generating launch that generates none).
@@ -196,6 +202,20 @@ class Template[Config: Hashable](tuning.KernelOp):
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         # The derived config, or a fixed space's first that fits: nothing ranks configs (bible §6).
         return self.fitting(ba, generation.gpu_target())[0]
+
+    def remaining(self, ba: tokamax.BoundArguments) -> Config | None:
+        # The first config the launch offers (`offering`, its refusals read), none where it offers none.
+        offered = self.offering(ba, generation.gpu_target())
+        return offered[0] if offered else None
+
+    def holds(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
+        """Whether a config of the launch holds the call `ba` on `target`, which its implementation's
+        eligibility reads: where a device certifies launches (`report.certified`), the call's own taking
+        (`taken`) finds one, so a call certification refuses every config of takes another route before
+        its call, its misses in the report; elsewhere one fits (`fits`)."""
+        if report._certifying_device() is None:
+            return bool(self.offering(ba, target))
+        return self.taken(ba) is not None
 
     def neighbours(self, ba: tokamax.BoundArguments, config: Config) -> Sequence[Config]:
         """The configs next to a generating launch's derived `config` an opt-in tuning run may time beside

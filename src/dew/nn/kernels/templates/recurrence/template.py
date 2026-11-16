@@ -947,6 +947,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
         # Its derived config on the target it launches for (`Template.estimate` and its ranking are gone).
         return self.fitting(ba, self.launched())[0]
 
+    def remaining(self, ba: tokamax.BoundArguments) -> mainloop.Tiles | None:
+        # The first config it offers on the target it launches for, none where it offers none.
+        offered = self.offering(ba, self.launched())
+        return offered[0] if offered else None
+
 
 
 def _refused_kernels(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles) -> frozenset[str]:

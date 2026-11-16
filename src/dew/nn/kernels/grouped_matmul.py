@@ -2020,7 +2020,7 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
         tile = self.tile(ba)
         return () if tile is None else (tile,)
 
-    def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
+    def offering(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         # Its build's kernel is the one it runs (`cutlass_tile`), sized to every part of its architecture.
         return self.space(ba)
 
