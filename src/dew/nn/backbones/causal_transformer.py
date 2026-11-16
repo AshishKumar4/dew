@@ -2286,15 +2286,13 @@ class CausalTransformer(LinearProducts):
 
         def kept(policy: RematPolicy | None) -> tuple[frozenset[str], ...] | None:
             """What `policy` does with the names these layers mark: None where it recomputes none of
-            them and keeps the rest, as no remat does. A rung that recomputes the block recomputes, besides,
-            what it has the layers recompute inside it (`recomputed_inside`: `full`'s in-context memory
-            chunks, train 933 F2: a decoder of memories alone otherwise climbed past `full`, its one rung
-            that keeps their steps small)."""
-            if policy is None or (policy.recompute and not frozenset(policy.recompute) & marked):
+            them and keeps the rest, as no remat does; else what it saves, offloads, and has the layers
+            recompute in their own backwards (`recomputed_inside`, the block's own statement of it: a
+            recompute rung's names, `full`'s in-context memory chunks; train 933 F2, 936 F3)."""
+            inside = frozenset(recomputed_inside(policy)) & marked
+            if policy is None or (policy.recompute and not inside):
                 return None
-            inside = frozenset() if policy.recompute else frozenset(recomputed_inside(policy))
-            return (frozenset(policy.save) & marked, frozenset(policy.offload) & marked,
-                    (frozenset(policy.recompute) | inside) & marked)
+            return frozenset(policy.save) & marked, frozenset(policy.offload) & marked, inside
 
         index = DECODER_REMAT.index(self.remat) + 1
         while (index < len(DECODER_REMAT) - 1

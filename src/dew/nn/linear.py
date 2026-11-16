@@ -401,6 +401,15 @@ def scan_cache(rows: int, taps: int, width: int, state: str, state_shape: tuple[
             state: Opened((rows, *state_shape), state_dtype)}
 
 
+def in_input_dtype(module: nn.Module, out, x):
+    """A recurrent layer's scan output `out` where its reference casts it back to the layer input's dtype,
+    with no compute dtype of the layer's own: Mamba2Mixer's gated, normed output before its projection
+    (`self.out_proj(scan_output.to(dtype))`), and the gated delta rules' (Qwen3-Next's, Kimi's) and
+    MiniMax's lightning attention's raw scan output before their norms (cast to the query's dtype), where
+    the scan's fp32 would otherwise reach the residual stream; with a compute dtype, as it is."""
+    return out.astype(x.dtype) if module.dtype is None else out
+
+
 def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
               coordinates: Coordinates, spec: Mapping[str, Opened] | None = None, state: str = 'ssm_state',
               state_dtype=None, conv_dtype=None, parts=None, dtype=None, token=None):
@@ -1325,11 +1334,11 @@ class GatedDeltaNet(nn.Module):
                             state='recurrent_state', state_dtype=stored, conv_dtype=conv,
                             parts=heads, dtype=operand if ported else wide, token=token)
         if token is not None:
-            # The fused step gated and normalized its output (`_fused_hooks`).
-            return self.out_proj(out)
+            # The fused step gated and normalized its output (`_fused_hooks`), in its epilogue's dtype.
+            return self.out_proj(in_input_dtype(self, out, x))
 
         gate = z.reshape(B, S, -1, self.head_v_dim)
-        out = self.norm(out, gate)  # the norm scales, then the activation gates
+        out = self.norm(in_input_dtype(self, out, x), gate)  # the norm scales, then the activation gates
         out = out.reshape(B, S, self.value_features)
         return self.out_proj(out)
 

@@ -451,7 +451,8 @@ class Templated(Protocol):
 TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
     Requirement('launch', lambda case: case.call is not None and case.call.eligible('mosaic_gpu'),
                 "the recurrence template's launches take no call of these dtypes or widths, or no config "
-                "fits this device, or no Mosaic bundle claims its instruction family", row='ledger 1294'),
+                "fits this device or holds in its compiles (each spilling, the start's misses name them), "
+                "or no Mosaic bundle claims its instruction family", row='ledger 1294'),
     Requirement('device', lambda case: case.family is not None,
                 "no GPU runs the call: off one, the mainloop runs interpreted where a call names it",
                 row=INHERENT, kind='measured'),
@@ -978,7 +979,14 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands, parameters: tu
     (`derivatives.with_gradients_formed_at`)."""
     forward = kernel_of('forward')
     try:
-        trained = kernel_of('training')
+        # Selected as reverse mode runs it (`launch_report.pulled`), as it is then certified, and at the
+        # call's own numbers: a template's eligibility reads its certified answer (`Template.holds`), which
+        # selected outside it certified the forward alone, took the A100's gated delta net for its training,
+        # and raised Exhausted from the call's own certification inside the step's trace (train 929's F1);
+        # selected in the pullback, a remat's re-trace under a caller's 'highest' read the accurate forms'
+        # numbers the call did not take (M-JS-63).
+        with launch_report.pulled():
+            trained = kernel_of('training')
     except KernelRefused as refusal:
         training = functools.partial(_refusing, refusal)
     else:

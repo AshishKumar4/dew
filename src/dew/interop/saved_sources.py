@@ -349,7 +349,7 @@ def release_sources(record: Mapping[str, object]) -> dict[str, JSON]:
     cache = Path(dew_cache_dir()) / RELEASES
     sources: dict[str, JSON] = {}
     named = {key: json_value(field, key) for key, field in record.items() if key != RELEASE_SOURCES}
-    for name in _strings(named):
+    for name in strings_of(named):
         path = Path(name)
         if not path.is_absolute() or not path.is_relative_to(cache) or path == cache:
             continue
@@ -395,7 +395,7 @@ def releases_here(record: Mapping[str, object], *, mesh: MeshSpec | Mesh | None 
             f"this step reads the releases of saved runs that this host lacks, and the runs as well "
             f"({missing or 'on another process of the pool'}): place each run where its record names it")
     fields = {key: json_value(field, key) for key, field in record.items() if key != RELEASE_SOURCES}
-    names = _strings(fields)
+    names = list(strings_of(fields))
     renamed: dict[str, str] = {}
     sources = {root: json_value(source, root) for root, source in listed.items() if root not in held}
     for root, source in held.items():
@@ -415,11 +415,6 @@ def releases_here(record: Mapping[str, object], *, mesh: MeshSpec | Mesh | None 
 
     return {**{key: mapped_strings(field, here_named) for key, field in fields.items()},
             RELEASE_SOURCES: sources}
-
-
-def _strings(record: JSON) -> list[str]:
-    """Every string `record` holds at any depth (`_records.strings_of`)."""
-    return list(strings_of(record))
 
 
 def pooled_export(run: SavedRun, destination: Path, *, ema: bool | None = None,

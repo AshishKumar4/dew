@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from contract_support import normal_float32
 from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, arguments
 from test_attention_triton import (
@@ -935,7 +936,7 @@ def test_power2_is_exact_under_jit_at_every_exponent():
     mantissas = jnp.asarray([0.0, 0.5, 0.75, 1.0, -0.6], jnp.float32)
     found = np.asarray(jax.jit(lambda x, k: algebra.power2(x[:, None], k[None, :]))(mantissas, exponents))
     exact = np.ldexp(np.asarray(mantissas, np.float64)[:, None], np.asarray(exponents, np.int64)[None, :])
-    normal = (np.abs(exact) >= np.finfo(np.float32).tiny) & (np.abs(exact) <= np.finfo(np.float32).max)
+    normal = normal_float32(exact)
     np.testing.assert_array_equal(found[normal], exact[normal].astype(np.float32))
     np.testing.assert_array_equal(found[0], 0.0)
     assert np.all(np.isinf(found[1:][np.abs(exact[1:]) > np.finfo(np.float32).max]))

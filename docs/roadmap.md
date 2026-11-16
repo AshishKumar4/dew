@@ -13,6 +13,10 @@ This page is generated from the maintainers' findings ledger as each change land
 - finished_merged's mean is 0 where its slices' masses total past fp32's largest. [6904]
 - finished_merged's derivative along its denominators is NaN where (o - out) / W passes fp32 though its product with the tangent does not. [6905]
 - Mosaic GPU converts an integer to a boolean by truncating it to its low bit, where lax (and XLA) convert by comparing with zero. [6941]
+- The flash fallback's packed documents on a TPU give wrong results. [6981]
+- Splash's float32 forward at width 256 does not compile on a v5e. [6992]
+- The attention template's Mosaic TPU forward does not compile for a v5e training step at width 64, full, float16. [6993]
+- Paged decode on a v5e does not compile. [6994]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -58,9 +62,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
 - Stacks, scans and looped models. [1568]
-- Saved runs carried across. [1622, 1641, 2791, 2792]
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
-- Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
 
 ## Training and parallelism
@@ -83,10 +85,12 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - Training and serving efficiency. [3330, 1880, 5292]
+- A recurrent layer's fused decode token (the template's fused step. [6963]
 - Dory: the release qualified and its tests' oracles. [596]
+- Serving and RL measured where users run them. [5315, 5321]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
 - A decoder computing in no dtype of its own (dtype=None) over parameters of mixed dtypes, e.g. [6215]
-- A dtype=None hybrid over narrower weights whose recurrent layers are GatedDeltaNet, Kimi Delta Attention or lightning attention can still widen the residual…. [6935]
+- The in-context memory reads no forks. [6969]
 
 ## Algebra
 
@@ -101,6 +105,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Released checkpoints judged on GPUs. [1703, 1549]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Every model comparison on check 1. [2300, 3722, 5212]
+- Saved runs carried across. [2791, 2792]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 - The saved data plan as recorded rules, one last version, and the resume modes. [6861]
 

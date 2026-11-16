@@ -61,7 +61,7 @@ from dew.nn.kernels.templates.attention import (
     scored,
     within,
 )
-from dew.nn.kernels.templates.base import Template, Unfitted
+from dew.nn.kernels.templates.base import Template
 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 """The operand dtypes the kernels take, one on queries, keys and values alike."""
@@ -185,7 +185,11 @@ def unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     another mainloop rather than a launch that cannot run; the backward's own launches hold the same tiles'
     operands."""
     op, args, _ = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
-    for each in op.launched_ops(value.dtype) if certified else (op,):
+    # A scaled op before the common op whose walk launches it (`_fwd`'s `rare`), whatever order
+    # `launched_ops` lists them in: certifying the common op traces the scaled op's call, which raised
+    # Exhausted where every config of it spilled, before its own refusal was read (train 934's F2).
+    ops = sorted(op.launched_ops(value.dtype), key=lambda each: not each.scaled)
+    for each in ops if certified else (op,):
         refused = _holding(each, each.bind(*args, residuals=_kept(residuals), interpret=False), "forward",
                            certified=certified)
         if refused is not None:
@@ -201,12 +205,11 @@ def _holding(op: Template, ba: tokamax.BoundArguments, launch: str, *, certified
     if not op.fits(ba, target):
         return Refusal('resources', f"no config of the Triton mainloop's {launch} fits the GPU's block and "
                        "registers")
-    if certified:
-        try:
-            op._certified(ba, op.derived(ba, target))
-        except Unfitted:
-            return Refusal('resources', f"every config of the Triton mainloop's {launch} spills as "
-                           f"{target.generation}'s assembler builds it")
+    # The launch's certified answer (`Template.holds`: its call's own taking, none where every config spills),
+    # the one decision its call reads back.
+    if certified and not op.holds(ba):
+        return Refusal('resources', f"every config of the Triton mainloop's {launch} spills as "
+                       f"{target.generation}'s assembler builds it")
     return None
 
 

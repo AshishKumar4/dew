@@ -163,18 +163,32 @@ class Template[Config: Hashable](tuning.KernelOp):
         registers = self.registers(ba, config)
         return registers is None or registers <= self.register_budget(config)
 
+    def offering(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
+        """The configs the launch offers the call `ba` on `target`, in its order, its refusals read: those
+        that fit (`fits`), unless the launch states its own."""
+        return self.fits(ba, target)
+
     def fitting(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
-        """The configs that fit (`fits`). A call none fits raises, naming the least any config stages and
-        the budget: the template's own requirements refuse the call before it reaches a launch."""
-        fits = self.fits(ba, target)
+        """The configs the launch offers (`offering`). A call it offers none raises (`unfitted`): the
+        template's own requirements refuse the call before it reaches a launch."""
+        fits = self.offering(ba, target)
         if not fits:
-            # The least any config whose threads hold their registers stages; None where none does (a
-            # generating launch that generates none).
-            named = () if self.GENERATES else self.space(ba)
-            held = [config for config in named if self._held(ba, config)]
-            least = min((self.staged_bytes(ba, config, target) for config in held), default=None)
-            raise Unfitted(type(self).__name__, least, generation.shared_budget(target), target.generation)
+            raise self.unfitted(ba, target)
         return fits
+
+    def unfitted(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> "Unfitted":
+        """Why the launch offers the call `ba` no config on `target`: the least any config whose threads hold
+        their registers stages, against the budget; None where none does (a generating launch that
+        generates none)."""
+        named = () if self.GENERATES else self.space(ba)
+        held = [config for config in named if self._held(ba, config)]
+        least = min((self.staged_bytes(ba, config, target) for config in held), default=None)
+        return Unfitted(type(self).__name__, least, generation.shared_budget(target), target.generation)
+
+    def launch_target(self) -> generation.GpuTarget:
+        """The target the launch derives its configs for: the GPU in effect, unless the launch states its
+        own."""
+        return generation.gpu_target()
 
     def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
         """Why `config` is no pin for `ba` (`pinnable`): no config of the launch's type, holding more
@@ -194,8 +208,32 @@ class Template[Config: Hashable](tuning.KernelOp):
 
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
-        # The derived config, or a fixed space's first that fits: nothing ranks configs (bible §6).
-        return self.fitting(ba, generation.gpu_target())[0]
+        # The config the launch offers now (`remaining`), the one entry its derivation has; a call it offers
+        # none raises `unfitted`'s refusal.
+        config = self.remaining(ba)
+        if config is None:
+            raise self.unfitted(ba, self.launch_target())
+        return config
+
+    def remaining(self, ba: tokamax.BoundArguments) -> Config | None:
+        # The derived config, or a fixed space's first that fits: nothing ranks configs (bible §6). The first
+        # config the launch offers (`offering`, its refusals read), none where it offers none.
+        offered = self.offering(ba, self.launch_target())
+        return offered[0] if offered else None
+
+    def exhausted(self, ba: tokamax.BoundArguments) -> report.Exhausted:
+        # A call no config fits refuses as fitting does (`unfitted`), naming what it stages; one
+        # certification refused every config of, as any launch's does.
+        if report.refused_any(self, ba):
+            return super().exhausted(ba)
+        return self.unfitted(ba, self.launch_target())
+
+    def holds(self, ba: tokamax.BoundArguments) -> bool:
+        """Whether a config of the launch holds the call `ba`, which its implementation's eligibility reads:
+        the call's own taking (`taken`) finds one, a pin, a tuned pick or the derived config certification
+        holds where a device certifies launches (`report.certified`), so a call certification refuses every
+        config of takes another route before its call, its misses in the report."""
+        return self.taken(ba) is not None
 
     def neighbours(self, ba: tokamax.BoundArguments, config: Config) -> Sequence[Config]:
         """The configs next to a generating launch's derived `config` an opt-in tuning run may time beside

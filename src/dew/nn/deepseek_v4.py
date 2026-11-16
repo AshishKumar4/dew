@@ -1092,6 +1092,17 @@ class DeepseekV4Mixer(MixerBase):
 
     residuals = ATTENTION_CONTEXT_RESIDUALS
 
+    def fork_refusal(self) -> str | None:
+        """Why the layer reads no forks (`MixerBase.fork_refusal`): its compressed kinds pool a document's
+        keys into windows of `compress_rate` (HCA, CSA, CSA2), each document's own (`document_windows`), and
+        its indexer selects among them, so a fork's document would need its pooling and its visibility to
+        continue over its ancestors' windows, its parent's partial window among them, which no path
+        builds; its window and full kinds read no forks as any mixer that declares none does."""
+        if self.compressor is not None:
+            return (f"a DeepSeek V4 {self.compressor} layer pools each document's own windows of keys, which "
+                    "no path continues over a fork's ancestors")
+        return super().fork_refusal()
+
     q_lora_rank: int = 1024
     o_groups: int = 8
     o_lora_rank: int = 1024

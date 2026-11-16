@@ -1840,16 +1840,15 @@ def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = 
     return wide
 
 
-def seeds_resolving(errors: np.ndarray, names, label: str, *, widths: Sequence[int],
-                    mine: np.ndarray | None = None, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS) -> int:
+def seeds_resolving(errors: np.ndarray, names, label: str, *, mine: np.ndarray | None = None,
+                    start: int = FEWEST_SEEDS, most: int = MOST_SEEDS) -> int:
     """`seeds_for`'s count from errors already measured, by its own sizing (`_sized_count`): `errors` holds
-    the reference's squared errors' logs (`log_errors`) a seed (rows, from seed 0) and a leaf (columns),
-    such as a recording's merged shards, each leaf's row width `widths` (`_width`), and `mine`, where given,
-    Dew's on the same draws, so the count is the paired sizing's (Dew against the reference, `seeds_for`'s
-    `dew_fn`, its stubborn leaves by their typical draw: testing.md's sizing, for a site whose errors are
-    heavy-tailed across draws alike in both arms), else the reference compared with itself's. Fails past
-    `most`, as `seeds_for` does, and where the rows held run out first: the recording then holds too few
-    seeds."""
+    the reference's squared errors' logs (`log_errors`) a seed (rows, from seed 0) and a leaf (columns), such
+    as a recording's merged shards, and `mine`, where given, Dew's on the same draws, so the count is the
+    paired sizing's (Dew against the reference, `seeds_for`'s `dew_fn`, its stubborn leaves by their typical
+    draw: testing.md's sizing, for a site whose errors are heavy-tailed across draws alike in both arms), else
+    the reference compared with itself's. Fails past `most`, as `seeds_for` does, and where the rows held run
+    out first: the recording then holds too few seeds."""
     paired = mine is not None
     names = list(names)
 
@@ -1861,9 +1860,11 @@ def seeds_resolving(errors: np.ndarray, names, label: str, *, widths: Sequence[i
         held = slice(first, stop)
         count, leaves = stop - first, len(names)
         ours = errors if mine is None else mine
+        # No examples and no rows a sizing reads (`_sized_count`): each leaf's width only a refusal of a
+        # site's examples reads, which a recording's sizing has none of.
         return _Draws(names, ours[held], errors[held], np.zeros((count, leaves, 2)),
                       [[NO_ZERO_ROWS] * leaves for _ in range(count)], np.ones((count, leaves), bool),
-                      tuple(widths))
+                      (0,) * leaves)
 
     return _sized_count(drawn, label, start=start, most=most, paired=paired)
 

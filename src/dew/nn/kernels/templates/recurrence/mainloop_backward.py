@@ -449,13 +449,22 @@ def _reverse_sums(call: Call) -> int:
     thread launches with, so no register moved to its consumers and ptxas spilled 168 bytes at every rung
     of its ladder; at 32 wide 199 against 255, which ptxas spilled at every rung and a program a
     multiprocessor (row 6816)."""
-    held = dataclasses.replace(call.held, rows=call.rows)
-    keyed = held if call.per_key else call.given
-    read = Operand(call.rows, 2 if held.parts == 1 else held.parts, jnp.dtype(jnp.float32))
+    keyed, held, read = _reverse_operands(call)
     if not call.family.products_overlap or max(keyed.parts, held.parts, read.parts) <= 2:
         return 0
     return (call.width // call.block) * (len(product.terms(keyed.parts, held.parts))
                                          + len(product.terms(keyed.parts, read.parts)))
+
+
+def _reverse_operands(call: Call) -> tuple[Operand, Operand, Operand]:
+    """`_reverse`'s step's product operands (`algebra.reverse_carried`): the keys (the held memory's rows
+    under a decay a key dimension, the keys as given else), the held memory's gradient, and the output's
+    gradient read (`reads`: the gradient as given under a decay a key dimension, else decayed in fp32 and
+    staged in two parts under a decay a head, a value tile's own parts where it holds more)."""
+    held = dataclasses.replace(call.held, rows=call.rows)
+    if call.per_key:
+        return held, held, call.given
+    return call.given, held, Operand(call.rows, 2 if held.parts == 1 else held.parts, jnp.dtype(jnp.float32))
 
 
 def _reverse_products(call: Call, bv: int) -> list:
@@ -464,10 +473,7 @@ def _reverse_products(call: Call, bv: int) -> list:
     gradient read (`reads`: decayed in fp32 and staged in two parts under a decay a head, a value
     tile's own parts where it holds more, the gradient as given under a decay a key dimension); and with the
     delta rule the weights read transposed against the corrected values' gradient ('weights_dv')."""
-    chunk, held = call.chunk, dataclasses.replace(call.held, rows=call.rows)
-    keyed = held if call.per_key else call.given
-    read = (call.given if call.per_key
-            else Operand(call.rows, 2 if held.parts == 1 else held.parts, jnp.dtype(jnp.float32)))
+    chunk, (keyed, held, read) = call.chunk, _reverse_operands(call)
     return largest_live_set(
         product_fragments(call, (keyed, chunk, call.block), (held, call.block, bv)),
         product_fragments(call, (keyed, call.block, chunk), (read, chunk, bv)),

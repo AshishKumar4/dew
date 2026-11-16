@@ -157,8 +157,10 @@ class Process:
     """The code a process's traces run, beside each call's own identity (`call_identity`): its Python,
     Dew's source (`dew._cache.package_digest`), the version of each installed distribution a loaded module
     belongs to, and the source of every other loaded module (a checkout installed in place, a user's own
-    package or script beside it; `__main__` is stated where a call names it). With them, the settings,
-    environment and facts as the process held them when it saved (`settings`, `environment`, `facts`):
+    package or script beside it; a function or class of `__main__` a call reaches is stated by its code
+    and what it reads, as any of the user's own code is, `dew._stated._own`, the script's other lines by
+    none). With them, the settings, environment and facts as the process held them when it saved
+    (`settings`, `environment`, `facts`):
     each call's identity holds its own, and these name what differs before any call. A process holds
     programs another kept only where all of it is the same (`held`); the JAX stack, XLA's flags and the
     devices are the target's (`dew.training.ahead.BuildTarget`)."""

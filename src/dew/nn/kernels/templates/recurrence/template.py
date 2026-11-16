@@ -18,7 +18,7 @@ import functools
 import math
 import threading
 from collections.abc import Hashable, Iterable, Iterator, Set
-from typing import ClassVar
+from typing import ClassVar, TypeGuard
 
 import jax
 import jax.numpy as jnp
@@ -160,8 +160,13 @@ compile_ahead planned 425 (row 4260's profile), and every plan kept for the proc
 geometry a derivation ever tried (row 4390)."""
 
 _PLANS: collections.OrderedDict = collections.OrderedDict()
-"""`_planned`'s plans by their call, tiles, bundle and target's facts, the most recently read last."""
+"""`_planned`'s plans by their call, tiles, bundle and target's facts, the most recently read last: each the
+call's launches by the depth they were planned at, its trace's at one stage."""
 _PLANNING = threading.Lock()
+
+_SPILLED: collections.OrderedDict = collections.OrderedDict()
+"""`Mosaic._spilled`'s launches by a launch's identity, its refusals and target, the most recently made
+last."""
 
 
 def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target: generation.GpuTarget,
@@ -176,7 +181,9 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
     (`Tiles.stages`) moves only the launches whose ring is the tiles' (`mainloop.Launch.ring`): the call is
     traced once at one stage and those launches planned at the tiles' depth (`Launch.deepened`). Traced at
     each depth, the derivation took 2.0 s of a CPU's time for Kimi Linear's delta attention on sm100, 30
-    traces of 66 ms (jsf-dtime at 0cbc7f8f1d9)."""
+    traces of 66 ms (jsf-dtime at 0cbc7f8f1d9); each depth's launches are kept beside the trace's, as a
+    derivation asks one tiles' plan again for every rule it reads (replanned at each ask, 1.6 million rings
+    deepened over a refusal walk's 296 derivations, 461 of its 842 profiled seconds, row 6551)."""
     facts = (target.generation, target.device_kind, target.shared_limit, target.multiprocessors)
     # A backward's plan holds the training call's forward: one key for it.
     training_forward = training_forward and not backward
@@ -184,19 +191,22 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
     key = (shapes, traced, family, facts, max_segments, delta, backward, training_forward, rounded, wide,
            ranged, skip, forked)
     with _PLANNING:
-        found = _PLANS.get(key)
-        if found is not None:
+        depths = _PLANS.get(key)
+        if depths is not None:
             _PLANS.move_to_end(key)
-    if found is None:
+            if (found := depths.get(tiles.stages)) is not None:
+                return found
+    if depths is None:
         *operands, starts = shapes
-        found = planned(*operands, tiles=traced, family=family, starts=starts, max_segments=max_segments,
-                        delta=delta, backward=backward, training_forward=training_forward, target=target,
-                        rounded=rounded, wide=wide, ranged=ranged, skip=skip, forked=forked)
-        with _PLANNING:
-            _PLANS[key] = found
-            while len(_PLANS) > PLANS_KEPT:
-                _PLANS.popitem(last=False)
-    return tuple(launch.deepened(tiles.stages, target) for launch in found)
+        depths = {1: planned(*operands, tiles=traced, family=family, starts=starts, max_segments=max_segments,
+                             delta=delta, backward=backward, training_forward=training_forward, target=target,
+                             rounded=rounded, wide=wide, ranged=ranged, skip=skip, forked=forked)}
+    found = tuple(launch.deepened(tiles.stages, target) for launch in depths[1])
+    with _PLANNING:
+        _PLANS[key] = {**_PLANS.get(key, depths), tiles.stages: found}
+        while len(_PLANS) > PLANS_KEPT:
+            _PLANS.popitem(last=False)
+    return found
 
 
 def _shaped(forked: chunk_forward.ForkedTable | None) -> chunk_forward.ForkedTable | None:
@@ -486,11 +496,61 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _refused(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                  ) -> bool:
+        """Whether a compile refused `tiles` past what its derivation's raise answers (`_exhausted`), or a
+        launch it spilled so at other tiles plans at `tiles` as it did there but its grid (`_spilled`): the
+        same kernel at the same registers, shared memory, ring, roles and residency, which a compile spills
+        again. Asked a tiles at a time, lightning attention's reverse walk on an H100 took
+        every rung of its ladder again at each of its tiles' eight ring depths, whose ring it does not read,
+        and its training step raised Unfitted after 3,107 s (row 6816); on an A100 its prefill certified its
+        output walk fifteen times, fourteen spilling 336 bytes at 255 registers stated alike, and the gated
+        delta net's training call its scores' backward 32 times, each 8 bytes at 255 stated alike."""
+        return self._exhausted(ba, tiles, target) or not self._spilled(ba, target).isdisjoint(
+            self._plans(ba, tiles, target).items())
+
+    def _spilled(self, ba: tokamax.BoundArguments, target: generation.GpuTarget
+                 ) -> frozenset[tuple[str, frozenset[tuple[bool, mainloop.Launch]]]]:
+        """Each launch a compile spilled at tiles it refused past what their raise answers (`_exhausted`), by
+        name with its plans there but their grids in each product that runs it (`_plans`): kept by the call's
+        identity and its refusals, so a derivation's checks of its tiles read it once a refusal (planned at
+        each, a refusal walk's 355 derivations took 148 s)."""
+        identity, refusals = report.refusals_at(self, ba)
+        key = (identity, refusals, target)
+        with _PLANNING:
+            found = _SPILLED.get(key)
+        if found is None:
+            # A rung's refusal (its producers raised, or its programs fewer) is its own tiles' ladder's.
+            found = frozenset(
+                (name, plan) for config, kernels in refusals
+                if _unraised(config) and self._exhausted(ba, config, target)
+                for planned in [self._plans(ba, config, target)]
+                for owned in [_owners(kernels, (launch for plan in planned.values() for _, launch in plan))]
+                for name, plan in planned.items() if name in owned)
+            with _PLANNING:
+                _SPILLED[key] = found
+                while len(_SPILLED) > PLANS_KEPT:
+                    _SPILLED.popitem(last=False)
+        return found
+
+    def _exhausted(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
+                   ) -> bool:
         """Whether a compile refused `tiles` past what its derivation's raise answers: a kernel spilled
         (`report.refused_at`) whose launch's producer can rise no further, or would leave its tiles unheld
         (`_raised`)."""
         spilled = report.refused_at(self, ba, tiles)
         return bool(spilled) and self._raised(ba, tiles, spilled, target) is None
+
+    def _plans(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
+               ) -> dict[str, frozenset[tuple[bool, mainloop.Launch]]]:
+        """Each launch the call runs at `tiles` by name, as planned but its grid (`_ungridded`) in each
+        product that runs it: a training call's, and a forward alone's at its own tiles (`Tiles.forward`). A
+        refusal names a kernel, not the product whose compile spilled it, so a launch is alike where every
+        product's plan of it is."""
+        plans: dict[str, set[tuple[bool, mainloop.Launch]]] = collections.defaultdict(set)
+        for backward in (True, False):
+            for launch in self.launches(ba, tiles if backward else tiles.forward or tiles, target,
+                                        backward=backward):
+                plans[launch.name].add((backward, _ungridded(launch)))
+        return {name: frozenset(plan) for name, plan in plans.items()}
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mainloop.Tiles | None:
         """The call's tiles on `target`, from its shape and the device's and its bundle's facts
@@ -563,7 +623,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
             narrower = family is not None and (_widths(ba, family, training=False)[1]
                                                < _widths(ba, family)[1])
             # The training call's tiles serve a forward alone only where no compile refused them for it.
-            serves = (not _refuses(refused[False], trained)
+            serves = (trained not in refused[False]
                       and self._product_holds(ba, trained, target, training=False))
             if alone is not None and target.multiprocessors is not None and not narrower and (
                     not self._one_wave(ba, alone, target)
@@ -589,17 +649,12 @@ class Mosaic(base.Template[mainloop.Tiles]):
                         (refused[False], forward,
                          self.launches(ba, joined.forward or joined, target, backward=False),
                          _refused_kernels(self, ba, joined)))
-            ran = [(tiles_refused, tiles, _ringed(owned, launches))
-                   for tiles_refused, tiles, launches, kernels in products
-                   if (owned := _owners(kernels, launches))]
+            ran = [(tiles_refused, tiles) for tiles_refused, tiles, launches, kernels in products
+                   if _owners(kernels, launches)]
             assert ran, (f"the spilled kernels {sorted(_refused_kernels(self, ba, joined))} are none of the "
                          "call's launches")
-            for tiles_refused, tiles, ringed in ran:
-                # A spilled launch whose ring is not the tiles' (`mainloop.Launch.ring`) is the same kernel at
-                # every depth of them: its tiles refused at each, the next value block derived. Refused a
-                # depth at a time, lightning attention's reverse walk on an H100 took every rung of its
-                # ladder again at each of eight (row 6816).
-                tiles_refused.add(tiles if ringed else _at_every_depth(tiles))
+            for tiles_refused, tiles in ran:
+                tiles_refused.add(tiles)
 
     def _settled(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                  ) -> mainloop.Tiles:
@@ -866,7 +921,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         assert family is not None
         widths = self._blocks(ba, family, training=training) if wide is None else [wide]
         def held(tiles: mainloop.Tiles) -> bool:
-            return not _refuses(refused, tiles) and self._product_holds(ba, tiles, target, training=training)
+            return tiles not in refused and self._product_holds(ba, tiles, target, training=training)
 
         shallowest = next((tiles for tiles in (mainloop.Tiles(block, 1, None if width == block else width,
                                                               walkers, chunk=chunk)
@@ -929,7 +984,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
         in a 16-bit call or one under the run's fast forms (`mainloop.per_key_refusal`), a
         16-bit delta rule's solve at fp32's range where its form proves no bound (`ranged`), a bundle for the
         target's family, the tensor rate its cost model reads, and a config whose launches the device holds
-        at the call's widths (`fits`: their shared memory and registers). Off a GPU (a CPU's), where the rule
+        at the call's widths (`fits`: their shared memory and registers; for a training call's launch where a
+        device certifies, `holds`, the config its certification takes, none where every config its
+        derivation offers spilled: the gated delta net's
+        scores' backward on an A100 spilled 8 bytes at 255 registers at each, and its training step raised
+        Unfitted from inside the call, row 6816). Off a GPU (a CPU's), where the rule
         runs its bundle interpreted, the target is the interpreted bundle's generation (`launched`)."""
         if generation.backend() == "cpu" and bundle(target) is None:
             target = self.launched()
@@ -941,11 +1000,20 @@ class Mosaic(base.Template[mainloop.Tiles]):
                  or mainloop.per_key_refusal(dtype, rounded=arguments.get("rounded", False)) is None)
         if not (taken and bundle(target, dtype) is not None and target.tensor_rate("16bit") is not None):
             return False
+        # A training call's launch, selected as reverse mode runs it (`recurrence_chunk._per_product`), holds
+        # where its certification takes a config (`holds`), as the call's own certification then reads it
+        # back. A forward alone is certified as its call runs it: selected beside a training call's, which a
+        # step runs instead, it asked a compile of a launch no step ran (train 929's F5). A gradient the fast
+        # backward does not take (`trains`) is the route's backward requirement's to refuse
+        # (`recurrence_chunk.TEMPLATE_SUPPORTS`): a certification of its pullback raises in the rule's
+        # gradient (`mosaic_rule`).
+        if report.pulling() and self.trains(ba, target):
+            return self.holds(ba)
         return bool(self.fits(ba, target))
 
-    def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> mainloop.Tiles:
-        # Its derived config on the target it launches for (`Template.estimate` and its ranking are gone).
-        return self.fitting(ba, self.launched())[0]
+    def launch_target(self) -> generation.GpuTarget:
+        # Its configs derived for the target it launches for (`launched`), the interpreted one's off a GPU.
+        return self.launched()
 
 
 
@@ -962,19 +1030,18 @@ def _owner(kernel: str, names: Iterable[str]) -> str | None:
     return next((name for name in sorted(names, key=len, reverse=True) if kernel.startswith(name)), None)
 
 
-def _at_every_depth(tiles: mainloop.Tiles) -> mainloop.Tiles:
-    """`tiles` at every depth of their ring (`Tiles.stages`), as a refusal names them (`_refuses`)."""
-    return dataclasses.replace(tiles, stages=0)
+def _unraised(config: Hashable) -> TypeGuard[mainloop.Tiles]:
+    """Whether `config` is tiles a derivation proposes (`derived`), no rung of their ladder (`rungs`): no
+    launch's producer raised or programs held fewer, its forward's neither."""
+    return isinstance(config, mainloop.Tiles) and all(
+        not tiles.producers.raised_to and not tiles.residents.held_to
+        for tiles in (config, config.forward) if tiles is not None)
 
 
-def _ringed(owned: Set[str], launches: Iterable[mainloop.Launch]) -> bool:
-    """Whether a launch of `owned` takes its ring from its tiles (`mainloop.Launch.ring`)."""
-    return any(launch.ring is not None for launch in launches if launch.name in owned)
-
-
-def _refuses(refused: Set[mainloop.Tiles], tiles: mainloop.Tiles) -> bool:
-    """Whether `refused` names `tiles`: at their depth, or at every depth (`_at_every_depth`)."""
-    return tiles in refused or _at_every_depth(tiles) in refused
+def _ungridded(launch: mainloop.Launch) -> mainloop.Launch:
+    """`launch` as planned but its grid (`Launch.programs`), which no thread's registers or shared memory
+    read: what a compile of its kernel spills at."""
+    return dataclasses.replace(launch, programs=0)
 
 
 def _owners(kernels: Iterable[str], launches: Iterable[mainloop.Launch]) -> frozenset[str]:
