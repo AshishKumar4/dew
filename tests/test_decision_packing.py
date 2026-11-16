@@ -176,13 +176,12 @@ def at_offset(batch, window: int, row: int) -> dict:
 
 def in_place(batch, placed: list[tuple[int, int]]) -> dict:
     """`batch` with each `(window, row)` of `placed`, at most one a window, alone in its window where
-    the window packed it (`at_offset`), and every other window empty: the packed batch's shapes and its
-    bound on a window's documents, so every product a row's tokens enter runs in the packed run's own
-    program. A window reads no other, so rows of different windows run alone together."""
+    the window packed it (`at_offset`), and every other window empty: the packed batch's shapes, so
+    every product a row's tokens enter runs at the packed run's shapes. A window reads no other, so
+    rows of different windows run alone together."""
     assert len({window for window, _ in placed}) == len(placed), "one row a window"
-    # The read's bound on its windows (`tokens_bound`) kept: a window of one row holds no more documents
-    # than it bounds, and the packed run's program, its bound static, serves the rows alone too.
-    one = {name: value if name == "tokens_bound" else np.zeros_like(value) for name, value in batch.items()}
+    # A window of its own rows apart: the read's bound on its windows (`tokens_bound`) is not its own.
+    one = {name: np.zeros_like(value) for name, value in batch.items() if name != "tokens_bound"}
     for window, row in placed:
         for name, value in at_offset(batch, window, row).items():
             one[name][window, :value.shape[1]] = value[0]
