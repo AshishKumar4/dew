@@ -7,6 +7,7 @@ component Dew wrote and its UNet recomputes the trained prediction
 (`diffusers_reads`).
 """
 import argparse
+import functools
 import json
 import sys
 import tempfile
@@ -446,13 +447,19 @@ def grid_walker(directory):
     source = bundle(directory)
     given, null = conditions(source)
 
-    def walked(name, inputs):
+    @functools.cache
+    def walking(name):
+        """The grid `name`'s task and its noise's scale, one task a grid, so its walk compiles once for
+        every draw over it."""
         schedule = SourceSchedule.from_config(dict(scheduler(name, directory).config))
         process, times = schedule.sampling(STEPS)
-        noise = jnp.asarray(inputs["noise"]) * process.sampler_schedule.prior_scale()
         task = replace(source.text_to_image(), grid=lambda count: (process, times), solver=schedule.solver)
-        output = task(DenoisingInputs(noise, given, null, rows=1), steps=STEPS, guidance=3.0,
-                      key=jax.random.PRNGKey(0), decode=False)
+        return task, process.sampler_schedule.prior_scale()
+
+    def walked(name, inputs):
+        task, scale = walking(name)
+        output = task(DenoisingInputs(jnp.asarray(inputs["noise"]) * scale, given, null, rows=1),
+                      steps=STEPS, guidance=3.0, key=jax.random.PRNGKey(0), decode=False)
         return {"latents": np.asarray(output.host().latents)}
 
     return walked
