@@ -198,8 +198,8 @@ def reader_name(reader: Callable[..., Batch], declared: str | None) -> str | Non
 REACHED_AS = 2
 """How a plan states the code a data step's own code reaches (`dew._stated.stated`), saved beside it
 (`reached_as`): 2 since a module is stated by its file and the attributes the code reading it names of
-it, through a container or not. A position that saved it otherwise (none, before) holds digests no statement now makes,
-so it proves no step's code unchanged (`Plan.check`)."""
+it, through a container or not. A position that saved it otherwise (none, before) holds digests no
+statement now makes, so it proves no step's code unchanged (`Plan.check`)."""
 
 
 @dataclasses.dataclass(frozen=True)
