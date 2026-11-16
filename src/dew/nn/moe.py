@@ -757,7 +757,7 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
     compute = canonicalize_dtype(tokens, *(_held(kernel.stack if isinstance(kernel, Layered) else kernel)
                                            for kernel in (first, second)), dtype=dtype)
     if (isinstance(first, Layered) or isinstance(second, Layered) or isinstance(first, formats.NvFp4)
-            or isinstance(second, formats.NvFp4) or projections.recipe_takes(*first.shape[-2:])):
+            or isinstance(second, formats.NvFp4) or _recipe_takes_experts(first)):
         # A stack's layer, a packed bank (its product the NVFP4 one, which pairs with none), or a run's
         # low-precision recipe that takes the experts (`recipe_refusal`), takes each product apart
         # (`expert_projection`); experts the recipe leaves pair as without one.
@@ -767,6 +767,13 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
         gate, up = gemm.gemm(tokens, first, group_sizes, compute=compute, out_dtype=compute,
                              out_dtypes=(compute, compute), precision=precision, paired=second, gather=rows)
     return gate, up
+
+
+def _recipe_takes_experts(matrix: jax.Array) -> bool:
+    """Whether the run's low-precision recipe takes experts of `matrix`'s widths (`recipe_refusal`), in the
+    experts' role `expert_projection` multiplies them in, whatever role its caller traces in."""
+    with projection_role("experts"):
+        return projections.recipe_takes(*matrix.shape[-2:])
 
 
 def _held(kernel):

@@ -195,18 +195,23 @@ def test_a_projection_the_recipe_leaves_runs_under_a_product_wrapper_as_without_
         np.testing.assert_array_equal(np.asarray(under), np.asarray(without), err_msg=name)
 
 
-def test_experts_the_recipe_leaves_take_their_gate_and_up_as_one_paired_product():
-    """A routed layer's gate and up projections whose widths hold no whole 128-wide blocks, which the 'fp8'
-    numerics leave (`projections.recipe_refusal`), take one paired product as in a run of no recipe
-    (`moe.paired_projections`): the same routes, each product bit for bit; only experts the recipe takes run
-    their products apart, each in the recipe (row 6914)."""
+@pytest.mark.parametrize(("roles", "width", "pairs"), [
+    (("mixer", "mlp", "experts"), WIDTH - 32, True), (("mlp",), WIDTH, True),
+    (("mixer", "mlp", "experts"), WIDTH, False)], ids=["no-whole-blocks", "a-role-it-keeps", "taken"])
+def test_experts_the_recipe_leaves_take_their_gate_and_up_as_one_paired_product(roles, width, pairs):
+    """A routed layer's gate and up projections the 'fp8' recipe leaves (`projections.recipe_refusal`), their
+    widths of no whole 128-wide blocks or a recipe keeping the experts' role, take one paired product as in a
+    run of no recipe (`moe.paired_projections`): the same routes, each product bit for bit, whatever role the
+    caller traces in (a block's feed-forward's, `mlp`); experts the recipe takes run their products apart,
+    each in the recipe (row 6914)."""
     from dew.nn.moe import paired_projections
     from dew.nn.precision import projection_role
 
     rng = np.random.default_rng(6914)
     x = jnp.asarray(rng.normal(size=(6, WIDTH)), jnp.float32)
-    gate, up = (jnp.asarray(rng.normal(size=(2, WIDTH, WIDTH - 32)), jnp.float32) for _ in range(2))
+    gate, up = (jnp.asarray(rng.normal(size=(2, WIDTH, width)), jnp.float32) for _ in range(2))
     sizes = jnp.asarray([4, 2], jnp.int32)
+    recipe = dataclasses.replace(FP8, low_precision=LowPrecision(roles=roles))
 
     def paired():
         with generation.routes() as routes:
@@ -215,8 +220,14 @@ def test_experts_the_recipe_leaves_take_their_gate_and_up_as_one_paired_product(
 
     with projection_role("mlp"):
         plain, plain_routes = paired()
-        with generation.run_precision(FP8):
+        with generation.run_precision(recipe):
             recipes, recipe_routes = paired()
+    if not pairs:
+        # Each product apart, in the recipe: its route a kernel of the recipe's choice, none unquantized.
+        recipe_kernels = [kernel for choice, kernel in recipe_routes
+                          if choice == projections.RECIPES["blockwise_fp8"].choice]
+        assert len(recipe_kernels) == 2 and "unquantized" not in recipe_kernels, recipe_routes
+        return
     assert recipe_routes == plain_routes
     for without, under in zip(plain, recipes, strict=True):
         np.testing.assert_array_equal(np.asarray(under), np.asarray(without))
