@@ -593,11 +593,11 @@ def test_a_chunk_walks_no_more_padding_than_the_shortest(length):
 
 @lowers('sm90')
 @pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
-def test_the_forwards_shared_memory_is_what_mosaic_allocates(packed):
+def test_the_forwards_shared_memory_is_what_mosaic_allocates(packed, tmp_path):
     """The forward's shared memory as the template counts it (`forward_scope`, `resources.scratch_bytes`) the
     scratch Mosaic GPU's resource estimate gives its kernel lowered for an H100, at the derived chunk; and
     counted for an A100's family, whose walks scope their streams (row 3854, 3859)."""
-    from kernel_compile import SHARED, _estimates, _printed, lowered_for
+    from kernel_compile import SHARED, _dumped, _estimates, dumps, lowered_for
 
     from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.kernels.templates import resources
@@ -611,10 +611,10 @@ def test_the_forwards_shared_memory_is_what_mosaic_allocates(packed):
     target = generation.gpu_target('sm90')
     with generation.assumed(target):
         chunk = selective.SELECTIVE.derived(selective.SELECTIVE.bind(*operands), target).chunk
-    with _printed(MOSAIC_GPU_DUMP_RESOURCES='1') as printed:
+    with _dumped(str(tmp_path)):
         lowered = lowered_for(lambda *given: selective.SELECTIVE(*given)[0], operands, 'sm90')
     calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == 'mosaic_gpu']
-    estimates = _estimates(calls, ''.join(printed))
+    estimates = _estimates(calls, dumps(str(tmp_path), '.resources.txt'))
     (estimate,) = [found for name, found in estimates.items() if name.startswith('selective_scan__')
                    or name == 'selective_scan']
     dtypes = (jnp.bfloat16,) * 4
