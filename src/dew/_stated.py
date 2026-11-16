@@ -140,7 +140,8 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         module = _coded(value.__module__, at)
         return ["class", module, value.__qualname__]
     if isinstance(value, (tuple, list, set, frozenset, Mapping, functools.partial, types.MethodType)) or (
-            dataclasses.is_dataclass(value) and not isinstance(value, type)):
+            not isinstance(value, type) and (dataclasses.is_dataclass(value)
+                                             or "__attrs_attrs__" in vars(type(value)))):
         # A container met again within itself (a mapping one of whose values is that mapping, a registry
         # holding a function that reads it) is a reference back to where the path met it, as a function
         # met again is itself: finite, where walking it recursed past Python's limit and crashed the read
@@ -181,6 +182,8 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         return ["native", _plain(key, at)]
     if (parts := _parts(value, at, again)) is not None:
         return parts
+    if (made := _attrs_made(value, at, again)) is not None:
+        return made
     raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} has no form an "
                         "identity can state")
 
@@ -299,21 +302,51 @@ def _own(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) ->
 
 def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
     """One class of a user's own class's MRO, completely: its module and name, its members (`_members`), its
-    generated fields with their defaults, default factories, converters and validators
-    (`dew._sources.generated_fields`: a dataclass's or an attrs class's), and its
+    generated fields (`_field`: a dataclass's or an attrs class's), and its
     metaclass where that is the user's own code too (which runs as the class is made and may set what it
     holds)."""
-    fields: list[JSON] = [
-        [field.name, *(_field_part(part, f"{at} ({held.__name__}.{field.name} {kind})", known, walking)
-                       for kind, part in (("default", field.default), ("factory", field.factory),
-                                          ("converter", field.converter), ("validator", field.validator)))]
-        for field in _sources.generated_fields(held)]
+    fields: list[JSON] = [_field(held, field, at, known, walking)
+                          for field in _sources.generated_fields(held)]
     maker = type(held)
     made = (_stated(maker, f"{at} ({held.__name__}'s metaclass)", known, walking)
             if _sources.own_source(maker.__module__) else None)
     entry: list[JSON] = [_coded(held.__module__, at), held.__qualname__, _members(held, at, known, walking),
                          fields, made]
     return entry
+
+
+def _attrs_made(value, at: str, again: Callable[..., JSON]) -> JSON | None:
+    """An instance of a class attrs made (its own validators, `attrs.validators.instance_of`'s and
+    `and_`'s among them) by its type and its fields' values, as a dataclass's record is, and an
+    `attrs.Converter` by its converter and how it is called; None for any other value, or where attrs is
+    not loaded (no such value exists then). Refused before, a step whose attrs class held a validator of
+    attrs' own was inexact (train 953's review)."""
+    attr = sys.modules.get("attr")
+    if attr is None:
+        return None
+    if "__attrs_attrs__" in vars(type(value)):
+        return ["attrs", again(type(value), at=at),
+                [[field.name, again(getattr(value, field.name), at=f"{at}.{field.name}")]
+                 for field in vars(type(value))["__attrs_attrs__"]]]
+    if isinstance(value, attr.Converter):
+        return ["converter", again(value.converter, at=at), value.takes_self, value.takes_field]
+    return None
+
+
+def _field(held: type, field: _sources.GeneratedField, at: str, known: Mapping[int, JSON],
+           walking: tuple[int, ...]) -> JSON:
+    """A generated field (`dew._sources.generated_fields`) as an identity states it: its name, default and
+    default factory, and the hooks attrs runs on its value where it has any (its converter, validator,
+    `on_setattr`, eq and order keys), each by its part's name. A field with no hooks, every dataclass's, is
+    stated as it was before them, so a position saved then holds (train 953's review)."""
+    stated: list[JSON] = [field.name,
+                          _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking),
+                          _field_part(field.factory, f"{at} ({held.__name__}.{field.name} factory)", known,
+                                      walking)]
+    if field.hooks:
+        stated.append({part: _stated(value, f"{at} ({held.__name__}.{field.name} {part})", known, walking)
+                       for part, value in field.hooks})
+    return stated
 
 
 def _field_part(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:

@@ -419,27 +419,45 @@ class Ranged:
     scaled: int = attrs.field(default=1, converter=lambda value: value * {factor})
 
 
+@attrs.define
+class Hooked:
+    scaled: int = attrs.field(default=1, on_setattr=lambda instance, attribute, value: value * {hook})
+
+
+@attrs.define(frozen=True)
+class Keyed:
+    value: int = attrs.field(eq=lambda value: value % {modulus}, order=lambda value: value * {sign})
+    checked: int = attrs.field(default=1, validator=attrs.validators.and_(
+        attrs.validators.instance_of({kinds}), attrs.validators.ge(0)))
+
+
 @dataclasses.dataclass(frozen=True)
 class Shifting:
     def __call__(self, row):
+        hooked = Hooked()
+        hooked.scaled = 2
         total = (Offset().by * Offset()._Offset__scale + Child().over + int(Listed().values[0])
-                 + Plain.by * Plain.scale + Ranged().span + Ranged().marks[0] + Ranged().scaled)
+                 + Plain.by * Plain.scale + Ranged().span + Ranged().marks[0] + Ranged().scaled
+                 + hooked.scaled + int(Keyed(1) == Keyed(3)) + int(Keyed(1) < Keyed(3)) + Keyed(1).checked)
         return {{**row, "id": row["id"] + total}}
 """
 """A class step of the user's file building classes generators made, each with a default or a factory its
 code reads: a slotted dataclass's field and its name-mangled field, a slotted child's override of its base's
 default, a default factory, plain or slotted, a plain dataclass's default and class variable, an attrs class's
-default, factory and converter."""
+default, factory, converter, setter hook, eq and order keys and validators of attrs' own."""
 
-GENERATED_AT = {"by": 1, "scale": 1, "over": 20, "value": 3, "slots": "", "span": 2, "mark": 5, "factor": 7}
+GENERATED_AT = {"by": 1, "scale": 1, "over": 20, "value": 3, "slots": "", "span": 2, "mark": 5, "factor": 7,
+                "hook": 7, "modulus": 2, "sign": 1, "kinds": "int"}
 
 
 @pytest.mark.parametrize(("edit", "assigned"), [
     ({"by": 20}, None), ({"scale": 30}, None), ({"over": 300}, None), ({"value": 55}, None),
     ({"value": 55, "slots": ", slots=True"}, None), ({"span": 200}, None), ({"mark": 500}, None),
-    ({"factor": 70}, None), ({}, ("by", 10)), ({}, ("scale", 10))],
+    ({"factor": 70}, None), ({"hook": 70}, None), ({"modulus": 20}, None), ({"sign": -10}, None),
+    ({"kinds": "(int, float)"}, None), ({}, ("by", 10)), ({}, ("scale", 10))],
     ids=["slotted field", "mangled field", "slotted child's override", "factory", "slotted factory",
-         "attrs default", "attrs factory", "attrs converter", "a default set at run time",
+         "attrs default", "attrs factory", "attrs converter", "attrs setter hook", "attrs eq key",
+         "attrs order key", "attrs validators", "a default set at run time",
          "a class variable set at run time"])
 def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factory_changed(
         tmp_path, monkeypatch, edit, assigned):
@@ -449,7 +467,9 @@ def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factor
     resume, the change named in code; unchanged, the step resumes exactly. A slot's descriptor skipped its
     default (train 942's review), a slotted child's override and every factory went unstated (train 947's),
     and so did a value set at run time, a class variable and an attrs class's fields (train 950's), and an
-    attrs field's converter, which its generated `__init__` alone holds (train 951's)."""
+    attrs field's converter, which its generated `__init__` alone holds (train 951's), and its setter hook
+    and eq and order keys, which its generated methods hold; its validators of attrs' own (`instance_of`,
+    `and_`) made the step inexact, refusing an unchanged exact resume (train 953's)."""
     module = tmp_path / f"generated_{uuid4().hex}.py"
     # Saved and edited under the same slotting, so an edit changes the factory alone.
     start = {**GENERATED_AT, **{name: value for name, value in edit.items() if name == "slots"}}

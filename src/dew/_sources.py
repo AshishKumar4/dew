@@ -212,26 +212,27 @@ def members(held) -> list[tuple]:
 
 
 MISSING = dataclasses.MISSING
-"""What a `GeneratedField` holds where its field has no default, factory, converter or validator."""
+"""What a `GeneratedField` holds where its field has no default or no factory."""
 
 
 class GeneratedField(NamedTuple):
-    """A field a class generator (`dataclasses`, attrs) recorded on a class: its name, its default, its
-    default factory, and the converter and validator its generated `__init__` runs on the value it is
-    handed (attrs'), each `MISSING` where it has none."""
+    """A field a class generator (`dataclasses`, attrs) recorded on a class: its name, its default and its
+    default factory, each `MISSING` where it has none, and the callables attrs runs on its value beside them
+    (`hooks`: its converter and validator, which its generated `__init__` holds in its globals; its
+    `on_setattr`, which its generated `__setattr__` closes over; its eq and order keys, which its generated
+    comparisons hold), each by its part's name where it has one; none for a dataclass's."""
 
     name: str
     default: Any
     factory: Any
-    converter: Any = MISSING
-    validator: Any = MISSING
+    hooks: tuple[tuple[str, Any], ...] = ()
 
 
 def generated_fields(held: type) -> list[GeneratedField]:
     """The fields a class generator recorded on `held` itself, in order, its bases' among them and an
     override's default its own: a dataclass's (`dataclasses.fields`, its class and init variables, which
     are no fields, apart) or an attrs class's (`__attrs_attrs__`, a default `attrs.Factory`'s factory its
-    factory). Empty for a class no generator made itself."""
+    factory, its hooks where set). Empty for a class no generator made itself."""
     if "__dataclass_fields__" in vars(held):
         return [GeneratedField(field.name, field.default, field.default_factory)
                 for field in dataclasses.fields(held)]
@@ -243,9 +244,11 @@ def generated_fields(held: type) -> list[GeneratedField]:
             default, factory = field.default, MISSING
             if isinstance(default, attr.Factory):
                 default, factory = MISSING, default.factory
-            # What the generated `__init__` runs on a value: held in its globals alone, which no member is.
+            parts = (("converter", field.converter), ("validator", field.validator),
+                     ("on_setattr", field.on_setattr), ("eq_key", field.eq_key),
+                     ("order_key", field.order_key))
+            hooks = tuple((part, value) for part, value in parts if value is not None)
             found.append(GeneratedField(field.name, MISSING if default is attr.NOTHING else default, factory,
-                                        MISSING if field.converter is None else field.converter,
-                                        MISSING if field.validator is None else field.validator))
+                                        hooks))
         return found
     return []
