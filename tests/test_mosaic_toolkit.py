@@ -776,6 +776,79 @@ def test_a_streams_three_part_products_are_each_issued_before_the_next_is_formed
     assert_fp32_reduction_bound(found, expected, magnitudes, terms=ISSUED * 7)
 
 
+def _ordered_forms(a, b, c, *, form: str):
+    """`a @ c + b @ c` through one prepared-operand issuer (`operands.Issuer.summed`) on warpgroup MMA,
+    interpreted, `a` and `b` register values staged into their product's three buffers (fp32's three parts)
+    and `c` a shared tile of its three parts, given as `form`: a list formed before the sum (`list`), a
+    stream (`stream`), each left operand a callable (`deferred`), or one group of `summed_together`
+    (`grouped`); and `blocks`, `product.Blocks` of two whose left operand a loader stages, `a` then `a + b`,
+    into one shared tile of three parts, each product retired before the next is formed:
+    `a @ c + (a + b) @ c`."""
+    from dew.nn.kernels.templates import mosaic_sm90, operands, product
+
+    family = mosaic_sm90.FED  # one warpgroup, no producer
+    part = plgpu.SMEM((ISSUED, ISSUED), jnp.bfloat16)
+
+    def body(a_gmem, b_gmem, c_gmem, out_gmem):
+        def scoped(*refs):
+            rights, lefts, buffers = refs[:3], refs[3:6], refs[6:]
+            for ref, value in zip(rights, product.formed(c_gmem[...], 3), strict=True):
+                ref[...] = value
+            right = operands.Parts(rights, jnp.float32)
+            issuer = operands.Issuer(_Call(family, INTERPRETED), {"memory": buffers})
+            a, b = a_gmem[...], b_gmem[...]
+            products = {"list": [("memory", a, right), ("memory", b, right)],
+                        "stream": (entry for entry in (("memory", a, right), ("memory", b, right))),
+                        "deferred": [("memory", lambda: a, right), ("memory", lambda: b, right)]}
+            if form == "grouped":
+                (read,) = issuer.summed_together([[("memory", a, right), ("memory", b, right)]])
+                out_gmem[...] = read()
+                return
+            if form == "blocks":
+                def left(j):
+                    loaded = product.formed(a_gmem[...] + j * b_gmem[...], 3)
+                    for ref, value in zip(lefts, loaded, strict=True):
+                        ref[...] = value
+                    return operands.Parts(lefts, jnp.float32)
+
+                out_gmem[...] = issuer.summed([product.Blocks("memory", left, lambda j: right, 2)],
+                                              (ISSUED, ISSUED), retired=True)
+                return
+            out_gmem[...] = issuer.summed(products[form], (ISSUED, ISSUED))
+
+        pl.run_scoped(scoped, *(part for _ in range(9)), collective_axes="wg")
+
+    out = jax.ShapeDtypeStruct((ISSUED, ISSUED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=INTERPRETED, name="ordered")(a, b, c)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("form", ["list", "stream", "deferred", "grouped"])
+def test_a_sum_of_three_part_products_in_any_form_stays_finite_where_its_products_in_order_do(form):
+    """Interpreted: float32's largest times the identity, then minus half of it, (2^128 - 2^104) E @ E +
+    -(2^127 - 2^103) E @ E, each operand of three parts: the half, 2^127 - 2^103, however the sum is given
+    (`_ordered_forms`): each product whole in its place, where a product's remainder added before its
+    leading term overflowed in every form but the list (base review 6da3c48c8 F2)."""
+    eye = np.eye(ISSUED, dtype=np.float32)
+    largest, half = np.finfo(np.float32).max, np.float32(2.0 ** 127 - 2.0 ** 103)
+    found = _ordered_forms(jnp.asarray(largest * eye), jnp.asarray(-half * eye), jnp.asarray(eye), form=form)
+    np.testing.assert_array_equal(np.asarray(found), half * eye)
+
+
+@INTERPRETS
+def test_listed_blocks_form_each_blocks_operands_as_its_product_issues():
+    """Interpreted: blocks whose loader stages `a`, then `a + b`, into one shared tile, retired a product at a
+    time (`_ordered_forms`' `blocks`): `a @ c + (a + b) @ c`, each block's operand formed as its product
+    issues, where formed for every block first the second's overwrote the first's (`2 (a + b) @ c`, base
+    review 6da3c48c8 F1)."""
+    keys = jax.random.split(jax.random.key(7), 3)
+    a, b, c = (jax.random.randint(key, (ISSUED, ISSUED), -4, 4).astype(jnp.float32) for key in keys)
+    wide = [np.asarray(x, np.float64) for x in (a, b, c)]
+    expected = wide[0] @ wide[2] + (wide[0] + wide[1]) @ wide[2]
+    np.testing.assert_array_equal(np.asarray(_ordered_forms(a, b, c, form="blocks")), expected)
+
+
 def _carried_sums(a, b, c, d, *, once: bool = False):
     """`a @ b + c @ d` issued in place into one accumulator a walk carries (`Issuer.summed`'s `into`),
     interpreted: `a` a register left operand its product takes in registers (its buffers a count, wgmma's
