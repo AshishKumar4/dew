@@ -21,7 +21,7 @@ def test_explain(cell, name, mode, monkeypatch):
         if cell.startswith("attention forward"):
             monkeypatch.setattr(mosaic_sm90.Wgmma, "derived_consumers", property(lambda self: 3))
         else:
-            monkeypatch.setattr(attention_mosaic.MosaicBackward, "ranks_alone", False)
+            monkeypatch.setattr(attention_mosaic.MosaicBackward, "ranks_alone", lambda self, ba, target: False)
     with generation.assumed(name):
         op, ba, config = CELLS[cell][0]()
         at = deepest(op, ba, config, generation.gpu_target())
@@ -46,7 +46,7 @@ def test_explain_matrix(mode, monkeypatch):
     base._DERIVED.clear()
     attention_matrix._route.cache_clear()
     if mode == "prior_rule":
-        monkeypatch.setattr(attention_mosaic.MosaicBackward, "ranks_alone", False)
+        monkeypatch.setattr(attention_mosaic.MosaicBackward, "ranks_alone", lambda self, ba, target: False)
     failed = []
     for label, case in kernel_matrix.covered("attention"):
         if case["generation"] != "sm90" or case["width"] != "128" or case["launch"] != "shared-keys":
