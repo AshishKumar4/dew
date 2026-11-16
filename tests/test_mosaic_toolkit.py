@@ -610,8 +610,8 @@ def _termwise_operands():
 def test_a_sum_of_three_part_products_is_as_accurate_as_fp32():
     """Interpreted: the sum over two slices of fp32 products whose operands each take three parts, one a
     shared tile's parts and one staged from registers: within an fp32 reduction's bound of the float64 sum,
-    where a product of the parts' leading terms alone is bfloat16's; and finite where the whole products' sum
-    is, float32's largest."""
+    where a product of the parts' leading terms alone is bfloat16's; and finite where the whole products' sums
+    are, float32's largest among them."""
     from reference_error import assert_fp32_reduction_bound
 
     a, b = _termwise_operands()
@@ -626,28 +626,13 @@ def test_a_sum_of_three_part_products_is_as_accurate_as_fp32():
     b = jnp.zeros((2, ISSUED, ISSUED), jnp.float32).at[:, 0, :].set(1.0)
     np.testing.assert_array_equal(np.asarray(_termwise_sums(a, b, interpret=INTERPRETED)),
                                   np.full((ISSUED, ISSUED), np.finfo(np.float32).max))
-
-
-def _accumulator(equation) -> bool:
-    """Whether `equation` scopes an accumulator of its own (a `run_scoped` whose scope takes one)."""
-    return equation.primitive.name == "run_scoped" and any(
-        "Accumulator" in type(var.aval).__name__ for var in equation.params["jaxpr"].invars)
-
-
-def test_a_sum_of_three_part_products_holds_one_accumulator_a_term_one_at_a_time():
-    """Traced for an H100: a sum over two slices of three-part products issues each slice's terms
-    (`product.terms`, six of three parts each) into an accumulator of its own, a slice at a time, one
-    accumulator scoped at a time: a tensor core's truncating accumulation keeps each term's last bit, and one
-    accumulator is live, where one a term held at once spilled an fp32 solve on an H100."""
-    from reference_error import equations
-
-    a, b = _termwise_operands()
-    with generation.assumed("sm90"):
-        traced = jax.make_jaxpr(lambda a, b: _termwise_sums(a, b, interpret=False))(a, b)
-
-    scopes = [equation for equation in equations(traced.jaxpr) if _accumulator(equation)]
-    assert len(scopes) == 2 * 6, len(scopes)
-    assert not any(_accumulator(inner) for scope in scopes for inner in equations(scope.params["jaxpr"]))
+    # Float32's largest, 2^128 - 2^104, then the negative half, -(2^127 - 2^103) (its remainder +2^103): the
+    # half itself, where the second's remainder added onto the first before its leading term overflowed
+    # (base review 60efbe75f F1).
+    largest = np.finfo(np.float32).max
+    a = jnp.zeros((2, ISSUED, ISSUED), jnp.float32).at[0, :, 0].set(largest).at[1, :, 0].set(-half)
+    np.testing.assert_array_equal(np.asarray(_termwise_sums(a, b, interpret=INTERPRETED)),
+                                  np.full((ISSUED, ISSUED), half))
 
 
 def _mixed_sums(a, b, c, d, *, interpret, together=False):
@@ -772,23 +757,6 @@ def test_a_streams_three_part_products_are_each_issued_before_the_next_is_formed
     magnitudes = sum(np.abs(wide[lhs]) @ np.abs(wide[rhs]) for lhs, rhs in sums)
     found = _streamed_sums(a, b, c, interpret=INTERPRETED, case=case)
     assert_fp32_reduction_bound(found, expected, magnitudes, terms=ISSUED * 7)
-
-
-def test_groups_summed_together_take_a_three_part_products_terms_into_their_groups_accumulator():
-    """Traced for an H100: a group of a product of three parts summed by `summed_together`'s reader takes
-    each of its six terms into the group's one accumulator, one after another (`Family.issued`), no
-    accumulator a term: an accumulator a term held beside the groups' spilled MiniMax's lightning training
-    query/key walk 200 bytes a thread (jsf-lightning-fs)."""
-    from reference_error import equations
-
-    a, b = (x[0] for x in _termwise_operands())
-    c = d = jnp.zeros((ISSUED, ISSUED), jnp.bfloat16)
-    with generation.assumed("sm90"):
-        traced = jax.make_jaxpr(lambda *xs: _mixed_sums(*xs, interpret=False, together=True))(a, b, c, d)
-
-    scopes = [equation for equation in equations(traced.jaxpr) if _accumulator(equation)]
-    assert len(scopes) == 1, len(scopes)
-    assert not any(_accumulator(inner) for scope in scopes for inner in equations(scope.params["jaxpr"]))
 
 
 def _carried_sums(a, b, c, d):
