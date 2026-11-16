@@ -759,10 +759,11 @@ def test_a_streams_three_part_products_are_each_issued_before_the_next_is_formed
     assert_fp32_reduction_bound(found, expected, magnitudes, terms=ISSUED * 7)
 
 
-def _carried_sums(a, b, c, d):
+def _carried_sums(a, b, c, d, *, once: bool = False):
     """`a @ b + c @ d` issued in place into one accumulator a walk carries (`Issuer.summed`'s `into`),
     interpreted: `a` a register left operand its product takes in registers (its buffers a count, wgmma's
-    register form), `c` staged into a shared buffer, `b` and `d` shared tiles, both products retired."""
+    register form), `c` staged into a shared buffer, `b` and `d` shared tiles, both products retired;
+    `once`, `a` formed where its product is issued, by a callable that forms it once."""
     from dew.nn.kernels.templates import mosaic_sm90, operands
 
     family = mosaic_sm90.FED  # one warpgroup, no producer
@@ -772,7 +773,8 @@ def _carried_sums(a, b, c, d):
         def scoped(staged, b_smem, d_smem):
             b_smem[...], d_smem[...] = b_gmem[...], d_gmem[...]
             issuer = operands.Issuer(call, {"registered": 1, "plain": (staged,)})
-            products = (("registered", a_gmem[...], operands.Parts((b_smem,), jnp.bfloat16)),
+            left = iter([a_gmem[...]]).__next__ if once else a_gmem[...]
+            products = (("registered", left, operands.Parts((b_smem,), jnp.bfloat16)),
                         ("plain", c_gmem[...], operands.Parts((d_smem,), jnp.bfloat16)))
             out_gmem[...] = issuer.summed(products, retired=True, into=family.zeros((ISSUED, ISSUED)))
 
@@ -787,11 +789,14 @@ def _carried_sums(a, b, c, d):
 @INTERPRETS
 def test_products_issue_in_place_into_a_carried_accumulator():
     """Interpreted: a register-operand product and a staged one, issued into one carried accumulator in
-    place: exactly `a @ b + c @ d`."""
+    place: exactly `a @ b + c @ d`, the register operand given as a value or formed once where it is issued
+    (a callable the sum forms once, not again to read its parts' count, base review ad23d20ee F1)."""
     keys = jax.random.split(jax.random.key(3), 4)
     a, b, c, d = (jax.random.randint(key, (ISSUED, ISSUED), -4, 4).astype(jnp.bfloat16) for key in keys)
     f32 = [np.asarray(x, np.float32) for x in (a, b, c, d)]
-    np.testing.assert_array_equal(np.asarray(_carried_sums(a, b, c, d)), f32[0] @ f32[1] + f32[2] @ f32[3])
+    for once in (False, True):
+        np.testing.assert_array_equal(np.asarray(_carried_sums(a, b, c, d, once=once)),
+                                      f32[0] @ f32[1] + f32[2] @ f32[3])
 
 
 def _merged(partials, combine):
