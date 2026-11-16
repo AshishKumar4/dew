@@ -344,9 +344,10 @@ def _converter(value, at: str, again: Callable[..., JSON]) -> JSON | None:
 def _field(held: type, field: _sources.GeneratedField, at: str, known: Mapping[int, JSON],
            walking: tuple[int, ...]) -> JSON:
     """A generated field (`dew._sources.generated_fields`) as an identity states it: its name, default and
-    default factory, and for an attrs field the rest of what attrs recorded of it
-    (`dew._sources.generated_fields`), each by its part's name. A dataclass's field is stated as it was before
-    them, so a position saved then holds (train 953's review)."""
+    default factory, and the rest of what its generator recorded of it (`dew._sources.generated_fields`),
+    each by its part's name: an attrs field's every part, a dataclass field's flags where they depart from
+    `dataclasses.field`'s. A dataclass field of default flags is stated as it was before them, so a
+    position saved then holds (train 953's review)."""
     stated: list[JSON] = [field.name,
                           _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking),
                           _field_part(field.factory, f"{at} ({held.__name__}.{field.name} factory)", known,
