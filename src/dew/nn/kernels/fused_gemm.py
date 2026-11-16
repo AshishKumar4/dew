@@ -245,6 +245,14 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
     consumer = _rewritten_consumer(consumer, values, acc)
     leaves, treedef = jax.tree.flatten(values)
+    axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
+                  if prefetch else _axes(consumer, values, acc))
+    if axes is None:
+        summed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
+                           precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
+        return consumer(values, summed)
+    # A consumer the launch takes as its epilogue is priced (`priced`), its work counted as the launch's
+    # body counts it; one it takes not runs after the plain product, XLA's, unpriced.
     if (collected := _PRICED.get()) is not None:
         depth = lhs.shape[-1]
         outs = jax.tree.leaves(jax.eval_shape(consumer, values, acc))
@@ -252,12 +260,6 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
             lhs.shape[0], depth, width, jnp.dtype(lhs.dtype), jnp.dtype(out_dtype),
             _chain(consumer, values, acc), float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
             float(sum(math.prod(out.shape) * out.dtype.itemsize for out in outs))))
-    axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
-                  if prefetch else _axes(consumer, values, acc))
-    if axes is None:
-        summed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
-                           precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
-        return consumer(values, summed)
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
     value_types = tuple(jax.typeof(leaf) for leaf in leaves)
     epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc)

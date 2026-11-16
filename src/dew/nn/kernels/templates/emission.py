@@ -109,10 +109,13 @@ _OPERATIONS = frozenset({
     lax.gt_p, lax.le_p, lax.lt_p, lax.max_p, lax.min_p, lax.mul_p, lax.ne_p, lax.neg_p, lax.not_p, lax.or_p,
     lax.rem_p, lax.select_n_p, lax.shift_left_p, lax.shift_right_logical_p, lax.shift_right_arithmetic_p,
     lax.sign_p, lax.sub_p, lax.xor_p, lax.integer_pow_p, lax.square_p, lax.round_p,
-    lax.one_minus_square_p, ad_util.add_jaxvals_p, lax.clz_p})
+    lax.one_minus_square_p, ad_util.add_jaxvals_p, lax.clz_p, lax.is_finite_p, lax.erf_p, lax.expm1_p})
 """Elementwise operations of the CUDA cores, one an output element (a cotangent's sum, `add_any`, among
 them; a leading-zero count, `clz`, an integer instruction the finish's exponent reads a subnormal's by,
-`dew.nn.precision.binade_of`)."""
+`dew.nn.precision.binade_of`). A finiteness test is a magnitude's comparison (XLA's elemental emitter: fabs
+and an fcmp), an erf XLA's own rational polynomial (xla/codegen/intrinsic/erf.cc: FMAs and a divide), and an
+expm1 CUDA's expm1f, whose fp32 SASS issues FMAs alone, no MUFU (sm80, probe FS-LIBM2: ten FFMAs and three
+FADDs, where an expf issues a MUFU.EX2)."""
 
 _REDUCTIONS = frozenset({lax.reduce_max_p, lax.reduce_min_p, lax.reduce_sum_p})
 """Reductions, one operation an input element."""

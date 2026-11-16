@@ -12,6 +12,7 @@ from generation_support import INTERPRETS
 from reference_error import assert_as_exact
 from test_algebra import traces_cheaper
 
+import dew
 from dew import algebra
 from dew.nn.kernels import fused_gemm, generation, selection
 
@@ -102,6 +103,19 @@ def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():
     assert found.fused_seconds is not None and found.unfused_seconds is not None, found
     assert found.unfused_seconds - found.fused_seconds >= 2 * 8192 * 4096 * 2 / rate, found
     assert plain.fused_seconds is None and plain.unfused_seconds is None
+
+
+@pytest.mark.parametrize("operation", [jax.lax.erf, jnp.expm1, jnp.isfinite], ids=lambda f: f.__name__)
+def test_a_projection_followed_by_an_elementwise_function_traces_through_dew_jit(operation):
+    """A bf16 projection followed by an erf, an expm1 or a finiteness test, traced through `dew.jit` for an
+    H100 (whose analysis prices each region, `fused_gemm.analysis`): it traces, each counted as the CUDA
+    cores' work (`emission`'s rule), where a counter that priced none of the three refused the program (base
+    review 92f34bc8d F1)."""
+    x = jax.ShapeDtypeStruct((256, 512), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((512, 256), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        traced = dew.jit(lambda x, w: operation(x @ w)).trace(x, w)
+    assert traced.out_info.shape == (256, 256)
 
 
 def test_an_integer_regions_product_is_xlas_own_dot_with_nothing_to_analyse():
