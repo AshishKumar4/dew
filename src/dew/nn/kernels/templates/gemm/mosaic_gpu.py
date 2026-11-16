@@ -1989,9 +1989,6 @@ def _stored_chunks(family: mosaic.Family, summed, store: Callable, place: tuple)
         store(chunk, (row_start, first_row, stored, at, *ladder))
 
 
-@tuning.lowered_once(('shape', 'tiles', 'out_dtype', 'multiprocessors', 'interpret', 'prologue',
-                      'prologue_axes', 'exact_sums', 'tail', 'k_major', 'unstaged', 'registers',
-                      'shared'))
 def _tgmm_declared(lhs, rhs, sizes, shape: tuple[int, int, int], dtype, k_major: bool):
     """Dew: a `tgmm` launch's output, each group's depth by width, stated as its operands' axes
     (`outputs.output`): its groups `sizes`', its depth `lhs`'s and its width `rhs`'s, each where `k_major`
@@ -2004,6 +2001,9 @@ def _tgmm_declared(lhs, rhs, sizes, shape: tuple[int, int, int], dtype, k_major:
     return out_type
 
 
+@tuning.lowered_once(('shape', 'tiles', 'out_dtype', 'multiprocessors', 'interpret', 'prologue',
+                      'prologue_axes', 'exact_sums', 'tail', 'k_major', 'unstaged', 'registers',
+                      'shared'))
 def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles, out_dtype,
                    multiprocessors: int, interpret, prologue, prologue_operands: tuple, prologue_axes: tuple,
                    exact_sums: bool, tail=None, k_major: bool = False, step_scales=None,
