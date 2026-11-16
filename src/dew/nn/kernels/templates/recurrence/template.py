@@ -563,7 +563,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
             narrower = family is not None and (_widths(ba, family, training=False)[1]
                                                < _widths(ba, family)[1])
             # The training call's tiles serve a forward alone only where no compile refused them for it.
-            serves = (trained not in refused[False]
+            serves = (not _refuses(refused[False], trained)
                       and self._product_holds(ba, trained, target, training=False))
             if alone is not None and target.multiprocessors is not None and not narrower and (
                     not self._one_wave(ba, alone, target)
@@ -589,12 +589,17 @@ class Mosaic(base.Template[mainloop.Tiles]):
                         (refused[False], forward,
                          self.launches(ba, joined.forward or joined, target, backward=False),
                          _refused_kernels(self, ba, joined)))
-            ran = [(tiles_refused, tiles) for tiles_refused, tiles, launches, kernels in products
-                   if _owners(kernels, launches)]
+            ran = [(tiles_refused, tiles, _ringed(owned, launches))
+                   for tiles_refused, tiles, launches, kernels in products
+                   if (owned := _owners(kernels, launches))]
             assert ran, (f"the spilled kernels {sorted(_refused_kernels(self, ba, joined))} are none of the "
                          "call's launches")
-            for tiles_refused, tiles in ran:
-                tiles_refused.add(tiles)
+            for tiles_refused, tiles, ringed in ran:
+                # A spilled launch whose ring is not the tiles' (`mainloop.Launch.ring`) is the same kernel at
+                # every depth of them: its tiles refused at each, the next value block derived. Refused a
+                # depth at a time, lightning attention's reverse walk on an H100 took every rung of its
+                # ladder again at each of eight (row 6816).
+                tiles_refused.add(tiles if ringed else _at_every_depth(tiles))
 
     def _settled(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                  ) -> mainloop.Tiles:
@@ -861,7 +866,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         assert family is not None
         widths = self._blocks(ba, family, training=training) if wide is None else [wide]
         def held(tiles: mainloop.Tiles) -> bool:
-            return tiles not in refused and self._product_holds(ba, tiles, target, training=training)
+            return not _refuses(refused, tiles) and self._product_holds(ba, tiles, target, training=training)
 
         shallowest = next((tiles for tiles in (mainloop.Tiles(block, 1, None if width == block else width,
                                                               walkers, chunk=chunk)
@@ -955,6 +960,21 @@ def _owner(kernel: str, names: Iterable[str]) -> str | None:
     """The launch of `names` that ran `kernel`: the longest it starts with, a name another launch's extends
     (`recurrence_intra` beside `recurrence_intra_solve`) owning only its own."""
     return next((name for name in sorted(names, key=len, reverse=True) if kernel.startswith(name)), None)
+
+
+def _at_every_depth(tiles: mainloop.Tiles) -> mainloop.Tiles:
+    """`tiles` at every depth of their ring (`Tiles.stages`), as a refusal names them (`_refuses`)."""
+    return dataclasses.replace(tiles, stages=0)
+
+
+def _ringed(owned: Set[str], launches: Iterable[mainloop.Launch]) -> bool:
+    """Whether a launch of `owned` takes its ring from its tiles (`mainloop.Launch.ring`)."""
+    return any(launch.ring is not None for launch in launches if launch.name in owned)
+
+
+def _refuses(refused: Set[mainloop.Tiles], tiles: mainloop.Tiles) -> bool:
+    """Whether `refused` names `tiles`: at their depth, or at every depth (`_at_every_depth`)."""
+    return tiles in refused or _at_every_depth(tiles) in refused
 
 
 def _owners(kernels: Iterable[str], launches: Iterable[mainloop.Launch]) -> frozenset[str]:
