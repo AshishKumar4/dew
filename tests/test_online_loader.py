@@ -606,6 +606,15 @@ def ran_where(row: Mapping) -> dict:
     return {**row, "square": int(row["id"]) ** 2, **where}
 
 
+def _alive(pid: int) -> bool:
+    """Whether process `pid` still runs."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def ran_expanded(row: Mapping) -> list[dict]:
     """The record twice, each beside where its step ran (`ran_where`)."""
     return [ran_where(row), {**ran_where(row), "id": int(row["id"]) + 1000}]
@@ -613,12 +622,14 @@ def ran_expanded(row: Mapping) -> list[dict]:
 
 @pytest.mark.parametrize("stage", ["map", "flat_map"])
 @pytest.mark.parametrize("pool", ["threads", "processes"])
-@pytest.mark.parametrize("read", ["streamed", "memory"])
+@pytest.mark.parametrize("read", ["streamed", "indexed", "memory"])
 def test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes(read, pool, stage):
     """A record stage declaring its pool (data.md §10's offline execution contract) runs its step there,
     on the stage's threads or in processes other than the reader's, and the read delivers what the
-    in-process stage delivers, in its order, its plan the same; in a streamed read a position saved part
-    way restores to the same remaining records, and a closed reader leaves no thread of its pool."""
+    in-process stage delivers, in its order, its plan the same; in a streamed or indexed read a position
+    saved part way restores to the same remaining records; and a closed reader leaves no thread of its pool
+    and no process (each ended as the reader closes, `Running.stop`). An indexed read on a pool read every
+    record again past a restore and every share the whole order (the head review of theme 16, F1)."""
     catalog = Memory([{"id": index} for index in range(23)], shard_rows=23)
 
     def built(declared):
@@ -647,10 +658,11 @@ def test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes(re
              for pid, thread in zip(batch["pid"], batch["thread"], strict=True)]
     if pool == "processes":
         assert all(pid != os.getpid() for pid, _ in where)
+        assert not [pid for pid in {pid for pid, _ in where} if _alive(pid)]
     else:
         assert all(pid == os.getpid() and thread.startswith("dew-step") for pid, thread in where)
     assert not [thread for thread in threading.enumerate() if thread.name.startswith("dew-step")]
-    if read == "streamed":
+    if read != "memory":
         resumed = data.train(DataPartition())
         try:
             resumed.set_state(saved)
@@ -698,3 +710,57 @@ def test_a_pool_is_declared_on_a_record_step_alone(batched):
             chain.map(lambda columns: columns, batched=True, pool="threads")
         else:
             chain.batch(2).map(lambda batch: batch, pool="threads")
+
+
+@pytest.mark.parametrize("read", ["streamed", "indexed", "memory"])
+@pytest.mark.parametrize("pool", ["threads", "processes"])
+def test_a_cached_stage_on_a_pool_fills_its_cache_there_or_is_refused_where_it_cannot(tmp_path, read, pool):
+    """A stage on a pool before a cache fills the cache on that pool: on its threads in every read, and in
+    processes in a streamed read, whose shard readers write each input the pool made; an indexed or memory
+    read, which fills its cache in its reading process as its steps make each input, refuses a process
+    stage before it. The read delivers the uncached chain's records. The fill ran the step in the reading
+    process, the declared pool unread (the head review of theme 16, F5)."""
+    catalog = Memory([{"id": index} for index in range(9)], shard_rows=9)
+
+    def reader(cache):
+        chain = Pipeline(catalog).map(ran_where, pool=pool)
+        chain = chain if cache is None else chain.cache(cache)
+        return compile(chain.batch(3), read=read, loading=READ).train(DataPartition())
+
+    if pool == "processes" and read != "streamed":
+        with pytest.raises(ValueError):
+            reader(str(tmp_path / "cache"))
+        return
+    cached, plain = reader(str(tmp_path / "cache")), reader(None)
+    try:
+        batches, expected = [next(cached) for _ in range(3)], [next(plain) for _ in range(3)]
+    finally:
+        cached.close()
+        plain.close()
+    assert [int(value) for batch in batches for value in batch["id"]] == [
+        int(value) for batch in expected for value in batch["id"]]
+    where = {(int(pid), str(thread)) for batch in batches
+             for pid, thread in zip(batch["pid"], batch["thread"], strict=True)}
+    assert all(pid != os.getpid() if pool == "processes" else thread.startswith("dew-step")
+               for pid, thread in where)
+
+
+def test_an_elastic_read_runs_a_pooled_map_on_its_pool():
+    """An elastic read's map on processes runs on its pool, in processes other than the reader's, and the
+    read delivers what the in-process map delivers. The elastic read ran a trailing map inline in its
+    reader, the declared pool unread (the head review of theme 16, F4)."""
+    catalog = Memory([{"id": index} for index in range(8)], shard_rows=8)
+
+    def reader(pool):
+        chain = Pipeline(catalog).map(ran_where, pool=pool).batch(2).elastic()
+        return compile(chain, read="streamed", loading=READ).train(DataPartition())
+
+    pooled, plain = reader("processes"), reader(None)
+    try:
+        batches, expected = [next(pooled) for _ in range(3)], [next(plain) for _ in range(3)]
+    finally:
+        pooled.close()
+        plain.close()
+    assert [int(value) for batch in batches for value in batch["id"]] == [
+        int(value) for batch in expected for value in batch["id"]]
+    assert all(int(pid) != os.getpid() for batch in batches for pid in batch["pid"])

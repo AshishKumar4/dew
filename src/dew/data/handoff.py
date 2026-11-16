@@ -64,6 +64,12 @@ def _threads(stages: Sequence[Stage]) -> int | None:
     return max(pools, default=None)
 
 
+def pooled(stage: Stage) -> bool:
+    """Whether `stage` runs its records on a pool of its own (`pool_of`): a fetch with threads of its own,
+    or a record stage that declares its pool."""
+    return (isinstance(stage, (Map, FlatMap)) and stage.pool is not None) or _threads((stage,)) is not None
+
+
 def pool_of(stages: Sequence[Stage]) -> Pool | None:
     """The pool a run of `stages` runs its records on, several at once (`Pool`): a fetch's threads
     (`Fetch.threads`), or the pool a record stage declares (`Map.pool`, `FlatMap.pool`), sized by the host;
@@ -146,7 +152,7 @@ def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, elastic: bool
     if spread:
         expanded = False
         for at, stage in enumerate(stages[start:], start=start):
-            pooled = isinstance(stage, _RECORD) and pool_of((stage,)) is not None
+            on_pool = isinstance(stage, _RECORD) and pooled(stage)
             # A step of each row's index reads a row's place in the stream, which an input's rows share.
             placed = expanded and isinstance(stage, MapWithIndex)
             grain = isinstance(stage, Native) and (elastic or expanded)
@@ -157,7 +163,7 @@ def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, elastic: bool
             # objective's of the source examples it makes rows of, `FlatMap.examples`) runs there.
             counted = isinstance(stage, FlatMap) and (
                 isinstance(stage.step, Chunks) or (expanded and stage.examples))
-            if windowed(stage, expanded or marked) or pooled or placed or grain or drawn or counted or (
+            if windowed(stage, expanded or marked) or on_pool or placed or grain or drawn or counted or (
                     expanded and not isinstance(stage, (*_RECORD, Native))):
                 return at
             expanded = expanded or isinstance(stage, FlatMap)
@@ -180,7 +186,9 @@ def _elastic_cut(stages: Sequence[Stage]) -> int:
     which draws they take or what their place gives them, which only the whole order states; a map
     after them computes a row from it alone."""
     def one_for_one(stage: Stage) -> bool:
-        return isinstance(stage, Prefetch) or (isinstance(stage, Map) and not stage.rejects)
+        # A map on a pool of its own runs where the order is read, on its pool (`lowering._through`).
+        return isinstance(stage, Prefetch) or (isinstance(stage, Map) and not stage.rejects
+                                               and not pooled(stage))
     return max((at + 1 for at, stage in enumerate(stages) if not one_for_one(stage)), default=0)
 
 

@@ -15,7 +15,6 @@ records the derived order facts a resume checks.
 
 from __future__ import annotations
 
-import concurrent.futures
 import dataclasses
 import logging
 from collections.abc import Mapping, Sequence
@@ -27,6 +26,7 @@ import numpy as np
 from dew._records import record
 from dew.batch import Batch
 from dew.data.analysis import _analyzed, _identity, _label, _name, written
+from dew.data.concurrent import ordered
 from dew.data.dataset import Ranges, Records
 from dew.data.facts import largest_bounds
 from dew.data.handoff import pool_of
@@ -174,13 +174,10 @@ def _memory_inputs(
         filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory")
         cached = filled.mapped(_cache_inputs(source, stored), manifest, transform=prefix, source=source)
         try:
-            if prefix.threads is None:
-                filling = [cached.record(index) for index in range(len(cached))]
-            else:
-                # A fetch with a pool of its own among the cached steps fills that many inputs at once.
-                pool = concurrent.futures.ThreadPoolExecutor(prefix.threads, thread_name_prefix="dew-step")
-                with pool:
-                    filling = list(pool.map(cached.record, range(len(cached))))
+            pooled = prefix.pool
+            # A stage on a pool of its own among the cached steps fills that many inputs at once.
+            filling = ((cached.record(index) for index in range(len(cached))) if pooled is None
+                       else ordered(pooled, cached.record, range(len(cached))))
             for index, outputs in enumerate(filling):
                 if not isinstance(outputs, tuple):
                     raise TypeError("cached input must return its tuple of expansion outputs")
@@ -277,15 +274,10 @@ def _memory_stages(
                 examples = list(rows)
             expanded: list[tuple[tuple[int, ...], Record]] = []
             pool = pool_of((stage,))
-            if pool is None:
-                made = (_outputs(stage, identifier[0], value, counts=counter) for identifier, value in rows)
-            else:
-                # A stage with a pool of its own runs that many records at once, in their order: a process
-                # pool is handed them in chunks, a pickle each.
-                step = _Fetched(stage)
-                chunk = 1 if pool.kind == "threads" else max(1, len(rows) // (4 * pool.size))
-                with pool.executor() as running:
-                    made = iter(list(running.map(step, rows, chunksize=chunk)))
+            # A stage with a pool of its own runs that many records at once, handed on in their order as
+            # each is made (`ordered`).
+            made = ((_outputs(stage, identifier[0], value, counts=counter) for identifier, value in rows)
+                    if pool is None else ordered(pool, _Fetched(stage), rows))
             for (identifier, _), outputs in zip(rows, made, strict=True):
                 for child, output in enumerate(outputs):
                     if isinstance(output, Rejected):

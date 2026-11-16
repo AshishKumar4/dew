@@ -257,7 +257,7 @@ class Cache:
         key: DependencyManifest,
         *,
         transform: Transform | None = None,
-        threads: int | None = None,
+        pool: Pool | None = None,
         source: Source | None = None,
         transparent: bool = False,
     ) -> ShardOpener:
@@ -266,7 +266,7 @@ class Cache:
         fills to seal (row 4211). A `transparent` read saves each shard's position as its reader does,
         so a position saved with the cache resumes without it and the reverse (row 4217)."""
         computed = (reader if transform is None
-                    else _PassthroughReader(reader, _Passthrough(transform), threads))
+                    else _PassthroughReader(reader, _Passthrough(transform), pool))
         if transform is not None and _volatile(transform):
             return computed
         try:
@@ -903,14 +903,14 @@ class _Applied:
 class _PassthroughReader:
     reader: ShardOpener
     transform: _Passthrough
-    threads: int | None = None
+    pool: Pool | None = None
 
     def __call__(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
-        if self.threads is None:
+        if self.pool is None:
             return self.reader(shard, options).map_with_index(self.transform)
         # A fetch with a pool of its own runs its records at once, in their order.
         indexed = self.reader(shard, options).map_with_index(_Indexed())
-        return Concurrently(indexed, _Applied(self.transform), Pool("threads", self.threads))
+        return Concurrently(indexed, _Applied(self.transform), self.pool)
 
 
 @dataclass(frozen=True)
