@@ -527,7 +527,7 @@ GENERATED_AT = {"by": 1, "scale": 1, "over": 20, "value": 3, "slots": "", "span"
     ({"kinds": "(int, float)"}, None), ({"classhook": 70}, None), ({"flag": "False"}, None),
     ({}, ("by", 10)), ({}, ("scale", 10)), ({"eq": "False"}, None), ({"compare": "False"}, None),
     ({"pipe": 30}, None), ({"attrs_eq": ", eq=False"}, None), ({"keyword": "True"}, None),
-    ({"takes_self": "True"}, None), ({"annotation": "float"}, None), ({"alias": "named"}, None)],
+    ({"takes_self": "True"}, None), ({"annotation": "float"}, None), ({"alias": "renamed"}, None)],
     ids=["slotted field", "mangled field", "slotted child's override", "factory", "slotted factory",
          "attrs default", "attrs factory", "attrs converter", "attrs setter hook", "attrs eq key",
          "attrs order key", "attrs validators", "attrs class setter hook", "attrs eq flag",

@@ -14,7 +14,7 @@ import site
 import sys
 import sysconfig
 import types
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
@@ -297,7 +297,7 @@ def generation_options(held: type) -> tuple[tuple[str, bool], ...]:
     return ()
 
 
-def annotation_text(annotation: object) -> str:
+def annotation_text(annotation: Hashable) -> str:
     """An annotation as an identity states it: a string as written, a class by its module and name, any other
     (a generic alias, a union, a typing form) by the text Python gives it, which names what it holds."""
     if isinstance(annotation, str):
@@ -307,11 +307,11 @@ def annotation_text(annotation: object) -> str:
     return repr(annotation)
 
 
-def _field_value(name: str, value: object) -> object:
+def _field_value[Value](name: str, value: Value) -> Value | str | dict:
     """A part of a field as its generator recorded it, as an identity states it: its annotation as text
     (`annotation_text`), its metadata as the mapping it is, a dataclass's field kind (a field, a class or an
     init variable, one of its sentinels) by its name, anything else as it is."""
-    if name == "type":
+    if name == "type" and isinstance(value, Hashable):
         return annotation_text(value)
     if isinstance(value, types.MappingProxyType):
         return dict(value)

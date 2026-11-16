@@ -354,7 +354,7 @@ def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, .
     return [*entry, dict(options), generated] if options or generated else entry
 
 
-def _generated(member: object) -> JSON:
+def _generated(member: types.FunctionType | tuple[str, ...]) -> JSON:
     """A member a class generator wrote (`dew._sources.generated_members`) by what it is: a function by its
     parameters (each one's name, kind, annotation as text and whether it has a default) and its code, which
     the generator wrote from the class's fields and options; `__match_args__` by its names."""
@@ -364,7 +364,8 @@ def _generated(member: object) -> JSON:
                    if parameter.annotation is not inspect.Parameter.empty else None,
                    parameter.default is not inspect.Parameter.empty]
                   for parameter in inspect.signature(member).parameters.values()]
-    return ["generated", parameters, _code(member.__code__)]
+    stated: list[JSON] = ["generated", parameters, _code(member.__code__)]
+    return stated
 
 
 def _converter(value, at: str, again: Callable[..., JSON]) -> JSON | None:
