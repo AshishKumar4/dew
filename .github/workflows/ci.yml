@@ -45,8 +45,8 @@ env:
   # and which shows a local plan's stderr, where Dew's plan states its reuse (armada bc61de0), and which
   # grades a task's kill for memory as a red row of its own beside its rows (armada 84a05a4; 2026-11-16: a
   # killed test may report none), and which leaves a run ungraded where a judge's map tasks never ran for want
-  # of capacity, never red (armada f2b680f).
-  ARMADA: github:AshishKumar4/armada#f2b680fa544df589ac692e4a0e655c3e0d3edb37
+  # of capacity, never red (armada 0da5300).
+  ARMADA: github:AshishKumar4/armada#0da53000b68c0fb1f839a7194d7e4d4f9f7b7499
 
 jobs:
   # A commit this workflow passed on another push, or one the land queue
