@@ -3,12 +3,13 @@
 
     python tools/smoke_wheel.py dist/dewml-*.whl
 
-The wheel is installed twice, each time into an empty environment, from PyPI's index and Dew's package index,
-which serves Dew's JAX build, dewml's releases and the forks Dew carries (`INDEX`), so a requirement neither
-can serve fails here: as a user installs it (pip, every requirement at its newest), and at the lower bound
-each of dewml's requirements declares (uv's `lowest-direct` resolution), so a floor older than the code it
-runs fails here too (row 862: 11 requirements had none, and optax's and huggingface_hub's predated an API
-Dew calls). Then, in each, from outside the checkout so nothing of it is importable:
+The wheel is installed twice, each time into an empty environment, from PyPI's index and the indexes Dew's
+installs read (`INDEXES`: Dew's package index, which serves Dew's JAX build, dewml's releases and the forks
+Dew carries, and a release under test's staging), so a requirement none can serve fails here: as a user
+installs it (pip, every requirement at its newest), and at the lower bound each of dewml's requirements
+declares (uv's `lowest-direct` resolution), so a floor older than the code it runs fails here too (row 862: 11
+requirements had none, and optax's and huggingface_hub's predated an API Dew calls). Then, in each, from
+outside the checkout so nothing of it is importable:
 
 - every module the wheel installed compiles (`compileall`), so a syntax
   error anywhere in the package fails, imported or not;
@@ -26,7 +27,6 @@ artifact it then uploads; CI's package job runs it on every push.
 from __future__ import annotations
 
 import argparse
-import runpy
 import subprocess
 import sys
 import tempfile
@@ -38,9 +38,13 @@ from packaging.requirements import Requirement
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_distribution
 
-INDEX = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src/dew/_builds.py"))[
-    "PACKAGE_INDEX"]
-"""Dew's package index, the one place Dew's JAX build is served (dew._builds.PACKAGE_INDEX)."""
+INDEXES = tuple(line.removeprefix("--extra-index-url ").strip() for line in
+                (Path(__file__).resolve().parents[1] / "constraints.txt").read_text().splitlines()
+                if line.startswith("--extra-index-url "))
+"""The indexes Dew's installs read beside PyPI, as constraints.txt names them: Dew's package index
+(dew._builds.PACKAGE_INDEX), the one place Dew's JAX build is served, and, while a pin's release is under
+test, the index's staging of it, which /simple lists only once the pin's train is green (row 6829): the pin's
+own package gate installs from it, as its locks do (tools/lock_environment.sh)."""
 
 TRAIN = """
 import sys
@@ -107,7 +111,8 @@ def smoke(wheel: Path, lowest: bool) -> None:
         python = root / "env" / "bin" / "python"
         # tools/pip.txt's pip first: older pips trust the roots of eMudhra's compromised CAs (2026-10-20).
         run(python, "-m", "pip", "install", "--quiet", "-r", Path(__file__).with_name("pip.txt"), cwd=root)
-        indexes = ("--index-url", "https://pypi.org/simple", "--extra-index-url", INDEX)
+        indexes = ("--index-url", "https://pypi.org/simple",
+                   *(flag for index in INDEXES for flag in ("--extra-index-url", index)))
         if lowest:
             # uv's lowest-direct lowers a project's own requirements, which a built wheel's are not to it:
             # they are named here as direct ones, read from the wheel's metadata, and the wheel goes in after.

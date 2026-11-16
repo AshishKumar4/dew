@@ -15,10 +15,10 @@ import dataclasses
 import functools
 import hashlib
 import json
+import logging
 import threading
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
-from concurrent import futures
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
 
@@ -30,8 +30,9 @@ from jax._src.interpreters import pxla
 from jax.experimental.layout import Format
 from jax.sharding import Sharding
 
-from dew import _cache, algebra
+from dew import _cache, _stated, algebra
 from dew._devices import xla_flag
+from dew._stated import Unestablished
 from dew.nn.kernels.generation import backend, gpu_target, stated, traced_fact
 from dew.nn.nested import staged
 from dew.telemetry.benchmark import UNGRAPHED_FLAG, options_of
@@ -39,6 +40,8 @@ from dew.telemetry.benchmark import UNGRAPHED_FLAG, options_of
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from flax import linen as nn
+
+_log = logging.getLogger(__name__)
 
 
 class QuantizedDtypes(Protocol):
@@ -165,6 +168,8 @@ class JitArguments(TypedDict, total=False):
     out_shardings: Placements
 
 
+_log = logging.getLogger("dew.kernels")
+
 _PROGRAMS: weakref.WeakSet[OuterProgram] = weakref.WeakSet()
 """Every program alive (`OuterProgram`), whose executables `release` drops."""
 
@@ -176,23 +181,61 @@ _TAKEN: contextvars.ContextVar[Taken | None] = _cache.untraced(
     contextvars.ContextVar("dew_taken_programs", default=None))
 
 
+def program_key(lowered: jax.stages.Lowered) -> Hashable:
+    """A program as `lowered` holds it, within this process: its text's digest, its arguments' and results'
+    trees as JAX holds them (a node's type the class itself, its data by equality) and its arguments'
+    types. Two lowerings of one program agree, whichever devices of one target they were lowered over, and
+    two whose texts agree only as JAX prunes an argument neither reads do not; any tree has one, a class
+    made inside a function among its nodes. The key of every match within a process (a search's compiled
+    executables, a begun compile's lowering); `program_digest` is the one a file of programs holds."""
+    types = tuple((aval.shape, str(aval.dtype), aval.weak_type) for aval in jax.tree.leaves(lowered.in_avals))
+    return _text_digest(lowered), lowered.in_tree, lowered.out_tree, types
+
+
+def _text_digest(lowered: jax.stages.Lowered) -> str:
+    return hashlib.sha256(lowered.as_text().encode()).hexdigest()
+
+
 def program_digest(lowered: jax.stages.Lowered) -> str:
-    """A program as `lowered` holds it, its text's digest beside its arguments' and results' trees and its
-    arguments' types: two lowerings of one program agree, whichever devices of one target they were
-    lowered over, and two whose texts agree only as JAX prunes an argument neither reads, which their
-    executables take in other trees, do not (a step's commit with its sample's summaries and without)."""
+    """A program as `lowered` holds it, as a file of programs holds it across processes: its text's digest
+    beside its arguments' and results' trees and its arguments' types, as `program_key` holds them within
+    one. Two lowerings of one program agree, whichever devices of one target they were lowered over, and
+    two whose texts agree only as JAX prunes an argument neither reads, which their executables take in
+    other trees, do not (a step's commit with its sample's summaries and without). Refused
+    (`dew._stated.Unestablished`) where a tree holds a node no process names (a class made inside
+    a function): no file can hold that program, and each reader of a file's programs takes it as one the
+    file holds none of (`taken`, `dew.training.ahead.kept`), or refuses it, naming the tree, where it
+    must keep it (a step compiled ahead)."""
     # Its trees node by node, each node's data by value as an identity states it (`dew._stated.stated`), never
     # as JAX prints them, which holds a node's data by its printed form: a checkified program's error tree
     # holds a traceback printed by its address, another in every process. A handed executable gives its
     # results in its own output tree, so a node's data that labels its leaves (a key of no plain form) is
     # part of the program.
-    from dew._stated import stated
-
     types = jax.tree.map(lambda aval: (aval.shape, str(aval.dtype), aval.weak_type), lowered.in_avals)
-    trees = json.dumps([stated(lowered.in_tree, "a program's arguments' tree"),
-                        stated(lowered.out_tree, "a program's results' tree")], sort_keys=True)
-    called = f"{trees}\n{types}"
-    return hashlib.sha256(f"{lowered.as_text()}\n{called}".encode()).hexdigest()
+    trees = json.dumps([_stated.stated(lowered.in_tree, "a program's arguments' tree"),
+                        _stated.stated(lowered.out_tree, "a program's results' tree")], sort_keys=True)
+    return hashlib.sha256(f"{_text_digest(lowered)}\n{trees}\n{types}".encode()).hexdigest()
+
+
+def stated_digest(lowered: jax.stages.Lowered) -> str | None:
+    """`lowered`'s digest as a file of programs holds it (`program_digest`), None (logged, with the tree)
+    where its trees hold a node no process names: a program no file holds, so one no file's is, which a
+    reader handed a file compiles (`taken`), or refuses where the file holds a program for its call
+    (`dew.training.ahead.kept`)."""
+    try:
+        return program_digest(lowered)
+    except Unestablished as refusal:
+        _log.info("a program no file of programs states is none a file holds: %s", refusal)
+        return None
+
+
+def taken(lowered: jax.stages.Lowered) -> Callable[[], jax.stages.Compiled] | None:
+    """The program compiled ahead for this target that `lowered` is (`taking`), None where the block hands
+    none or holds none for it: a program whose trees no file can hold (`stated_digest`) among them."""
+    if (programs := _TAKEN.get()) is None or (digest := stated_digest(lowered)) is None:
+        return None
+    return programs.get(digest)
+
 
 
 
@@ -259,7 +302,7 @@ class Compiling:
     """A program's first compile running in a thread of its own (`compiling`): the program, what its call
     lowered from (`OuterProgram.abstract_of`, None for a plain jit) and its lowering, which the program's
     compile through Dew's compile point takes where it compiles the same program over the same, lowering
-    nothing again, else where it lowers the same program (`program_digest`) (`attempting`), and whether
+    nothing again, else where it lowers the same program (`program_key`) (`attempting`), and whether
     a call has taken its lowering (`taken`): a start that lowered again, its algebra passed twice, says
     so."""
 
@@ -274,15 +317,24 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
     """`program` over these arguments (arrays or shapes) lowered here and its first compile begun in a
     daemon thread of its own (`report.attempted`: XLA's compile alone, which releases the GIL), so it
     compiles while this thread runs on: a run's start beside its step's planning, which does not read it.
-    `attempting` takes it; the process's exit waits for it where it still runs (`_exit_waits`), so a run
-    refused before its start is taken exits with its refusal once the compile ends, never through a
-    compile XLA's exit tears down under it."""
+    `attempting` takes it; the process's exit waits for it where it still runs, saying so
+    (`dew._coordination.stop_at_exit`), so a run refused or stopped before it takes its start exits once the
+    compile ends, never through a compile XLA's exit tears down under it."""
     from dew.nn.kernels.templates import report
 
     lowered = program.lower(*args, **kwargs)
     attempt: Future = Future()
     # In this thread's context: the compile's target reads it (`report.for_devices`).
     context = contextvars.copy_context()
+
+    # Its compile runs inside jaxlib: the process's exit waits for it (`stop_at_exit`), so neither JAX's exit
+    # cleanup nor the C runtime's exit tears XLA down under it (row 6837: 12 of 48 refused runs' exits ended
+    # by a segmentation fault).
+    from dew._coordination import stop_at_exit
+
+    def said() -> None:
+        _log.warning("the process waits to exit for a program's compile it began beside its work, still "
+                     "running")
 
     def attempted() -> None:
         attempt.set_running_or_notify_cancel()
@@ -292,39 +344,13 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
             # Its reader raises it (`attempting`).
             attempt.set_exception(error)
         finally:
-            with _IN_FLIGHT_GUARD:
-                _IN_FLIGHT.discard(attempt)
+            withdraw()
 
-    with _IN_FLIGHT_GUARD:
-        _IN_FLIGHT.add(attempt)
-    _exit_waits()
-    threading.Thread(target=attempted, name="dew-compile-ahead", daemon=True).start()
+    thread = threading.Thread(target=attempted, name="dew-compile-ahead", daemon=True)
+    withdraw = stop_at_exit(thread, said, timeout=None)
+    thread.start()
     abstract = program.abstract_of(args, kwargs) if isinstance(program, OuterProgram) else None
     return Compiling(program, abstract, lowered, attempt)
-
-
-_IN_FLIGHT: set[Future] = set()
-"""The compiles `compiling` began that have not ended."""
-_IN_FLIGHT_GUARD = threading.Lock()
-
-
-@functools.cache
-def _exit_waits() -> None:
-    """The process's exit waits for every compile `compiling` began that still runs, registered once one
-    begins, after JAX is imported, so it runs before JAX's own exit cleanup (`atexit` runs the last
-    registered first): neither JAX's clearing of its backends nor the C runtime's exit, which destroys
-    XLA's static objects, meets a running compile. A run refused while its start compiles exits with its
-    refusal, the compile's remaining time later; it ended by a segmentation fault in 12 of 48 such exits
-    (row 6837). Its cost falls on a refusal that comes after the start's compile begins, which only one that
-    needs what runs beside it is (`dew.training.trainer.Trainer._compiled_fresh`)."""
-    import atexit
-
-    def waited() -> None:
-        with _IN_FLIGHT_GUARD:
-            running = list(_IN_FLIGHT)
-        futures.wait(running)
-
-    atexit.register(waited)
 
 
 _ATTEMPTING: contextvars.ContextVar[Compiling | None] = _cache.untraced(
@@ -487,12 +513,49 @@ _PASSING: contextvars.ContextVar[bool] = contextvars.ContextVar("outer_program_p
 
 
 def release() -> None:
-    """Drop every live program's compiled executables (`OuterProgram.released`), as `jax.clear_caches`
-    drops jit's own: XLA:CPU maps each executable's code into the process, and a program keeps up to
-    `OuterProgram.CACHED` of them for as long as it lives, past a cache JAX clears. A process that compiles
-    on and on (a test suite) frees the mappings this way; each program compiles again at its next call."""
+    """Drop every live program's compiled executables (`OuterProgram.released`) and the process's held ones
+    (`held`), as `jax.clear_caches` drops jit's own: XLA:CPU maps each executable's code into the process,
+    and a program keeps up to `OuterProgram.CACHED` of them for as long as it lives, past a cache JAX
+    clears. A process that compiles on and on (a test suite) frees the mappings this way; each program
+    compiles again at its next call."""
     for program in list(_PROGRAMS):
         program.released()
+    unhold()
+
+
+def unhold() -> None:
+    """Drop the executables the process holds across its trainers (`hold`) alone, every program's own kept:
+    what a fresh process holds of them, which a test of what a start compiles begins from."""
+    with _HELD_LOCK:
+        _HELD.clear()
+
+
+_HELD: collections.OrderedDict[Hashable, jax.stages.Compiled] = collections.OrderedDict()
+"""The executables a process compiled from a lowering it may lower again (`hold`, `held`), the latest
+`OuterProgram.CACHED`, by the program within the process, its options and its devices."""
+_HELD_LOCK = threading.Lock()
+
+
+def held(key: Hashable) -> jax.stages.Compiled | None:
+    """The executable this process compiled under `key` (`hold`), None where it holds none."""
+    with _HELD_LOCK:
+        return _HELD.get(key)
+
+
+def hold(key: Hashable, executable: jax.stages.Compiled) -> None:
+    """Hold `executable` under `key` (the program within the process, `program_key`, its options and the
+    devices it loads on) for the process: a plan of the same step by a later trainer of the process takes
+    it (`held`), where each new trainer read it back from the persistent compilation cache (4.4 s of a
+    small model's 11.9 s start on CPU, row 6995). Its kernels' report is its lowering's, which the later
+    plan reads as it lowers; a held executable compiles nothing, so the compile telemetry names no compile
+    of it (`dew.telemetry.compiles`). A plan holds the executables that fit, which a run may step on, a
+    guided one in its unguided one's place (`dew.training.planning.Planned.guided`), never one that missed,
+    whose device code would be held for nothing. The latest `OuterProgram.CACHED` are held, as a program
+    keeps its own; `release` drops them."""
+    with _HELD_LOCK:
+        _HELD[key] = executable
+        while len(_HELD) > OuterProgram.CACHED:
+            _HELD.popitem(last=False)
 
 
 class OuterProgram:
@@ -671,7 +734,7 @@ class OuterProgram:
             self._released(key, pending, failure)
             raise
         # A program compiled ahead for this target runs as it was compiled (`taking`).
-        if (taken := _TAKEN.get()) and (ahead := taken.get(program_digest(lowered))) is not None:
+        if (ahead := taken(lowered)) is not None:
             self._keep(key, pending, ahead(), [])
         else:
             together[id(self), key] = _Lowering(self, key, pending, lowered, args, kwargs)
@@ -725,12 +788,12 @@ class OuterProgram:
         else:
             lowered = self.lower(*args, **kwargs)
         # A program compiled ahead for this target runs as it was compiled (`taking`).
-        if (taken := _TAKEN.get()) and (ahead := taken.get(program_digest(lowered))) is not None:
+        if (ahead := taken(lowered)) is not None:
             return ahead()
         # Its first compile from that thread, where it lowers the program begun there.
         first = None
         if begun is not None and (lowered is begun.lowered
-                                  or program_digest(begun.lowered) == program_digest(lowered)):
+                                  or program_key(begun.lowered) == program_key(lowered)):
             first = begun.attempt.result()
         executable = report.compiled(lowered,
                                      relower=functools.partial(self._relowered, args, kwargs, relowered),

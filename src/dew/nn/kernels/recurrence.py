@@ -76,8 +76,8 @@ class Gates:
 class OutputNorm:
     """The epilogue's gated RMS norm of a head's output: `rms_norm(o) weight act(z)`, the norm in fp32
     with `epsilon`, `activation` the gate's ('silu' or 'sigmoid'), the output first read back in `read_in`
-    where it names a dtype: the one the layer's input projection computes in, where its reference casts
-    the scan's output before its norm (`dew.nn.linear.as_projected`; transformers' Qwen3-Next and Kimi
+    where it names a dtype: the one the layer's input projection computes in, the projections' dtype,
+    where its reference casts the scan's output before its norm (transformers' Qwen3-Next and Kimi
     `.to(query.dtype)`), as the layer's unfused token does. Normalized unrounded, a fused bf16 token sat
     nearer float64 than its reference and apart from the layer's own unfused token (row 6963)."""
     epsilon: float

@@ -85,7 +85,8 @@ def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():
     """`fused_gemm.analysis` prices a region both ways from one model (`fused_gemm.priced`, the shared
     `templates.cost`): a bf16 product of 8192 x 4096 x 4096 with a bias and a SiLU after it costs less fused
     than its launch writing the product and XLA's fusion reading it back, by at least that round trip's
-    bytes at the H100's device memory rate; a region with no consumer is not priced. Shapes only."""
+    bytes at the H100's device memory rate; a region with no consumer and no producer is not priced. Shapes
+    only."""
     sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
     x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
     w = jax.ShapeDtypeStruct((4, 4096, 4096), jnp.bfloat16)
@@ -102,6 +103,29 @@ def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():
     assert found.fused_seconds is not None and found.unfused_seconds is not None, found
     assert found.unfused_seconds - found.fused_seconds >= 2 * 8192 * 4096 * 2 / rate, found
     assert plain.fused_seconds is None and plain.unfused_seconds is None
+
+
+def test_a_normed_projections_analysis_prices_its_prologue_against_forming_the_rows_whole():
+    """`fused_gemm.analysis` of an RMS norm feeding a bf16 product of 8192 x 4096 x 4096 (a compile-only
+    H100): its prologue fused (the rows' inverse RMS computed whole beside, the normalization tile by tile
+    in the kernel), it costs less than XLA forming the normalized rows whole and the launch reading them
+    back, by at least the rows' bytes once at the device memory rate: the normalized rows are never written
+    or read, where the statistics' pass reads the rows once more. Shapes only."""
+    x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
+    scale = jax.ShapeDtypeStruct((4096,), jnp.float32)
+    w = jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16)
+
+    def region(x, scale, w):
+        wide = x.astype(jnp.float32)
+        inverse = jax.lax.rsqrt(jnp.mean(wide * wide, axis=-1, keepdims=True) + 1e-6)
+        return fused_gemm.product((wide * inverse * scale).astype(jnp.bfloat16), w, out_dtype=jnp.bfloat16)
+
+    with generation.assumed("sm90"):
+        found = fused_gemm.analysis(region, x, scale, w)
+        rate = generation.gpu_target().memory_rate
+    assert found.prologue is not None and found.prologue.kernel == "fused", found
+    assert found.fused_seconds is not None and found.unfused_seconds is not None, found
+    assert found.unfused_seconds - found.fused_seconds >= 8192 * 4096 * 2 / rate, found
 
 
 def test_a_regions_price_reads_its_declared_precision_and_every_bank_of_its_matrix():

@@ -18,7 +18,7 @@ from decision_support import decision_rows
 from float64_terms import float64_terms
 from optim_support import in_float64
 from recording import RecordingTracker
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, dew_path
 from torch_layout import node
 
 from dew.batch import VALID_ROWS
@@ -176,12 +176,13 @@ def at_offset(batch, window: int, row: int) -> dict:
 
 def in_place(batch, placed: list[tuple[int, int]]) -> dict:
     """`batch` with each `(window, row)` of `placed`, at most one a window, alone in its window where
-    the window packed it (`at_offset`), and every other window empty: the packed batch's shapes, so
-    every product a row's tokens enter runs at the packed run's shapes. A window reads no other, so
-    rows of different windows run alone together."""
+    the window packed it (`at_offset`), and every other window empty: the packed batch's shapes and its
+    bound on a window's documents, so every product a row's tokens enter runs in the packed run's own
+    program. A window reads no other, so rows of different windows run alone together."""
     assert len({window for window, _ in placed}) == len(placed), "one row a window"
-    # A window of its own rows apart: the read's bound on its windows (`tokens_bound`) is not its own.
-    one = {name: np.zeros_like(value) for name, value in batch.items() if name != "tokens_bound"}
+    # The read's bound on its windows (`tokens_bound`) kept: a window of one row holds no more documents
+    # than it bounds, and the packed run's program, its bound static, serves the rows alone too.
+    one = {name: value if name == "tokens_bound" else np.zeros_like(value) for name, value in batch.items()}
     for window, row in placed:
         for name, value in at_offset(batch, window, row).items():
             one[name][window, :value.shape[1]] = value[0]
@@ -313,7 +314,8 @@ class AttentionTerms:
             heads, width = queries.shape[2:]
             dout = jnp.einsum("bsf,hdf->bshd", cotangents[path], kernel.reshape(heads, width, -1))
             _, query_terms, key_terms, value_terms = attention_terms(queries, keys, values, dout, keep)
-            carried[place] = {name: (np.asarray(into, np.float64), terms) for name, into, terms in (
+            # `into` stays on the device: `with_attention_terms` widens it there, at float64 under x64.
+            carried[place] = {name: (into, terms) for name, into, terms in (
                 (query_name, into_queries, query_terms), (key_name, into_keys, key_terms),
                 (value_name, into_keys, value_terms))}
         return carried
@@ -483,6 +485,8 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 
         logits, grads = decide(variables, batch)
         return asked(batch, logits), grads
 
+    # One of Dew's own paths: packing invariance, both arms one `decide` under one rewrite, one program.
+    @dew_path
     @as_given
     def alone(variables):
         return rows_alone(lambda one: decide(variables, one), batch)
