@@ -2440,3 +2440,28 @@ def test_an_unseeded_mix_of_indexed_files_ends_at_its_share_spans_whatever_its_r
     finally:
         passed.close()
     assert read_ids == [0, 1, 1000]
+
+
+def test_a_streamed_unseeded_mix_of_a_file_with_no_length_is_refused_or_provisioned(tmp_path):
+    """An unseeded mix ends at its members' share-spans, so its streamed read requires each member's length
+    (data.md §10's length rule): a JSON-lines file with no provisioned index is refused, naming the
+    preparation, where it read on to a different end than its indexed read; provisioned, the mix reads to
+    its share-spans."""
+    for name, count, first in (("many", 100, 0), ("one", 1, 1000)):
+        rows = "".join(f'{{"id": {first + index}}}\\n' for index in range(count))
+        (tmp_path / f"{name}.jsonl").write_text(rows)
+
+    def chain():
+        many, one = (Pipeline(Files(str(tmp_path / f"{name}.jsonl"), format="jsonl"))
+                     for name in ("many", "one"))
+        return mix([many, one], weights=[2, 1]).batch(1)
+
+    with pytest.raises(ValueError):
+        held(chain().read("streamed").loading(READ))(DataPartition())
+    for name in ("many", "one"):
+        Files(str(tmp_path / f"{name}.jsonl"), format="jsonl").provision()
+    reader = held(chain().read("streamed").loading(READ))(DataPartition())
+    try:
+        assert [value for batch in ids(reader) for value in batch] == [0, 1, 1000]
+    finally:
+        reader.close()
