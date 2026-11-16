@@ -453,10 +453,19 @@ _BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '
 # over 40 SMs at 1590 MHz -> 1024 and 128.
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
+# Its VPU's fp32 operations and its transcendental unit's exponentials a clock, measured (Google's pages state
+# neither): a Pallas kernel's chain over one VMEM-resident 512 x 1024 fp32 block, the slope of its wall time
+# over 256 to 4096 iterations (the tpu_rates script on Colab TPUs, colab7062's rates2, two rounds each, at
+# most 1% from the line), over the clock its MXU's peak gives. A step bound by the block's
+# VMEM read and write, a lone add's on both (v5e 0.959 us, v6e 0.413), states no unit's rate: the VPU's is a
+# multiply-add's, two operations an element, which outlasts it (v5e 1.278 us, 8.21e11 operations a second;
+# v6e 0.646, 1.62e12), and the v6e's exponentials an exp2's (0.563 us, 9.33e11 a second). A v5e's exp2 took
+# as long as its add, so its own rate waits on a chain of four exp2 an iteration.
 _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
-                             vmem_bytes=128 * 2 ** 20),
+                             vmem_bytes=128 * 2 ** 20, vector_per_clock=8.21e11 / (197e12 / 131072)),
          'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
-                             vmem_bytes=128 * 2 ** 20)}
+                             vmem_bytes=128 * 2 ** 20, vector_per_clock=1.62e12 / (918e12 / 524288),
+                             exponentials_per_clock=9.33e11 / (918e12 / 524288))}
 
 
 def architecture(generation: str) -> Architecture | None:
