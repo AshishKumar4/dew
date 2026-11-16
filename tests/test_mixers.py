@@ -521,7 +521,8 @@ def test_a_decoder_of_no_compute_dtype_over_bfloat16_weights_decodes(kind, resid
     """A decoder of each kind that keeps a decode cache, computing in no dtype of its own over bfloat16
     weights, its stream summing in fp32 or not, decodes: each norm reads an fp32 stream in its weight's
     dtype (`RMSNorm.weight_dtype_reads`, mamba_ssm's Block), and Mamba-2's projection reads its scan in its
-    input's dtype (transformers' Mamba2Mixer), so every holder's cache keeps what its forward writes, where
+    input's dtype (transformers' Mamba2Mixer, `dew.nn.linear.in_input_dtype`), so every holder's cache
+    keeps what its forward writes, where
     the attention kinds' keys and a short conv's history came in fp32 to a bfloat16 cache and were refused
     by the leaf's name (row 6215). Falcon-H1's parallel mixer among them, its Mamba-2 branch beside its
     attention."""
@@ -539,7 +540,7 @@ def test_a_decoder_of_no_compute_dtype_over_bfloat16_weights_decodes(kind, resid
 def test_a_mamba2_of_a_stated_dtype_projects_its_scan_in_it():
     """A Mamba-2 layer computing in float32 over bfloat16 activations projects its gated scan in float32,
     as its input projection and norm compute it, its output what the same values in float32 give: the
-    input's dtype rounds the scan only where the layer states none (`Mamba2Mixer._read`)."""
+    input's dtype rounds the scan only where the layer states none (`dew.nn.linear.in_input_dtype`)."""
     fields, _ = KIND_FIELDS["mamba2"]
     layer = mixers.build("mamba2", **fields).build(MixerContext(
         emb_features=32, num_heads=4, num_kv_heads=4, head_dim=8, max_seq_len=16, dtype=jnp.float32))(
@@ -550,6 +551,29 @@ def test_a_mamba2_of_a_stated_dtype_projects_its_scan_in_it():
     # bfloat16 input's dtype rounds anywhere past it would differ.
     np.testing.assert_array_equal(np.asarray(layer.apply(variables, x)),
                                   np.asarray(layer.apply(variables, x.astype(jnp.float32))))
+
+
+RECURRENT = ("gated_delta_net", "kimi_delta_attention", "lightning_attention", "mamba", "mamba2", "mamba3")
+"""The registered recurrent kinds, each beside attention in a hybrid."""
+
+
+@pytest.mark.parametrize("kind", RECURRENT)
+def test_a_hybrid_of_no_compute_dtype_over_bfloat16_weights_decodes(kind):
+    """A hybrid of a recurrent kind beside full attention, computing in no dtype of its own over bfloat16
+    weights, decodes: the stream stays the weights' dtype, each recurrent layer's scan output read back
+    in its input's dtype where its reference casts it (`dew.nn.linear.in_input_dtype`), so the attention
+    layer's keys come to its cache in the dtype the cache states, where a gated delta net's, Kimi's or
+    lightning's fp32 scan widened the stream and the keys were refused by the leaf's name (row 6935)."""
+    fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
+    model = tiny(max_seq_len=32, num_layers=2, layer_types=("recurrent", "full_attention"),
+                 kinds={"recurrent": {"mixer": {"class": kind, "fields": fields}}},
+                 **{key: value for key, value in overrides.items() if key != "num_layers"})
+    tokens = jnp.asarray(np.random.default_rng(6935).integers(0, VOCAB, (2, 8)), jnp.int32)
+    variables = jax.tree.map(
+        lambda leaf: leaf.astype(jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
+        model.init(jax.random.key(0), tokens))
+    logits = decode_logits(model, variables, tokens[:, :5], tokens[:, 5:])
+    assert logits.shape == (2, 4, VOCAB) and bool(jnp.all(jnp.isfinite(logits)))
 
 
 @pytest.mark.parametrize("kind", sorted(set(mixers.paths) - ATTENDS_NOTHING))

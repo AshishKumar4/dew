@@ -20,6 +20,13 @@ class InContextMemoryMixer(MixerBase):
 
     memory: InContextMemory
 
+    def fork_refusal(self) -> str | None:
+        """Why the layer reads no forks (`MixerBase.fork_refusal`): the memory's state carries through a
+        row's chunks in place order, and a fork's document continues its parent's state, which the row's
+        order does not hand it: its parent's tokens sit earlier in the row beside other documents'."""
+        return ("an in-context memory carries its state through a row's chunks in place order, which does "
+                "not hand a fork's document its parent's state")
+
     def marks(self) -> tuple[str, ...]:
         """The residuals of every path the memory's configuration can take (`InContextMemory.residuals`):
         the kind cannot see the wrappers a model computes under, which decide whether a linear memory
