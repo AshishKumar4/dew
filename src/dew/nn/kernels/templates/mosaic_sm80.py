@@ -192,6 +192,20 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     """A consumer's shared-memory tile its register left operands relay through where its warps split their
     columns (`relaying`, `relay_bytes`)."""
 
+    held_registers = 40
+    """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
+    indices, the walk's carry), a measured whole (`scalars_whole`): CUTLASS's cooperative sm90 kernel's 168
+    less its accumulator's 128; an A100's attention dQ holds 13 to 43 integers live at its peaks, places and
+    addresses together. Its derivations need it: without it the GEMM's gate picks on sm80, sm86, sm89 and
+    sm120 spill 36 to 784 bytes, where its operands' fragments share the registers (FS-HELDREG)."""
+
+    scalars_whole = True
+
+    def scalar_registers(self, addressed=()) -> int:
+        # Its measured whole, its addresses among them.
+        del addressed
+        return self.held_registers
+
     rows = 16
 
     # Its kernels take hooks and exact sums: an epilogue's side values read in its accumulator's layouts

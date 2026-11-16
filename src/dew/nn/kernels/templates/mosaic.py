@@ -737,22 +737,18 @@ class Issuer[Accumulator](abc.ABC):
         del tile
         return self
 
-    held_registers: int = 40
-    """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
-    indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
-
-    scalars_whole: bool = True
-    """Whether `held_registers` is a measured whole of a consumer thread's scalars, its addresses, indices
-    and a select's predicates among them, which a launch's own scalar terms do not add to (an A100's
-    attention dQ: 13 to 43 integers live at its peaks, places and addresses together, no predicate saved
-    to a register, within the 40)."""
+    scalars_whole: bool = False
+    """Whether `scalar_registers` is a measured whole of a consumer thread's scalars, its addresses, indices
+    and a select's predicates among them, which a launch's own scalar terms do not add to (mma.sync's)."""
 
     def scalar_registers(self, addressed=()) -> int:
-        """The registers a consumer thread holds beside its tiles: its own scalars (`held_registers`), its
-        addresses into the shared tiles it reads and writes through registers (`addressed`, each
-        `(shape, dtype)`) among them where the family's count is a measured whole, as this one is."""
-        del addressed
-        return self.held_registers
+        """The registers a consumer thread holds beside its tiles that its launch states: its addresses into
+        the shared tiles it reads and writes through registers (`addressed`, each `(shape, dtype)`,
+        `resources.addresses`). Its other scalars (indices, the walk's carry, a select's predicates) no
+        constant states where its products read shared memory (warpgroup MMA's, tcgen05's): the derivations
+        hold without one (a 4B start's certifications on sm90 and sm100, the gate's GEMM picks), and the
+        model they sit in misses ptxas by up to a hundred registers either way (row 7095)."""
+        return resources.addresses(addressed)
 
     operands_in_registers: bool
     """Whether a product reads its operands from registers a consumer loads them into (mma.sync's), where

@@ -350,18 +350,18 @@ def shared_programs(most: int, shared: int, block: int) -> int:
 
 def held_area(family: "Family", consumers: int) -> int:
     """The fp32 accumulator elements `consumers` consumers of `family` hold beside what they hold besides
-    (`Family.held_registers`): a derived tile's rows times columns at most (`held_rows` at any columns); a
+    (`Family.scalar_registers`): a derived tile's rows times columns at most (`held_rows` at any columns); a
     family's own where its values live in a core's scratch memory (`Issuer.held_area`: a TPU's VMEM)."""
     area = family.held_area(consumers)
     if area is not None:
         return area
-    return (family.registers(consumers) - family.held_registers) * THREADS * consumers
+    return (family.registers(consumers) - family.scalar_registers()) * THREADS * consumers
 
 
 def held_rows(family: "Family", consumers: int, columns: int) -> int:
     """The most rows, in whole roles of `consumers` consumers of `family` (`Family.role_rows` each), whose
     fp32 accumulator of `columns` columns their threads hold beside what they hold besides
-    (`Family.held_registers`): the rows a derived tile's registers bound (docs/design/kernel-templates.md
+    (`Family.scalar_registers`): the rows a derived tile's registers bound (docs/design/kernel-templates.md
     §7). A family whose products read registers holds a step's fragments too (`tile_registers`), which
     its derivation checks at each step."""
     share = held_area(family, consumers) // consumers // columns
