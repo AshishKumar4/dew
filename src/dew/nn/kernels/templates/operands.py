@@ -178,7 +178,7 @@ class Issuer:
             runs = self._runs(products)
             if any(isinstance(run, _Whole) for run in runs):
                 return self._summed_runs(runs, shape, retired=retired, into=into)
-            products = runs[0] if runs else []
+            products = [entry for run in runs if isinstance(run, list) for entry in run]
         rest = iter(self._entries(products))
         first = next(rest, None)
         if first is None:
