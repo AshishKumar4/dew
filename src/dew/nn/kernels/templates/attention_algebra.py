@@ -1822,12 +1822,13 @@ def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax
     its row's total's binade (`dew.nn.precision.raised_exactly`, from its bits) and taken back in the one
     rounding of the correctly rounded division (`lowered_divide`): a subnormal one kept (row 6302); every
     other element's bits the plain ratio's. Wider sums (a float64 truth's) keep their subnormals as they
-    are. Where `held` (a call whose weights take no multiplier past 1: no dropout), a quotient of finite
-    sums is a mean of finite values, within their dtype's largest, so one past it is the sums' rounding,
-    held there by selection: a scaled row's sums of values at fp32's largest round up an ulp onto 2^127 at
-    a total of 1/2, its quotient 2^128 (row 6842); an infinite value's sum stays infinite, its quotient as
-    it is. A dropping call's kept weights take its multiplier past their denominator's, so its quotient may
-    pass the values' largest, as the reference's does."""
+    are. Where `held` (an fp32 call's walk, `MosaicForward.parts`: dropout-free inference), a quotient of
+    finite sums is a mean of finite values, within their dtype's largest, so one past it is the sums'
+    rounding, held there by selection: a scaled row's sums of values at fp32's largest round up an ulp onto
+    2^127 at a total of 1/2, its quotient 2^128 (row 6842); an infinite value's sum stays infinite, its
+    quotient as it is. A dropping call's kept weights take its multiplier past their denominator's, so its
+    quotient may pass the values' largest, as the reference's does; and a 16-bit output casts a quotient held
+    at fp32's largest to inf as it would the unheld one, so no 16-bit walk pays for the hold's registers."""
     def divided(*, flushing: bool) -> jax.Array:
         plain = ratio(acc)
         if not flushing:
@@ -1869,7 +1870,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     rows' scale leaves (both its sums are at it). A `normalized` state's sums are its output already (a
     merge of finished states, `finished_merged`): zero where it holds no mass. Where its arithmetic flushes
     a subnormal result (XLA's CPU, `bodies.subnormals`), its ratio is `quotient`'s, held at the values'
-    largest where `held` (a call taking no dropout)."""
+    largest where `held` (an fp32 call's walk, `quotient`)."""
     m, denominator = finished_rows(spec, state, initial=initial)
     if normalized:
         out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)

@@ -619,8 +619,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         acc = algebra.split_output(split.others, own, value_rows)
         # The joined sums over the denominator at their rows' scale (`algebra.split_residuals`).
         total = rows[1] if not form.headroom else algebra.power2(rows[1], -split.shift, reach=2 * 127)
-        out = algebra.output_of(acc, total, guarded=form.guarded or hooks.initial is not None,
-                                held=hooks.drop is None)
+        out = algebra.output_of(acc, total, guarded=form.guarded or hooks.initial is not None)
         out = _output_hooked(out, hooks, hooked)
         return (jnp.swapaxes(out, 1, 2).astype(q.dtype), rows[0], rows[1], anchors, split), status[0], None
 
@@ -1353,7 +1352,8 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         else:
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
                                                           output_mod=hooks.output_mod,
-                                                          output_params=out_params, held=hooks.drop is None)
+                                                          output_params=out_params,
+                                                          held=program.parts > 1)
             out_stage(lambda stage: family.stored((_kept_rows(family, keep, output, out_view),), (out_view,),
                                                   smem=stage))
         finished = stored().finished
