@@ -32,7 +32,7 @@ from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
-from dew.nn.memory import CARRY, Gate, InContextMemory, MLPMemory, Objective
+from dew.nn.memory import CARRY, CHUNK, Gate, InContextMemory, MLPMemory, Objective
 from dew.nn.mlp import GatedMLP
 
 SEEDS = {"scanned memory decoder gradient": 32, "rematted memory decoder gradient": 64,
@@ -734,7 +734,7 @@ def test_a_memory_decoder_marks_and_climbs_by_the_paths_it_can_take(capsys):
     memory on the delta rule marks the rule's port's decay, inverse and memory on the recurrence, and
     its chunk scan's carry under an input quantization of its first head, which takes it off the
     recurrence; its ladder takes the rung recomputing the rule's memory alone. Titans' memory marks its
-    carry, and its ladder has no such rung."""
+    carry and its chunks' own values (row 6577), and its ladder has no such rung."""
     from jax.ad_checkpoint import print_saved_residuals
     from model_support import TINY_DECODER
 
@@ -778,7 +778,7 @@ def test_a_memory_decoder_marks_and_climbs_by_the_paths_it_can_take(capsys):
     titans, titans_rungs = kept(layer("titans"))
     assert set(DELTA_RESIDUALS) <= delta and "all_but_delta_memory" in delta_rungs
     assert CARRY in quantized
-    assert CARRY in titans and "all_but_delta_memory" not in titans_rungs
+    assert {CARRY, CHUNK} <= titans and "all_but_delta_memory" not in titans_rungs
 
 
 def test_muon_steps_each_memory_heads_matrices_on_their_own():

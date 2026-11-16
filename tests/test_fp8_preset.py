@@ -376,6 +376,32 @@ def test_an_mxfp8_product_of_operands_whose_scales_are_subnormal_is_their_value(
     np.testing.assert_array_equal(np.asarray(out, np.float32), 32.0)
 
 
+@pytest.mark.parametrize("program", ["jitted", "op by op"])
+def test_an_mxfp8_operand_of_zero_blocks_and_least_scales_quantizes_to_its_values(program):
+    """MXFP8's quantization (`formats.MxFp8.quantized`) of a block of zeros, a block whose largest magnitude
+    takes the least scale (2^-125: the scale float32's subnormal 2^-127), and a block of ordinary values,
+    jitted and op by op (XLA's CPU flushing subnormals): each decodes to its values, the zeros zero and the
+    least-scaled block 2^-125 exactly, where dividing by the scale read it as zero, its zeros over it NaN
+    (row 6931)."""
+    from dew.nn.kernels.formats import MxFp8
+
+    x = np.zeros((1, 96), np.float32)
+    x[0, 32:64] = 2.0 ** -125
+    x[0, 64:] = np.linspace(-448.0, 448.0, 32, dtype=np.float32)
+
+    def decoded(x):
+        return MxFp8.quantized(x).decoded()
+
+    if program == "jitted":
+        out = jax.jit(decoded)(x)
+    else:
+        with jax.disable_jit():
+            out = decoded(x)
+    expected = np.asarray(jax.jit(decoded)(x))
+    np.testing.assert_array_equal(np.asarray(out)[0, :64], x[0, :64])
+    np.testing.assert_array_equal(np.asarray(out), expected)
+
+
 def test_a_recipe_projection_on_a_data_parallel_mesh_lowers_for_cuda():
     """Row 6719: under the 'fp8' numerics, a feed-forward's projection and its gradients on two compile-only
     H100s whose automatic data axis splits the rows (a data-parallel run's mesh, `MeshSpec().build`), the

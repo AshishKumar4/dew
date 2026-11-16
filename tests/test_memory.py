@@ -226,3 +226,26 @@ def test_an_orthogonalized_step_follows_the_paper_with_muons_iteration():
     assert_as_exact(applied(module), written(module, dtype=jnp.float32, gradient=gradient), drawn(module),
                     "orthogonalized memory", seeds=MEMORY_SEEDS,
                     truth_fn=written(module, dtype=jnp.float64, gradient=gradient))
+
+
+def test_a_memory_recomputes_its_chunks_only_where_its_rung_names_them():
+    """An in-context memory's training step recomputes each chunk from its carry in the backward only where
+    the rung it runs under names its chunks (`recurrence_chunk.recomputing`, `memory_chunk`: the heaviest
+    rung's, `decoder_block._recomputed_inside`); under any other it keeps their values, the step's work its
+    forward's and backward's alone (row 6577: recomputed under every rung, a Titans step that fit ran
+    31-41% slower)."""
+    from dew.nn.inputs import PLAIN_CALL
+    from dew.nn.kernels.recurrence_chunk import recomputing
+
+    module = layer("titans")
+    params = jax.eval_shape(lambda: module.init(jax.random.key(0), jnp.zeros((1, LENGTH, WIDTH))))
+    x = jax.ShapeDtypeStruct((ROWS, LENGTH, WIDTH), jnp.float32)
+
+    def flops(names: tuple[str, ...]) -> float:
+        def loss(params, x):
+            with recomputing(names):
+                return jnp.sum(module.apply(params, x, PLAIN_CALL))
+
+        return jax.jit(jax.grad(loss)).lower(params, x).compile().cost_analysis()["flops"]
+
+    assert flops(()) < flops(("memory_chunk",))
