@@ -13,7 +13,6 @@ import contextvars
 import dataclasses
 import functools
 import gc
-import json
 import weakref
 from collections.abc import Callable
 
@@ -1936,10 +1935,7 @@ def test_each_attention_launch_states_its_outputs_dimensions_for_an_h100(accurat
     output descends from (`outputs.Output`, its call's `outputs.OUTPUT_DIMS` frontend attribute), an output
     an entry a dimension, so a compile's live buffers name the call's axes they scale with; the fast form's
     one launch and the accurate form's two (a split of the columns among them included)."""
-    from jax.extend.mlir import ir
-
-    from dew.nn.kernels import lowered as reading
-    from dew.nn.kernels.templates.outputs import OUTPUT_DIMS
+    from kernel_compile import stated_outputs
 
     tokens, heads, kv_heads, width = 1024, 4, 2, 128
     spans = template.spans(tokens, tokens, 1, causal=True)
@@ -1958,21 +1954,12 @@ def test_each_attention_launch_states_its_outputs_dimensions_for_an_h100(accurat
     for fn in (step, forward):
         with generation.assumed("sm90"):
             lowered = jax.jit(fn).trace(query, key, key).lower(lowering_platforms=("cuda",))
-        # Each Mosaic GPU call: the outputs it defines (its results less those aliasing an operand, a ref it
-        # writes in place) and the dimensions it states (none where it states none).
-        def defined(operation) -> int:
-            aliased = (len(ir.ArrayAttr(operation.attributes["output_operand_aliases"]))
-                       if "output_operand_aliases" in operation.attributes else 0)
-            return len(operation.results) - aliased
-
-        calls = [call for call, _ in reading._read_calls(lowered, lambda target, operation: (
-            defined(operation), reading._frontend(operation.attributes).get(OUTPUT_DIMS))
-            if target == "mosaic_gpu_v2" else None)]
-        returning = [stated for count, stated in calls if count]
+        # Each Mosaic GPU call: the outputs it defines and the dimensions it states (`stated_outputs`).
+        returning = [stated for count, stated in stated_outputs(lowered, "mosaic_gpu_v2") if count]
         assert returning, "no Mosaic launch defines an output"
         for stated in returning:
             assert stated is not None, "a launch returning arrays states no dimensions"
-            assert all(dims is not None for dims in json.loads(stated)), stated
+            assert all(dims is not None for dims in stated), stated
 
 
 def _lowered_call(call: str) -> tuple:
