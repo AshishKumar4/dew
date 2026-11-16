@@ -136,7 +136,6 @@ CASES = (
     ('sm90', 'flash', '64', 'mha', 'causal', 'bfloat16'),
     ('sm90', 'triton', '128', 'gqa-8-2', 'full', 'float32'),
     ('sm80', 'flash', '256', 'gqa-8-2', 'documents', 'float16'),
-    ('v5e', 'template', '64', 'mha', 'full', 'float16'),
     ('sm80', 'cudnn', '128', 'mha', 'documents', 'bfloat16'),
     ('v5e', 'inference', '256', 'mha', 'causal', 'float32'),
     ('v5e', 'tpu', '64', 'gqa-8-2', 'documents', 'bfloat16'),
@@ -146,13 +145,15 @@ CASES = (
     ('sm90', 'inference', '64', 'gqa-8-2', 'documents', 'bfloat16'),
     ('sm80', 'template', '128', 'mha', 'documents', 'float32'),
     ('sm80', 'inference', '128', 'mha', 'full', 'float16'),
-    ('v5e', 'tpu', '128', 'mha', 'causal', 'float16'),
     ('v5e', 'tpu', '256', 'mha', 'full', 'float32'),
     ('sm90', 'flash', '128', 'mha', 'full', 'bfloat16'),
     ('sm90', 'triton', '256', 'mha', 'causal', 'bfloat16'),
     ('sm90', 'cudnn', '64', 'mha', 'full', 'bfloat16'),
     ('sm90', 'cudnn', '256', 'mha', 'causal', 'bfloat16'),
     ('sm90', 'template', '64', 'mha', 'causal', 'bfloat16'),
+    ('v5e', 'tpu', '128', 'mha', 'causal', 'bfloat16'),
+    ('sm90', 'template', '64', 'mha', 'causal', 'float16'),
+    ('v5e', 'template', '64', 'mha', 'causal', 'bfloat16'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the op serves
 (`kernel_matrix.covering("attention_kernels")`, regenerated where the axes or the op's support change)."""
