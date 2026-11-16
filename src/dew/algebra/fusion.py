@@ -424,9 +424,8 @@ def _decided(identity: Hashable, decide: Callable[[], bool]) -> bool:
 def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
     """Whether the region is fused (`fused_gemm.analysis`): its product's launch the template's (its
     selector's choice, or a call's, `generation.chosen`), its prologue and epilogue the kernel's, nothing
-    refused, and
-    its fused seconds less than its unfused ones. The prices are a roofline on the part's rates (each
-    stage's units overlapped, plus the fixed launch), not the derived tile's walk: on a cell where the
+    refused, and its fused seconds less than its unfused ones. The prices are a roofline on the part's rates
+    (each stage's units overlapped, plus the fixed launch), not the derived tile's walk: on a cell where the
     launch measured slower than XLA's dot (`grouped_matmul.DECLARED`, every dense cell: DENSE1, 1.05 to 2.9
     times XLA's) they favour fusion more than measurement does, so a region whose launch the selector gives
     XLA is never fused by price alone; a call naming the template (an A/B's arm) fuses it."""
@@ -437,14 +436,15 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
     with jax.enable_x64(new_val=wide):
         found = fused_gemm.analysis(_replayed(jaxpr, region, fused_gemm), *inputs)
     routes = [found.launch, *([found.prologue] if region.prologue else [])]
-    if found.epilogue is None:
-        # No epilogue to weigh (a bare product, a kernel gradient's): its launch's selector decides alone,
-        # and its prologue's where it has one.
+    if found.epilogue is None and not region.prologue:
+        # No stage to weigh (a bare product, a kernel gradient's): its launch's selector decides alone.
         return all(route is not None and route.refusal is None and route.kernel != "xla" for route in routes)
     # A prologue the template refuses (a row normalized from float32 to bfloat16, `dtype_changes`) is no
-    # region's: the region without it is weighed instead (`fused_program`).
-    taken = all(route is not None and route.refusal is None and route.kernel != "xla"
-                for route in (*routes, found.epilogue))
+    # region's: the region without it is weighed instead (`fused_program`). Each stage it holds is weighed by
+    # price, a prologue's as an epilogue's (`fused_gemm.priced`: the operand formed in the launch, not
+    # written whole and read back).
+    stages = (*routes, *([found.epilogue] if found.epilogue is not None else []))
+    taken = all(route is not None and route.refusal is None and route.kernel != "xla" for route in stages)
     return (taken and found.fused_seconds is not None and found.unfused_seconds is not None
             and found.fused_seconds < found.unfused_seconds)
 

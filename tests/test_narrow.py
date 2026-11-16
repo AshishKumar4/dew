@@ -539,6 +539,7 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
 
     from dew.data.dataset import Loader
     from dew.distributed.placement import placed_bytes
+    from dew.nn.kernels import options
     from dew.telemetry.compiles import Compiles
     from dew.training import Layout, MeshSpec, Trainer
 
@@ -586,6 +587,8 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     grown = {"bytes_limit": state + with_copies + state // 2, "bytes_in_use": 0, "pool_bytes": state,
              "largest_free_block_bytes": state // 2}
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: grown)
+    # A fresh run's process, holding no executable of the runs above.
+    options.unhold()
     run, _ = built()
     with chosen(narrow_copies='on'), Compiles("step") as steps:
         run.fit(stream, steps=2)
