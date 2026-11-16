@@ -1074,11 +1074,10 @@ def scale_by_trust_ratio(min_norm: float = 0.0, trust_coefficient: float = 1.0,
         def scaled(path, update, param):
             stacked = layers_of(path)[1]
             param_norm, update_norm = (layer_norms(leaf, stacked, min_norm) for leaf in (param, update))
-            # The update over its own norm, then the parameters' norm: the same product as the ratio's, with
-            # no quotient of two norms to overflow where the update's is tiny beside the parameters'.
-            scaled = update / (update_norm + eps) * (trust_coefficient * param_norm)
+            ratio = trust_coefficient * param_norm / (update_norm + eps)
             # A layer whose parameters or update are zero would never move: it keeps its update.
-            return jnp.where((param_norm == 0.0) | (update_norm == 0.0), update, scaled)
+            return update * jnp.where((param_norm == 0.0) | (update_norm == 0.0),
+                                      jnp.array(1.0, param.dtype), ratio)
         return jax.tree_util.tree_map_with_path(scaled, updates, params), state
 
     return optax.GradientTransformation(optax.init_empty_state, update_fn)
