@@ -181,6 +181,7 @@ class Objective()  [dew.objectives.base]
   .row_moments(values: jax.Array, batch: Batch, axis: int | tuple[int, ...], *, rows: int | tuple[int, ...] = 0) -> tuple[jax.Array, jax.Array]  [staticmethod]
   .row_tokens(self, batch: Batch) -> int | None
   .row_weights(batch: Batch, rows: int) -> jax.Array  [staticmethod]
+  .run_tokenizer(self) -> Tokenizer | None
   .scalar_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]
   .scalars: property -> TrainingScalars[Loss, Effects]
   .scored_tokens(self, batch: Batch) -> np.ndarray
@@ -283,6 +284,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .row_moments(values: jax.Array, batch: Batch, axis: int | tuple[int, ...], *, rows: int | tuple[int, ...] = 0) -> tuple[jax.Array, jax.Array]  [staticmethod]
   .row_tokens(self, batch: Batch) -> int | None
   .row_weights(batch: Batch, rows: int) -> jax.Array  [staticmethod]
+  .run_tokenizer(self) -> Tokenizer | None
   .scalar_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]
   .scalars: property -> TrainingScalars[Loss, Effects]
   .scored_tokens(self, batch: Batch) -> np.ndarray
