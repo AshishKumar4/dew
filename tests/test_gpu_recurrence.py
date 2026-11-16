@@ -159,8 +159,7 @@ def the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed():
     operands = fused_inputs(layer, variables, cache, token)
     load = jnp.ones((8192, 8192), jnp.bfloat16)
     busy = jax.jit(lambda a: a @ a)
-    run = jax.jit(functools.partial(fused_step, epsilon=layer.norm_eps, activation=layer.gate_activation,
-                                    dtype=jnp.bfloat16))
+    run = jax.jit(functools.partial(fused_step, layer._fused_hooks(layer.dtype), dtype=jnp.bfloat16))
     first = jax.tree.map(np.asarray, run(*operands))
     for repeat in range(20):
         if repeat % 2:

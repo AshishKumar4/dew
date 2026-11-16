@@ -75,9 +75,14 @@ class Gates:
 @dataclasses.dataclass(frozen=True)
 class OutputNorm:
     """The epilogue's gated RMS norm of a head's output: `rms_norm(o) weight act(z)`, the norm in fp32
-    with `epsilon`, `activation` the gate's ('silu' or 'sigmoid')."""
+    with `epsilon`, `activation` the gate's ('silu' or 'sigmoid'), the output first read back in `read_in`
+    where it names a dtype: the one the layer's input projection computes in, where its reference casts
+    the scan's output before its norm (`dew.nn.linear.as_projected`; transformers' Qwen3-Next and Kimi
+    `.to(query.dtype)`), as the layer's unfused token does. Normalized unrounded, a fused bf16 token sat
+    nearer float64 than its reference and apart from the layer's own unfused token (row 6963)."""
     epsilon: float
     activation: str = 'silu'
+    read_in: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -423,6 +428,8 @@ def normed(hooks: Hooks, out, given: dict, work):
     """An output `[..., Hv, Dv]` in `work` through the epilogue's gated RMS norm where the hooks have one."""
     if hooks.output is None:
         return out
+    if hooks.output.read_in is not None:
+        out = out.astype(hooks.output.read_in).astype(work)
     return gated_rms(out, given['z'].astype(work), given['weight'].astype(work), hooks.output)
 
 
