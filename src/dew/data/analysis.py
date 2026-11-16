@@ -1170,19 +1170,20 @@ def _checked(
             if refused is not None:
                 raise ValueError(f"cache prefix in {name} must hold deterministic record steps and views of "
                                  f"the inputs: {refused}")
-            processes = [_identity(step).name for step in prefix
-                         if isinstance(step, (Map, FlatMap)) and step.pool == "processes"]
-            if processes and read != "streamed":
-                raise ValueError(f"cache prefix in {name} holds {processes} on processes, and a {read} read "
-                                 "fills its cache in its reading process, which writes each input as its "
-                                 "steps make it; run them on threads (pool='threads'), or read streamed")
+            declared = [_identity(step).name for step in prefix
+                        if isinstance(step, (Map, FlatMap)) and step.pool is not None]
+            if declared:
+                raise ValueError(f"cache prefix in {name} holds {declared} on pools of their own, and a cache "
+                                 "fills in its reading process, writing each input as its steps make it; "
+                                 "declare the pool after the cache, or no pool")
         laid = laid or (read == "memory" and cuts((stage,)) and examples_bound((*ran, *prefix)) is not None)
         if (isinstance(stage, Shuffle) and stage.window is None and stage.streamed is None and not indexed
                 and not promotion and not laid):
             raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window= or streamed=")
         if isinstance(stage, Slice) and not indexed and not promotion:
             raise ValueError(f"{type(stage).__name__} in {name} needs an indexed pipeline")
-        # A stage on a pool of its own hands its records on as its pool makes them: a stream, cut per share.
+        # A stage on a pool of its own hands its records on as its pool makes them: a stream, cut per
+        # share.
         on_pool = pooled(stage) and index >= eager
         streams = isinstance(stage, (Interleave, Workers, BatchStage, TokenBudget)) or (
             _drops(stage) and index >= eager

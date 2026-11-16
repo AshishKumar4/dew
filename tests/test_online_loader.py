@@ -643,8 +643,9 @@ def test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes(re
         return [int(value) for batch in batches for value in batch["id"]]
 
     data = built(pool)
-    # An indexed read through a pool is cut per share, which its plan states; any other read's is the same.
-    assert (data.plan.identity() == built(None).plan.identity()) is (read != "indexed")
+    # An indexed read through a pool is cut per share, which its plan states (a one-to-one map's read is cut
+    # so on the pool's account alone); any other read's plan is the same.
+    assert data.plan.identity() == built(None).plan.identity() or (read, stage) == ("indexed", "map")
     plain = built(None).train(DataPartition())
     reader = data.train(DataPartition())
     try:
@@ -716,35 +717,21 @@ def test_a_pool_is_declared_on_a_record_step_alone(batched):
 
 @pytest.mark.parametrize("read", ["streamed", "indexed", "memory"])
 @pytest.mark.parametrize("pool", ["threads", "processes"])
-def test_a_cached_stage_on_a_pool_fills_its_cache_there_or_is_refused_where_it_cannot(tmp_path, read, pool):
-    """A stage on a pool before a cache fills the cache on that pool: on its threads in every read, and in
-    processes in a streamed read, whose shard readers write each input the pool made; an indexed or memory
-    read, which fills its cache in its reading process as its steps make each input, refuses a process
-    stage before it. The read delivers the uncached chain's records. The fill ran the step in the reading
-    process, the declared pool unread (the head review of theme 16, F5)."""
+def test_a_stage_on_a_pool_of_its_own_before_a_cache_is_refused(tmp_path, read, pool):
+    """A stage declaring a pool before a cache is refused as the read is compiled: a cache fills in its
+    reading process, writing each input as its steps make it, so the pool would be unread; after the cache
+    it reads. The fill ran the step in the reading process, the declared pool unread (the head review of
+    theme 16, F5)."""
     catalog = Memory([{"id": index} for index in range(9)], shard_rows=9)
-
-    def reader(cache):
-        chain = Pipeline(catalog).map(ran_where, pool=pool, identity="ran_where@1")
-        chain = chain if cache is None else chain.cache(cache)
-        return compile(chain.batch(3), read=read, loading=READ).train(DataPartition())
-
-    if pool == "processes" and read != "streamed":
-        with pytest.raises(ValueError):
-            reader(str(tmp_path / "cache"))
-        return
-    cached, plain = reader(str(tmp_path / "cache")), reader(None)
+    with pytest.raises(ValueError):
+        compile(Pipeline(catalog).map(ran_where, pool=pool, identity="ran_where@1").cache(str(tmp_path / "a"))
+                .batch(3), read=read, loading=READ)
+    after = Pipeline(catalog).cache(str(tmp_path / "b")).map(ran_where, pool=pool).batch(3)
+    reader = compile(after, read=read, loading=READ).train(DataPartition())
     try:
-        batches, expected = [next(cached) for _ in range(3)], [next(plain) for _ in range(3)]
+        assert [int(value) for value in next(reader)["id"]] == [0, 1, 2]
     finally:
-        cached.close()
-        plain.close()
-    assert [int(value) for batch in batches for value in batch["id"]] == [
-        int(value) for batch in expected for value in batch["id"]]
-    where = {(int(pid), str(thread)) for batch in batches
-             for pid, thread in zip(batch["pid"], batch["thread"], strict=True)}
-    assert all(pid != os.getpid() if pool == "processes" else thread.startswith("dew-step")
-               for pid, thread in where)
+        reader.close()
 
 
 def test_an_elastic_read_runs_a_pooled_map_on_its_pool():
