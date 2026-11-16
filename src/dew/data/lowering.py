@@ -85,16 +85,7 @@ from dew.data.handoff import (
     draws_after_expansion,
     record_stage_of,
 )
-from dew.data.mixing import (
-    Accepted,
-    Chunked,
-    CorpusCounts,
-    KeyedMix,
-    TokenDeficit,
-    mix_end,
-    mixed_indexed,
-    rewound,
-)
+from dew.data.mixing import Accepted, Chunked, CorpusCounts, KeyedMix, TokenDeficit, mixed_indexed, rewound
 from dew.data.ordering import Skipping, place_of
 from dew.data.packing import packed_documents
 from dew.data.pipeline import (
@@ -1443,27 +1434,7 @@ class _Build:
                 labels=[_label(child) for child in source.pipelines],
                 stamped=self.stamped,
             )
-        # Its end is its indexed read's where every member's length is known, in one order (`mix_end`).
-        lengths = [self.member_records(child, index) for index, child in enumerate(children(pipeline))]
-        known = [length for length in lengths if length is not None]
-        end = mix_end(known, source) if partition.count == 1 and len(known) == len(lengths) else None
-        return KeyedMix(streams, source.weights, keys, source.seed, stamped=self.stamped, end=end)
-
-    def member_records(self, member: Pipeline, index: int) -> int | None:
-        """The records the `index`th member of a mix, `member`, reads before it ends (`dew.data.epochs`), one
-        held in memory and read on nowhere; None otherwise, which ends its mix at its first failed pull."""
-        analyzed = self.lowering.children[index]
-        if (isinstance(member.source, Combined) or not _in_memory(member.source) or analyzed.unending
-                or any(isinstance(stage, Repeat) for stage in member.stages)):
-            return None
-        from dew.data.epochs import held_records
-
-        child = self.child(index)
-        # Counted by index in one order, as an epoch is, whatever order the member is read in.
-        counting = dataclasses.replace(child, read="indexed", training=False,
-                                       lowering=dataclasses.replace(child.lowering, per_share=False),
-                                       loading=dataclasses.replace(self.loading, workers=0))
-        return held_records(member, counting)
+        return KeyedMix(streams, source.weights, keys, source.seed, stamped=self.stamped)
 
     def counted_members(self, pipeline: Pipeline) -> tuple[tuple[str, str, str], ...]:
         """The members of `pipeline`'s mixture, each's key (`_member_keys`), name and label, where a read
