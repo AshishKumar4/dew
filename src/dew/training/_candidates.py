@@ -102,7 +102,7 @@ class StepSettings[LossT, EffectsT]:
     state_mesh: Mesh
     reads_all: bool = True
     """Whether every update its steps take is read finite: its optimizer is no build of Dew's
-    (`dew.optim.Bounded`), whose bound Dew cannot read (`Transaction.reads_all`)."""
+    (`dew.optim.DewBuilt`), whose bound Dew cannot read (`Transaction.reads_all`)."""
 
     @property
     def optimizer(self) -> optax.GradientTransformation:

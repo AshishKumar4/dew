@@ -827,7 +827,7 @@ def test_an_update_of_a_transformation_dew_did_not_build_is_read():
     np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), before[0]["params"]["w"])
 
 
-class Scaled(Pushed):
+class ScaledAfter(Pushed):
     """`Pushed`, its optimizer the one it is handed with a scale of 1e38 chained after it: a composition of
     the user's, whose bound Dew cannot read."""
 
@@ -835,7 +835,7 @@ class Scaled(Pushed):
         return optax.chain(tx, optax.scale(1e38))
 
 
-class Clamped(Pushed):
+class ClampedOutside(Pushed):
     """`Pushed`, its weight starting at 2, outside the [0, 1] its param group clamps it to."""
 
     def fresh_variables(self, key, held):
@@ -851,7 +851,8 @@ def test_a_rejected_steps_weights_are_kept_by_its_post_step_effects_and_its_comp
     infinite weight, and the clamp acted on a rejected step's weights (the round-3 head review's F6, F7)."""
     from dew.optim import ParamGroup
 
-    trainer = Trainer(Scaled(), OptimConfig(optimizer="adam", learning_rate=10.0), key=jax.random.PRNGKey(0))
+    trainer = Trainer(ScaledAfter(), OptimConfig(optimizer="adam", learning_rate=10.0),
+                      key=jax.random.PRNGKey(0))
     trainer.scheduled(1)
     state = trainer.initial_state()
     batch = next(type("Fed", (Inputs,), {"value": 1.0})())
@@ -859,7 +860,7 @@ def test_a_rejected_steps_weights_are_kept_by_its_post_step_effects_and_its_comp
     assert not bool(finite) and np.all(np.asarray(advanced.variables["params"]["w"]) == 0)
     clamped = OptimConfig(optimizer="adam", learning_rate=1e-3,
                           param_groups=(ParamGroup("all", ("*",), bounds=(0.0, 1.0)),))
-    trainer = Trainer(Clamped(), clamped, key=jax.random.PRNGKey(0))
+    trainer = Trainer(ClampedOutside(), clamped, key=jax.random.PRNGKey(0))
     trainer.scheduled(1)
     state = trainer.initial_state()
     batch = next(type("Fed", (Inputs,), {"value": np.nan})())

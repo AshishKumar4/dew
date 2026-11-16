@@ -1743,7 +1743,7 @@ class UpdatesRead(NamedTuple):
     inner: optax.OptState
 
 
-class Bounded(optax.GradientTransformationExtraArgs):
+class DewBuilt(optax.GradientTransformationExtraArgs):
     """A transformation `OptimConfig.build` made, which decides as its state is made whether a step reads its
     update (`bounded_updates`); a run reads every update of a transformation of any other making."""
 
@@ -1768,7 +1768,7 @@ def parameter_bound(dtype) -> float:
     return float(jnp.finfo(dtype).max) / 2
 
 
-def bounded_updates(solver: optax.GradientTransformation, bounds: LeafBounds, peak: float) -> Bounded:
+def bounded_updates(solver: optax.GradientTransformation, bounds: LeafBounds, peak: float) -> DewBuilt:
     """`solver`, its state marked read (`UpdatesRead`) unless every floating parameter's update bound
     (`bounds`, a unit-rate update's largest magnitude from a gradient within `MAGNITUDE_BOUND` and a
     parameter whose norm is within `parameter_bound`, by leaf, None where none is stated) times the largest
@@ -1792,7 +1792,7 @@ def bounded_updates(solver: optax.GradientTransformation, bounds: LeafBounds, pe
             moved, inner = solver.update(updates, state.inner, params, **extra_args)
             return moved, UpdatesRead(inner)
         return solver.update(updates, state, params, **extra_args)
-    return Bounded(init, update)
+    return DewBuilt(init, update)
 
 
 def spectral_bound(coefficients: np.ndarray) -> float:
@@ -1827,7 +1827,7 @@ def unbounded(params: optax.Params) -> list[float | None]:
     return [None] * len(jax.tree.leaves(params))
 
 
-def solved(params: optax.Params) -> list[float | None]:
+def solve_bounds(params: optax.Params) -> list[float | None]:
     """A Gauss-Newton solve's leaves, whose update a step reads finite as it is formed whatever its bound
     (`dew.gauss_newton.solves_equations`): none is past a bound of zero beyond that read, so its state is
     never marked read (`UpdatesRead`) and stays the solver's own, as runs saved before the mark hold it."""
@@ -1839,7 +1839,7 @@ def update_bounds(optimizer: Optimizer | str, opts: Mapping[str, object], *, qua
     """Each parameter's bound on the unit-rate update `optimizer` forms from a gradient within
     `MAGNITUDE_BOUND` and a parameter within `parameter_bound`, by leaf of the parameters it is handed, from
     its constants `opts` over its factory's defaults (`bounded_updates`); None for a factory Dew does not
-    build, whose bound it cannot read. A Gauss-Newton solve's are `solved`'s, its update read as it is
+    build, whose bound it cannot read. A Gauss-Newton solve's are `solve_bounds`'s, its update read as it is
     formed whatever its bound. A param group's own decay (`decays`) is bounded as the largest any group steps
     with. Moments stored in 8 bits (`quantized`, `dew._moments.int8_moments`) may hold
     a second moment of zero beside a first that is not, which only the guard bounds.
@@ -1861,7 +1861,7 @@ def update_bounds(optimizer: Optimizer | str, opts: Mapping[str, object], *, qua
     if decays and isinstance(values.get('weight_decay'), int | float):
         values['weight_decay'] = max(float(values['weight_decay']), *decays)
     if make is gauss_newton:
-        return solved
+        return solve_bounds
     if make is _muon_groups:
         return _muon_bounds(values, quantized)
     decay = values.get('weight_decay', 0.0)

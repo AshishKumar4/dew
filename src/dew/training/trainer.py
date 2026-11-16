@@ -82,7 +82,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import STACKED_OPTIMIZERS, Bounded, declaring, with_bounds
+from dew.optim import STACKED_OPTIMIZERS, DewBuilt, declaring, with_bounds
 from dew.optim_schedules import (
     ScheduleBase,
     held_rates,
@@ -268,11 +268,11 @@ def signature_digest(signature: Hashable) -> str:
 def reads_every_update(objective: Objective[Loss, Effects], built: optax.GradientTransformation,
                        composed: optax.GradientTransformation) -> bool:
     """Whether a run's steps read every update (`Transaction.reads_all`) of `composed`, the optimizer
-    `objective` made of `built` (`Objective.optimizer`): unless Dew built it (`dew.optim.Bounded`, whose
+    `objective` made of `built` (`Objective.optimizer`): unless Dew built it (`dew.optim.DewBuilt`, whose
     state says where its bound fails) and the objective handed it back as it is, or composed it in Dew's own
     code (a copy a network over `optax.multi_transform`, each leaf's update a copy's or none); a
     composition of a user's (a scale chained after it) has a bound Dew cannot read."""
-    if not isinstance(built, Bounded):
+    if not isinstance(built, DewBuilt):
         return True
     return composed is not built and not type(objective).optimizer.__module__.startswith("dew.")
 

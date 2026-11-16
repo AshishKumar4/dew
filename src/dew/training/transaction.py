@@ -417,7 +417,7 @@ def _held_in_copies(opt_state, params) -> bool:
     return all(np.ndim(leaf) == 0 for leaf in jax.tree.leaves(rest))
 
 
-def rated(opt_state) -> jax.Array:
+def rates_finite(opt_state) -> jax.Array:
     """Whether every learning rate `opt_state` holds is finite (`learning_rates`, one scalar each): the rates
     its next update takes, which an injected solver reports until that update (`dew.optim_schedules`)."""
     finite = jnp.asarray(a=True)
@@ -538,8 +538,8 @@ class _Planned:
     plan: in_backward.InBackward
     read: dict[str, Variables]
     rated: jax.Array
-    """Whether every learning rate the step's update takes is finite (`rated`), read before the backward:
-    the walk holds every layer where one is not, each taking the zero gradient's update."""
+    """Whether every learning rate the step's update takes is finite (`rates_finite`), read before the
+    backward: the walk holds every layer where one is not, each taking the zero gradient's update."""
 
 
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
@@ -871,7 +871,7 @@ class Transaction:
         """
         self.resting = dict(resting or {})
         self.placed = placed
-        # Whether every update is read finite (`_reads`): an optimizer Dew did not build (`optim.Bounded`).
+        # Whether every update is read finite (`_reads`): an optimizer Dew did not build (`optim.DewBuilt`).
         self.reads_all = reads_all
         self.record = record
         # What a sampled step summarizes at its commit (`Committed.inspected`); None in every other step.
@@ -1115,11 +1115,11 @@ class Transaction:
 
     def _rated(self, opt_state) -> jax.Array:
         """Whether the learning rates a step's update takes are finite, read from `opt_state` before it is
-        formed (`rated`) where Dew built its optimizer, whose injected solvers report the rate their next
-        update takes (`dew.optim_schedules.stepped_rate`); a transformation Dew did not build may report the
-        rate its last update took (Optax's injected schedule), so its rates are read with its update
-        (`_read_ahead`), every one of which it reads."""
-        return jnp.asarray(a=True) if self.reads_all else rated(opt_state)
+        formed (`rates_finite`) where Dew built its optimizer, whose injected solvers report the rate their
+        next update takes (`dew.optim_schedules.stepped_rate`); a transformation Dew did not build may
+        report the rate its last update took (Optax's injected schedule), so its rates are read with its
+        update (`_read_ahead`), every one of which it reads."""
+        return jnp.asarray(a=True) if self.reads_all else rates_finite(opt_state)
 
     def _read_ahead(self, inputs: tuple, qk, statistics, progress, applied: Applied | None) -> jax.Array:
         """Whether the update a step's `inputs` (its gradient, its optimizer's state and the parameters) form
@@ -1201,7 +1201,7 @@ class Transaction:
             # What bounded inputs leave open, each read before the update is formed from them, so a step
             # it rejects forms its update and its optimizer's step from the zero gradient, as one whose
             # inputs are not finite does (training.md, a step that is not finite): the rates the update
-            # takes (an injected one a user set infinite, `rated`), and its update where Dew states no
+            # takes (an injected one a user set infinite, `_rated`), and its update where Dew states no
             # bound covering it (`_read_ahead`). A solve's direction is read as it is formed (`_formed`).
             # A scaled step's acceptance reads its whole new state instead (`finish_attempt`).
             taken, (gradient, before, stored) = jnp.asarray(a=True), (native, current.opt_state, stored)

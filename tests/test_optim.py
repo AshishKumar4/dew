@@ -1952,21 +1952,21 @@ def test_a_built_optimizer_reads_its_update_only_where_its_bound_cannot_cover_a_
     read it, and no configuration is refused. Main refused a guard of zero at build and took every other
     update unread (the round-2 head review's F6), and the round-3 review's F2 to F5 found bounds a coupled
     decay, LAMB's trust ratio and a flushed guard broke."""
-    from dew.optim import Bounded, reads_updates
+    from dew.optim import DewBuilt, reads_updates
 
     params = {"w": jnp.zeros((8, 4), dtype), "b": jnp.zeros((4,), dtype)}
     built = config.build(100)
     state = built.init(params)
-    assert isinstance(built, Bounded) and reads_updates(state) is reads
+    assert isinstance(built, DewBuilt) and reads_updates(state) is reads
 
 
 def test_an_optax_factory_a_config_names_is_no_build_of_dews():
     """A config naming an Optax factory (`optax:sgd`) builds that factory's transformation, no build of Dew's
-    (`dew.optim.Bounded`), whose bound Dew cannot read: a run reads its every update
+    (`dew.optim.DewBuilt`), whose bound Dew cannot read: a run reads its every update
     (`Transaction.reads_all`)."""
-    from dew.optim import Bounded
+    from dew.optim import DewBuilt
 
-    assert not isinstance(OptimConfig(optimizer="optax:sgd", learning_rate=1e-3).build(10), Bounded)
+    assert not isinstance(OptimConfig(optimizer="optax:sgd", learning_rate=1e-3).build(10), DewBuilt)
 
 
 def test_newton_schulz_leaves_no_singular_value_past_its_spectral_bound():

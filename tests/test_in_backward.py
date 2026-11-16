@@ -372,7 +372,7 @@ def test_a_scanned_step_at_a_learning_rate_that_is_not_finite_moves_no_weight():
         np.testing.assert_array_equal(new, old)
 
 
-class Counted(LMObjective):
+class CollectionWriting(LMObjective):
     """The language model's loss beside a collection its forward writes: the exponential of its first
     token id's mean times `scale`, past float32 where `scale` is large, its loss and gradient finite."""
 
@@ -394,7 +394,7 @@ def test_a_scanned_step_whose_collection_is_not_finite_moves_no_weight():
     runs nor any other, and is reported not finite: the walk reads the forward's statistics and collections
     as the commit does. It read the loss alone, and its layers moved where the commit rejected the step (the
     round-3 head review's F1)."""
-    objective = type("Overflowing", (Counted,), {"scale": 1e4})(decoder(scan=True), SEQ)
+    objective = type("Overflowing", (CollectionWriting,), {"scale": 1e4})(decoder(scan=True), SEQ)
     run = Trainer(objective, ADAMW, key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
                   layout=Layout(min_shard=TINY_SHARD), checkpoints=None, tracker=None)
     run.device_mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
