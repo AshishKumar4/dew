@@ -135,7 +135,9 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "a logit near fp32's largest at scale 1/4": 8, "values near fp32's largest over 2 equal keys": 8,
          "values near fp32's largest over 64 equal keys": 8,
          "values near fp32's largest over 256 equal keys": 8,
-         "values near fp32's largest over 2 equal keys, bfloat16": 8, "one key": 8, "a sink and one key": 64,
+         "values near fp32's largest over 2 equal keys, bfloat16": 8,
+         "values at fp32's largest over 2 equal keys": 8, "values at fp32's largest over 256 equal keys": 8,
+         "one key": 8, "a sink and one key": 64,
          "a sink near fp32's largest and one key": 8, "a sink and one key, its logit near fp32's largest": 8,
          "a sink near fp32's largest at scale 1/4": 8, "logits near 1e4": 32, "logits near 1e30": 8,
          "a small weight on a large value, float32": 128, "a small weight on a large value, bfloat16": 256,
@@ -441,17 +443,30 @@ def _near_max_logit(width: int):
     return draw
 
 
-def _large_values(keys: int, top: float = 3.4e38):
-    # Equal logits over values drawn within a few percent of fp32's largest (to `top`, bf16's below its
-    # largest), one sign: the sum of the weighted values passes fp32's largest where the reference's
-    # normalized one does not. The cotangent is drawn times 2^-8, so the cotangent's product with the
-    # values stays finite in the reference's backward too.
+def _large_values(keys: int, top: float = 3.4e38, bottom: float | None = None, *, at_limit: bool = False):
+    # Equal logits over values drawn within a few percent of fp32's largest (from `bottom` to `top`, bf16's
+    # below its largest), one sign: the sum of the weighted values passes fp32's largest where the
+    # reference's normalized one does not. `at_limit` draws fp32's largest and the float below it into every
+    # row's first two columns, their output a value there (row 6842: a walk forming its operands' parts or
+    # its sums largest first passed it). The cotangent is drawn times 2^-8, so the cotangent's product with
+    # the values stays finite in the reference's backward too.
+    low = 3.0e38 * top / 3.4e38 if bottom is None else bottom
+
     def draw(seed):
-        value = _uniform(seed, 3.0e38 * top / 3.4e38, top, (ROWS, keys, 1, 16))
+        value = _uniform(seed, low, top, (ROWS, keys, 1, 16))
+        if at_limit:
+            value = value.copy()
+            value[:, :, 0, 0] = np.finfo(np.float32).max
+            value[:, :, 0, 1] = np.nextafter(np.finfo(np.float32).max, np.float32(0))
         (dout,) = _normal(seed + 1, (ROWS, 1, 1, 16))
         return (np.zeros((ROWS, 1, 1, 16), np.float32), np.zeros((ROWS, keys, 1, 16), np.float32), value,
                 None, dout * np.float32(2.0 ** -8))
     return draw
+
+
+def _at_the_limit(keys: int):
+    # Values in fp32's top binade's last 0.08%, [3.4e38, its largest], and the limit itself (`_large_values`).
+    return _large_values(keys, float(np.finfo(np.float32).max), 3.4e38, at_limit=True)
 
 
 def _drawn(queries, keys, width=16, rows=ROWS, size=1.0, heads=2):
@@ -657,17 +672,6 @@ def _families() -> dict[str, Family]:
         # Folded at scale 1/4, the backward takes the base-2 maximum back to natural units, which near fp32's
         # largest rounds the key's own weight away from 1, as at logits near 1e30.
         "a logit near fp32's largest at scale 1/4": Family(_near_max_logit(16), _kept(1, 1), folded=False),
-        "values near fp32's largest over 2 equal keys": Family(_large_values(2), _kept(1, 2), folded=False,
-                                                               overflows=True),
-        "values near fp32's largest over 64 equal keys": Family(_large_values(64), _kept(1, 64),
-                                                                folded=False, overflows=True),
-        # Eight key tiles of 32 (`PINS`, a decode step's `BLOCK`): a walk's chain of its tiles' sums errs past
-        # the reference's, which sums a row whole, unless the walk keeps their additions' roundings
-        # (`algebra.compensates`).
-        "values near fp32's largest over 256 equal keys": Family(_large_values(256), _kept(1, 256),
-                                                                 folded=False, overflows=True),
-        "values near fp32's largest over 2 equal keys, bfloat16": Family(
-            _large_values(2, top=3.3e38), _kept(1, 2), folded=False, overflows=True, dtype="bfloat16"),
         # A key at its row's maximum weighs 1 exactly in the accurate form; the fold's contracted weight is
         # 1 within an ulp of its logit's exponent.
         "one key": Family(_drawn(4, 1), _kept(4, 1), folded=False),
@@ -752,7 +756,29 @@ def _families() -> dict[str, Family]:
             dtype=dtype, drawn_in=lambda dtype: functools.partial(_separated_rows, dtype=dtype))
            for dtype in ("float32", "bfloat16")},
     }
-    return {**families, **_structured_families()}
+    return {**families, **_large_value_families(), **_structured_families()}
+
+
+def _large_value_families() -> dict[str, Family]:
+    """The families of equal logits over values near fp32's largest (`_families`'), whose weighted sums pass
+    it where the reference's normalized mean does not: to 3.4e38, and at fp32's limit itself."""
+    return {
+        "values near fp32's largest over 2 equal keys": Family(_large_values(2), _kept(1, 2), folded=False,
+                                                               overflows=True),
+        "values near fp32's largest over 64 equal keys": Family(_large_values(64), _kept(1, 64),
+                                                                folded=False, overflows=True),
+        # Eight key tiles of 32 (`PINS`, a decode step's `BLOCK`): a walk's chain of its tiles' sums errs past
+        # the reference's, which sums a row whole, unless the walk keeps their additions' roundings
+        # (`algebra.compensates`).
+        "values near fp32's largest over 256 equal keys": Family(_large_values(256), _kept(1, 256),
+                                                                 folded=False, overflows=True),
+        "values near fp32's largest over 2 equal keys, bfloat16": Family(
+            _large_values(2, top=3.3e38), _kept(1, 2), folded=False, overflows=True, dtype="bfloat16"),
+        "values at fp32's largest over 2 equal keys": Family(_at_the_limit(2), _kept(1, 2), folded=False,
+                                                             overflows=True),
+        "values at fp32's largest over 256 equal keys": Family(_at_the_limit(256), _kept(1, 256),
+                                                               folded=False, overflows=True),
+    }
 
 
 def _structured_families() -> dict[str, Family]:
@@ -1094,6 +1120,26 @@ def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
     (`algebra.SCALED_WALK`) and under the fold's guard (`algebra.walked`), finite in the default form over
     every family (`default_is_finite`)."""
     default_is_finite(family, "portable")
+
+
+@pytest.mark.skipif(not INTERPRETED, reason="an H100 runs these families in `_mainloops`' Mosaic arms")
+@pytest.mark.parametrize("family", ["values at fp32's largest over 2 equal keys",
+                                    "values at fp32's largest over 256 equal keys"])
+def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_reference_interpreted(family):
+    """The Mosaic forward in fp32, interpreted on a CPU as an H100 runs it, over values at fp32's limit: check
+    1 over the family's draws, where it summed its operands' bf16 parts and its products' pairs largest first
+    and passed fp32's largest before the smaller terms took it back (inf over 2 keys already, row 6842). A
+    GPU runs it in `_mainloops`' Mosaic arms."""
+    seeds, family = SEEDS[family], FAMILIES[family]
+
+    def forward(query, key, value, extra):
+        with generation.assumed("sm90"):
+            spans = _spans(family, query, key)
+            return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
+
+    assert_as_exact(jax.jit(forward), as_given(jax.jit(_reference(family, anchored=False))),
+                    lambda seed: _cast(family, family.draw)(seed)[:4], "mosaic forward at fp32's limit",
+                    seeds=seeds, truth_fn=_reference(family, anchored=True))
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])

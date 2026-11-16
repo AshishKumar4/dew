@@ -1802,25 +1802,32 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     return _derived_merged(spec, stacked, axis)
 
 
-def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool) -> jax.Array:
+def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool, held: bool = False) -> jax.Array:
     """The weighted values `acc` over their denominator, any leading axes: zero for a query that saw nothing
     where it may (`guarded`: a walk's whose row may see none, or one from a state); a subnormal ratio kept
-    where the arithmetic flushes one (`quotient`)."""
+    where the arithmetic flushes one, and one past the values' largest held there where `held`
+    (`quotient`)."""
     if not guarded:
-        return quotient(lambda held: held / expand(denominator, held), acc, denominator)
+        return quotient(lambda sums: sums / expand(denominator, sums), acc, denominator, held=held)
     safe = jnp.where(denominator > 0, denominator, 1.0)
-    out = quotient(lambda held: held / expand(safe, held), acc, safe)
+    out = quotient(lambda sums: sums / expand(safe, sums), acc, safe, held=held)
     return jnp.where(expand(denominator > 0, acc), out, 0.0)
 
 
-def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax.Array) -> jax.Array:
+def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax.Array, *,
+             held: bool = False) -> jax.Array:
     """`ratio(acc)`, the weighted values `acc` `[..., Dv]` over their rows' `total` `[...]` as its caller
     divides them; where the arithmetic flushes a subnormal result (`bodies.subnormals`: XLA's CPU, per
     primitive, row 4023), each element whose quotient may fall below fp32's least normal divided raised to
     its row's total's binade (`dew.nn.precision.raised_exactly`, from its bits) and taken back in the one
     rounding of the correctly rounded division (`lowered_divide`): a subnormal one kept (row 6302); every
     other element's bits the plain ratio's. Wider sums (a float64 truth's) keep their subnormals as they
-    are."""
+    are. Where `held` (a call whose weights take no multiplier past 1: no dropout), a quotient of finite
+    sums is a mean of finite values, within their dtype's largest, so one past it is the sums' rounding,
+    held there by selection: a scaled row's sums of values at fp32's largest round up an ulp onto 2^127 at
+    a total of 1/2, its quotient 2^128 (row 6842); an infinite value's sum stays infinite, its quotient as
+    it is. A dropping call's kept weights take its multiplier past their denominator's, so its quotient may
+    pass the values' largest, as the reference's does."""
     def divided(*, flushing: bool) -> jax.Array:
         plain = ratio(acc)
         if not flushing:
@@ -1831,7 +1838,12 @@ def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax
         lifted = raised_exactly(acc, raised)
         return jnp.where(raised > 0, lowered_divide(lifted, divisor, raised), plain)
 
-    return bodies.subnormals(divided, acc.dtype)
+    out = bodies.subnormals(divided, acc.dtype)
+    if not held:
+        return out
+    largest = jnp.finfo(out.dtype).max
+    past = finite(acc) & (jnp.abs(out) > largest)
+    return jnp.where(past, jnp.where(out > 0, largest, -largest).astype(out.dtype), out)
 
 
 def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.Array, jax.Array]:
@@ -1849,19 +1861,21 @@ def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.
 
 
 def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable | None = None,
-           output_params: tuple[jax.Array, ...] = (), normalized: bool = False
+           output_params: tuple[jax.Array, ...] = (), normalized: bool = False, held: bool = False
            ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residual rows
     (`finished_rows`); the output is the derived forms' ratio (`_derived_output`), which a scaled walk's
     rows' scale leaves (both its sums are at it). A `normalized` state's sums are its output already (a
     merge of finished states, `finished_merged`): zero where it holds no mass. Where its arithmetic flushes
-    a subnormal result (XLA's CPU, `bodies.subnormals`), its ratio is `quotient`'s."""
+    a subnormal result (XLA's CPU, `bodies.subnormals`), its ratio is `quotient`'s, held at the values'
+    largest where `held` (a call taking no dropout)."""
     m, denominator = finished_rows(spec, state, initial=initial)
     if normalized:
         out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
     else:
-        out = quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)), state.acc, state.total)
+        out = quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)), state.acc, state.total,
+                       held=held)
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator
