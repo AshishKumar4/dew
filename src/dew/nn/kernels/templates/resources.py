@@ -428,8 +428,7 @@ def raise_ceiling() -> int:
     at one program, spilled a 64-bit address at a raise of 256 and none at any of 192 to 248
     (FS-LT-OUTPUT-CAPS1, its PTX otherwise the same)."""
     held = facts()
-    raises = held.raises()
-    return min(raises.highest, held.thread_registers // raises.step * raises.step)
+    return held.raises().below(held.thread_registers)
 
 
 def raised_registers(consumers: int, programs: int = 1, producer: int | None = None) -> int:
