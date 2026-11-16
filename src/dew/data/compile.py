@@ -2098,24 +2098,25 @@ class _Replayed:
     """A Grain iterator whose first element was read already (`native_loader`'s probe of the batch): it
     gives that element first, then reads on, its position the one before it until it is given."""
 
-    def __init__(self, source: pygrain.DatasetIterator, first, before):
-        self._source, self._first, self._before, self._pending = source, first, before, True
+    def __init__(self, source: pygrain.DatasetIterator, first: Batch, before):
+        # The element and the position before it, until given: then let go, so the stream holds no batch
+        # past the one it gives.
+        self._source, self._held = source, (first, before)
 
     def __iter__(self):
         return self
 
-    def __next__(self):
-        if self._pending:
-            # Given once, then let go: the stream holds no batch past the one it gives.
-            first, self._first, self._before, self._pending = self._first, None, None, False
+    def __next__(self) -> Batch:
+        if self._held is not None:
+            (first, _), self._held = self._held, None
             return first
         return next(self._source)
 
     def get_state(self):
-        return self._before if self._pending else self._source.get_state()
+        return self._source.get_state() if self._held is None else self._held[1]
 
     def set_state(self, state) -> None:
-        self._first, self._before, self._pending = None, None, False
+        self._held = None
         self._source.set_state(state)
 
     def close(self) -> None:
