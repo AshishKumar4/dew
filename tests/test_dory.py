@@ -714,11 +714,9 @@ EXAMPLES = [Example(state, {'team': INTENT}, {'team': label})
                                  ('double charge', 'billing'), ('cannot log in', 'technical'))]
 
 
-def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
-    """The joint schema head's lexical prior gathers the output table's rows: the head's matrix
-    rows times each token's logit gain, which contracted with the final states give Dory's logits.
-    Over the release's own tokenizer it trains a step that moves the head and the backbone, and
-    the saved run answers as the live one does (check 1: the two tasks are two programs)."""
+def test_dorys_vocabulary_rows_contracted_with_its_final_states_give_its_logits():
+    """The rows a joint schema head's lexical prior gathers (`output_table`): the head's matrix rows
+    times each token's logit gain, which contracted with the final states give Dory's logits."""
     loaded = load(max_seq_len=1024)
 
     def contracted(ids):
@@ -726,6 +724,15 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
         return loaded.model.apply(loaded.variables, ids, method='hidden_states') @ table.rows().T
 
     assert_logits_as_vllms(contracted, loaded, "Dory's vocabulary rows", stream=0xD05)
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=32)
+def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
+    """The joint schema head over Dory's vocabulary rows (`output_table`), over the release's own
+    tokenizer, trains a step that moves the head and the backbone, and the saved run answers as the live
+    one does (check 1: the two tasks are two programs), its draws in armada's map tasks of 32: whole,
+    with the rows' own check, CI took 109 to 181 s (mains 3e5b75d3c to 599a23f5d, row 5200)."""
+    loaded = load(max_seq_len=1024)
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
     objective = DecisionObjective(loaded, layout=JointLayout(max_len=1024), head=head)
     data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
