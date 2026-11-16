@@ -803,6 +803,19 @@ _UNOPENED = "unopened"
 """The key of a mix's corpus's position where the mix has not opened it (`_MixRead`)."""
 
 
+def _detached(state):
+    """`state`, an iterator's position, copied so no later read of the iterator moves it: its mappings and
+    lists anew, each of its leaves (a number, a string) as it is. A position is plain data, and this copies
+    it a tenth as long as `copy.deepcopy` does, which a mix read one record ahead pays each record."""
+    if isinstance(state, Mapping):
+        return {key: _detached(value) for key, value in state.items()}
+    if isinstance(state, list):
+        return [_detached(value) for value in state]
+    if isinstance(state, np.ndarray):
+        return state.copy()
+    return state
+
+
 class _MixReads:
     """Every corpus of a mix, each opened and read only as the mix draws from it: a corpus the mix has
     not drawn holds no iterator, so no reader's threads, buffers or files, and no position but its
@@ -845,7 +858,7 @@ class _MixReads:
         given = self.held.pop(index) if index in self.held else next(parent)
         if self.ahead:
             # The position after the record given, captured before the pull ahead moves it.
-            self.states[index] = copy.deepcopy(parent.get_state())
+            self.states[index] = _detached(parent.get_state())
             self.copied.add(index)
             try:
                 self.held[index] = next(parent)

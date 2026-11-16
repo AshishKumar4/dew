@@ -2418,3 +2418,22 @@ def test_a_streamed_training_read_of_a_mix_reads_each_member_on_without_end():
         assert [int(batch["id"][0]) for batch in itertools.islice(reader, 6)] == [0, 1, 1000, 2, 3, 1000]
     finally:
         reader.close()
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_mix_of_files_ends_after_its_first_exhausted_members_last_record_whatever_its_read(tmp_path, read):
+    """A mix of JSON-lines files, 100 rows and 1 at weights 2 and 1, ends after the short file's one row,
+    A, A, B, read by index or streamed: a streamed read knows the row is its file's last as it gives it,
+    reading each member one record ahead, so no read opens a file's index to count its rows, and none
+    reads A, A again before the short file's next pull fails (train 921's review, F3)."""
+    for name, count, first in (("many", 100, 0), ("one", 1, 1000)):
+        rows = "".join(f'{{"id": {first + index}}}\n' for index in range(count))
+        (tmp_path / f"{name}.jsonl").write_text(rows)
+    many, one = (Pipeline(Files(str(tmp_path / f"{name}.jsonl"), format="jsonl"))
+                 for name in ("many", "one"))
+    passed = held(mix([many, one], weights=[2, 1]).batch(1).read(read).loading(READ))(DataPartition())
+    try:
+        read_ids = [value for batch in ids(passed) for value in batch]
+    finally:
+        passed.close()
+    assert read_ids == [0, 1, 1000]
