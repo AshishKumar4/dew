@@ -125,6 +125,7 @@ from .decoder_block import (
     RematPolicy,
     decoder_norm,
     feedforward_factories,
+    recomputed_inside,
     remat_record,
     residual_normed,
 )
@@ -2285,11 +2286,15 @@ class CausalTransformer(LinearProducts):
 
         def kept(policy: RematPolicy | None) -> tuple[frozenset[str], ...] | None:
             """What `policy` does with the names these layers mark: None where it recomputes none of
-            them and keeps the rest, as no remat does."""
+            them and keeps the rest, as no remat does. A rung that recomputes the block recomputes, besides,
+            what it has the layers recompute inside it (`recomputed_inside`: `full`'s in-context memory
+            chunks, train 933 F2: a decoder of memories alone otherwise climbed past `full`, its one rung
+            that keeps their steps small)."""
             if policy is None or (policy.recompute and not frozenset(policy.recompute) & marked):
                 return None
+            inside = frozenset() if policy.recompute else frozenset(recomputed_inside(policy))
             return (frozenset(policy.save) & marked, frozenset(policy.offload) & marked,
-                    frozenset(policy.recompute) & marked)
+                    (frozenset(policy.recompute) | inside) & marked)
 
         index = DECODER_REMAT.index(self.remat) + 1
         while (index < len(DECODER_REMAT) - 1

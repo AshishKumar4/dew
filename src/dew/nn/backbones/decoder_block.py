@@ -567,12 +567,13 @@ of either kind, attention's context or a recurrence's scan. `full` keeps
 nothing but the block's inputs."""
 
 
-def _recomputed_inside(remat: RematPolicy) -> tuple[str, ...]:
+def recomputed_inside(remat: RematPolicy) -> tuple[str, ...]:
     """The residuals a rung recomputing the block in its backward has the layer computing them recompute in
     its own backward too: on the heaviest rung, which keeps nothing (`full`), an in-context memory's chunks
     (`memory_chunk`), whose scan's backward would otherwise stack them all inside the block's recompute, a
     layer's at a time (row 6577: 320 GiB of a Titans step at 4 x 2048); a lighter rung keeps them, each
-    step that fits as fast as it ran, so the ladder recomputes them last."""
+    step that fits as fast as it ran, so the ladder recomputes them last: a rung's recompute is its own and
+    this (`CausalTransformer.recompute_more`'s, which climbs past no rung it changes)."""
     return () if remat.save or remat.offload else (Residual.MEMORY_CHUNK,)
 
 
@@ -1005,7 +1006,7 @@ class DecoderBlock(nn.Module):
             with recomputing(() if self.remat is None else self.remat.recompute):
                 return self._forward(x, train, decode, kv_store, per_layer_input, attention_metadata,
                                      prediction_phase)
-        with recomputing(_recomputed_inside(self.remat)):
+        with recomputing(recomputed_inside(self.remat)):
             return self._rematted(self.remat, x, train, kv_store, per_layer_input, attention_metadata,
                                   prediction_phase)
 
