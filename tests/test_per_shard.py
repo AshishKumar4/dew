@@ -134,11 +134,9 @@ def test_a_kernel_every_split_flow_launches_has_a_cell(flow):
     """Each kernel off the reference path a model flow's programs launch split over two devices
     (`split_routes`, in a process of the flow's own XLA flags, `model_flows.flow_flags`, two devices its
     own) has a per-shard cell: production names the kernels that must run per shard, never a list."""
-    from lane_environment import without_flags
-    from process_support import fresh
+    from process_support import device_flags, fresh
 
-    devices = "--xla_force_host_platform_device_count"
-    flags = f"{without_flags(flow_flags(flow_named(flow)), devices)} {devices}=2".strip()
+    flags = device_flags(2, flow_flags(flow_named(flow)))
     launched = {tuple(pair) for pair in fresh(SPLIT_ROUTES, flow, flags=flags, platforms="cpu")}
     held = {(choice, kernel) for module, choice, kernel in kernels() if stated(module, choice, kernel)}
     assert launched <= held, sorted(launched - held)

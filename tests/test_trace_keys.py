@@ -365,17 +365,10 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
     apart from the fit before it (row 6022: of the first fit's 9 programs JAX traced, the refit traced 6
     again, 4 now, its batches' placement and its evaluation alone); the kept step's spreads are its
     trace's (`Candidate.spread`)."""
-    import jax.monitoring
-
     from dew.data.dataset import Loader
     from dew.optim import OptimConfig
+    from dew.telemetry.compiles import Compiles
     from dew.training import MeshSpec, Trainer
-
-    traced = []
-
-    def heard(event: str, seconds: float, **_) -> None:
-        if event == "/jax/core/compile/jaxpr_trace_duration":
-            traced.append(seconds)
 
     rows = {"text": np.random.default_rng(0).integers(0, 8, size=(8, 17)).astype(np.int32)}
     # The optimizer stated as a config, which keys the step.
@@ -383,15 +376,11 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
     trainer = Trainer(LMObjective(tiny(max_seq_len=16), 16), optimizer, key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=2, sequence=2))
     fitted = []
-    jax.monitoring.register_event_duration_secs_listener(heard)
-    try:
-        for _ in range(2):
-            before = len(traced)
-            data = Loader(train=lambda partition: iter([rows] * 4), val=None, records=None, batch=8)
+    for _ in range(2):
+        data = Loader(train=lambda partition: iter([rows] * 4), val=None, records=None, batch=8)
+        with Compiles(None) as heard:
             trainer.fit(data, steps=2)
-            fitted.append((dict(trainer.links), len(traced) - before))
-    finally:
-        jax.monitoring.unregister_event_duration_listener(heard)
+        fitted.append((dict(trainer.links), sum(program.kind == "traced" for program in heard.programs)))
     (first, tracing), (again, retracing) = fitted
     assert retracing <= tracing // 2, (tracing, retracing)
     assert {axis: link.spread for axis, link in again.items()} == {
@@ -401,33 +390,23 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
 def test_a_trainers_refit_traces_its_step_again_where_xlas_flags_change(monkeypatch):
     """A trainer fitted, then fitted again with XLA's deterministic operations asked, then again with them
     unchanged: the fit after the change traces its step anew, the one after it reads that step
-    (`dew.training._candidates`' held step, keyed by `options.trace_context`, which holds the flag), so a
-    step whose kernels were chosen without the flag never serves a run that asked for it (train 940's F1)."""
-    import jax.monitoring
-
+    (`dew.training._candidates`' held step, keyed by `options.held_context`, whose trace context holds the
+    flag), so a step whose kernels were chosen without the flag never serves a run that asked for it (train
+    940's F1)."""
     from dew.data.dataset import Loader
     from dew.optim import OptimConfig
+    from dew.telemetry.compiles import Compiles
     from dew.training import Trainer
-
-    traced = []
-
-    def heard(event: str, seconds: float, **_) -> None:
-        if event == "/jax/core/compile/jaxpr_trace_duration":
-            traced.append(seconds)
 
     rows = {"text": np.random.default_rng(0).integers(0, 8, size=(8, 17)).astype(np.int32)}
     optimizer = OptimConfig(optimizer="adam", learning_rate=1e-2)
     trainer = Trainer(LMObjective(tiny(max_seq_len=16), 16), optimizer, key=jax.random.key(0))
-    counts = []
-    jax.monitoring.register_event_duration_secs_listener(heard)
-    try:
-        for flags in ("", "--xla_gpu_deterministic_ops=true", "--xla_gpu_deterministic_ops=true"):
-            monkeypatch.setenv("XLA_FLAGS", flags)
-            before = len(traced)
+    traced = []
+    for flags in ("", "--xla_gpu_deterministic_ops=true", "--xla_gpu_deterministic_ops=true"):
+        monkeypatch.setenv("XLA_FLAGS", flags)
+        with Compiles("step") as heard:
             trainer.fit(Loader(train=lambda partition: iter([rows] * 2), val=None, records=None, batch=8),
                         steps=1)
-            counts.append(len(traced) - before)
-    finally:
-        jax.monitoring.unregister_event_duration_listener(heard)
-    _, changed, unchanged = counts
-    assert changed > unchanged, counts
+        traced.append(sum(program.kind == "traced" for program in heard.programs))
+    first, changed, unchanged = traced
+    assert first > 0 and changed > 0 and unchanged == 0, traced

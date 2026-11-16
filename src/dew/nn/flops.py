@@ -8,7 +8,6 @@ MFU. Rematerialization belongs only to the separate HLO hardware count.
 
 import collections
 import math
-import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Self
@@ -18,6 +17,8 @@ import numpy as np
 from flax import linen as nn
 from jax.core import ShapedArray
 from jax.extend import core as jaxpr_core
+
+from dew import _cache
 
 from .programs import (
     branches,
@@ -69,7 +70,8 @@ COUNTED = 256
 batches repeat a few signatures, a packed window's rows filling it alike, so each is counted once."""
 
 _counts: collections.OrderedDict[tuple[str, int, bytes], tuple[object, float]] = collections.OrderedDict()
-_counting = threading.Lock()
+"""Each module's counted work by its lengths' signature, the module held beside it (`_declared`, through
+`_cache.holding`)."""
 
 
 def _declared(kind: str, module: Counted | CountedParameters, lengths: np.ndarray,
@@ -80,17 +82,7 @@ def _declared(kind: str, module: Counted | CountedParameters, lengths: np.ndarra
     count is kept. A batch's host steps count its work before its step (`dew.training.model_flops`)."""
     held = np.asarray(lengths)
     key = (kind, id(module), held.dtype.str.encode() + repr(held.shape).encode() + held.tobytes())
-    with _counting:
-        kept = _counts.get(key)
-        if kept is not None:
-            _counts.move_to_end(key)
-            return kept[1]
-    counted = float(count(held))
-    with _counting:
-        _counts[key] = (module, counted)
-        while len(_counts) > COUNTED:
-            _counts.popitem(last=False)
-    return counted
+    return _cache.holding(_counts, key, lambda: (module, float(count(held))), COUNTED)[1]
 
 
 def counted_flops(module: nn.Module | Counted, lengths: np.ndarray) -> float:

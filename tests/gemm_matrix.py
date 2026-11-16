@@ -24,7 +24,6 @@ kernels' contract (`_cutlass_takes`).
 
 import contextlib
 import functools
-import os
 
 import jax
 import jax.numpy as jnp
@@ -348,12 +347,9 @@ def launched() -> frozenset[tuple[str, str]]:
     the cells its tests then skip (the `mesh` mark)."""
     if jax.default_backend() == "cpu" and jax.device_count() >= 2:
         return frozenset(map(tuple, launched_here()))
-    from lane_environment import without_flags
-    from process_support import fresh
+    from process_support import device_flags, fresh
 
-    devices = "--xla_force_host_platform_device_count"
-    flags = f"{without_flags(os.environ.get('XLA_FLAGS', ''), devices)} {devices}=2".strip()
-    return frozenset(map(tuple, fresh(LAUNCHED, flags=flags, platforms="cpu")))
+    return frozenset(map(tuple, fresh(LAUNCHED, flags=device_flags(2), platforms="cpu")))
 
 
 def per_shard(choice: str, kernel: str) -> dict:
