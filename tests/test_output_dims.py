@@ -7,7 +7,6 @@ import jax.numpy as jnp
 from generation_support import declared_outputs
 
 from dew.nn.kernels import gemm, generation
-from dew.nn.kernels.templates import outputs
 
 
 def test_a_gemms_output_states_its_rows_and_width_as_its_operands_axes():
