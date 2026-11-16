@@ -13,9 +13,8 @@ kernel emits."""
 import dataclasses
 import functools
 import math
-import operator
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -150,14 +149,57 @@ _PRODUCTS = frozenset({gpu.wgmma_ref_p, gpu.tcgen05_mma_p})
 _COPIES = frozenset({gpu.copy_gmem_to_smem_p, gpu.copy_smem_to_gmem_p})
 """Copies between device and shared memory (`_copied`)."""
 
-_CONCRETE: dict = {
-    lax.add_p: operator.add, lax.sub_p: operator.sub, lax.mul_p: operator.mul, lax.max_p: max, lax.min_p: min,
-    lax.lt_p: operator.lt, lax.le_p: operator.le, lax.gt_p: operator.gt, lax.ge_p: operator.ge,
-    lax.eq_p: operator.eq, lax.ne_p: operator.ne, lax.and_p: operator.and_, lax.or_p: operator.or_,
-    lax.not_p: operator.not_, lax.neg_p: operator.neg,
-    lax.div_p: lambda a, b: a // b if isinstance(a, int) and isinstance(b, int) else a / b,
-    lax.rem_p: lambda a, b: a % b}
-"""The scalar arithmetic a warpgroup's index flows through to its roles' predicates and switch, evaluated."""
+def _folded(equation, values: list) -> list:
+    """`equation` over its concrete integer and boolean scalar operands, each at its own dtype, as its
+    primitive computes it on the GPU (`scalar_evaluated`): a width's wrap, a quotient's truncation and a
+    remainder's sign the program's own; unknown where it computes none."""
+    operands = [np.asarray(value, dtype=atom.aval.dtype)[()] for value, atom in zip(values, equation.invars,
+                                                                                      strict=True)]
+    (out,) = equation.outvars
+    return [scalar_evaluated(equation.primitive, operands, equation.params, out.aval.dtype)]
+
+
+def scalar_evaluated(primitive, operands: Sequence, params: Mapping, dtype) -> np.generic | None:
+    """An elementwise `primitive`'s output, of `dtype`, over concrete integer and boolean scalar `operands`,
+    as this host computes a constant (`programs.host_evaluated`), which for integers and booleans is `lax`'s
+    and the GPU's exactly: a width's wrap, a quotient truncated and a remainder of its dividend's sign,
+    shifts past the width. None for a primitive outside the arithmetic a warpgroup's index flows through
+    (`SCALAR_EVALUATED`), a parameter it does not read (`_READ`), a floating or complex operand or output,
+    whose IEEE semantics no warpgroup's index arithmetic reads and this host's CPU computes otherwise than a
+    GPU (its subnormals flushed), and a quotient or remainder the GPU leaves undefined (`_undefined`)."""
+    if (primitive not in SCALAR_EVALUATED
+            or any(value is not None for name, value in params.items() if name not in _READ)
+            or not all(_integral(np.result_type(value)) for value in operands) or not _integral(dtype)
+            or (primitive in (lax.div_p, lax.rem_p) and _undefined(*operands))):
+        return None
+    made = programs.host_evaluated(primitive, operands, params)
+    return None if made is None else np.dtype(dtype).type(np.asarray(made[0]).item())
+
+
+def _integral(dtype) -> bool:
+    """Whether `dtype` is an integer or boolean one (JAX's 4-bit integers among them)."""
+    return jnp.issubdtype(dtype, jnp.integer) or jnp.issubdtype(dtype, jnp.bool_)
+
+
+def _undefined(dividend, divisor) -> bool:
+    """Whether an integer quotient or remainder is undefined where the GPU computes it (LLVM's `sdiv` and
+    `srem`, which Mosaic GPU's integer division lowers to), though this host's XLA defines one: by zero, or
+    the least integer by -1."""
+    dtype = np.result_type(dividend)
+    return divisor == 0 or (dtype != np.bool_ and dividend == jnp.iinfo(dtype).min and divisor == -1)
+
+
+SCALAR_EVALUATED = frozenset({
+    lax.add_p, lax.sub_p, lax.mul_p, lax.neg_p, lax.div_p, lax.rem_p, lax.max_p, lax.min_p, lax.clamp_p,
+    lax.lt_p, lax.le_p, lax.gt_p, lax.ge_p, lax.eq_p, lax.ne_p, lax.and_p, lax.or_p, lax.xor_p, lax.not_p,
+    lax.shift_left_p, lax.shift_right_arithmetic_p, lax.shift_right_logical_p, lax.convert_element_type_p})
+"""The elementwise primitives a warpgroup's index arithmetic flows through, which `scalar_evaluated`
+computes over concrete integer and boolean scalars."""
+
+_READ = frozenset({"new_dtype", "out_dtype", "weak_type", "sharding"})
+"""The parameters `scalar_evaluated` evaluates with (a conversion's target, a product's output dtype) or that
+state nothing of a scalar's value (its weak type, its placement): a primitive given any other one set is
+computed by none."""
 
 _TRANSFORMS = ("acc_transforms_tree", "a_transforms_tree", "b_transforms_tree", "barrier_transforms_tree",
                "a_scale_transforms_tree", "b_scale_transforms_tree", "a_sparse_metadata_transforms_tree")
@@ -326,8 +368,9 @@ class _Counting:
 
         def read(atom):
             if isinstance(atom, jax_core.Literal):
-                # A literal's value is a host array (`literals.TypedNdArray`), a scalar's of no dimension.
-                return np.asarray(atom.val).item() if np.ndim(atom.val) == 0 else atom.val
+                # A literal's value is a host array (`literals.TypedNdArray`), a scalar's of no dimension,
+                # held at its own dtype as the program computes with it.
+                return np.asarray(atom.val)[()] if np.ndim(atom.val) == 0 else atom.val
             return held.get(atom)
 
         for equation in jaxpr.eqns:
@@ -340,13 +383,13 @@ class _Counting:
         unknown = [None] * len(equation.outvars)
         if primitive is lax.axis_index_p:
             return [self.place(params["axis_name"])]
-        if primitive in _CONCRETE and values and all(_scalar(value) for value in values):
-            return [_CONCRETE[primitive](*values)]
+        if (primitive in SCALAR_EVALUATED and values
+                and all(_scalar(value) for value in values)):
+            if primitive is lax.convert_element_type_p:
+                self.add(Work(conversions=1))
+            return _folded(equation, values)
         if (placed := _placed(primitive, values)) is not None:
             return [placed]
-        if primitive is lax.convert_element_type_p and _scalar(values[0]):
-            self.add(Work(conversions=1))
-            return [values[0]]
         if (primitive is lax.select_n_p and _scalar(values[0])
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]
@@ -566,7 +609,12 @@ def _envelope(works) -> Work:
 
 
 def _scalar(value) -> bool:
-    return isinstance(value, int | bool | float | np.integer | np.bool_ | np.floating)
+    """Whether `value` is a concrete integer or boolean scalar, what a warpgroup's index arithmetic holds:
+    a Python integer or boolean, or a NumPy scalar of an integer or boolean dtype (JAX's 4-bit integers among
+    them). A float is none: its predicate's branches are unknown, each counted
+    (`scalar_evaluated`)."""
+    return isinstance(value, int) or (isinstance(value, np.generic) and any(
+        jnp.issubdtype(value.dtype, kind) for kind in (jnp.integer, jnp.bool_)))
 
 
 def built_with(cost: pl.CostEstimate | Stated | None) -> pl.CostEstimate | None:

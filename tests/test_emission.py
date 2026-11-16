@@ -3,13 +3,15 @@ counted from its body, as each warpgroup runs it."""
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn import derivatives
+from dew.nn import derivatives, programs
 from dew.nn.kernels.templates import emission
-from dew.nn.kernels.templates.cost import Work
+from dew.nn.kernels.templates.cost import Stated, Work
 
 _STEP = derivatives.marked(derivatives.WalkStep(), lambda index: index)
 """A walk step's mark, as `mosaic.stepped` makes it."""
@@ -94,6 +96,131 @@ def test_a_scoped_bodys_results_resolve_the_roles_after_it():
         return lax.fori_loop(0, trips, step, row)
 
     assert [role.step(_exponentials) for role in _emitted(walk, _ROW, _TRIPS).roles] == [128, 128]
+
+
+def _converted(row, index):
+    _STEP(index)
+    return row.astype(jnp.bfloat16).astype(jnp.float32)
+
+
+def test_a_switch_on_the_warpgroups_role_counts_each_warpgroups_branch_alone():
+    """A switch whose index the warpgroup's role decides, as a schedule's exclusive roles take theirs
+    (`handoffs.Schedule.run`: the index from the warpgroup through comparisons, a sum and a select, which
+    `lax.switch` clamps to its branches): each warpgroup counts its own branch, the producer none of a
+    consumer's work. Unfolded, every warpgroup counted every branch's (ET's sm90 forward: a consumer's
+    products on its producer too)."""
+    def walk(row, trips):
+        def walked(step):
+            return lambda row: lax.fori_loop(0, trips, lambda index, row: step(row, index), row)
+
+        wg = lax.axis_index("wg")
+        role = sum((wg >= bound).astype(jnp.int32) for bound in (1,))
+        return lax.switch(jnp.where(wg >= 2, 0, role), [walked(_one), walked(_converted)], row)
+
+    roles = _emitted(walk, _ROW, _TRIPS).roles
+    assert [(role.step(_exponentials), role.step(lambda work: work.conversions)) for role in roles] == [
+        (128, 0), (0, 2 * 128)]
+
+
+@pytest.mark.parametrize("predicate, exponentials", [
+    # An integer quotient truncates toward zero: -1 over 2 is 0 at every warpgroup.
+    (lambda wg: lax.div(1 - lax.clamp(2, wg, 3), 2) == 0, [128, 128]),
+    # By a negative divisor too: 7 over -2 is -3 at the first warpgroup, 8 over -2 -4 at the second.
+    (lambda wg: lax.div(7 + wg, -2) == -3, [128, 0]),
+    # A remainder takes its dividend's sign: -7 rem 2 is -1, -6 rem 2 is 0.
+    (lambda wg: lax.rem(wg - 7, 2) == -1, [128, 0]),
+    # int8 wraps 128 to -128 at the second warpgroup.
+    (lambda wg: (wg + 127).astype(jnp.int8) < 0, [0, 128]),
+    # A logical shift of -1 by 31 is 1; of 0, 0.
+    (lambda wg: lax.shift_right_logical(wg - 1, 31) == 1, [128, 0]),
+    # A shift past the width is 0, an arithmetic one's of a negative value -1.
+    (lambda wg: lax.shift_left(wg + 1, 32) == 0, [128, 128]),
+    (lambda wg: lax.shift_right_arithmetic(wg - 1, 40) == -1, [128, 0]),
+    # A float predicate is no warpgroup arithmetic the fold computes: both branches at every warpgroup.
+    (lambda wg: wg.astype(jnp.float32) == jnp.float32(0), [128, 128]),
+], ids=["truncated-quotient", "negative-divisor", "remainder-sign", "int8-wrap", "logical-shift",
+        "shift-past-width", "arithmetic-shift-past-width", "float-unknown"])
+def test_scalar_arithmetic_on_the_warpgroup_folds_as_the_program_computes_it(predicate, exponentials):
+    """A conditional on integer arithmetic over the warpgroup's index (a quotient by either sign, a
+    remainder, a narrower integer's wrap, shifts within and past the width) counts the branch each
+    warpgroup's program takes, folded as `lax` computes it at its own dtype, where Python's arithmetic floored
+    an integer quotient (base review 951e3f9e7 F3); a float predicate, which no warpgroup's index arithmetic
+    is, counts both branches at every warpgroup, never one dropped: the fold computes integers and booleans
+    alone, where IEEE semantics' edges (subnormals, signed zeros, float64, a complex value) were where its
+    defects lived (base reviews 127d2d95c to edd99fc1d)."""
+    def walk(row):
+        wg = lax.axis_index("wg").astype(jnp.int32)
+        return lax.cond(predicate(wg), jnp.exp, lambda row: row, row)
+
+    assert [role.fixed.exponentials for role in _emitted(walk, _ROW).roles] == exponentials
+
+
+@pytest.mark.parametrize("wide, predicate, exponentials", [
+    # The second warpgroup's int8 16 times itself at int32 is 256, which int8 wraps to 0.
+    (False, lambda wg: lax.mul(*[(wg * 16).astype(jnp.int8)] * 2, out_dtype=jnp.int32) == 256, 128),
+    # The first warpgroup's 2**63 + 2048 times 3 at uint64 wraps to 2**63 + 6144, under x64.
+    (True, lambda wg: lax.mul(wg.astype(jnp.uint64) + jnp.uint64(2 ** 63 + 2048), jnp.uint64(3))
+     == jnp.uint64(2 ** 63 + 6144), 128),
+    # The second warpgroup's 10 wraps to int4's -6.
+    (False, lambda wg: (wg * 10).astype(jnp.int4) == -6, 128),
+    # A float predicate counts both branches at both warpgroups.
+    (False, lambda wg: wg.astype(jnp.float32) == jnp.float32(2.0 ** -140), 256),
+], ids=["product-out-dtype", "uint64-wrap", "int4-wrap", "float-unknown"])
+def test_a_launchs_cost_counts_a_scalar_predicate_as_the_gpu_computes_it(wide, predicate, exponentials):
+    """A kernel of two warpgroups exponentiating its row where a predicate on the warpgroup's index holds:
+    its launch's cost (`emission.costed`, the estimate XLA and Dew's FLOP count read) states the
+    exponentials of the warpgroups an integer predicate holds for, folded as the GPU computes it (a product
+    at the output dtype it names, base review f9953e23a F1; a uint64's wrap, edd99fc1d F1; int4's, 0f72bd41c
+    F1), and both branches of each warpgroup where the predicate is a float's, which the fold computes none
+    of."""
+    def body(x_ref, o_ref, row):
+        wg = lax.axis_index("wg").astype(jnp.int32)
+        row[...] = lax.cond(predicate(wg), jnp.exp, lambda value: value, row[...])
+
+    with jax.enable_x64(new_val=wide):
+        launch = plgpu.kernel(body, out_type=_ROW, num_threads=2, thread_name="wg",
+                              scratch_types=[plgpu.SMEM((128,), jnp.float32)])
+        traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=1, bytes_accessed=0)))(_ROW)
+    assert [equation.params["cost_estimate"].transcendentals for equation in programs.equations(traced.jaxpr)
+            if "cost_estimate" in equation.params] == [exponentials]
+
+
+def _convert(dtype) -> dict:
+    return {"new_dtype": np.dtype(dtype), "weak_type": False, "sharding": None}
+
+
+@pytest.mark.parametrize("primitive, operands, params", [
+    (lax.div_p, (np.int32(-7), np.int32(2)), {}), (lax.div_p, (np.int32(7), np.int32(-2)), {}),
+    (lax.div_p, (np.int32(-7), np.int32(-2)), {}), (lax.rem_p, (np.int32(-7), np.int32(2)), {}),
+    (lax.rem_p, (np.int32(7), np.int32(-2)), {}), (lax.add_p, (np.int32(2 ** 31 - 1), np.int32(1)), {}),
+    (lax.sub_p, (np.uint32(0), np.uint32(1)), {}), (lax.neg_p, (np.int32(-2 ** 31),), {}),
+    (lax.mul_p, (np.int8(16), np.int8(16)), {"out_dtype": np.dtype(np.int32)}),
+    (lax.mul_p, (np.int32(2), np.int32(1)), {"out_dtype": np.dtype(np.bool_)}),
+    (lax.and_p, (np.int32(6), np.int32(3)), {}), (lax.xor_p, (np.int32(6), np.int32(3)), {}),
+    (lax.not_p, (np.int32(5),), {}), (lax.not_p, (np.bool_(1),), {}),
+    (lax.or_p, (np.bool_(0), np.bool_(1)), {}),
+    (lax.max_p, (np.int32(-3), np.int32(2)), {}), (lax.clamp_p, (np.int32(0), np.int32(9), np.int32(4)), {}),
+    (lax.shift_left_p, (np.int32(3), np.int32(30)), {}), (lax.shift_left_p, (np.int32(3), np.int32(32)), {}),
+    (lax.shift_right_arithmetic_p, (np.int32(-8), np.int32(1)), {}),
+    (lax.shift_right_arithmetic_p, (np.int32(-8), np.int32(40)), {}),
+    (lax.shift_right_arithmetic_p, (np.uint32(2 ** 31), np.uint32(1)), {}),
+    (lax.shift_right_arithmetic_p, (np.uint32(2 ** 31), np.uint32(40)), {}),
+    (lax.shift_right_logical_p, (np.int32(-1), np.int32(28)), {}),
+    (lax.shift_right_logical_p, (np.int32(-1), np.int32(32)), {}),
+    (lax.convert_element_type_p, (np.int32(10),), _convert(jnp.int4)),
+    (lax.convert_element_type_p, (np.int32(200),), _convert(np.int8)),
+    (lax.convert_element_type_p, (np.int32(-2),), _convert(np.bool_)),
+    (lax.convert_element_type_p, (np.bool_(1),), _convert(np.int32)),
+], ids=lambda value: getattr(value, "name", None))
+def test_an_integer_scalar_folds_as_its_primitive_computes_it(primitive, operands, params):
+    """A quotient and a remainder by either sign, a width's wrap (int32's, uint32's, int8's, int4's, a
+    product at the output dtype it names, a boolean's among them), bitwise and boolean logic, an extremum and
+    a clamp, shifts within and past the width (an unsigned value's arithmetic one reading it as signed) and
+    conversions among integer and boolean dtypes fold as the primitive bound at its operands' dtypes computes
+    them (`emission.scalar_evaluated` against `lax`'s own evaluation; base review 4608795fd F1, F2)."""
+    bound = np.asarray(primitive.bind(*map(jnp.asarray, operands), **params))
+    folded = emission.scalar_evaluated(primitive, operands, params, bound.dtype)
+    assert folded is not None and folded.dtype == bound.dtype and folded == bound[()], (folded, bound)
 
 
 def test_an_unknown_branch_counts_the_most_of_each_unit_any_branch_issues():
