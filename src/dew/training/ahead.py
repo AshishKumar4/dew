@@ -67,7 +67,7 @@ from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
 from dew._devices import COMPILE_ONLY_MEMORY, device_memory
 from dew._records import JSON, boolean, record
-from dew._stated import Unestablished
+from dew._stated import Unestablished, traceback_frames
 from dew.batch import Batch
 from dew.nn.kernels import options
 from dew.nn.kernels.generation import (
@@ -212,8 +212,9 @@ class HeldTraceback:
 
 
 def _held_traceback(traceback: Traceback) -> tuple[type[HeldTraceback], tuple[tuple[str, ...]]]:
-    """A traceback of JAX's reduced to its frames (`HeldTraceback`), as a program file holds it."""
-    return HeldTraceback, (tuple(str(frame) for frame in traceback.frames),)
+    """A traceback of JAX's reduced to its frames (`HeldTraceback`, `dew._stated.traceback_frames`), as a
+    program file holds it."""
+    return HeldTraceback, (tuple(traceback_frames(traceback)),)
 
 
 def filed(value: Executable | AheadPrograms | AheadOfTime) -> bytes:
@@ -289,7 +290,7 @@ class AheadProgram:
         """The executable, loaded onto `devices`, for a run whose program lowered as `lowered`: refused
         where that is another program than this one, and admitted as a compiled one is
         (`dew.communicators.admit`)."""
-        if program_digest(lowered) != self.program:
+        if _stated_digest(lowered) != self.program:
             raise NotTheStepCompiledAhead(
                 "the sampled step compiled ahead is another program than the one this run compiles: compile "
                 "it ahead from this run's config, with its inspection")
@@ -484,7 +485,7 @@ class AheadOfTime:
         """The executable, loaded (`loaded`), for a run whose step lowered as `lowered`: refused where
         that is another program than the one compiled ahead, a config, a data shape, a rung or a Dew
         that differs, which the executable would not run as the run's step."""
-        if program_digest(lowered) != self.program:
+        if _stated_digest(lowered) != self.program:
             raise NotTheStepCompiledAhead(
                 "the step compiled ahead is another program than the one this run compiles first: compile it "
                 "ahead from this run's config and data (--trainer.compile-ahead), with this Dew, and no plan "
@@ -757,7 +758,13 @@ class Keeping:
                                   "outside the process's default backend"
             return
         devices = tuple(device.id for device in ran)
-        program_kept = AheadProgram(program_digest(lowered), serialized)
+        try:
+            digest = program_digest(lowered)
+        except Unestablished as refusal:
+            # A tree of a node no process names: no file holds the program, which compiles where it is handed.
+            self.refused[named] = f"its program is stated by no file: {refusal}"
+            return
+        program_kept = AheadProgram(digest, serialized)
         self.kept[identity.digest(call)] = KeptProgram(call, program_kept, devices)
 
     def save(self, path: str | Path) -> AheadPrograms:
@@ -784,22 +791,35 @@ def keeping() -> Iterator[Keeping]:
             server = ScoringServer.from_task(task, variables)
         programs.save("scoring.dew-aot")
 
-    A later process of the same target, code and settings hands them back (`kept`) and traces none of
-    them. A program compiled before the block, or handed or taken within it, is not among them. The
-    block compiles with JAX's persistent cache off (`dew._cache.uncached`): an executable XLA loaded
-    from that cache serializes without its kernels (on a CPU it then loads and fails at its first call,
-    "Function ... not found"; plain JAX, 2026-11-09), so each kept one is compiled here."""
+    A later process of the same target, code and settings hands them back (`kept`), compiling none of
+    them: it traces and lowers each to prove it, or with `verify=False` traces none. A program compiled
+    before the block, or handed or taken within it, is not among them. The block compiles with JAX's
+    persistent cache off (`dew._cache.uncached`): an executable XLA loaded from that cache serializes
+    without its kernels (on a CPU it then loads and fails at its first call, "Function ... not found";
+    plain JAX, 2026-11-09), so each kept one is compiled here."""
     kept = Keeping()
     with uncached(), options.keeping(kept.heard):
         yield kept
 
 
+
+def _stated_digest(lowered: jax.stages.Lowered) -> str | None:
+    """`lowered`'s digest as a file of programs holds it (`program_digest`), None where its trees hold a node
+    no process names: a program no file holds, so none it is compared with."""
+    try:
+        return program_digest(lowered)
+    except Unestablished as refusal:
+        _log.info("a program no file of programs states is none a file holds: %s", refusal)
+        return None
+
 @contextlib.contextmanager
-def kept(path: str | Path, *, verify: bool = False) -> Iterator[AheadPrograms]:
+def kept(path: str | Path, *, verify: bool = True) -> Iterator[AheadPrograms]:
     """Within the block, a call at Dew's compile point whose identity
     (`dew.training.identity.call_identity`) one of the programs kept at `path` was compiled for
-    (`keeping`) runs that executable, loaded onto the devices it was compiled for, and traces, lowers and
-    compiles nothing; a call the file holds no program for compiles as without it.
+    (`keeping`) runs that executable, loaded onto the devices it was compiled for, its own program lowered
+    first and held to the kept one's digest (`program_digest`): it compiles nothing, and a kept program its
+    call no longer lowers to is refused (`NotTheKeptProgram`), never run. A call the file holds no program
+    for compiles as without it.
 
     Refused before any call, naming what differs, where this process is not the one the file was kept in:
     its devices, JAX, jaxlib, XLA flags and host (`BuildTarget.held`), or its Python, Dew's source, a
@@ -809,9 +829,12 @@ def kept(path: str | Path, *, verify: bool = False) -> Iterator[AheadPrograms]:
     it covers is `dew.training.identity`'s to say. Code that changes what a trace computes by assigning
     module state at run time is outside the identity, as it is outside `jax.jit`'s cache.
 
-    With `verify`, each call handed a program also lowers its own and holds the two to one digest
-    (`program_digest`), at the cost of the trace the file saves: the proof, for this file and this
-    process, that the identity covered what the trace read (`NotTheKeptProgram` where it did not)."""
+    With `verify=False`, a handed call traces and lowers nothing, and the file is trusted on its identity
+    alone: what that identity states (above) is all that holds the kept program to the code that calls it,
+    so a change it does not state (an installed distribution's file edited in place, or a wheel rebuilt and
+    reinstalled at the same version, which the identity states by its version alone; a module's state
+    assigned at run time) runs the stale program as the current one, its results wrong with nothing to show
+    it. Only where no such change can have happened."""
     programs = AheadPrograms.load(path)
     if programs.process is None:
         raise ValueError(f"{path} holds programs compiled ahead by name, none kept by its call (`keeping`)")
@@ -827,7 +850,14 @@ def kept(path: str | Path, *, verify: bool = False) -> Iterator[AheadPrograms]:
             return None
         if found is None:
             return None
-        if verify and program_digest(program.lower(*args, **kwargs)) != found.program.program:
+        if not verify:
+            return found.loaded()
+        digest = _stated_digest(program.lower(*args, **kwargs))
+        if digest is None:
+            # A program whose trees no file states is none a file holds: it compiles, as a call the file
+            # holds no program for does.
+            return None
+        if digest != found.program.program:
             raise NotTheKeptProgram(
                 f"{identity.called(program)} lowers here to another program than the one kept at "
                 f"{path} for the same identity: something its trace reads is outside the identity "
@@ -1410,7 +1440,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
     except Unlowerable as refused:
         raise refused.refusing("step") from refused
     # The sampled step as the search compiled it, its program what it lowered then.
-    sampled = None if planned.sampled is None else AheadProgram.of(*planned.sampled)
+    sampled = (None if planned.sampled is None
+               else AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable))
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     memory = compiled_memory(compiled)

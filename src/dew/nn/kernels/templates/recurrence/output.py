@@ -17,11 +17,11 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Held,
     Tiles,
     addressed,
+    building,
     chunk_liveness,
     f32,
     held_tile,
     launch_kernel,
-    lowered_once,
     masks,
     product_fragments,
     staging_tiles,
@@ -171,7 +171,7 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     return Held(carried=prefixes, phases=(values + products, *(stage + scored for stage in stages)))
 
 
-@lowered_once
+@building(lambda launch: ("recurrence_output",))
 def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Tiles, *, scale: float,
                   out_dtype, scores=None, skip=None):
     """Each chunk's output `[R, HV * Dv]` in `out_dtype`, a program a chunk and value head and a step each

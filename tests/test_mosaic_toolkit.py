@@ -5,7 +5,6 @@ here, and runs on one in the GPU gate."""
 
 import dataclasses
 import functools
-import json
 
 import jax
 import jax.numpy as jnp
@@ -15,7 +14,7 @@ from generation_support import INTERPRETS
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
-from kernel_compile import gate_generations
+from kernel_compile import gate_generations, stated_outputs
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import across, handoffs, mosaic, outputs, rings, stores, swizzling
@@ -808,7 +807,6 @@ def test_a_kernels_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
     lowered for a B200 on any host: its shape is theirs, and its call states the dimensions each output
     descends from (`outputs.OUTPUT_DIMS`, its operands by their place), which a compile's live buffers read;
     the TPU core's, interpreted, takes the same statement as its shape."""
-    from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.kernels.templates import mosaic_sm100
 
     family = mosaic_sm100.RINGS
@@ -818,8 +816,7 @@ def test_a_kernels_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
         lowered = jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(
             x, w).lower(lowering_platforms=("cuda",))
     assert lowered.out_info.shape == (x.shape[0], w.shape[1])
-    (call,) = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
-    assert json.loads(call.output_dims) == [[[[0, 0]], [[1, 1]]]]
+    assert [dims for _, dims in stated_outputs(lowered) if dims is not None] == [[[[[0, 0]], [[1, 1]]]]]
 
 
 def test_a_pallas_calls_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
@@ -827,7 +824,6 @@ def test_a_pallas_calls_outputs_stated_as_its_operands_axes_are_stated_on_its_ca
     lowered for an H100 on any host: its shape is theirs, and its call states each dimension's axis
     (`outputs.OUTPUT_DIMS`), as a Mosaic launch's does."""
     from dew.nn.kernels import launches
-    from dew.nn.kernels.lowered import kernel_calls
 
     def copied(x):
         def body(x_ref, o_ref):
@@ -841,8 +837,7 @@ def test_a_pallas_calls_outputs_stated_as_its_operands_axes_are_stated_on_its_ca
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(copied).trace(x).lower(lowering_platforms=("cuda",))
     assert lowered.out_info.shape == (32, 16)
-    (call,) = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "triton"]
-    assert json.loads(call.output_dims) == [[[[0, 1]], [[0, 0]]]]
+    assert [dims for _, dims in stated_outputs(lowered) if dims is not None] == [[[[[0, 1]], [[0, 0]]]]]
 
 
 @INTERPRETS
@@ -1282,7 +1277,8 @@ def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_g
     """A persistent warpgroup-MMA walk, one consumer beside its producer, launched at each residency its
     family admits a multiprocessor on an H100 (`RegisterModel.most`) and compiled as the GPU gate compiles
     it: the registers its consumer raises to in its PTX (`setmaxnreg.inc`) are the gate's cap for it at that
-    residency (`RegisterModel.cap`), and its binary holds its registers within them, spilling nothing."""
+    residency (`RegisterModel.cap`), the cap its record states its launch runs at, and its binary holds its
+    registers within them, spilling nothing."""
     import kernel_compile
     from fla_gdn_support import KernelCase
 
@@ -1298,7 +1294,7 @@ def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_g
         [record] = kernel_compile.compile_mosaic_kernels([case], "sm90")
         [kernel] = record["kernels"]
         cap = model.cap(programs, honored=True)
-        assert (kernel["raised"], kernel["spilled"]) == (cap, 0), (programs, record.get("error"), kernel)
+        assert (kernel["raised"], kernel["cap"], kernel["spilled"]) == (cap, cap, 0), (programs, kernel)
         assert kernel["registers"] <= cap
 
 
@@ -1760,6 +1756,28 @@ def test_groups_summed_together_stage_no_operand_into_a_tile_a_product_in_flight
         in_flight = (in_flight or event == "tcgen05_mma") and event != "barrier_wait"
 
 
+@pytest.mark.gpu(reason="a tcgen05 product's late operand read is the device's alone")
+@pytest.mark.generations("sm100")
+@pytest.mark.skipif(generation.device_generation() != "sm100",
+                    reason="a tcgen05 product's late operand read is a B200's alone")
+@pytest.mark.parametrize("shared", [True, False], ids=["one tile", "a tile each"])
+def test_groups_summed_together_from_staged_operands_are_each_its_own_sum(shared):
+    """On a B200: two groups summed by one issuer on tcgen05's chunks (`operands.Issuer.summed_together`),
+    each left operand a register value staged into a shared tile, one tile for both or a tile each, its
+    operands distinct small integers: each group's sum is exactly its own, `x @ w` and `2 x @ w`. A tcgen05
+    product reads its operands after it issues, so a group staged while another's product still read the
+    tile gave that product the second group's operand (row 6527: the order-only test held no sum). Mosaic
+    GPU's interpreter runs a product as it issues, so only the device's run can tell (the fix undone, the
+    interpreted sums stay exact)."""
+    x = jax.random.randint(jax.random.key(11), (64, CHUNK_DEPTH), -4, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(jax.random.key(12), (CHUNK_DEPTH, 128), -4, 4).astype(jnp.bfloat16)
+    with generation.assumed("sm100"):
+        first, twice = (np.asarray(out) for out in _staged_together(x, w, interpret=False, shared=shared))
+    product = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+    np.testing.assert_array_equal(first, product)
+    np.testing.assert_array_equal(twice, 2 * product)
+
+
 def test_a_group_summed_together_that_awaits_its_own_products_is_refused():
     """A group summed together on tcgen05 whose issue awaits its own products (a value added into its
     accumulator, `added_into`) is refused as it traces: its wait would leave the groups' one commit behind
@@ -1836,7 +1854,8 @@ def _walked_once(x, w, *, family, interpret, all_once=False, prologue=False):
     though its index map moves with the step, loaded once outside the ring and read by every step beside
     `w`'s ringed blocks, the walk's sums read out after its last step (`Walk.read`). `all_once`, `w`'s first
     block a once stream too: every step reads the two once blocks, and the walk rotates no ring. `prologue`,
-    the walk's prologue reads a row of `x` from global memory, each step taking it."""
+    the walk's prologue reads `w`'s first row from global memory, each step adding it to the walk's carry,
+    which the read adds to every row: the sums plus `PERSISTED_STEPS` times that row."""
     rows, columns = family.rows, w.shape[1]
     family = family.specialized(rows, columns)
     shape = (rows, columns)
@@ -1851,9 +1870,10 @@ def _walked_once(x, w, *, family, interpret, all_once=False, prologue=False):
     def body(x_gmem, w_gmem, o_gmem):
         def scope(*staged, streams):
             def read(carry, sums):
-                del carry
                 out = staged[0] if staged else o_gmem
                 for first, (value,) in family.chunks(sums):
+                    if prologue:
+                        value = value + carry[None, first:first + value.shape[1]]
                     out[:, pl.ds(first, value.shape[1])] = value
                 if staged:
                     pltpu.sync_copy(out, o_gmem)
@@ -1864,9 +1884,13 @@ def _walked_once(x, w, *, family, interpret, all_once=False, prologue=False):
                 once, views = {**once, **views}, {}
             step = _multiplying(family, 'x', 'w', interpret)
             if prologue:
-                step = functools.partial(lambda step, *given, loaded: step(*given), step)
+                def step(index, slots, carry, accumulators, *, loaded, multiplied=step):
+                    carry, accumulators = multiplied(index, slots, carry, accumulators)
+                    return carry + loaded.astype(jnp.float32), accumulators
+
             walk = mosaic.Walk(views, step, steps=PERSISTED_STEPS, sums=(shape,), read=read, once=once,
-                               prologue=(lambda: x_gmem[0]) if prologue else None)
+                               carry=jnp.zeros((columns,), jnp.float32) if prologue else (),
+                               prologue=(lambda: w_gmem[0]) if prologue else None)
             family.run(streams["walked"], walk, interpret, once=streams["once"])
 
         ringed, held = {'w': ((PERSISTED_DEPTH, columns), w.dtype)}, {'x': ((rows, PERSISTED_DEPTH), x.dtype)}
@@ -1919,6 +1943,24 @@ def test_a_walks_once_stream_loads_once_and_every_step_reads_it(bundle):
         got = np.asarray(_walked_once(x, w, family=family, interpret=interpret))
     blocks = np.asarray(w, np.float32).reshape(PERSISTED_STEPS, PERSISTED_DEPTH, -1).sum(axis=0)
     np.testing.assert_array_equal(got, np.asarray(x, np.float32)[:, :PERSISTED_DEPTH] @ blocks)
+
+
+@pytest.mark.parametrize("bundle", ONCE_BUNDLES[:2])
+def test_a_walks_prologue_value_reaches_every_step_beside_its_once_stream(bundle):
+    """Interpreted: the once-stream walk with a prologue (`Walk.prologue`) on a GPU's two ways of holding
+    one, the prologue reading `w`'s first row from global memory before the walk waits on its once streams
+    (row 6657; a TPU core's walk reads HBM only by a copy, its prologue none): every step adds that row to
+    the walk's carry, which its read adds to every row of the sums, so the output is the once-stream walk's
+    plus `PERSISTED_STEPS` times that row, exactly in fp32 (base review 584d4776f F1: a prologue whose value
+    no step read held only the emitted order)."""
+    family, target, interpret = _once_bundle(bundle)
+    x, w = _persisted_operands(family.rows)
+    x = x[:family.rows]
+    with generation.assumed(target):
+        got = np.asarray(_walked_once(x, w, family=family, interpret=interpret, prologue=True))
+    blocks = np.asarray(w, np.float32).reshape(PERSISTED_STEPS, PERSISTED_DEPTH, -1).sum(axis=0)
+    expected = np.asarray(x, np.float32)[:, :PERSISTED_DEPTH] @ blocks
+    np.testing.assert_array_equal(got, expected + PERSISTED_STEPS * np.asarray(w, np.float32)[0])
 
 
 @pytest.mark.parametrize("bundle", ONCE_BUNDLES)

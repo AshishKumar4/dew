@@ -14,6 +14,7 @@ import json
 import struct
 import weakref
 from collections.abc import Callable, Iterator
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -278,6 +279,27 @@ def lm(split=None, accumulation=1, objective=LMObjective, *, seq=SEQ, width=16, 
                               mlp_features=2 * width, max_seq_len=seq, **fields)
     return one_device(Trainer(objective(model, seq_len=seq), optax.sgd(1e-2), key=jax.random.key(0),
                               split=split, accumulation=accumulation))
+
+
+def test_a_step_whose_optimizer_state_is_a_class_made_in_its_factory_plans_and_steps():
+    """A step whose optimizer keeps its state in a class its factory makes, as an optax-style factory may: a
+    node no process names, which no file of programs states, is planned and compiled within this process by
+    the program as JAX holds it (`program_key`), so the run plans and steps, where the plan's key of its
+    executables stated its trees for a file and raised (train 961's F1)."""
+    def counted(rate: float) -> optax.GradientTransformation:
+        class Counted(NamedTuple):
+            steps: jax.Array
+
+        def update(updates, state, params=None):
+            return jax.tree.map(lambda update: -rate * update, updates), Counted(state.steps + 1)
+
+        return optax.GradientTransformation(lambda params: Counted(jnp.zeros((), jnp.int32)), update)
+
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ)
+    trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), counted(1e-2), key=jax.random.key(0)))
+    state = trained(trainer, steps=2)
+    assert int(state.opt_state.steps) == 2
 
 
 def trained(trainer, steps=3, batch=None):

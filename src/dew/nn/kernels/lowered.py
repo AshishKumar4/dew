@@ -18,7 +18,6 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
 from dew.nn.kernels.templates import report
-from dew.nn.kernels.templates.outputs import OUTPUT_DIMS
 from dew.telemetry.instrumentation import MODEL_FLOPS, call_weights, counted_trips, custom_call_kind
 
 
@@ -49,9 +48,6 @@ class KernelCall:
     caller: str | None = None
     """The launch that traced a Mosaic GPU kernel, as its call's caller states it (`report.launch_metadata`),
     beside its name; None where its call states none."""
-    output_dims: str | None = None
-    """The dimensions a Mosaic GPU or Triton kernel's outputs descend from, as its call states them
-    (`outputs.OUTPUT_DIMS`); None where it states none."""
 
     @property
     def launched(self) -> str | None:
@@ -336,8 +332,7 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
         config = ir.DictAttr(attributes["mhlo.backend_config"])
         return KernelCall(kind, ir.StringAttr(config["name"]).value, ir.StringAttr(config["ir"]).value_bytes,
                           f"warps={ir.IntegerAttr(config['num_warps']).value} "
-                          f"stages={ir.IntegerAttr(config['num_stages']).value}", None,
-                          output_dims=_frontend(attributes).get(OUTPUT_DIMS))
+                          f"stages={ir.IntegerAttr(config['num_stages']).value}", None)
     if kind == "mosaic_gpu":
         config = ir.DictAttr(attributes["mhlo.backend_config"])
         stated = (json.loads(ir.StringAttr(config["cost_estimate_json"]).value)
@@ -348,7 +343,7 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
         # A call whose location names no kernel is named by its kernel's hash, apart from every other.
         return KernelCall(kind, named[0] if named else hashed, ir.StringAttr(config["module"]).value_bytes,
                           hashed, stated.get("flops"), named[1] if named else None, _model_flops(attributes),
-                          caller=caller, output_dims=_frontend(attributes).get(OUTPUT_DIMS))
+                          caller=caller)
     if kind == "mosaic_tpu":
         config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
         return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",

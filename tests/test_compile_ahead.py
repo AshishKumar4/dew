@@ -8,6 +8,7 @@ a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 
 import contextlib
 import dataclasses
+import enum
 import functools
 import itertools
 import json
@@ -324,6 +325,71 @@ else:
 """A process that keeps a checked program, or is handed it, and reports what its failed check raises."""
 
 
+class Side(enum.Enum):
+    """Two labels of no plain form a program's results may carry."""
+
+    LEFT = "left"
+    RIGHT = "right"
+
+
+@jax.tree_util.register_pytree_node_class
+@dataclasses.dataclass(frozen=True)
+class Labelled:
+    """Results and their labels, the labels a node's static data (`Side`), as a tree of results states which
+    leaf is which."""
+
+    values: tuple
+    labels: tuple
+
+    def tree_flatten(self):
+        return self.values, self.labels
+
+    @classmethod
+    def tree_unflatten(cls, labels, values):
+        return cls(tuple(values), labels)
+
+
+DIGESTED = """
+import json
+import jax.numpy as jnp
+import checked_module
+from dew.nn.kernels.options import owned_program, program_digest
+
+print(json.dumps({"digest": program_digest(owned_program(checked_module.checked).lower(jnp.ones(3)))}))
+"""
+"""A process printing the digest of the checked program's lowering (`program_digest`)."""
+
+
+def test_a_programs_digest_is_one_in_every_process_and_its_trees_part_programs(tmp_path):
+    """A program's digest (`program_digest`) states its trees node by node: a checkified program, whose error
+    tree holds a traceback JAX prints by its address and whose frames name where its code is installed,
+    digests the same in two processes of the code installed in two places, as its lowered text is the same,
+    its frames stated by module, line and function (`dew._stated.traceback_frames`), and apart from one
+    whose check sits a line further down, which a kept program's failing check would report;
+    and two programs of one text whose trees differ (a mapping of other keys, or of one
+    enumeration's members labelling its results the other way round) digest apart, since an executable
+    takes and gives its leaves by its trees."""
+    from dew.nn.kernels.options import owned_program, program_digest
+
+    places = [tmp_path / "one", tmp_path / "other" / "install", tmp_path / "moved"]
+    # The third's check a line further down its file.
+    texts = [CHECKED_MODULE, CHECKED_MODULE, CHECKED_MODULE.replace("def _doubled", "\ndef _doubled")]
+    for place, text in zip(places, texts, strict=True):
+        place.mkdir(parents=True)
+        (place / "checked_module.py").write_text(text)
+    first, second, moved = (process_support.fresh(DIGESTED, cwd=place)["digest"] for place in places)
+    assert first == second != moved
+    values = jnp.ones(3)
+    one = owned_program(lambda tree: tree["a"] * 2).lower({"a": values})
+    other = owned_program(lambda tree: tree["b"] * 2).lower({"b": values})
+    assert program_digest(one) != program_digest(other)
+    # One text, its results labelled by a node's data of no plain form the other way round: a handed
+    # executable gives its results in its own tree, so the labels are part of the program.
+    first = owned_program(lambda x: Labelled((x * 2, x * 3), (Side.LEFT, Side.RIGHT))).lower(values)
+    swapped = owned_program(lambda x: Labelled((x * 2, x * 3), (Side.RIGHT, Side.LEFT))).lower(values)
+    assert program_digest(first) != program_digest(swapped)
+
+
 def test_a_kept_programs_failed_check_raises_where_handed_as_where_kept(tmp_path):
     """A checked program kept by one process (its error tree's tracebacks held as their frames,
     `HeldTraceback`) and handed to another raises its failed check there as the keeping process does, the
@@ -458,8 +524,63 @@ def test_a_begun_compile_is_not_taken_by_a_call_over_another_layout():
         np.testing.assert_array_equal(np.asarray(program(other)), values * 2)
 
 
+# Its import is read only as a call of `run` traces.
+LAZY_FRONT = "def run(x):\n    import lazy_impl\n\n    return lazy_impl.add(x)\n"
+"""An installed module whose function imports another installed module inside its body."""
+
+
+LAZY_KEPT = """
+import json
+import site
+import sys
+
+site.USER_SITE = sys.argv[3]
+sys.path.insert(0, sys.argv[3])
+import front
+import jax.numpy as jnp
+import numpy as np
+
+from dew.nn.kernels.options import owned_program
+from dew.training.ahead import NotTheKeptProgram, keeping, kept
+
+run = owned_program(front.run)
+if sys.argv[1] == "keep":
+    with keeping() as programs:
+        np.asarray(run(jnp.ones(2)))
+    programs.save(sys.argv[2])
+    print(json.dumps({"kept": len(programs.kept)}))
+else:
+    try:
+        with kept(sys.argv[2]):
+            print(json.dumps({"answer": np.asarray(run(jnp.ones(2))).tolist()}))
+    except NotTheKeptProgram as refused:
+        print(json.dumps({"refused": type(refused).__name__}))
+"""
+"""A process keeping `front.run`'s program (`keep`), whose trace imports `lazy_impl`, or handed it from the
+kept file by `kept`'s default (`take`): the call's answer, or the refusal."""
+
+
+def test_kepts_default_refuses_a_program_whose_code_changed_since_it_was_kept(tmp_path):
+    """A kept program of an installed distribution's code, handed by `kept`'s default in a later process,
+    the dependency it calls changed in place since (`x + 1` to `x + 2`), its version and RECORD as they
+    were: the default lowers the call's own program and holds it to the kept one's digest, so the stale
+    program is refused (`NotTheKeptProgram`), where the default trusted the identity alone, which states an
+    installed distribution by its version, and ran `x + 1`."""
+    from wheels import installed
+
+    site_packages = tmp_path / "site"
+    installed(site_packages, "front", {"front/__init__.py": LAZY_FRONT})
+    installed(site_packages, "lazy-impl", {"lazy_impl.py": "def add(x):\n    return x + 1\n"})
+    path = tmp_path / "lazy.dew-aot"
+    kept = process_support.fresh(LAZY_KEPT, "keep", str(path), str(site_packages), cwd=tmp_path)
+    assert kept == {"kept": 1}
+    (site_packages / "lazy_impl.py").write_text("def add(x):\n    return x + 2\n")
+    taken = process_support.fresh(LAZY_KEPT, "take", str(path), str(site_packages), cwd=tmp_path)
+    assert taken == {"refused": "NotTheKeptProgram"}
+
+
 def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):
-    """`kept(path, verify=True)` lowers each handed call's own program and holds it to the kept one's
+    """`kept(path)` lowers each handed call's own program and holds it to the kept one's
     digest: a file whose program for a call is another program (here its recorded digest changed) is
     refused at that call (`NotTheKeptProgram`), where the same file handed without verifying runs. And a
     file of programs compiled ahead by name, none kept by its call, is refused as it is handed."""

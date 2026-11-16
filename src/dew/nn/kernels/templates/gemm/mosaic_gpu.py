@@ -63,6 +63,7 @@ from dew.nn.kernels.templates import (
     cost as unit_cost,
     mosaic,
     mosaic_sm100,
+    outputs,
     resources,
     rings,
     stores,
@@ -905,7 +906,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                              joined=operand_streams(rewritten),
                                              **_gathered(gather, tiles, lhs.dtype, interpret)))
 
-    out_type = _declared(m if stored is None else stored, n, tiles.splits, dtypes)
+    out_type = _declared(lhs, rhs, gather, (m, n, stored), tiles.splits, dtypes, transpose_lhs, transpose_rhs)
     operands = _gmm_operands(lhs, rhs, paired, scales, step_scales, mx_scales, gather, scatter, joined)
     kernel = family.kernel(body, out_type=out_type,
                            grid=(multiprocessors // pair,), grid_names=("programs",),
@@ -971,13 +972,26 @@ def _prefetched(tiles: Tiles, grid: tuple, steps: int, transpose_rhs: bool, inte
     return {'prefetched': prefetched}
 
 
-def _declared(rows: int, n: int, splits: int, dtypes: tuple) -> tuple:
+def _declared(lhs, rhs, gather, shape: tuple[int, int, int | None], splits: int, dtypes: tuple,
+              transpose_lhs: bool, transpose_rhs: bool) -> tuple:
     """Dew: a `gmm` launch's outputs, `[rows, n]` each, a depth split's each run's partial a slice of its own
-    (`[splits, rows, n]`). A scattered product declares its stored rows alone, which its table's entries land
-    on, each once: its padded rows land nowhere, so rows past them would be declared and never written
-    (NSNAN-2)."""
-    return tuple(jax.ShapeDtypeStruct((rows, n) if splits == 1 else (splits, rows, n), dtype)
-                 for dtype in dtypes)
+    (`[splits, rows, n]`), stated as its operands' axes (`outputs.output`): its rows `lhs`'s (a gathered
+    product's table's, `gather`), its columns `rhs`'s width (each as its transpose lays it). A
+    scattered product declares its stored rows alone, which its table's entries land on, each once: its padded
+    rows land nowhere, so rows past them would be declared and never written (NSNAN-2); that count is its
+    call's, no operand axis of the launch, so its outputs state their shapes alone."""
+    m, n, stored = shape
+    if stored is not None:
+        return tuple(jax.ShapeDtypeStruct((stored, n) if splits == 1 else (splits, stored, n), dtype)
+                     for dtype in dtypes)
+    # Its rows the walked rows' less their extension past the last tile (`_walked_rows`), sized by the launch.
+    rows = outputs.axis(lhs, 1 if transpose_lhs else 0) if gather is None else outputs.axis(gather, 0)
+    rows = rows.sized(m)
+    width = outputs.axis(rhs, 1 if transpose_rhs else 2)
+    if width.size != n:
+        raise ValueError(f"a gmm's outputs are its matrix's width, {n}, not {width.size}")
+    dims = (rows, width) if splits == 1 else (splits, rows, width)
+    return tuple(outputs.output(dtype, *dims) for dtype in dtypes)
 
 
 def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family, part: tuple, share_row,
@@ -2007,6 +2021,18 @@ def _stored_chunks(family: mosaic.Family, summed, store: Callable, place: tuple)
         store(chunk, (row_start, first_row, stored, at, *ladder))
 
 
+def _tgmm_declared(lhs, rhs, sizes, shape: tuple[int, int, int], dtype, k_major: bool):
+    """Dew: a `tgmm` launch's output, each group's depth by width, stated as its operands' axes
+    (`outputs.output`): its groups `sizes`', its depth `lhs`'s and its width `rhs`'s, each where `k_major`
+    lays it, at the sizes the launch computes of them (its operands padded past them)."""
+    g, m, n = shape
+    out_type = outputs.output(dtype, outputs.axis(sizes, 0), outputs.axis(lhs, 0 if k_major else 1).sized(m),
+                              outputs.axis(rhs, 0 if k_major else 1).sized(n))
+    if out_type.shape[0] != g:
+        raise ValueError(f"a tgmm's outputs are its {g} groups, not its sizes' {out_type.shape[0]}")
+    return out_type
+
+
 @tuning.lowered_once(('shape', 'tiles', 'out_dtype', 'multiprocessors', 'interpret', 'prologue',
                       'prologue_axes', 'exact_sums', 'tail', 'k_major', 'unstaged', 'registers',
                       'shared'))
@@ -2121,7 +2147,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                                              swizzles=SCALE_SWIZZLES if step_scales is not None else None,
                                              **_tgmm_gathered(tables, allocations.blocks, bool(interpret))))
 
-    out_type = jax.ShapeDtypeStruct((g, m, n), out_dtype)
+    out_type = _tgmm_declared(lhs, rhs, groups[0], (g, m, n), out_dtype, k_major)
     kernel = family.kernel(body, out_type=out_type,
                            grid=(1 if interpret else multiprocessors // pair,), grid_names=("programs",),
                            consumers=consumers + rewritten, interpret=interpret, approx_math=False,

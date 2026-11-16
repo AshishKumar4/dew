@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import functools
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -110,6 +111,9 @@ class Report:
     binary_frame: int | None = None
     """Its registers a thread and stack frame's bytes as its executable's binary carries them
     (`report.Binary`): this process's assembly, which `inherited` reads where no PTX of it was dumped."""
+    cap: int | None = None
+    """The registers its launch runs a thread at, as its compile states them (`_compiled_here`'s), None where
+    unstated."""
 
     @property
     def traced(self) -> str:
@@ -118,10 +122,11 @@ class Report:
 
     def failure(self, shared_limit: int, tmem_limit: int) -> str | None:
         """Why the kernel is not within a multiprocessor's `shared_limit` bytes and `tmem_limit` tensor memory
-        columns without spilling registers, with its warpgroup MMAs in flight together and its register raises
-        taken, or None where it is: a kernel ptxas serializes runs its MMAs one at a time, its registers and
-        spills clean (row 3615; the kernel challenge's C7511 at 112 registers, C7512 at 96), and one whose
-        raises it ignores keeps its consumers at the entry's registers (C7507, row 4071)."""
+        columns without spilling registers, within its launch's register cap (`cap`), with its warpgroup MMAs
+        in flight together and its register raises taken, or None where it is: a kernel ptxas serializes runs
+        its MMAs one at a time, its registers and spills clean (row 3615; the kernel challenge's C7511 at 112
+        registers, C7512 at 96), and one whose raises it ignores keeps its consumers at the entry's registers
+        (C7507, row 4071)."""
         if self.unread:
             return f"its reports state no {', '.join(self.unread)}"
         if self.losses:
@@ -130,6 +135,8 @@ class Report:
                  else "serializes its warpgroup MMAs") + f" ({code})" for code in self.losses)
         if self.sass:
             return "its machine code holds " + "; ".join(self.sass)
+        if self.registers is not None and self.cap is not None and self.registers > self.cap:
+            return f"{self.registers} registers a thread, above its launch's {self.cap}"
         if (self.shared is not None and self.tmem is not None and self.shared <= shared_limit
                 and self.tmem <= tmem_limit and self.spilled == 0):
             return None
@@ -527,6 +534,27 @@ class Gated(str):
     own gathers the session's cells of one capability by (`compiled_apart`)."""
 
 
+
+def stated_outputs(lowered: jax.stages.Lowered, target: str | None = None) -> list[tuple[int, list | None]]:
+    """Each custom call of `lowered` (of the call target `target`, every one where None), in the order JAX
+    lowered them: the outputs it defines (its results less those aliasing an operand, a ref it writes in
+    place) and the dimensions it states them by (`outputs.OUTPUT_DIMS`, parsed; None where it states none),
+    as XLA's compiler reads its frontend attribute."""
+    from jax.extend.mlir import ir
+
+    from dew.nn.kernels import lowered as reading
+    from dew.nn.kernels.templates.outputs import OUTPUT_DIMS
+
+    def read(called: str, operation) -> tuple[int, list | None] | None:
+        if target is not None and called != target:
+            return None
+        aliased = (len(ir.ArrayAttr(operation.attributes["output_operand_aliases"]))
+                   if "output_operand_aliases" in operation.attributes else 0)
+        stated = reading._frontend(operation.attributes).get(OUTPUT_DIMS)
+        return len(operation.results) - aliased, None if stated is None else json.loads(stated)
+
+    return [call for call, _ in reading._read_calls(lowered, read)]
+
 def gate_generations(dtype=jnp.bfloat16, *, stated: bool = False, scoped: bool = False, tpu: bool = False,
                      needs: Callable[[Any, Any], bool] | None = None) -> tuple[Gated, ...]:
     """The generations a compile gate's cells take for a template's launches of `dtype` (its launch's
@@ -725,6 +753,9 @@ DECREASED = re.compile(r"setmaxnreg\.dec\.sync\.aligned\.u32 (\d+);")
 
 THREADS = re.compile(r"\.maxntid (\d+),")
 """A kernel's threads a block (`.maxntid`'s first), as a kernel record states them (`threads`)."""
+PROGRAMS = re.compile(r"\.minnctapersm (\d+)")
+"""The programs a multiprocessor holds of a kernel at once (`.minnctapersm`, Mosaic's `min_blocks_per_sm`), as
+ptxas bounds its registers by them (`cap`)."""
 
 
 RELOCATABLE = not resources.RAISES_HONORED
@@ -818,6 +849,14 @@ def _compiled_here(cases, generation: str) -> list[dict]:
                 kernel["threads"] = int(threads.group(1)) if (threads := THREADS.search(ptx)) else None
                 # Whether this process dumped its PTX: none where its module compiled before the gate's.
                 kernel["dumped"] = bool(ptx)
+                # The registers its launch runs a thread at, as its compile states them: its consumers' raise
+                # where it raises, else its threads' share of the multiprocessor's registers at the programs
+                # it is launched to hold (`resources.thread_share`); None where no PTX states its threads.
+                programs = int(held.group(1)) if (held := PROGRAMS.search(ptx)) else 1
+                with assumed(gpu_target(generation)):
+                    kernel["cap"] = (kernel["raised"] if kernel["raised"] is not None
+                                     else None if kernel["threads"] is None
+                                     else resources.thread_share(kernel["threads"], programs))
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         found.append(record)
     return found

@@ -14,6 +14,8 @@ import contextvars
 import dataclasses
 import functools
 import hashlib
+import json
+import logging
 import threading
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
@@ -29,8 +31,9 @@ from jax._src.interpreters import pxla
 from jax.experimental.layout import Format
 from jax.sharding import Sharding
 
-from dew import _cache, algebra
+from dew import _cache, _stated, algebra
 from dew._devices import xla_flag
+from dew._stated import Unestablished
 from dew.nn.kernels.generation import backend, gpu_target, stated, traced_fact
 from dew.nn.nested import staged
 from dew.telemetry.benchmark import UNGRAPHED_FLAG, options_of
@@ -164,6 +167,8 @@ class JitArguments(TypedDict, total=False):
     out_shardings: Placements
 
 
+_log = logging.getLogger("dew.kernels")
+
 _PROGRAMS: weakref.WeakSet[OuterProgram] = weakref.WeakSet()
 """Every program alive (`OuterProgram`), whose executables `release` drops."""
 
@@ -175,14 +180,55 @@ _TAKEN: contextvars.ContextVar[Taken | None] = _cache.untraced(
     contextvars.ContextVar("dew_taken_programs", default=None))
 
 
+def program_key(lowered: jax.stages.Lowered) -> Hashable:
+    """A program as `lowered` holds it, within this process: its text's digest, its arguments' and results'
+    trees as JAX holds them (a node's type the class itself, its data by equality) and its arguments'
+    types. Two lowerings of one program agree, whichever devices of one target they were lowered over, and
+    two whose texts agree only as JAX prunes an argument neither reads do not; any tree has one, a class
+    made inside a function among its nodes. The key of every match within a process (a search's compiled
+    executables, a begun compile's lowering); `program_digest` is the one a file of programs holds."""
+    types = tuple((aval.shape, str(aval.dtype), aval.weak_type) for aval in jax.tree.leaves(lowered.in_avals))
+    return _text_digest(lowered), lowered.in_tree, lowered.out_tree, types
+
+
+def _text_digest(lowered: jax.stages.Lowered) -> str:
+    return hashlib.sha256(lowered.as_text().encode()).hexdigest()
+
+
 def program_digest(lowered: jax.stages.Lowered) -> str:
-    """A program as `lowered` holds it, its text's digest beside its arguments' and results' trees and its
-    arguments' types: two lowerings of one program agree, whichever devices of one target they were
-    lowered over, and two whose texts agree only as JAX prunes an argument neither reads, which their
-    executables take in other trees, do not (a step's commit with its sample's summaries and without)."""
+    """A program as `lowered` holds it, as a file of programs holds it across processes: its text's digest
+    beside its arguments' and results' trees and its arguments' types, as `program_key` holds them within
+    one. Two lowerings of one program agree, whichever devices of one target they were lowered over, and
+    two whose texts agree only as JAX prunes an argument neither reads, which their executables take in
+    other trees, do not (a step's commit with its sample's summaries and without). Refused
+    (`dew._stated.Unestablished`) where a tree holds a node no process names (a class made inside
+    a function): no file can hold that program, and each reader of a file's programs takes it as one the
+    file holds none of (`taken`, `dew.training.ahead.kept`), or refuses it, naming the tree, where it
+    must keep it (a step compiled ahead)."""
+    # Its trees node by node, each node's data by value as an identity states it (`dew._stated.stated`), never
+    # as JAX prints them, which holds a node's data by its printed form: a checkified program's error tree
+    # holds a traceback printed by its address, another in every process. A handed executable gives its
+    # results in its own output tree, so a node's data that labels its leaves (a key of no plain form) is
+    # part of the program.
     types = jax.tree.map(lambda aval: (aval.shape, str(aval.dtype), aval.weak_type), lowered.in_avals)
-    called = f"{lowered.in_tree}\n{lowered.out_tree}\n{types}"
-    return hashlib.sha256(f"{lowered.as_text()}\n{called}".encode()).hexdigest()
+    trees = json.dumps([_stated.stated(lowered.in_tree, "a program's arguments' tree"),
+                        _stated.stated(lowered.out_tree, "a program's results' tree")], sort_keys=True)
+    return hashlib.sha256(f"{_text_digest(lowered)}\n{trees}\n{types}".encode()).hexdigest()
+
+
+def taken(lowered: jax.stages.Lowered) -> Callable[[], jax.stages.Compiled] | None:
+    """The program compiled ahead for this target that `lowered` is (`taking`), None where the block hands
+    none or holds none for it: a program whose trees no file can hold (`program_digest`) among them."""
+    if (programs := _TAKEN.get()) is None:
+        return None
+    try:
+        return programs.get(program_digest(lowered))
+    except Unestablished as refusal:
+        _log.info("a program no file of programs states compiles, though programs compiled ahead are "
+                  "handed: %s", refusal)
+        return None
+
+
 
 
 @contextlib.contextmanager
@@ -660,7 +706,7 @@ class OuterProgram:
             self._released(key, pending, failure)
             raise
         # A program compiled ahead for this target runs as it was compiled (`taking`).
-        if (taken := _TAKEN.get()) and (ahead := taken.get(program_digest(lowered))) is not None:
+        if (ahead := taken(lowered)) is not None:
             self._keep(key, pending, ahead(), [])
         else:
             together[id(self), key] = _Lowering(self, key, pending, lowered, args, kwargs)
@@ -714,12 +760,12 @@ class OuterProgram:
         else:
             lowered = self.lower(*args, **kwargs)
         # A program compiled ahead for this target runs as it was compiled (`taking`).
-        if (taken := _TAKEN.get()) and (ahead := taken.get(program_digest(lowered))) is not None:
+        if (ahead := taken(lowered)) is not None:
             return ahead()
         # Its first compile from that thread, where it lowers the program begun there.
         first = None
         if begun is not None and (lowered is begun.lowered
-                                  or program_digest(begun.lowered) == program_digest(lowered)):
+                                  or program_key(begun.lowered) == program_key(lowered)):
             first = begun.attempt.result()
         executable = report.compiled(lowered,
                                      relower=functools.partial(self._relowered, args, kwargs, relowered),

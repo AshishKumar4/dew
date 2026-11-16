@@ -193,6 +193,23 @@ def test_a_recording_holds_its_own_contexts_records():
         assert list(report.rewrites()) == [*before, *recorded.rewritten]
 
 
+def test_a_recording_opened_after_a_miss_holds_it_when_met_again():
+    """A miss a launch's certification records (`report.missed`) is the process's once, and a `recording`
+    opened since (a later plan's admission, `planning.admitted`) holds it when its own trace meets it again,
+    where the process's having it already kept it from the recording (train 935 F4)."""
+    from dew.nn.kernels.templates import report
+
+    op = Doubling()
+    with generation.assumed("sm86"):
+        ba, config = bound(op), Block(64)
+    spilled = report.Binary("doubling", None, 255, 16)
+    with report.refusals():
+        report.missed(op, ba, config, [spilled], stepped=True)
+        with report.recording() as recorded:
+            report.missed(op, ba, config, [spilled], stepped=True)
+        assert len(report.misses()) == 1 and len(recorded.missed) == 1, (report.misses(), recorded.missed)
+
+
 def test_chosen_names_a_declared_choice_and_no_other():
     """`generation.chosen` names a choice by the name its declaration gives it (`generation.Choice`), which a
     site deciding by that declaration reads (`chosen_kernel`), and refuses a name no choice is declared by (a

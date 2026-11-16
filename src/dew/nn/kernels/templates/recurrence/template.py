@@ -434,7 +434,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         each launch's stated tiles, `resources.live_registers`; `_forwards`): a legal config's launches spill
         nothing. The fast backward's launches are held to the same budget where its rule takes them
         (`backward_holds`), and a call they do not hold takes no gradient of it (`trains`)."""
-        target = self.launched()
+        target = self.launch_target()
         if bundle(target) is None:
             return None
         return max(launch.registers for launch in self._forwards(ba, config, target))
@@ -449,7 +449,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
                 *self.launches(ba, config, target, backward=False, training_forward=True))
 
     def register_budget(self, config: mainloop.Tiles) -> int:
-        family = bundle(self.launched())
+        family = bundle(self.launch_target())
         return resources.facts().thread_registers if family is None else family.registers(1)
 
     def held(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> bool:
@@ -457,7 +457,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         (`Family.registers` at `Launch.consumers`: a walk of `Tiles.walkers` roles holds less a role than a
         launch of one) and a multiprocessor holds a program of it (`Launch.resident`): the forwards' at the
         tiles each runs at (`_forwards`)."""
-        target = self.launched()
+        target = self.launch_target()
         family = bundle(target, _dtype(ba))
         if family is None:
             return super().held(ba, config)
@@ -695,24 +695,17 @@ class Mosaic(base.Template[mainloop.Tiles]):
         return tiles
 
     def emitted(self, config: Hashable, kernel: str) -> Hashable:
-        """What `kernel` reads of `config` as it is emitted: all of it but the other launches' producers
-        (`Tiles.producers`, each launch's own setmaxnreg cap, the call's tiles' and its forward's apart, each
-        a level a launch reads), so a producer's raise leaves every other kernel of the launch the module it
-        was, which a rung's certification then reads from the lowering cache and Mosaic's compile (`rungs`):
-        a rung re-lowered and recompiled every kernel of the 4B's training launch, 7 and 5 s of each 12."""
+        """What `kernel` reads of `config` as it is emitted: all of it but the other launches' producers and
+        residents (`Tiles.producers`, each launch's own setmaxnreg cap, and `Tiles.residents`, the call's
+        tiles' and its forward's apart, each a level a launch reads), so a producer's raise leaves every other
+        kernel of the launch the module it was, which a rung's certification then reads from the lowering
+        cache and Mosaic's compile (`rungs`): a rung re-lowered and recompiled every kernel of the 4B's
+        training launch, 7 and 5 s of each 12."""
         if not self._typed(config):
             return config
-
-        def own(tiles: mainloop.Tiles) -> mainloop.Tiles:
-            # The caps its emission reads: its launch's by its name, which the launch passes to `report.named`
-            # and to `Call.producers` and `Call.residents` alike.
-            cap, held = tiles.producers.of(kernel), tiles.residents.of(kernel)
-            return dataclasses.replace(
-                tiles, producers=resources.Producers(() if cap is None else ((kernel, cap),)),
-                residents=resources.Residents(() if held is None else ((kernel, held),)))
-
-        forward = None if config.forward is None else own(config.forward)
-        return dataclasses.replace(own(config), forward=forward)
+        # The tiles its launch is given (`Tiles.at`), its cap and residents by its name, which the launch
+        # passes to `report.named` and reads of `Call.producers` and `Call.residents` alike.
+        return config.at((kernel,))
 
     def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> Iterator[mainloop.Tiles]:
         """The tiles a refused `config`'s spilling launches step through (`_stepped`): each one's producer's
@@ -882,7 +875,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         hold at the call's derived tiles (`_backward_holds`), the rule's gradient (`mosaic_rule`) refusing
         every other call."""
         if generation.backend() == "cpu" and bundle(target) is None:
-            target = self.launched()
+            target = self.launch_target()
         arguments = ba.arguments
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
         forms = mainloop_backward.fast_backward_form(arguments.get("delta", True),
@@ -979,7 +972,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         the next value block either side of it at its stage rule (`_staged`), and its block one stage
         shallower (or two deep where it takes one), their launches' producers raised as the derived config's
         are (`_settled`)."""
-        target = self.launched()
+        target = self.launch_target()
         family = bundle(target, _dtype(ba))
         assert family is not None
         blocks = self._blocks(ba, family)
@@ -1011,7 +1004,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         Unfitted from inside the call, row 6816). Off a GPU (a CPU's), where the rule
         runs its bundle interpreted, the target is the interpreted bundle's generation (`launched`)."""
         if generation.backend() == "cpu" and bundle(target) is None:
-            target = self.launched()
+            target = self.launch_target()
         arguments = ba.arguments
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
         if dtype not in (jnp.bfloat16, jnp.float16, jnp.float32):

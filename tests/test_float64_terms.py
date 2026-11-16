@@ -413,3 +413,111 @@ def test_the_anchored_truth_is_within_its_bound_and_never_further_than_the_plain
         resolved = [at for at in anchors if not within(exact[at], 2 * bound[at])]
         assert resolved
         assert not any(within(plain_errors[at], bound[at]) for at in resolved)
+
+
+def _momentum(weights, xs, reverse=False):
+    """A scan whose carry's terms its first step makes (a halved carry beside a product's sum) and whose
+    outputs stack each step's sum, from its last step first where `reverse`."""
+    def step(carry, x):
+        carry = carry * 0.5 + weights @ x
+        return carry, jnp.sum(carry * x)
+    return jax.lax.scan(step, jnp.zeros(weights.shape[0], weights.dtype), xs, reverse=reverse)
+
+
+def _momentum_unrolled(weights, xs, reverse=False):
+    """`_momentum`'s steps written one after another, each output at its step's place (`jnp.stack`)."""
+    carry, ys = jnp.zeros(weights.shape[0], weights.dtype), {}
+    for index in reversed(range(len(xs))) if reverse else range(len(xs)):
+        carry = carry * 0.5 + weights @ xs[index]
+        ys[index] = jnp.sum(carry * xs[index])
+    return carry, jnp.stack([ys[index] for index in range(len(xs))])
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reversed"])
+def test_a_scans_values_and_terms_are_its_steps_walked_whole(reverse):
+    """A scan walked whole (one scan whose step is the walk of its body, its first step alone until its
+    carry's terms keep their kind) is its steps written one after another, values and terms, a stacked
+    output's terms its steps' (`jnp.stack` carries them, as the scan's stacking does): the stepped walk's
+    evaluation, compiled once. Small integers, halved, so every value and term is exact in float64 and any
+    order or fusion of the arithmetic gives it."""
+    rng = np.random.default_rng(0)
+    weights, xs = (rng.integers(-3, 4, shape).astype(np.float64) for shape in ((6, 6), (5, 6)))
+    with jax.enable_x64(new_val=True):
+        scanned = float64_terms(lambda w, x: _momentum(w, x, reverse), weights, xs)
+        unrolled = float64_terms(lambda w, x: _momentum_unrolled(w, x, reverse), weights, xs)
+    for got, own in zip(jax.tree.leaves(scanned), jax.tree.leaves(unrolled), strict=True):
+        np.testing.assert_array_equal(got, own)
+
+
+def _alternating(xs, length):
+    """A carry whose terms alternate step by step: its product by a sum ends its terms (a product of two
+    sums), the next step's by that sum making them again."""
+    total = jnp.sum(xs)
+    return jax.lax.scan(lambda carry, _: (carry * total, None), jnp.ones((), xs.dtype), None,
+                        length=length)[0]
+
+
+def _alternating_unrolled(xs, length):
+    total, carry = jnp.sum(xs), jnp.ones((), xs.dtype)
+    for _ in range(length):
+        carry = carry * total
+    return carry
+
+
+def _given(xs, length):
+    """A scan reading nothing it is given: each step's output a sum of its own constants."""
+    del xs
+    return jax.lax.scan(lambda carry, _: (carry, jnp.sum(jnp.arange(4.0))), None, None, length=length)[1]
+
+
+def _given_unrolled(xs, length):
+    del xs
+    return jnp.stack([jnp.sum(jnp.arange(4.0)) for _ in range(length)])
+
+
+def _beside_empty(xs, length):
+    """An input beside an empty scan's outputs: the input's own size, no terms the empty scan made up."""
+    del length
+    return jnp.concatenate([xs, jax.lax.scan(lambda carry, _: (carry, jnp.sum(xs)), None, None, length=0)[1]])
+
+
+def _beside_empty_unrolled(xs, length):
+    del length
+    return jnp.concatenate([xs, jnp.zeros((0,), xs.dtype)])
+
+
+def _picking(xs, length):
+    """A scan whose step's branch its values pick (its carry's sign): stepped on concrete values."""
+    total = jnp.sum(xs)
+
+    def step(carry, _):
+        carry = jax.lax.cond(carry > 0, lambda value: value - total, lambda value: value + 2 * total, carry)
+        return carry, None
+    return jax.lax.scan(step, total, None, length=length)[0]
+
+
+def _picking_unrolled(xs, length):
+    total = jnp.sum(xs)
+    carry = total
+    for _ in range(length):
+        carry = jax.lax.cond(carry > 0, lambda value: value - total, lambda value: value + 2 * total, carry)
+    return carry
+
+
+@pytest.mark.parametrize("length", [1, 2, 5])
+@pytest.mark.parametrize(("scanned", "unrolled"), [(_alternating, _alternating_unrolled),
+                                                   (_given, _given_unrolled),
+                                                   (_beside_empty, _beside_empty_unrolled),
+                                                   (_picking, _picking_unrolled)],
+                         ids=["alternating terms", "nothing given", "an empty scan", "a picked branch"])
+def test_a_scans_walk_is_its_steps_whatever_its_carries_terms_do(scanned, unrolled, length):
+    """A scan whose carry's terms alternate (its steps alone until they cycle, then whole cycles scanned, at
+    an odd length one left over), one reading nothing it is given, an empty one beside an input, and one
+    whose step's branch its values pick (stepped): each its steps written one after another, values and
+    terms, exactly (small integers)."""
+    xs = np.asarray([1.0, 2.0, -1.0])
+    with jax.enable_x64(new_val=True):
+        got = float64_terms(lambda x: scanned(x, length), xs)
+        own = float64_terms(lambda x: unrolled(x, length), xs)
+    for value, expected in zip(jax.tree.leaves(got), jax.tree.leaves(own), strict=True):
+        np.testing.assert_array_equal(value, expected)

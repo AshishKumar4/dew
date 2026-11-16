@@ -13,6 +13,7 @@ roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
 
 import collections
+import contextlib
 import dataclasses
 import functools
 import types
@@ -1226,18 +1227,26 @@ def _two_roles(bound, derived, facts, *, packed: bool, training: bool) -> list:
 
 def _gate_call(name: str, dtype, given: list, starts, tiles, family, *, training: bool):
     """A gate case's call (`KernelCase`'s): `name`'s forward, or training step over the output's and final
-    memory's cotangents in `given`, at `tiles` on `family`, over packed documents where `starts` are given."""
+    memory's cotangents in `given`, at `tiles` on `family`, over packed documents where `starts` are given.
+    A training step runs as the template's call does (`Mosaic.launches`' backward): the forward keeping what
+    its backward takes (`chunk_forward.kept_forward`, its output launch the step's own) and the backward
+    taking it, each of its launches compiled as the step compiles it."""
     formed = {key: value for key, value in _form(name, dtype).items() if key != 'wide' or not training}
-    run = functools.partial(mainloop_backward.gradients if training else chunk_forward.forward, **formed,
-                            )
     skip = list(_skipped(name).values())
     packed = starts is not None
 
     def fn(*operands):
         *operands, documents = operands if packed else (*operands, None)
         *operands, fused = (*operands, None) if not skip else operands
-        return run(*operands, tiles=tiles, starts=documents, max_segments=8 if packed else None,
-                   family=family, skip=fused)
+        options = dict(tiles=tiles, starts=documents, max_segments=8 if packed else None, family=family,
+                       skip=fused, **formed)
+        if not training:
+            return chunk_forward.forward(*operands, **options)
+        *inputs, out_grad, final_grad = operands
+        out, final, (inverse, kept) = chunk_forward.kept_forward(*inputs, keeps=True, **options)
+        grads = mainloop_backward.gradients(*inputs, out_grad, final_grad, inverse=inverse, kept=kept,
+                                            **options)
+        return out, final, grads
 
     return fn, (*given, *skip, *([starts] if packed else []))
 
@@ -1515,6 +1524,38 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
         cases = compiled_cases(target, plans, [], apart, only=group, launched=launched)
         found = compile_mosaic_kernels(cases, target)
     return cases, found
+
+
+@pytest.mark.parametrize("first", [False, True], ids=["forward first", "gradient first"])
+def test_a_launchs_call_and_its_gradients_product_are_two_launches_in_either_order(first):
+    """A recurrence launch traced as its call runs it and as a gradient's product (`report.pulled`), in either
+    order in one process: each its own launch (`report.launch_digest`, its calls' caller), read back in its
+    own mode (`report.traced`, which a program's refusal's verdict keys on, `_held`), the two verdict keys
+    apart (`_verdict_key`). One digest for both, the registry kept the first mode, and a training program's
+    refusal was stored as the forward's verdict, a later start meeting it again by a whole-program compile
+    (the evening audit's KPM-01)."""
+    name, dtype = 'kimi-linear-kda', jnp.bfloat16
+    # A length of its own a parametrization: a launch identity neither order traced before.
+    length = 256 if first else 512
+    bound = template.MOSAIC.bind(*resource_operands(name, dtype, 1, length),
+                                 jax.ShapeDtypeStruct((1, length), jnp.bool_), max_segments=8, bound=1.0,
+                                 **_form(name, dtype))
+    tiles = mainloop.Tiles(32, 3, 128, 2, chunk=64)
+
+    def digest(reverse: bool) -> str:
+        with contextlib.ExitStack() as scope:
+            if reverse:
+                scope.enter_context(report.pulled())
+            with report.launching(template.MOSAIC, bound, tiles):
+                return report.launch_digest()
+
+    digests = {reverse: digest(reverse) for reverse in (first, not first)}
+    assert digests[False] != digests[True]
+    launches = {reverse: report.traced(found) for reverse, found in digests.items()}
+    assert {reverse: launch.reverse for reverse, launch in launches.items()} == {False: False, True: True}
+    keys = {report._verdict_key(launch.identity, launch.config, launch.reverse)
+            for launch in launches.values()}
+    assert len(keys) == 2 or keys == {None}, keys
 
 
 @COMPILES_ON_CPU
@@ -1972,6 +2013,45 @@ def test_a_programs_refusal_is_stored_as_its_own_configs_verdict_whatever_body_n
     from process_support import fresh
 
     assert fresh(SHARED_NAME, cache_dir=tmp_path / "cache")["stored"] == [False, True]
+PROGRAM_LOWERED = """
+import collections, json
+import jax, jax.numpy as jnp, numpy as np
+from jax._src import monitoring
+from dew.nn.kernels import generation
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.templates import report
+from dew.training.runtime import ready_process
+import test_recurrence_mosaic as gate
+
+served = collections.Counter()
+monitoring.register_event_listener(
+    lambda event, **_: served.update([event.rsplit("/", 1)[-1]]) if "lowering_cache" in event else None)
+ready_process()
+# A step on one B200, compiled ahead for it: its program set on one compile-only device's mesh, as a trainer
+# sets its step's (`jax.set_mesh`).
+device = compile_only_gpus("sm100")[0]
+mesh = jax.sharding.Mesh(np.array([device]), ("data",))
+with jax.set_mesh(mesh):
+    certified, _ = gate._reverse_walk_certified()
+bodies = {kernel_hash for each in certified for kernel_hash, _ in each.kernels.values()}
+print(json.dumps({"served": dict(served), "bodies": len(bodies)}))
+"""
+"""A process configured as a run's (`ready_process`) certifying the 4B reverse walk's training call and
+lowering its program on one B200's mesh (`_reverse_walk_certified`): the lowering cache's hits and misses,
+and the kernel bodies its certifications compiled."""
+
+
+@lowers('sm100')
+def test_a_program_on_one_gpu_reads_back_every_kernel_its_certification_lowered(tmp_path):
+    """A training call certified on its own GPU and lowered in a program set on that one GPU's mesh
+    (`PROGRAM_LOWERED`): each kernel body is lowered once in Python, by its certification on the program's
+    mesh (`report._certifying_placement`), and the program reads it back from the lowering cache. On a mesh
+    of its own, certification lowered the call's nine kernels to jaxprs of other abstract values, and the
+    program lowered all nine again."""
+    from process_support import fresh
+
+    found = fresh(PROGRAM_LOWERED, cache_dir=tmp_path / "cache", platforms="cpu")
+    assert found["served"].get("miss", 0) == found["bodies"], found
 
 
 @lowers('sm100')
