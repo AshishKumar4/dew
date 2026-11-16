@@ -1159,7 +1159,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         # output fp32, the call's. Its fold's logits a difference of raw products scaled after it
         # (`MosaicForward.subtracted`): no reach, so no natural rewalk, whose guarded walk of parts held no
         # registers at width 64 (8 bytes spilled on an H100, et-fp32regs7).
-        query, key, value = (jnp.concatenate(product.formed(x, parts), axis=0) for x in (query, key, value))
+        query, key, value = (product.stacked(x, parts) for x in (query, key, value))
         out_dtype = jnp.float32 if out_dtype is None else out_dtype
         subtracted = True
     op = MosaicForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,

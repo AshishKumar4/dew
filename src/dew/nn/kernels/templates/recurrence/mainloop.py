@@ -259,14 +259,14 @@ class Operand:
         return jax.ShapeDtypeStruct((self.parts * self.rows, columns), self.stored)
 
     def split(self, x):
-        """`x` `[rows, columns]` in its dtype as its stacked parts."""
+        """`x` `[rows, columns]` in its dtype as its stacked parts (`product.stacked`)."""
         if self.parts == 1:
             return x.astype(self.dtype)
-        return jnp.concatenate(product.formed(x.astype(jnp.float32), self.parts), 0)
+        return product.stacked(x, self.parts)
 
     def joined(self, x):
-        """Its stacked parts `x` as the value `[rows, columns]` they sum to, fp32 (`split`'s inverse)."""
-        return x.astype(jnp.float32).reshape(self.parts, -1, x.shape[-1]).sum(0)
+        """Its stacked parts `x` as the value `[rows, columns]` they sum to, fp32 (`product.joined`)."""
+        return product.joined(x, self.parts)
 
 
 @dataclasses.dataclass(frozen=True)
