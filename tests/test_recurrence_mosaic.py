@@ -1605,8 +1605,12 @@ def test_a_forked_calls_walks_keep_its_table_spilling_none(target, name, trainin
         if not spilling or tiles in stepped:
             break
         stepped.add(tiles)
+        # The roles each spill stood in, as a run's certification states them, which its ladder steps by.
+        spilled_in = {binary["kernel"]: None if binary["spilled_in"] is None else tuple(binary["spilled_in"])
+                      for record in found for binary in record.get("binaries", ())
+                      if binary["kernel"] in spilling}
         with generation.assumed(facts):
-            report.refuse_launch(template.MOSAIC, bound, tiles, spilling)
+            report.refuse_launch(template.MOSAIC, bound, tiles, spilling, spilled_in)
     assert mosaic_failures(found) == []
 
 

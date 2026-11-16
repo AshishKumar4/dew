@@ -656,12 +656,31 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _stepped(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                  target: generation.GpuTarget) -> mainloop.Tiles | None:
         """`joined`'s next rung for its `spilled` launches: their producers a rung down their ladders
-        (`_raised`), or, past a ladder's foot, those launches a program fewer a multiprocessor with their
-        producers at the least again (`_fewer`), whose ladders then run at that residency; None past one
-        program."""
-        if (raised := self._raised(ba, joined, spilled, target)) is not None:
+        (`_raised`), or, past a ladder's foot or where every rung left gives their consumers less
+        (`_consumers_spilled`), those launches a program fewer a multiprocessor with their producers at the
+        least again (`_fewer`), whose ladders then run at that residency; None past one program."""
+        if not self._consumers_spilled(ba, joined, spilled, target) and (
+                raised := self._raised(ba, joined, spilled, target)) is not None:
             return _limited(joined, producers=raised, residents=joined.residents)
         return self._fewer(ba, joined, spilled, target)
+
+    def _consumers_spilled(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
+                           target: generation.GpuTarget) -> bool:
+        """Whether `joined`'s `spilled` kernels each spilled in its consumers' code alone
+        (`report.spilled_in`, the training call's and its forward alone's) with its launch's producer at its
+        consumers' statement's share, or at its least where it states none (`_stated_caps`): every rung its
+        ladder has left raises the producer, giving the consumers less, which a program fewer gives more (row
+        6744: a write-gated H100 scores' backward spilled 16 bytes in its consumers at the least, and its
+        ladder compiled a hundred rungs from the top down, each spilling more, before the program fewer)."""
+        roles = report.spilled_in(self, ba, joined) | (
+            report.spilled_in(self, ba, joined.forward) if joined.forward else {})
+        if any(roles.get(kernel) != (report.CONSUMERS,) for kernel in spilled):
+            return False
+        family = bundle(target, _dtype(ba))
+        assert family is not None
+        moving = self._moving(ba, joined, spilled, target)
+        stated = _stated_caps(moving, family)
+        return all(joined.producers.of(launch.name) == stated.get(launch.name) for launch in moving)
 
     def _fewer(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                target: generation.GpuTarget) -> mainloop.Tiles | None:

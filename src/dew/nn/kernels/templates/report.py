@@ -24,7 +24,7 @@ import struct
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, overload
@@ -189,6 +189,10 @@ class _Registry:
     passes: collections.deque[float] = dataclasses.field(
         default_factory=lambda: collections.deque(maxlen=RECORDS_HELD))
     """Each program's whole pass, in seconds: its walks of its bodies and windows beside its regions'."""
+    spilled_in: dict[tuple[str, Hashable], dict[str, tuple[str, ...] | None]] = dataclasses.field(
+        default_factory=dict)
+    """The roles each refused kernel's spill stood in, by its refusal, where its compile read them
+    (`refuse_launch`)."""
     by_launch: dict[str, frozenset] = dataclasses.field(default_factory=dict)
     """`refusals_of`'s answers by launch identity, each dropped as a refusal of its launch is recorded: read
     for every config a derivation weighs, each answer gathered from every launch's refusals took 426 of a
@@ -476,11 +480,27 @@ def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable) -> froze
     return dict(refusals_of(_identity(op, arguments))).get(config, frozenset())
 
 
-def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kernels) -> None:
+def spilled_in(op, arguments: tokamax.BoundArguments, config: Hashable) -> dict[str, tuple[str, ...] | None]:
+    """The roles each of `op`'s kernels a compile refused at `config` for `arguments` spilled in, as its
+    refusal states them (`refuse_launch`'s `spilled_in`, `Binary.spilled_in`), by kernel name: what a launch's
+    ladder steps it by (row 6744). A kernel refused with no roles stated is absent."""
+    with _GUARD:
+        return dict(_registry().spilled_in.get((_identity(op, arguments), config), {}))
+
+
+def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kernels,
+                  spilled_in: Mapping[str, tuple[str, ...] | None] | None = None) -> None:
     """`op`'s launch of `arguments` at `config` refused in this context as a compile that found `kernels`
     spilling refuses it (`settled`), so its derivation takes the next config: a compile gate's, which
-    compiles a launch apart from `compiled`, stepping as a run's compile steps (row 4727)."""
-    _record((_identity(op, arguments), config), None, frozenset(kernels))
+    compiles a launch apart from `compiled`, stepping as a run's compile steps (row 4727). `spilled_in`, the
+    roles each kernel's spill stood in where the compile read them (`Binary.spilled_in`), kept for its
+    ladder (`spilled_in`)."""
+    refusal = (_identity(op, arguments), config)
+    _record(refusal, None, frozenset(kernels))
+    if spilled_in:
+        registry = _registry()
+        with _GUARD:
+            registry.spilled_in[refusal] = {**registry.spilled_in.get(refusal, {}), **spilled_in}
 
 
 _CERTIFYING: contextvars.ContextVar = contextvars.ContextVar("certifying_device", default=None)
@@ -1447,6 +1467,9 @@ class Binary:
     notes: tuple["AssemblerNote", ...] = ()
     """What ptxas noted of a loss of performance as it assembled it, in its order (`ASSEMBLER_NOTES`, a
     Mosaic GPU kernel's); none where its call states none (a Pallas-Triton kernel's, a build without them)."""
+    spilled_in: tuple[str, ...] | None = ()
+    """The roles whose code its spill stands in where it spills (`spilled_roles`: `PRODUCER`, `CONSUMERS`),
+    none where it spills none; None where no disassembler listed it (`disassembler`)."""
 
     @property
     def launched(self) -> str | None:
@@ -1633,8 +1656,12 @@ def _binary(function: str, elf: bytes, decoded: bool = False) -> Binary:
                 at += 4
     if REGISTER_COUNT not in stated:
         raise ValueError(f"the binary of {function} states no registers")
-    return Binary(*kernel_of(function), stated[REGISTER_COUNT], stated.get(FRAME_SIZE, 0),
-                  sass=sass_findings(elf) if decoded else ())
+    frame = stated.get(FRAME_SIZE, 0)
+    # Listed where its findings are asked or it spills, whose roles the ladder that steps it reads.
+    listing = _listing(elf) if decoded or frame else None
+    return Binary(*kernel_of(function), stated[REGISTER_COUNT], frame,
+                  sass=(None if listing is None else sass_findings_of(listing)) if decoded else (),
+                  spilled_in=(None if listing is None else spilled_roles(listing)) if frame else ())
 
 
 def disassembler() -> Path | None:
@@ -1652,14 +1679,42 @@ def disassembler() -> Path | None:
 def sass_findings(elf: bytes) -> tuple[str, ...] | None:
     """What the machine code of the cubin `elf` breaks of the SASS rules (`sass_findings_of`, nvdisasm's
     listing of it); None where no disassembler is installed (`disassembler`), the rules unread."""
+    listing = _listing(elf)
+    return None if listing is None else sass_findings_of(listing)
+
+
+def _listing(elf: bytes) -> str | None:
+    """nvdisasm's listing of the cubin `elf`; None where no disassembler is installed (`disassembler`)."""
     tool = disassembler()
     if tool is None:
         return None
     with tempfile.NamedTemporaryFile(suffix=".cubin") as cubin:
         cubin.write(elf)
         cubin.flush()
-        listing = subprocess.run([str(tool), "-c", cubin.name], capture_output=True, text=True, check=True)
-    return sass_findings_of(listing.stdout)
+        return subprocess.run([str(tool), "-c", cubin.name], capture_output=True, text=True,
+                              check=True).stdout
+
+
+PRODUCER, CONSUMERS = "producer", "consumers"
+"""A warpgroup-specialized kernel's roles, as its SASS places them (`spilled_roles`)."""
+
+
+def spilled_roles(listing: str) -> tuple[str, ...]:
+    """The roles whose code a kernel's spill stands in, from nvdisasm's `listing`: each local-memory store
+    and load (STL, LDL) the role of the last setmaxnreg before it, ptxas laying each role's branch out after
+    its own, the producer's drop (`USETMAXREG.DEALLOC`) or the consumers' raise (`USETMAXREG.TRY_ALLOC`); one
+    before either, a prologue's, neither role's (row 6744: a B200's decayed keys spilled after its producer's
+    drop to the least, an H100's output walk between the consumers' raise and the producer's drop)."""
+    roles, role = set(), None
+    for line in listing.splitlines():
+        if not (found := _INSTRUCTION.search(line)):
+            continue
+        opcode = _parsed(found.group(2))[0]
+        if opcode.startswith("USETMAXREG"):
+            role = PRODUCER if ".DEALLOC" in opcode else CONSUMERS
+        elif role is not None and opcode.split(".")[0] in ("STL", "LDL"):
+            roles.add(role)
+    return tuple(sorted(roles))
 
 
 _INSTRUCTION = re.compile(r"/\*([0-9a-f]{4,})\*/\s+(.*?)\s*;")
