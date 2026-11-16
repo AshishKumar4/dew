@@ -19,9 +19,6 @@
 "tests/test_algebra_fusion.py::test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes[a causal window]",
 "tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
 ],
-"tests/test_algebra_scan.py": [
-"tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[kimi_delta-after]"
-],
 "tests/test_architectures.py": [
 "tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer+gemma4_moe]",
 "tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer+glm4_moe]",
@@ -542,8 +539,8 @@
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-alibi-forward]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-fp32-forward]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-temperature-step]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-fp32-forward]",
-"tests/test_attention_triton.py::test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wide",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-fp32-step]",
+"tests/test_attention_triton.py::test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block[128]",
 "tests/test_attention_triton.py::test_an_fp32_weight_that_normalizing_would_lose_still_reaches_dv",
 "tests/test_attention_triton.py::test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two[192-160-portable]",
 "tests/test_attention_triton.py::test_the_backward_is_on_par_over_every_call_form[documents-Tiles(block_q=128, block_k=64, warps=4, stages=2)-default]",
@@ -1936,7 +1933,7 @@
 "tests/test_mixed_step.py::test_a_mixed_call_through_one_template_work_list_is_on_par_interpreted[True-dense-window]"
 ],
 "tests/test_mixers.py": [
-"tests/test_mixers.py::test_a_hybrid_of_no_compute_dtype_over_bfloat16_weights_decodes[kimi_delta_attention]",
+"tests/test_mixers.py::test_a_decoder_of_no_compute_dtype_over_bfloat16_weights_decodes[parallel-True]",
 "tests/test_mixers.py::test_a_packed_row_computes_what_its_documents_compute_alone[block_sparse_attention]",
 "tests/test_mixers.py::test_a_packed_row_computes_what_its_documents_compute_alone[kpool_sparse_attention]",
 "tests/test_mixers.py::test_a_packed_row_computes_what_its_documents_compute_alone[mamba]",
@@ -3082,7 +3079,7 @@
 "tests/test_step_memory_3.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[gated_delta_net-plain-no copies]",
 "tests/test_step_memory_3.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[mamba2-plain-copies]",
 "tests/test_step_memory_3.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[mamba2-plain-no copies]",
-"tests/test_step_memory_3.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[parallel-plain-no copies]"
+"tests/test_step_memory_3.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[parallel-plain-copies]"
 ],
 "tests/test_step_memory_4.py": [
 "tests/test_step_memory_4.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[attention-experts-no copies]",
