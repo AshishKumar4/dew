@@ -45,7 +45,8 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(moved))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
     # A decision layout recorded by one of the classes it was before (decision-inputs.md §1, row 6140).
-    earlier = {name: _records.earlier_layout(value) for name, value in earlier.items()}
+    earlier = {name: _records.earlier_layout(_records.json_value(value, name))
+               for name, value in earlier.items()}
     return records.earlier_chains(earlier_data_plan(earlier), _chains())
 
 
