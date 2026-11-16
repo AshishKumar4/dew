@@ -410,3 +410,18 @@ def test_a_function_step_reading_a_module_by_its_default_holds_what_it_reads_of_
     assert first[0] is True
     (tmp_path / "helping.py").write_text(HELPERS.format(by=10))
     assert _held_in_a_process(tmp_path, "1")[1] != first[1]
+
+
+def test_a_class_step_holding_a_module_as_an_attribute_holds_what_its_methods_read_of_it(tmp_path):
+    """A class step that holds a module of the user's as a class attribute (`settings = helping`) holds the
+    attributes its methods name of it: `helping.delta` changed, the step's held code changes. The module was
+    stated by its name alone, the step exact across the change (train 921's review, F9)."""
+    (tmp_path / "helping.py").write_text(HELPERS.format(by=1))
+    (tmp_path / "stepping.py").write_text(
+        "import dataclasses\n\nimport helping\n\n\n@dataclasses.dataclass(frozen=True)\nclass Holding:\n"
+        "    settings = helping\n\n    def __call__(self, row):\n"
+        "        return {**row, 'id': row['id'] + self.settings.delta()}\n\n\nshifted = Holding()\n")
+    first = _held_in_a_process(tmp_path, "1")
+    assert first[0] is True
+    (tmp_path / "helping.py").write_text(HELPERS.format(by=10))
+    assert _held_in_a_process(tmp_path, "1")[1] != first[1]
