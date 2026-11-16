@@ -27,6 +27,7 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.engram import Engram, PLELayer
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.inputs import MixerCall
+from dew.nn.memory import Gate, InContextMemory, LinearMemory, Objective
 from dew.objectives.lm.objective import LMObjective
 
 VOCAB = 37
@@ -57,9 +58,14 @@ RECURRENT = {
     "mamba2": {"num_heads": 16, "head_dim": 8, "state_size": 8, "n_groups": 1, "chunk_size": 4},
     "short_conv": {"conv_L_cache": 3},
     "lightning_attention": {"block_size": 4},
-    "mamba3": {"head_dim": 8, "state_size": 8, "chunk_size": 4}}
+    "mamba3": {"head_dim": 8, "state_size": 8, "chunk_size": 4},
+    "memory": {"memory": InContextMemory(network=LinearMemory(), objective=Objective("dot"),
+                                         retention=Gate(bias=-2.0), heads=2, head_features=8, chunk=4,
+                                         normalize=True, learning_rate=Gate(scale=0.1))}}
 """The mixers holding row state that read forks, at toy size: Qwen3.5's gated delta net, Kimi's delta
-attention, Mamba-1, -2 and -3, LFM2's gated short convolution and MiniMax's lightning attention."""
+attention, Mamba-1, -2 and -3, LFM2's gated short convolution, MiniMax's lightning attention and an
+in-context memory on the shared recurrence, gated linear attention's (a linear memory on the dot objective
+with a retention gate: its state and the share of W_0 it keeps, each carried over a fork)."""
 
 MLA = {"q_lora_rank": 8, "kv_lora_rank": 8, "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8}
 """DeepSeek's latent attention at toy size, dense (no indexer), as Kimi Linear's full-attention layers
@@ -182,6 +188,27 @@ def test_rows_whose_shared_prefix_needs_more_documents_than_a_window_holds_are_l
         tokens = np.asarray(forks.tokens).reshape(-1)
         for number, row in enumerate(rows):
             assert list(tokens[np.asarray(forks.index[number, :len(row)])]) == row
+
+
+def test_a_memory_whose_products_a_quantization_holds_lays_its_rows_whole():
+    """An in-context memory on its shared recurrence reads forks (`RECURRENT`'s), but a quantization's
+    products take its heads off the recurrence (`InContextMemory._route`), the one path of it that reads
+    them: the quantized decoder's objective lays its rows whole (`shares_prefixes`,
+    `MixerBase.wrapped_fork_refusal`) and its call over forks is refused, where the decoder unquantized
+    runs it."""
+    pytest.importorskip("qwix")
+    from dew.quantization import Quantization
+
+    forks = ForkedRows.pack(ROWS, WIDTH)
+    model = hybrid_model("memory")
+    quantized = Quantization(patterns=(r"(.*/)?head_\d+/.*",)).apply(model)
+    assert LMObjective(model, WIDTH - 1).shares_prefixes(train=True)
+    assert not LMObjective(quantized, WIDTH - 1).shares_prefixes()
+    params = model.init(jax.random.key(0), jnp.ones((1, WIDTH), jnp.int32))
+    model.apply(params, forks.tokens, coordinates=forks.coordinates)
+    with pytest.raises(ValueError):
+        quantized.apply(quantized.init(jax.random.key(0), jnp.ones((1, WIDTH), jnp.int32)), forks.tokens,
+                        coordinates=forks.coordinates)
 
 
 def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
