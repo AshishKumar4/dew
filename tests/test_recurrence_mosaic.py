@@ -900,10 +900,14 @@ MiniMax-Text-01's lightning layer among them), an unrounded write gate, and a ga
 192 wide, whose training launches take whole staged blocks (a bf16 output gradient's 64-column swizzle; 96
 columns cut one): key heads, value heads, key and value widths, and whether the decay is a key dimension's."""
 
-WHOLE = frozenset({'minimax-text-01-lightning', 'a write gate'})
+WHOLE = frozenset({'a write gate'})
 """The gate's forms without the delta rule whose numbers the run's fast forms leave whole
-(`recurrence_chunk.chunk_rounding`): lightning attention's and a write gate's, their intermediates in fp32's
-three parts."""
+(`recurrence_chunk.chunk_rounding`): a write gate's, its intermediates in fp32's three parts, the accurate
+forms' launches every form without the delta rule takes under the accurate numerics."""
+
+RELEASED = frozenset({'minimax-text-01-lightning'})
+"""The gate's forms without the delta rule that take their release's numbers where the run's fast forms do
+(`recurrence_chunk.chunk_rounding`'s `released`): lightning attention's, fla's simple GLA."""
 
 RATED = frozenset({'nemotron-h-4b-ssd'})
 """The gate's rated scans (Mamba2's SSD): no delta rule, its 16-bit call `rounded` (the fast forms), its
@@ -1239,9 +1243,12 @@ with its two-role walks 130.2 s on sm90 (train 630's CI, main f424ab7d8)."""
 def _form(name: str, dtype) -> dict:
     """A resource case's call form beside its operands under the run's fast forms (`rounded`, `fast_rounding`,
     an fp32 call's operands in two parts), as its route gives it: a rated scan's without the delta rule and
-    wide, as Mamba-2's mixer reads its output (`chunk`'s fp32 `dtype`)."""
+    wide, as Mamba-2's mixer reads its output (`chunk`'s fp32 `dtype`); lightning attention's at its
+    release's rounding as `chunk` takes it (`chunk_rounding`'s `released`)."""
     if name in WHOLE:
         return {'delta': False}
+    if name in RELEASED:
+        return {'delta': False, 'rounded': chunk_rounding(delta=False, dtype=dtype, released=True)}
     return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
 
 
@@ -1272,10 +1279,10 @@ def _two_roles(bound, derived, facts, *, packed: bool, training: bool) -> list:
         return []
     # As the derivation walks a call of two waves (`Mosaic._walked`): two roles only where they hold, and
     # a training call's only where its fast backward holds as it does at one.
-    two = template.MOSAIC._walked(bound, derived, facts, 2, training=training)
-    if two.walkers != 2:
-        return []
     with generation.assumed(facts):
+        two = template.MOSAIC._walked(bound, derived, facts, 2, training=training)
+        if two.walkers != 2:
+            return []
         return [(template.MOSAIC._settled(bound, two, facts), 'two roles ')]
 
 
