@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 
-from dew._records import earlier_layout
+from dew._records import earlier_layout, json_value
 from dew.decision.calibration import Calibration
 from dew.decision.layout import Layout, SegmentLayout
 from dew.interop.release import ReleaseDtypes, ReleaseTask
@@ -48,7 +48,7 @@ def released_decision(directory: Path, layout: SegmentLayout, calibration: Calib
     wrote is (`dew._records.earlier_layout`)."""
     release = _loaded(directory)
     if release is not None and release.layout is not None:
-        laid = earlier_layout(release.layout)
+        laid = earlier_layout(json_value(release.layout, "release layout"))
         stated = from_record(Layout, laid, dtypes=False)
         if not isinstance(stated, SegmentLayout) or stated.joint != joint:
             raise ValueError(f"the release in {directory} states the layout {stated!r}, and its format reads "
