@@ -691,6 +691,13 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
             # A record's list is the union's one sequence member (`Files.url: str | tuple[str, ...]`).
             return _rebuilt(sequences[0], value, dtypes=dtypes)
         return configured(value)
+    if (isinstance(annotation, type) and annotation in _SCALARS
+            and not isinstance(value, (np.generic, np.ndarray, jax.Array))):
+        # A field declaring a scalar holds one of its type (`dew._records`' readers), kept as written: a
+        # null, a list or a record is refused as a mistyped scalar is; a NumPy or JAX value, which a module
+        # built in Python may hold, is the field's as built.
+        _SCALARS[annotation](value, name or annotation.__name__)
+        return configured(value)
     if isinstance(value, Mapping):
         if typing.get_origin(annotation) is Callable or annotation is Callable:
             # A callable field, such as a Sequential's layers or a loss, takes
@@ -726,11 +733,6 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
         rebuilt = [_rebuilt(entry, record, dtypes=dtypes)
                    for entry, record in zip(entry_types(annotation, len(value)), value, strict=True)]
         return tuple(rebuilt) if wants_tuple(annotation) else type(value)(rebuilt)
-    if isinstance(annotation, type) and annotation in _SCALARS and isinstance(value, (bool, int, float, str)):
-        # A record's scalar is of the type its field declares (`dew._records`' readers), kept as written; a
-        # NumPy scalar, which a module built in Python may hold, is the field's as built.
-        _SCALARS[annotation](value, name or annotation.__name__)
-        return value
     return configured(value)
 
 

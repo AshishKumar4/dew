@@ -110,6 +110,8 @@ def test_a_decision_run_starts_from_a_saved_run_whose_export_is_its_native_relea
     {"run": "/runs/first", "step": True, "ema": None},
     {"run": "/runs/first", "step": 3, "ema": "false"},
     {"run": "/runs/first", "step": 3},
+    {"run": "/runs/first", "step": None, "ema": None},
+    {"run": "/runs/first", "step": [3], "ema": None},
 ])
 def test_a_release_record_of_another_shape_is_refused(record):
     """A cache release's record of the saved run it holds (`Held`) is a run's directory, a step (never a

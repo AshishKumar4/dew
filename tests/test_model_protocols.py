@@ -50,7 +50,7 @@ and `tiny_inputs`, which that file's registry-wide parametrization needs.
 import dataclasses
 import functools
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import NamedTuple
 
 import jax
@@ -438,8 +438,9 @@ def _margined_prompts(name: str, call: tuple) -> jax.Array:
 
     source = loaded(name)
     wide, variables = _programs(name, "wide", call), widened(source.variables)
-    captured = (selection_margins.capture(float64_twin(source.model))
-                if selection_margins.selects(source.model_config) else None)
+    config, method = _decoder_selecting(name, source)
+    captured = (selection_margins.capture(float64_twin(source.model), method=method)
+                if selection_margins.selects(config) else None)
 
     def draw(key):
         rng = np.random.default_rng([0x6693, key])
@@ -454,9 +455,25 @@ def _margined_prompts(name: str, call: tuple) -> jax.Array:
                    for score in scores[:STEPS]):
             return False
         return selections is None or selection_margins.margin(
-            source.model_config, selections, f"{name} greedy walk") > MARGIN
+            config, selections, f"{name} greedy walk") > MARGIN
 
     return jnp.asarray(clearing(draw, clears)(0))
+
+
+def _decoder_selecting(name: str, source) -> tuple[Mapping[str, object], str | None]:
+    """The record of the decoder whose selections `source` (`name`'s `Pretrained`) makes, and the method its
+    capture runs (`selection_margins.capture`): a decoder's own record, a wrapper's text decoder's
+    (`model_config['text']`), its forward over tokens; DiffusionGemma's text model's, as the module holds
+    it, through its clean causal encoder (`logits`), not its canvas denoiser."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import to_record
+
+    if name in OWN:
+        text = source.model.text
+        record = to_record(text, CausalTransformer)
+        assert isinstance(record, dict)
+        return {"num_layers": text.num_layers, **record}, "logits"
+    return source.model_config.get("text", source.model_config), None
 
 
 def _by_call(decisions: dict) -> list[dict]:
