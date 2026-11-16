@@ -109,7 +109,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Saved runs carried across. [2791, 2792]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 - The saved data plan as recorded rules, one last version, and the resume modes. [6861]
-- The float64 terms walk (tests/float64_terms.py scanned_steps and its eager evaluation) runs a scanned model's float64 truth one eager step at a time on a GPU. [7096]
 
 ## Tutorials and docs
 
