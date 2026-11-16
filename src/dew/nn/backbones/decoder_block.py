@@ -114,7 +114,7 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float 
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
                  dtype: Dtype | None, precision: PrecisionLike = None,
                  specs: Mapping[str, NormSpec] | None = None,
-                 routed: bool | None = None) -> Callable[..., nn.Module]:
+                 routed: bool | None = None, weight_dtype_reads: bool = False) -> Callable[..., nn.Module]:
     """The decoder's norm factory, building each norm by its `name` as
     `specs` changes it there, a gated one (`NormSpec.gate_rank`) gated where
     `norm_gated` says: a layer's on the layers it names, the `routed` layer's
@@ -125,7 +125,8 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float 
     and square reduce in one pass, for a model that states it: it cancels in
     fp32 wherever a row's mean dwarfs its spread, so no port of a torch norm
     takes it. An `epsilon` of None is an RMS norm's input dtype's
-    (`RMSNorm.epsilon`); a layer norm states its own."""
+    (`RMSNorm.epsilon`); a layer norm states its own. `weight_dtype_reads` gives an RMS norm's output its
+    weight's dtype where no `dtype` is set (`RMSNorm.weight_dtype_reads`)."""
 
     def build(*, name: str) -> nn.Module:
         # A site's own name, a plain string (`NormSite`'s value): the module's path holds no enum.
@@ -136,7 +137,8 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float 
         if kind == 'rms':
             norm = functools.partial(
                 RMSNorm, epsilon=eps, scale_offset=scale_offset if spec.offset is None else spec.offset,
-                scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups, dtype=dtype)
+                scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups, dtype=dtype,
+                weight_dtype_reads=weight_dtype_reads)
             if gated and spec.gate_rank is not None:
                 return GatedRMSNorm(spec.gate_rank, norm, dtype=dtype, precision=precision, name=name)
             return norm(name=name)
@@ -461,6 +463,10 @@ class BlockWiring:
     """Initial value of learned per-feature attention and feed-forward residual scales."""
     normed_residual: bool = False
     stream_multiplier: float = 1.0
+    residual_in_fp32: bool = False
+    """Whether the stream sums in at least fp32 whatever the compute dtype
+    (`CausalTransformer.residual_in_fp32`): with no compute dtype, each norm reads it in its weight's dtype
+    (`dew.nn.norms.RMSNorm.weight_dtype_reads`), as mamba_ssm's Block does."""
     ngpt: NGPT | None = None
 
     def __post_init__(self):
@@ -858,10 +864,13 @@ class DecoderBlock(nn.Module):
 
     def setup(self):
         projections = self.projections()
+        # A stream summing in fp32 with no compute dtype is read in each norm's weight's dtype
+        # (`BlockWiring.residual_in_fp32`).
         norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype, precision=self.precision, specs=self.norms, routed=self.routed)
+            dtype=self.dtype, precision=self.precision, specs=self.norms, routed=self.routed,
+            weight_dtype_reads=self.wiring.residual_in_fp32 and self.dtype is None)
         if self.wiring.parallel_residual and (
                 not self.wiring.pre_norms or self.wiring.output_norms
                 or self.feedforward is None or self.hyper_connections is not None

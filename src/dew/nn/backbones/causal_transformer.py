@@ -490,7 +490,8 @@ class CausalTransformer(LinearProducts):
                            residual_norms=self.post_residual_norms,
                            layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
                            shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt,
-                           normed_residual=self.normed_residual, stream_multiplier=self.stream_multiplier)
+                           normed_residual=self.normed_residual, stream_multiplier=self.stream_multiplier,
+                           residual_in_fp32=self.residual_in_fp32)
 
     @property
     def init_stds(self) -> tuple[float | None, float | None]:
