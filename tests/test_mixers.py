@@ -529,6 +529,22 @@ def test_a_decoder_of_no_compute_dtype_over_bfloat16_weights_decodes(kind, resid
     assert logits.shape == (2, 4, VOCAB) and bool(jnp.all(jnp.isfinite(logits)))
 
 
+def test_a_mamba2_of_a_stated_dtype_projects_its_scan_in_it():
+    """A Mamba-2 layer computing in float32 over bfloat16 activations projects its gated scan in float32,
+    as its input projection and norm compute it, its output what the same values in float32 give: the
+    input's dtype rounds the scan only where the layer states none (`Mamba2Mixer._read`)."""
+    fields, _ = KIND_FIELDS["mamba2"]
+    layer = mixers.build("mamba2", **fields).build(MixerContext(
+        emb_features=32, num_heads=4, num_kv_heads=4, head_dim=8, max_seq_len=16, dtype=jnp.float32))(
+        name="mixer")
+    x = jax.random.normal(jax.random.key(0), (1, 8, 32), jnp.bfloat16)
+    variables = layer.init(jax.random.key(1), x)
+    # The same values given in float32, which its input projection takes them in exactly: an output the
+    # bfloat16 input's dtype rounds anywhere past it would differ.
+    np.testing.assert_array_equal(np.asarray(layer.apply(variables, x)),
+                                  np.asarray(layer.apply(variables, x.astype(jnp.float32))))
+
+
 @pytest.mark.parametrize("kind", sorted(set(mixers.paths) - ATTENDS_NOTHING))
 @pytest.mark.parametrize("policy", sorted(POLICY_VALUES))
 def test_every_attention_mixer_computes_or_refuses_each_policy_it_is_asked(kind, policy):

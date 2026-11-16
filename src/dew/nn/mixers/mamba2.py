@@ -348,12 +348,12 @@ class Mamba2(nn.Module):
         wide = at_least_fp32(out.dtype)
         return (out.astype(wide) * nn.silu(gate.astype(wide))).astype(out.dtype)
 
-    @staticmethod
-    def _read(gated, x):
-        """The gated scan output as the output projection reads it: in the layer input's dtype, as
-        transformers' Mamba2Mixer casts it (`self.out_proj(scan_output.to(dtype))`, `dtype` its input's),
-        where a projection of no compute dtype would carry the scan's fp32 into the stream."""
-        return gated.astype(x.dtype)
+    def _read(self, gated, x):
+        """The gated scan output as the output projection reads it: with no compute dtype, in the layer
+        input's dtype, as transformers' Mamba2Mixer casts it (`self.out_proj(scan_output.to(dtype))`,
+        `dtype` its input's), where the projection would carry the scan's fp32 into the stream; with one,
+        as it is, the projection computing in it."""
+        return gated.astype(x.dtype) if self.dtype is None else gated
 
     @nn.nowrap
     def cache_spec(self, rows: int) -> dict[str, Opened]:
