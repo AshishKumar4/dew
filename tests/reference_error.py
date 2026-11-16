@@ -290,9 +290,10 @@ def _followed_truth(prepared, followed: Followed, result, inputs):
 def _truth_read(truth_fn, followed, result):
     """The truth `_of_float64` reads a site's program of: `truth_fn`, or at a site of followed roundings
     (`result` Dew's `Rounded`) `followed` bound to Dew's decisions, as the gate runs a truth
-    (`_truth_program`), as given where `followed` runs on the host (a recording's, `indexed_recording`)."""
+    (`_truth_program`), as given where `followed` runs on the host (a recording's, `indexed_recording`);
+    unrewritten either way."""
     if result is None:
-        return truth_fn
+        return unrewritten(truth_fn)
     bound = functools.partial(followed.truth, jax.device_get(result.decisions))
     return _truth_program(as_given(bound) if _given(followed.truth) else bound)
 
@@ -318,6 +319,35 @@ def dew_programs(fn):
         return fn(*inputs, **options)
     programs.dew_programs = True
     return programs
+
+
+def dew_path(fn):
+    """`fn`, a reference that is one of Dew's own paths: the same model run another way (rows packed against
+    each row alone, a remat policy against none, another layout), so its site's claim is invariance under
+    what differs, not the algebra's rewrite. The gate runs it as it runs Dew's arm, under the rewrite
+    (`_compiled`), so one function at one shape is one program for both arms (a decision head's `decide`,
+    packed and alone, compiled once, where the reference unrewritten compiled it twice); the rewrite's
+    correctness is held by the sites whose references are written apart from Dew, which run unrewritten. A
+    reference undeclared is written apart. Only a site whose claim is invariance may declare it, as a
+    declaration elsewhere drops the reference's independence (docs/design/algebra.md §3). It keeps the marks
+    of what it wraps (`as_given`), and an adapter's (`run_to_run`, `over_windows`) it declares within, so
+    the adapter stays the gate's to read; a float64 truth the gate takes from the reference stays unrewritten
+    (`_drawn`, `_conditioning`)."""
+    if isinstance(fn, _RunToRun):
+        return _RunToRun(dew_path(fn.fn), fn.why)
+    if isinstance(fn, _Windowed):
+        return _Windowed(dew_path(fn.fn))
+
+    @functools.wraps(fn)
+    def path(*inputs, **options):
+        return fn(*inputs, **options)
+    path.dew_path = True
+    return path
+
+
+def _declared(fn) -> bool:
+    """Whether reference `fn`, or an arm it adapts (`_layers`), is one of Dew's own paths (`dew_path`)."""
+    return any(getattr(layer, "dew_path", False) for layer in _layers(fn))
 
 
 def _given(fn) -> bool:
@@ -361,8 +391,9 @@ def _compiled(fn, compile, pairing=None, *, reference: bool = False):
     """`fn` as the gate runs it: as given (`_given`), as it is where it is a `without_ynn` program already
     (another jit around it would nest its compiler options), or compiled by `compile`, a window loop's arm
     within it (`over_windows`), without YNNPACK's fusions, paired by `pairing` (`_Paired`); a `reference`
-    unrewritten (`arm_arithmetic.unrewritten`)."""
-    run = unrewritten if reference else _as_is
+    unrewritten (`arm_arithmetic.unrewritten`), but one of Dew's own paths (`dew_path`), which runs under the
+    rewrite as Dew's arm does."""
+    run = unrewritten if reference and not _declared(fn) else _as_is
     if isinstance(fn, _RunToRun):
         return _RunToRun(_compiled(fn.fn, compile, pairing, reference=reference), fn.why)
     if _given(fn) or getattr(fn, "without_ynn", False):
@@ -538,7 +569,8 @@ def _arms(dew_fn, reference_fn):
     Dew's seam; where one runs as it is given (`as_given`: torch, NumPy, a recording, a host loop over
     programs of its own), the other as Dew's users run it, with the fusions (`jax.jit`). A site passes plain
     functions; the gate compiles them, so no site can compile one arm otherwise than its other. The
-    reference runs unrewritten (`_compiled`), so one function as both arms compiles twice. A program XLA:CPU
+    reference runs unrewritten (`_compiled`), so one function as both arms compiles twice, but one of Dew's
+    own paths (`dew_path`), which runs under the rewrite as Dew's arm does. A program XLA:CPU
     cannot compile without the fusions turns both arms over to them, decided once a site (`_ynn_decided`)."""
     compile, pairing = (jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn), _Pairing()
     _refuse_owned_policies(compile, dew_fn, reference_fn)
@@ -1136,22 +1168,26 @@ def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None, scale=None) -> 
 
     # Its heavy elements over `seeds`' draws, each run as its arm runs (`summed_as_run`) beside its float64
     # truth, `truth_fn`'s or its own, classed alike in every process that runs them.
-    ran_fn, true_fn = unrewritten(ran or reference_fn), unrewritten(truth_fn)
+    # The reference as its arm runs (under the rewrite where `dew_path`), its truth unrewritten.
+    ran_fn = ran or reference_fn
+    ran_fn, true_fn = ran_fn if _declared(reference_fn) else unrewritten(ran_fn), unrewritten(truth_fn)
 
     def ran_and_true(seed):
         inputs = draw(seed)
         with summed_as_run():
             ran_here = jax.device_get(ran_fn(*inputs))
         with jax.enable_x64(new_val=True):
-            return ran_here, jax.device_get((true_fn or ran_fn)(*widened(inputs)))
+            return ran_here, jax.device_get((true_fn or unrewritten(ran_fn))(*widened(inputs)))
 
     return Conditioning(scale_of, heavy_masks(map(ran_and_true, seeds)))
 
 
 def _truth_and_terms(truth_fn, terms_fn, inputs):
-    """The float64 truth of `inputs` (`truth_fn` on them widened) and, with `terms_fn`, its terms (else
-    None): a site's own terms program's (`_SiteTerms`), or the truth's own evaluated op by op
-    (`float64_terms`)."""
+    """The float64 truth of `inputs` (`truth_fn` on them widened, unrewritten, as every truth the gate runs:
+    one taken from a reference of Dew's own path, `dew_path`, which runs under the rewrite, included) and,
+    with `terms_fn`, its terms (else None): a site's own terms program's (`_SiteTerms`), or the truth's own
+    evaluated op by op (`float64_terms`)."""
+    truth_fn = unrewritten(truth_fn)
     if terms_fn is None or isinstance(terms_fn, _SiteTerms):
         with jax.enable_x64(new_val=True):
             truth = truth_fn(*widened(inputs))
@@ -1192,7 +1228,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
            label: str = "", examples: bool = False, conditioning=None, timed: dict | None = None,
            followed=None):
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
-    `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
+    `truth_fn` on them (by default `reference_fn` on them widened, unrewritten). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
     row of float64 zero is paired only where the two truths are the same values (an orbit's draws).
     With `orders`, each arm also runs at every other order of its own draw (`orders(inputs)` past its

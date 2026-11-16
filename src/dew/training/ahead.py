@@ -67,7 +67,7 @@ from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
 from dew._devices import COMPILE_ONLY_MEMORY, device_memory
 from dew._records import JSON, boolean, record
-from dew._stated import Unestablished
+from dew._stated import Unestablished, traceback_frames
 from dew.batch import Batch
 from dew.nn.kernels import options
 from dew.nn.kernels.generation import (
@@ -212,8 +212,9 @@ class HeldTraceback:
 
 
 def _held_traceback(traceback: Traceback) -> tuple[type[HeldTraceback], tuple[tuple[str, ...]]]:
-    """A traceback of JAX's reduced to its frames (`HeldTraceback`), as a program file holds it."""
-    return HeldTraceback, (tuple(str(frame) for frame in traceback.frames),)
+    """A traceback of JAX's reduced to its frames (`HeldTraceback`, `dew._stated.traceback_frames`), as a
+    program file holds it."""
+    return HeldTraceback, (tuple(traceback_frames(traceback)),)
 
 
 def filed(value: Executable | AheadPrograms | AheadOfTime) -> bytes:

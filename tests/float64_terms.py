@@ -151,7 +151,7 @@ def _termed(fn, args, *, power: int):
     token = POWER.set(power)
     try:
         with evaluated_on(leaves):
-            if _static(closed.jaxpr, terms=True):
+            if _static(closed.jaxpr):
                 values, energies = _compiled(closed.jaxpr)(closed.consts, leaves)
             else:
                 values, energies = _evaluated(closed.jaxpr, closed.consts, leaves, compiling=True)
@@ -175,16 +175,15 @@ STATIC: dict = {}
 """Whether each jaxpr is static (`_static`), by the jaxpr."""
 
 
-def _static(jaxpr, terms: bool = False) -> bool:
+def _static(jaxpr) -> bool:
     """Whether `jaxpr`, its calls' and scans' bodies included, takes no branch or loop its values pick
-    (`cond`, `while`), which the walk reads concretely (`_applied`), once a jaxpr (`terms` the terms walk's
-    key: a scan is static to both, bound whole where traced, `_terms_scan`, `_bound_walk`). A branch its
-    platform picks (`jax.lax.platform_dependent`'s) is static: the walk reads its platform where it runs
-    (`_platform`)."""
-    if (jaxpr, terms) not in STATIC:
+    (`cond`, `while`), which the walk reads concretely (`_applied`), once a jaxpr (a scan is static to every
+    walk, bound whole where traced, `_terms_scan`, `_bound_walk`). A branch its platform picks
+    (`jax.lax.platform_dependent`'s) is static: the walk reads its platform where it runs (`_platform`)."""
+    if jaxpr not in STATIC:
         picked = _platform_picked(jaxpr)
-        STATIC[jaxpr, terms] = all(_static_equation(equation, picked, terms) for equation in jaxpr.eqns)
-    return STATIC[jaxpr, terms]
+        STATIC[jaxpr] = all(_static_equation(equation, picked) for equation in jaxpr.eqns)
+    return STATIC[jaxpr]
 
 
 def _platform_picked(jaxpr) -> frozenset:
@@ -337,7 +336,7 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=No
     None: an initializer's forward pass, whose outputs its init drops, never runs."""
     from jax.extend.core import Literal
 
-    wanted, last, runs = _layout(jaxpr, terms=rule is None)
+    wanted, last, runs = _layout(jaxpr)
     values, energies = {}, {}
     for var, value, energy in zip(jaxpr.constvars + jaxpr.invars, [*consts, *args],
                                   [None] * len(consts) + list(given or [None] * len(args)), strict=True):
@@ -414,25 +413,25 @@ LAYOUTS: dict = {}
 every draw, its bodies' too."""
 
 
-def _layout(jaxpr, terms: bool = False):
-    """What the walk reads of `jaxpr`'s structure alone, once a jaxpr, measure (`POWER`) and walk (the terms'
-    where `terms`): the variables whose terms reach an output (`_carrying`), the step that reads each
-    variable last, after which it goes as an execution frees it (a chunked scan's float64 intermediates
-    would otherwise all stay), and its spans (`_runs`)."""
+def _layout(jaxpr):
+    """What the walk reads of `jaxpr`'s structure alone, once a jaxpr and measure (`POWER`): the variables
+    whose terms reach an output (`_carrying`), the step that reads each variable last, after which it goes as
+    an execution frees it (a chunked scan's float64 intermediates would otherwise all stay), and its spans
+    (`_runs`)."""
     from jax.extend.core import Literal
 
-    key = (jaxpr, POWER.get(), terms)
+    key = (jaxpr, POWER.get())
     if key not in LAYOUTS:
         last = {var: index for index, equation in enumerate(jaxpr.eqns)
                 for var in equation.invars if not isinstance(var, Literal)}
         for var in jaxpr.outvars:
             if not isinstance(var, Literal):
                 last.pop(var, None)
-        LAYOUTS[key] = (_carrying(jaxpr), last, tuple(_runs(jaxpr, terms)))
+        LAYOUTS[key] = (_carrying(jaxpr), last, tuple(_runs(jaxpr)))
     return LAYOUTS[key]
 
 
-def _static_equation(equation, picked: frozenset = frozenset(), terms: bool = False) -> bool:
+def _static_equation(equation, picked: frozenset = frozenset()) -> bool:
     """Whether `equation` takes no branch or loop its values pick, its bodies' included (`_static`): a
     branch whose index is among `picked`, its platform's (`_platform_picked`), is not one. A scan is: it is
     bound as a scan whose body the walk evaluates once (the terms walk's, `_terms_scan`, its steps alone only
@@ -440,20 +439,19 @@ def _static_equation(equation, picked: frozenset = frozenset(), terms: bool = Fa
     compiles its body once, never a step at a time (a scanned model's float64 terms dispatched each layer's
     steps alone: 1,083 s on a GH200 at 21% busy, row 7096), nor every step unrolled into the program (a
     token scan's 64 steps and their adjoint's took 128 s of XLA's CPU compile, row 6004)."""
-    del terms  # A scan is static to every walk alike, bound whole where traced.
     primitive = equation.primitive
     if primitive is jax.lax.while_p or (primitive is jax.lax.cond_p and equation.invars[0] not in picked):
         return False
     return all(_static(body) for body in programs.bodies(equation))
 
 
-def _runs(jaxpr, terms: bool = False) -> list[tuple[int, int]]:
-    """`jaxpr`'s steps as spans: each maximal run of static ones (`_static_equation`, the terms walk's
-    where `terms`) one span, each branch or loop a span of its own."""
+def _runs(jaxpr) -> list[tuple[int, int]]:
+    """`jaxpr`'s steps as spans: each maximal run of static ones (`_static_equation`) one span, each branch
+    or loop a span of its own."""
     spans, start = [], 0
     picked = _platform_picked(jaxpr)
     for index, equation in enumerate(jaxpr.eqns):
-        if not _static_equation(equation, picked, terms):
+        if not _static_equation(equation, picked):
             if start < index:
                 spans.append((start, index))
             spans.append((index, index + 1))
@@ -745,17 +743,17 @@ def _bound_walk(equation, inputs: list, rule, used=None) -> list:
     return [*carry, *ys]
 
 
-def _scan_reads(equation, used, compiling: bool = False, terms: bool = False) -> tuple:
+def _scan_reads(equation, used, compiling: bool = False) -> tuple:
     """Which of a scan body's outputs its `used` outputs read (`_evaluated`'s `used`, every one where None):
     a used carry or output, and every carry a read output reads back in through the next step, until none
-    is added, over the spans its steps run (`_evaluated`'s, the terms walk's where `terms`: each run of static
-    steps whole where `compiling`, which reads every input of a run any of it reads, else each equation)."""
+    is added, over the spans its steps run (`_evaluated`'s: each run of static steps whole where
+    `compiling`, which reads every input of a run any of it reads, else each equation)."""
     from jax.extend.core import Var
 
     body = programs.scan_body(equation).jaxpr
     constants, carries = scan_groups(equation)
     reading = tuple([True] * len(body.outvars) if used is None else used)
-    spans = (_layout(body, terms)[2] if compiling
+    spans = (_layout(body)[2] if compiling
              else tuple((index, index + 1) for index in range(len(body.eqns))))
     while True:
         read = {body.outvars[index] for index, kept in enumerate(reading)
@@ -790,7 +788,7 @@ def _scanned(equation, inputs, given, compiling: bool = False, rule=None, used=N
     and the terms walk's of a body whose branch or loop its values pick; the terms walk's of a static body
     is `_terms_scan`."""
     body = programs.scan_body(equation)
-    reading = _scan_reads(equation, used, compiling, terms=rule is None)
+    reading = _scan_reads(equation, used, compiling)
 
     def step(index, pairs):
         outputs, made = _evaluated(body.jaxpr, body.consts, [value for value, _ in pairs],
@@ -824,7 +822,7 @@ def _terms_scan(equation, inputs, given, used=None):
     body, params = programs.scan_body(equation), equation.params
     length, reverse = params["length"], params["reverse"]
     constants, carries = scan_groups(equation)
-    reading = _scan_reads(equation, used, terms=True)
+    reading = _scan_reads(equation, used)
     consts, carry, xs = (inputs[:constants], inputs[constants:constants + carries],
                          inputs[constants + carries:])
     const_given, carry_given, xs_given = (given[:constants], given[constants:constants + carries],
