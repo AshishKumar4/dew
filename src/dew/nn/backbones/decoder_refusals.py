@@ -79,8 +79,8 @@ def forked(decoder: CausalTransformer, train: bool = False, *, joint: bool = Fal
     own row does, or None (`dew.nn.protocols.ForkedCalls`): a bidirectional decoder, whose shared prefix
     reads each branch's tokens; in training, dropout, which draws each row's masks apart where a shared
     prefix draws them once; its mixture's block routing or capacity (`Mixture.fork_refusal`), or a layer
-    whose mixer reads no forks (`MixerBase.fork_refusal`), or none under the wrappers of the model's
-    products (`MixerBase.wrapped_fork_refusal`: an in-context memory's). Attention, the recurrent mixers,
+    whose mixer reads no forks (`MixerBase.fork_refusal`), or none under a wrapper whose products are not
+    linear (`MixerBase.wrapped_fork_refusal`: an in-context memory's). Attention, the recurrent mixers,
     engram's n-gram hashes (over each chain, `dew.nn.engram._forked_lookback`) and tokenwise layers read
     each document from its ancestors alone; a learned position embedding reads the places forks give each
     token; cross-attention reads each tree's own context (`Forks.trees`), a context a tree."""
@@ -92,13 +92,25 @@ def forked(decoder: CausalTransformer, train: bool = False, *, joint: bool = Fal
         return "dropout draws each row's masks apart, which a shared prefix draws once"
     if decoder.mixture is not None and (refusal := decoder.mixture.fork_refusal()) is not None:
         return refusal
-    from dew.registry import wrapper_layers
-
-    # A wrapper of the model's products may take a layer off the one path of it that reads forks.
-    if wrapper_layers(type(decoder))[1] and (refusal := _layer(
+    # A wrapper whose products are not linear may take a layer off the one path of it that reads forks.
+    if not _keeps_products_linear(decoder, train) and (refusal := _layer(
             decoder, lambda mixer, _: mixer.wrapped_fork_refusal())) is not None:
         return refusal
     return _layer(decoder, lambda mixer, _: mixer.fork_refusal())
+
+
+def _keeps_products_linear(decoder: CausalTransformer, train: bool) -> bool:
+    """Whether every wrapper of the decoder's products keeps them linear in a call, a training one where
+    `train` (`dew.registry.Wrapper.keeps_products_linear`): its wrapper classes' records
+    (`dew.registry.wrapper_layers`) and the quantization a served model computes under, which records no
+    wrapper class (`dew.quantization.QuantizedClass`)."""
+    from dew.quantization import QuantizedClass
+    from dew.registry import wrapper_layers
+
+    wrappers = [layer._dew_wrapper() for layer in wrapper_layers(type(decoder))[1]]
+    if isinstance(decoder, QuantizedClass):
+        wrappers.append(type(decoder)._dew_quantization)
+    return all(wrapper.keeps_products_linear(train) for wrapper in wrappers)
 
 
 def _layer(decoder: CausalTransformer, refused: Callable[[MixerBase, MixerContext], str | None]

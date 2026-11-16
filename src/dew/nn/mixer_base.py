@@ -295,9 +295,10 @@ class MixerBase:
         return None if self.reads_forks else f"{type(self).__name__} reads no forks"
 
     def wrapped_fork_refusal(self) -> str | None:
-        """Why the mixer this kind builds would not read forks in a model whose products a wrapper holds (a
-        quantization's class, a checkpoint's input quantizer: `dew.registry.wrapper_layers`) where it reads
-        them unwrapped (`fork_refusal`), or None: by default a wrapper changes no reading of forks."""
+        """Why the mixer this kind builds would not read forks in a model whose products a wrapper makes
+        other than linear (a quantization's, a checkpoint's input quantizer, an adapter's dropout in
+        training: `dew.registry.Wrapper.keeps_products_linear`) where it reads them unwrapped
+        (`fork_refusal`), or None: by default such a wrapper changes no reading of forks."""
         return None
 
     @property

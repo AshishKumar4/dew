@@ -208,6 +208,9 @@ class ParallelMixer(MixerBase):
     def fork_refusal(self) -> str | None:
         return self._branch_refusal(lambda mixer: mixer.fork_refusal())
 
+    def wrapped_fork_refusal(self) -> str | None:
+        return self._branch_refusal(lambda mixer: mixer.wrapped_fork_refusal())
+
     def _branch_refusal(self, refusal_of) -> str | None:
         """The first branch's refusal `refusal_of(mixer)` says, named by its branch, or None."""
         return next((f"branch {branch.name!r}: {refusal}" for branch in self.branches

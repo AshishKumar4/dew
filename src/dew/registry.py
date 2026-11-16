@@ -1265,6 +1265,13 @@ class Wrapper(Protocol):
 
     def apply(self, model: nn.Module) -> nn.Module: ...
 
+    def keeps_products_linear(self, train: bool) -> bool:
+        """Whether every product the wrapper holds stays the linear map of its input by its kernel in a call,
+        a training one where `train`: an adapter's where it drops nothing there, a quantization's never.
+        A layer that reads forks along a linear path alone (an in-context memory's recurrence) reads none
+        under a wrapper that does not (`MixerBase.wrapped_fork_refusal`)."""
+        ...
+
 
 @runtime_checkable
 class Recorded(Protocol):
