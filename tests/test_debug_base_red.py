@@ -8,7 +8,7 @@ from kernel_compile import compile_mosaic_kernels, mosaic_failures
 from test_deepest_rings import CELLS, deepest
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_mosaic, base, mosaic_sm90
+from dew.nn.kernels.templates import attention_mosaic, base, mosaic_sm90, resources
 
 
 @pytest.mark.parametrize("cell,name", [("attention forward 128", "sm90"),
@@ -96,3 +96,21 @@ def test_derived_decisions():
             print("DECISION " + json.dumps({"cell": cell, "generation": name, "derived": repr(config),
                                             "deepest": repr(at), "registers": op.registers(ba, at),
                                             "budget": op.register_budget(at)}, default=str), flush=True)
+
+
+def test_forward_raise(monkeypatch):
+    original = resources.moves_registers
+    monkeypatch.setattr(resources, "moves_registers",
+                        lambda registers, warpgroups, consumers, programs=1:
+                        (warpgroups == 3 and consumers == 2)
+                        or original(registers, warpgroups, consumers, programs))
+    base._DERIVED.clear()
+    with generation.assumed("sm90"):
+        op, ba, config = CELLS["attention forward 128"][0]()
+        at = deepest(op, ba, config, generation.gpu_target())
+        found = compile_mosaic_kernels([KernelCase("forward raised", lambda: op.lowering(ba, at))], "sm90")
+    print("RAISED " + json.dumps({"config": repr(at), "kernels":
+                                 [{key: kernel.get(key) for key in
+                                   ("kernel", "registers", "spilled", "cap")}
+                                  for record in found for kernel in record.get("kernels", [])]}), flush=True)
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)
