@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import tokamax
 from jax.ad_checkpoint import checkpoint_name
 
+from dew import _cache
 from dew.nn import derivatives
 from dew.nn.kernels import chunked_launch, generation
 from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources
@@ -165,8 +166,8 @@ call's launches by the depth they were planned at, its trace's at one stage."""
 _PLANNING = threading.Lock()
 
 _SPILLED: collections.OrderedDict = collections.OrderedDict()
-"""`Mosaic._spilled`'s launches by a launch's identity, its refusals and target, the most recently made
-last."""
+"""`Mosaic._spilled`'s launches by what a derivation reads (`report.derivation_inputs`), the most recently
+made last."""
 
 
 def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target: generation.GpuTarget,
@@ -510,26 +511,23 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _spilled(self, ba: tokamax.BoundArguments, target: generation.GpuTarget
                  ) -> frozenset[tuple[str, frozenset[tuple[bool, mainloop.Launch]]]]:
         """Each launch a compile spilled at tiles it refused past what their raise answers (`_exhausted`), by
-        name with its plans there but their grids in each product that runs it (`_plans`): kept by the call's
-        identity and its refusals, so a derivation's checks of its tiles read it once a refusal (planned at
-        each, a refusal walk's 355 derivations took 148 s)."""
-        identity, refusals = report.refusals_at(self, ba)
-        key = (identity, refusals, target)
-        with _PLANNING:
-            found = _SPILLED.get(key)
-        if found is None:
+        name with its plans there but their grids in each product that runs it (`_plans`): kept by what its
+        derivation reads (`report.derivation_inputs`: the call's identity, the target and its refusals), so a
+        derivation's checks of its tiles read it once a refusal (planned at each, a refusal walk's 355
+        derivations took 148 s)."""
+        key = report.derivation_inputs(self, ba, target)
+        _, _, refusals, _ = key
+
+        def made() -> frozenset[tuple[str, frozenset[tuple[bool, mainloop.Launch]]]]:
             # A rung's refusal (its producers raised, or its programs fewer) is its own tiles' ladder's.
-            found = frozenset(
+            return frozenset(
                 (name, plan) for config, kernels in refusals
                 if _unraised(config) and self._exhausted(ba, config, target)
                 for planned in [self._plans(ba, config, target)]
                 for owned in [_owners(kernels, (launch for plan in planned.values() for _, launch in plan))]
                 for name, plan in planned.items() if name in owned)
-            with _PLANNING:
-                _SPILLED[key] = found
-                while len(_SPILLED) > PLANS_KEPT:
-                    _SPILLED.popitem(last=False)
-        return found
+
+        return _cache.holding(_SPILLED, key, made, PLANS_KEPT)
 
     def _exhausted(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                    ) -> bool:

@@ -465,11 +465,15 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
                                         out_sharding=xla_products.ragged_placement(((lhs, 1), (rhs, 1))))
             return accumulated(product, lhs.astype(compute), rhs.astype(compute),
                                preferred_element_type=wide)[None].astype(out_dtype)
+        # Its operands and precision are XLA's ragged dot's as every one of its products takes them
+        # (`xla_products.as_multiplied`): XLA's TPU kernel refuses 16-bit operands at HIGHEST, which a v5e's
+        # grouped weight gradient met under a highest default (row 7064, "Bad lhs type").
+        rows, columns, multiplied = xla_products.as_multiplied(lhs.astype(compute), rhs.astype(compute),
+                                                               precision)
         product = functools.partial(
-            jax.lax.ragged_dot_general, ragged_dot_dimension_numbers=_CONTRACTED_ROWS, precision=precision,
-            out_sharding=xla_products.ragged_placement((None, (lhs, 1), (rhs, 1))))
-        return accumulated(product, lhs.astype(compute), rhs.astype(compute), group_sizes,
-                           preferred_element_type=wide).astype(out_dtype)
+            jax.lax.ragged_dot_general, ragged_dot_dimension_numbers=_CONTRACTED_ROWS, precision=multiplied,
+            out_sharding=xla_products.ragged_placement((None, (rows, 1), (columns, 1))))
+        return accumulated(product, rows, columns, group_sizes, preferred_element_type=wide).astype(out_dtype)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays, tables)
 

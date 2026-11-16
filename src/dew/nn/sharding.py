@@ -526,6 +526,21 @@ def manual_map[**Arguments, Result](local: Callable[Arguments, Result], in_specs
                          check_vma=False)
 
 
+def shard_shapes(operands: Sequence[jax.Array], specs) -> tuple[jax.ShapeDtypeStruct, ...]:
+    """Each of `operands` as `manual_map(local, specs, ...)` hands it to `local`: its shape on each shard of
+    the axes its spec names (`jax.sharding.NamedSharding.shard_shape`), whole off a mesh or where the
+    context holds every axis manual already."""
+    mesh = jax.sharding.get_abstract_mesh()
+    manual = [axis for axis in mesh.axis_names if axis not in mesh.manual_axes]
+    if not manual:
+        return tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in operands)
+    # The axes the map holds manual alone: an axis an outer map holds manual already is no shard here, and a
+    # sharding over it is refused (a manual subgroup, JAX's op_shardings).
+    held = jax.sharding.AbstractMesh(tuple(mesh.shape[axis] for axis in manual), tuple(manual))
+    return tuple(jax.ShapeDtypeStruct(jax.sharding.NamedSharding(held, spec).shard_shape(x.shape), x.dtype)
+                 for x, spec in zip(operands, specs, strict=True))
+
+
 def on_shards(local: Callable, spec: jax.sharding.PartitionSpec, operands: Sequence[jax.Array | None],
               whole: Collection[int] = (), out_specs=None, gathered: Mapping[int, jax.sharding.PartitionSpec]
               = types.MappingProxyType({})):
