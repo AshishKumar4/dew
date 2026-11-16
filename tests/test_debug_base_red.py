@@ -2,6 +2,8 @@
 
 import json
 
+import jax
+import jax.numpy as jnp
 import pytest
 from fla_gdn_support import KernelCase
 from kernel_compile import compile_mosaic_kernels, mosaic_failures
@@ -142,3 +144,38 @@ def test_certified_matrix(index):
     print("CERTIFIED_MATRIX " + json.dumps({"label": label, "raw": repr(raw), "chosen": chosen,
                                             "failures": mosaic_failures(found)}), flush=True)
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
+
+
+@pytest.mark.parametrize("mode", ["original", "certify_plan"])
+def test_product_decode_certifies_before_lowering(mode, monkeypatch):
+    from dew.nn.kernels.templates import attention as template, attention_decode, attention_route
+
+    if mode == "certify_plan":
+        streamed = attention_decode._streamed
+
+        def certified(*args, **kwargs):
+            found = streamed(*args, **kwargs)
+            if found is None:
+                return None
+            config, op, ba = found
+            config = op._certified(ba, config)
+            return None if config is None else (config, op, ba)
+
+        monkeypatch.setattr(attention_decode, "_streamed", certified)
+    query = jax.ShapeDtypeStruct((1, 1, 4, 128), jnp.float16)
+    key = jax.ShapeDtypeStruct((1, 1024, 2, 128), jnp.float16)
+    spans = template.spans(1, 1024, 1, causal=False)
+
+    def attended(q, k, v):
+        return attention_route.attend(q, k, v, spans, natural=False)
+
+    with generation.assumed("sm90"):
+        assert attention_decode.serves(query, key, None, natural=False, target=generation.gpu_target())
+        found = compile_mosaic_kernels([KernelCase("product decode", lambda: (attended, (query, key, key)))],
+                                       "sm90")
+    certificates = [cert for record in found for cert in record.get("certifications", [])
+                    if cert["op"] == "MosaicForward"]
+    print("PRODUCT_DECODE " + json.dumps({"mode": mode, "certificates": certificates,
+                                          "failures": mosaic_failures(found)}, default=str), flush=True)
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)
+    assert certificates, "product decode compiled its pinned raw proposal without certifying it"
