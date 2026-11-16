@@ -412,7 +412,7 @@ class Plain:
     scale: ClassVar[int] = 1
 
 
-@attrs.define(frozen=True)
+@attrs.define(frozen=True{attrs_eq})
 class Ranged:
     span: int = {span}
     marks: list = attrs.Factory(lambda: [{mark}])
@@ -483,7 +483,7 @@ class Shifting:
                  + Plain.by * Plain.scale + Ranged().span + Ranged().marks[0] + Ranged().scaled
                  + hooked.scaled + int(Keyed(1) == Keyed(3)) + int(Keyed(1) < Keyed(3)) + Keyed(1).checked
                  + classhooked.scaled + int(Flagged(1) == Flagged(3)) + int(HELD is not None)
-                 + int(Compared() == Compared()) + int(Fielded(1) == Fielded(3))
+                 + int(Compared() == Compared()) + int(Fielded(1) == Fielded(3)) + int(Ranged() == Ranged())
                  + Piped().value + self.held.count)
         return {{**row, "id": row["id"] + total}}
 """
@@ -494,7 +494,7 @@ default, factory, converter, setter hook, eq and order keys and validators of at
 
 GENERATED_AT = {"by": 1, "scale": 1, "over": 20, "value": 3, "slots": "", "span": 2, "mark": 5, "factor": 7,
                 "hook": 7, "modulus": 2, "sign": 1, "kinds": "int", "classhook": 7, "flag": "True",
-                "eq": "True", "compare": "True", "pipe": 3}
+                "eq": "True", "compare": "True", "pipe": 3, "attrs_eq": ""}
 
 
 @pytest.mark.parametrize(("edit", "assigned"), [
@@ -503,12 +503,12 @@ GENERATED_AT = {"by": 1, "scale": 1, "over": 20, "value": 3, "slots": "", "span"
     ({"factor": 70}, None), ({"hook": 70}, None), ({"modulus": 20}, None), ({"sign": -10}, None),
     ({"kinds": "(int, float)"}, None), ({"classhook": 70}, None), ({"flag": "False"}, None),
     ({}, ("by", 10)), ({}, ("scale", 10)), ({"eq": "False"}, None), ({"compare": "False"}, None),
-    ({"pipe": 30}, None)],
+    ({"pipe": 30}, None), ({"attrs_eq": ", eq=False"}, None)],
     ids=["slotted field", "mangled field", "slotted child's override", "factory", "slotted factory",
          "attrs default", "attrs factory", "attrs converter", "attrs setter hook", "attrs eq key",
          "attrs order key", "attrs validators", "attrs class setter hook", "attrs eq flag",
          "a default set at run time", "a class variable set at run time", "dataclass eq option",
-         "dataclass field compare flag", "attrs nested converter"])
+         "dataclass field compare flag", "attrs nested converter", "attrs eq option"])
 def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factory_changed(
         tmp_path, monkeypatch, edit, assigned):
     """A step of a class of the user's file, stated by its members, whose code builds classes of the file
@@ -769,3 +769,54 @@ def test_an_exact_resume_holds_the_code_a_steps_methods_reach(tmp_path, monkeypa
         resumed_changes(reader(), state)
     (changed,) = resumed_changes(reader("relaxed"), state)
     assert changed.startswith("code.")
+
+
+REMAPPED = """import attrs
+import dataclasses
+
+import numpy as np
+
+
+@attrs.define(frozen=True, eq=False)
+class Remap:
+    table: np.ndarray
+
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + int(self.table[int(row["id"])])}}
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class Holding:
+    remap: Remap
+
+    def __call__(self, row):
+        return self.remap(row)
+
+
+def step(changed, held):
+    table = np.arange(2000)
+    if changed:
+        table[1000] = -1
+    return Holding(Remap(table)) if held else Remap(table)
+"""
+
+
+@pytest.mark.parametrize("held", [False, True], ids=["attrs step", "dataclass holding an attrs instance"])
+def test_an_exact_resume_refuses_an_attrs_step_whose_long_array_changed(tmp_path, monkeypatch, held):
+    """An attrs step holding an array of 2000 entries, or a dataclass step holding it, is stated by its
+    fields, each array by its content: one entry changed past its repr's elision refuses an exact resume,
+    and the unchanged step resumes exactly. Its repr, which elides an array's middle past 1000 entries,
+    stated it and the changed step resumed (train 963's review)."""
+    module = tmp_path / f"remapped_{uuid4().hex}.py"
+    module.write_text(REMAPPED.format())
+    monkeypatch.syspath_prepend(str(tmp_path))
+    remapped = importlib.import_module(module.stem)
+
+    def reader(changed=False):
+        pipeline = Pipeline(ROWS).map(remapped.step(changed, held)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(changed=True), state)

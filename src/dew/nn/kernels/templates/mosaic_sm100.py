@@ -641,7 +641,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
-                gathered: tuple[str, ...] = ()) -> dict:
+                gathered: tuple[str, ...] = (), joined: tuple[str, ...] = ()) -> dict:
+        del joined  # a pair a stream (`Family.streams`)
         from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on `rings.Ring`
 
         if multicast:
@@ -1404,7 +1405,8 @@ class Tcgen05Chunks(Tcgen05ChunksIssuer, mosaic.RingFamily):
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
-                gathered: tuple[str, ...] = ()) -> dict:
+                gathered: tuple[str, ...] = (), joined: tuple[str, ...] = ()) -> dict:
+        del joined  # a pair a stream (`Family.streams`)
         # A 64-row product reads a transposed operand as two halves of 32 rows and splits its columns
         # between two lane groups, each whole tiles of its swizzle: at 128 bytes the keys' (64, 8) transposed
         # tiling divides no half (Mosaic GPU's layout inference refused a 27B gated delta net's fp32 forward

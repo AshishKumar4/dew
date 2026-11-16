@@ -255,12 +255,19 @@ def _head_changes(first: Mapping[str, object], other: Mapping[str, object]) -> l
     return [f"head.{name}" for name in registry.computing_differences(
         registry.imported(str(first["class"])), *stated, kept=(_records.NUMBERS,))]
 
+def _tokenizer_files(settings: "DecideSettings") -> Mapping[str, str] | str | None:
+    """What a run's text tokenizer is, which runs compare by: its files' hashes (`tokenizer_files`, which a
+    run's load states where its record did not, `dew.inference.tasks.tokenizer_here`), else its name (`byte`,
+    which has no files), else None."""
+    return settings.tokenizer_files if settings.tokenizer_files is not None else settings.tokenizer
+
+
 @dataclass(frozen=True)
 class DecideSettings:
     """What a decision run records beside its backbone, and its task is built with
     (`Decide.from_run`): the head's record (`Head.record`), the layout (by import path, its
-    segments with it), the special tokens, the text tokenizer's name, and an image processor's
-    source, or None."""
+    segments with it), the special tokens, where the text tokenizer is found (its name, a hub snapshot as
+    its repo and commit) and what it is (its files' hashes), and an image processor's source, or None."""
 
     head: Mapping[str, object]
     """The head's class record (`Head.record`), which `Head.from_record` builds over the backbone it reads,
@@ -279,6 +286,10 @@ class DecideSettings:
     which a pass of its task pads each question to (`Budget.options`); None where the run recorded
     none, as before it did. A pass's question slots are its windows' (`Decide.pass_shapes`), so the
     run records no count of questions (an earlier run's `questions` is read past, `saved_settings`)."""
+    tokenizer_files: Mapping[str, str] | None = field(default=None, metadata={_records.ADDED: True})
+    """What the text tokenizer is: each of its files' hash (`dew.inference.tasks.recorded_files`), which a
+    load holds the files it finds to and runs compare by; None where a run recorded none, as runs before
+    it did."""
 
 
 CALIBRATIONS = "calibrations"
@@ -486,7 +497,8 @@ class Decide(SavedRunTask, InItsForm):
         # here as documents continuing the shared part: the same tokens at the same positions, each
         # question reading the shared part and itself (with siblings, the questions before it), so the
         # same function, each held to its questions' own rows (tests/test_decision_state_once.py).
-        return cls(model, variables, settings.layout, tokenizer_for(settings.tokenizer), settings.specials,
+        tokenizer = tokenizer_for(settings.tokenizer, files=settings.tokenizer_files, held=directory)
+        return cls(model, variables, settings.layout, tokenizer, settings.specials,
                    name=str(epath.Path(directory).name), weights=weights, processor=processor, budget=budget,
                    derives_sharing=False)
 
@@ -599,11 +611,15 @@ class Decide(SavedRunTask, InItsForm):
         settings = [saved_settings(saved, DecideSettings) for saved in recorded]
         # A setting its data derives (its padding, `metadata["derived"]`) may differ between the runs, and
         # their heads by how they run or train alone (`_head_changes`).
-        for directory, own in zip(runs, settings, strict=True):
+        # Their tokenizers by what they are, their files' hashes, wherever each found it (`_tokenizer_files`).
+        tokenizers = [_tokenizer_files(own) for own in settings]
+        for directory, own, held in zip(runs, settings, tokenizers, strict=True):
             differing = [entry.name for entry in fields(DecideSettings)
-                         if entry.metadata.get("derived") != "data" and entry.name != "head"
+                         if entry.metadata.get("derived") != "data"
+                         and entry.name not in ("head", "tokenizer", "tokenizer_files")
                          and getattr(own, entry.name) != getattr(settings[0], entry.name)]
             differing += _head_changes(settings[0].head, own.head)
+            differing += ["tokenizer"] if held != tokenizers[0] else []
             if differing:
                 raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
                                  f"{', '.join(differing)}, so their weights are not one task's to average")
@@ -705,6 +721,7 @@ class Decide(SavedRunTask, InItsForm):
         import optax
 
         from dew.decision.objective import DecisionObjective
+        from dew.inference.tasks import hold_tokenizer
         from dew.interop.saved_sources import with_release_sources
         from dew.state import TrainState
 
@@ -723,6 +740,7 @@ class Decide(SavedRunTask, InItsForm):
                 # The releases of saved runs its paths lie within mapped to the runs they hold, as a
                 # trainer's checkpoint carries them (`with_release_sources`).
                 record = with_release_sources(DecisionObjective(self).inference_record())
+            hold_tokenizer(record, checkpoints.directory)
             checkpoints.save(self.weights.step, state, artifact=record, weights_only=True)
             checkpoints.wait()
 

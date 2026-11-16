@@ -281,25 +281,33 @@ FIELD_FLAGS = {name: parameter.default
                for name, parameter in inspect.signature(dataclasses.field).parameters.items()
                if name not in ("default", "default_factory", "kw_only")}
 """What `dataclasses.field` gives a field unless told otherwise (compare, hash, init, repr, metadata), read
-from its signature: a field's departures from it are its parts (`GeneratedField.hooks`). Its keyword-only
+from its signature: a field's departures from it are its parts (`GeneratedField.parts`). Its keyword-only
 flag is its class's unless set, and names only how `__init__` is called."""
 
-COMPARISONS = ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__", "__hash__")
-"""The comparisons a class generator writes into a class, whose presence an attrs class's options decide."""
+ATTRS_COMPARISONS = {"eq": "__eq__", "order": "__lt__"}
+"""An attrs class's comparison options by the method each writes into it, and so whether it was given each:
+attrs makes a class with equality and without ordering unless told otherwise (`attrs.define`'s eq=True,
+order=False)."""
+
+ATTRS_DEFAULTS = {"eq": True, "order": False}
+"""What `attrs.define` makes a class with unless told otherwise, of `ATTRS_COMPARISONS`."""
 
 
 def generation_options(held: type) -> tuple[tuple[str, bool], ...]:
     """How a class generator made `held` itself where that departs from its defaults, each by its name: a
     dataclass's options apart from `DATACLASS_OPTIONS` (eq, order, frozen, unsafe_hash, ...); an attrs
-    class's comparisons by whether it holds each (`COMPARISONS`, a hash set to None not held). Empty for a
+    class's equality and ordering by the methods it holds (`ATTRS_COMPARISONS`) apart from `ATTRS_DEFAULTS`.
+    Empty for a
     class made as its generator makes one by default, or by none, so its statement is what it was (base
-    review of 67fd128db: an eq=False went unstated, and a step comparing its instances read other rows)."""
+    review of 67fd128db: an eq=False went unstated, and a step comparing its instances read other rows; train
+    963's review: every attrs class stated its comparisons, a class made by default among them)."""
     params = vars(held).get("__dataclass_params__")
     if params is not None:
         return tuple((name, getattr(params, name)) for name, default in DATACLASS_OPTIONS.items()
                      if getattr(params, name) != default)
     if "__attrs_attrs__" in vars(held):
-        return tuple((name, vars(held).get(name) is not None) for name in COMPARISONS)
+        given = {name: vars(held).get(method) is not None for name, method in ATTRS_COMPARISONS.items()}
+        return tuple((name, value) for name, value in given.items() if value != ATTRS_DEFAULTS[name])
     return ()
 
 

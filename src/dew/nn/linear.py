@@ -1219,7 +1219,7 @@ class GatedDeltaNet(nn.Module):
     def _fused_hooks(self, operand) -> recurrence.Hooks:
         """The decode token whole in the recurrence's step: the conv and its silu, the queries' and
         keys' l2 norm, the gates from their pre-activations, the delta rule and the gated norm, its output
-        read back first in `operand`, the input projection's dtype (`as_projected`)."""
+        read back first in `operand`, the input projection's dtype."""
         return recurrence.Hooks(conv=recurrence.Conv('silu'), l2norm=True, decay='scalar',
                                 gates=self._gates,
                                 output=recurrence.OutputNorm(self.norm_eps, self.gate_activation,

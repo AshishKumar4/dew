@@ -348,7 +348,7 @@ def test_a_phased_runs_later_phase_is_compiled_off_its_loop(monkeypatch, tmp_pat
     from test_plan import LIMIT, free
 
     from dew.checkpoints import Checkpoints
-    from dew.nn.kernels import generation
+    from dew.nn.kernels import generation, options
     from dew.nn.precision import Numerics
 
     free(monkeypatch, LIMIT)
@@ -362,6 +362,8 @@ def test_a_phased_runs_later_phase_is_compiled_off_its_loop(monkeypatch, tmp_pat
     with jax.enable_x64(new_val=True), generation.run_precision(the_runs), generation.chosen(rms_norm="xla"):
         phased_params(phased_trainer(looped(), 0, checkpoints=Checkpoints(directory)), tokens, steps=2,
                       checkpoint_every=2)
+        # The resumed run as a process of its own, which plans and compiles its second phase as it resumes.
+        options.unhold()
         resumed = phased_trainer(looped(), 0, checkpoints=Checkpoints(directory))
         planned = phased_params(resumed, tokens)
     assert [probe["ahead"] for probe in resumed.plan["probes"]] == [False]

@@ -57,7 +57,7 @@ from dew.data.analysis import (
 )
 from dew.data.cache import _Mapped
 from dew.data.completion import Completed, Numbered, cuts, reach, released
-from dew.data.concurrent import Concurrently
+from dew.data.concurrent import Concurrently, Made, Pool, dies_with_parent
 from dew.data.dataset import (
     SHARED_BYTES,
     DataPartition,
@@ -82,10 +82,10 @@ from dew.data.handoff import (
     _Grouped,
     _handoff,
     _Spread,
-    _threads,
     _Ungrouped,
     _Unspread,
     draws_after_expansion,
+    pool_of,
     record_stage_of,
 )
 from dew.data.mixing import (
@@ -512,7 +512,8 @@ def _run(
     The run's one random stage draws from the rng Grain hands its operator, keyed by the record's
     place in what that operator reads, as it would lowered alone: so a stage before it that drops
     records (counted out by `Accepted`, unless they go on `marked`) or expands them ends the run,
-    as does a second random stage. A fetch on its own pool (`Fetch.threads`) runs alone on it.
+    as does a second random stage. A stage on a pool of its own (a fetch's threads, a declared pool,
+    `pool_of`) runs alone on it.
     Over `indexed` rows the steps before an expansion run by index, on the read's threads, and the
     expansion and the steps after it read them as a stream (`_expanded`)."""
     run: list[RecordStage] = []
@@ -520,7 +521,7 @@ def _run(
     for stage in stages[start:stop]:
         if not record_stage_of(stage):
             break
-        if _threads((stage,)) is not None:
+        if pool_of((stage,)) is not None:
             return tuple(run) or (stage,)
         if isinstance(stage, RandomMap):
             if drawn or counted:
@@ -573,10 +574,14 @@ def _through(rows: Rows, run: tuple[RecordStage, ...], name: str, label: str, lo
     """`rows` through a run of record stages (`_run`) as one Grain operator: on the pool of its
     fetch, as an expansion, as a draw from `seed` where it holds its random stage, or as a map."""
     lowered = _Rows(run, unplaced=unplaced)
-    threads = _threads(run)
-    if threads is not None:
+    pool = pool_of(run)
+    if pool is not None:
         # A step with a pool of its own: its records in flight at once, delivered in order.
-        return Concurrently(_as_iter(rows, loading), lowered, threads)
+        if any(isinstance(stage, FlatMap) for stage in run):
+            # An expansion's records each come back as the tuple it made of them, handed on one by one.
+            return gx.FlatMapIterDataset(Concurrently(_as_iter(rows, loading), lowered.flat_map, pool),
+                                         Made())
+        return Concurrently(_as_iter(rows, loading), lowered, pool)
     if any(isinstance(stage, FlatMap) for stage in run):
         return _expanded(_as_iter(rows, loading), run, name, label, unplaced=unplaced)
     return rows.map(lowered) if seed is None else rows.random_map(lowered, seed=seed)
@@ -610,9 +615,10 @@ class _Prefix:
     stages: tuple[Stage, ...]
 
     @property
-    def threads(self) -> int | None:
-        """The records a fetch among these steps runs at once on its own pool (`Fetch.threads`)."""
-        return _threads(self.stages)
+    def pool(self) -> Pool | None:
+        """The pool a stage among these steps runs its records on (`pool_of`): a fetch's own threads, or a
+        declared pool."""
+        return pool_of(self.stages)
 
     @property
     def volatile(self) -> bool:
@@ -746,30 +752,6 @@ class _TokenSplit(_WrappingDataset):
             key: np.asarray(column)[first:last] if key in self._split.fields else column
             for key, column in record(self._parent[document], "token split document").items()
         }
-
-
-def _dies_with_parent(index: int, count: int) -> None:
-    """Ends this Grain worker once the process that started it has ended, however it ended.
-
-    A worker reads until its parent sets a stop event, so a parent killed, timed out or crashed
-    left its workers reading into a queue no one empties: 81 of them on one host, 47 GB between
-    them, a day later. A spawned worker holds its parent's sentinel, a pipe only the parent
-    writes, which reads as ended once the parent has exited; a thread waits on it and ends the
-    worker."""
-    import multiprocessing.connection
-    import os
-    import threading
-
-    parent = multiprocessing.parent_process()
-    if parent is None:
-        return
-
-    def watch() -> None:
-        multiprocessing.connection.wait([parent.sentinel])
-        os._exit(1)
-
-    watcher = f"dew worker {index} of {count} watching its parent"
-    threading.Thread(target=watch, name=watcher, daemon=True).start()
 
 
 def _as_iter(rows: Rows, loading: Loading) -> pygrain.IterDataset:
@@ -1540,8 +1522,10 @@ class _Build:
             kept = (_as_iter(single, self.loading) if marked
                     else Accepted(_as_iter(single, self.loading), _name(pipeline), _label(pipeline)))
             return kept, cache + 1, None
-        # A fetch with a pool of its own among the cached steps reads that many inputs at once.
-        threads = max(self.loading.threads, prefix.threads or 0)
+        # A stage on a thread pool of its own among the cached steps reads that many inputs at once (a
+        # process pool before an indexed read's cache is refused as the read is analyzed).
+        pooled = prefix.pool
+        threads = max(self.loading.threads, 0 if pooled is None else pooled.size)
         read = dataclasses.replace(self.loading, threads=threads,
                                    read_buffer=max(self.loading.read_buffer, threads))
         flat = gx.FlatMapIterDataset(_as_iter(view, read), _CachedOutputs())
@@ -1570,7 +1554,7 @@ class _Build:
         if cache is not None:
             filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
             shards = _positioned(shards, partition, self.stream_loading) if 0 <= last < cache else shards
-            reader = filled.streamed(shards.reader, manifest, transform=prefix, threads=prefix.threads,
+            reader = filled.streamed(shards.reader, manifest, transform=prefix, pool=prefix.pool,
                                      source=source, transparent=transparent)
             shards = dataclasses.replace(shards, reader=reader)
         shards = _positioned(shards, partition, self.stream_loading) if last >= start else shards
@@ -1924,7 +1908,7 @@ class _Build:
                 pygrain.MultiprocessingOptions(
                     num_workers=stage.count, per_worker_buffer_size=stage.buffer
                 ),
-                worker_init_fn=_dies_with_parent,
+                worker_init_fn=dies_with_parent,
             )
         elif isinstance(stage, Native):
             # A Grain step reads cache fills through an iterator that owns them (`_Filled`).
