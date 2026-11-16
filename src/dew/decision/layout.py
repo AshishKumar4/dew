@@ -1361,6 +1361,11 @@ class SegmentLayout(Layout):
         return cls(**{"max_len": 16384, "segments": JOINT_SEGMENTS, "framing": Framing(), **fields,
                       "form": "joint"})
 
+    @property
+    def _joint_segments(self) -> "tuple[RowSegment, ...]":
+        """The joint row's segments: its own, `JOINT_SEGMENTS` where it states none."""
+        return JOINT_SEGMENTS if self.segments is None else self.segments
+
     def _joint_post_init(self) -> None:
         """The joint row's own checks (`joint_row`): its question-row fields refused, its turn's segments and
         framing given where it states none."""
@@ -1374,8 +1379,8 @@ class SegmentLayout(Layout):
             object.__setattr__(self, "framing", Framing())
         if self.max_state_tokens is not None:
             _least("max_state_tokens", self.max_state_tokens, 0)
-        kinds = [type(segment) for segment in self.segments]
-        others = sorted({type(segment).__name__ for segment in self.segments
+        kinds = [type(segment) for segment in self._joint_segments]
+        others = sorted({type(segment).__name__ for segment in self._joint_segments
                      if not isinstance(segment, JOINT_KINDS)})
         if others:
             raise ValueError(f"a joint row writes its questions in its schema and reads no cue, so it has no "
@@ -1384,18 +1389,20 @@ class SegmentLayout(Layout):
             raise ValueError("a joint row's segments hold the schema once, and the images "
                              f"at most once each, not {[kind.__name__ for kind in kinds]}")
         if any(isinstance(segment, State) and (segment.render != "compact" or segment.turns is not None
-                                               or segment.values != Values()) for segment in self.segments):
+                                               or segment.values != Values())
+               for segment in self._joint_segments):
             raise ValueError("a joint row writes its state as sorted compact JSON (State(render='compact')); "
                              "its turns and values are a question row's")
-        _streamed(self.segments, self.reads)
+        _streamed(self._joint_segments, self.reads)
 
     def _joint_spans_in_context(self) -> bool:
         """Whether the row's schema is its context (`Schema.stream`), its spans the context's."""
-        return any(isinstance(segment, Schema) and segment.stream == "context" for segment in self.segments)
+        return any(isinstance(segment, Schema) and segment.stream == "context"
+                   for segment in self._joint_segments)
 
     def _joint_attention(self) -> "tuple[tuple[tuple[int, ...], ...], int] | None":
         """Its rows' reads over their streams (`streamed_attention`)."""
-        return streamed_attention(self.reads, self.segments)
+        return streamed_attention(self.reads, self._joint_segments)
 
     def _joint_state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
         return tuple(encoder.encode(_compact(state), add_special_tokens=False))
@@ -1411,14 +1418,14 @@ class SegmentLayout(Layout):
         tokens the marks its chunks carry. Its row holds no summary of the request (`JOINT_KINDS`),
         whose `request` it reads none of."""
         pieces = _Pieces(encoder)
-        if media and not any(isinstance(segment, Media) for segment in self.segments):
+        if media and not any(isinstance(segment, Media) for segment in self._joint_segments):
             raise ValueError("this joint layout's segments have no place for images")
         schema = rendered_chunks(self._joint_schema(questions, orders), pieces, "pieces")
         state_ids = tuple(self._joint_state(encoder, specials, state) if tokens is None else tokens)
         whole = len(state_ids)
         # The turn's markup and the text beside it are read as one piece each, as the turn writes them.
         before, after = self.framing.around(encoder)
-        parts: list[str | Segment] = [before, *self.segments, after]
+        parts: list[str | Segment] = [before, *self._joint_segments, after]
         laid_out: list[tuple[Segment | None, Chunk]] = []
         for part in parts:
             if isinstance(part, (str, Text)):
@@ -1450,7 +1457,7 @@ class SegmentLayout(Layout):
         kept_count = min((len(chunk.ids or ()) for (segment, _), chunk in zip(laid_out, chunks, strict=True)
                           if isinstance(segment, State)), default=0)
         # Where the row turns to another of its streams, its tokens are marked there (`Reads`).
-        streams = [segment_stream(segment, self.segments) if segment is not None else "row"
+        streams = [segment_stream(segment, self._joint_segments) if segment is not None else "row"
                    for segment, _ in laid_out]
         row = rendered_chunks(streamed_chunks(chunks, streams) if self.reads is not None else chunks,
                               pieces, "pieces")
@@ -1463,7 +1470,7 @@ class SegmentLayout(Layout):
                 if isinstance(segment, State)]
         # A row of no State segment holds none of the state: all of it is cut.
         state_cut = sum(whole - kept for kept in held) if held else whole
-        tokens_streams = (token_streams(row.points, len(row.tokens), self.segments)
+        tokens_streams = (token_streams(row.points, len(row.tokens), self._joint_segments)
                           if self.reads is not None else None)
         if tokens_streams is not None and media:
             raise ValueError("a row whose streams say what each token reads holds no images, whose tokens "
@@ -2243,7 +2250,7 @@ def _joint_order(question: Question) -> list[int]:
     return list(range(len(keys)))
 
 
-def per_question(layout: Layout) -> TypeIs[SegmentLayout]:
+def per_question(layout: Layout | None) -> TypeIs[SegmentLayout]:
     """Whether `layout` writes a row a question (`SegmentLayout`'s marker or state-first row), whose
     question-row fields it reads (labels, sharing, parallel options, blocks)."""
     return isinstance(layout, SegmentLayout) and not layout.joint
