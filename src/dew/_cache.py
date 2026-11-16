@@ -35,8 +35,8 @@ def holding[Key: Hashable, Value](cache: collections.OrderedDict[Key, Value], ke
     later kept: a held value is a function of its key, so either is the same. How a process holds what it
     decides and derives once for what it reads: the algebra's kernel decisions, written programs,
     recognitions, window derivations and scan forms (`dew.algebra`), a declared walk's forms
-    (`derive.derived`), a launch's derived config (`templates.base`) and a module's counted work
-    (`dew.nn.flops`)."""
+    (`derive.derived`), a launch's derived config (`templates.base`), a module's counted work
+    (`dew.nn.flops`) and a keyed objective's traced work (`objectives.base.traced_update_flops`)."""
     with _HOLDING:
         if key in cache:
             cache.move_to_end(key)
