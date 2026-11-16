@@ -669,41 +669,23 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     np.testing.assert_array_equal(np.asarray(scored.weights), ~padding)
 
 
-def masked_run(tmp_path, corpus, name: str, pretrained, tokenizer, *flags: str):
-    """One step of a masked-diffusion run from `pretrained`, encoding with `tokenizer`, over `corpus`'s
-    windows, checkpointed in tmp_path/runs/`name`."""
-    data = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
-        Loading(workers=0))
-    return LMRunConfig.cli([
-        "--pretrained", str(pretrained), "--objective", "masked_diffusion", "--tokenizer", str(tokenizer),
-        "--model.dtype", "float32", "--model.attention-impl", "xla",
-        "--trainer.steps", "1", "--trainer.log-every", "1",
-        "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", name,
-        "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--objective.ema-decay", "None", "--max-new-tokens", "0", *flags],
-        default=LMRunConfig(data=data)).run()
-
-
 def test_a_run_whose_tokenizer_is_gone_exports_and_starts_a_run_from_the_copy_it_holds(tmp_path, monkeypatch):
     """A run holds its tokenizer, so with the directory it read it from gone and this host's cache fresh,
     its bundle (`Pretrained.from_run`) encodes with the run's own copy, its export writes those files,
     and a run started from it (`--pretrained <run>`) over token files of that vocabulary trains. The
     bundle carried the name the run recorded, which an export and a start resolved on this host and failed
     on (train 972's review)."""
-    import shutil
-
-    from dew.data.text import HFTokenizer
+    from dew.data.text import HFTokenizer, tokenizer_for
     from dew.interop import Pretrained
 
-    checkpoint = REPO_ROOT / "tests/fixtures/hf/llada-tiny"
-    source = tmp_path / "source"
-    shutil.copytree(checkpoint, source)
-    ids = np.random.RandomState(400).randint(4, 100, 400)
-    corpus = write_token_corpus(tmp_path / "tokens", ids, tokenizer=str(checkpoint), vocab_size=100, eos_id=1)
-    own = write_token_corpus(tmp_path / "own", ids, tokenizer=str(source), vocab_size=100, eos_id=1)
-    masked_run(tmp_path, own, "first", source, source)
+    vocabulary = REPO_ROOT / "tests/fixtures/laya/tiny/tokenizer"
     text = "a run's own tokenizer"
-    expected = HFTokenizer(str(checkpoint)).encode(text)
+    expected = HFTokenizer(str(vocabulary)).encode(text)
+    source = export_tiny_decoder(tmp_path / "source", tokenizer=tokenizer_for(str(vocabulary)),
+                                 vocab_size=len(HFTokenizer(str(vocabulary)).tokenizer))
+    own = write_token_files(tmp_path / "own", 40 * SEQ, 8 * SEQ, tokenizer=str(source), eos_id=0)
+    pretrained_config(own, source, "--trainer.steps", "1", "--max-new-tokens", "0",
+                      "--trainer.name", "first").run()
     source.rename(tmp_path / "moved")
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "fresh"))
     first = tmp_path / "runs" / "first"
@@ -713,7 +695,9 @@ def test_a_run_whose_tokenizer_is_gone_exports_and_starts_a_run_from_the_copy_it
     assert processor.encode(text, specials=True) == expected
     bundle.save(tmp_path / "exported")
     assert HFTokenizer(str(tmp_path / "exported")).encode(text) == expected
-    started = masked_run(tmp_path, corpus, "started", first, checkpoint)
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, tokenizer=str(vocabulary), eos_id=0)
+    started = pretrained_config(tokens, first, "--trainer.steps", "1", "--max-new-tokens", "0",
+                                "--trainer.name", "started").run()
     assert int(started.updates) == 1
 
 
