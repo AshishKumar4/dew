@@ -10,7 +10,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -50,73 +50,77 @@ def producer_floor() -> int:
 
 
 @dataclasses.dataclass(frozen=True)
-class Producers:
-    """The registers a config's launches lower their producers to, by launch (a kernel's name, `report.Binary
-    .kernel`), where a compile found one spilling at fewer (its derivation's raise, the recurrence's
-    `Mosaic._raised`): every other launch's at the least (`producer_floor`). A dimension of the config its
-    launches derive, refused and raised as a compile or its certification refuses a spilling config, so the
-    assembler derives a producer's registers, a step at a time (the B200's natural d256 forward over 4,096
-    tokens and sm100's recurrence states, scan and reverse launches each spilled at the least, rows 6010
-    and 5357)."""
+class ByLaunch:
+    """A config's caps on some of its launches, by launch (a kernel's name, `report.Binary.kernel`), where a
+    compile found one spilling: every other launch's its derivation's own. A dimension of the config its
+    launches derive, refused and stepped as a compile or its certification refuses a spilling config."""
 
-    raised_to: tuple[tuple[str, int], ...] = ()
+    caps: tuple[tuple[str, int], ...] = ()
 
     def of(self, launch: str) -> int | None:
-        """The registers `launch`'s producer lowers to, None at the least (`producer_floor`)."""
-        return dict(self.raised_to).get(launch)
+        """`launch`'s cap, None where its derivation alone decides."""
+        return dict(self.caps).get(launch)
 
-    def only(self, launches: Collection[str]) -> "Producers":
-        """The registers of `launches`' own producers alone, what they read of these."""
-        return Producers(tuple((name, cap) for name, cap in self.raised_to if name in launches))
+    def only(self, launches: Collection[str]) -> Self:
+        """The caps of `launches` alone, what they read of these."""
+        return type(self)(tuple((name, cap) for name, cap in self.caps if name in launches))
 
-    def stepped(self, tops: Mapping[str, int]) -> "Producers | None":
-        """These, with each of `tops`' launches' producers at the next rung of its ladder, which runs from its
-        top down a setmaxnreg step at a time to a step above the least: an unraised producer to its top (its
-        program's entry share, where every role holds the same and no register moves: past it the roles'
-        setmaxnreg moves invert, the producer's drop a rise, and the assembler rejects the kernel), a raised
-        one a step lower; None where one is a step above the least already, or its top is not above it."""
-        steps, held = facts().raises(), dict(self.raised_to)
-        for launch, top in tops.items():
-            cap = held.get(launch)
-            # A top in setmaxnreg's steps: a program of two warpgroups launches at a thread's 255, no step.
-            lower = min(top, steps.highest) // steps.step * steps.step if cap is None else cap - steps.step
-            if lower <= steps.lowest:
-                return None
-            held[launch] = lower
-        return Producers(tuple(sorted(held.items())))
+    def without(self, launches: Collection[str]) -> Self:
+        """These but `launches`', each its derivation's own again."""
+        return type(self)(tuple((name, cap) for name, cap in self.caps if name not in launches))
+
+    def held(self, stepped: Mapping[str, int]) -> Self:
+        """These with each of `stepped`'s launches at its cap there."""
+        return type(self)(tuple(sorted({**dict(self.caps), **stepped}.items())))
 
 
 @dataclasses.dataclass(frozen=True)
-class Residents:
-    """The programs a multiprocessor holds of a config's launches at most, by launch (a kernel's name, as
-    `Producers`), where a compile found one spilling with its producer's ladder run out (its derivation's
-    step, the recurrence's `Mosaic._fewer`): every other launch's as many as its registers and shared memory
-    hold (`plan`). A dimension of the config as `Producers` is, refused and stepped as a compile or its
-    certification refuses a spilling config: a program fewer gives every role of the launch a larger share,
-    where the assembler may hold what it spilled at more, which no model of a launch's live values states
-    (Mamba-2's query/key walk at 8 heads of 32 and a state of 32, row 6718: its consumers spilled two table
-    reads at three programs' 136 registers at every rung of its producer's ladder, its values 91 registers
-    live at their peak, and held them at two programs' 232)."""
+class Producers(ByLaunch):
+    """The registers a config's launches lower their producers to (`ByLaunch`), where a compile found one
+    spilling at the least (its derivation's raise, the recurrence's `Mosaic._raised`): every other launch's
+    at the least (`producer_floor`), so the assembler derives a producer's registers, a rung at a time (the
+    B200's natural d256 forward over 4,096 tokens and sm100's recurrence states, scan and reverse launches
+    each spilled at the least, rows 6010 and 5357)."""
 
-    held_to: tuple[tuple[str, int], ...] = ()
+    def stepped(self, tops: Mapping[str, int], stated: Mapping[str, int] | None = None) -> "Producers | None":
+        """These, with each of `tops`' launches' producers at the next rung of its ladder: from the least, its
+        `stated` cap where given (where its consumers' statement leaves the producer more than the least,
+        `stated_producer`; a GEMM's gathering producer states none, `gemm.producers`), then its top (its
+        program's entry share, where every role holds the same and no register moves: past it the roles'
+        setmaxnreg moves invert, the producer's drop a rise, and the assembler rejects the kernel), then down
+        a setmaxnreg step at a time past the stated cap, asked already, to a step above the least; None where
+        one is a step above the least already, or its top is not above it."""
+        steps, rungs = facts().raises(), {}
+        for launch, top in tops.items():
+            cap, start, first = self.of(launch), steps.below(top), (stated or {}).get(launch)
+            if cap is None:
+                lower = start if first is None else first
+            else:
+                lower = start if cap == first != start else cap - steps.step
+                if lower == first != start:
+                    lower -= steps.step
+            if lower <= steps.lowest:
+                return None
+            rungs[launch] = lower
+        return self.held(rungs)
 
-    def of(self, launch: str) -> int | None:
-        """The most programs of `launch` a multiprocessor holds, None where its plan alone decides."""
-        return dict(self.held_to).get(launch)
 
-    def only(self, launches: Collection[str]) -> "Residents":
-        """The programs of `launches` alone, what they read of these."""
-        return Residents(tuple((name, programs) for name, programs in self.held_to if name in launches))
+@dataclasses.dataclass(frozen=True)
+class Residents(ByLaunch):
+    """The programs a multiprocessor holds of a config's launches at most (`ByLaunch`), where a compile found
+    one spilling with its producer's ladder run out (its derivation's step, the recurrence's
+    `Mosaic._fewer`): every other launch's as many as its registers and shared memory hold (`plan`). A program
+    fewer gives every role of the launch a larger share, where the assembler may hold what it spilled at more,
+    which no model of a launch's live values states (Mamba-2's query/key walk at 8 heads of 32 and a state of
+    32, row 6718: its consumers spilled two table reads at three programs' 136 registers at every rung of its
+    producer's ladder, its values 91 registers live at their peak, and held them at two programs' 232)."""
 
     def fewer(self, planned: Mapping[str, int]) -> "Residents | None":
         """These, with each of `planned`'s launches held to a program fewer than the programs it plans now;
         None where one plans one already."""
-        held = dict(self.held_to)
-        for launch, programs in planned.items():
-            if programs <= 1:
-                return None
-            held[launch] = programs - 1
-        return Residents(tuple(sorted(held.items())))
+        if any(programs <= 1 for programs in planned.values()):
+            return None
+        return self.held({launch: programs - 1 for launch, programs in planned.items()})
 
 
 THREADS = 128
@@ -434,8 +438,7 @@ def raise_ceiling() -> int:
     at one program, spilled a 64-bit address at a raise of 256 and none at any of 192 to 248
     (FS-LT-OUTPUT-CAPS1, its PTX otherwise the same)."""
     held = facts()
-    raises = held.raises()
-    return min(raises.highest, held.thread_registers // raises.step * raises.step)
+    return held.raises().below(held.thread_registers)
 
 
 def raised_registers(consumers: int, programs: int = 1, producer: int | None = None) -> int:
@@ -699,6 +702,29 @@ class RegisterModel:
         """The model's numeric facts; its live family supplies rules, not serialized state."""
         return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
                 if field.name != "family"}
+
+
+def stated_producer(registers: int | None, warpgroups: int, consumers: int, programs: int = 1) -> int | None:
+    """The registers a producer lowers to where each of its program's `consumers` consumer warpgroups holds
+    its stated `registers` a thread (a program of `warpgroups` warpgroups, `programs` of it a multiprocessor):
+    the most of setmaxnreg's steps below the program's entry share that leaves the consumers that many
+    (`consumer_registers`), the rest of the pool the producer's; None where none above the least does, or the
+    registers are unstated. A launch spilling at the least takes it before its top: the 4B gated delta net's
+    training forward's output walk on an H100, stated at 176 of a two-warpgroup program held two to a
+    multiprocessor, spilled its tile index with its consumers at 232 and 216 and held from 208 down to 176
+    (jsf-out4bcaps), and its reverse walk on a B200, stated at 149, spilled 40 bytes with its producer at the
+    least and none from 80 up (jsf-revcaps). Not before the least: a statement short of what ptxas holds
+    spills at its share where the least holds (a B200's recurrence_solved and recurrence_output, an H100's
+    recurrence_scores_back, jsf-theme-cells)."""
+    if registers is None:
+        return None
+    steps = facts().raises()
+    producer = steps.below(entry_registers(warpgroups, programs))
+    while producer > steps.lowest:
+        if consumer_registers(consumers, programs, producer) >= registers:
+            return producer
+        producer -= steps.step
+    return None
 
 
 def moves_registers(registers: int | None, warpgroups: int, consumers: int, programs: int = 1) -> bool:

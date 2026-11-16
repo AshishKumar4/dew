@@ -195,6 +195,24 @@ def formed(x: jax.Array, count: int) -> tuple[jax.Array, ...]:
     return tuple(bf16_parts(x, count, saturating=count))
 
 
+def stacked(x: jax.Array, count: int) -> jax.Array:
+    """fp32 `x` `[rows, ...]` as its `count` bf16 parts (`formed`) stacked along its first axis `[count *
+    rows, ...]`, the largest first: an operand as a launch reads its parts."""
+    return jnp.concatenate(formed(x.astype(jnp.float32), count), 0)
+
+
+def joined(x: jax.Array, count: int) -> jax.Array:
+    """`stacked`'s inverse: the value `[rows, ...]` its `count` parts sum to, fp32, summed from the smallest
+    up. The parts sum to the value exactly, each the last's remainder (`formed`); summed largest first, a
+    finite value past bf16's largest by `2^120 - 2^111` or more took its leading two parts past fp32's, to
+    infinity, before the third's negative remainder brought it back (rows 6842, 6866)."""
+    parts = x.astype(jnp.float32).reshape(count, x.shape[0] // count, *x.shape[1:])
+    whole = parts[count - 1]
+    for part in range(count - 2, -1, -1):
+        whole = parts[part] + whole
+    return whole
+
+
 def terms(left: int, right: int) -> list[tuple[int, int]]:
     """The pairs `(i, j)` of two operands' parts (`formed`, `left` and `right` of them) a product of them
     issues, smallest first: those whose orders sum under the larger count, each part's bits beside the
