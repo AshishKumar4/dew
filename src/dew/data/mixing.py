@@ -819,6 +819,8 @@ class _MixReads:
         self.ahead = ahead
         self.held: dict[int, Batch] = {}
         self.exhausted: set[int] = set()
+        # The corpora whose captured position (`states`) is a copy made as the read ahead moved them.
+        self.copied: set[int] = set()
         # Each opened corpus's captured position, until a read or a restore moves it.
         self.states: dict[int, Mapping[str, object]] = {}
         # A position whose counters a corpus back at its start, unopened, takes on as it opens, every
@@ -838,11 +840,13 @@ class _MixReads:
 
     def read(self, index: int) -> Batch:
         self.states.pop(index, None)
+        self.copied.discard(index)
         parent = self.parent(index)
         given = self.held.pop(index) if index in self.held else next(parent)
         if self.ahead:
             # The position after the record given, captured before the pull ahead moves it.
             self.states[index] = copy.deepcopy(parent.get_state())
+            self.copied.add(index)
             try:
                 self.held[index] = next(parent)
             except StopIteration:
@@ -880,6 +884,7 @@ class _MixReads:
         """Corpus `index` holding no record ahead and not exhausted, as a restore or a rewind leaves it."""
         self.held.pop(index, None)
         self.exhausted.discard(index)
+        self.copied.discard(index)
 
     def close(self, index: int) -> None:
         self._unheld(index)
@@ -1106,6 +1111,12 @@ class _MixRead(pygrain.DatasetIterator[Batch]):
         """Whether the record this read gave last was its corpus's last (`_MixReads.ahead`)."""
         return self._index in self._group.exhausted
 
+    def snapshot(self) -> Mapping[str, object]:
+        """This read's position as a copy no later read moves: the one its group copied as it read ahead
+        (`_MixReads.copied`), else a copy of it made now, so each record's position is copied once."""
+        state = self.get_state()
+        return state if self._index in self._group.copied else copy.deepcopy(state)
+
     def get_state(self) -> Mapping[str, object]:
         state = self._group.state(self._index)
         if state is None:
@@ -1177,7 +1188,7 @@ class _Captured:
         # Each moved corpus's position copied whole as it is captured, a snapshot no read of it moves on
         # (Grain's iterators may hand back what they keep), which the shared mapping holds as it is, and a
         # copy of it with it (`SharedMapping.__deepcopy__`).
-        changed = {key: copy.deepcopy(self._reads[key].get_state()) for key in self._moved}
+        changed = {key: self._reads[key].snapshot() for key in self._moved}
         self._held = SharedMapping.of(changed) if self._held is None else self._held.replaced(changed)
         self._moved.clear()
         return self._held

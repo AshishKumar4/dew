@@ -60,7 +60,7 @@ from dew.nn.kernels import generation
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
 from dew.nn.projections import packed_owned
-from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
+from dew.nn.protocols import Bounded, CacheCapacity, StatesVocabulary, TokenModel, refuse_prefix
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping, id_row
 from dew.sampling.solvers import Solver
@@ -1125,7 +1125,8 @@ class TextGeneration(_NativeTextTask):
         if not strings:
             return ()
         return (decoding.stop_strings(self._listing(), strings,
-                                      self.model.vocab_size if isinstance(self.model, Bounded) else None),)
+                                      self.model.vocab_size if isinstance(self.model, StatesVocabulary)
+                                      else None),)
 
     @functools.cached_property
     def _stops(self) -> tuple[Stopping, ...]:
