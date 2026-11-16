@@ -421,3 +421,22 @@ def test_a_step_reading_a_module_it_holds_holds_what_it_reads_of_it(tmp_path, ho
     assert first[0] is True
     (tmp_path / "helping.py").write_text(HELPERS.format(by=10))
     assert _held_in_a_process(tmp_path, "1")[1] != first[1]
+
+
+def test_a_function_reading_a_module_by_a_computed_name_is_stated_by_the_whole_module(tmp_path, monkeypatch):
+    """A function of the user's that reads a module of the user's by a name it computes
+    (`getattr(settings, "scale")`) is stated by every attribute of that module, not only those its code
+    names: a value set on the module at run time, its file unchanged, changes the statement. Filtered to the
+    names its code reads, the statement held none of it (the round-3 head review's F11)."""
+    from dew._stated import stated
+
+    settings = tmp_path / f"settings_{uuid4().hex}.py"
+    settings.write_text("scale = 1\n")
+    user = tmp_path / f"user_{uuid4().hex}.py"
+    user.write_text(f"import {settings.stem}\n\n\n"
+                    f"def read(row):\n    return getattr({settings.stem}, 'scale')\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    held, reading = importlib.import_module(settings.stem), importlib.import_module(user.stem)
+    before = stated(reading.read, "step")
+    held.scale = 2
+    assert stated(reading.read, "step") != before

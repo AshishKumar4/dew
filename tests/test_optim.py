@@ -1930,18 +1930,28 @@ def test_adams_default_first_moment_keeps_its_promoted_dtype():
     (OptimConfig(optimizer="adamw", learning_rate=1e37), jnp.float32, True),
     (OptimConfig(optimizer="adamw", learning_rate=1e3), jnp.float16, True),
     (OptimConfig(optimizer="muon", learning_rate=2e-2, optimizer_opts={"adaptive": True}), jnp.float32, True),
+    (OptimConfig(optimizer="adam", learning_rate=1e-3, weight_decay=1.0, spared=False), jnp.float32, True),
+    (OptimConfig(optimizer="lamb", learning_rate=1e19), jnp.float32, True),
+    (OptimConfig(optimizer="adamw", learning_rate=3e-4, optimizer_opts={"eps": 1e-50}), jnp.float32, True),
+    (OptimConfig(optimizer="laprop", learning_rate=1e-3), jnp.float16, True),
+    (OptimConfig(optimizer="muon", learning_rate=2e-2, optimizer_opts={"eps": 0.0}), jnp.float32, True),
 ], ids=["defaults", "defaults in float16", "8-bit", "lamb", "laprop", "muon", "polar express", "cosine",
         "b2 under b1 squared, eps 1e-21", "b2 zero, eps 1e-20", "adam eps zero", "laprop eps zero",
-        "rate past float32's half", "rate past float16's half", "adaptive muon"])
+        "rate past float32's half", "rate past float16's half", "adaptive muon", "coupled decay",
+        "lamb past its parameters' norm", "eps below float32's smallest normal",
+        "laprop's eps below float16's smallest normal", "muon's normalization unguarded"])
 def test_a_built_optimizer_reads_its_update_only_where_its_bound_cannot_cover_a_bounded_gradient(
         config, dtype, reads):
     """Whether a step reads its formed update finite, decided as Dew's build makes its state
     (`dew.optim.bounded_updates`, from its constants and the parameters' dtypes and shapes): Dew's defaults,
     each optimizer's, a schedule's and 8-bit moments', whose bound times their peak rate stays within half of
     every parameter's dtype, read nothing and hold the state they did; a tiny eps beside b2 at most b1
-    squared, a guard of zero, a rate past half a parameter's dtype and an option whose bound Dew does not
-    state read it, and no configuration is refused. Main refused a guard of zero at build and took every
-    other update unread (the round-2 head review's F6)."""
+    squared, a guard of zero or one the arithmetic's dtype flushes (eps 1e-50, LaProp's 1e-20 over
+    float16, Muon's normalization over none), a coupled decay, which the moments square, a rate past half a
+    parameter's dtype (LAMB's against its parameters' norm) and an option whose bound Dew does not state
+    read it, and no configuration is refused. Main refused a guard of zero at build and took every other
+    update unread (the round-2 head review's F6), and the round-3 review's F2 to F5 found bounds a coupled
+    decay, LAMB's trust ratio and a flushed guard broke."""
     from dew.optim import Bounded, reads_updates
 
     params = {"w": jnp.zeros((8, 4), dtype), "b": jnp.zeros((4,), dtype)}
@@ -2023,3 +2033,17 @@ def test_a_layers_norm_is_finite_where_its_values_squares_pass_float32():
     scaled, _ = scale_by_trust_ratio().update({"w": jnp.full((4,), 1e-3, jnp.float32)},
                                               scale_by_trust_ratio().init(params), params)
     assert np.all(np.isfinite(np.asarray(scaled["w"])))
+
+
+def test_a_muon_config_builds_inside_a_trace():
+    """A Muon config built where a trace is open (an injected factory builds its solver as its state is
+    made) states its bound from its Newton-Schulz coefficients, constants of the build: its state is made
+    and its update steps. Its coefficients were read as an array of the trace and the build failed (the
+    round-3 head review's F10)."""
+    params = {"w": jnp.ones((8, 4)), "b": jnp.ones((4,))}
+    wrapped = optax.inject_hyperparams(
+        lambda gain: optax.chain(OptimConfig(optimizer="muon", learning_rate=2e-2).build(10),
+                                 optax.scale(gain)))(gain=1.0)
+    state = jax.jit(wrapped.init)(params)
+    updates, _ = jax.jit(wrapped.update)(params, state, params)
+    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(updates))

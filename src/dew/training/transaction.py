@@ -1113,17 +1113,27 @@ class Transaction:
         bounded gradient, as its state says (`dew.optim.reads_updates`), or Dew cannot read its bound."""
         return self.reads_all or reads_updates(opt_state)
 
+    def _rated(self, opt_state) -> jax.Array:
+        """Whether the learning rates a step's update takes are finite, read from `opt_state` before it is
+        formed (`rated`) where Dew built its optimizer, whose injected solvers report the rate their next
+        update takes (`dew.optim_schedules.stepped_rate`); a transformation Dew did not build may report the
+        rate its last update took (Optax's injected schedule), so its rates are read with its update
+        (`_read_ahead`), every one of which it reads."""
+        return jnp.asarray(a=True) if self.reads_all else rated(opt_state)
+
     def _read_ahead(self, inputs: tuple, qk, statistics, progress, applied: Applied | None) -> jax.Array:
         """Whether the update a step's `inputs` (its gradient, its optimizer's state and the parameters) form
-        is finite, read in a pass of its own that forms it and reduces it leaf by leaf, keeping no tree: the
+        is finite, with the optimizer state it leaves (a moment a coupled decay or an 8-bit store could make
+        infinite beside a finite update), read in a pass of its own that forms both and reduces them leaf by
+        leaf, keeping no tree: the
         commit forms its update again from the gradient this read gates (the zero gradient where it is not
         finite), which no compiler merges with this pass, so the update is never held whole beside the state
         it moves. The runs that updated in their backward read their own (`planned`); their part is read by
         nothing."""
         gradient, opt_state, params = inputs
-        update, _ = optimizer_update(self.optimizer, gradient, opt_state, params, qk=qk,
-                                     statistics=statistics, progress=progress)
-        return all_finite(update if applied is None else _without(update, applied.params))
+        update, after = optimizer_update(self.optimizer, gradient, opt_state, params, qk=qk,
+                                         statistics=statistics, progress=progress)
+        return all_finite((update if applied is None else _without(update, applied.params), after))
 
     def _solved(self, current, update, opt_state, taken: jax.Array) -> tuple[jax.Array, optax.OptState]:
         """Whether a gated step that solves its system (`solves_equations`) takes its `update`, read finite
@@ -1196,7 +1206,7 @@ class Transaction:
             # A scaled step's acceptance reads its whole new state instead (`finish_attempt`).
             taken, (gradient, before, stored) = jnp.asarray(a=True), (native, current.opt_state, stored)
             if gated:
-                taken = rated(current.opt_state)
+                taken = self._rated(current.opt_state)
                 if self._reads(current.opt_state) and not solves_equations(current.opt_state):
                     taken = taken & self._read_ahead((gradient, before, stored), qk, statistics, progress,
                                                      applied)
@@ -1208,9 +1218,13 @@ class Transaction:
                 formed, opt_state = self._solved(current, update, opt_state, taken)
             update = zeroed_unless(native_finite & formed, update) if gated else update
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
-            # rescale, a bounded group's clamp) acts on them (`stepped`).
-            params = {**current.variables, "params": stepped(stored, update, current.opt_state, opt_state,
-                                                             post_step_order(self.optimizer, stored))}
+            # rescale, a bounded group's clamp) acts on them (`stepped`): on a gated step's only where it is
+            # taken, as the effect's count steps with the zero gradient's step of a rejected one.
+            order = post_step_order(self.optimizer, stored)
+            moved = stepped(stored, update, current.opt_state, opt_state, order)
+            if gated and order:
+                moved = _chosen(native_finite & formed, moved, stored)
+            params = {**current.variables, "params": moved}
             if applied is not None:
                 # The runs that updated in their backward take what their backward wrote, and the update's
                 # own of them, read by nothing, is never computed.
@@ -1482,7 +1496,7 @@ class Transaction:
             # backward (`_Planned.rated`).
             formed = jnp.asarray(a=True)
             if self._reads(state.opt_state):
-                formed = all_finite(formed_from(descent)[0])
+                formed = all_finite(formed_from(descent))
                 descent = zeroed_unless(formed, descent)
             stepped_held, after = formed_from(descent)
             # Each copy's new value where the update leaves it in the state it read, which the update keeps
@@ -1506,7 +1520,8 @@ class Transaction:
         if state.compute is not None:
             # The masters the step's update applies to, as its constraint projects them (`Transaction.read`).
             read[in_backward.MASTERS] = self.objective.projected(params, updated=False)
-        return _Planned(in_backward.InBackward(update=update, moments=names), read, rated(state.opt_state))
+        return _Planned(in_backward.InBackward(update=update, moments=names), read,
+                        self._rated(state.opt_state))
 
     def realize_planned(self, planned: _Planned) -> Callable[[Variables, Batch, Step], Realization]:
         """`realize`, differentiating the collections `planned` adds beside the parameters, whose
@@ -1566,7 +1581,10 @@ class Transaction:
             # A run that updates in its backward holds no loss scale (`consumed_where_made`), so a step
             # that is not finite is gated layer by layer as the walk reaches each: by the loss's
             # finiteness and each layer's own gradient's (`in_backward.gated`).
-            with in_backward.gated(active, jnp.isfinite(loss) & planned.rated):
+            # The forward's statistics and the collections it writes, as the commit and the attempt read
+            # them: a step either rejects moves no layer.
+            forward = all_finite((realized.stats, realized.aux.variables))
+            with in_backward.gated(active, jnp.isfinite(loss) & planned.rated & forward):
                 gradient, applied = self.split_planned(planned, realized.pullback(cotangent), masters)
             return gradient, None, applied
         if realized.probed is None or not whole:

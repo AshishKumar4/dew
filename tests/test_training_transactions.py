@@ -827,6 +827,57 @@ def test_an_update_of_a_transformation_dew_did_not_build_is_read():
     np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), before[0]["params"]["w"])
 
 
+class Scaled(Pushed):
+    """`Pushed`, its optimizer the one it is handed with a scale of 1e38 chained after it: a composition of
+    the user's, whose bound Dew cannot read."""
+
+    def optimizer(self, tx):
+        return optax.chain(tx, optax.scale(1e38))
+
+
+class Clamped(Pushed):
+    """`Pushed`, its weight starting at 2, outside the [0, 1] its param group clamps it to."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.full((FEATURES,), 2.0)}}
+
+
+def test_a_rejected_steps_weights_are_kept_by_its_post_step_effects_and_its_composition_is_read():
+    """A step a configured Adam takes through an objective that chains a scale of 1e38 after it (a
+    composition of the user's, `Objective.optimizer`) has its update read, though Dew's own build reads
+    none: its first update, past float32, is rejected and its weight kept. And a rejected step (inputs not
+    finite) of a param group clamped to [0, 1] keeps its weight of 2 outside the clamp, the clamp's count
+    stepping with the zero gradient's step. The composition was taken unread as Dew's build, writing an
+    infinite weight, and the clamp acted on a rejected step's weights (the round-3 head review's F6, F7)."""
+    from dew.optim import ParamGroup
+
+    trainer = Trainer(Scaled(), OptimConfig(optimizer="adam", learning_rate=10.0), key=jax.random.PRNGKey(0))
+    trainer.scheduled(1)
+    state = trainer.initial_state()
+    batch = next(type("Fed", (Inputs,), {"value": 1.0})())
+    advanced, _, _, finite, _, _ = trainer.compile(state, batch)(state, batch)
+    assert not bool(finite) and np.all(np.asarray(advanced.variables["params"]["w"]) == 0)
+    clamped = OptimConfig(optimizer="adam", learning_rate=1e-3,
+                          param_groups=(ParamGroup("all", ("*",), bounds=(0.0, 1.0)),))
+    trainer = Trainer(Clamped(), clamped, key=jax.random.PRNGKey(0))
+    trainer.scheduled(1)
+    state = trainer.initial_state()
+    batch = next(type("Fed", (Inputs,), {"value": np.nan})())
+    advanced, _, _, finite, _, _ = trainer.compile(state, batch)(state, batch)
+    assert not bool(finite) and np.all(np.asarray(advanced.variables["params"]["w"]) == 2.0)
+
+
+def test_an_injected_schedules_step_after_a_rejected_one_is_taken():
+    """An injected SGD schedule of a transformation Dew did not build, infinite at its second update alone:
+    the second step is rejected, and the third, at the schedule's finite rate, is taken. Its state reports
+    the rate its last update took, which was read as the next update's, so the third step was rejected too
+    (the round-3 head review's F8)."""
+    schedule = optax.inject_hyperparams(optax.sgd)(
+        learning_rate=lambda count: jnp.where(count == 1, jnp.inf, 0.1))
+    taken = [finite for _, finite in _configured_steps(schedule, [1.0, 1.0, 1.0])]
+    assert taken == [True, False, True]
+
+
 def test_a_window_summing_bounded_gradients_past_the_bound_is_rejected_whole():
     """An optimizer that holds updates back and sums its window (`optax.MultiSteps(..., use_grad_mean=False)`
     of two) hands Adam the sum of two gradients of 1.5e19, each within the bound and their sum past it: the

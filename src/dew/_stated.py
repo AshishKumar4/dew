@@ -322,17 +322,24 @@ def _method_names(held: type) -> frozenset[str]:
     return frozenset(name for method in methods for name in _sources.names_read(method.__code__))
 
 
+DYNAMIC = frozenset({"getattr", "vars", "__dict__", "__getattribute__", "globals", "hasattr"})
+"""The names by which code reads an attribute whose name it computes (`getattr(module, name)`,
+`vars(module)[name]`), past what its own read names say (`_module_state`)."""
+
+
 def _module_state(module: types.ModuleType, names: frozenset[str], at: str, known: Mapping[int, JSON],
                   walking: frozenset[int]) -> JSON:
     """The attributes of a module of the user's that code naming the module names too (`names`, its read
     names), as an identity states each, through those names again (a module it holds, read through it):
     a member the code never names (a path, a compiled pattern beside the function it calls) is no part of
-    it; a module met again within its own walk is itself."""
+    it; a module met again within its own walk is itself. Code that can read an attribute by a name it
+    computes (`getattr`, `vars`, a `__dict__`; `DYNAMIC`) may read any of them, so all are stated."""
     if id(module) in walking:
         return "itself"
     within = walking | {id(module)}
+    whole = not DYNAMIC.isdisjoint(names)
     return {name: _stated(member, f"{at} ({module.__name__}.{name})", known, within, names)
-            for name, member in _sources.members(module) if name in names}
+            for name, member in _sources.members(module) if whole or name in names}
 
 
 def _tree(tree, at: str, again: Callable[..., JSON]) -> JSON:

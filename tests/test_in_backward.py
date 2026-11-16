@@ -312,10 +312,12 @@ def test_a_layer_walked_past_a_gradient_that_is_not_finite_keeps_its_weights_and
     np.testing.assert_array_equal(np.asarray(norms["nonfinite"] > 0), [False, False, True])
     unmoved, _, _ = _walked([1.0, 1.0, 1.0], finite=False)
     np.testing.assert_array_equal(np.asarray(unmoved["a"]), [0.5, 0.5, 0.5])
-    # An update that does not form (a rate set infinite) moves no layer; each count steps.
-    unformed, stepped_counts, _ = _walked([1.0, 1.0, 1.0], rate=np.inf)
+    # An update that does not form (a rate set infinite) moves no layer; each count steps, and each is
+    # counted not finite, so the step is reported and rejected by its counts (the round-3 review's F9).
+    unformed, stepped_counts, counted_norms = _walked([1.0, 1.0, 1.0], rate=np.inf)
     np.testing.assert_array_equal(np.asarray(unformed["a"]), [0.5, 0.5, 0.5])
     np.testing.assert_array_equal(np.asarray(stepped_counts["count"]["a"]), [1.0, 1.0, 1.0])
+    assert bool(jnp.all(counted_norms["nonfinite"] > 0))
 
 
 def test_a_walk_names_the_first_layer_it_met_not_finite_across_its_stage_axis():
@@ -366,4 +368,41 @@ def test_a_scanned_step_at_a_learning_rate_that_is_not_finite_moves_no_weight():
     assert bool(jnp.isfinite(loss)) and not bool(finite) and int(jax.device_get(moved.updates)) == 0
     after = jax.device_get(moved.variables["params"])
     for old, new in zip(jax.tree.leaves(before), jax.tree.leaves(after), strict=True):
+        np.testing.assert_array_equal(new, old)
+
+
+class Counted(LMObjective):
+    """The language model's loss beside a collection its forward writes: the exponential of its first
+    token id's mean times `scale`, past float32 where `scale` is large, its loss and gradient finite."""
+
+    scale = 1.0
+
+    def fresh_variables(self, key, held):
+        return {**super().fresh_variables(key, held), "seen": {"value": jnp.zeros(())}}
+
+    def loss(self, variables, batch, step):
+        stats, aux = super().loss(variables, batch, step)
+        seen = jnp.exp(jnp.mean(batch["tokens"][..., 0].astype(jnp.float32)) * self.scale)
+        return stats, dataclasses.replace(aux, variables={**(aux.variables or {}), "seen": {"value": seen}})
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_scanned_step_whose_collection_is_not_finite_moves_no_weight():
+    """A step updating its runs in their backward whose loss and gradient are finite and whose forward
+    writes a collection that is not finite (an exponential past float32) moves no weight of its walked
+    runs nor any other, and is reported not finite: the walk reads the forward's statistics and collections
+    as the commit does. It read the loss alone, and its layers moved where the commit rejected the step (the
+    round-3 head review's F1)."""
+    objective = type("Overflowing", (Counted,), {"scale": 1e4})(decoder(scan=True), SEQ)
+    run = Trainer(objective, ADAMW, key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
+                  layout=Layout(min_shard=TINY_SHARD), checkpoints=None, tracker=None)
+    run.device_mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    run.validate(steps=1)
+    state, _, _ = run.place()
+    before = jax.device_get(state.variables["params"])
+    batch = shard_batch(run.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1))
+    moved, loss, _, finite, *_ = run.compile(state, batch)(state, batch)
+    assert bool(jnp.isfinite(loss)) and not bool(finite) and int(jax.device_get(moved.updates)) == 0
+    for old, new in zip(jax.tree.leaves(before), jax.tree.leaves(jax.device_get(moved.variables["params"])),
+                        strict=True):
         np.testing.assert_array_equal(new, old)

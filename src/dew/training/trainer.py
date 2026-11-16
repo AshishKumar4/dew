@@ -264,6 +264,18 @@ def signature_digest(signature: Hashable) -> str:
     return hashlib.sha256(repr(signature).encode()).hexdigest()[:16]
 
 
+
+def reads_every_update(objective: Objective, built: optax.GradientTransformation,
+                       composed: optax.GradientTransformation) -> bool:
+    """Whether a run's steps read every update (`Transaction.reads_all`) of `composed`, the optimizer
+    `objective` made of `built` (`Objective.optimizer`): unless Dew built it (`dew.optim.Bounded`, whose
+    state says where its bound fails) and the objective handed it back as it is, or composed it in Dew's own
+    code (a copy a network over `optax.multi_transform`, each leaf's update a copy's or none); a
+    composition of a user's (a scale chained after it) has a bound Dew cannot read."""
+    if not isinstance(built, Bounded):
+        return True
+    return composed is not built and not type(objective).optimizer.__module__.startswith("dew.")
+
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
@@ -1316,11 +1328,11 @@ class Trainer(Generic[Loss, Effects]):
         """What a trainer holds of the optimizer it is given: a config, its groups taking what the objective
         draws fresh as a run's do (`OptimConfig.claiming`), built over the run's length (`scheduled`); or a
         transformation, made the objective's (`Objective.optimizer`). And whether its steps read every
-        update (`Transaction.reads_all`): a transformation's that Dew did not build (`dew.optim.Bounded`),
-        whose bound it cannot read, and a config's until it is built."""
+        update (`reads_every_update`), a config's until it is built."""
         if isinstance(optimizer, optax.GradientTransformation):
-            return (None, declaring(objective.optimizer(optimizer), self._boxed_axes),
-                    not isinstance(optimizer, Bounded))
+            composed = objective.optimizer(optimizer)
+            reads = reads_every_update(objective, optimizer, composed)
+            return None, declaring(composed, self._boxed_axes), reads
         return optimizer.claiming(*objective.fresh_trained()), None, True
 
     def scheduled(self, updates: int | None) -> None:
@@ -1330,9 +1342,10 @@ class Trainer(Generic[Loss, Effects]):
         if self._config is None:
             return
         built = self._config.build(updates, clocked=self._shape.examples is not None, stated=True)
-        self._reads_all = not isinstance(built, Bounded)
+        composed = self.objective.optimizer(built)
+        self._reads_all = reads_every_update(self.objective, built, composed)
         self._shape = dataclasses.replace(self._shape, updates=updates)
-        self._optimizer = declaring(self.objective.optimizer(built), self._boxed_axes)
+        self._optimizer = declaring(composed, self._boxed_axes)
 
     def _training_loop(self, plan: FitPlan, run: FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,

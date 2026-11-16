@@ -199,12 +199,14 @@ def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments, bad: 
     zero gradient, its weights kept as they were, as they are where its update did not form (one the step
     reads, not finite: `InBackward.update` then forms its moments from the zero gradient), its moments
     stepped as a commit's are. The layer's moved weights, moments and
-    non-finite count, and whether it was written."""
+    non-finite count (an update that did not form counted in it), and whether it was written."""
     gradient = zeroed_unless(ok, gradient)
     moved, moved_moments, formed = update(gradient, held, moments)
     written = ok & formed
     moved = jax.tree.map(lambda new, old: jnp.where(written, new, old), moved, held)
-    return moved, moved_moments, bad, written
+    # An update that did not form is counted as the layer's own value not finite, so the step is reported
+    # and rejected by its count, whatever reaches the layers below.
+    return moved, moved_moments, bad + (ok & ~formed).astype(bad.dtype), written
 
 
 def _pulled(back: Callable, dx):
