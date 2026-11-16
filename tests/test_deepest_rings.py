@@ -19,7 +19,7 @@ from test_attention_mosaic import _residuals
 from test_recurrence_mosaic import resource_operands
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_mosaic_program
+from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_mosaic_program, report
 from dew.nn.kernels.templates.recurrence import template as recurrence
 
 pytestmark = pytest.mark.kernel
@@ -47,6 +47,29 @@ def deepest(op, ba, config, target):
             raise AssertionError(f"{type(op).__name__} stages no more at {deeper.stages} stages than at "
                                  f"{config.stages}: its ring is its walk's, past a block's bound")
         config = deeper
+
+
+def certified_at_depth(op, ba, config, depth, target):
+    """Certify tiles at the original deepest ring, never changing its number of slots. A refusal advances
+    the tile derivation in this test's scope alone; its default two stages are not a substitute ring."""
+    seen = set()
+    with report.refusals():
+        while config is not None and config not in seen:
+            seen.add(config)
+            at = dataclasses.replace(config, stages=depth)
+            refused = {"fixed-depth shared memory"}
+            if op.legal(ba, at, target):
+                verdict = report.certified(op, ba, at)
+                assert verdict is not None, f"{type(op).__name__} could not certify {at}"
+                if not verdict:
+                    assert at.stages == depth
+                    return at
+                refused = {binary.kernel for binary in verdict}
+            # Refuse this proposal only within the constrained search: it has not held the required
+            # depth, irrespective of whether its default two-stage launch would have held.
+            report.refuse_launch(op, ba, config, refused)
+            config = op.remaining(ba)
+    raise AssertionError(f"{type(op).__name__} offers no spill-free tiles at {depth} stages")
 
 
 def _attention(pass_: str, width: int):
@@ -121,8 +144,18 @@ def test_a_launch_at_its_deepest_ring_compiles_within_its_resources(cell, genera
     with generation.assumed(generation_name):
         op, ba, config = CELLS[cell][0]()
         assert config is not None, f"{cell} derives no config on {generation_name}"
-        at = deepest(op, ba, config, generation.gpu_target())
-        case = KernelCase(f"{cell} at {at.stages} stages", lambda: op.lowering(ba, at))
+        target = generation.gpu_target()
+        depth = deepest(op, ba, config, target).stages
+        _, shapes = op.lowering(ba, config)
+
+        def launch(*arrays):
+            at = certified_at_depth(op, ba, config, depth, target)
+            assert at.stages == depth
+            print(f"FIXED DEPTH {cell} {generation_name}: {at}", flush=True)
+            lowered, _ = op.lowering(ba, at)
+            return lowered(*arrays)
+
+        case = KernelCase(f"{cell} at {depth} stages", lambda: (launch, shapes))
         found = compile_mosaic_kernels([case], generation_name)
     failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
