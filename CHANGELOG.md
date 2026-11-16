@@ -7,6 +7,18 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Programs a process keeps (`dew.training.ahead.keeping`) are kept and handed by their fingerprint: the
+  digest of the lowered program, its trees and its arguments' types under the XLA options it compiled
+  with (`dew.nn.kernels.options.program_digest`), with the target they were built for (`BuildTarget`).
+  Within `kept(path)` every call traces and lowers as it would and runs the kept executable of the program
+  it lowers to; a call of changed code, settings or facts lowers another program and compiles, and a file
+  kept for another target hands nothing, every call compiling: nothing raises for a mismatch and no stale
+  executable runs. This replaces the verify default an entry below states: the call identity and the
+  process record that kept programs were handed by (`dew.training.identity`), `kept(path, verify=False)`,
+  `NotTheKeptProgram`, `options.handing` and `generation.TRACED_FACTS` are gone. A run's warm start is
+  JAX's persistent compilation cache with the rung records, which key a compile by the same lowered
+  program, options and target.
+
 - A process holds the step executables its plans compiled (`dew.nn.kernels.options.hold`), by the program,
   its options and its devices: a later trainer of the same step plans on the earlier's executable, where
   each new trainer read it back from the persistent compilation cache (4.4 s of a small model's 11.9 s
