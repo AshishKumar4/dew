@@ -466,9 +466,6 @@
 "tests/test_attention_route.py::test_a_row_that_sees_no_key_weighs_each_value_before_summing_them",
 "tests/test_attention_route.py::test_narrowed_operands_hand_back_their_gradients_unrounded"
 ],
-"tests/test_attention_splash.py": [
-"tests/test_attention_splash.py::test_splash_agrees_with_the_reference_the_oracle_holds[sinks]"
-],
 "tests/test_attention_stability.py": [
 "tests/test_attention_stability.py::test_a_score_cotangent_past_bf16s_largest_keeps_the_gradients_finite[accurate]",
 "tests/test_attention_stability.py::test_an_unseen_keys_value_past_fp32s_largest_takes_no_part_in_a_gradient[bfloat16]",
@@ -1577,9 +1574,6 @@
 "tests/test_jepa.py::test_training_makes_the_prediction_depend_on_the_context",
 "tests/test_jepa.py::test_video_objective_trains"
 ],
-"tests/test_joined.py": [
-"tests/test_joined.py::test_a_delta_nets_gates_joined_under_a_recipe_are_as_exact_as_apart_from_float64[nvfp4]"
-],
 "tests/test_kda.py": [
 "tests/test_kda.py::test_default_eps_gradients_certify_element_by_element",
 "tests/test_kda.py::test_documents_that_continue_another_read_its_memory_and_history_as_their_own_rows_do[permuted]",
@@ -2094,6 +2088,9 @@
 "tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[pallas-8-1-False-False-None-geglu]",
 "tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[xla-2-2-data2-True-True-0.7-swiglu]",
 "tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[xla-8-1-True-True-0.7-geglu]"
+],
+"tests/test_mosaic_toolkit.py": [
+"tests/test_mosaic_toolkit.py::test_a_quantized_stage_converts_into_the_tile_its_products_read[sm80-int8-unscaled]"
 ],
 "tests/test_multimodal_model.py": [
 "tests/test_multimodal_model.py::test_a_drawn_site_is_on_par_with_its_reference[llama4]",
@@ -2720,6 +2717,10 @@
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[lfm3-tiny-native]",
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[mimo-v2-sliding-tiny-native]",
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[mimo-v2-tiny-saved]"
+],
+"tests/test_rl_contracts.py": [
+"tests/test_rl_contracts.py::test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima[DPOObjective]",
+"tests/test_rl_contracts.py::test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima[GRPOObjective]"
 ],
 "tests/test_router_statistics.py": [
 "tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains",
