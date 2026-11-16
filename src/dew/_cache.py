@@ -28,19 +28,24 @@ from dew._devices import cuda_builds, deterministic_ops_requested, xla_flag
 _log = logging.getLogger(__name__)
 
 def holding[Key: Hashable, Value](cache: collections.OrderedDict[Key, Value], key: Key,
-                                  made: Callable[[], Value], held: int) -> Value:
-    """`cache`'s entry at `key`, made (`made()`) where it holds none, outside the lock every held value shares
-    (`_HOLDING`: compiles trace on several threads, and a value made may hold another), the least recently
-    read dropped past `held`, each cache's own bound. Two threads missing one key at once each make it, the
-    later kept: a held value is a function of its key, so either is the same. How a process holds what it
-    decides and derives once for what it reads: the algebra's kernel decisions, written programs,
+                                  made: Callable[[], Value], held: int,
+                                  still: Callable[[Value], bool] | None = None) -> Value:
+    """`cache`'s entry at `key`, made (`made()`) where it holds none, or where `still` finds the one it holds
+    no longer what `made` would make (a held trace whose facts answer otherwise now), outside the lock every
+    held value shares (`_HOLDING`: compiles trace on several threads, and a value made may hold another), the
+    least recently read dropped past `held`, each cache's own bound. Two threads missing one key at once each
+    make it, the later kept: a held value is a function of its key, so either is the same. How a process holds
+    what it decides and derives once for what it reads: the algebra's kernel decisions, written programs,
     recognitions, window derivations and scan forms (`dew.algebra`), a declared walk's forms
-    (`derive.derived`), a launch's derived config (`templates.base`), a module's counted work
-    (`dew.nn.flops`) and a keyed objective's traced work (`objectives.base.traced_update_flops`)."""
+    (`derive.derived`), a launch's derived config (`templates.base`), a module's counted work (`dew.nn.flops`)
+    and a keyed objective's traced work (`objectives.base.traced_update_flops`)."""
     with _HOLDING:
-        if key in cache:
+        # The held value boxed, so a value of None is held too.
+        found = (cache[key],) if key in cache else None
+        if found is not None:
             cache.move_to_end(key)
-            return cache[key]
+    if found is not None and (still is None or still(found[0])):
+        return found[0]
     value = made()
     with _HOLDING:
         cache[key] = value
