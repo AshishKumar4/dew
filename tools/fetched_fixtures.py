@@ -184,7 +184,7 @@ def _url(repo: str, release: str, asset: str) -> str:
     return f"https://github.com/{repo}/releases/download/{release}/{asset}"
 
 
-def _downloaded(url: str) -> bytes:
+def downloaded(url: str) -> bytes:
     """`url` read anonymously over HTTPS, as every machine a test runs on reads it."""
     import urllib.request
 
@@ -307,7 +307,7 @@ def fetch(root: Path = REPO_ROOT) -> None:
         if not pin["revision"]:
             raise SystemExit(f"{name}: pinned with no revision and not in {LOCAL}: its upload is due")
         if pin.get("origin") == "github":
-            data = _checked(_downloaded(_url(pin["repo"], pin["revision"], pin["path"])), pin, name)
+            data = _checked(downloaded(_url(pin["repo"], pin["revision"], pin["path"])), pin, name)
         else:
             from huggingface_hub import hf_hub_download
 
@@ -337,7 +337,8 @@ def card(catalog: dict[str, dict]) -> str:
             "|---|---|---|---|---|\n" + rows + "\n")
 
 
-def _gh(*arguments: str) -> str:
+def github(*arguments: str) -> str:
+    """The GitHub CLI's answer to `arguments`, through the credential it holds: the store's one way to GitHub."""
     return subprocess.run(["gh", *arguments], capture_output=True, text=True, check=True).stdout
 
 
@@ -349,9 +350,9 @@ def upload_github(due: dict[str, dict], root: Path = REPO_ROOT) -> None:
     it, and checked before its pin takes its release. The repository is the owner's to create, public: none is
     created here."""
     try:
-        if json.loads(_gh("api", f"repos/{GITHUB}"))["private"]:
+        if json.loads(github("api", f"repos/{GITHUB}"))["private"]:
             raise SystemExit(f"{GITHUB} is private, and a fetch reads it anonymously")
-        pages = json.loads(_gh("api", "--paginate", "--slurp", f"repos/{GITHUB}/releases"))
+        pages = json.loads(github("api", "--paginate", "--slurp", f"repos/{GITHUB}/releases"))
     except subprocess.CalledProcessError as error:
         raise SystemExit(f"{GITHUB} could not be read ({error.stderr.strip()[-200:]}): the owner creates it, "
                          "public, before its first upload") from error
@@ -378,18 +379,18 @@ def upload_github(due: dict[str, dict], root: Path = REPO_ROOT) -> None:
                     # After the highest, whatever releases were removed between (review).
                     highest = max((int(tag.removeprefix("store-")) for tag in counts), default=0)
                     release = f"store-{highest + 1}"
-                    _gh("release", "create", release, "--repo", GITHUB, "--title", release, "--notes",
+                    github("release", "create", release, "--repo", GITHUB, "--title", release, "--notes",
                         "Dew's recorded test fixtures (https://github.com/AshishKumar4/dew): each asset is "
                         "named by its SHA-256, pinned beside the fixture it stands for in Dew's "
                         "tests/fixtures/, and licensed as the reference it records, as its pin names.")
                     counts[release] = 0
                 written = Path(directory) / asset
                 written.write_bytes(_checked(_stored(pin, root).read_bytes(), pin, name))
-                _gh("release", "upload", release, str(written), "--repo", GITHUB)
+                github("release", "upload", release, str(written), "--repo", GITHUB)
                 written.unlink()
                 counts[release] += 1
                 held[asset] = (release, f"sha256:{pin['sha256']}")
-            _checked(_downloaded(_url(GITHUB, release, asset)), pin, name)
+            _checked(downloaded(_url(GITHUB, release, asset)), pin, name)
             print(f"{pin['sha256']}  {asset} read back at {GITHUB}'s {release}", flush=True)
             _pinned(name, {**pin, "revision": release}, root)
 

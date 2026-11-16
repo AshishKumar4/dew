@@ -356,8 +356,8 @@ def _github(store, monkeypatch, releases: list[dict], private: bool = False, exi
             return ""
         raise AssertionError(arguments)
 
-    monkeypatch.setattr(store, "_gh", gh)
-    monkeypatch.setattr(store, "_downloaded", lambda url: served["/".join(url.split("/")[-2:])])
+    monkeypatch.setattr(store, "github", gh)
+    monkeypatch.setattr(store, "downloaded", lambda url: served["/".join(url.split("/")[-2:])])
     return asked, served
 
 
@@ -416,7 +416,7 @@ def test_upload_puts_each_due_file_as_an_asset_reads_it_back_and_never_overwrite
     asked, served = _github(store, monkeypatch, releases)
     # A read back that is not the pin's bytes pins nothing; the next upload takes the asset held, uploading
     # none.
-    monkeypatch.setattr(store, "_downloaded", lambda url: _flipped(stored.read_bytes()))
+    monkeypatch.setattr(store, "downloaded", lambda url: _flipped(stored.read_bytes()))
     with pytest.raises(AssertionError):
         store.upload(root)
     assert store.pins(root)[LARGE]["revision"] is None
@@ -457,7 +457,7 @@ def test_fetch_reads_a_githubs_store_file_anonymously_and_takes_it_only_as_its_p
     data, pin = stored.read_bytes(), store.pins(root)[LARGE]
     store._pinned(LARGE, {**pin, "revision": "store-3"}, root)
     asked = []
-    monkeypatch.setattr(store, "_downloaded", lambda url: asked.append(url) or served[0])
+    monkeypatch.setattr(store, "downloaded", lambda url: asked.append(url) or served[0])
     served = [data]
     stored.unlink()
     store.fetch(root)
