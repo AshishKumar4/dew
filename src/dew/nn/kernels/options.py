@@ -340,10 +340,11 @@ def shapes_of(tree):
     array (JAX's `pjit` lowers an uncommitted array's sharding as unspecified)."""
     def shaped(leaf):
         if not isinstance(leaf, jax.Array):
-            return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding, weak_type=leaf.weak_type)
+            return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding,
+                                        weak_type=leaf.weak_type)
         # Its abstract value's weak type: a key array states none of its own.
-        return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding if leaf.committed else None,
-                                    weak_type=leaf.aval.weak_type)
+        placed = leaf.sharding if leaf.committed else None
+        return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=placed, weak_type=leaf.aval.weak_type)
 
     return jax.tree.map(shaped, tree)
 
