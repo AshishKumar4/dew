@@ -38,7 +38,7 @@ from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
-from dew.nn.kernels.options import OuterProgram, compiler_options, owned_program, program_key
+from dew.nn.kernels.options import OuterProgram, compiler_options, held, hold, owned_program, program_key
 from dew.nn.kernels.templates import report
 from dew.objectives.base import RECORD, Objective, Pooled
 from dew.state import TrainState, apart, together
@@ -349,7 +349,7 @@ class Probe:
     argument: int | None
     ahead: bool = False
     """Whether the executable was compiled before this search, not by it: the step compiled ahead
-    (`FitSearch.ahead`), or one a search before it compiled (`FitSearch.compiled`)."""
+    (`FitSearch.ahead`), or one a search before it compiled (`dew.nn.kernels.options.held`)."""
     compile_seconds: float = 0.0
     """Time spent compiling or loading this program, apart from its shape trace and lowering."""
     spent: Mapping[str, float] = dataclasses.field(default_factory=dict)
@@ -570,11 +570,13 @@ class Trials:
         return self.run(profile)
 
 
-def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None) -> Hashable:
-    """A search's key of the executable it compiles from `lowered` under `options` (`FitSearch.compiled`):
-    the program within this process (`program_key`), one for a lowering over a state's shapes before it is
-    placed and over the placed state, and the options as text."""
-    return program_key(lowered), repr(sorted((options or {}).items()))
+def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
+                 devices: Sequence) -> Hashable:
+    """The key of the executable a plan compiles from `lowered` under `options` for `devices`, which the
+    process holds across its trainers (`dew.nn.kernels.options.hold`): the program within this process
+    (`program_key`), one for a lowering over a state's shapes before it is placed and over the placed state,
+    the options as text, and the devices it loads on."""
+    return program_key(lowered), repr(sorted((options or {}).items())), tuple(devices)
 
 
 def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch,
@@ -733,7 +735,6 @@ class FitSearch[LossT, EffectsT]:
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
     is that program (`AheadOfTime.taken`), lowered as its own compile lowered it (`handed`: within its
     refusals, for its GPU, `fits_here`)."""
-    compiled: dict[Hashable, jax.stages.Compiled] = dataclasses.field(default_factory=dict)
     """Each executable this search, or one before it over the same candidates, compiled, by its program and
     its options (`compiled_key`): one a search before the state was placed compiled is taken
     here in place of compiling it again (`dew.training.compiler.StepCompiler.planned_unplaced`), judged on
@@ -883,6 +884,11 @@ class FitSearch[LossT, EffectsT]:
         (`ladder` asks none such); the compile point adds the target's own (`report.targeted`)."""
         return self.required if self.xla_defaults else self.options(candidate)
 
+    def compiled_key(self, lowered: jax.stages.Lowered,
+                     options: jax.stages.CompilerOptions | None) -> Hashable:
+        """`lowered`'s executable's key under `options` on the search's devices (`compiled_key`)."""
+        return compiled_key(lowered, options, local_devices(self.mesh))
+
     def measured(self, split: int, candidate: Candidate) -> tuple[
             jax.stages.CompilerOptions | None, Candidate, jax.stages.Compiled | None, Probe]:
         """`candidate`, the step at `split` at the objective's rung, compiled under the rung's options
@@ -899,8 +905,7 @@ class FitSearch[LossT, EffectsT]:
         with spending(candidate) as spent:
             began = time.perf_counter()
             early, firsts, relowered = None, [], None
-            key = compiled_key(candidate.lowered, options)
-            kept = self.compiled.get(key)
+            kept = held(self.compiled_key(candidate.lowered, options))
             if ahead is not None:
                 executable, self.ahead = ahead.taken(candidate.lowered), None
             elif candidate.sampled is None and kept is not None:
@@ -915,11 +920,12 @@ class FitSearch[LossT, EffectsT]:
                 executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered,
                                                  first=firsts[0])
                 candidate = relowered.candidate(candidate)
-                if executable is not None:
-                    # Under the program it compiled: the relowered one past a spill, which a plan after it
-                    # lowers directly, the spill's refusal held for the process.
-                    self.compiled[compiled_key(candidate.lowered, options)] = executable
             fit, headroom = self.fitting(executable, candidate)
+            if relowered is not None and executable is not None and fit:
+                # One that fits, which a run may step on, under the program it compiled: the relowered one
+                # past a spill, which a plan after it lowers directly, the spill's refusal held for the
+                # process. One that misses is no step's, its device code held for nothing.
+                hold(self.compiled_key(candidate.lowered, options), executable)
             self.sampled = None
             if fit and candidate.sampled is not None:
                 if ahead is not None and ahead.sampled is not None:

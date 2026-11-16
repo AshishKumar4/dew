@@ -68,6 +68,7 @@ from dew.inputs import Field, InputSpec
 from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.options import Compiling, attempting, owned_program, shapes_of
+from dew.nn.kernels.templates import report
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, tracing
 from dew.objectives.base import (
@@ -712,7 +713,9 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             from dew.distributed.host import transfer
             key = transfer(key, NamedSharding(self.state_mesh, P()))
-        abstract, through, build = traced_start(self._staged_start, initializer, key)
+        # Its kernels certified on the GPU the run targets, outside the mesh its step traces under (row 6824).
+        with report.targeting(self.device_mesh):
+            abstract, through, build = traced_start(self._staged_start, initializer, key)
         checkpoints = self.checkpoints
         # Each process lists the checkpoints itself, and on a shared filesystem one listing can lag
         # another's: every process resumes from one step or none does.
@@ -2178,8 +2181,8 @@ class Trainer(Generic[Loss, Effects]):
                 # Its empty window binds no split: the new step's window is built over it.
                 self._compiler.afresh = True
             if self._later is not None:
-                # What the phase's plan off the loop compiled, which its plan here takes (`LaterPlans`).
-                self._compiler.taken_executables(self._later.taken(self.phase_passes.current))
+                # The phase's plan off the loop waited for, its executables the process's (`LaterPlans`).
+                self._later.waited(self.phase_passes.current)
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
         trials = Trials(state, batch)
         if signature not in compiled:

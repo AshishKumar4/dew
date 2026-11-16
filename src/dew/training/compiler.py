@@ -22,6 +22,7 @@ from dew.distributed.batches import batch_layout, batch_shardings, batch_signatu
 from dew.distributed.placement import Validation
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import gpu_target
+from dew.nn.kernels.options import hold
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
@@ -218,9 +219,6 @@ class StepCompiler[L, E]:
         # (`dew.training.trainer.Trainer._compiled_for`): the empty window its state holds binds no split
         # (`resumed_stepping`), the new step's window built over it.
         self.afresh = False
-        # The executables a search before the state was placed compiled where it held no plan
-        # (`planned_unplaced`), which the run's first compile's search takes in place of compiling them again.
-        self._executables: dict | None = None
 
     @property
     def narrow(self) -> bool:
@@ -379,7 +377,6 @@ class StepCompiler[L, E]:
                                  "this layout keeps the variables on the host")
             return Compiled(stepping.shape.split, step=self._compile_host(stepping, state, batch))
         held, self._unplaced = self._unplaced, None
-        executables, self._executables = self._executables, None
         mesh = settings.device_mesh
         fit, headroom = (False, None) if held is None or held.signature != batch_signature(batch) else (
             admitted_placed(held.planned, mesh))
@@ -395,17 +392,10 @@ class StepCompiler[L, E]:
             compiled = dataclasses.replace(compiled, plan={**plan, "probes": probes}, memory=memory)
         else:
             # Where the devices, the state placed, hold no block for it, the plan's search runs here, on them.
-            planned, compiled, keep = self._plan(stepping, state, batch, trials, executables=executables)
+            planned, compiled, keep = self._plan(stepping, state, batch, trials)
             keep()
         return dataclasses.replace(compiled, step=self.runner(stepping, planned.released(),
                                                               settings.device_mesh))
-
-    def taken_executables(self, executables: dict | None) -> None:
-        """The executables a plan elsewhere compiled (`FitSearch.compiled`: a later phase's off the loop,
-        `dew.training.ahead.LaterPlans`), which the next compile's search takes in place of compiling them
-        again; nothing where none."""
-        if executables:
-            self._executables = {**(self._executables or {}), **executables}
 
     def planned_unplaced(self, stepping: Stepping, state: TrainState, batch: Batch,
                          unplaced: int) -> None:
@@ -416,13 +406,11 @@ class StepCompiler[L, E]:
         against their allocators once the state is on them (`compile`, `admitted_placed`), its executable the
         one the run steps: the process searches its step once, and compiles its plan once. Where the plan
         does not fit the placed devices, or none fitted before the state was placed, that compile plans once
-        the state is placed, from the plan's rung and split (`_plans`), not from the ladder's foot, taking
-        the executables this search compiled (`FitSearch.compiled`)."""
-        executables: dict = {}
-        self._executables = executables
+        the state is placed, from the plan's rung and split (`_plans`), not from the ladder's foot, its
+        search finding the executables this one compiled, which the process holds
+        (`dew.nn.kernels.options.held`)."""
         try:
-            planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced,
-                                                 executables=executables)
+            planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced)
         except PlanRefused as refused:
             _log.info("the step fits no plan before its state is placed, planned once it is: %s", refused)
             return
@@ -439,11 +427,10 @@ class StepCompiler[L, E]:
         return planned, compiled
 
     def _plan(self, stepping: Stepping, state: TrainState, batch: Batch, trials: Trials | None,
-              frontier: bool = False, *, unplaced: int | None = None, executables: dict | None = None
+              frontier: bool = False, *, unplaced: int | None = None
               ) -> tuple[Planned, Compiled, Callable[[], None]]:
         """`plan`, over a state whose devices hold `unplaced` bytes a device holds of it none of yet where
-        given (`FitSearch.unplaced`), its search taking and keeping its executables in `executables` where
-        given (`FitSearch.compiled`), and the record of its rung, which the caller keeps once it takes the
+        given (`FitSearch.unplaced`), and the record of its rung, which the caller keeps once it takes the
         plan (`keep_rung`)."""
         settings = stepping.settings
         mesh = settings.device_mesh
@@ -452,8 +439,7 @@ class StepCompiler[L, E]:
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with stepping.traced_on(mesh, links) as schedule, held_objects():
             planned, flops, plan, validation, keep = self._planned(stepping, state, batch, mesh, schedule,
-                                                                   resumed, trials, frontier, unplaced,
-                                                                   executables)
+                                                                   resumed, trials, frontier, unplaced)
             split, candidate = planned.split, planned.candidate
             self._shape_rungs[batch_layout(batch)] = self.rung()
             memory = memory_record(planned.executable, local_devices(mesh), candidate.held, fits=True)
@@ -530,7 +516,7 @@ class StepCompiler[L, E]:
 
     def _planned(self, stepping: Stepping, state: TrainState, batch: Batch,
                  mesh: Mesh, schedule: Schedule, resumed: JSON, trials: Trials | None,
-                 frontier: bool, unplaced: int | None, executables: dict | None
+                 frontier: bool, unplaced: int | None
                  ) -> tuple[Planned, StepFlops | None, JSON, Validation, Callable[[], None]]:
         """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the first that
         fits, guided under AutoPGLE (`Planned.guided`), with `plan` its record and the objective at its rung,
@@ -581,7 +567,7 @@ class StepCompiler[L, E]:
                 self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self.ahead,
-            unplaced=unplaced, compiled={} if executables is None else executables)
+            unplaced=unplaced)
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         # The rungs above the plan are read for their memory alone, no device ever running them: offline
@@ -599,7 +585,11 @@ class StepCompiler[L, E]:
             trials = Trials(state, batch, owned=False) if trials is None else trials
             run = self.runner(stepping, planned, mesh)
             relower = functools.partial(lower, planned.split, planned.narrow)
+            asked = search.compiled_key(planned.candidate.lowered, planned.options)
             planned = planned.guided(trials.profiled(run, planned, mesh, runs), runs, mesh, relower)
+            # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
+            # AutoPGLE: the one the run steps, the unguided one freed with the search.
+            hold(asked, planned.executable)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         validation = stepping.validation(planned.candidate.prepared)
