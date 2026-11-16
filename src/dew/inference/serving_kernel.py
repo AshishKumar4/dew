@@ -764,7 +764,8 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
     program = _compiled(automatic(resident), automatic(carried), rows, compiler_options(model) or None)
     arguments = (model, params, pad_id, placement, steps, abstract(resident), abstract(carried), None,
                  transforms, stopping, grammar, progress)
-    # A program a block hands (`dew.training.ahead.kept`) is neither tuned nor traced again.
+    # A program a block hands (`dew.training.ahead.kept`) is neither tuned nor compiled again: traced and
+    # lowered to prove it (none with `kept`'s `verify=False`).
     compiled = program.handed(*arguments)
     if compiled is None:
         tune(lambda: program.lower(*arguments))

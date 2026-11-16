@@ -684,7 +684,8 @@ def _row_sizes(truth, terms=None, *, xp=np) -> tuple:
     its RMS, or with terms the larger of it and its terms' RMS, so a row sized by what it sums is held
     against a leaf sized by what it sums (the owner's 10-29 decision, ledger 2442: check 1 sizes by terms
     as the one-draw rule's `row_errors` does). The gate's one sizing of a row: one draw's (`row_errors`)
-    and check 1's own (`_truth_rows`), in NumPy or in `xp`, where a draw's leaves live."""
+    and check 1's own (`_truth_rows`), in NumPy or in `xp`, as `_computed_here` computes a draw's
+    statistics (on its GPUs where it has one, an array a GPU holds where it is, else in NumPy)."""
     rows = truth.reshape(-1, truth.shape[-1])
     own, leaf = _scaled_rms(rows, xp), xp.sqrt(xp.mean(xp.square(truth)))
     if terms is None:
@@ -795,18 +796,27 @@ def rows_summary(rows, truth, *, finite: bool, dtype: str, log_mse: float | None
 
 
 def _computed_here(program, *trees):
-    """`program(*trees, xp=...)` in float64, its small results on the host: in one compiled program where
-    every array lives on a GPU, whose float64 arithmetic keeps subnormals as numpy does (IEEE's; XLA:CPU
-    reads a subnormal float64 as zero, `1e-310 != 0` false there, and a TPU has no float64), else in numpy,
-    on a CPU the arrays' own memory. Where the arrays live decides it, not the default backend: a program
-    over arrays a GPU host placed on its CPU would run on XLA:CPU."""
+    """`program(*trees, xp=...)` in float64, its small results on the host: in one compiled program on a
+    GPU where the process computes on one, every array placed there that does not live on one already
+    (a host's NumPy truth, a CPU array), whose float64 arithmetic keeps subnormals as numpy does (IEEE's),
+    so a draw's statistics over a model's every parameter run on the GPU's float64 units, not on the host
+    (bible §8: a float64 truth's array math is a GPU's where one is booked; on a GPU host they ran its
+    sites' statistics in NumPy for half an hour, ledger 6795); else in numpy, on a CPU (XLA:CPU reads a
+    subnormal float64 as zero, `1e-310 != 0` false there, and a TPU has no float64)."""
     arrays = [leaf for leaf in jax.tree.leaves(trees) if leaf is not None]
-    if not arrays or not all(isinstance(leaf, jax.Array) and all(device.platform == "gpu"
-                                                                 for device in leaf.devices())
-                             for leaf in arrays):
+    gpu = next((device for device in jax.local_devices() if device.platform == "gpu"), None)
+    if not arrays or gpu is None:
         return program(*trees, xp=np)
-    with jax.enable_x64(new_val=True):
-        return jax.device_get(_compiled(program)(*trees))
+
+    def placed(leaf):
+        # Its host values put uncommitted on this process's first GPU, so the program lays them beside the
+        # arrays a GPU already holds, sharded or not: a CPU array's own put would keep it on the CPU.
+        on_gpu = isinstance(leaf, jax.Array) and all(device.platform == "gpu" for device in leaf.devices())
+        return leaf if leaf is None or on_gpu else jax.device_put(np.asarray(leaf))
+
+    with jax.enable_x64(new_val=True), jax.default_device(gpu):
+        held = jax.tree.map(placed, trees, is_leaf=lambda leaf: leaf is None)
+        return jax.device_get(_compiled(program)(*held))
 
 
 @functools.cache
@@ -887,12 +897,12 @@ def _largest_share(rows, xp=np):
 @dataclasses.dataclass(frozen=True)
 class _LaidTruths:
     """A draw's truth leaves read once for both arms (`_summaries`), every leaf that is not empty in its
-    order, its rows in C order (its last axis's, none for a scalar). Each row has its own
-    RMS (`_scaled_rms`) and its size, the RMS where it is past RESOLUTION of its leaf, else zero
-    (`row_errors`'), computed where the leaves live in one program a draw (`_truth_rows`): only these
-    rows' statistics leave the device. `truths` is every leaf as given, `laid` the leaves that are not
-    empty, `counts` each laid leaf's rows, `own` and `sizes` their rows' own RMS and size, and `finite`
-    whether each laid leaf's every value is."""
+    order, its rows in C order (its last axis's, none for a scalar). Each row has its own RMS (`_scaled_rms`)
+    and its size, the RMS where it is past RESOLUTION of its leaf, else zero (`row_errors`'), computed in one
+    program a draw (`_truth_rows`, `_computed_here`: on its GPUs where it has one, an array a GPU holds where
+    it is, else in NumPy): only these rows' statistics leave the device. `truths` is every leaf as given,
+    `laid` the leaves that are not empty, `counts` each laid leaf's rows, `own` and `sizes` their rows' own
+    RMS and size, and `finite` whether each laid leaf's every value is."""
 
     truths: list
     laid: list[int]
@@ -918,9 +928,9 @@ class _LaidTruths:
 
 def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     """Each reference leaf's evidence against its truth in `held` (`_LaidTruths.of`) as check 1 reads it
-    (`RecordedLeaf`), every leaf read in one program a draw where the leaves live (`_error_rows`); None
-    for a reference of None. The caller holds each reference to its truth's shape (`leaf_summaries`,
-    `_evidence`)."""
+    (`RecordedLeaf`), every leaf read in one program a draw (`_error_rows`, `_computed_here`: on its GPUs
+    where it has one, an array a GPU holds where it is, else in NumPy); None for a reference of None. The
+    caller holds each reference to its truth's shape (`leaf_summaries`, `_evidence`)."""
     names = {}
 
     def dtype(reference) -> str:
@@ -1202,9 +1212,10 @@ class _Prepared:
 
 
 def _term_leaves(terms, truth):
-    """A truth's terms tree (`float64_terms`) as its leaves on the host, one a leaf of `truth`, a leaf no
-    sum made None; or None. Read by the truth's own structure, so an output the truth holds as None (a
-    gradient of an input given as None) takes no leaf of the terms either."""
+    """A truth's terms tree (`float64_terms`) as its leaves, one a leaf of `truth`, a leaf no sum made None;
+    or None, where they live, the statistics over them computed as `_computed_here` computes them. Read by the
+    truth's own structure, so an output the truth holds as None (a gradient of an input given as None) takes
+    no leaf of the terms either."""
     if terms is None:
         return None
     return jax.tree.structure(truth).flatten_up_to(terms)

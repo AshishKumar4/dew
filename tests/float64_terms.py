@@ -30,7 +30,8 @@ transpose, which the kernel's gradient runs, is one too."""
 CARRIES = frozenset({jax.lax.add_p, primitives.add_jaxvals_p, jax.lax.sub_p, jax.lax.neg_p,
     jax.lax.convert_element_type_p, jax.lax.reshape_p, jax.lax.transpose_p, jax.lax.broadcast_in_dim_p,
     jax.lax.squeeze_p, jax.lax.copy_p, jax.lax.reduce_precision_p, jax.lax.slice_p, jax.lax.dynamic_slice_p,
-    jax.lax.concatenate_p, jax.lax.pad_p, jax.lax.select_n_p, jax.lax.optimization_barrier_p,
+    jax.lax.concatenate_p, jax.lax.stack_p, jax.lax.unstack_p, jax.lax.pad_p, jax.lax.select_n_p,
+    jax.lax.optimization_barrier_p,
     primitives.name_p, jax.lax.psum_p, primitives.psum_invariant_p, primitives.reduce_scatter_p,
     jax.lax.all_gather_p, primitives.all_gather_invariant_p, jax.lax.all_to_all_p, jax.lax.ppermute_p,
     primitives.pvary_p})
@@ -176,9 +177,10 @@ STATIC: dict = {}
 
 def _static(jaxpr, terms: bool = False) -> bool:
     """Whether `jaxpr`, its calls' and scans' bodies included, takes no branch or loop its values pick
-    (`cond`, `while`), which the walk reads concretely (`_applied`), once a jaxpr; for the terms walk
-    (`terms`), no scan either, which it steps (`_static_equation`). A branch its platform picks
-    (`jax.lax.platform_dependent`'s) is static: the walk reads its platform where it runs (`_platform`)."""
+    (`cond`, `while`), which the walk reads concretely (`_applied`), once a jaxpr (`terms` the terms walk's
+    key: a scan is static to both, bound whole where traced, `_terms_scan`, `_bound_walk`). A branch its
+    platform picks (`jax.lax.platform_dependent`'s) is static: the walk reads its platform where it runs
+    (`_platform`)."""
     if (jaxpr, terms) not in STATIC:
         picked = _platform_picked(jaxpr)
         STATIC[jaxpr, terms] = all(_static_equation(equation, picked, terms) for equation in jaxpr.eqns)
@@ -432,16 +434,17 @@ def _layout(jaxpr, terms: bool = False):
 
 def _static_equation(equation, picked: frozenset = frozenset(), terms: bool = False) -> bool:
     """Whether `equation` takes no branch or loop its values pick, its bodies' included (`_static`): a
-    branch whose index is among `picked`, its platform's (`_platform_picked`), is not one. For the terms
-    walk (`terms`) a scan is not either: the walk steps it (`_scanned`), its body's runs compiled once
-    and run a step at a time, where a run compiled whole traces every step (`scanned_steps`): a token
-    scan's float64 terms of 64 steps and their adjoint's took 128 s of XLA's CPU compile (row 6004). A
-    rule's walk binds a traced scan as a scan (`_bound_walk`), so its runs keep their scans whole."""
+    branch whose index is among `picked`, its platform's (`_platform_picked`), is not one. A scan is: it is
+    bound as a scan whose body the walk evaluates once (the terms walk's, `_terms_scan`, its steps alone only
+    until its carries' terms keep their kinds; a rule's traced one, `_bound_walk`), so a run holding it
+    compiles its body once, never a step at a time (a scanned model's float64 terms dispatched each layer's
+    steps alone: 1,083 s on a GH200 at 21% busy, row 7096), nor every step unrolled into the program (a
+    token scan's 64 steps and their adjoint's took 128 s of XLA's CPU compile, row 6004)."""
+    del terms  # A scan is static to every walk alike, bound whole where traced.
     primitive = equation.primitive
-    if (primitive is jax.lax.while_p or (terms and primitive is jax.lax.scan_p)
-            or (primitive is jax.lax.cond_p and equation.invars[0] not in picked)):
+    if primitive is jax.lax.while_p or (primitive is jax.lax.cond_p and equation.invars[0] not in picked):
         return False
-    return all(_static(body, terms) for body in programs.bodies(equation))
+    return all(_static(body) for body in programs.bodies(equation))
 
 
 def _runs(jaxpr, terms: bool = False) -> list[tuple[int, int]]:
@@ -586,6 +589,11 @@ def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rul
         # Traced, its values pick no branch and bound no Python loop: the primitive itself over walked bodies.
         outputs = _bound_walk(equation, inputs, rule, used)
         return outputs, [None] * len(outputs)
+    static_scan = primitive is jax.lax.scan_p and all(map(_static, programs.bodies(equation)))
+    if walked and static_scan and rule is None:
+        # The terms walk's scan of a static body, bound whole over the walk of it (`_terms_scan`), traced or
+        # not; one whose body's branch or loop its values pick is stepped on concrete values (`_scanned`).
+        return _terms_scan(equation, inputs, given, used)
     if walked and primitive is jax.lax.scan_p:
         return _scanned(equation, inputs, given, compiling, rule, used)
     if walked and primitive is jax.lax.while_p:
@@ -658,8 +666,12 @@ def scanned_steps(equation, inputs: list[tuple], body, lanes: int) -> list[tuple
                          inputs[constants + carries:])
     ys = []
     steps = range(params["length"])
+    # Each lane's steps sliced once, a dispatch for them all (an array's iteration unstacks it), where a
+    # step's slice of each lane was a gather of its own: on a GPU the walk's every step paid one a lane,
+    # host-bound (ledger 6795).
+    held = [tuple(None if lane is None else list(lane) for lane in x) for x in xs]
     for step in reversed(steps) if params["reverse"] else steps:
-        sliced = [tuple(None if lane is None else lane[step] for lane in x) for x in xs]
+        sliced = [tuple(None if lane is None else lane[step] for lane in x) for x in held]
         outputs = body(step, [*consts, *carry, *sliced])
         carry = outputs[:carries]
         ys.append(outputs[carries:])
@@ -668,9 +680,16 @@ def scanned_steps(equation, inputs: list[tuple], body, lanes: int) -> list[tuple
     if not ys:
         return [*carry, *((jnp.zeros((0, *var.aval.shape), var.aval.dtype), *(None,) * (lanes - 1))
                           for var in jaxpr.outvars[carries:])]
-    return [*carry, *(tuple(None if any(entry is None for entry in lane) else jnp.stack(lane)
+    return [*carry, *(tuple(None if any(entry is None for entry in lane) else _stacked(*lane)
                             for lane in zip(*column, strict=True))
                       for column in zip(*ys, strict=True))]
+
+
+@jax.jit
+def _stacked(*steps):
+    """A scanned output's `steps` stacked in one compiled call, where `jnp.stack` dispatched each step's
+    expansion on its own (a host-bound walk on a GPU, ledger 6795)."""
+    return jnp.stack(steps)
 
 
 def _traced_values(values) -> bool:
@@ -766,8 +785,10 @@ def _held(value, var, rule):
 
 
 def _scanned(equation, inputs, given, compiling: bool = False, rule=None, used=None):
-    """A scan's outputs and energies (`float64_terms`), its body evaluated a step at a time, each step's
-    rule its own (`Rule.at`), its `used` outputs alone (`_scan_reads`)."""
+    """A scan's outputs and energies on concrete values (`float64_terms`), its body evaluated a step at a
+    time, each step's rule its own (`Rule.at`), its `used` outputs alone (`_scan_reads`): a rule's walk's,
+    and the terms walk's of a body whose branch or loop its values pick; the terms walk's of a static body
+    is `_terms_scan`."""
     body = programs.scan_body(equation)
     reading = _scan_reads(equation, used, compiling, terms=rule is None)
 
@@ -779,6 +800,120 @@ def _scanned(equation, inputs, given, compiling: bool = False, rule=None, used=N
 
     walked = scanned_steps(equation, list(zip(inputs, given, strict=True)), step, lanes=2)
     return [value for value, _ in walked], [energy for _, energy in walked]
+
+
+def _kind(energy) -> tuple | None:
+    """What a scan's carry must hold alike at every step of an energy (`_terms_scan`): its shape, dtype and
+    weak type, or None for none."""
+    if energy is None:
+        return None
+    typed = energy if isinstance(energy, jax.ShapeDtypeStruct) else jax.typeof(energy)
+    return tuple(typed.shape), np.dtype(typed.dtype), bool(typed.weak_type)
+
+
+def _terms_scan(equation, inputs, given, used=None):
+    """A scan's outputs and energies (`float64_terms`) as the walk of its body a step at a time, each step's
+    own, its `used` outputs alone (`_scan_reads`), bound as one `jax.lax.scan` wherever it can be: an
+    energy is a value or none, and a scan's carry holds the same kinds (`_kind`) at every step. The kinds a
+    step's carries leave with are a function of those they enter with, so the steps' kinds run from the
+    first into a cycle (`jax.eval_shape` of a step): the steps before it run alone, the cycle's steps are
+    one step of a scan over as many whole cycles as the length holds, and the steps left over run alone
+    (one alone where a carry's first step makes its terms; none where its kinds never change). A stacked
+    output's energy is where every step's is, as `scanned_steps` stacks one; an empty scan's outputs carry
+    none. Each step is the stepped walk's evaluation, the scan's body compiled once."""
+    body, params = programs.scan_body(equation), equation.params
+    length, reverse = params["length"], params["reverse"]
+    constants, carries = scan_groups(equation)
+    reading = _scan_reads(equation, used, terms=True)
+    consts, carry, xs = (inputs[:constants], inputs[constants:constants + carries],
+                         inputs[constants + carries:])
+    const_given, carry_given, xs_given = (given[:constants], given[constants:constants + carries],
+                                          given[constants + carries:])
+    outvars, kept = body.jaxpr.outvars, reading[carries:]
+    ys_vars = outvars[carries:]
+    if length == 0:
+        return ([*carry, *(jnp.zeros((0, *var.aval.shape), var.aval.dtype) if read else None
+                           for var, read in zip(ys_vars, kept, strict=True))],
+                [*carry_given, *(None for _ in ys_vars)])
+
+    def walk(carry_values, carry_energies, x_values, x_energies):
+        outputs, made = _evaluated(body.jaxpr, body.consts, [*consts, *carry_values, *x_values],
+                                   [*const_given, *carry_energies, *x_energies], used=reading)
+        filled = [jnp.zeros(var.aval.shape, var.aval.dtype) if value is None else value
+                  for value, var in zip(outputs, outvars, strict=True)]
+        # Each carry at the type it entered with: a scan's carry keeps one at every step.
+        values = [jnp.asarray(value, jnp.result_type(entered))
+                  for value, entered in zip(filled[:carries], carry_values, strict=True)]
+        return [*values, *filled[carries:]], list(made)
+
+    # The steps' slices in the order the scan takes them (its last first where `reverse`).
+    xs = [x[::-1] if reverse else x for x in xs]
+    xs_given = [None if f is None else f[::-1] if reverse else f for f in xs_given]
+
+    def at(step):
+        return [x[step] for x in xs], [None if f is None else f[step] for f in xs_given]
+
+    def following(kinds):
+        energies = [None if kind is None else jax.ShapeDtypeStruct(kind[0], kind[1], weak_type=kind[2])
+                    for kind in kinds]
+        left = jax.eval_shape(lambda c, e, x, f: walk(c, e, x, f)[1][:carries], carry, energies, *at(0))
+        return tuple(map(_kind, left))
+
+    sequence, first = [tuple(map(_kind, carry_given))], {}
+    while sequence[-1] not in first and len(sequence) <= length:
+        first[sequence[-1]] = len(sequence) - 1
+        sequence.append(following(sequence[-1]))
+    cycle = sequence[-1] in first
+    alone = first[sequence[-1]] if cycle else length
+    period = len(sequence) - 1 - alone if cycle else 0
+    whole = (length - alone) // period if period else 0
+    parts = []
+
+    def stepped(steps):
+        nonlocal carry, carry_given
+        for step in steps:
+            outputs, made = walk(carry, carry_given, *at(step))
+            carry, carry_given = outputs[:carries], made[:carries]
+            parts.append(([y[None] for y in outputs[carries:]],
+                          [None if energy is None else energy[None] for energy in made[carries:]]))
+
+    stepped(range(min(alone, length)))
+    if whole:
+        span = whole * period
+
+        def grouped(x):
+            return None if x is None else x[alone:alone + span].reshape(whole, period, *x.shape[1:])
+
+        def cycled(state, sliced):
+            values, energies = state
+            made_ys, made_energies = [], []
+            for offset in range(period):
+                outputs, made = walk(values, energies, [x[offset] for x in sliced[0]],
+                                     [None if f is None else f[offset] for f in sliced[1]])
+                values, energies = outputs[:carries], made[:carries]
+                made_ys.append(outputs[carries:])
+                made_energies.append(made[carries:])
+            stacked = [jnp.stack(lane) for lane in zip(*made_ys, strict=True)]
+            stacked_energies = [None if any(energy is None for energy in lane) else jnp.stack(lane)
+                                for lane in zip(*made_energies, strict=True)]
+            return (values, energies), (stacked, stacked_energies)
+
+        (carry, carry_given), (ys, ys_given) = jax.lax.scan(
+            cycled, (carry, carry_given), ([grouped(x) for x in xs], [grouped(f) for f in xs_given]),
+            length=whole)
+        parts.append(([y.reshape(span, *y.shape[2:]) for y in ys],
+                      [None if energy is None else energy.reshape(span, *energy.shape[2:])
+                       for energy in ys_given]))
+    stepped(range(alone + whole * period, length))
+    ys = [jnp.concatenate([values[lane] for values, _ in parts]) for lane in range(len(ys_vars))]
+    ys_given = [None if any(energies[lane] is None for _, energies in parts)
+                else jnp.concatenate([energies[lane] for _, energies in parts])
+                for lane in range(len(ys_vars))]
+    if reverse:
+        ys = [y[::-1] for y in ys]
+        ys_given = [None if energy is None else energy[::-1] for energy in ys_given]
+    return ([*carry, *(y if read else None for y, read in zip(ys, kept, strict=True))],
+            [*carry_given, *(energy if read else None for energy, read in zip(ys_given, kept, strict=True))])
 
 
 def _looped(equation, inputs, given, compiling: bool = False, rule=None):

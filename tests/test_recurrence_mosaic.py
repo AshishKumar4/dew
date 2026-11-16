@@ -1028,6 +1028,38 @@ def _route_loss(options: dict):
     return loss
 
 
+@lowers('sm90')
+def test_a_launch_spilling_at_every_rung_refuses_the_tiles_that_plan_it_alike():
+    """Lightning attention's training call at its GPU flow's widths on a compile-only H100: where a compile
+    spills its reverse walk at every rung of its ladder (its producer's and each program fewer,
+    `Mosaic.rungs`) from the derived tiles, the tiles a ring stage shallower, which the walk does not read
+    (`mainloop.Launch.ring`), are refused unasked: their reverse walk plans as it did, so its ladder runs the
+    same (`Mosaic._spilled`), and not before each rung from its base was refused. Read at the tiles alone,
+    whose raise answers them, a launch that moves registers was never read as spilled, and its tiles at
+    another depth took its whole ladder again (train 929's F4)."""
+    shape = jax.ShapeDtypeStruct
+    given = shape((2, 256, 4, 128), jnp.bfloat16)
+    operands = (given, given, given, shape((2, 256, 4), jnp.float32), shape((2, 256, 4), jnp.bfloat16))
+    with report.refusals(), generation.assumed('sm90'):
+        target = template.Mosaic.launched()
+        bound = template.MOSAIC.bind(*operands, None, None, delta=False, rounded=True)
+        tiles = template.MOSAIC.derived(bound, target)
+        shallower = dataclasses.replace(tiles, stages=tiles.stages - 1)
+        assert not template.MOSAIC._refused(bound, shallower, target)
+        spilled, identity = {'recurrence_reverse'}, report._identity(template.MOSAIC, bound)
+        report.refuse([(identity, tiles, spilled)])
+        held, *upper, foot = template.MOSAIC.rungs(bound, tiles)
+        # Its foot refused alone (a config pinned there) leaves the rungs above it unasked: nothing spent.
+        report.refuse([(identity, foot, spilled)])
+        assert not template.MOSAIC._refused(bound, shallower, target)
+        # A rung that held the reverse walk and spilled another kernel is no evidence against the walk.
+        report.refuse([(identity, held, {'recurrence_states'})])
+        report.refuse([(identity, rung, spilled) for rung in upper])
+        assert not template.MOSAIC._refused(bound, shallower, target)
+        report.refuse([(identity, held, spilled)])
+        assert template.MOSAIC._refused(bound, shallower, target)
+
+
 def test_a_refusal_under_the_remat_rung_reaches_the_route():
     """Under the remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`), a refusal of
     every tile of the run's training call's launch (its identity as its lowering for an H100 names it,

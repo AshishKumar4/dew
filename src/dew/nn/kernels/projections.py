@@ -41,6 +41,7 @@ from dew.nn.sharding import (
     on_shards,
     placed_layout,
     seen_whole,
+    shard_shapes,
 )
 
 
@@ -146,7 +147,6 @@ def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, along) -> ja
     matrix, the groups' sizes and the bias whole on every device and the matrix's and bias's gradients
     summed over the devices (the map's transpose). Experts' sizes count every device's rows together, each
     group's after the last's: a device's groups are its share of each (`_local_sizes`)."""
-    from dew.mesh import mesh_axes
 
     names = mesh_axes(along)
 
@@ -438,8 +438,8 @@ def shard_placement(lhs: jax.Array, matrices: tuple[jax.Array, ...], paths: tupl
     if split is None or layout is None:
         return None
     mesh = jax.sharding.get_abstract_mesh()
-    shards = math.prod(mesh.shape[axis] for entry in split for axis in mesh_axes(entry))
-    rows = jax.ShapeDtypeStruct((math.prod(lhs.shape[:-1]) // shards, lhs.shape[-1]), lhs.dtype)
+    held = shard_shapes((lhs,), (split,))[0]
+    rows = jax.ShapeDtypeStruct((math.prod(held.shape[:-1]), held.shape[-1]), lhs.dtype)
     return split, {1 + index: layout.leaf_spec(mesh, path, each)
                    for index, (path, each) in enumerate(zip(paths, matrices, strict=True))}, rows
 

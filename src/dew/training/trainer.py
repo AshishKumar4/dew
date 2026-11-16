@@ -169,6 +169,7 @@ from dew.training.distributed import (
     start_compiling,
     step_reads,
     traced_start,
+    transferred_copy,
 )
 from dew.training.evaluation import EvalSuite, Evaluator, episodic
 from dew.training.inspection import Inspection
@@ -439,16 +440,17 @@ class Trainer(Generic[Loss, Effects]):
         # collections a step writes back (`write_back`) and its restores share one structure.
         params = drawn_in(owned_dicts(unboxed(initialized)), self.param_dtype, self.objective)
         # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
-        # which the step's donation would free: the moving state takes buffers of its own, as a
-        # placed one does (`distributed.placed_held`). The frozen tree no step donates (`apart`), so
-        # it shares the held arrays as they are, one copy for the run. Traced, no leaf is a held array,
-        # so nothing is copied; a state held on the host is never donated, and takes the arrays over
-        # leaf by leaf as it is placed (`execution.placed_host`), so it takes them as they are.
+        # which the step's donation would free: the moving state takes buffers of its own, copied by the
+        # transfer as a placed one's are (`distributed.transferred_copy`), compiling no program. The frozen
+        # tree no step donates (`apart`), so it shares the held arrays as they are, one copy for the run.
+        # Traced, no leaf is a held array, so nothing is copied; a state held on the host is never donated,
+        # and takes the arrays over leaf by leaf as it is placed (`execution.placed_host`), so it takes them
+        # as they are.
         if not self.host_master:
             held = {id(leaf) for leaf in jax.tree.leaves(self.objective.held_variables())
                     if isinstance(leaf, jax.Array)}
             params = {collection: tree if collection == FROZEN else jax.tree.map(
-                lambda leaf: leaf.copy() if id(leaf) in held else leaf, tree)
+                lambda leaf: transferred_copy(leaf) if id(leaf) in held else leaf, tree)
                 for collection, tree in params.items()}
         if "params" not in params:
             raise ValueError(

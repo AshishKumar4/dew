@@ -321,16 +321,20 @@ class AttentionTerms:
 
 def with_attention_terms(sized, carried: dict):
     """`sized`, a gradient's float64 terms (`float64_terms`), each attention projection's bias and kernel
-    sized by at least the attention's terms carried to it (`AttentionTerms`)."""
-    sized = jax.tree.map(np.array, sized)
-    for place, projections in carried.items():
-        placed = node(sized["params"], place)
-        for name, (into, terms) in projections.items():
-            leaf = placed[name]
-            squares = np.asarray(terms, np.float64) ** 2
-            leaf["bias"] = np.maximum(leaf["bias"], np.sqrt(squares.sum((0, 1))).reshape(leaf["bias"].shape))
-            leaf["kernel"] = np.maximum(leaf["kernel"], np.sqrt(np.einsum(
-                "bse,bshd->ehd", into ** 2, squares)).reshape(leaf["kernel"].shape))
+    sized by at least the attention's terms carried to it (`AttentionTerms`), in float64 where JAX places
+    them: on a GPU, its float64 units, not the host's (bible §8)."""
+    with jax.enable_x64(new_val=True):
+        sized = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), sized)
+        for place, projections in carried.items():
+            placed = node(sized["params"], place)
+            for name, (into, terms) in projections.items():
+                leaf = placed[name]
+                squares = jnp.square(jnp.asarray(terms, jnp.float64))
+                leaf["bias"] = jnp.maximum(leaf["bias"],
+                                           jnp.sqrt(squares.sum((0, 1))).reshape(leaf["bias"].shape))
+                leaf["kernel"] = jnp.maximum(leaf["kernel"], jnp.sqrt(jnp.einsum(
+                    "bse,bshd->ehd", jnp.square(jnp.asarray(into, jnp.float64)), squares)).reshape(
+                        leaf["kernel"].shape))
     return sized
 
 

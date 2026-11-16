@@ -401,18 +401,6 @@ def scan_cache(rows: int, taps: int, width: int, state: str, state_shape: tuple[
             state: Opened((rows, *state_shape), state_dtype)}
 
 
-def as_projected(out, dtype):
-    """A recurrent layer's scan output `out` read in `dtype`, the dtype its input projection computes in,
-    where its reference casts it back: the gated delta rules' (Qwen3-Next's, Kimi's) and MiniMax's
-    lightning attention's raw scan output before their norms (`.to(query.dtype)`), Mamba-2's gated output
-    before its projection (`self.out_proj(scan_output.to(dtype))`), Mamba's and Mamba-3's, and the
-    in-context memory's read. A projection computes in the layer's dtype where it states one and
-    otherwise in its input's and weights' promoted dtype, so the scan's fp32 reaches the residual stream
-    only where the projections compute in it; a view the layer reads unprojected computes in the layer's
-    dtype, or the stream's."""
-    return out.astype(dtype)
-
-
 def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
               coordinates: Coordinates, spec: Mapping[str, Opened] | None = None, state: str = 'ssm_state',
               state_dtype=None, conv_dtype=None, parts=None, dtype=None, token=None):
@@ -1228,19 +1216,22 @@ class GatedDeltaNet(nn.Module):
         sigmoid write gate and the softplus step's log decay (`recurrence.gated`)."""
         return recurrence.Gates()
 
-    def _fused_hooks(self) -> recurrence.Hooks:
+    def _fused_hooks(self, operand) -> recurrence.Hooks:
         """The decode token whole in the recurrence's step: the conv and its silu, the queries' and
-        keys' l2 norm, the gates from their pre-activations, the delta rule and the gated norm."""
+        keys' l2 norm, the gates from their pre-activations, the delta rule and the gated norm, its output
+        read back first in `operand`, the input projection's dtype (`as_projected`)."""
         return recurrence.Hooks(conv=recurrence.Conv('silu'), l2norm=True, decay='scalar',
                                 gates=self._gates,
-                                output=recurrence.OutputNorm(self.norm_eps, self.gate_activation))
+                                output=recurrence.OutputNorm(self.norm_eps, self.gate_activation,
+                                                             read_in=jnp.dtype(operand).name))
 
-    def _fused_token(self, z, b, a, valid):
+    def _fused_token(self, z, b, a, valid, operand):
         """A decode token's conv, gates, update and gated norm in one launch (`fused_token`): the
-        layer's gate pre-activations and output gate a row's, its decay's rate and bias a head's."""
+        layer's gate pre-activations and output gate a row's, its decay's rate and bias a head's, its
+        output read back in `operand` before the norm, as the unfused token's."""
         B = z.shape[0]
         return fused_token(
-            self._fused_hooks(), self.conv1d()[0],
+            self._fused_hooks(operand), self.conv1d()[0],
             heads=(self.num_k_heads, self.num_k_heads, self.num_v_heads),
             widths=(self.head_k_dim, self.head_k_dim, self.head_v_dim),
             per_row={'gate': a[:, 0], 'beta': b[:, 0], 'z': z[:, 0].reshape(B, self.num_v_heads, -1)},
@@ -1261,7 +1252,7 @@ class GatedDeltaNet(nn.Module):
         # An initialization runs the general path, where the layer makes its parameters.
         if decode and S == 1 and not forked and not self.is_initializing():
             kernel = self._decode_kernel(x, operand)
-            token = self._fused_token(z, b, a, valid) if kernel == 'fused' else None
+            token = self._fused_token(z, b, a, valid, operand) if kernel == 'fused' else None
             stepped = kernel == 'step'
 
         # fp32 on purpose, as the reference notes: an fp16 A can make exp
@@ -1338,10 +1329,11 @@ class GatedDeltaNet(nn.Module):
                             parts=heads, dtype=operand if ported else wide, token=token)
         if token is not None:
             # The fused step gated and normalized its output (`_fused_hooks`), in its epilogue's dtype.
-            return self.out_proj(as_projected(out, mixed.dtype))
+            return self.out_proj(out.astype(mixed.dtype))
 
         gate = z.reshape(B, S, -1, self.head_v_dim)
-        out = self.norm(as_projected(out, mixed.dtype), gate)  # the norm scales, then the activation gates
+        # The scan read back in its projections' dtype, as Qwen3-Next's `.to(initial_dtype)` (the query's).
+        out = self.norm(out.astype(mixed.dtype), gate)  # the norm scales, then the activation gates
         out = out.reshape(B, S, self.value_features)
         return self.out_proj(out)
 

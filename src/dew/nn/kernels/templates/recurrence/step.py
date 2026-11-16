@@ -580,12 +580,14 @@ def _tree_added(partials: tuple, index, term) -> tuple:
 
 def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, interpret: bool):
     """The token's output past the update: its skip and its gated norm over the head's columns (a block of
-    one head a warpgroup wide, `fits`), as `recurrence.step_reference`'s epilogue (`recurrence.skipped`,
-    `recurrence.normed`)."""
+    one head a warpgroup wide, `fits`), read back first in the norm's `read_in`, as
+    `recurrence.step_reference`'s epilogue (`recurrence.skipped`, `recurrence.normed`)."""
     if hooks.skip:
         out = out + token.per_head([inputs['skip'][head].astype(jnp.float32) for head in token.heads]) * value
     if hooks.output is None:
         return out
+    if hooks.output.read_in is not None:
+        out = out.astype(hooks.output.read_in).astype(jnp.float32)
     gate = token.tile(inputs['z'])
     weight = plgpu.load(inputs['weight'].at[pl.ds(0, 1), token.columns], layout=token.block.layout,
                         optimized=False).astype(jnp.float32)
