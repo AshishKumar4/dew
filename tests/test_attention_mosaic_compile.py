@@ -1,19 +1,35 @@
 """The attention template's Mosaic GPU mainloop compiled at the tiles its models decide
 (dew.nn.kernels.templates.attention_mosaic): each launch, forward, backward and decode step, compiled by XLA's
 CUDA backend for a compile-only A100 and H100 on the CPU (tests/kernel_compile.py), within its block and
-spill-free; and an A100's launches counting the shared memory their lowering asks for. The mainloop's values
-are tests/test_attention_mosaic.py's."""
+spill-free; an A100's launches counting the shared memory their lowering asks for; and the launches lowered
+for an H100 and a v5e: each stating its outputs' dimensions, a hook's approximated operations exact, every
+score hook's lowering. The mainloop's values are tests/test_attention_mosaic.py's."""
 
 
 import dataclasses
+import functools
+import json
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
-from generation_support import COMPILES_ON_CPU, INTERPRETS
+from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
+from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from kernel_compile import gate_generations, lowered_for
-from test_attention_mosaic import BACKWARD_HOOKS, SHAPES, _check_backward, _residuals
-from test_attention_triton import SCORE_HOOKS, score_hooks
+from test_attention_mosaic import (
+    BACKWARD_HOOKS,
+    FORWARD_HOOKS,
+    SHAPES,
+    _bound,
+    _check_backward,
+    _forward_call,
+    _kept,
+    _pinned,
+    _residuals,
+)
+from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
+from test_attention_triton import HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, tuning
@@ -21,6 +37,7 @@ from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
     attention_mosaic_program,
+    attention_route,
     bundles,
 )
 
@@ -804,3 +821,288 @@ def test_a_stack_of_layers_holds_no_launchs_accumulator_past_its_own_layer():
     batch, tokens, heads, _, width, _ = STACK
     saved = batch * tokens * heads * width * jnp.dtype(jnp.bfloat16).itemsize
     assert _stack_temp(2) <= _stack_temp(1) + saved
+
+
+@pytest.mark.parametrize("accurate", [False, True], ids=["fast", "accurate"])
+def test_each_attention_launch_states_its_outputs_dimensions_for_an_h100(accurate):
+    """A training step's attention on the Mosaic mainloop, lowered for an H100, and its forward alone: every
+    kernel call that defines arrays of its own (not refs it writes in place) states the operand axes each
+    output descends from (`outputs.Output`, `KernelCall.output_dims`), an output an entry a dimension, so a
+    compile's live buffers name the call's axes they scale with; the fast form's one launch and the accurate
+    form's two (a split of the columns among them included)."""
+    from jax.extend.mlir import ir
+
+    from dew.nn.kernels import lowered as reading
+    from dew.nn.kernels.templates.outputs import OUTPUT_DIMS
+
+    tokens, heads, kv_heads, width = 1024, 4, 2, 128
+    spans = template.spans(tokens, tokens, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
+
+    def step(query, key, value):
+        out, *residuals = attention_mosaic.forward(query, key, value, spans, None,
+                                                   residuals=template.Kept.SPLIT)
+        return attention_mosaic.backward(query, key, value, spans, None, out, residuals=tuple(residuals),
+                                         accurate=accurate)
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None)
+
+    for fn in (step, forward):
+        with generation.assumed("sm90"):
+            lowered = jax.jit(fn).trace(query, key, key).lower(lowering_platforms=("cuda",))
+        # Each Mosaic GPU call: the outputs it defines (its results less those aliasing an operand, a ref it
+        # writes in place) and the dimensions it states (none where it states none).
+        def defined(operation) -> int:
+            aliased = (len(ir.ArrayAttr(operation.attributes["output_operand_aliases"]))
+                       if "output_operand_aliases" in operation.attributes else 0)
+            return len(operation.results) - aliased
+
+        calls = [call for call, _ in reading._read_calls(lowered, lambda target, operation: (
+            defined(operation), reading._frontend(operation.attributes).get(OUTPUT_DIMS))
+            if target == "mosaic_gpu_v2" else None)]
+        returning = [stated for count, stated in calls if count]
+        assert returning, "no Mosaic launch defines an output"
+        for stated in returning:
+            assert stated is not None, "a launch returning arrays states no dimensions"
+            assert all(dims is not None for dims in json.loads(stated)), stated
+
+
+def _lowered_call(call: str) -> tuple:
+    """A lowering test's call form `call` as abstract operands: its spans, its query and key `[B, S, H, 128]`
+    bf16 and a training forward's residuals' shapes, the compiled shape's causal call or a template core
+    case's (`CASES`, `RUN_CASES`) over four query heads and two key heads."""
+    if call == "causal":
+        rows, tokens, heads, kv_heads = SHAPES["compiled"]
+        spans = template.spans(tokens, tokens, rows, causal=True)
+    else:
+        case = CASES[call] if call in CASES else RUN_CASES[call]
+        (tokens, _), rows, heads, kv_heads = core_geometry(case), ROWS, 4, 2
+        spans = template.spans(tokens, tokens, rows, **arguments(case))
+    q = jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.bfloat16)
+    kv = jax.ShapeDtypeStruct((rows, tokens, kv_heads, 128), jnp.bfloat16)
+    rows_shape = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
+    others = jax.ShapeDtypeStruct((rows, heads, tokens, 128), jnp.float32)
+    split = template.Split(others, rows_shape, rows_shape, rows_shape)
+    anchors = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32)
+    return spans, q, kv, (rows_shape, rows_shape, anchors, split)
+
+
+@lowers("sm90")
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("call", ["causal", "causal-documents-window", "runs-documents-valid"])
+def test_the_launches_lower_for_an_h100(call, accurate):
+    """The forward and the backward's launches lower for an H100 on any host, as the GPU gate runs them: a
+    causal call, a spans one of documents, whose programs read its block map and ids, and one over a
+    decision row's runs, whose programs read each run's bounds; the forward under every hook too, whose
+    programs read each kind of parameter and the initial state."""
+    spans, q, kv, residuals = _lowered_call(call)
+    tokens = q.shape[1]
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    score_mod, kinds, draw_hooks = score_hooks(FORWARD_HOOKS["all"][0], tokens, tokens, 128)
+    params, initial = draw_hooks(0)
+    gate = hooks_for(HOOKS["gate"], tokens, 128, gate_of(tokens, 128))
+    hooks = template.Hooks(score_mod, tuple(template.Param(value, kind)
+                                            for value, kind in zip(params, kinds, strict=True)), initial,
+                           gate.output_mod, gate.output_params)
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        for forward_hooks in (None, hooks):
+            for training in (template.Kept.NONE, template.Kept.SPLIT):
+                entry = functools.partial(attention_mosaic.forward, spans=spans, hooks=forward_hooks,
+                                          residuals=training)
+                jax.jit(entry).trace(q, kv, kv).lower(lowering_platforms=("cuda",))
+        jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
+            q, k, v, spans, None, dout, residuals=residuals, accurate=accurate)).trace(
+            q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
+
+
+@pytest.mark.parametrize("call", ["causal", "causal-documents-window"])
+def test_the_launches_lower_for_a_v5e(call):
+    """The forward, the training forward and the backward on a v5e's MXU (`mosaic_tpu.MXU`, the route's Mosaic
+    mainloop on a TPU) lower for a TPU on this CPU, Pallas TPU's Mosaic lowering, as a TPU compiles them: a
+    causal call and a spans one of documents under a window, whose programs read its block map and ids."""
+    spans, q, kv, residuals = _lowered_call(call)
+    # An abstract mesh of one v5e device, which Pallas TPU's lowering reads its target from on any host.
+    device = AbstractDevice(device_kind=generation.gpu_target("v5e").device_kind, num_cores=1, platform="tpu")
+    mesh = AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    with generation.assumed("v5e"), jax.sharding.use_abstract_mesh(mesh):
+        for training in (template.Kept.NONE, template.Kept.SPLIT):
+            entry = functools.partial(attention_mosaic.forward, spans=spans, hooks=None, residuals=training)
+            jax.jit(entry).trace(q, kv, kv).lower(lowering_platforms=("tpu",))
+        jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
+            q, k, v, spans, None, dout, residuals=residuals)).trace(q, kv, kv, q, residuals).lower(
+            lowering_platforms=("tpu",))
+
+
+APPROXIMATED_BY_MOSAIC = ("exp", "exp2", "log", "log2", "log1p", "tanh", "logistic", "sin", "cos", "sqrt",
+                          "rsqrt")
+"""The unary operations whose Mosaic GPU lowering takes `approx_math` (jax's Pallas Mosaic GPU lowering rules
+for exp, exp2, log, log2, tanh, sin, cos, sqrt and rsqrt, which pass it to the lane implementation and set
+the fast-math flag; logistic and log1p lower through them), read from the lowering, not from the
+mainloop's own list."""
+
+
+@pytest.mark.parametrize("operation", APPROXIMATED_BY_MOSAIC)
+def test_every_approximated_operation_in_a_hook_takes_exact_math(operation):
+    """A score hook, an output hook and a query prologue each computing one operation Mosaic GPU approximates
+    under `approx_math` (`APPROXIMATED_BY_MOSAIC`) take exact math, in the forward and (the score hook)
+    differentiated: no such operation of a hook passes unseen."""
+    def applied(x):
+        return getattr(jax.lax, operation)(jnp.abs(x) + 1.0)
+
+    def score_mod(s, q_pos, k_pos):
+        del q_pos, k_pos
+        return s + applied(s)
+
+    def output_mod(out):
+        return applied(out)
+
+    def query_mod(q, q_pos):
+        del q_pos
+        return applied(q.astype(jnp.float32)).astype(q.dtype)
+
+    for hooks in (template.Hooks(score_mod), template.Hooks(output_mod=output_mod)):
+        for differentiated in (False, True):
+            assert not attention_mosaic_program.approximate(hooks, (64, 64), 64,
+                                                            differentiated=differentiated)
+    # A query prologue a launch takes on its query tile (`attention_mosaic_forward._prologued`).
+    assert not attention_mosaic_program.approximate(
+        template.Hooks(query_mod=query_mod), (64, 64), 64, differentiated=False,
+        query=(64, 64, jnp.bfloat16))
+
+
+def _fullest(op, ba, target):
+    """The fitting config of `op`'s launch of `ba` on `target` that stages the most shared memory."""
+    return max(op.fitting(ba, target), key=lambda config: op.staged_bytes(ba, config, target))
+
+
+@lowers("sm90")
+@pytest.mark.parametrize("launch", ["forward", "training", "default", "accurate"])
+def test_the_fullest_fitting_tiles_lower_within_a_hoppers_block(launch):
+    """Mosaic GPU's own lowering, which refuses a kernel staging past a block's shared memory, takes each
+    launch at the fitting config that stages the most (`staged_bytes`), the one nearest the H100's block: the
+    model counts every array and barrier the launch allocates (`_staged`), an independent witness of it."""
+    rows, tokens, heads, kv_heads = SHAPES["compiled"]
+    width = 128
+    spans = template.spans(tokens, tokens, rows, causal=True)
+    q = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
+    kv = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
+    stats = jnp.zeros((rows, heads, tokens), jnp.float32)
+    residuals = (stats, stats, jnp.zeros((rows, heads, tokens), jnp.int32),
+                 template.Split(jnp.zeros((rows, heads, tokens, width), jnp.float32), stats, stats, stats))
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        target = generation.gpu_target()
+        if launch in ("forward", "training"):
+            training = _kept(launch)
+            op, ba = _forward_call((rows, tokens, heads, kv_heads), width, width, training)
+            fullest = _fullest(op, ba, target)
+            assert op.staged_bytes(ba, fullest, target) <= generation.shared_budget(target)
+            with _pinned(fullest):
+                entry = functools.partial(attention_mosaic.forward, spans=spans, residuals=training)
+                jax.jit(entry).trace(q, kv, kv).lower(lowering_platforms=("cuda",))
+            return
+        accurate = launch == "accurate"
+        op = attention_mosaic.MosaicBackward(form="causal", keys=tokens, scale=width ** -0.5,
+                                             accurate=accurate)
+        ba = _bound(op, q, kv, kv, q, spans.start, spans.end, None, None, (), None, residuals)
+        fullest = _fullest(op, ba, target)
+        assert op.staged_bytes(ba, fullest, target) <= generation.shared_budget(target)
+        with _pinned(backward=fullest):
+            jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
+                q, k, v, spans, None, dout, residuals=residuals, accurate=accurate)).trace(
+                q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
+
+
+@lowers("sm90")
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("hooks", BACKWARD_HOOKS)
+def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate):
+    """The backward under each score hook lowers for an H100 on any host, as the GPU gate runs it: each hook
+    parameter and the initial state read per tile by the dQ and dK/dV programs."""
+    case = CASES["causal-documents-window"]
+    queries, keys = core_geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    q = jax.ShapeDtypeStruct((ROWS, queries, 4, 128), jnp.bfloat16)
+    kv = jax.ShapeDtypeStruct((ROWS, keys, 2, 128), jnp.bfloat16)
+    rows_shape = jnp.zeros((ROWS, 4, queries), jnp.float32)
+    split = template.Split(jnp.zeros((ROWS, 4, queries, 128), jnp.float32), rows_shape, rows_shape,
+                           rows_shape)
+    residuals = (rows_shape, rows_shape, jnp.zeros((ROWS, 4, queries), jnp.int32), split)
+    score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, keys, 128)
+    params, initial = draw_hooks(0)
+
+    def backward_of(q, k, v, dout, residuals, params, initial):
+        hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
+                                                 for value, kind in zip(params, kinds, strict=True)),
+                                initial)
+        return attention_route.backward(q, k, v, spans, hooked, dout, residuals=residuals, accurate=accurate)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
+            lowering_platforms=("cuda",))
+
+
+@lowers("sm90")
+@pytest.mark.parametrize("width", [64, 128])
+@pytest.mark.parametrize("natural", [False, True], ids=["folded", "natural"])
+@pytest.mark.parametrize("hooks", BACKWARD_HOOKS)
+def test_the_training_forward_under_every_score_hook_lowers_for_an_h100(hooks, natural, width):
+    """The training forward that supplies each hooked backward's residuals lowers for an H100 at the GPU
+    cells' head widths, in either form: a row-indexed hook's unit column of its query places found no layout
+    beside the walk's split on mma.sync (row 5279)."""
+    case = CASES["causal-documents-window"]
+    queries, keys = core_geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    q = jax.ShapeDtypeStruct((ROWS, queries, 4, width), jnp.bfloat16)
+    kv = jax.ShapeDtypeStruct((ROWS, keys, 2, width), jnp.bfloat16)
+    score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, keys, width)
+    params, initial = draw_hooks(0)
+
+    def trained(q, k, v, params, initial):
+        hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
+                                                 for value, kind in zip(params, kinds, strict=True)),
+                                initial)
+        return attention_mosaic.forward(q, k, v, spans, hooked, natural=natural,
+                                        residuals=template.Kept.SPLIT)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(trained).trace(q, kv, kv, params, initial).lower(lowering_platforms=("cuda",))
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("axis", [0, 1])
+def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
+    """A score hook that forms a unit column (`q_pos[:, :1]`, `axis` 0) or a unit row (`k_pos[:1, :]`, 1,
+    which Mosaic GPU selects by a reduction across warps, its scratch the launch's warpgroups reserve,
+    ledger 1428), the training forward and the backward lowered and compiled by ptxas for an H100 on this
+    CPU (tests/kernel_compile.py), within its shared memory (`failures`: no lowering error, no block past
+    it). Its registers at the derived tiles are the template's register model's (ledger 1617), hooked or
+    not."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, failures
+
+    queries = 256
+    spans = template.spans(queries, queries, 1, causal=True)
+    def score_mod(s, q_pos, k_pos):
+        return s + 0.01 * (q_pos[:, :1] if axis == 0 else k_pos[:1, :]).astype(s.dtype)
+
+    hooks = template.Hooks(score_mod)
+    query = jax.ShapeDtypeStruct((1, queries, 4, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, queries, 2, 128), jnp.bfloat16)
+
+    def trained(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, hooks, residuals=template.Kept.SPLIT)
+
+    def backward(query, key, value, dout):
+        residuals = trained(query, key, value)[1:]
+        grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals)
+        return grads.query, grads.key, grads.value
+
+    found = compile_mosaic_kernels([KernelCase("forward", lambda: (trained, (query, key, key))),
+                                    KernelCase("backward", lambda: (backward, (query, key, key, query)))],
+                                   "sm90")
+    assert not failures(found), "\n".join(failures(found))
