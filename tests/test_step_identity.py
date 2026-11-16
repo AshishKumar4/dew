@@ -357,7 +357,7 @@ from pathlib import Path
 
 ROOT = Path("/data")
 PATTERN = re.compile("[a-z]+")
-WORDS = {{"alpha", "beta", "gamma", "delta", "epsilon", "zeta"}}
+WORDS = {{2, 3, 5, 7, 11, 13}}
 
 
 def delta():
@@ -383,10 +383,11 @@ def _held_in_a_process(directory, seed: str) -> str:
 
 def test_a_function_step_naming_a_module_is_held_by_what_it_reads_of_it_alike_in_every_process(tmp_path):
     """A function step that names a module of the user's (`helping.delta()`, `helping.WORDS`) is held by the
-    attributes it reads of it, alike in two processes of other string hashing (a set of words stated in its
-    statements' order), and exact beside members it never reads that no statement holds (a path, a compiled
-    pattern); `delta` changed, its held code changes. Every process stated the set in its own order, and the
-    module's every member was stated, its pattern refusing the step (train 912's review, F3 and F4)."""
+    attributes it reads of it, alike in two processes of other string hashing (a set of numbers, whose order
+    no hash seed decides, stated in the order it holds them, which the code may read), and exact beside
+    members it never reads that no statement holds (a path, a compiled pattern); `delta` changed, its held
+    code changes. The module's every member was stated, its pattern refusing the step (train 912's review,
+    F4)."""
     (tmp_path / "helping.py").write_text(HELPERS.format(by=1))
     (tmp_path / "stepping.py").write_text(
         "import helping\n\n\ndef shifted(row):\n"
@@ -402,10 +403,12 @@ def test_a_function_step_naming_a_module_is_held_by_what_it_reads_of_it_alike_in
     "import dataclasses\n\n\n@dataclasses.dataclass(frozen=True)\nclass Holding:\n    settings = helping\n\n"
     "    def __call__(self, row):\n        return {**row, 'id': row['id'] + self.settings.delta()}\n\n\n"
     "shifted = Holding()\n",
-], ids=["a default", "a class attribute"])
+    "def shifted(row, settings=(helping,)):\n    return {**row, 'id': row['id'] + settings[0].delta()}\n",
+], ids=["a default", "a class attribute", "a container"])
 def test_a_step_reading_a_module_it_holds_holds_what_it_reads_of_it(tmp_path, holder):
-    """A step that reads a module of the user's it holds, through a default argument (`settings=helping`)
-    or a class attribute (`settings = helping`), holds the attributes it names of it, as one reading it by a
+    """A step that reads a module of the user's it holds, through a default argument (`settings=helping`),
+    a class attribute (`settings = helping`) or a container (`settings=(helping,)`), holds the attributes it
+    names of it, as one reading it by a
     global does: `helping.delta` changed, the step's held code changes. The module was stated by its name
     alone, the step exact across the change (the round-2 review's F4, train 921's review's F9)."""
     (tmp_path / "helping.py").write_text(HELPERS.format(by=1))

@@ -2106,15 +2106,16 @@ class _Replayed:
 
     def __next__(self):
         if self._pending:
-            self._pending = False
-            return self._first
+            # Given once, then let go: the stream holds no batch past the one it gives.
+            first, self._first, self._before, self._pending = self._first, None, None, False
+            return first
         return next(self._source)
 
     def get_state(self):
         return self._before if self._pending else self._source.get_state()
 
     def set_state(self, state) -> None:
-        self._pending = False
+        self._first, self._before, self._pending = None, None, False
         self._source.set_state(state)
 
     def close(self) -> None:

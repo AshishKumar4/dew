@@ -1755,7 +1755,9 @@ class Trainer(Generic[Loss, Effects]):
         the run reads its stream from its beginning: that stream, handed on; else a stream opened now, the
         primed one closed."""
         primed, run.primed = run.primed, None
-        if primed is not None and primed[0] == partition and position is None:
+        # Handed on only where the stream reads from its beginning: a resume, or a relaxed one starting a
+        # stage again (`FitRun.restarted`, which `_prefetched` moves a staged stream to), reads elsewhere.
+        if primed is not None and primed[0] == partition and position is None and run.restarted is None:
             return primed[1], (primed[2], primed[3])
         if primed is not None:
             _closed(primed[1])
