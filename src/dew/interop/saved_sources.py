@@ -141,9 +141,10 @@ def step_records(artifact: dict[str, JSON] | list[JSON] | str | int | float | bo
         return ()
     held: tuple[epath.Path, ...] = ()
     files = artifact.get("tokenizer_files")
-    if isinstance(files, dict) and (held_place(directory, files) / HELD_FILES).exists():
-        place = held_place(directory, files)
-        held = (*(place / str(path) for path in files), place / HELD_FILES)
+    hashed = {str(path): str(digest) for path, digest in files.items()} if isinstance(files, dict) else {}
+    if hashed and (held_place(directory, hashed) / HELD_FILES).exists():
+        place = held_place(directory, hashed)
+        held = (*(place / path for path in hashed), place / HELD_FILES)
     task = declared_objective(artifact).saved_task
     if task is None or not issubclass(task, SavedRunTask):
         return held
