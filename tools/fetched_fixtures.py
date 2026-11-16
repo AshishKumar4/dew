@@ -146,15 +146,17 @@ def _file_name(path: str) -> str:
     return name
 
 
-def _pin(data: bytes, name: str, *, reference: str, license: str, kind: str | None = None) -> Pin:
+def _pin(data: bytes, name: str, *, reference: str, license: str, kind: str | None = None,
+         origin: bool = False) -> Pin:
     """The pin of `data` kept in the store for the fixture `name`, before its upload gives a revision: its
     sha256 and size, `reference` and `license`, and a release file's `kind`, stored in GitHub's store where
-    its license lets it be re-hosted (`_asset`), else in the Hub's where `_store_path` puts it."""
+    its license lets it be re-hosted (`_asset`) and it is not kept at its release's `origin`, else in the
+    Hub's where `_store_path` puts it."""
     sha = digest(data)
     held = {"sha256": sha, "kind": kind}
     pin: Pin = {"repo": STORE, "revision": None, "sha256": sha, "bytes": len(data), "reference": reference,
                 "license": license, "path": _store_path(held, name)}
-    if rehosted(license):
+    if rehosted(license) and not origin:
         pin.update(repo=GITHUB, path=_asset(held, name), origin="github")
     if kind is not None:
         pin["kind"] = kind
@@ -171,8 +173,9 @@ def _asset(pin: dict, name: str) -> str:
     release file by its own name after it, so no name ever holds two files' bytes."""
     if pin.get("kind") == RELEASE:
         # GitHub renames an asset with other characters, and a URL reads a space, `#` or `?` as its own.
-        if not re.fullmatch(r"[A-Za-z0-9._-]+", file := _file_name(name)):
-            raise ValueError(f"{name}: {file!r} is no name GitHub keeps for an asset ([A-Za-z0-9._-])")
+        if not re.fullmatch(r"[A-Za-z0-9._-]*[A-Za-z0-9_-]", file := _file_name(name)):
+            raise ValueError(f"{name}: {file!r} is no name GitHub keeps for an asset ([A-Za-z0-9._-], "
+                             "no trailing period)")
         return f"{_sha(pin)}-{file}"
     return f"{_sha(pin)}.npz"
 
@@ -208,7 +211,7 @@ def pin_release(path, data: bytes, *, reference: str, license: str, origin: bool
     # Written where it resolves to: a symlink at the place, or above it, may not carry a write out.
     if name is None or not (root / name).resolve().is_relative_to((root / FIXTURES).resolve()):
         raise ValueError(f"{path}: a release file is pinned under {FIXTURES}/, and resolves there")
-    pin = _pin(data, name, reference=reference, license=license, kind=RELEASE)
+    pin = _pin(data, name, reference=reference, license=license, kind=RELEASE, origin=origin)
     if origin:
         repo, revision, file = _released(reference)
         pin.update(repo=repo, revision=revision, path=file, origin="release")

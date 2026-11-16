@@ -387,10 +387,14 @@ def test_a_rehostable_file_is_kept_in_githubs_store_and_any_other_in_the_hubs(st
                    {"sha256": "not-a-sha"}):
         store._pinned(LARGE, {**recording, "revision": "store-1", **broken}, root)
         assert store.check(root)
-    # A release file of a name GitHub would not keep as an asset is refused as it is pinned.
-    with pytest.raises(ValueError):
-        store.pin_release("tests/fixtures/hf/site/release/model code.py", b"x", license="MIT", root=root,
-                          reference="org/site@abc/model code.py")
+    # A release file of a name GitHub would not keep as an asset is refused as it is pinned there, and taken
+    # where it is kept at its release's origin, which is no asset.
+    for unkept in ("model code.py", "model.py."):
+        with pytest.raises(ValueError):
+            store.pin_release(f"tests/fixtures/hf/site/release/{unkept}", b"x", license="MIT", root=root,
+                              reference=f"org/site@abc/{unkept}")
+    store.pin_release("tests/fixtures/hf/site/release/model code.py", b"x", license="MIT", origin=True,
+                      root=root, reference=f"org/site@{'c' * 40}/model code.py")
 
 
 def test_upload_puts_each_due_file_as_an_asset_reads_it_back_and_never_overwrites_one(store, tmp_path,
