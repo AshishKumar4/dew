@@ -472,7 +472,9 @@ def _decoder_selecting(name: str, source) -> tuple[Mapping[str, object], str | N
         text = source.model.text
         record = to_record(text, CausalTransformer)
         assert isinstance(record, dict)
-        return {"num_layers": text.num_layers, **record}, "logits"
+        # Its fields as a translated record holds them: a field it leaves unset is absent, not null.
+        return {"num_layers": text.num_layers,
+                **{field: value for field, value in record.items() if value is not None}}, "logits"
     return source.model_config.get("text", source.model_config), None
 
 
