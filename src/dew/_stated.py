@@ -322,7 +322,9 @@ def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, .
             if _sources.own_source(maker.__module__) else None)
     entry: list[JSON] = [_coded(held.__module__, at), held.__qualname__, _members(held, at, known, walking),
                          fields, made]
-    return entry
+    # How its generator made it where that departs from the generator's defaults (eq=False, order=True).
+    options = _sources.generation_options(held)
+    return [*entry, dict(options)] if options else entry
 
 
 def _field(held: type, field: _sources.GeneratedField, at: str, known: Mapping[int, JSON],
