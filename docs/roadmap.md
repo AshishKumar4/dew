@@ -10,6 +10,8 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - A launch's call and its gradient's product shared one digest. [6780]
 - Dew's jaxlib 0.12.0.1.post99 crashed CPU processes by SIGFPE. [6829]
+- Finished_merged's mean is 0 where its slices' masses total past fp32's largest. [6904]
+- Finished_merged's derivative along its denominators is NaN where. [6905]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
