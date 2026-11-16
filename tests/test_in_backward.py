@@ -278,7 +278,9 @@ def test_a_layer_walked_past_a_gradient_that_is_not_finite_keeps_its_weights_and
     assert [bool(count > 0) for count in norms["nonfinite"]] == [True, True, False]
     overflowed, held, norms = _walked([1.0, 1.0, 1.0], scale=1e20)
     np.testing.assert_array_equal(np.asarray(overflowed["a"]), [0.5, 0.5, 0.5])
-    assert bool(jnp.all(jnp.isfinite(held["nu"]["a"]))) and bool(jnp.all(norms["nonfinite"] > 0))
+    # The top layer's candidate counts not finite; those after it are held by the walk's latch.
+    assert bool(jnp.all(jnp.isfinite(held["nu"]["a"])))
+    np.testing.assert_array_equal(np.asarray(norms["nonfinite"] > 0), [False, False, True])
     unmoved, _, _ = _walked([1.0, 1.0, 1.0], finite=False)
     np.testing.assert_array_equal(np.asarray(unmoved["a"]), [0.5, 0.5, 0.5])
     # The top layer's candidate overflows from a finite gradient: it and every layer walked after it keep
