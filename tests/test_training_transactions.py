@@ -711,8 +711,8 @@ class Huge(Counting):
 def test_a_run_whose_finite_gradient_overflows_its_optimizer_stops_at_its_next_log_step():
     """A run saving nothing whose finite gradient (inputs of 1e20) puts Adam's second moment past float32
     stops at its next log step, its state read outside the step (`stop_non_finite`): the moment's update is
-    zero, so its weight froze while its loss stayed finite, and the run went on to its end in silence (Main,
-    on the owner's option B: detection apart from rollback)."""
+    zero, so its weight froze while its loss stayed finite, and the run went on to its end in silence (row
+    6861: detection apart from rollback)."""
     from recording import RecordingTracker
 
     tracker = RecordingTracker()

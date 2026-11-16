@@ -1395,9 +1395,9 @@ def test_the_best_step_is_the_lowest_loss(tmp_path):
 # Local checkpoints
 # --------------------------------------------------------------------------
 
-def local_trainer(tmp_path, optimizer=None, **kwargs):
+def local_trainer(tmp_path, **kwargs):
     return Trainer(
-        Regression(), optax.sgd(0.1) if optimizer is None else optimizer, key=jax.random.key(0),
+        Regression(), optax.sgd(0.1), key=jax.random.key(0),
         layout=Layout(min_shard=1, tolerance=1.0),
         checkpoints=Checkpoints(str(tmp_path / "run"), keep=4,
                                 local_directory=str(tmp_path / "local"), local_every=2),

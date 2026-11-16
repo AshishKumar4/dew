@@ -732,8 +732,8 @@ def test_a_group_stack_is_orthogonalized_one_group_at_a_time(declared):
     """A block-diagonal kernel's groups, declared ('groups', 'embed', 'mlp') or on one side
     ('groups', 'attention', None) as DeepSeek V4's grouped output projection is, are stacked matrices, as
     an expert stack's are: Muon steps each group's matrix alone, where reading the groups as part of a side
-    would orthogonalize one [groups * embed, mlp] matrix, and a one-sided group stack was refused (row 6746;
-    the models lane's DeepSeek V4)."""
+    would orthogonalize one [groups * embed, mlp] matrix, and a one-sided group stack was refused (row
+    6746)."""
     embed, mlp = 8, 16
     path = ('params', 'layers_0', 'o_a_proj', 'kernel')
     draw = scaled_stack_draw([1.0, 16.0, 0.25], embed, mlp)
