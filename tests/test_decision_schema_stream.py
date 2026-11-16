@@ -161,10 +161,10 @@ def test_a_schema_read_in_context_reads_the_context_after_it_in_the_room_it_leav
         (question.span, question.options) for question in laid.questions]
     task = Decide(objective.model, objective.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS)
     assert isinstance(task("one two three", QUESTION, context=note)["pick"], ChoiceAnswer)
-    examples = [Example("one", QUESTION, {"pick": "a"}, context=note)] * 4
+    examples = [Example("one", QUESTION, {"pick": "a"}, context=note)] * 8
     tracker = RecordingTracker()
     Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker).fit(
-        decision_rows(examples, 2, objective=objective.data()), steps=1, log_every=1)
+        decision_rows(examples, 8, objective=objective.data()), steps=1, log_every=1)
     [logged] = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
     [rows] = [value for name, value in logged.items()
               if name.startswith("data/cut/") and name.endswith("/context")]

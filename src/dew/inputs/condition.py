@@ -13,11 +13,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Generic, Self
 
-import numpy as np
-from typing_extensions import TypeVar
-
 import jax
+import numpy as np
 from flax import linen as nn
+from typing_extensions import TypeVar
 
 from dew import _records
 from dew.batch import Variables
