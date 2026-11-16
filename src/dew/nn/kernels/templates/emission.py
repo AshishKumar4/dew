@@ -172,7 +172,9 @@ def scalar_evaluated(primitive, operands: Sequence, params: Mapping, dtype) -> n
             or not all(_integral(np.result_type(value)) for value in operands) or not _integral(dtype)
             or (primitive in (lax.div_p, lax.rem_p) and _undefined(*operands))):
         return None
-    made = programs.host_evaluated(primitive, operands, params)
+    # At the widths its program declared: a kernel's body may have traced under x64 that this fold is not.
+    with jax.enable_x64(new_val=True):
+        made = programs.host_evaluated(primitive, operands, params)
     return None if made is None else np.dtype(dtype).type(np.asarray(made[0]).item())
 
 

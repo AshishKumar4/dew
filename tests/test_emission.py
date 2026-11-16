@@ -185,6 +185,23 @@ def test_a_launchs_cost_counts_a_scalar_predicate_as_the_gpu_computes_it(wide, p
             if "cost_estimate" in equation.params] == [exponentials]
 
 
+def test_a_launchs_cost_folds_a_bodys_64_bit_arithmetic_at_its_width():
+    """A kernel whose body alone traces under x64 (its own `jax.enable_x64`), its warpgroup's index widened to
+    int64 and 2**31 added: its launch's cost (`emission.costed`, folded outside that scope) folds the sum at
+    int64, where it is no negative number at either warpgroup, and states no exponential, where a fold at
+    the ambient width narrowed it to int32's wrap below zero at both (base review 802cf38a0 F1)."""
+    def body(x_ref, o_ref, row):
+        with jax.enable_x64(new_val=True):
+            wg = lax.axis_index("wg").astype(jnp.int64)
+            row[...] = lax.cond(wg + jnp.int64(2 ** 31) < 0, jnp.exp, lambda value: value, row[...])
+
+    launch = plgpu.kernel(body, out_type=_ROW, num_threads=2, thread_name="wg",
+                          scratch_types=[plgpu.SMEM((128,), jnp.float32)])
+    traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=1, bytes_accessed=0)))(_ROW)
+    assert [equation.params["cost_estimate"].transcendentals for equation in programs.equations(traced.jaxpr)
+            if "cost_estimate" in equation.params] == [0]
+
+
 def _convert(dtype) -> dict:
     return {"new_dtype": np.dtype(dtype), "weak_type": False, "sharding": None}
 
