@@ -190,13 +190,19 @@ def members(held) -> list[tuple]:
     """What a class or a module of the user's holds, by name, in order: a method as the function its
     descriptor wraps (`wrapped`), anything else as itself. Of Python's own entries (`__dict__`, `__doc__`,
     `__annotations__`) only the methods the user wrote (`__call__`), which a call runs; the rest are its
-    machinery's, the methods a dataclass makes among them, which the class's description states, and the
-    state `abc.ABCMeta` writes into every class it makes (`_ABC_STATE`), a Grain transform's among them."""
+    machinery's, the methods a dataclass makes among them, which the class's description states, the
+    state `abc.ABCMeta` writes into every class it makes (`_ABC_STATE`), a Grain transform's among them, and
+    the descriptor Python makes for each of a class's own slots (a slotted dataclass's fields), whose values
+    an instance's fields state (`structured`): read as code, a frozen slotted step was inexact, and its
+    unchanged exact resume refused (the base review of 826882bbf)."""
+    slots = vars(held).get("__slots__", ())
+    slots = (slots,) if isinstance(slots, str) else tuple(slots)
     found = []
     for name, member in sorted(vars(held).items()):
         member = wrapped(member)
         if ((name.startswith("__") and name.endswith("__") and not hand_written(member))
-                or isinstance(member, _ABC_STATE)):
+                or isinstance(member, _ABC_STATE)
+                or (isinstance(member, types.MemberDescriptorType) and name in slots)):
             continue
         found.append((name, member))
     return found
