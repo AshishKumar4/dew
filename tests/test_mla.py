@@ -38,7 +38,7 @@ import torch
 from flax import linen as nn
 from interop_support import fixture_arrays, fixture_ids, transformers_arms, transformers_model
 from jax.sharding import PartitionSpec as P
-from model_support import as_stepped, decode_through
+from model_support import as_stepped, decode_through, kept_by_slot
 from quantized_basis import dequantized_in_own_basis
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
@@ -355,33 +355,6 @@ def test_decode_matches_prefill(name):
     # The truth one float64 pass over the whole sequence, whose products round alike at every shape.
     assert_as_exact(decoded, full, lambda seed: (variables, draw(seed)[0]), f"{name} decode",
                     seeds=SEEDS["decode"], truth_fn=jax.jit(module.apply))
-
-
-def kept_by_slot(cache) -> dict[tuple[str, ...], np.ndarray]:
-    """Each leaf of a latent attention's decode `cache` by its path, what a slot keeps as `[rows, capacity,
-    ...]`: a pool's leaf (`[heads, pages, page_size, ...]`, `kv_cache.POOLED`) read through each row's pages
-    (`kv_cache.TABLE`), a compact cache's scales and bounds (head-major, `kv_cache.scale_shape`) by slot
-    first, and every other leaf as it is (the cursor, the indexer's keys, which a paged cache keeps
-    compact too)."""
-    from flax.traverse_util import flatten_dict
-
-    from dew.nn.kv_cache import BOUND, POOLED, SCALES, TABLE
-
-    flat = {path: np.asarray(leaf) for path, leaf in flatten_dict(nn.unbox(cache)).items()}
-    tables = {path[:-1]: leaf for path, leaf in flat.items() if path[-1] == TABLE}
-    kept = {}
-    for path, leaf in flat.items():
-        table = tables.get(path[:-1])
-        if path[-1] == TABLE:
-            continue
-        if table is not None and path[-1] in POOLED:
-            rows, pages = table.shape
-            leaf = np.moveaxis(leaf[:, table].reshape(leaf.shape[0], rows, pages * leaf.shape[2],
-                                                      *leaf.shape[3:]), 0, 2)
-        elif table is None and path[-1] in {*SCALES, BOUND}:
-            leaf = np.swapaxes(leaf, 1, 2)
-        kept[path] = leaf
-    return kept
 
 
 @pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
