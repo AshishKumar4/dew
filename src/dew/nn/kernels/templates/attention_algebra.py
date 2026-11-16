@@ -617,12 +617,15 @@ def _mean_value(weights: jax.Array, outputs: jax.Array, axis: int) -> jax.Array:
 def _mean_tangent(axis: int, primals: tuple, tangents: tuple) -> tuple[jax.Array, jax.Array]:
     """The mean's derivative, d out = sum(dw (o - out)) / W + sum(w do) / W, its masses' coefficients
     (o - out) / W formed from the primals at a scale that passes fp32's largest only where they do: a gap
-    of an output or the mean reaching `HALVED` at half its size, over the largest mass and then their sum
-    (`_normalized`), doubled after; the rest exact. A coefficient as to a mass, never one as to a weight
-    over the largest, which passes fp32 where outputs of both signs are near it ((o - out) over their sum
-    -1.125 times fp32's largest at weights 1 and 1/3, a denominator's derivative L/8 returned as inf, row
-    6827). Each case's operands are selected before its arithmetic; the derivative is linear in its
-    tangents, so a reverse pass forms the same coefficients."""
+    of an output or the mean reaching `HALVED` at half its size, doubled after; the rest exact; each over
+    the largest mass and their normalized sum (`_normalized`), whose product is W, by the one of them at
+    least 1 first, so no quotient on the way passes the coefficient (eight masses of 1/8 under outputs of
+    alternate signs at 2^127: their gaps over 1/8 first reached 2^129 before the sum 8 took them back, row
+    6886). A coefficient as to a mass, never one as to a weight over the largest, which passes fp32 where
+    outputs of both signs are near it ((o - out) over their sum -1.125 times fp32's largest at weights 1 and
+    1/3, a denominator's derivative L/8 returned as inf, row 6827). Each case's operands are selected
+    before its arithmetic; the derivative is linear in its tangents, so a reverse pass forms the same
+    coefficients."""
     weights, outputs = primals
     dweights, doutputs = tangents
     out = _mean(weights, outputs, axis)
@@ -632,8 +635,11 @@ def _mean_tangent(axis: int, primals: tuple, tangents: tuple) -> tuple[jax.Array
     large = (jnp.abs(outputs) >= HALVED) | (jnp.abs(mean) >= HALVED)
     halved = (jnp.where(large, outputs, 0.0) * 0.5 - jnp.where(large, mean, 0.0) * 0.5)
     exact = jnp.where(large, 0.0, outputs) - jnp.where(large, 0.0, mean)
-    over = expand(largest, outputs), expand(summed, outputs)
-    coefficients = jnp.where(large, halved / over[0] / over[1] * 2, exact / over[0] / over[1])
+    over_largest, over_summed = expand(largest, outputs), expand(summed, outputs)
+    # The summed count is at least 1; the largest mass first only where it is too.
+    first = jnp.where(over_largest >= 1, over_largest, over_summed)
+    second = jnp.where(over_largest >= 1, over_summed, over_largest)
+    coefficients = jnp.where(large, halved / first / second * 2, exact / first / second)
     shares = weights / (largest * summed)
     return out, (jnp.sum(expand(dweights, outputs) * coefficients, axis=axis)
                  + jnp.sum(expand(shares, outputs) * doutputs, axis=axis))

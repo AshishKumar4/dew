@@ -1114,14 +1114,27 @@ def _cancelling_beside_least_normal(seed):
     return jnp.stack([large, -large, tiny]).astype(jnp.float32), totals
 
 
-@pytest.mark.parametrize("draw", [_opposite_near_largest, _cancelling_beside_least_normal],
-                         ids=["opposite-near-largest", "cancelling-beside-least-normal"])
+def _subunit_masses_of_alternate_signs(seed):
+    """Eight slices of outputs of alternate signs near 2^127, denominators near 1/8: a mean near zero over a
+    total mass near 1, its derivatives near 2^127, where a gap over the largest mass alone reached 2^129
+    (row 6886)."""
+    streams = jax.random.split(jax.random.key(seed), 2)
+    sizes = 2.0 ** 127 * (1 + 0.25 * jax.random.uniform(streams[0], (8,), jnp.float32))
+    totals = 0.125 * (1 + 0.25 * jax.random.uniform(streams[1], (8,), jnp.float32))
+    return (sizes * jnp.asarray([1.0, -1.0] * 4, jnp.float32)).astype(jnp.float32), totals
+
+
+@pytest.mark.parametrize("draw", [_opposite_near_largest, _cancelling_beside_least_normal,
+                                  _subunit_masses_of_alternate_signs],
+                         ids=["opposite-near-largest", "cancelling-beside-least-normal",
+                              "subunit-masses-of-alternate-signs"])
 def test_the_merges_derivative_as_to_its_denominators_is_on_par(draw):
     """The derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) as to each
     slice's denominator, (o_j - out) / T, on par with the mean's own derivative formed in fp32 as
     o_j / T - out / T against float64 (check 1): slices of opposite signs near fp32's largest, whose sum's
-    reverse pass overflowed (L/8 returned as inf, row 6827), and slices cancelling near 2^127 beside a
-    least-normal one, whose gaps halved would lose its bits."""
+    reverse pass overflowed (L/8 returned as inf, row 6827), slices cancelling near 2^127 beside a
+    least-normal one, whose gaps halved would lose its bits, and eight of subunit masses under outputs of
+    alternate signs near 2^127, whose gaps over the largest mass passed fp32 before their sum (row 6886)."""
 
     def ours(outputs, totals):
         return jax.grad(lambda each: _finished_merged_output(outputs, jnp.zeros_like(totals), each).sum())(
