@@ -53,6 +53,7 @@ from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
+from tools import benchmark_recurrence
 
 pytestmark = pytest.mark.kernel
 
@@ -890,15 +891,16 @@ def test_the_rated_hook_over_packed_documents_is_as_exact_as_the_recurrence_inte
     every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed=True)
 
 
-RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True),
-                   'nemotron-h-4b-ssd': (8, 96, 128, 80, False),
-                   'minimax-text-01-lightning': (64, 64, 128, 128, False),
-                   'a write gate': (2, 2, 64, 64, False),
-                   'a 192-wide value head': (16, 16, 128, 192, False)}
-"""The scoreboard's geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`,
-MiniMax-Text-01's lightning layer among them), an unrounded write gate, and a gated delta rule's value head
-192 wide, whose training launches take whole staged blocks (a bf16 output gradient's 64-column swizzle; 96
-columns cut one): key heads, value heads, key and value widths, and whether the decay is a key dimension's."""
+RESOURCE_SHAPES = {
+    **{name: (shape.key_heads, shape.value_heads, shape.key_width, shape.value_width, shape.kind == 'kda')
+       for name, shape in benchmark_recurrence.SHAPES.items()
+       if name in ('qwen3.5-27b-gdn', 'kimi-linear-kda', 'nemotron-h-4b-ssd', 'minimax-text-01-lightning')},
+    'a write gate': (2, 2, 64, 64, False), 'a 192-wide value head': (16, 16, 128, 192, False)}
+"""The scoreboard's geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`, read there:
+a gated delta net's, Kimi delta attention's, an SSD's and MiniMax-Text-01's lightning layer), an unrounded
+write gate, and a gated delta rule's value head 192 wide, whose training launches take whole staged blocks
+(a bf16 output gradient's 64-column swizzle; 96 columns cut one): key heads, value heads, key and value
+widths, and whether the decay is a key dimension's."""
 
 WHOLE = frozenset({'a write gate'})
 """The gate's forms without the delta rule whose numbers the run's fast forms leave whole
