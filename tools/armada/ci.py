@@ -2277,8 +2277,8 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
         own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name
                and session.site_name(node, marked) not in marked}
         took = sum(row_["seconds"] for row_ in held)
-        # Drifted past the cut's own tolerance, and by a quarter of the target at least, so a second's noise in
-        # a light file rewrites nothing.
+        # Drifted past the cut's own tolerance, and by a quarter of the target at least, so a second's noise
+        # in a light file rewrites nothing.
         recorded_sum, ran_sum = sum(own.values()), sum(observed.values())
         drifted = (max(recorded_sum, ran_sum) > session.KEPT * min(recorded_sum, ran_sum)
                    and abs(recorded_sum - ran_sum) > target / 4)
