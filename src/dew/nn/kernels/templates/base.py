@@ -78,7 +78,7 @@ class Template[Config: Hashable](tuning.KernelOp):
         """Every config the launch takes for `ba`: its generated one on this device (`derived`), or the
         fixed set it names, in a fixed order."""
         if self.GENERATES:
-            config = self.derived(ba, generation.gpu_target())
+            config = self.derived(ba, self.launch_target())
             return () if config is None else (config,)
         raise NotImplementedError(f"{type(self).__name__} declares no space")
 
@@ -131,7 +131,7 @@ class Template[Config: Hashable](tuning.KernelOp):
     def pinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> bool:
         # A generating launch's pin may name any legal config of its type; a fixed space's, one of the
         # configs it keeps (`fitting`), whose space and fitting state what its legality alone does not.
-        target = generation.gpu_target()
+        target = self.launch_target()
         if not self._typed(config):
             return False
         if self.GENERATES:
@@ -187,7 +187,7 @@ class Template[Config: Hashable](tuning.KernelOp):
         if not self._held(ba, config):
             return (f"its threads hold {self.registers(ba, config)} registers live, past the "
                     f"{self.register_budget(config)} a thread has")
-        target = generation.gpu_target()
+        target = self.launch_target()
         staged, shared = self.staged_bytes(ba, config, target), self.program_shared(config, target)
         if staged > shared:
             return (f"its programs stage {staged} bytes of shared memory, past the {shared} a program of it "
@@ -235,7 +235,7 @@ class Template[Config: Hashable](tuning.KernelOp):
         first = ba.heuristics_config
         if not self.GENERATES:
             return (first,)
-        target = generation.gpu_target()
+        target = self.launch_target()
         return tuple(dict.fromkeys((first, *(config for config in self.neighbours(ba, first)
                                              if self.legal(ba, config, target)))))
 
