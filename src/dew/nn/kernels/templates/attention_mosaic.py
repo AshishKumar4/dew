@@ -107,7 +107,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     walked_layouts,
     whole_tiles,
 )
-from dew.nn.kernels.templates.base import Template
+from dew.nn.kernels.templates.base import Template, Unfitted
 
 
 def _column_blocks_of(family: mosaic.Family, dtype, value_width: int) -> list[int | None]:
