@@ -519,11 +519,19 @@ def checked(state: TrainState | ReplicaState) -> dict[str, Variables | optax.Opt
     (`dew.training.trainer.refuse_non_finite`) read. The optimizer state is read without the
     hyperparameters injected beside it (`dew.optim_schedules.INJECTED`): control values a schedule or the
     user sets, not written by a step's gradient, and legally infinite (a clip's bound of `math.inf`)."""
-    def numerical(node):
-        return node._replace(hyperparams={}) if isinstance(node, INJECTED) else node
+    return {"variables": state.variables, "opt_state": _numerical(state.opt_state), "ema": state.ema}
 
-    opt_state = jax.tree.map(numerical, state.opt_state, is_leaf=lambda node: isinstance(node, INJECTED))
-    return {"variables": state.variables, "opt_state": opt_state, "ema": state.ema}
+
+def _numerical(opt_state: optax.OptState) -> optax.OptState:
+    """`opt_state` without the hyperparameters injected beside it at any depth
+    (`dew.optim_schedules.INJECTED`; an injected state's inner state holds injected states in turn): the
+    state a step's gradients write."""
+    def numerical(node):
+        if not isinstance(node, INJECTED):
+            return node
+        return node._replace(hyperparams={}, inner_state=_numerical(node.inner_state))
+
+    return jax.tree.map(numerical, opt_state, is_leaf=lambda node: isinstance(node, INJECTED))
 
 
 def _finite(leaf: jax.Array) -> jax.Array:

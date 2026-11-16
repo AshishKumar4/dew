@@ -67,3 +67,18 @@ def test_an_optimizer_given_an_infinite_bound_trains_and_saves(tmp_path, scaled)
         dataset(), steps=3, log_every=100, checkpoint_every=1)
     assert int(state.updates) == 3
     assert Checkpoints(str(tmp_path / "run")).latest == 3
+
+
+def test_an_optimizer_injecting_an_infinite_bound_inside_another_injection_trains_and_saves(tmp_path):
+    """A clip's bound of infinity injected inside an injected rate's chain (`optax.inject_hyperparams` of a
+    factory whose chain injects its own) is a control value at any depth: the run trains, its updates
+    counted, and saves. It was read as a state that is not finite, and its first save refused it."""
+    def chained(learning_rate):
+        return optax.chain(optax.inject_hyperparams(optax.clip_by_global_norm)(max_norm=math.inf),
+                           optax.sgd(learning_rate))
+
+    nested = optax.inject_hyperparams(chained)(learning_rate=0.1)
+    state = make_trainer(tmp_path, optimizer=nested).fit(dataset(), steps=3, log_every=100,
+                                                         checkpoint_every=1)
+    assert int(state.updates) == 3
+    assert Checkpoints(str(tmp_path / "run")).latest == 3
