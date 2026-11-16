@@ -24,7 +24,7 @@ import struct
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, overload
@@ -44,8 +44,6 @@ from dew._devices import deterministic_ops_requested, deviceless, xla_flag
 from dew.nn.kernels import generation
 
 if TYPE_CHECKING:
-    from jax.extend import core as jax_core
-
     from dew.nn.kernels.lowered import KernelCall
     from dew.nn.kernels.templates.resources import RegisterModel
 
@@ -170,8 +168,9 @@ def naming() -> Iterator[list[tuple[str | None, "RegisterModel | None", str | No
 @contextlib.contextmanager
 def replayed() -> Iterator[None]:
     """Within the block, no launch traces: the state a held trace is kept under (`tuning.lowered_once`),
-    which reads the launch tracing it only as it names its kernels and carries the launch on their calls,
-    each replayed as it is bound (`renamed`, `carrying`)."""
+    which reads the launch tracing it only as it names its kernels and carries the launch on their calls:
+    its key holds the launch (`launch_metadata`), so a held trace is the launch's own, its names replayed as
+    it is bound (`renamed`)."""
     tracing, form, naming = _TRACING.set(None), _FORM.set(((), None)), _NAMING.set(None)
     try:
         yield
@@ -399,41 +398,6 @@ def _named(name: str | None, model: "RegisterModel | None") -> str | None:
         # mode it traced in.
         _LAUNCHES.setdefault(own, dataclasses.replace(launch, reverse=pending.reverse))
     return launch_name(kernel, own)
-
-
-def carrying(closed: "jax_core.Jaxpr", metadata: bytes) -> "jax_core.Jaxpr":
-    """`closed` with each Mosaic GPU call in it carrying `metadata` (`launch_metadata`), the launch it is
-    bound for: a held trace (`tuning.lowered_once`) bound for another launch than the one it was traced
-    for, whose calls' compiled serializations then name that launch (`Binary.caller`)."""
-    from jax._src.pallas.mosaic_gpu import core as plgpu_core
-
-    from dew.nn import programs
-
-    def carried_jaxpr(jaxpr: "jax_core.Jaxpr") -> "jax_core.Jaxpr":
-        # Its constants with it (`ClosedJaxpr` is `Jaxpr`); itself where no equation's parameters change: a
-        # kernel's body, unchanged, keeps its identity, by which its lowering's cache key is kept.
-        equations = [carried_equation(equation) for equation in jaxpr.eqns]
-        if all(new is old for new, old in zip(equations, jaxpr.eqns, strict=True)):
-            return jaxpr
-        return jaxpr.replace(eqns=equations)
-
-    def carried_equation(equation: "jax_core.JaxprEqn") -> "jax_core.JaxprEqn":
-        params = {key: carried(value) for key, value in
-                  programs.with_bodies(equation.params, carried_jaxpr).items()}
-        if all(params[key] is equation.params[key] for key in params):
-            return equation
-        return equation.replace(params=params)
-
-    def carried(value: Hashable | Mapping) -> Hashable | Mapping:
-        # A Mosaic GPU call's parameters carrying the launch, where they stand alone or by their backend.
-        if isinstance(value, plgpu_core.CompilerParams):
-            return dataclasses.replace(value, metadata=metadata)
-        if isinstance(value, Mapping) and any(isinstance(each, plgpu_core.CompilerParams)
-                                              for each in value.values()):
-            return {key: carried(each) for key, each in value.items()}
-        return value
-
-    return carried_jaxpr(closed)
 
 
 def launch_metadata() -> bytes:
