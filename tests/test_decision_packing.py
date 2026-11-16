@@ -44,6 +44,7 @@ from dew.interop import Pretrained
 from dew.nn.attention_blocks import NormalAttention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step
+from dew.telemetry.compiles import Compiles
 from dew.training.trainer import Trainer
 
 QWEN35 = Path(__file__).parent / "fixtures" / "hf" / "qwen35-tiny"
@@ -477,7 +478,10 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 
     rows = apart(batch)
     wide = copy.copy(objective)
     wide.substitute(wide_modules)
-    decide = jax.jit(lambda variables, batch: decided(objective, variables, batch, segments))
+
+    @jax.jit
+    def decide(variables, batch):
+        return decided(objective, variables, batch, segments)
 
     @as_given
     def packed(variables):
@@ -519,8 +523,11 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 
     initialized = jax.jit(lambda key: nn.unbox(objective.init(key)))
     # A leaf whose float64 truth cancels, an algebraic zero's, is sized by the terms its sums add
     # (`terms`), so each arm's rounding of them is on par, on every backend.
-    assert_as_exact(packed, alone, lambda seed: (initialized(jax.random.key(seed)),), "packed window",
-                    seeds=seeds, truth_fn=truth, terms=terms)
+    # The packed rows and the rows alone, the packed batch's shapes and bound, in one program.
+    with Compiles("decide") as compiles:
+        assert_as_exact(packed, alone, lambda seed: (initialized(jax.random.key(seed)),), "packed window",
+                        seeds=seeds, truth_fn=truth, terms=terms)
+    assert compiles.count == 1, f"the packed and the alone decided in {compiles.count} programs"
 
 
 def test_a_decision_run_steps_one_program_over_rows_of_every_length():
