@@ -1009,10 +1009,13 @@ def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta,
               scale: float, dtype, forked, own):
     """The portable math's chunked op (`xla_mainloop`) under `hooks`' readout: a readout apart from its
     token's writes (`Hooks.reads` 'apart') as its decayed query's read of the state entering the token,
-    `(g q)^T S`, exactly the state after the update less the token's write, and of a group of more than one
-    token (`Hooks.ranks`) less the group's earlier writes (`_group_read`)."""
+    `(g q)^T S` (a value head's decay, its queries and keys repeated to its value heads), exactly the state
+    after the update less the token's write, and of a group of more than one token (`Hooks.ranks`) less the
+    group's earlier writes (`_group_read`)."""
     reads = hooks.reads
     if reads == 'apart':
+        # The decay a value head's: its keys' queries and keys repeated to its value heads first.
+        query, key = (jnp.repeat(t, value.shape[2] // t.shape[2], axis=2) for t in (query, key))
         decay = accurate_exp(jnp.asarray(g, dtype))
         query, reads = query.astype(dtype) * (decay if g.ndim == query.ndim else decay[..., None]), 'before'
     out, final = xla_mainloop(tiles, query, key, value, g, beta, state, starts, firsts, scale=scale,
@@ -1030,10 +1033,8 @@ def _group_read(query, key, value, g, beta, group: int) -> jax.Array:
     math's readout 'apart' at a group of more than one token is its read of the state entering the token
     (`Scan.reads` 'before') less this, which cancels the group's earlier writes at their whole gate, their
     rounding the token's (row 7402's portable part, until the scan's derivation reads a group's entering
-    state). Heads of keys and values alike."""
+    state). Heads of keys and values alike (`_portable`'s)."""
     batch, length, heads = value.shape[:3]
-    if key.shape[2] != heads:
-        raise NotImplementedError("a readout apart from a group of tokens reads keys a value head each")
 
     def grouped(t):
         return jnp.reshape(t, (batch, length // group, group, *t.shape[2:]))
