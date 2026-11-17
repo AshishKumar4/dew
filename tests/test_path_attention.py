@@ -4,9 +4,12 @@ documents (check 1)."""
 
 import functools
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
-from test_recurrence_chunk import assert_packed_on_par, hosted, sigmoid
+from reference_error import assert_as_exact, with_gradients
+from test_recurrence_chunk import assert_packed_on_par, hosted, marked, sigmoid
 
 from dew.nn.kernels.path_attention import path_attention, recurrent_path_attention
 
@@ -43,3 +46,46 @@ def test_the_chunks_are_as_exact_as_the_definition_a_lag_at_a_time(packed):
     within its document."""
     assert_packed_on_par(CHUNKED, recurrent_path_attention, draw, 'path attention', packed=packed,
                          documents=DOCUMENTS, length=LENGTH, seeds=SEEDS[packed])
+
+
+LARGE_PREFIX = -2.0 ** 30
+"""A first document's gates a token: every later prefix of its row's whole running sum rounds to it."""
+
+
+def draw_after_a_large_prefix(seed: int):
+    """`draw`'s operands with each row's first document's gates at `LARGE_PREFIX`."""
+    *operands, cotangent = draw(seed)
+    first = np.zeros((ROWS, LENGTH, 1), bool)
+    for row, documents in enumerate(DOCUMENTS):
+        first[row, :documents[1]] = True
+    gate = jnp.where(first, LARGE_PREFIX, operands[5])
+    return *operands[:5], gate, cotangent
+
+
+def _alone(fn):
+    """`fn` over each packed document of each row (`DOCUMENTS`) alone, the outputs side by side: what a
+    packed call's documents are."""
+    def separate(query, key, value, w, beta, gate):
+        rows = []
+        for row, documents in enumerate(DOCUMENTS):
+            bounds = (*documents, LENGTH)
+            operands = (query, key, value, w, beta, gate)
+            rows.append(jnp.concatenate([fn(*(t[row:row + 1, a:b] for t in operands))
+                                         for a, b in zip(bounds, bounds[1:])], axis=1))
+        return jnp.concatenate(rows, axis=0)
+
+    return separate
+
+
+@pytest.mark.parametrize('form', ('chunked', 'recurrent'))
+def test_a_packed_document_after_a_large_prefix_is_the_document_alone(form):
+    """Packed documents after a first one whose gates are -2^30 a token, each document's output and every
+    operand's gradient on par with the document taken alone (check 1, from float64), chunked and a lag at a
+    time: a document's gate sums are its own (row 7609: summed across the row, every later prefix rounded to
+    -2^30, the documents' gate differences to 0, and a last output of 0.5 where the document alone gives
+    0.7310586)."""
+    packed = {'chunked': CHUNKED, 'recurrent': recurrent_path_attention}[form]
+    starts = marked(DOCUMENTS, LENGTH)
+    assert_as_exact(jax.jit(with_gradients(functools.partial(packed, starts=starts))),
+                    jax.jit(with_gradients(_alone(recurrent_path_attention))), draw_after_a_large_prefix,
+                    f'path attention {form} after a large prefix', seeds=SEEDS[True])
