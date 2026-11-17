@@ -69,7 +69,7 @@ if TYPE_CHECKING:
     from dew.data.dataset import Loader
 
 
-def _data_summary(dataset: Loader) -> dict[str, object]:
+def _data_summary(dataset: Loader) -> Mapping[str, object]:
     """What a decision run's data left out or cut, as its data counters count them: the rows each layout
     refused by reason, the rows and tokens each cut removed, and the draws of "none of the above" declined."""
     found: dict[str, object] = {}
@@ -313,7 +313,7 @@ class DecisionRunConfig(DecoderRunConfig):
         revision = SourceReference(self.pretrained, self.revision, self.subfolder).pinned().revision
         return run if revision == self.revision else dataclasses.replace(run, revision=revision)
 
-    def _context_derived(self, dtype: str) -> dict[str, object]:
+    def _context_derived(self, dtype: str) -> Mapping[str, object]:
         """The objective's context arguments: how its backbone encodes a row's context, or the encoder a
         run configures (`context_text`, built in the run's compute `dtype` and refused where it encodes no
         text, `_text_encoder`) and whether its weights train (`context_text_trained`)."""
@@ -383,7 +383,7 @@ class DecisionRunConfig(DecoderRunConfig):
         attention_impl = self.source_attention()
         budgets = self._row_fields()
         self._refuse_unread_context()
-        derived: dict[str, object] = self._context_derived(dtype)
+        derived: dict[str, object] = dict(self._context_derived(dtype))
         from dew.decision.slot_source import reads_blocks
         from dew.decision.sources import PretrainedDecision
 

@@ -473,6 +473,11 @@ def test_a_clip_context_encoder_trains_serves_and_counts_each_rows_context_alone
         "attention_mask": (np.arange(77)[None, :] < np.sum(row == document)).astype(np.int32)}).flops
         for row in owners for document in set(row.tolist()) - {0})
     assert alone > 0 and objective._encoder_flops(batch) == alone
+    # Frozen, as it is unless trained, the tower runs forward alone: a step counts its work once where a
+    # trained one counts three passes.
+    trained = DecisionObjective(source.with_cross_attention(blocks, key=0), tokenizer=ByteTokenizer(),
+                                specials=SPECIALS, context_encoder=tower, context_trained=True)
+    assert trained.training_flops(None, batch) - objective.training_flops(None, batch) == 2 * alone
     state = Trainer(objective, optax.adam(1e-3), key=0).fit(data, steps=1, log_every=1)
     task = objective.pipeline(state)
     assert set(task("one two three", QUESTION, context="a first note")) == {"pick"}
@@ -803,11 +808,9 @@ def test_the_batched_engine_reads_a_requests_context():
 def test_a_configured_context_encoder_is_frozen_unless_trained_and_counted_as_it_runs():
     """A configured context encoder's weights are held frozen (`FROZEN`) and run forward alone, as a
     diffusion run's text towers do: a step leaves them as drawn; trained (`context_trained=True`) they are
-    parameters a step moves, and its work counts three passes where frozen it counts one. They trained
-    always, their Adam state beside them, their work counted three times (theme 22's review)."""
+    parameters a step moves. They trained always, their Adam state beside them (theme 22's review)."""
     from dew.batch import FROZEN
 
-    counted = {}
     for trained in (False, True):
         objective = configured(trained=trained)
         data = decision_rows(examples(), 8, objective=objective.data())
@@ -821,9 +824,6 @@ def test_a_configured_context_encoder_is_frozen_unless_trained_and_counted_as_it
                  for after, before in zip(jax.tree.leaves(held), jax.tree.leaves(drawn), strict=True)]
         assert any(moved) == trained
         assert "context" not in state.variables.get(FROZEN if trained else "params", {})
-        counted[trained] = (objective.training_flops(None, batch), objective._encoder_flops(batch))
-    (frozen, work), (whole, _) = counted[False], counted[True]
-    assert work > 0 and whole - frozen == 2 * work
 
 
 def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(tmp_path):
