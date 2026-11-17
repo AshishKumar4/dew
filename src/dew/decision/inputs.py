@@ -106,7 +106,7 @@ class DecisionInputs:
     """Whether the questions' spans are positions in `context`, which holds the schema
     (`Schema.stream`), rather than in `tokens`."""
     whole_blocks: bool = struct.field(pytree_node=False, default=False)
-    """Whether each row's one block is the whole row (`QuestionLayout.split` 'whole'), which a backbone
+    """Whether each row's one block is the whole row (`SegmentLayout.split` 'whole'), which a backbone
     reads as non-causal attention by rows (`AttentionMetadata.whole_blocks`)."""
     fork_depth: int = struct.field(pytree_node=False, default=1)
     """The longest chain of `documents` (`Forks.depth`)."""

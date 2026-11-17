@@ -22,6 +22,7 @@ import optax
 import pytest
 import torch
 from flax import linen as nn
+from map_judge import marked_seeds
 from model_support import TINY_DECODER, Digits, decoder, flat_tree, stepped_outputs
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from serving_support import Served, assert_same_draws, assert_served_as_exact
@@ -649,25 +650,23 @@ def test_a_served_request_reads_its_own_context(options):
     assert (hits, server.prefix_hits) == ((4, 4) if shares else (0, 0))
 
 
-SERVED_CONTEXT_SEEDS = {"dense": 512, "kv_cache": 512, "kv_cache, chunk": 256,
-                        "kv_cache, chunk, prefix_cache": 256}
-"""Check 1's declared seeds for each served-contexts site, by its serving options, sized paired by `seeds_for`
-on armada (main f57250bb2)."""
-
-
 @pytest.mark.parametrize("options", [
-    {},
-    {"kv_cache": KVCache(page_size=4, pages=40)},
-    {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3},
-    {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True},
-], ids=["dense", "paged", "chunked", "prefix"])
-def test_served_requests_score_their_draws_from_their_own_contexts(options):
+    pytest.param({}, id="dense", marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
+    pytest.param({"kv_cache": KVCache(page_size=4, pages=40)}, id="paged",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
+    pytest.param({"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3}, id="chunked",
+                 marks=pytest.mark.check1_shards(seeds=256, per_task=128)),
+    pytest.param({"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True}, id="prefix",
+                 marks=pytest.mark.check1_shards(seeds=256, per_task=128))])
+def test_served_requests_score_their_draws_from_their_own_contexts(options, request):
     """Requests of their own contexts, one with none, served together as
     `test_a_served_request_reads_its_own_context` serves them, over a dense cache, a pool of pages, pieces
     of three tokens and a prefix cache, greedily to their budgets, then a repeat of one and the same prompt
     under another context in rounds of their own: each draws what it draws alone, and scores each drawn
-    token on par with a full forward over its prompt, its context and the tokens drawn before it (check 1),
-    truth float64's."""
+    token on par with a full forward over its prompt, its context and the tokens drawn before it (check 1,
+    over its mark's seeds, sized paired by `seeds_for` on armada at main f57250bb2), truth float64's. Each
+    cell's draws run in armada's map tasks of 128: whole, CI's paged cell took 64 to 132 s and its dense one
+    up to 115 s (mains 0ef162e00 to af8a72a90, row 7231)."""
     requests = [Served(len(prompt), conditioning=functools.partial(drawn_context, index))
                 for index, prompt in enumerate(PROMPTS)]
     # A repeat of the third request in a round of its own, its prefix pages shared under its context, and
@@ -679,7 +678,7 @@ def test_served_requests_score_their_draws_from_their_own_contexts(options):
     site = ", ".join(options) or "dense"
     assert_served_as_exact(served_task(eos_token_ids=None), [*requests, *repeated], f"served contexts {site}",
                            serving={"slots": 4, "capacity": 128, "admission": 2, **options},
-                           rounds=(len(requests), 1, 1), seeds=(SERVED_CONTEXT_SEEDS[site],) * 2)
+                           rounds=(len(requests), 1, 1), seeds=(marked_seeds(request),) * 2)
 
 
 def test_a_server_refuses_a_context_its_layers_cannot_read():
