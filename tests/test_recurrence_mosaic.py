@@ -838,22 +838,37 @@ def test_lightning_attentions_fast_forms_are_as_exact_as_flas_rounding_interpret
     lightning_fast_forms_are_as_exact_as(jax.jit(with_gradients(functools.partial(fla_rounding, chunk=64))))
 
 
-def test_lightning_attentions_write_rounds_its_decayed_values_where_fla_does_interpreted():
+def test_lightning_attentions_write_at_fp32s_edge_is_as_exact_as_flas_rounding_interpreted():
     """Lightning attention's write under the run's fast forms rounds each token's decayed value, as fla's
     `chunk_fwd_kernel_h` does (`b_v * exp(g_last - g)` cast bf16 before `k^T v`), not its decayed key, as
     mamba_ssm's SSD places its write gate: at fp32's edge the two part. A key of 2^64 and a value of
     (145/128) 2^64 decayed by exp(-0.1268) to the chunk's end: rounded on the key, 113/128, the write is
     (16385/16384) 2^128, past fp32's largest; on the value, 255/256, (255/256) 2^128, fla's, finite (base
-    review 3ee9253c9 F1). Its parity with fla's rounding is the lightning cell's
-    (`test_lightning_attentions_fast_forms_are_as_exact_as_flas_rounding_interpreted`)."""
+    review 3ee9253c9 F1). Over draws of that edge among normal keys and values, the final memory is finite
+    where fla's rounding's is (`simple_gla_support.fla_rounding`) and on par with it from float64 (check 1,
+    row 7358)."""
+    from simple_gla_support import fla_rounding
+
     hooks = recurrence.Hooks(decay='scalar', delta=False)
-    zeros = jnp.zeros((1, 128, 1, 128), jnp.bfloat16)
-    key, value = (zeros.at[0, 0, 0, 0].set(scale * 2.0 ** 64) for scale in (1.0, 145 / 128))
-    log_decay = jnp.zeros((1, 128, 1), jnp.float32).at[0, 1, 0].set(-0.1268)
-    operands = Chunk(zeros, key, value, log_decay=log_decay)
-    run = formed('fast', functools.partial(chunk_on, 'mosaic_gpu', hooks, chunk_size=64))
-    _, final = jax.jit(run)(operands)
-    assert np.isfinite(np.asarray(final)).all(), float(final[0, 0, 0, 0])
+
+    def draw(seed):
+        key, value = np.random.default_rng(seed).normal(size=(2, 1, 128, 1, 128))
+        key[0, 0, 0, 0], value[0, 0, 0, 0] = 2.0 ** 64, 145 / 128 * 2.0 ** 64
+        log_decay = jnp.zeros((1, 128, 1), jnp.float32).at[0, 1, 0].set(-0.1268)
+        return (Chunk(jnp.zeros(key.shape, jnp.bfloat16), jnp.asarray(key, jnp.bfloat16),
+                      jnp.asarray(value, jnp.bfloat16), log_decay=log_decay),)
+
+    def final(run):
+        return jax.jit(lambda operands: run(operands)[1])
+
+    dew = final(formed('fast', functools.partial(chunk_on, 'mosaic_gpu', hooks, chunk_size=64)))
+    reference = final(functools.partial(fla_rounding, chunk=64))
+    for seed in range(2):
+        assert np.isfinite(np.asarray(reference(*draw(seed)))).all()
+        assert np.isfinite(np.asarray(dew(*draw(seed)))).all()
+    assert_as_exact(dew, reference, draw, "lightning's final memory at fp32's edge", seeds=8,
+                    truth_fn=final(functools.partial(token_by_token, hooks)))
+
 
 HOOK_CELLS = [(hooks, packed) for hooks in TAKEN for packed in (False, True)]
 """The mainloop's hook cells, each hook combination over one sequence and packed documents."""
