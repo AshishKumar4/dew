@@ -15,9 +15,9 @@ import lane_environment
 import jax
 import jax.numpy as jnp
 import model_flows
-import tier_wire
 import numpy as np
 import pytest
+import tier_wire
 from process_support import relayed
 from reference_error import assert_as_exact, over_windows, windows
 from truths_ahead import MissingTruth, compiled_truths

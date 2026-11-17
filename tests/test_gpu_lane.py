@@ -748,7 +748,8 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
         assert (row["output"], row["exitCode"]) == ("", 0)
         # Its measured peak's share raised to Dew's admission, exactly as the lane gives it.
         record = {"depends": ["tests/test_flow.py"], "peak": 2 * gib, "shares": 0, "pools": 0}
-        assert share == float(str(ci.gpu_needs(record, budget, float(admitted(*programs)))[0] / total)) * total
+        given = ci.gpu_needs(record, budget, float(admitted(*programs)))[0]
+        assert share == float(str(given / total)) * total
     # Its children each take a share's fraction: what it holds is of its raised share, 7 GiB twice over.
     assert ci.gpu_needs({"depends": [], "peak": 2 * gib, "shares": 1, "pools": 0}, 40 * gib, 7 * gib) == (
         7 * gib, 14 * gib)
