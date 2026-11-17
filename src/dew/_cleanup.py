@@ -173,12 +173,13 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
         raise
 
 
-def _run(function: Callable[..., None], *args: object) -> None:
-    """`function(*args)` on a thread `_thread` started, under the trace and profile hooks a `threading`
+def _run[**Arguments](function: Callable[Arguments, None], *args: Arguments.args,
+                      **kwargs: Arguments.kwargs) -> None:
+    """`function(*args, **kwargs)` on a thread `_thread` started, under the trace and profile hooks a `threading`
     thread takes (`threading.settrace`, `threading.setprofile`)."""
     sys.settrace(threading.gettrace())
     sys.setprofile(threading.getprofile())
-    function(*args)
+    function(*args, **kwargs)
 
 
 class _Done:
