@@ -93,6 +93,8 @@ def diffusion(args: list[str], root: Path) -> Callable[[], object]:
     config = DiffusionRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs"),
                                      "--set", "validation.images.size=8",
                                      "--set", "validation.images.batch=8",
+                                     # Its default scores read a CLIP model from the Hub.
+                                     "--val-metrics", "[]",
                                      "--text.encoder", "char_table", "--text.checkpoint", "char_table"],
                                     default=recipe.default(*pictures()))
     return config.run
