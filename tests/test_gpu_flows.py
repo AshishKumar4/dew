@@ -25,13 +25,9 @@ def test_a_model_trains_and_decodes_on_its_gpu_routes(name, monkeypatch, record_
     prepared where this process prepares, what its prepare took reported (`prepare_seconds`,
     `prepare_peak_bytes`, `prepare_written_bytes`), else run, its process held to its flags and precision
     first (`model_flows.held_process`), its device's peak bytes reported (`peak_bytes`). A site its first
-    stage leaves undecided asks a later job for its second (`map_judge.ask_later`, `check1_wire.LATER`); a
-    flow whose every failed cell so asked reports `later` (tests/conftest.py), which a follow-up job
-    resolves: given its first run's asks (`check1_wire.ASKED`), it prepares and runs the flows of the asked
-    sites alone, every cell of each, its asked sites over every stage (`model_flows.kinds_of`)."""
+    stage leaves undecided draws its second in its run, from the programs its prepare compiled
+    (`truths_ahead`)."""
     flow = model_flows.flow_named(name)
-    if not model_flows.kinds_of(flow):
-        pytest.skip(f"{flow.name}: this follow-up job was asked for no site of it")
     if model_flows.preparing():
         if (took := model_flows.prepared_apart(flow)) is None:
             pytest.skip(f"{flow.name}: no native kernel claims a route it is for on the node's GPU")

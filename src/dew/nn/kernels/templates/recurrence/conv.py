@@ -22,7 +22,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, short_conv, tuning
 from dew.nn.kernels.templates import mosaic, scan
-from dew.nn.precision import compensated_add
+from dew.nn.precision import compensated_add, compensated_sum
 
 TOKENS = 64
 """The most tokens a program walks: a backward program computes K-1 past them, `(K - 1) / TOKENS` extra."""
@@ -289,7 +289,8 @@ def _backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation:
                              family=family.name, name=_named("short_conv_backward", parts),
                              scratch=(scan.scratch(),))
     dx, dw, db = launched(*(operand for operand in operands if operand is not None), *dys)
-    return dx, jnp.sum(dw, axis=(0, 1)), jnp.sum(db, axis=(0, 1))
+    # The bias's partials summed in one rounding, the one rule of a conv's bias (`short_conv.conv_bias`).
+    return dx, jnp.sum(dw, axis=(0, 1)), compensated_sum(db, (0, 1))
 
 
 def pieces(parts):

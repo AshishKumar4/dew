@@ -29,7 +29,7 @@ import grain.python as grain
 import numpy as np
 from etils import epath
 
-from dew._files import is_uri, staged
+from dew._files import inside, is_uri, staged
 from dew.data.pipeline import TOKEN_FIELDS, Rejected
 from dew.data.tokens import chunk_table
 
@@ -971,12 +971,11 @@ def cached_tokenizer(source: epath.Path, files: Mapping[str, str], *, named: str
 
 def confined_files(files: Mapping[str, str]) -> dict[str, str]:
     """A record's tokenizer files (each path to its hash) whose paths all stand within the tokenizer's
-    directory: relative, in forward slashes, no part empty, `.` or `..`. Any other is refused (ValueError)
+    directory, a file's (`dew._files.inside`), not a directory's. Any other is refused (ValueError)
     before a file is read or written by it: a saved run's record is outside input, and a path out of the
     directory would copy into, or out of, an unrelated place (`copy_checked`)."""
     for path in files:
-        parts = path.split("/")
-        if "\\" in path or ":" in parts[0] or any(part in ("", ".", "..") for part in parts):
+        if not inside(path) or path.endswith("/"):
             raise ValueError(f"a recorded tokenizer file must be a path within its directory, not {path!r}")
     return dict(files)
 

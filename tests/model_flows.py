@@ -29,9 +29,7 @@ import jax
 import jax.numpy as jnp
 import kernel_matrix
 import numpy as np
-from check1_wire import ASKED
 from gpu_flow import Cell, run_cells
-from map_judge import site_id
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact
 from tier_wire import PREPARE, TRUTHS, UNIT, needs_file
@@ -520,7 +518,7 @@ def prepare(flow: Flow) -> bool:
         reference, found = _compiled(named, "reference", target)
     reference.save(directory / "reference.programs")
     held_reference(flow, [route for kind in KINDS for route in found[kind]])
-    for kind in kinds_of(flow):
+    for kind in KINDS:
         judge(flow, {}, kind, target)
     programs = need(dew, reference, directory / "truths")
     (directory / NEED).write_text(json.dumps(programs))
@@ -549,23 +547,24 @@ def unit_needs(programs: list[dict[str, int]]) -> None:
 
 def need(dew, reference, truths: Path) -> dict[str, list[dict[str, int]]]:
     """A flow's run's programs as the allocator admits them (`dew.training.memory.admitted`), each its
-    compile's memory (`Executable.memory`, `truths_ahead.compiled_memory`): the bytes `resident` in the
-    allocator's pool as it runs (its arguments; a float64 truth's or terms program's beside the arms' state,
-    the most any arm takes as arguments, which the run holds while its truths compute; every program's
-    outputs are fetched to the host, `loaded`, `CompiledTruths.called`), the bytes `beside` its temporaries
-    (its outputs no donated argument holds) and its `temporaries`, one block. A part's worker fits a slot
-    where every program of its flows is admitted there."""
+    compile's memory (`Executable.memory`, `truths_ahead.compiled_memory`) in the admission's own terms
+    (`dew.training.memory.admission`): a float64 truth's or terms program's with the arms' state held beside
+    it (the most any arm takes as arguments, which the run keeps while its truths compute; every program's
+    outputs are fetched to the host, `loaded`, `CompiledTruths.called`). A part's worker fits a slot where
+    every program of its flows is admitted there."""
+    from dew.telemetry.instrumentation import CompiledMemory
+    from dew.training.memory import admission
+
     arms = [executable.memory for programs in (dew, reference) for executable in programs.programs.values()
             if executable.memory is not None]
     state = max((memory.argument for memory in arms), default=0)
 
-    def admitted_as(memory, held: int) -> dict[str, int]:
-        # The allocator's bytes alone: a program's code lives outside its pool (`dew.communicators`).
-        return {"resident": held + memory["argument"], "beside": memory["output"] - memory["alias"],
-                "temporaries": memory["temp"]}
+    def admitted_as(memory: CompiledMemory, held: int) -> dict[str, int]:
+        return dict(zip(("resident", "beside", "temporaries"), admission(memory, held), strict=True))
 
-    return {"programs": [*(admitted_as(memory._asdict(), 0) for memory in arms),
-                         *(admitted_as(memory, state) for memory in compiled_memory(truths))]}
+    truths_memory = [CompiledMemory(**memory) for memory in compiled_memory(truths)]
+    return {"programs": [*(admitted_as(memory, 0) for memory in arms),
+                         *(admitted_as(memory, state) for memory in truths_memory)]}
 
 
 PREPARED_APART = """import sys
@@ -621,30 +620,13 @@ def judge(flow: Flow, programs: Mapping[str, Callable], kind: str, target=None) 
                         f"{flow.name}: {kind}", seeds=flow.seeds[kind], truth_fn=truth)
 
 
-def asked() -> frozenset[str]:
-    """The sites (`map_judge.site_id`) a follow-up job draws the second stage of (`check1_wire.ASKED`, its
-    first run's asks merged), none for a job that is no follow-up."""
-    path = os.environ.get(ASKED)
-    return frozenset() if not path else frozenset(
-        json.loads(line)["site"] for line in Path(path).read_text().splitlines() if line.strip())
-
-
-def kinds_of(flow: Flow) -> tuple[str, ...]:
-    """The flow's programs a job judges: every one, in a follow-up (`asked`) every one of a flow it was asked
-    a site of and none of another. A flow's cells fail as one (`gpu_flow.CellsFailed`) and its case is
-    waived for its asks alone, so a follow-up judges the flow's decided cells again beside its asked one: a
-    red of theirs comes back in its receipt."""
-    later = asked()
-    return KINDS if not later or any(site_id(f"{flow.name}: {kind}") in later for kind in KINDS) else ()
-
-
 def run(flow: Flow) -> int:
     """The flow on this GPU from its prepared programs and truths: check 1 of each program its run judges
-    (`kinds_of`), each a cell (`gpu_flow.run_cells`, which reports the cells that ran); its device's peak
+    (`KINDS`), each a cell (`gpu_flow.run_cells`, which reports the cells that ran); its device's peak
     bytes after them, which the test reports."""
     programs = loaded(flow)
     run_cells([Cell(f"{flow.name}: {kind}", functools.partial(judge, flow, programs, kind))
-               for kind in kinds_of(flow)])
+               for kind in KINDS])
     return int((jax.devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0))
 
 

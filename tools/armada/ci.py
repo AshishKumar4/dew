@@ -2015,8 +2015,7 @@ PREPARES = "prepares"
 """The mark of a GPU test whose part's prepare runs it first, on the node's CPU (`gpu_prepared`)."""
 
 
-def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, deadline: float,
-                 asked: Path | None = None) -> int:
+def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, deadline: float) -> int:
     """A GPU lane's prepare, on its node's CPU before its files' GPU run (`gpu_lane`) and with no GPU drawn:
     each of `tests` that holds a test marked `PREPARES` run once in a process of its own on the CPU alone,
     under the prepare's word (tests/tier_wire.py's PREPARE, which tests/conftest.py reads to skip every test
@@ -2060,8 +2059,7 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
             return 0
         return tested(python, [file], group, verdict, mine, "off", session.GRACE, "",
                       {"JAX_PLATFORMS": "cpu", gpu_measures.wire().PREPARE: "1", "OMP_NUM_THREADS": threads,
-                       **(VARIANTS[variant][1] if variant else {}), **asked_environment(asked),
-                       gpu_measures.wire().UNIT: name},
+                       **(VARIANTS[variant][1] if variant else {}), gpu_measures.wire().UNIT: name},
                       recorded=False, variant=variant)
 
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
@@ -2108,22 +2106,8 @@ def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str
             for name, (file, group, _) in units.items()}
 
 
-def asked_environment(asked: Path | None) -> dict[str, str]:
-    """What hands a GPU lane's files a follow-up's asks (`asked`, check 1's ASKED: the later units sites of an
-    earlier run asked for, check1_wire.LATER), which its prepare draws and its run judges over every stage;
-    nothing where it was asked for none."""
-    return {} if asked is None else {check1_wire().ASKED: str(asked)}
-
-
-def later_asks(verdict: Path) -> Path:
-    """Where a GPU lane's file whose verdict is `verdict` writes its sites' asks for their later units (check
-    1's LATER, `map_judge.ask_later`, a JSON line each), beside its JUnit report, so its receipt carries them
-    to a follow-up (dew-ops)."""
-    return verdict.with_name(f"{verdict.name}.later.jsonl")
-
-
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,
-             deadline: float, network: bool = False, asked: Path | None = None) -> int:
+             deadline: float, network: bool = False) -> int:
     """Run `tests` on this process's share of the one GPU it sees, each once, as a task of its own
     (`tested`), and write their verdict rows to `out`: a test file, or one group of one as CI names it
     (`<file>#G/N`, the Gth of N runs of the tests the file's collection here finds, split.py), whose row is
@@ -2199,14 +2183,10 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                            "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
                            "OMP_NUM_THREADS": threads}
                 file, group, variant = units[fits]
-                # A site's asks for its later units go beside the file's report; a follow-up of asks
-                # (`asked`) reuses no row: its run is another than theirs.
-                later_asks(verdicts[fits]).unlink(missing_ok=True)
-                running[pool.submit(tested, python, [file], group, verdicts[fits], deadline,
-                                    "off" if asked is not None else cache, session.GRACE, common,
-                                    {**environ, **(VARIANTS[variant][1] if variant else {}),
-                                     check1_wire().LATER: str(later_asks(verdicts[fits])),
-                                     **asked_environment(asked)}, None, network, variant=variant)] = fits
+                running[pool.submit(tested, python, [file], group, verdicts[fits], deadline, cache,
+                                    session.GRACE, common,
+                                    {**environ, **(VARIANTS[variant][1] if variant else {})}, None, network,
+                                    variant=variant)] = fits
                 continue
             done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
@@ -2397,12 +2377,12 @@ def lane_asked(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         if args.network or args.cache is not None:
             parser.error("gpu-lane --prepare names its --tests, and takes neither --network nor --cache")
         return gpu_prepared(PYTHONS[0], args.tests.split(), args.out, processes=args.processes,
-                            deadline=args.deadline, asked=args.asked)
+                            deadline=args.deadline)
     if args.cache is None:
         parser.error("gpu-lane names the test cache's policy (--cache)")
     tests = args.tests.split() if args.tests is not None else list(network_files(PYTHONS[0]))
     return gpu_lane(PYTHONS[0], tests, args.out, cache=args.cache, processes=args.processes,
-                    deadline=args.deadline, network=args.network, asked=args.asked)
+                    deadline=args.deadline, network=args.network)
 
 
 def main() -> int:
