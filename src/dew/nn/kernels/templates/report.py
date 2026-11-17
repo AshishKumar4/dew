@@ -618,9 +618,8 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
                 _UNCERTIFIED[key] = str(error)[:400]
             return None
         except Untuned as error:
-            # A prepare without its devices (`for_devices`) meets an instruction of the launch alone no
-            # device run has tuned: certification reads no binary there, and the program's own compile says
-            # it untuned, by the program (`dew.training.ahead.CompiledAhead.untuned`).
+            # Or, deviceless, XLA holds no tuned result for its fusions (`Untuned`), which the program's
+            # compile states (`dew.training.ahead.CompiledAhead.untuned`).
             with _GUARD:
                 _UNCERTIFIED[key] = str(error)[:400]
             return None
