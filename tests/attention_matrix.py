@@ -12,6 +12,7 @@ deterministic mode's) at the dK/dV launch on the layout whose consumers feed the
 """
 
 import concurrent.futures
+import contextlib
 import functools
 import multiprocessing
 
@@ -26,7 +27,7 @@ from reference_error import assert_as_exact
 from test_attention_mosaic import FED, WGMMA, _residuals
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
+from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route, report
 
 MAINLOOP = "attention_mainloop"
 """The choice of the mainloop the route's passes run on (`attention_route.MAINLOOP`)."""
@@ -132,18 +133,33 @@ def _backward_op(case: dict[str, str]):
     return op, op.bind(*args, interpret=False), generation.gpu_target()
 
 
-@functools.cache
-def _route(call: tuple[tuple[str, str], ...]):
-    """What the Mosaic backward does with a call (`case` but its launch): whether it declines it, and else the
-    config it derives and the two launches' pin (`FED`) where that is legal, under the call's generation."""
+def _routed(call: tuple[tuple[str, str], ...], certified: bool):
+    """What the Mosaic backward does with a call (`case` but its launch), under the call's generation:
+    whether it declines it, and else its config and the two launches' pin (`FED`) where that is legal. Its
+    derivation's offer, or where `certified` the one a run takes (`KernelOp.taken`: its derived config, or
+    the next where that one spills as the GPU assembles it alone, on a compile-only GPU of the generation;
+    declined where none holds, as its route then takes another mainloop before the call, `Template.holds`),
+    the pin only where it holds there too."""
     case = dict(call)
-    with generation.assumed(case["generation"]):
+    certifying = (report.certifying(generation.compile_only_gpus(case["generation"])[0]) if certified
+                  else contextlib.nullcontext())
+    with generation.assumed(case["generation"]), certifying:
         op, ba, target = _backward_op(case)
         if op.declined(ba, target) is not None:
             return True, None, None
+        config = op.taken(ba) if certified else op.derived(ba, target)
+        if config is None and certified:
+            return True, None, None
         two = attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2 if case["width"] == "256" else 1,
                                              family=WGMMA, **FED)
-        return False, op.derived(ba, target), two if op.legal(ba, two, target) else None
+        held = op.legal(ba, two, target) and (not certified or report.certified(op, ba, two) == ())
+        return False, config, two if held else None
+
+
+@functools.cache
+def _route(call: tuple[tuple[str, str], ...]):
+    """The derivation's offer for a call (`_routed`)."""
+    return _routed(call, certified=False)
 
 
 _CERTIFYING: dict[str, concurrent.futures.ProcessPoolExecutor] = {}
@@ -151,36 +167,14 @@ _CERTIFYING: dict[str, concurrent.futures.ProcessPoolExecutor] = {}
 compiles a module once a process, for one architecture."""
 
 
+@functools.cache
 def _certified_route(call: tuple[tuple[str, str], ...]):
-    """`_route` as a run takes it: the backward's config certified (`KernelOp.taken`: its derived config, or
-    the next where that one spills as the GPU assembles it alone; declined where none holds) on a
-    compile-only GPU of the call's generation, and the two launches' pin only where it holds there too, in
-    that generation's own process."""
+    """A call's route as a run takes it (`_routed`), certified in its generation's own process."""
     name = dict(call)["generation"]
     if name not in _CERTIFYING:
         _CERTIFYING[name] = concurrent.futures.ProcessPoolExecutor(
             max_workers=1, mp_context=multiprocessing.get_context("spawn"))
-    return _CERTIFYING[name].submit(_certified_in_process, call).result()
-
-
-def _certified_in_process(call: tuple[tuple[str, str], ...]):
-    from dew.nn.kernels.templates import report
-
-    case = dict(call)
-    with generation.assumed(case["generation"]), report.certifying(
-            generation.compile_only_gpus(case["generation"])[0]):
-        op, ba, target = _backward_op(case)
-        if op.declined(ba, target) is not None:
-            return True, None, None
-        two = attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2 if case["width"] == "256" else 1,
-                                             family=WGMMA, **FED)
-        config = op.taken(ba)
-        if config is None:
-            # Certification refuses every config the derivation offers: the route takes another mainloop
-            # before the call (`Template.holds`), as where the backward declines it.
-            return True, None, None
-        held = op.legal(ba, two, target) and report.certified(op, ba, two) == ()
-        return False, config, two if held else None
+    return _CERTIFYING[name].submit(_routed, call, True).result()
 
 
 def pin_of(case: dict[str, str], *, certified: bool = False) -> attention_mosaic.BackwardTiles | None:
@@ -306,11 +300,11 @@ one-launch backward, which the register rule's calibration found within its regi
     for case in CASES], ids="-".join)
 def a_routes_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The route's training step of `case` on its GPU on par with the reference path's (check 1), its launch
-    form pinned (`pin_of`): its passes on the Mosaic mainloop where it pins one, and on none but the GPU's
-    mainloops (`KERNELS`)."""
+    form pinned as a run takes it (`pin_of(certified=True)`, the form its cell is declared served in): its
+    passes on the Mosaic mainloop where it pins one, and on none but the GPU's mainloops (`KERNELS`)."""
     named = dict(zip(AXES["attention"], case, strict=True))
     heads, _, _, _, spans, keep = _case(named)
-    config = pin_of(named)
+    config = pin_of(named, certified=True)
 
     def ours(*operands):
         if config is None:
