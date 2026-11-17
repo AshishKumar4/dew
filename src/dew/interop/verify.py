@@ -62,7 +62,7 @@ from dew.interop import (
     sources,
 )
 from dew.interop.decoder_families import ENTRIES
-from dew.interop.isolated import Isolated
+from dew._isolated import Isolated
 from dew.interop.probe import BATCH, LENGTH, probe_ids
 from dew.nn.blocks import padded_row
 from dew.nn.kernels.options import owned_program
@@ -828,7 +828,7 @@ def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.M
 @dataclass(frozen=True)
 class _Source:
     """The probe's reference at float32, in the load's process, and its float64 twin, built and run in a
-    process of its own (`twin`, `dew.interop.isolated`: the twin sets torch's defaults process-wide),
+    process of its own (`twin`, `dew._isolated`: the twin sets torch's defaults process-wide),
     whose runs over each draw tier 2's verdict reads (`_mapped`)."""
 
     reference: PreTrainedModel
@@ -1217,7 +1217,7 @@ def _registered(source: ModelSource, config: PretrainedConfig) -> tuple[type, ob
     """The config class of `config` and the causal LM transformers' auto classes register for it, the
     constructor `ModelSource.causal_lm` builds by (which may return another class, a factory's), which the
     twin's process registers alike (`_twin_built`), so a type a script or a module registered at runtime
-    builds there (`dew.interop.isolated`); None for a source's remote code, which its auto classes do not
+    builds there (`dew._isolated`); None for a source's remote code, which its auto classes do not
     build."""
     from transformers import MODEL_FOR_CAUSAL_LM_MAPPING
 

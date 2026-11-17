@@ -1,33 +1,34 @@
-"""A process of its own for code that sets torch's defaults process-wide: tier 2's float64 twin of a source
-(`dew.interop.verify`), whose build and runs set the default dtype and widen the float32 casts and pins a
-source's code carries (`_dew_torch.precision.float64`), which no other thread of a load's process may see.
+"""A process of its own, a fresh interpreter running this module, which calls the module-level functions it
+is sent and replies with their values, both pickled over pipes of their own: nothing the functions or the
+libraries they load print (a C library's debug log on the process's stdout, a warning) reaches a reply. Dew
+runs here what must not share its caller's process: tier 2's float64 twin of a source (`dew.interop.verify`),
+whose build sets torch's defaults process-wide, and a host's measurement of NCCL's communicators
+(`dew.communicators`), whose GPUs' memory the caller has not yet opened.
 
-The process is a fresh interpreter running this module, which calls the module-level functions it is sent
-and replies with their values, both pickled over pipes of their own, so nothing the functions print reaches
-the replies. It imports what the load's process imports (that process's `sys.path`), so a class a module
-defines, sent by reference, is found there. It imports the load's script itself only where it is asked to
-(`main`): a class the script defines is found there as `multiprocessing`'s spawn finds it, the script run
-as `__mp_main__`, its `if __name__ == "__main__":` block skipped, which any other load leaves unrun; and a
-load inside a daemon process (a pool's worker) starts it, which a `multiprocessing` child of a daemon may
-not.
+The process imports what the caller imports (that process's `sys.path`), so a class a module defines, sent
+by reference, is found there. It imports the caller's script itself only where it is asked to (`main`): a
+class the script defines is found there as `multiprocessing`'s spawn finds it, the script run as
+`__mp_main__`, its `if __name__ == "__main__":` block skipped, which any other load leaves unrun; and a call
+inside a daemon process (a pool's worker) starts it, which a `multiprocessing` child of a daemon may not.
 """
 
 import os
 import pickle
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from multiprocessing.connection import Connection
 
 
 class Isolated:
     """A process of its own (this module's): `call` runs a module-level function there. It ends with the
-    context."""
+    context. Its environment is the caller's with `environment`'s settings over it."""
 
-    def __init__(self):
+    def __init__(self, environment: Mapping[str, str] | None = None):
         asked, asks = os.pipe()
         replies, replied = os.pipe()
-        environment = {**os.environ, 'PYTHONPATH': os.pathsep.join(path for path in sys.path if path)}
+        environment = {**os.environ, **(environment or {}),
+                       'PYTHONPATH': os.pathsep.join(path for path in sys.path if path)}
         self._process = subprocess.Popen([sys.executable, '-m', __name__, str(asked), str(replied)],
                                          pass_fds=(asked, replied), env=environment)
         os.close(asked)
