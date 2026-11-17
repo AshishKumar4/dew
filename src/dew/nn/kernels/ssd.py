@@ -369,7 +369,7 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, 
         if dtable is not None:
             for slot in range(held):
                 dtable[slot] = dtable[slot] + jnp.where(load == count_given + slot + 1, dmemory, 0.0)
-        if dentry is not None:
+        if entry is not None and dentry is not None:
             key, value, weight = (ref[document] for ref in entry)
             taken = (load >= 0).astype(jnp.float32)
             dkey, dvalue, dweight = dentry

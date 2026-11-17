@@ -166,15 +166,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     def parts(chunk: Mapping, window=None):
         affine = affine_of(chunk)
-        if window is None:
-            return affine, _token_parts(declaration, names, affine, chunk)
-        if declaration.reads == "before":
-            raise Refused("a window's memory enters mid-chunk, which a token reading the state entering it "
-                          "reads before the window's first token: no windowed form")
-        # A window holds no reset (its segment ends before the next document's first token): its origin
-        # takes its own exponent, the memory entering it decayed as a row's entering state is.
-        unreset = dataclasses.replace(declaration, reset=None)
-        return affine, _windowed(_token_parts(unreset, names, affine, chunk), window)
+        return affine, _segment_parts(declaration, names, affine, chunk, window)
 
     # A walk's decay and state carried in its chunks' accumulation (`parts`' float32 at least; a float64
     # state's, float64), the state rounded to its declared dtype once, at the finish: a 16-bit state carried
@@ -237,21 +229,40 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         unreset = dataclasses.replace(declaration, reset=None)
         return _replayed(unreset, names, affine_of(chunk), chunk, h, walked)
 
-    def backward(chunk, state, d_state, d_outputs, walked=None):
-        # The reset's booleans held, no operand of the derivative.
-        operands = {name: chunk[name] for name in names}
-        if walked is None:
-            _, pullback = jax.vjp(lambda h, operands: replay({**chunk, **operands}, h), state[1], operands)
-            return pullback((d_outputs, d_state))
-        before, after, carried, d_carried = walked
-        _, pullback = jax.vjp(lambda h, operands, carried: replay({**chunk, **operands}, h,
-                                                                   (before, after, carried)),
-                              state[1], operands, carried)
-        return pullback((d_outputs, d_state, d_carried))
-
     return Derived(init, _stepped, merge, finish, mapped,
-                   {"rounding": "compensated prefix", "walked": declaration.walked}, backward, prepare,
-                   replay=replay)
+                   {"rounding": "compensated prefix", "walked": declaration.walked},
+                   functools.partial(_replay_backward, replay, names), prepare, replay=replay)
+
+
+def _segment_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, window=None):
+    """A chunk's token parts (`_token_parts`), or where `window` is given (`(origin, through)`) a document's
+    segment of it (`_windowed`), refused for a token that reads the state entering it, which a window's
+    memory enters mid-chunk, after the window's first token reads it."""
+    if window is None:
+        return _token_parts(declaration, names, affine, chunk)
+    if declaration.reads == "before":
+        raise Refused("a window's memory enters mid-chunk, which a token reading the state entering it "
+                      "reads before the window's first token: no windowed form")
+    # A window holds no reset (its segment ends before the next document's first token): its origin
+    # takes its own exponent, the memory entering it decayed as a row's entering state is.
+    unreset = dataclasses.replace(declaration, reset=None)
+    return _windowed(_token_parts(unreset, names, affine, chunk), window)
+
+
+def _replay_backward(replay: Callable, names: Sequence[str], chunk, state, d_state, d_outputs, walked=None):
+    """A chunk's adjoint (`derive_scan`'s `backward`) through its token walk (`replay`): the cotangent of the
+    state entering it and of each operand but the reset's, and with a walk's hooks (`walked`, theirs and the
+    cotangent of what the walk carries after the chunk) the cotangent of what it carries before."""
+    # The reset's booleans held, no operand of the derivative.
+    operands = {name: chunk[name] for name in names}
+    if walked is None:
+        _, pullback = jax.vjp(lambda h, operands: replay({**chunk, **operands}, h), state[1], operands)
+        return pullback((d_outputs, d_state))
+    before, after, carried, d_carried = walked
+    _, pullback = jax.vjp(lambda h, operands, carried: replay({**chunk, **operands}, h,
+                                                               (before, after, carried)),
+                          state[1], operands, carried)
+    return pullback((d_outputs, d_state, d_carried))
 
 
 def _stepped(state, prepared: Prepared, issue=None):

@@ -109,8 +109,8 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     loads, stores, _ = (jnp.pad(t, ((0, 0), (0, pad)), constant_values=fill).reshape(batch, -1, chunk_size)
                         for t, fill in zip(forked.tokens(length), (-1, 0, 0), strict=True))
     walk = functools.partial(_forked_scan, scanned, documents=forked.loads.shape[1], held=forked.held)
-    out, last = jax.vmap(walk)(*(jnp.moveaxis(t, 0, 1) for t in steps[:4]), loads, stores,
-                               jnp.asarray(state, work))
+    x_c, dt_c, B_c, C_c = (jnp.moveaxis(t, 0, 1) for t in steps[:4])
+    out, last = jax.vmap(walk)(x_c, dt_c, B_c, C_c, loads, stores, jnp.asarray(state, work))
     out = out.reshape(batch, length + pad, channels)[:, :length] + x * D
     return out.astype(dtype), last.astype(dtype)
 

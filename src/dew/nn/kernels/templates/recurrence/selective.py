@@ -570,8 +570,6 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
     states, positions = b.shape[1], block_positions(length, scan.positions)
     blocks = length // positions
     interpret = scan.interpret
-    if scan.forked and positions % scan.chunk:
-        raise ValueError(f"a backward block of {positions} tokens holds no whole chunks of {scan.chunk}")
     layout = block_scan.blocked(positions)
     owned = scan.owned
     partials = math.gcd(PARTIALS, channels) if owned else min(PARTIALS, channels)
@@ -684,6 +682,8 @@ def _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfin
     states' gradient `[R * count, N, D]` after them, its stored slots' sums a scratch of the launch's."""
     rows, channels, _ = x.shape
     states, positions = b.shape[1], block_positions(x.shape[2], scan.positions)
+    if scan.forked and positions % scan.chunk:
+        raise ValueError(f"a backward block of {positions} tokens holds no whole chunks of {scan.chunk}")
     interpret = scan.interpret
     sized = jax.ShapeDtypeStruct
     out_type = (sized(x.shape, jnp.float32), sized(x.shape, jnp.float32),

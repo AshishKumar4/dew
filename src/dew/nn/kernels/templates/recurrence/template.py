@@ -264,7 +264,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
            "ranged": ranged(dtype, delta, bound)}
     table = None
     if forked is not None:
-        table, starts, firsts, max_segments = forked_table(state, forked, *query.shape[:2], tiles.chunk)
+        batch, length = query.shape[:2]
+        table, starts, firsts, max_segments = forked_table(state, forked, batch, length, tiles.chunk)
         state = None
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
     fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=wide)
@@ -415,9 +416,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
         if forked is not None:
             # A forked call's walks over its documents laid as a packed call's at the config's chunk, and
             # its table.
+            batch, length = arguments["query"].shape[:2]
             table, starts, _, _ = jax.eval_shape(
-                functools.partial(forked_table, batch=given[0].shape[0], length=given[0].shape[1],
-                                  chunk=config.chunk), given[5], forked)
+                functools.partial(forked_table, batch=batch, length=length, chunk=config.chunk), given[5],
+                forked)
             shapes, max_segments = (*shapes[:5], None, starts), forked.loads.shape[1]
         return _planned(shapes, config, family, target, max_segments, delta, bool(fast) and backward,
                         arguments.get("rounded", False), arguments.get("wide", False),
