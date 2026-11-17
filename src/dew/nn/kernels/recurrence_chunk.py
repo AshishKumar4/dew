@@ -254,9 +254,12 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                       max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
             else:
                 size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
-                out, final = _portable(hooks, Tiles(size), query, key, wide, g, beta, state, starts, firsts,
-                                       scale=scale, dtype=work, forked=carried,
-                                       own=given['own'] if hooks.own_weight else None, turn=turn)
+                launch = functools.partial(_portable_launch, hooks, Tiles(size), starts=starts, firsts=firsts,
+                                           scale=scale, dtype=work, forked=carried,
+                                           own=given['own'] if hooks.own_weight else None)
+                out, final = _turned_or_plain(launch, query, key, wide, g, beta, state, None, turn,
+                                              starts=starts, forked=carried, scale=scale,
+                                              group=hooks.ranks if hooks.reads == 'apart' else 1)
             out = out.astype(work)
             return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
 
@@ -1026,19 +1029,19 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
 
 
 def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta, state, starts, firsts, *,
-              scale: float, dtype, forked, own, turn=None):
-    """The portable math's chunked op (`xla_mainloop`) under `hooks`' readout: a readout apart from its
-    group's writes (`Hooks.reads` 'apart', the group a token's `Hooks.ranks`) the scan's own
+              scale: float, dtype, forked, own):
+    """The portable math's unturned chunked op (`xla_mainloop`) under `hooks`' readout: a readout apart from
+    its group's writes (`Hooks.reads` 'apart', the group a token's `Hooks.ranks`) the scan's own
     (`scan.Scan.group`: each rank reads the state after its token's decay less every rank's write of its
     token, no write read and taken back off), its walk's chunk the largest multiple of the group within the
-    call's, so no chunk cuts a group (a rank-three call's 64 tokens, 63); its state's key pairs turned by
-    `turn` where given (`Hooks.turns`)."""
+    call's, so no chunk cuts a group (a rank-three call's 64 tokens, 63). A turned call's turns are
+    `_turned_or_plain`'s."""
     group = hooks.ranks if hooks.reads == 'apart' else 1
     if tiles.chunk % group:
         tiles = dataclasses.replace(tiles, chunk=max(group, tiles.chunk // group * group))
     return xla_mainloop(tiles, query, key, value, g, beta, state, starts, firsts, scale=scale,
                         delta=hooks.delta, dtype=dtype, bound=hooks.inverse_bound, forked=forked,
-                        reads=hooks.reads, own=own, group=group, turn=turn)
+                        reads=hooks.reads, own=own, group=group)
 
 
 def _read_once(value, work) -> tuple[jax.Array, jax.Array]:
@@ -1267,14 +1270,34 @@ def _launched_template(query, key, value, g, beta, state, skip, entry, *, starts
 
 def _on_template(query, key, value, g, beta, state, skip, turn, *, starts, firsts, forked, scale: float,
                  apart: int, **options):
-    """The chunked op's `(output, final memory)` on the template (`template_rule`), a turned call's (`turn`
-    given) with its keys and queries turned into its documents' frames, a value head's each (its turns'), a
-    forked one's documents' entry keys too, and its turns' gradient in the crossing form
-    (`templates.recurrence.turned`)."""
-    from .templates.recurrence import turned
-
+    """The chunked op's `(output, final memory)` on the template (`template_rule`, a turned call's through
+    `_turned_or_plain`)."""
     launch = functools.partial(_launched_template, starts=starts, firsts=firsts, forked=forked, scale=scale,
                                apart=apart, **options)
+    return _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, starts=starts,
+                            forked=forked, scale=scale, group=max(apart, 1))
+
+
+def _portable_launch(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta, state, skip, entry, *,
+                     starts, firsts, scale: float, dtype, forked, own):
+    """`_portable`'s `(output, final memory)` with its operands first (`turned.call`'s launch), a forked
+    call's entry write `entry` its documents' (`Forked.entry`), the skip the caller's."""
+    del skip
+    if forked is not None:
+        forked = dataclasses.replace(forked, entry=entry)
+    return _portable(hooks, tiles, query, key, value, g, beta, state, starts, firsts, scale=scale,
+                     dtype=dtype, forked=forked, own=own)
+
+
+def _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, *, starts, forked, scale: float,
+                     group: int):
+    """`launch(query, key, value, g, beta, state, skip, entry)`'s `(output, final memory)`, a kernel's
+    unturned chunked op, a forked call's entry write its documents' (`Forked.entry`); a turned call's (`turn`
+    given, `Hooks.turns`) every kernel's alike, its keys and queries turned into its documents' frames, a
+    value head's each (its turns'), a forked one's documents' entry keys too, and its turns' gradient in the
+    crossing form (`templates.recurrence.turned`): the kernel's own speed and its turns' gradient exact."""
+    from .templates.recurrence import turned
+
     entry = None if forked is None else forked.entry
     if turn is None:
         return launch(query, key, value, g, beta, state, skip, entry)
@@ -1283,9 +1306,9 @@ def _on_template(query, key, value, g, beta, state, skip, turn, *, starts, first
     if entry is not None:
         entry = (jnp.repeat(entry[0], heads // entry[0].shape[3], axis=3), *entry[1:])
     documents = None if forked is None else (forked.firsts, forked.loads, forked.stores)
+    held = 0 if forked is None else forked.held
     return turned.call(launch, query, key, value, g, beta, state, skip, turn, starts, scale=scale,
-                       group=max(apart, 1), documents=documents, held=0 if forked is None else forked.held,
-                       entry=entry)
+                       group=group, documents=documents, held=held, entry=entry)
 
 
 def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, forked: Forked | None,
