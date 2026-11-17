@@ -1129,15 +1129,10 @@ def _compiled(
     )
     sources = [source for _, source in _leaves(original)]
     # The plan of this read, whole: its manifest, its facts, its members' digests, its caches and its rules.
-    manifest = _manifest(
-        {"sources": [source.fingerprint() for source in sources]},
-        sources,
-        (
-            *(_identity(stage) for stage in written(tuple(_steps(original)))
-              if not isinstance(stage, (Workers, Prefetch))),
-            *(StepIdentity.of(step) for step in host),
-        ),
-    )
+    described = [stage for stage in written(tuple(_steps(original)))
+                 if not isinstance(stage, (Workers, Prefetch))]
+    manifest = _manifest({"sources": [source.fingerprint() for source in sources]}, sources,
+                         (*map(_identity, described), *map(StepIdentity.of, host)))
     members = _member_manifests(train, build, host)
     plan = Plan(
         "global" if global_order else "per-share",
@@ -1152,7 +1147,8 @@ def _compiled(
         rules=build.rules(train),
         volatile=any(_volatile(stage) for stage in (*_steps(original), *(
             stage for source in sources for stage in _written(source, ())))),
-        earlier=earlier_readers((*_steps(original), *host)),
+        # The steps it describes read a saved plan's earlier descriptions of them (`ReadsEarlier`).
+        earlier=earlier_readers((*described, *host)),
     )
     tuned = build.tuned(train, batches=batches)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
