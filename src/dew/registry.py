@@ -250,14 +250,19 @@ def trust_sources(names: Sequence[str]) -> None:
 
 
 def import_trusted(record: JSON | Mapping[str, object], trust: Sequence[str]) -> None:
-    """Trust the packages in `trust` for the rest of the process, and import
-    every module of theirs that `record` names by an import path, so reading
-    the record finds them imported (`imported`) and may construct their
-    classes where a field declares no base class (`_owned`). A source named
-    there, a Hub repository or a directory, has its own code run where a
-    load reads it (`trusts_source`)."""
+    """Trust the packages in `trust` for the rest of the process, import each
+    of them, so the classes their modules name by a decorator join their kinds
+    (`Aliases.register`, a run.json's `{"name": "my_model"}`), and import every
+    module of theirs that `record` names by an import path, so reading the
+    record finds them imported (`imported`) and may construct their classes
+    where a field declares no base class (`_owned`). A source named there, a
+    Hub repository or a directory, has its own code run where a load reads it
+    (`trusts_source`)."""
     _TRUSTED.update(trust)
     trust_sources(trust)
+    for package in trust:
+        if package.replace(".", "").isidentifier():
+            importlib.import_module(package)
     # Only JSON a record holds (`json_value` refuses any other), its every string read once.
     for named in strings_of(json_value(record, "record")):
         module, colon, name = named.partition(":")

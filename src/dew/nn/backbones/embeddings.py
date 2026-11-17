@@ -1,21 +1,90 @@
 """How a `CausalTransformer`'s token becomes its stream's first state: the table's lookup with its zeroed
 ids, the stream-width projection, the first layer's scaling and its factor, each layer's own input signal
 (Gemma's per-layer inputs), and a caller's prepared embeddings in their place. The decoder builds the
-tables and their projections (`_embeddings`); its methods of these names read them here, within its
-scope."""
+tables and their projections in its setup (`build`); its methods of these names read them here, within
+its scope."""
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
 
-from ..precision import scaled
+from dew.nn.dense import Dense
+from dew.nn.dropout import Dropout
+
+from ..blocks import TokenEmbedding, normal_kernel
+from ..kv_cache import DecodeCursor
+from ..norms import NormSite, RMSNorm
+from ..precision import float32_dot_general, scaled
+from ..sharding import LogicalAxes, declared
+from .decoder_block import decoder_norm
 
 if TYPE_CHECKING:
     from .causal_transformer import CausalTransformer
+
+
+EMBEDDING_AXES: dict[str, LogicalAxes] = {
+    "embed_tokens": ("vocab", "embed"),
+    "embed_positions": (None, "embed"),
+    "embed_tokens_per_layer": ("vocab", None),
+    "per_layer_model_projection": ("embed", "mlp"),
+}
+"""The logical axes of the embeddings' own parameters, by name, as `build` declares them where it makes
+them."""
+
+
+def build(decoder: CausalTransformer, projections) -> None:
+    """The decoder's embeddings, which its setup builds: the token and position tables, their dropout and
+    norm, their projections in and out, and Gemma's per-layer input table with its projection and norm."""
+    decoder.embed_tokens = TokenEmbedding(
+        num_embeddings=decoder.vocab_size, features=decoder.embedding_features or decoder.emb_features,
+        dtype=decoder.dtype, name='embed_tokens', padding_idx=decoder.padding_idx,
+        embedding_init=declared(TokenEmbedding.embedding_init if decoder.initializer_range is None
+                                else nn.initializers.normal(decoder.initializer_range),
+                                EMBEDDING_AXES['embed_tokens']))
+    if decoder.embedding_features is not None:
+        projection = functools.partial(Dense, use_bias=False, dtype=decoder.dtype,
+                                       precision=decoder.precision,
+                                       **normal_kernel(decoder.initializer_range))
+        decoder.project_in = projection(projections['project_in'][1], name='project_in')
+        decoder.project_out = projection(projections['project_out'][1], name='project_out')
+    if decoder.embedding_dropout_rate:
+        decoder.embedding_dropout = Dropout(decoder.embedding_dropout_rate, name="embedding_dropout")
+    if decoder.embedding_norm:
+        decoder.embedding_layernorm = decoder_norm(
+            decoder.norm_type, epsilon=decoder.norm_eps, bias=decoder.norm_bias,
+            scale_offset=decoder.scale_offset, scale_after_cast=decoder.scale_after_cast,
+            dtype=decoder.dtype, precision=decoder.precision, specs=decoder.norms)(name=NormSite.EMBEDDING)
+    if decoder.position_embedding == 'learned':
+        decoder.embed_positions = TokenEmbedding(
+            num_embeddings=decoder.position_rows,
+            features=decoder.emb_features, dtype=decoder.dtype, name='embed_positions',
+            embedding_init=declared(TokenEmbedding.embedding_init if decoder.initializer_range is None
+                                    else nn.initializers.normal(decoder.initializer_range),
+                                    EMBEDDING_AXES['embed_positions']))
+        decoder.decode_cursor = DecodeCursor()
+    if ple := decoder.per_layer_input_dim:
+        # The packed table every layer reads its own slice of
+        # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
+        # hidden_size_per_layer_input slice per layer.
+        decoder.embed_tokens_per_layer = TokenEmbedding(
+            num_embeddings=decoder.per_layer_vocab, features=decoder.num_layers * ple,
+            dtype=decoder.dtype, name='embed_tokens_per_layer', padding_idx=decoder.padding_idx,
+            embedding_init=declared(TokenEmbedding.embedding_init,
+                                    EMBEDDING_AXES['embed_tokens_per_layer']))
+        decoder.per_layer_model_projection = Dense(
+            projections['per_layer_model_projection'][1], use_bias=False,
+            dtype=decoder.dtype, precision=decoder.precision, name='per_layer_model_projection',
+            dot_general=float32_dot_general, kernel_axes=EMBEDDING_AXES['per_layer_model_projection'])
+        decoder.per_layer_projection_norm = RMSNorm(
+            epsilon=decoder.norm_eps, scale_offset=decoder.scale_offset,
+            scale_after_cast=decoder.scale_after_cast, dtype=decoder.dtype,
+            name='per_layer_projection_norm')
 
 
 def token_embeddings(decoder: CausalTransformer, tokens) -> jax.Array:
