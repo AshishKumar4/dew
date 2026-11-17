@@ -376,7 +376,8 @@ def _scale_by_shape(consistent_rms: float | None, per_head: Mapping[str, int] | 
     `per_head` names its width (`head_widths`): Jordan's width transfer, or Moonlight's consistent RMS where
     `consistent_rms` is given."""
     def by_shape(update, numbers):
-        return shape_scale(update, numbers, consistent_rms) * update
+        return (_muon._scale_update_for_width_transfer(update, numbers) if consistent_rms is None
+                else _muon._scale_update_for_consistent_rms(update, numbers, consistent_rms))
 
     def scaled(update, numbers, width):
         if width is None:
@@ -1731,239 +1732,6 @@ def _claims(modules: Sequence[str], leaves: Sequence[str]) -> tuple[str, ...]:
     return (*(f"{glob.escape(module)}/*" for module in modules), *map(glob.escape, leaves))
 
 
-ROUNDING_ROOM = 2.0
-"""The room a bound leaves for the rounding of the moments and iterations it is read through."""
-
-
-class UpdatesRead(NamedTuple):
-    """The state of an optimizer `OptimConfig.build` made whose update's bound cannot cover a bounded
-    gradient (`bounded_updates`): its solver's state, `inner`, which a step reads its formed update finite
-    beside (`reads_updates`)."""
-
-    inner: optax.OptState
-
-
-class DewBuilt(optax.GradientTransformationExtraArgs):
-    """A transformation `OptimConfig.build` made, which decides as its state is made whether a step reads its
-    update (`bounded_updates`); a run reads every update of a transformation of any other making."""
-
-    __slots__ = ()
-
-
-def reads_updates(opt_state: optax.OptState) -> bool:
-    """Whether a step reads its formed update finite: its optimizer's bound could not cover a bounded
-    gradient, as its state says (`UpdatesRead`), however it is composed."""
-    def marked(node) -> bool:
-        return isinstance(node, UpdatesRead)
-    return any(marked(node) for node in jax.tree.leaves(opt_state, is_leaf=marked))
-
-
-LeafBounds = Callable[[optax.Params], list[float | None]]
-"""A unit-rate update's bound by leaf of the parameters it is handed (`update_bounds`)."""
-
-
-def parameter_bound(dtype) -> float:
-    """The magnitude a parameter of `dtype`, and its layer's norm, is assumed within: half its dtype's largest
-    value, the other half the room its update takes (`bounded_updates`)."""
-    return float(jnp.finfo(dtype).max) / 2
-
-
-def bounded_updates(solver: optax.GradientTransformation, bounds: LeafBounds, peak: float) -> DewBuilt:
-    """`solver`, its state marked read (`UpdatesRead`) unless every floating parameter's update bound
-    (`bounds`, a unit-rate update's largest magnitude from a gradient within `MAGNITUDE_BOUND` and a
-    parameter whose norm is within `parameter_bound`, by leaf, None where none is stated) times the largest
-    rate it steps at (`peak`) stays within that parameter bound: the update finite, and the parameter it
-    moves finite after it (a parameter past half its dtype's largest value is the one case the bound leaves
-    open, which a save's refusal backs). Decided as the state is made, from the parameters' dtypes and
-    shapes alone; an unmarked state is the solver's own, so a run that reads nothing holds no state and runs
-    no program it did not."""
-    solver = optax.with_extra_args_support(solver)
-
-    def init(params):
-        state = solver.init(params)
-        leaves = jax.tree.leaves(params)
-        covered = all(bound is not None and peak * bound <= parameter_bound(leaf.dtype)
-                      for leaf, bound in zip(leaves, bounds(params), strict=True)
-                      if jnp.issubdtype(leaf.dtype, jnp.inexact))
-        return state if covered else UpdatesRead(state)
-
-    def update(updates, state, params=None, **extra_args):
-        if isinstance(state, UpdatesRead):
-            moved, inner = solver.update(updates, state.inner, params, **extra_args)
-            return moved, UpdatesRead(inner)
-        return solver.update(updates, state, params, **extra_args)
-    return DewBuilt(init, update)
-
-
-def spectral_bound(coefficients: np.ndarray) -> float:
-    """The largest singular value Newton-Schulz's quintic iteration leaves of a matrix whose own are at most
-    one (a Frobenius-normalized one), by `coefficients`, a row `(a, b, c)` an iteration: each takes a singular
-    value s to `|a s + b s^3 + c s^5|`, so the bound after it is that polynomial's largest magnitude over the
-    singular values the bound before it holds, at its ends or where its derivative vanishes."""
-    bound = 1.0
-    for a, b, c in coefficients:
-        # The derivative's zeros: 5c t^2 + 3b t + a over t = s^2.
-        turns = [math.sqrt(t.real) for t in np.roots([5 * c, 3 * b, a])
-                 if abs(t.imag) == 0 and 0 <= t.real <= bound * bound]
-        bound = max(abs(a * s + b * s ** 3 + c * s ** 5) for s in [bound, *turns])
-    return bound
-
-
-def shape_scale(update: jax.Array, numbers: optax.contrib.MuonDimensionNumbers,
-                consistent_rms: float | None, root: Callable = jnp.sqrt):
-    """The factor Muon's shape scaling (`_scale_by_shape`) multiplies a matrix's update by, from its fans
-    (optax's `scale_by_shape`): Jordan's width transfer, `sqrt(max(1, fan_out / fan_in))`, or Moonlight's
-    consistent RMS, `consistent_rms * sqrt(max(fan_in, fan_out))`. Read from the update's shape alone, its
-    square root `root`'s: an array's in the step, as optax's, a number's where the bound reads it
-    (`math.sqrt`)."""
-    fan_in, fan_out = _muon._get_shape_products(update, numbers)
-    if consistent_rms is None:
-        return root(max(1, fan_out / fan_in))
-    return root(max(fan_in, fan_out)) * consistent_rms
-
-
-def unbounded(params: optax.Params) -> list[float | None]:
-    """No bound for any leaf of `params`: every update read (`bounded_updates`)."""
-    return [None] * len(jax.tree.leaves(params))
-
-
-def solve_bounds(params: optax.Params) -> list[float | None]:
-    """A Gauss-Newton solve's leaves, whose update a step reads finite as it is formed whatever its bound
-    (`dew.gauss_newton.solves_equations`): none is past a bound of zero beyond that read, so its state is
-    never marked read (`UpdatesRead`) and stays the solver's own, as runs saved before the mark hold it."""
-    return [0.0] * len(jax.tree.leaves(params))
-
-
-def update_bounds(optimizer: Optimizer | str, opts: Mapping[str, object], *, quantized: bool = False,
-                  decays: Sequence[float] = ()) -> LeafBounds | None:
-    """Each parameter's bound on the unit-rate update `optimizer` forms from a gradient within
-    `MAGNITUDE_BOUND` and a parameter within `parameter_bound`, by leaf of the parameters it is handed, from
-    its constants `opts` over its factory's defaults (`bounded_updates`); None for a factory Dew does not
-    build, whose bound it cannot read. A Gauss-Newton solve's are `solve_bounds`'s, its update read as it is
-    formed whatever its bound. A param group's own decay (`decays`) is bounded as the largest any group steps
-    with. Moments stored in 8 bits (`quantized`, `dew._moments.int8_moments`) may hold
-    a second moment of zero beside a first that is not, which only the guard bounds.
-
-    A direction's bound is `_direction_bound`'s; a decoupled decay adds its rate times the parameter's bound
-    (AdamW's, Muon's); a coupled one (Adam's, torch's) adds the parameter to the gradient its moments
-    square, which no gradient bound covers, so its leaves have none; LAMB's trust ratio scales its
-    direction to its layer's norm, within the parameter's bound; a Muon matrix's update has no entry past its
-    spectral norm, Newton-Schulz's (`spectral_bound`) of a Frobenius-normalized matrix, times its shape
-    scaling (`shape_scale`) and `ROUNDING_ROOM`, its other leaves' Adam's."""
-    make = optimizers[optimizer]
-    if make not in OPTIMIZER_MAP.values():
-        return None
-    # MuonClip's factory takes Muon's options through to it.
-    make = _muon_groups if make is _muonclip_groups else make
-    given = {name: parameter.default for name, parameter in inspect.signature(make).parameters.items()
-             if parameter.default is not inspect.Parameter.empty}
-    values = {**given, **opts}
-    if decays and isinstance(values.get('weight_decay'), int | float):
-        values['weight_decay'] = max(float(values['weight_decay']), *decays)
-    if make is gauss_newton:
-        return solve_bounds
-    if make is _muon_groups:
-        return _muon_bounds(values, quantized)
-    decay = values.get('weight_decay', 0.0)
-    if not isinstance(decay, int | float) or (make is _adam and decay):
-        return unbounded
-
-    def bound(leaf) -> float | None:
-        direction = _direction_bound(values, leaf.dtype, quantized=quantized, momentum=make is not laprop)
-        if direction is None:
-            return None
-        decayed = direction + float(decay) * parameter_bound(leaf.dtype)
-        # LAMB's trust ratio takes its direction to the layer's norm, or keeps it where either norm is zero.
-        return max(decayed, parameter_bound(leaf.dtype)) if make is _lamb else decayed
-
-    return lambda params: [bound(leaf) for leaf in jax.tree.leaves(params)]
-
-
-def _direction_bound(values: Mapping[str, object], dtype, *, quantized: bool, momentum: bool = True,
-                     prefix: str = '') -> float | None:
-    """The largest magnitude of a unit-rate Adam or LaProp direction (`momentum`: Adam's `m^/(sqrt(v^) +
-    eps)`; else LaProp's, its momentum an average of `g/(sqrt(v^) + eps)`) from a gradient within
-    `MAGNITUDE_BOUND`, of a parameter of `dtype`, by the constants `values` holds under `prefix` (Muon's
-    AdamW leaves' `adam_b1`): None where its guard is no normal number of the arithmetic's dtype (zero, or
-    one that rounds or flushes to zero, 0/0 on a parameter whose moments are), a decay is not under one (its
-    bias correction divides by zero), or a moment is stored in float16.
-
-    Adam's is at most `1/sqrt((1 - b2)(1 - b1^2/b2))` where b1 squared is under b2 (Cauchy-Schwarz over the
-    moments' weights), Nesterov's adding `1/sqrt(1 - b2)`, LaProp's `1/sqrt(1 - b2)`; `ROUNDING_ROOM` times
-    that, times the root of the dtype's smallest normal over the guard where that is larger, the squares the
-    arithmetic flushes to zero taken from the second moment; elsewhere (b2 at most b1 squared, 8-bit moments)
-    the gradient bound over the guard, eps or eps_root's root."""
-    from dew.nn.finite import MAGNITUDE_BOUND
-
-    b1, b2 = values[f'{prefix}b1'], values[f'{prefix}b2']
-    eps, eps_root = values['eps'], values.get(f'{prefix}eps_root', 0.0)
-    if not (isinstance(b1, int | float) and isinstance(b2, int | float) and isinstance(eps, int | float)
-            and isinstance(eps_root, int | float)):
-        return None
-    stored = {str(values.get(name)) for name in ('mu_dtype', 'nu_dtype')}
-    if 'float16' in stored:
-        return None
-    # The arithmetic's smallest normal: float32's where both moments are stored in it (Dew's Adam widens a
-    # narrower gradient before either reads it, `dew._moments.scale_by_adam`), else the parameter's dtype's
-    # too.
-    widened = stored == {'float32'}
-    smallest = max(float(jnp.finfo(jnp.float32).tiny), 0.0 if widened else float(jnp.finfo(dtype).tiny))
-    # Each guard as the arithmetic holds it: one below its smallest normal rounds or flushes to zero, eps_root
-    # before its root is taken (it is added to the second moment).
-    guard = max(float(eps) if eps >= smallest else 0.0, math.sqrt(eps_root) if eps_root >= smallest else 0.0)
-    if guard <= 0 or not (0 <= b1 < 1 and 0 <= b2 < 1):
-        return None
-    if quantized or (momentum and not b1 * b1 < b2):
-        return MAGNITUDE_BOUND / guard
-    ratio = 1 / math.sqrt(1 - b2) if not momentum else (
-        1 / math.sqrt((1 - b2) * (1 - b1 * b1 / b2)) + 1 / math.sqrt(1 - b2))
-    return ROUNDING_ROOM * ratio * max(1.0, math.sqrt(smallest) / guard)
-
-
-def _muon_bounds(values: Mapping[str, object], quantized: bool) -> LeafBounds:
-    """Muon's update bounds by leaf (`update_bounds`), from its factory's `values`: a matrix's its iteration's
-    spectral bound times its shape scaling, where the options leave its update the normalized iteration's
-    (Frobenius preconditioning over a guard that is a normal number, a momentum under one, no dual scaling,
-    neuron norm or heads of its own), the rest the AdamW leaves' (`_direction_bound`), which step at Muon's
-    rate; each with its decoupled decay."""
-    ns_steps, eps, beta = values['ns_steps'], values['eps'], values['beta']
-    decay = values['weight_decay']
-    adam_decay = decay if values['adam_weight_decay'] is None else values['adam_weight_decay']
-    if not (isinstance(ns_steps, int) and isinstance(eps, int | float) and isinstance(beta, int | float)
-            and isinstance(decay, int | float) and isinstance(adam_decay, int | float)):
-        return unbounded
-    covered = (values['preconditioning'] == 'frobenius' and not values['adaptive'] and 0 <= beta < 1
-               and values['neuron_beta2'] is None and values['per_head'] is None
-               and values['adam_learning_rate'] is None)
-    # The coefficients are the build's constants, made where a trace may be open (an injected factory's).
-    with jax.ensure_compile_time_eval():
-        rows = np.asarray(_coefficients(values['ns_coeffs'], ns_steps), np.float64).reshape(-1, 3)
-    spectral = spectral_bound(np.repeat(rows, ns_steps, axis=0) if len(rows) == 1 else rows)
-    rms = values['consistent_rms']
-    rms = float(rms) if isinstance(rms, int | float) else None
-    adam = {**values, 'b1': values['adam_b1'], 'b2': values['adam_b2'], 'eps_root': values['adam_eps_root']}
-
-    # A momentum stored in float16 cannot hold a bounded gradient's average (`_direction_bound`'s rule).
-    momentum_held = str(values.get('mu_dtype')) != 'float16'
-
-    def matrix(leaf, number) -> float | None:
-        smallest = max(float(jnp.finfo(leaf.dtype).tiny), float(jnp.finfo(jnp.float32).tiny))
-        if not covered or not momentum_held or eps < smallest:
-            return None
-        return (ROUNDING_ROOM * spectral * shape_scale(leaf, number, rms, math.sqrt)
-                + decay * parameter_bound(leaf.dtype))
-
-    def rest(leaf) -> float | None:
-        direction = _direction_bound(adam, leaf.dtype, quantized=quantized)
-        return None if direction is None else direction + adam_decay * parameter_bound(leaf.dtype)
-
-    def bounds(params) -> list[float | None]:
-        numbers = jax.tree.leaves(muon_weight_dimension_numbers(params), is_leaf=muon_leaf)
-        return [rest(leaf) if number is None else matrix(leaf, number)
-                for leaf, number in zip(jax.tree.leaves(params), numbers, strict=True)]
-    return bounds
-
-
 @dataclasses.dataclass(frozen=True)
 class OptimConfig:
     """Holds the optimizer, learning-rate schedule and gradient clipping."""
@@ -2119,8 +1887,6 @@ class OptimConfig:
         elif self.optimizer in ('adam', 'adamw', 'muon', 'muonclip'):
             # Muon's and MuonClip's AdamW group stores its moments as AdamW's do.
             opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
-        # The options its factory takes, which its update's bound reads (`_bounded`).
-        bounded = dict(opts)
         # Gauss-Newton solves its own direction, which it caps at `clip_grads` (the gradient it is handed
         # it never reads): one solve over every parameter, each param group's rate its leaves of it.
         solved = None
@@ -2163,25 +1929,7 @@ class OptimConfig:
             solver = optax.chain(solver, forced_weight_normalization())
         if self.ema_profiles:
             solver = power_profiles(solver, self.ema_profiles)
-        return self._bounded(solver, bounded)
-
-    def _bounded(self, solver: optax.GradientTransformation, opts: Mapping[str, object]
-                 ) -> optax.GradientTransformation:
-        """`solver` as `build` returns it: deciding as its state is made whether a step reads its update
-        (`bounded_updates`), from its factory's options `opts` and the largest rate any group steps at (a
-        schedule's peak, `ScheduleBase.peak`), every update read where a group's b1 is scheduled; a factory
-        Dew does not build is returned as it is, no build of Dew's, whose every update a run reads
-        (`dew.training.transaction.Transaction.reads_all`)."""
-        bounds = update_bounds(self.optimizer, opts, quantized=self.state_dtype == 'int8',
-                               decays=[group.weight_decay for group in self.param_groups
-                                       if group.weight_decay is not None])
-        if bounds is None:
-            return solver
-        if any(group.b1 is not None for group in self.param_groups):
-            bounds = unbounded
-        peak = max(abs(rate.peak() if isinstance(rate, ScheduleBase) else float(rate)) * multiplier
-                   for rate, multiplier in self.grouped_rates().values())
-        return bounded_updates(solver, bounds, peak)
+        return solver
 
     def update_flops(self, params) -> float | None:
         """One update's analytic matrix work over `params` beyond the model's, the FLOPs a run reports as

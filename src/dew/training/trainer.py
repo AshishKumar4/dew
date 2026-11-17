@@ -82,7 +82,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import STACKED_OPTIMIZERS, DewBuilt, declaring, with_bounds
+from dew.optim import STACKED_OPTIMIZERS, declaring, with_bounds
 from dew.optim_schedules import (
     ScheduleBase,
     held_rates,
@@ -266,17 +266,6 @@ def signature_digest(signature: Hashable) -> str:
 
 
 
-def reads_every_update(objective: Objective[Loss, Effects], built: optax.GradientTransformation,
-                       composed: optax.GradientTransformation) -> bool:
-    """Whether a run's steps read every update (`Transaction.reads_all`) of `composed`, the optimizer
-    `objective` made of `built` (`Objective.optimizer`): unless Dew built it (`dew.optim.DewBuilt`, whose
-    state says where its bound fails) and the objective handed it back as it is, or composed it in Dew's own
-    code (a copy a network over `optax.multi_transform`, each leaf's update a copy's or none); a
-    composition of a user's (a scale chained after it) has a bound Dew cannot read."""
-    if not isinstance(built, DewBuilt):
-        return True
-    return composed is not built and not type(objective).optimizer.__module__.startswith("dew.")
-
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
@@ -309,6 +298,7 @@ class Trainer(Generic[Loss, Effects]):
         diloco: DiLoCo | None = None,
         phase_passes: Sequence[int] | None = None,
         data_resume: DataResume = "relaxed",
+        skip_nonfinite: bool = False,
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -322,7 +312,10 @@ class Trainer(Generic[Loss, Effects]):
         (`Objective.optimizer`), made from it. `step` replaces the built-in transaction. A custom step then
         owns the clocks, the scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
         attempted-step counter; it passes a model that reads the run's progress it (`PassesProgress`).
-        `rollout` runs once per batch read, before the step and outside replay. `layout` and `mesh` say where
+        `rollout` runs once per batch read, before the step and outside replay. A step with no loss scale
+        whose loss or gradient norm is not finite is taken as it is formed, and the run stops at its next
+        log naming the step and the value; `skip_nonfinite` skips such a step instead, taking its optimizer
+        one step of zero gradient (training.md, a step that is not finite). `layout` and `mesh` say where
         the state lives: `mesh` a `MeshSpec` or a native `jax.sharding.Mesh` of any axes, which `layout`'s
         rules name (`Layout.data_axes` its rows'). `microbatches` is how many a pipelined step feeds through
         the mesh's stage axis, a multiple of its size; None feeds one a stage. `lower_for`, a CUDA generation,
@@ -346,7 +339,11 @@ class Trainer(Generic[Loss, Effects]):
         layout = objective.placement(layout)  # as its models place their trees (a tier-3 plan, ledger 2777)
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
-        self._config, self._optimizer, self._reads_all = self._taken(objective, optimizer)
+        built = isinstance(optimizer, optax.GradientTransformation)
+        # A config's groups take what the objective draws fresh, as a run's do (`OptimConfig.claiming`).
+        self._config, self._optimizer = ((None, declaring(objective.optimizer(optimizer), self._boxed_axes))
+                                         if built else (optimizer.claiming(*objective.fresh_trained()), None))
+        self.skip_nonfinite = skip_nonfinite
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
@@ -412,7 +409,8 @@ class Trainer(Generic[Loss, Effects]):
         return StepSettings(self.objective if objective is None else objective, self._optimizer, self.layout,
                             self.device_mesh, self.accumulation,
                             self.step, self.dynamic_scale, self.diloco, self.tune_kernels, self.inspection,
-                            self.microbatches, self.record, self.lower_for, self.state_mesh, self._reads_all)
+                            self.microbatches, self.record, self.lower_for, self.state_mesh,
+                            self.skip_nonfinite)
 
     # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
@@ -1033,7 +1031,7 @@ class Trainer(Generic[Loss, Effects]):
                                split=split, record=self.record, resting=resting,
                                examples=self._shape.examples,
                                inspection=self.inspection if sampled else None, placed=placed,
-                               reads_all=self._reads_all).step()
+                               skip=self.skip_nonfinite).step()
         # A custom step need not run the objective's loss, which passes a model the run's progress.
         refuse_unpassed_progress(objective, passes=isinstance(self.step, PassesProgress))
         custom = self.step(objective, self.optimizer)
@@ -1324,19 +1322,6 @@ class Trainer(Generic[Loss, Effects]):
                 steps, tokens, self.accumulation, self._shape.examples),
         )
 
-    def _taken(self, objective: Objective[Loss, Effects],
-               optimizer: optax.GradientTransformation | OptimConfig
-               ) -> tuple[OptimConfig | None, optax.GradientTransformation | None, bool]:
-        """What a trainer holds of the optimizer it is given: a config, its groups taking what the objective
-        draws fresh as a run's do (`OptimConfig.claiming`), built over the run's length (`scheduled`); or a
-        transformation, made the objective's (`Objective.optimizer`). And whether its steps read every
-        update (`reads_every_update`), a config's until it is built."""
-        if isinstance(optimizer, optax.GradientTransformation):
-            composed = objective.optimizer(optimizer)
-            reads = reads_every_update(objective, optimizer, composed)
-            return None, declaring(composed, self._boxed_axes), reads
-        return optimizer.claiming(*objective.fresh_trained()), None, True
-
     def scheduled(self, updates: int | None) -> None:
         """Build the configured optimizer (an `OptimConfig`) for `updates` updates, as `fit` and
         `validate` do for their run's length; its state holds the rate it logs. A trainer given an Optax
@@ -1344,10 +1329,8 @@ class Trainer(Generic[Loss, Effects]):
         if self._config is None:
             return
         built = self._config.build(updates, clocked=self._shape.examples is not None, stated=True)
-        composed = self.objective.optimizer(built)
-        self._reads_all = reads_every_update(self.objective, built, composed)
         self._shape = dataclasses.replace(self._shape, updates=updates)
-        self._optimizer = declaring(composed, self._boxed_axes)
+        self._optimizer = declaring(self.objective.optimizer(built), self._boxed_axes)
 
     def _training_loop(self, plan: FitPlan, run: FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
@@ -1363,7 +1346,9 @@ class Trainer(Generic[Loss, Effects]):
         current, position, placed, abstract, fresh = self._starting(run, plan.dataset, initial, resume)
         run.last_checkpoint = time.perf_counter()
         interval = Interval.resumed(run.stop_control, last_saved=(
-            current if checkpoints is not None and checkpoints.latest is not None else None))
+            current if checkpoints is not None and checkpoints.latest is not None else None),
+            # A scaled run drops an overflowing step as its scale backs off, which no run stops at.
+            skips_nonfinite=self.skip_nonfinite or self.dynamic_scale)
         state, shardings, complete = self._opened(plan, run, interval, current, position, placed, abstract,
                                                   resumed=initial is None and interval.last_saved is not None,
                                                   fresh=fresh)

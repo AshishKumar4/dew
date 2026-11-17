@@ -145,9 +145,8 @@ def keeping_sgd(learning_rate) -> optax.GradientTransformation:
     return _keeping_gradients(optax.sgd(learning_rate))
 
 
-ADAM_2, ADAM_3 = (OptimConfig(optimizer="adam", learning_rate=rate) for rate in (1e-2, 1e-3))
-"""Adam at 1e-2 and 1e-3, as configs, which key the step: Dew's, whose bound covers its updates, so a step
-reads none (`dew.optim.bounded_updates`) and plans as the ladder alone decides."""
+ADAM_2, ADAM_3 = (OptimConfig(optimizer="optax:adam", learning_rate=rate) for rate in (1e-2, 1e-3))
+"""Optax's Adam at 1e-2 and 1e-3, as configs, which key the step."""
 
 SGD = OptimConfig(optimizer="optax:sgd", learning_rate=0.5)
 """Optax's SGD at 0.5, as a config, which keys the step."""

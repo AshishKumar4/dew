@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.derivatives import Surrogate, contracted, declared_derivative, with_gradients_formed
-from dew.nn.finite import bounded, zeroed_unless
+from dew.nn.finite import zeroed_unless
 from dew.nn.programs import holes
 
 type Tree = Mapping[str, object]
@@ -56,9 +56,8 @@ class InBackward:
     `update(path, index, gradient, weights, moments)` is the step's optimizer update of one layer: the
     layer `index` of the run at `path` (the run's module path in the model), its `gradient` and
     `weights` (the masters where the step keeps narrow copies), and its `moments` by collection; it returns
-    the moved weights and moments, and whether the update formed: its moved weights finite where the step
-    reads its update (`dew.optim.reads_updates`), the update and moments then formed from the zero gradient
-    where they are not, the weights kept. `moments` names the collections of the optimizer's moments the step
+    the moved weights and moments, and whether the update formed (every update the step forms does).
+    `moments` names the collections of the optimizer's moments the step
     added. `handled` records each run's path as the model traces it in the plan, so the step reads those
     runs' state off the backward."""
 
@@ -163,10 +162,11 @@ def _merged(shared: tuple, flowed: tuple, *, flows: tuple[bool, ...]) -> tuple:
 
 
 def _norms(gradient) -> tuple[jax.Array, jax.Array]:
-    """A layer's gradient's sum of squares and its count of values that are not finite (`NORMS`)."""
+    """A layer's gradient's sum of squares and whether it is not finite, 1 or 0 (`NORMS`): a value not finite
+    anywhere makes the sum so, read with no pass of its own."""
     leaves = jax.tree.leaves(gradient)
     squares = jnp.sum(jnp.stack([jnp.sum(jnp.square(leaf.astype(jnp.float32))) for leaf in leaves]))
-    return squares, jnp.sum(jnp.stack([jnp.sum(~jnp.isfinite(leaf)) for leaf in leaves])).astype(jnp.float32)
+    return squares, (~jnp.isfinite(squares)).astype(jnp.float32)
 
 
 def _passed_down(cotangent, tripped: jax.Array):
@@ -180,14 +180,13 @@ def _passed_down(cotangent, tripped: jax.Array):
 def _layer_update(update: Callable, finite: jax.Array | None, tripped: jax.Array, gradient, held, moments,
                   bad: jax.Array):
     """One layer's update as the walk takes it: as it is where no step's finiteness gates the walk
-    (`gated`), else gated (`_gated_layer`) on the loss's finiteness, the walk's latch (`tripped`) and the
-    layer's own gradient finite within the magnitude bound (`bounded`, counted as not finite past it), its
-    weights written where its update formed (`InBackward.update`). The layer's weights, moments, non-finite
-    count and the latch after it."""
+    (`gated`: a run that takes its steps as formed), else gated (`_gated_layer`) on the loss's finiteness,
+    the walk's latch (`tripped`) and the layer's own gradient's (`bad`, from its norm), its weights written
+    where its update formed (`InBackward.update`). The layer's weights, moments, non-finite count and the
+    latch after it."""
     if finite is None:
         moved, moved_moments, _ = update(gradient, held, moments)
         return moved, moved_moments, bad, tripped
-    bad = bad + (~bounded(gradient)).astype(bad.dtype)
     moved, moved_moments, bad, written = _gated_layer(update, finite & (bad == 0) & ~tripped, gradient, held,
                                                       moments, bad)
     return moved, moved_moments, bad, tripped | ~written
@@ -195,7 +194,7 @@ def _layer_update(update: Callable, finite: jax.Array | None, tripped: jax.Array
 
 def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments, bad: jax.Array):
     """One layer's update in a step that may not be finite (`gated`): where `ok` (the loss finite, the
-    layer's gradient finite and bounded, `dew.nn.finite.bounded`) by its gradient, else by a
+    layer's gradient finite) by its gradient, else by a
     zero gradient, its weights kept as they were, as they are where its update did not form (one the step
     reads, not finite: `InBackward.update` then forms its moments from the zero gradient), its moments
     stepped as a commit's are. The layer's moved weights, moments and

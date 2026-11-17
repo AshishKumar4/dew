@@ -3,7 +3,6 @@
 Replay and effect commits are Dew transaction policies; Optax and Flax oracle their arithmetic.
 """
 
-import math
 
 import jax
 import jax.numpy as jnp
@@ -19,7 +18,6 @@ from test_trainer import make_trainer
 from dew.batch import under
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
-from dew.nn.finite import MAGNITUDE_BOUND
 from dew.objectives import Aux, EMASpec, Objective, Ratio
 from dew.optim import OptimConfig
 from dew.training import Trainer
@@ -631,14 +629,15 @@ class SkippingThird(Counting):
 
 
 @pytest.mark.parametrize("optimizer", ["sgd", "adam"])
-def test_an_unscaled_non_finite_step_leaves_the_parameters_as_they_were(optimizer):
-    """With no loss scale, a step whose gradient is not finite leaves the parameters, the update count and
-    the EMA as they were, and its optimizer takes one step of zero gradient (training.md, a step that is
-    not finite): under SGD, which holds no state, the run lands bit for bit where the run that never read
-    that batch does; under Adam its parameters stay finite, its moments having decayed a step. Main committed
-    the update, its parameters non-finite from that step on (row 6699)."""
+def test_a_run_that_skips_a_step_not_finite_leaves_the_parameters_as_they_were(optimizer):
+    """A run that skips steps not finite (`skip_nonfinite`), with no loss scale: a step whose gradient is not
+    finite leaves the parameters, the update count and the EMA as they were, and its optimizer takes one
+    step of zero gradient (training.md, a step that is not finite): under SGD, which holds no state, the run
+    lands bit for bit where the run that never read that batch does; under Adam its parameters stay finite,
+    its moments having decayed a step."""
     solver = optax.sgd(0.1) if optimizer == "sgd" else optax.adam(0.1)
-    state = make_trainer(optimizer=solver).fit(dataset(PoisonedThird), steps=5, log_every=100)
+    state = make_trainer(optimizer=solver, skip_nonfinite=True).fit(dataset(PoisonedThird), steps=5,
+                                                                    log_every=100)
     assert int(state.updates) == 4
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(state.variables))
     if optimizer == "sgd":
@@ -648,20 +647,36 @@ def test_an_unscaled_non_finite_step_leaves_the_parameters_as_they_were(optimize
             np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
-def test_a_step_whose_loss_is_finite_and_its_gradient_not_is_reported_not_finite():
+def test_a_run_stops_at_the_first_step_not_finite_and_saves_none_of_it(tmp_path):
+    """By default a step not finite is taken as it is formed, read by its loss and gradient norm alone, and
+    the run stops at its next log, before the next step, its last checkpoint the last finite step's
+    (training.md, a step that is not finite: the owner's ruling of 2026-11-16, as torchtitan stops). A run
+    that skips such steps reads on past it."""
+    trainer = make_trainer(tmp_path)
+    with pytest.raises(RuntimeError):
+        trainer.fit(dataset(PoisonedThird), steps=5, log_every=1, checkpoint_every=1)
+    trainer.checkpoints.wait()
+    assert trainer.checkpoints.latest == 2
+    assert int(make_trainer(skip_nonfinite=True).fit(dataset(PoisonedThird), steps=5, log_every=1).step) == 5
+
+
+@pytest.mark.parametrize("skip", [True, False], ids=["skipped", "taken"])
+def test_a_step_whose_loss_is_finite_and_its_gradient_not_is_reported_not_finite(skip):
     """A step with no loss scale whose loss is finite and its gradient not (a square root's derivative at
-    zero) trains nothing and is reported not finite, so a run's streak of such steps stops it (training.md,
-    a step that is not finite): it was reported finite, by its loss, and the streak reset on it (the theme's
-    head review, F2)."""
-    stepper = Trainer(Tiny(), optax.sgd(0.1), key=jax.random.PRNGKey(9))
+    zero) is reported not finite by its gradient's norm, so the run stops at it, or, skipping such steps, its
+    streak counts it: a skipped one trains nothing. It was reported finite, by its loss, and the streak reset
+    on it (the theme's head review, F2)."""
+    stepper = Trainer(Tiny(), optax.sgd(0.1), key=jax.random.PRNGKey(9), skip_nonfinite=skip)
     state = stepper.initial_state()
     bad = batches()[1]
     step = stepper.compile(state, bad)
     # The step consumes the state.
     before = np.asarray(state.variables["params"]["w"])
     advanced, loss, _, finite, _, committed = step(state, bad)
-    assert bool(jnp.isfinite(loss)) and not bool(finite) and int(committed.count) == 0
-    np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), before)
+    assert bool(jnp.isfinite(loss)) and not bool(finite)
+    if skip:
+        assert int(committed.count) == 0
+        np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), before)
 
 
 class Overflowing(Objective):
@@ -676,13 +691,13 @@ class Overflowing(Objective):
         return w * w, Aux({}, variables={"stats": {"seen": jnp.exp(jnp.mean(batch["x"]))}})
 
 
-def test_a_step_whose_collection_overflows_moves_no_weight_and_writes_no_collection():
-    """With no loss scale, a step whose loss and gradient are finite and whose forward's collection is not
-    (an exponential past float32) is not finite as a whole: its weight, its update count and its collection
-    stay as they were, and it reports not finite. Its collection was kept while its weight and update count
-    moved (the round-2 review's F3)."""
+def test_a_skipped_step_whose_collection_overflows_moves_no_weight_and_writes_no_collection():
+    """A run that skips steps not finite, with no loss scale: a step whose loss and gradient are finite and
+    whose forward's collection is not (an exponential past float32) is not finite as a whole: its weight,
+    its update count and its collection stay as they were, and it reports not finite. Its collection was kept
+    while its weight and update count moved (the round-2 review's F3)."""
     rows = jax.device_count()
-    stepper = Trainer(Overflowing(), optax.sgd(0.1), key=jax.random.PRNGKey(0))
+    stepper = Trainer(Overflowing(), optax.sgd(0.1), key=jax.random.PRNGKey(0), skip_nonfinite=True)
     state = stepper.initial_state()
     batch = {"x": jnp.full((rows,), 100.0, jnp.float32)}
     step = stepper.compile(state, batch)
@@ -714,230 +729,26 @@ class Inputs(Counting):
         return {**batch, "x": np.full_like(batch["x"], self.value)}
 
 
-def _pushed_step(value: float, optimizer):
-    """One step with no loss scale of `Pushed` under `optimizer` over inputs of `value`: the state before,
-    and what the step reports."""
-    trainer = Trainer(Pushed(), optimizer, key=jax.random.PRNGKey(0))
-    state = trainer.initial_state()
-    batch = next(type("Fed", (Inputs,), {"value": value})())
-    before = jax.tree.map(np.asarray, (state.variables, state.opt_state))
-    step = trainer.compile(state, batch)
-    return before, step(state, batch)
-
-
-@pytest.mark.parametrize("value", [1e20, 1e19], ids=["past the bound", "within it"])
-def test_a_step_is_finite_where_its_gradients_magnitude_is_within_the_bound(value):
-    """With no loss scale, a step whose gradient is finite and past the magnitude bound (1e20, whose square
-    no float32 moment holds: `dew.nn.finite.MAGNITUDE_BOUND`) is rejected before Adam forms its update, its
-    weight as it was, its update count too and Adam's moments those of a step of zero gradient, and
-    reported not finite; one within it (three weights of
-    1e19, whose squares' sum passes float32 though each square is finite) is taken, its weight moved and
-    finite. Main froze the weight under an infinite moment while the loss stayed finite (row 6861)."""
-    before, (advanced, _, _, finite, _, _) = _pushed_step(value, optax.adam(0.1))
-    weight = np.asarray(advanced.variables["params"]["w"])
-    if value > MAGNITUDE_BOUND:
-        # The weight as it was, Adam's moments those of one step of zero gradient (training.md).
-        assert not bool(finite) and int(advanced.updates) == 0
-        np.testing.assert_array_equal(weight, before[0]["params"]["w"])
-        moments = advanced.opt_state[0]
-        assert np.all(np.asarray(moments.mu["w"]) == 0) and np.all(np.asarray(moments.nu["w"]) == 0)
-    else:
-        assert bool(finite) and int(advanced.updates) == 1
-        assert np.all(np.isfinite(weight)) and not np.array_equal(weight, before[0]["params"]["w"])
-
-
-def test_a_step_at_a_learning_rate_that_is_not_finite_is_rejected():
-    """An injected learning rate set infinite (`optax.inject_hyperparams`) forms an update that is not
-    finite from a bounded gradient: the step is rejected, the weight as it was, and reported not finite;
-    its rate is read where the update is formed."""
-    before, (advanced, _, _, finite, _, _) = _pushed_step(1.0, optax.inject_hyperparams(optax.sgd)(
-        learning_rate=math.inf))
-    assert not bool(finite) and int(advanced.updates) == 0
-    np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), before[0]["params"]["w"])
-
-
-def _configured_steps(config: OptimConfig | optax.GradientTransformation, values: list[float], *,
-                      states: bool = False):
-    """`Pushed` stepped with no loss scale under `config` (a config built over the steps, or a
-    transformation), a step over inputs of each of `values` in turn: each step's weight and whether it was
-    reported finite, and given `states`, the optimizer state it stored."""
-    trainer = Trainer(Pushed(), config, key=jax.random.PRNGKey(0))
-    trainer.scheduled(len(values))
-    state = trainer.initial_state()
-    batches = [next(type("Fed", (Inputs,), {"value": value})()) for value in values]
-    step = trainer.compile(state, batches[0])
-    taken = []
-    for batch in batches:
-        state, _, _, finite, _, _ = step(state, batch)
-        weight = np.asarray(state.variables["params"]["w"])
-        reported = (weight, bool(finite))
-        taken.append((*reported, jax.device_get(state.opt_state)) if states else reported)
-    return taken
-
-
-def test_a_step_rejected_for_its_update_steps_its_optimizer_by_the_zero_gradient():
-    """SGD with momentum at a rate of 1e30, a transformation Dew did not build, so every update is read: a
-    gradient of 1e10, within the magnitude bound, forms an update past float32, and the step is rejected,
-    its weight as it was, and its momentum the zero gradient's, zero, not the rejected gradient's 1e10
-    (training.md, a step that is not finite); the next step, over a gradient of 1e-32, is taken, its momentum
-    that gradient's alone, as a run's that began there. The rejected step stored the momentum its gradient
-    formed, so every later update was formed past float32 again until it decayed (Main, theme-15's P0)."""
-    (first, first_finite, first_state), (second, second_finite, second_state) = _configured_steps(
-        optax.sgd(learning_rate=1e30, momentum=0.9), [1e10, 1e-32], states=True)
-
-    def momentum(state):
-        def traced_node(node):
-            return isinstance(node, optax.TraceState)
-        traced, = [node for node in jax.tree.leaves(state, is_leaf=traced_node) if traced_node(node)]
-        return np.asarray(traced.trace["w"])
-
-    assert not first_finite and np.all(first == 0) and np.all(momentum(first_state) == 0)
-    assert second_finite and np.all(np.isfinite(second)) and np.all(second < 0)
-    # The momentum a run that began at the second step holds after it: the rejected step left none.
-    (_, _, alone), = _configured_steps(optax.sgd(learning_rate=1e30, momentum=0.9), [1e-32], states=True)
-    np.testing.assert_array_equal(momentum(second_state), momentum(alone))
-
-
-def test_an_update_its_bound_cannot_cover_is_skipped_only_where_it_is_not_finite():
-    """Adam with b2 under b1 squared and a guard of 1e-21, whose bound cannot cover a bounded gradient, so its
-    step reads its formed update (`dew.optim.reads_updates`): its first step over a gradient of 1e18,
-    whose update is 1, is taken, the weight moved by the rate; with b2 of zero and a guard of 1e-20, a
-    gradient of 1e19 then one of zero divides a first moment of 4.7e18 by the guard, past float32, and that
-    step alone is skipped, its weight as the first left it and reported not finite. The bound refused the
-    first configuration's step, though its update was finite (the round-2 head review's F6, as Main
-    retracted it)."""
-    taken = _configured_steps(OptimConfig(optimizer="adam", learning_rate=1.0, b1=0.9, b2=0.1,
-                                          optimizer_opts={"eps": 1e-21}), [1e18])
-    (weight, finite), = taken
-    # Taken: each weight moved against its gradient by about the rate, finite.
-    assert finite and np.all(np.isfinite(weight)) and np.all(np.rint(weight) == -1.0)
-    (first, first_finite), (second, second_finite) = _configured_steps(
-        OptimConfig(optimizer="adam", learning_rate=1.0, b2=0.0, optimizer_opts={"eps": 1e-20}), [1e19, 0.0])
-    assert first_finite and not second_finite and np.all(np.isfinite(first))
-    np.testing.assert_array_equal(second, first)
-
-
-def test_an_update_of_a_transformation_dew_did_not_build_is_read():
-    """A transformation Dew did not build (`optax.scale(-1e30)`), whose bound Dew cannot read, has its every
-    update read finite: a finite gradient of 1e10, within the magnitude bound, forms an update of -1e40,
-    which is not finite, and the step is skipped, its weight as it was. Taken unread, it wrote infinite
-    weights, which only a later save refused (Main, theme-15's F6)."""
-    before, (advanced, _, _, finite, _, _) = _pushed_step(1e10, optax.scale(-1e30))
-    assert not bool(finite) and int(advanced.updates) == 0
-    np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), before[0]["params"]["w"])
-
-
-class ScaledAfter(Pushed):
-    """`Pushed`, its optimizer the one it is handed with a scale of 1e38 chained after it: a composition of
-    the user's, whose bound Dew cannot read."""
-
-    def optimizer(self, tx):
-        return optax.chain(tx, optax.scale(1e38))
-
-
 class ClampedOutside(Pushed):
-    """`Pushed`, its weight starting at 2, outside the [0, 1] its param group clamps it to."""
+    """`Pushed`, its weight starting at 2, outside a param group's clamp of [0, 1]."""
 
     def fresh_variables(self, key, held):
         return {"params": {"w": jnp.full((FEATURES,), 2.0)}}
 
 
-def test_a_rejected_steps_weights_are_kept_by_its_post_step_effects_and_its_composition_is_read():
-    """A step a configured Adam takes through an objective that chains a scale of 1e38 after it (a
-    composition of the user's, `Objective.optimizer`) has its update read, though Dew's own build reads
-    none: its first update, past float32, is rejected and its weight kept. And a rejected step (inputs not
-    finite) of a param group clamped to [0, 1] keeps its weight of 2 outside the clamp, the clamp's count
-    stepping with the zero gradient's step. The composition was taken unread as Dew's build, writing an
-    infinite weight, and the clamp acted on a rejected step's weights (the round-3 head review's F6, F7)."""
+def test_a_skipped_steps_weights_are_kept_by_its_post_step_effects():
+    """A skipped step (inputs not finite) of a param group clamped to [0, 1] keeps its weight of 2 outside the
+    clamp, the clamp's count stepping with the zero gradient's step. The clamp acted on a rejected step's
+    weights (the round-3 head review's F7)."""
     from dew.optim import ParamGroup
-
-    trainer = Trainer(ScaledAfter(), OptimConfig(optimizer="adam", learning_rate=10.0),
-                      key=jax.random.PRNGKey(0))
-    trainer.scheduled(1)
-    state = trainer.initial_state()
-    batch = next(type("Fed", (Inputs,), {"value": 1.0})())
-    advanced, _, _, finite, _, _ = trainer.compile(state, batch)(state, batch)
-    assert not bool(finite) and np.all(np.asarray(advanced.variables["params"]["w"]) == 0)
     clamped = OptimConfig(optimizer="adam", learning_rate=1e-3,
                           param_groups=(ParamGroup("all", ("*",), bounds=(0.0, 1.0)),))
-    trainer = Trainer(ClampedOutside(), clamped, key=jax.random.PRNGKey(0))
+    trainer = Trainer(ClampedOutside(), clamped, key=jax.random.PRNGKey(0), skip_nonfinite=True)
     trainer.scheduled(1)
     state = trainer.initial_state()
     batch = next(type("Fed", (Inputs,), {"value": np.nan})())
     advanced, _, _, finite, _, _ = trainer.compile(state, batch)(state, batch)
     assert not bool(finite) and np.all(np.asarray(advanced.variables["params"]["w"]) == 2.0)
-
-
-def test_an_injected_schedules_step_after_a_rejected_one_is_taken():
-    """An injected SGD schedule of a transformation Dew did not build, infinite at its second update alone:
-    the second step is rejected, and the third, at the schedule's finite rate, is taken. Its state reports
-    the rate its last update took, which was read as the next update's, so the third step was rejected too
-    (the round-3 head review's F8)."""
-    schedule = optax.inject_hyperparams(optax.sgd)(
-        learning_rate=lambda count: jnp.where(count == 1, jnp.inf, 0.1))
-    taken = [finite for _, finite in _configured_steps(schedule, [1.0, 1.0, 1.0])]
-    assert taken == [True, False, True]
-
-
-def _started_at(value: float):
-    """`Pushed`, its weight starting at `value`."""
-    return type("Started", (Pushed,), {"fresh_variables": lambda self, key, held: {
-        "params": {"w": jnp.full((FEATURES,), value)}}})()
-
-
-def _adam_moments(state):
-    """The first and second moments of the one Adam state `state` holds."""
-    def adam_node(node):
-        return isinstance(node, optax.ScaleByAdamState)
-    adam, = [node for node in jax.tree.leaves(state, is_leaf=adam_node) if adam_node(node)]
-    return np.asarray(adam.mu["w"]), np.asarray(adam.nu["w"])
-
-
-@pytest.mark.parametrize(("config", "start", "value"), [
-    (OptimConfig(optimizer="adam", learning_rate=1e-3, weight_decay=1.0, spared=False), 1e18, 1.8e19),
-    (OptimConfig(optimizer="lamb", learning_rate=1e19), 1e20, 1.0)], ids=["coupled decay", "lamb"])
-def test_a_step_its_bound_cannot_cover_is_rejected_to_the_zero_gradients_step(config, start, value):
-    """A configured step whose optimizer's bound cannot cover a bounded gradient reads its update and the
-    state it leaves: Adam with a coupled decay of 1 over a weight of 1e18, whose second moment the gradient
-    of 1.8e19 plus the decayed weight takes past float32 beside a finite update, and LAMB at a rate of 1e19,
-    whose trust ratio takes its direction to its weights' norm of 1.7e20 and its update past float32. Each
-    step is rejected, its weight as it was, and its moments those of an explicit step of zero gradient
-    (training.md, a step that is not finite). The marker alone was checked before (the round-4 head review's
-    F6), and the coupled decay's step was taken unread, its second moment infinite (the round-3's F2)."""
-    trainer = Trainer(_started_at(start), config, key=jax.random.PRNGKey(0))
-    trainer.scheduled(1)
-    state = trainer.initial_state()
-    params = jax.device_get(state.variables["params"])
-    zero_step = config.build(1)
-    _, expected = zero_step.update({"w": jnp.zeros((FEATURES,))}, zero_step.init(params), params)
-    batch = next(type("Fed", (Inputs,), {"value": value})())
-    advanced, _, _, finite, _, _ = trainer.compile(state, batch)(state, batch)
-    assert not bool(finite)
-    np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), params["w"])
-    moments = _adam_moments(jax.device_get(advanced.opt_state))
-    for got, want in zip(moments, _adam_moments(expected), strict=True):
-        np.testing.assert_array_equal(got, want)
-
-
-def test_a_step_whose_guard_flushes_is_rejected_only_where_its_update_is_not_finite():
-    """AdamW with an eps of 1e-50, which float32 flushes to zero, so its bound covers nothing and its update
-    is read: a zero gradient over zero moments forms 0/0, and that step is rejected, its weight as it was;
-    the next, over a gradient of one, is taken. Its bound was the eps's, and the 0/0 was written unread (the
-    round-3 head review's F4)."""
-    flushed = OptimConfig(optimizer="adamw", learning_rate=1e-3, optimizer_opts={"eps": 1e-50})
-    taken = _configured_steps(flushed, [0.0, 1.0])
-    assert [finite for _, finite in taken] == [False, True]
-    np.testing.assert_array_equal(taken[0][0], np.zeros((FEATURES,)))
-    assert np.all(np.isfinite(taken[1][0])) and np.all(taken[1][0] < 0)
-
-
-def test_an_injected_control_that_is_infinite_does_not_reject_a_step():
-    """A transformation Dew did not build, so every update is read, whose injected clip bound is infinite
-    (`optax.inject_hyperparams(optax.clip)(max_delta=inf)`, legal: no clip) beside SGD: its finite updates
-    are taken, the read reading the optimizer's numbers and not its controls. The read took the whole
-    state and rejected every step (the round-4 head review's F1)."""
-    clipped = optax.chain(optax.inject_hyperparams(optax.clip)(max_delta=math.inf), optax.sgd(0.1))
-    assert [finite for _, finite in _configured_steps(clipped, [1.0, 1.0])] == [True, True]
 
 
 class CountingEffects(Pushed):
@@ -954,24 +765,22 @@ class CountingEffects(Pushed):
         return {"stats": {"seen": variables["stats"]["seen"] + effects}}
 
 
-def test_a_step_rejected_for_its_update_applies_no_effect():
-    """A step whose gradient is finite and whose update, read (a transformation Dew did not build, a scale
-    of -1e30), is not finite is rejected, and its objective's effects move nothing: its count stays zero.
+def test_a_skipped_step_applies_no_effect():
+    """A skipped step (inputs not finite) moves nothing by its objective's effects: its count stays zero.
     The effects were gated on the gradient alone and counted the rejected step (the round-4 head review's
     F5)."""
-    trainer = Trainer(CountingEffects(), optax.scale(-1e30), key=jax.random.PRNGKey(0))
+    trainer = Trainer(CountingEffects(), optax.sgd(0.1), key=jax.random.PRNGKey(0), skip_nonfinite=True)
     state = trainer.initial_state()
-    batch = next(type("Fed", (Inputs,), {"value": 1e10})())
+    batch = next(type("Fed", (Inputs,), {"value": np.nan})())
     advanced, _, _, finite, _, _ = trainer.compile(state, batch)(state, batch)
     assert not bool(finite) and float(advanced.variables["stats"]["seen"]) == 0.0
 
 
-def test_a_window_summing_bounded_gradients_past_the_bound_is_rejected_whole():
+def test_a_window_whose_summed_gradient_overflows_its_moments_is_dropped_whole():
     """An optimizer that holds updates back and sums its window (`optax.MultiSteps(..., use_grad_mean=False)`
-    of two) hands Adam the sum of two gradients of 1.5e19, each within the bound and their sum past it: the
-    window's closing step, whose Adam moment the sum overflows, is rejected whole, its state as it was, and
-    reported not finite; its first step is taken. The bound over a window is the wrapper's own, read in its
-    new state."""
+    of two) hands Adam the sum of two gradients of 1.5e19, whose square overflows its second moment: the
+    window's closing step is dropped whole, its state as it was, and reported not finite, as such an
+    optimizer's step always is read over its whole new state; its first step is taken."""
     held = optax.MultiSteps(optax.adam(0.1), 2, use_grad_mean=False).gradient_transformation()
     trainer = Trainer(Pushed(), held, key=jax.random.PRNGKey(0))
     state = trainer.initial_state()
@@ -984,12 +793,3 @@ def test_a_window_summing_bounded_gradients_past_the_bound_is_rejected_whole():
     for got, want in zip(jax.tree.leaves((state.variables, state.opt_state)), jax.tree.leaves(before),
                          strict=True):
         np.testing.assert_array_equal(np.asarray(got), want)
-
-
-def test_a_half_gradient_that_is_not_finite_is_not_bounded():
-    """A float16 gradient holding an infinity is not within the magnitude bound, read in float32, where the
-    bound read in float16 was its infinity, which an infinity met (the head review's F2)."""
-    from dew.nn.finite import bounded
-
-    assert not bool(bounded({"w": jnp.asarray([1.0, np.inf], jnp.float16)}))
-    assert bool(bounded({"w": jnp.asarray([1.0, 60000.0], jnp.float16)}))

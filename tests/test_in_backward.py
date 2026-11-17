@@ -297,28 +297,15 @@ def test_a_layer_walked_past_a_gradient_that_is_not_finite_keeps_its_weights_and
     a finite loss above it: the top layer, walked first, moves and stays finite; the middle layer and the
     one below, whose gradients are not finite, keep their weights and take the zero gradient's update, so
     every layer's count steps alike; the walk counts both non-finite (training.md, a step that is not
-    finite; train 912's review, F2). A top layer whose gradient is finite and past the magnitude bound
-    (`dew.nn.finite.MAGNITUDE_BOUND`: 1e20, whose square no moment holds) is held, and every layer walked
-    after it by the walk's latch, each count stepping; a step whose loss is not finite moves no layer."""
+    finite; train 912's review, F2), as a run that skips such steps walks it; a step whose loss is not
+    finite moves no layer."""
     weights, moments, norms = _walked([1.0, 0.0, 1.0])
     assert bool(jnp.all(jnp.isfinite(weights["a"]))) and float(weights["a"][2]) != 0.5
     np.testing.assert_array_equal(np.asarray(weights["a"][:2]), [0.5, 0.5])
     np.testing.assert_array_equal(np.asarray(moments["count"]["a"]), [1.0, 1.0, 1.0])
     assert [bool(count > 0) for count in norms["nonfinite"]] == [True, True, False]
-    latched, counted, norms = _walked([1.0, 1.0, 1.0], top=1e20)
-    np.testing.assert_array_equal(np.asarray(latched["a"]), [0.5, 0.5, 0.5])
-    np.testing.assert_array_equal(np.asarray(counted["count"]["a"]), [1.0, 1.0, 1.0])
-    assert bool(jnp.all(jnp.isfinite(counted["nu"]["c"])))
-    np.testing.assert_array_equal(np.asarray(norms["nonfinite"] > 0), [False, False, True])
     unmoved, _, _ = _walked([1.0, 1.0, 1.0], finite=False)
     np.testing.assert_array_equal(np.asarray(unmoved["a"]), [0.5, 0.5, 0.5])
-    # An update that does not form (a rate set infinite) moves no layer; each count steps, and each is
-    # the walk's first counted not finite, so the step is reported and rejected by its counts, the layers
-    # its latch then holds not counted (the round-3 review's F9).
-    unformed, stepped_counts, counted_norms = _walked([1.0, 1.0, 1.0], rate=np.inf)
-    np.testing.assert_array_equal(np.asarray(unformed["a"]), [0.5, 0.5, 0.5])
-    np.testing.assert_array_equal(np.asarray(stepped_counts["count"]["a"]), [1.0, 1.0, 1.0])
-    np.testing.assert_array_equal(np.asarray(counted_norms["nonfinite"] > 0), [False, False, True])
 
 
 def test_a_walk_names_the_first_layer_it_met_not_finite_across_its_stage_axis():
@@ -340,36 +327,17 @@ def test_a_walk_names_the_first_layer_it_met_not_finite_across_its_stage_axis():
 @pytest.mark.parametrize("through_context", [False, True], ids=["its input", "a context"])
 def test_a_layer_held_in_an_upper_run_holds_every_layer_of_the_runs_walked_after_it(through_context):
     """A compiled step of two in-backward runs, one after the other, whose upper run's top layer, the walk's
-    first, takes a finite gradient past the magnitude bound: every layer of both runs keeps its
+    first, takes a gradient that is not finite, under a run that skips such steps: every layer of both runs
+    keeps its
     weights, each count stepping alike, as one run's layers after a held one do (training.md, a step that
     is not finite), whether the lower run reaches the upper as its input or as a context every upper layer
     reads (an encoder's). The latch started anew in each run, so the lower run's layers moved (train 921's
     review, F1), carried as a value between runs it escaped the compiled backward's own trace (the head
     review's F1), and carried on the input's cotangent alone an encoder beneath moved (its round 2, F3)."""
-    weights, moments, _ = _walked([1.0, 1.0, 1.0], top=1e20, runs=2, through_context=through_context)
+    weights, moments, _ = _walked([1.0, 1.0, 1.0], top=np.inf, runs=2, through_context=through_context)
     for run in range(2):
         np.testing.assert_array_equal(np.asarray(weights[run]["a"]), [0.5, 0.5, 0.5])
         np.testing.assert_array_equal(np.asarray(moments[run]["count"]["a"]), [1.0, 1.0, 1.0])
-
-
-@pytest.mark.mesh(devices=8)
-def test_a_scanned_step_at_a_learning_rate_that_is_not_finite_moves_no_weight():
-    """A step updating its runs in their backward at a learning rate set infinite (`with_rates`) moves no
-    weight, the walked layers' nor the rest's, keeps its update count and is reported not finite (training.md,
-    a step that is not finite): each layer's update reads the rate it is formed at. The walk gated only on the
-    gradient and wrote infinite weights (the round-2 head review's F4)."""
-    from dew.optim_schedules import with_rates
-
-    run = trainer(decoder(scan=True), ADAMW)
-    state, _, _ = run.place()
-    state = dataclasses.replace(state, opt_state=with_rates(state.opt_state, {None: {"value": np.inf}}))
-    before = jax.device_get(state.variables["params"])
-    batch = shard_batch(run.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1))
-    moved, loss, _, finite, *_ = run.compile(state, batch)(state, batch)
-    assert bool(jnp.isfinite(loss)) and not bool(finite) and int(jax.device_get(moved.updates)) == 0
-    after = jax.device_get(moved.variables["params"])
-    for old, new in zip(jax.tree.leaves(before), jax.tree.leaves(after), strict=True):
-        np.testing.assert_array_equal(new, old)
 
 
 class CollectionWriting(LMObjective):
@@ -389,14 +357,15 @@ class CollectionWriting(LMObjective):
 
 @pytest.mark.mesh(devices=8)
 def test_a_scanned_step_whose_collection_is_not_finite_moves_no_weight():
-    """A step updating its runs in their backward whose loss and gradient are finite and whose forward
-    writes a collection that is not finite (an exponential past float32) moves no weight of its walked
+    """A step of a run that skips steps not finite, updating its runs in their backward, whose loss and
+    gradient are finite and whose forward writes a collection that is not finite (an exponential past
+    float32) moves no weight of its walked
     runs nor any other, and is reported not finite: the walk reads the forward's statistics and collections
     as the commit does. It read the loss alone, and its layers moved where the commit rejected the step (the
     round-3 head review's F1)."""
     objective = type("Overflowing", (CollectionWriting,), {"scale": 1e4})(decoder(scan=True), SEQ)
     run = Trainer(objective, ADAMW, key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
-                  layout=Layout(min_shard=TINY_SHARD), checkpoints=None, tracker=None)
+                  layout=Layout(min_shard=TINY_SHARD), checkpoints=None, tracker=None, skip_nonfinite=True)
     run.device_mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
     run.validate(steps=1)
     state, _, _ = run.place()

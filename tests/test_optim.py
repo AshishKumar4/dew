@@ -1910,79 +1910,6 @@ def test_adams_default_first_moment_keeps_its_promoted_dtype():
     assert state.mu["w"].dtype == jnp.float32
 
 
-@pytest.mark.parametrize(("config", "dtype", "reads"), [
-    (OptimConfig(optimizer="adamw", learning_rate=3e-4), jnp.float32, False),
-    (OptimConfig(optimizer="adamw", learning_rate=3e-4), jnp.float16, False),
-    (OptimConfig(optimizer="adam", learning_rate=1e-3, state_dtype="int8"), jnp.float32, False),
-    (OptimConfig(optimizer="lamb", learning_rate=1e-3), jnp.bfloat16, False),
-    (OptimConfig(optimizer="laprop", learning_rate=1e-3), jnp.float32, False),
-    (OptimConfig(optimizer="muon", learning_rate=2e-2), jnp.float32, False),
-    (OptimConfig(optimizer="muon", learning_rate=2e-2, optimizer_opts={"ns_coeffs": "polar_express"}),
-     jnp.float32, False),
-    (OptimConfig(optimizer="adamw", learning_rate=Cosine(peak_value=1e-3, warmup_steps=10)), jnp.float32,
-     False),
-    (OptimConfig(optimizer="adam", learning_rate=1.0, b1=0.9, b2=0.1, optimizer_opts={"eps": 1e-21}),
-     jnp.float32, True),
-    (OptimConfig(optimizer="adam", learning_rate=1.0, b2=0.0, optimizer_opts={"eps": 1e-20}), jnp.float32,
-     True),
-    (OptimConfig(optimizer="adam", learning_rate=1e-3, optimizer_opts={"eps": 0.0}), jnp.float32, True),
-    (OptimConfig(optimizer="laprop", learning_rate=1e-3, optimizer_opts={"eps": 0.0}), jnp.float32, True),
-    (OptimConfig(optimizer="adamw", learning_rate=1e37), jnp.float32, True),
-    (OptimConfig(optimizer="adamw", learning_rate=1e3), jnp.float16, True),
-    (OptimConfig(optimizer="muon", learning_rate=2e-2, optimizer_opts={"adaptive": True}), jnp.float32, True),
-    (OptimConfig(optimizer="laprop", learning_rate=1e-3), jnp.float16, True),
-    (OptimConfig(optimizer="adamw", learning_rate=3e-4, optimizer_opts={"eps": 0.0, "eps_root": 1e-50}),
-     jnp.float32, True),
-    (OptimConfig(optimizer="muon", learning_rate=2e-2, optimizer_opts={"mu_dtype": "float16"}), jnp.float32,
-     True),
-], ids=["defaults", "defaults in float16", "8-bit", "lamb", "laprop", "muon", "polar express", "cosine",
-        "b2 under b1 squared, eps 1e-21", "b2 zero, eps 1e-20", "adam eps zero", "laprop eps zero",
-        "rate past float32's half", "rate past float16's half", "adaptive muon",
-        "laprop's eps below float16's smallest normal", "eps_root below float32's smallest normal",
-        "muon's momentum in float16"])
-def test_a_built_optimizer_reads_its_update_only_where_its_bound_cannot_cover_a_bounded_gradient(
-        config, dtype, reads):
-    """Whether a step reads its formed update finite, decided as Dew's build makes its state
-    (`dew.optim.bounded_updates`, from its constants and the parameters' dtypes and shapes): Dew's defaults,
-    each optimizer's, a schedule's and 8-bit moments', whose bound times their peak rate stays within half of
-    every parameter's dtype, read nothing and hold the state they did; a tiny eps beside b2 at most b1
-    squared, a guard of zero or one the arithmetic's dtype flushes (eps 1e-50, LaProp's 1e-20 over
-    float16, Muon's normalization over none), a coupled decay, which the moments square, a rate past half a
-    parameter's dtype (LAMB's against its parameters' norm) and an option whose bound Dew does not state
-    read it, and no configuration is refused. Main refused a guard of zero at build and took every other
-    update unread (the round-2 head review's F6), and the round-3 review's F2 to F5 found bounds a coupled
-    decay, LAMB's trust ratio and a flushed guard broke."""
-    from dew.optim import DewBuilt, reads_updates
-
-    params = {"w": jnp.zeros((8, 4), dtype), "b": jnp.zeros((4,), dtype)}
-    built = config.build(100)
-    state = built.init(params)
-    assert isinstance(built, DewBuilt) and reads_updates(state) is reads
-
-
-def test_an_optax_factory_a_config_names_is_no_build_of_dews():
-    """A config naming an Optax factory (`optax:sgd`) builds that factory's transformation, no build of Dew's
-    (`dew.optim.DewBuilt`), whose bound Dew cannot read: a run reads its every update
-    (`Transaction.reads_all`)."""
-    from dew.optim import DewBuilt
-
-    assert not isinstance(OptimConfig(optimizer="optax:sgd", learning_rate=1e-3).build(10), DewBuilt)
-
-
-def test_newton_schulz_leaves_no_singular_value_past_its_spectral_bound():
-    """Newton-Schulz's quintic iteration takes no singular value in [0, 1] past `spectral_bound`: the
-    iteration's polynomial composed over a grid of them, by Jordan's and Polar Express's coefficients, peaks
-    within it; and `(1.875, -1.25, 0.375)`, which holds [0, 1] in place with one at one, is bounded by one
-    exactly."""
-    from dew.newton_schulz import NEWTON_SCHULZ, polar_express
-    from dew.optim import spectral_bound
-
-    for rows in (np.asarray([NEWTON_SCHULZ] * 5), np.asarray(polar_express(5))):
-        values = np.linspace(0.0, 1.0, 100001)
-        for a, b, c in rows:
-            values = np.abs(a * values + b * values ** 3 + c * values ** 5)
-        assert values.max() <= spectral_bound(rows)
-    assert spectral_bound(np.asarray([(1.875, -1.25, 0.375)] * 5)) == 1.0
 def test_lambs_trust_ratio_is_finite_where_the_update_is_tiny_beside_the_parameters():
     """LAMB's trust ratio scales a layer's update to its parameters' norm: an update of 1e-22 beside
     parameters of 5e18 (norm 1e19) is scaled to that norm, each element 5e18, finite, as `(u / |u|) |p|`,
@@ -2037,9 +1964,8 @@ def test_a_layers_norm_is_finite_where_its_values_squares_pass_float32():
 
 def test_a_muon_config_builds_inside_a_trace():
     """A Muon config built where a trace is open (an injected factory builds its solver as its state is
-    made) states its bound from its Newton-Schulz coefficients, constants of the build: its state is made
-    and its update steps. Its coefficients were read as an array of the trace and the build failed (the
-    round-3 head review's F10)."""
+    made): its state is made and its update steps. A build that read its Newton-Schulz coefficients as
+    numbers failed on them as an array of the trace (the round-3 head review's F10)."""
     params = {"w": jnp.ones((8, 4)), "b": jnp.ones((4,))}
     wrapped = optax.inject_hyperparams(
         lambda gain: optax.chain(OptimConfig(optimizer="muon", learning_rate=2e-2).build(10),
