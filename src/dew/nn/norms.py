@@ -402,12 +402,10 @@ class GatedRMSNorm(nn.Module):
 
 class _Shifted(nn.LayerNorm):
     """flax's `nn.LayerNorm` over its input less each row's mean, which a layer norm does not change: its
-    statistics read rows centered near zero, a corrected two-pass mean, so a row whose mean dwarfs its
-    spread rounds as a row near zero does (half torch's distance from float64 at rows a hundred from zero,
-    where flax's one centering sat 1.6 times it at a width of 64). The shift is a constant to the
-    gradient, whose own term a layer norm's invariance makes zero; one shift over every shard its
-    statistics read (`axis_name`), and taken in float32 at least, as flax's statistics read a narrower
-    input, its output in the dtype flax gives that input."""
+    statistics read rows centered near zero, so a row whose mean dwarfs its spread rounds as a row near
+    zero does. The shift is a constant to the gradient, whose own term a layer norm's invariance makes
+    zero; one shift over every shard its statistics read (`axis_name`), and taken in float32 at least, as
+    flax's statistics read a narrower input, its output in the dtype flax gives that input."""
 
     @nn.compact
     def __call__(self, x, *, mask=None):
@@ -427,13 +425,14 @@ class LayerNorm(nn.remat(_Shifted, policy=jax.checkpoint_policies.nothing_saveab
     """flax's `nn.LayerNorm`, rematerialized saving nothing: its backward pass keeps the input as
     it arrived and its parameters, not the two fp32 copies flax's own differentiation keeps
     (2.35 GiB of them on one SimpleDiT step). The parameter tree and the module's name are flax's, so
-    checkpoints and scopes move both ways; its statistics read each row less its mean (`_Shifted`), and
-    its variance is the centered mean square, E[(x - E[x])^2], as torch's LayerNorm takes it, where
-    flax's default E[x^2] - E[x]^2 cancels in fp32 wherever a row's mean dwarfs its spread (row 5907:
-    Gemma 4's audio subsampling, whose norm reads a ReLU's output, sat 1.58 times Transformers' distance
-    from float64 on a GH200). A caller that takes the one-pass form states it (`use_fast_variance`)."""
-
-    use_fast_variance: bool = False
+    checkpoints and scopes move both ways. Its statistics read each row less its mean (`_Shifted`), then
+    the shifted rows' mean and mean square in one read (`use_fast_variance`), the variance the second
+    less the first's square, which a shifted row's tiny mean leaves uncancelled: as near float64 as a
+    corrected two-pass (at a width of 64, a hundredth of torch's distance at rows a hundred from zero,
+    where flax's E[x^2] - E[x]^2 over the rows as given cancels: row 5907, Gemma 4's audio subsampling at
+    1.58 times Transformers' distance on a GH200), without the third read that kept a SimpleDiT step's
+    residual sums alive (291 MiB of its temporaries on a GH200, row 6741). A caller that states
+    `use_fast_variance=False` takes the corrected two-pass, its centered rows centered again."""
 
     def spread(self, x: jax.Array) -> jax.Array:
         """Per row, the root mean square of `x` centered, its statistic (`dew.nn.protocols.BoundedNorm`),
@@ -461,8 +460,9 @@ def _gain_of(norm: nn.Module, *, offset: bool) -> jax.Array:
 
 class OffsetLayerNorm(nn.Module):
     """A LayerNorm whose weight is stored as its offset from one, zero at initialization: the input
-    normalized by torch's exact variance in fp32 (flax's `nn.LayerNorm`), times (1 + `scale`), plus
-    `bias` (MaxText's `Gpt3LayerNorm`, maxtext/models/gpt3.py, PaxML's layer norm)."""
+    normalized as `LayerNorm` normalizes it (its rows shifted by their mean, then their mean and mean
+    square in one read), times (1 + `scale`), plus `bias` (MaxText's `Gpt3LayerNorm`,
+    maxtext/models/gpt3.py, PaxML's layer norm)."""
 
     epsilon: float = 1e-5
     use_bias: bool = True

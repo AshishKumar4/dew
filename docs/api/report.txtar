@@ -54,13 +54,13 @@ class Dataset()  [dew.data.pipeline]
   .elastic(self) -> Pipeline
   .facts(self) -> Mapping[str, object]
   .filter(self, predicate: Callable[[Batch], bool], *, reason: str | None = None, identity: str | None = None) -> Pipeline
-  .filter_map(self, *steps: RecordStep, identity: str | None = None) -> Pipeline
-  .flat_map(self, step: ExpandStep | ColumnStep, *, batched: bool = False, batch_size: int = 1000, identity: str | None = None) -> Pipeline
+  .filter_map(self, *steps: RecordStep, identity: str | None = None, pool: PoolKind | None = None) -> Pipeline
+  .flat_map(self, step: ExpandStep | ColumnStep, *, batched: bool = False, batch_size: int = 1000, identity: str | None = None, pool: PoolKind | None = None) -> Pipeline
   .grain(self, function: Callable[[pygrain.MapDataset | pygrain.IterDataset], pygrain.MapDataset | pygrain.IterDataset], *, identity: str | None = None) -> Pipeline
   .holdout(self, fraction: float | None = None, *, key: str | None = None, records: int | None = None, split: str | tuple[str, ...] | None = None, tokens: float | None = None, fields: tuple[str, ...] = ('text',), **named: float) -> tuple[Dataset, ...]
   .interleave(self, cycle_length: int = 16) -> Pipeline
   .loading(self, loading: Loading) -> Pipeline
-  .map(self, *steps: RecordStep | Configured | HostStep, batched: bool = False, batch_size: int = 1000, identity: str | None = None) -> Pipeline
+  .map(self, *steps: RecordStep | Configured | HostStep, batched: bool = False, batch_size: int = 1000, identity: str | None = None, pool: PoolKind | None = None) -> Pipeline
   .map_with_index(self, step: Callable[[int, Batch], Batch | Rejected], *, identity: str | None = None) -> Pipeline
   .named(self, name: str) -> Pipeline
   .pack(self, seq_len: int, *, fields: tuple[str, ...] = ('text',), bins: int = 32, policy: Literal['first-fit', 'best-fit', 'concat'] = 'first-fit', segments: int | None = None, along: tuple[tuple[str, int], ...] = (), overlap: int = 0) -> Pipeline
@@ -363,6 +363,7 @@ module kernels  [dew.kernels]
   choices = frozenset({'attention', 'attention_mainloop', 'blockwise_fp8', 'decode', 'delta_decode', 'delta_gates', 'gate_up', 'gated_delta_rule', 'gated_mlp', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'low_rank', 'mxfp8', 'narrow_copies', 'nvfp4', 'nvfp4_block', 'paged_decode', 'rms_norm', 'selective_scan', 'short_conv', 'ssd', 'swiglu'})
   def use(**kernels: str) -> Iterator[None]  [dew.nn.kernels.generation]
 def pipeline(source: str, *, mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, dtype: DTypeLike | None = None, param_dtype: DTypeLike | Literal['auto'] | None = None, ema: bool | None = None, step: int | str | None = None, revision: str | None = None, trust: Sequence[str] = (), options: SourceOptions | None = None, precision: Numerics | str | None = None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask  [dew.inference.loading]
+def register(name: str, /) -> Callable[[M], M]  [dew.registry]
 def sample(denoise: dew.diffusion.process.Denoiser | dew.diffusion.discrete.DiscreteDenoiser, x_T: jax.Array, steps: int | None = None, *, solver: dew.sampling.solvers.common.Solver[StateT], guidance: dew.sampling.guidance.Guidance | None = None, key: int | jax.Array | dew.sampling.solvers.common.RowKeys, times: jax.Array | numpy.ndarray | numpy.bool | numpy.number | bool | int | float | complex | collections.abc.Sequence[float] | None = None, initial: StateT | None = None, final_denoise: bool = True, record: collections.abc.Callable[[jax.Array, StateT, jax.Array], RecordT] | None = None) -> jax.Array | tuple[jax.Array, RecordT]  [dew.sampling.walks]
 -- config --
 dew.checkpoints.Keep

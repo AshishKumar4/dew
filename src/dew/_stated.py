@@ -14,6 +14,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import logging
+import os
 import sys
 import types
 from collections.abc import Callable, Hashable, Mapping
@@ -88,9 +89,9 @@ def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
     its code is the process record's, `Process`), and one of a user's own code with what it reads (`_own`);
     a function no module holds (a lambda, a local one) is its code (`_code`) with what it reads (`reads`); a
     dataclass its type and fields; a number its type and bits, an array of NumPy's its dtype, shape and
-    bytes; a mapping's pairs and a set's members in the order it holds them, which code may read; a module
-    by its file's code, the attributes the code reading it names of it beside (`_module_state`); an
-    enumeration's member, a mesh, a sharding and a partition as the algebra's structural key states them
+    bytes; a mapping's pairs and a set's members in the order it holds them, which a trace may read; a
+    module of the user's everything it holds (`_module_state`); an enumeration's member,
+    a mesh, a sharding and a partition as the algebra's structural key states them
     (`dew.algebra.terms.parameter_key`, the one owner of a placement as plain data); JAX's other values of
     a call's key (an abstract value, a tree's structure node by node, a format, a device) by their parts. A
     value among `known` (by its `id`) is what its caller says of it (`call_identity`).
@@ -101,15 +102,12 @@ def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
     return _stated(value, at, known, ())
 
 
-def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...],
-            names: frozenset[str] | None = None) -> JSON:
+def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
     """`stated`, within the functions and containers `walking` whose reads or parts are being stated, the
     path to `value` in order: a function among them met again (one that names itself) is that function,
     stated once; a container among them met again is a reference back to it, by how far up the path it
-    stands (`_again`). `names` are the names the code reaching `value` reads (a function's, a class's
-    methods'), through which a module of the user's it holds, in a container or not, is stated by the
-    attributes those names read of it (`_module_state`)."""
-    again = functools.partial(_stated, known=known, walking=walking, names=names)
+    stands (`_again`)."""
+    again = functools.partial(_stated, known=known, walking=walking)
     if id(value) in known:
         return known[id(value)]
     if (plain := _data(value, at)) is not None:
@@ -120,7 +118,9 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...],
     if isinstance(value, jax.Array):
         raise Unestablished(f"{at}: an array of JAX's, a constant of the program")
     if isinstance(value, types.ModuleType):
-        return _module(value, at, known, walking, names)
+        # A module of the user's is everything it holds: code that names it may read any of it.
+        held = _module_state(value, at, known, walking) if _sources.own_source(value.__name__) else None
+        return ["module", _coded(value.__name__, at), held]
     if isinstance(value, logging.Logger):
         return ["logger", value.name]
     if isinstance(value, (types.FunctionType, type)) and _sources.own_source(value.__module__):
@@ -150,15 +150,14 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...],
         # the path's alone.
         if id(value) in walking:
             return _again(value, walking)
-        walking = (*walking, id(value))
-        again = functools.partial(_stated, known=known, walking=walking, names=names)
+        again = functools.partial(_stated, known=known, walking=(*walking, id(value)))
     if isinstance(value, (tuple, list)):
         # A named tuple's type names its fields, which its parts take in order.
         return ["sequence", again(type(value), at=at),
                 [again(each, at=f"{at}[{index}]") for index, each in enumerate(value)]]
     if isinstance(value, (set, frozenset)):
-        # In the order it holds them, as a mapping's: code that iterates it reads that order, which for
-        # strings is another in each process unless its hash seed is set.
+        # In the order it holds them, as a mapping's: a trace that iterates it reads that order, which
+        # for strings is another in each process unless its hash seed is set.
         return ["set", again(type(value), at=at), [again(each, at=at) for each in value]]
     if isinstance(value, Mapping):
         # In the order it holds them: a trace that iterates it reads that order.
@@ -176,14 +175,10 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...],
                 reads(value, at, known, walking)]
     if _sources.generated_instance(value):
         # An instance of a class a generator made (a dataclass's, attrs', its validators' among them) by its
-        # fields, one unset (an attrs field with no init) None; read by what reads it and, of the user's, by
-        # its class's methods too, which name what its fields hold.
-        kind = type(value)
-        own = _method_names(kind) if _sources.own_source(kind.__module__) else frozenset()
-        held = None if names is None and not own else (names or frozenset()) | own
-        return ["record", again(kind, at=at),
-                [[name, _stated(getattr(value, name, None), f"{at}.{name}", known, walking, held)]
-                 for name in _sources.field_names(kind)]]
+        # fields: one unset (an attrs field with no init) is None.
+        return ["record", again(type(value), at=at),
+                [[name, again(getattr(value, name, None), at=f"{at}.{name}")]
+                 for name in _sources.field_names(type(value))]]
     key = terms.parameter_key(value)
     if isinstance(key, tuple) and key[0] != "object":
         return ["native", _plain(key, at)]
@@ -223,12 +218,33 @@ def _data(value, at: str) -> JSON | None:
 
 
 def _traceback(value) -> JSON | None:
-    """A traceback of JAX's by its frames, as a file of programs holds one
-    (`dew.training.ahead.HeldTraceback`): a checkified program's error tree holds each check's in its node
-    data, which prints by its address; None for any other value."""
-    if isinstance(value, xla_client.Traceback):
-        return ["traceback", [str(frame) for frame in value.frames]]
-    return None
+    """A traceback of JAX's by its frames (`traceback_frames`): a checkified program's error tree holds each
+    check's in its node data, which tells where a check that fails was; None for any other value."""
+    if not isinstance(value, xla_client.Traceback):
+        return None
+    frames: list[JSON] = list(traceback_frames(value))
+    return ["traceback", frames]
+
+
+def traceback_frames(traceback) -> list[str]:
+    """Each frame of a JAX `traceback` as its module, line and function (`dotted.module:12 (function)`), where
+    its code is wherever the run is installed: so two programs whose checks sit on other lines are two, and
+    one of the same code is one across installs. The one statement of a traceback, a program file's too
+    (`dew.training.ahead.HeldTraceback`)."""
+    return [f"{_frame_module(frame.file_name)}:{frame.line_num} ({frame.function_name})"
+            for frame in traceback.frames]
+
+
+def _frame_module(file: str) -> str:
+    """The module a frame's `file` is, by the longest import path entry it lies under (`a/b.py` under it is
+    `a.b`), else its file's name: no directory where the run is installed."""
+    real = os.path.realpath(file)
+    roots = [root for entry in sys.path if entry
+             and real.startswith(root := os.path.join(os.path.realpath(entry), ""))]
+    if not roots:
+        return os.path.basename(file)
+    relative = os.path.splitext(real[len(max(roots, key=len)):])[0]
+    return relative.replace(os.sep, ".").removesuffix(".__init__")
 
 
 def _parts(value, at: str, again: Callable[..., JSON]) -> JSON | None:
@@ -284,19 +300,12 @@ def reads(function: types.FunctionType, at: str, known: Mapping[int, JSON] = _NO
     within = (*walking, id(function))
     named = function.__qualname__
     cells, read = _sources.function_reads(function)
-    names = frozenset(_sources.names_read(function.__code__))
-
-    def value_read(value, where: str) -> JSON:
-        return _stated(value, where, known, within, names)
-
-    return {"closure": {name: value_read(value, f"{at} ({named}'s closure, {name})")
+    return {"closure": {name: _stated(value, f"{at} ({named}'s closure, {name})", known, within)
                         for name, value in sorted(cells.items())},
-            "globals": {name: value_read(value, f"{at} ({named}'s global {name})")
+            "globals": {name: _stated(value, f"{at} ({named}'s global {name})", known, within)
                         for name, value in sorted(read.items())},
-            "defaults": [value_read(value, f"{at} ({named}'s defaults)")
-                         for value in function.__defaults__ or ()],
-            "keyword defaults": {name: value_read(value, f"{at} ({named}'s default {name})")
-                                 for name, value in sorted((function.__kwdefaults__ or {}).items())}}
+            "defaults": _stated((function.__defaults__, function.__kwdefaults__),
+                                f"{at} ({named}'s defaults)", known, within)}
 
 
 def _own(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
@@ -304,16 +313,15 @@ def _own(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) ->
     it reads: a function's reads (`reads`); a class's data, each attribute its body or other code set on
     it, and its members' reads (`_members`), its bases' of the user's code among them. Such code reaches
     the program through a name alone, and what it reads at run time (a module's setting another module
-    assigned) is nothing its source states, so it is walked, through every function and class of the
-    user's it names in turn, and each module of the user's by the attributes the code names of it
-    (`_module_state`); one met again within its own walk is itself, stated once. A class's classes are its
-    MRO's in order, each whole (`_class`: its members, its dataclass fields with their defaults and
-    factories, a metaclass of the user's; keyed by name alone, a base's members replaced its child's of the
-    same name, the child's edit unseen, the base review of 201a04c58). No file's digest is part of it: its
-    code and its reads state it completely, a script's (`__main__`) as any module's, and a script's other
-    bytes are no step's or program's (an unrelated edit of `__main__` refused a class step's exact resume,
-    the same review; a class stated without its fields' defaults and factories handed a kept program back
-    over an edit of them, train 947's review)."""
+    assigned) is nothing its source states, so it is walked, through every function, class and module of
+    the user's it names in turn; one met again within its own walk is itself, stated once. A class's
+    classes are its MRO's in order, each whole (`_class`: its members, its dataclass fields with their
+    defaults and factories, a metaclass of the user's; keyed by name alone, a base's members replaced its
+    child's of the same name, the child's edit unseen, the base review of 201a04c58). No file's digest is
+    part of it: its code and its reads state it completely, a script's (`__main__`) as any module's, and a
+    script's other bytes are no step's or program's (an unrelated edit of `__main__` refused a class step's
+    exact resume, the same review; a class stated without its fields' defaults and factories handed a
+    kept program back over an edit of them, train 947's review)."""
     module = _coded(value.__module__, at)
     stated_name = ["own", module, value.__qualname__]
     if id(value) in walking:
@@ -330,16 +338,17 @@ def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, .
     """One class of a user's own class's MRO, completely: its module and name, its members (`_members`), its
     generated fields (`_field`: a dataclass's or an attrs class's), and its
     metaclass where that is the user's own code too (which runs as the class is made and may set what it
-    holds). Each field is read through the names the class's methods read, as its members are."""
-    names = _method_names(held)
-    fields: list[JSON] = [_field(held, field, at, known, walking, names)
+    holds)."""
+    fields: list[JSON] = [_field(held, field, at, known, walking)
                           for field in _sources.generated_fields(held)]
     maker = type(held)
     made = (_stated(maker, f"{at} ({held.__name__}'s metaclass)", known, walking)
             if _sources.own_source(maker.__module__) else None)
     entry: list[JSON] = [_coded(held.__module__, at), held.__qualname__, _members(held, at, known, walking),
                          fields, made]
-    return entry
+    # How its generator made it, as it records its options (`generation_options`).
+    options = _sources.generation_options(held)
+    return [*entry, dict(options)] if options else entry
 
 
 def _converter(value, at: str, again: Callable[..., JSON]) -> JSON | None:
@@ -355,27 +364,23 @@ def _converter(value, at: str, again: Callable[..., JSON]) -> JSON | None:
 
 
 def _field(held: type, field: _sources.GeneratedField, at: str, known: Mapping[int, JSON],
-           walking: tuple[int, ...], names: frozenset[str]) -> JSON:
-    """A generated field (`dew._sources.generated_fields`) as an identity states it, through the names its
-    class's methods read (`names`): its name, default and default factory, and for an attrs field the rest
-    of what attrs recorded of it, each by its part's name. A dataclass's field is stated as it was before
-    them, so a position saved then holds (train 953's review)."""
-    stated: list[JSON] = [
-        field.name,
-        _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking, names),
-        _field_part(field.factory, f"{at} ({held.__name__}.{field.name} factory)", known, walking, names)]
+           walking: tuple[int, ...]) -> JSON:
+    """A generated field (`dew._sources.generated_fields`) as an identity states it: its name, default and
+    default factory, and every other part its generator recorded of it, each by its part's name."""
+    stated: list[JSON] = [field.name,
+                          _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking),
+                          _field_part(field.factory, f"{at} ({held.__name__}.{field.name} factory)", known,
+                                      walking)]
     if field.parts:
-        stated.append({part: _field_part(value, f"{at} ({held.__name__}.{field.name} {part})", known,
-                                         walking, names)
+        stated.append({part: _stated(value, f"{at} ({held.__name__}.{field.name} {part})", known, walking)
                        for part, value in field.parts})
     return stated
 
 
-def _field_part(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...],
-                names: frozenset[str]) -> JSON:
+def _field_part(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
     """A generated field's default or default factory as an identity states it, `"missing"` where it has
     none (`dew._sources.MISSING`)."""
-    return "missing" if value is _sources.MISSING else _stated(value, at, known, walking, names)
+    return "missing" if value is _sources.MISSING else _stated(value, at, known, walking)
 
 
 def _again(value, walking: tuple[int, ...]) -> JSON:
@@ -386,54 +391,20 @@ def _again(value, walking: tuple[int, ...]) -> JSON:
 
 
 def _members(held, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
-    """What a class of the user's holds, each under its name (`dew._sources.members`), as an identity states
-    it (`stated`): a method by the function its descriptor wraps, a module of the user's by the attributes
-    the class's methods name of it (`_module_state`), anything else by its value, a partial or a bound
-    method whole."""
-    names = _method_names(held)
-    return {name: _stated(member, f"{at} ({held.__name__}.{name})", known, walking, names)
+    """What a class or a module of the user's holds, each under its name (`dew._sources.members`), as an
+    identity states it (`stated`): a method by the function its descriptor wraps, anything else by its
+    value, a partial or a bound method whole."""
+    return {name: _stated(member, f"{at} ({held.__name__}.{name})", known, walking)
             for name, member in _sources.members(held)}
 
 
-def _method_names(held: type) -> frozenset[str]:
-    """Every name the methods of `held` and its bases of the user's code read (`names_read`)."""
-    methods = [member for owner in _sources.own_classes(held) for _, member in _sources.members(owner)
-               if isinstance(member, types.FunctionType)]
-    return frozenset(name for method in methods for name in _sources.names_read(method.__code__))
-
-
-DYNAMIC = frozenset({"getattr", "vars", "__dict__", "__getattribute__", "globals", "hasattr"})
-"""The names by which code reads an attribute whose name it computes (`getattr(module, name)`,
-`vars(module)[name]`), past what its own read names say (`_module_state`)."""
-
-
-def _module_state(module: types.ModuleType, names: frozenset[str], at: str, known: Mapping[int, JSON],
+def _module_state(module: types.ModuleType, at: str, known: Mapping[int, JSON],
                   walking: tuple[int, ...]) -> JSON:
-    """The attributes of a module of the user's that code naming the module names too (`names`, its read
-    names), as an identity states each, through those names again (a module it holds, read through it):
-    a member the code never names (a path, a compiled pattern beside the function it calls) is no part of
-    it; a module met again within its own walk is itself. Code that can read an attribute by a name it
-    computes (`getattr`, `vars`, a `__dict__`; `DYNAMIC`) may read any of them, so all are stated."""
+    """Everything a module of the user's holds (`_members`), for code that names the module itself and so
+    may read any of it; a module met again within its own walk is itself."""
     if id(module) in walking:
         return "itself"
-    within = (*walking, id(module))
-    whole = not DYNAMIC.isdisjoint(names)
-    return {name: _stated(member, f"{at} ({module.__name__}.{name})", known, within, names)
-            for name, member in _sources.members(module) if whole or name in names}
-
-
-def _module(value: types.ModuleType, at: str, known: Mapping[int, JSON], walking: tuple[int, ...],
-            names: frozenset[str] | None) -> JSON:
-    """A module as an identity states it: one of the user's by its file's code, beside the attributes the
-    code reading it names of it (`names`, `_module_state`); another by its version. The script's
-    (`__main__`) file is no process record's, so what it holds, read by no names, is stated whole."""
-    module: list[JSON] = ["module", _coded(value.__name__, at)]
-    if value.__name__ == "__main__" and names is None:
-        names = DYNAMIC
-    if names is None or not _sources.own_source(value.__name__):
-        return module
-    stated: list[JSON] = [module, _module_state(value, names, at, known, walking)]
-    return stated
+    return _members(module, at, known, (*walking, id(module)))
 
 
 def _tree(tree, at: str, again: Callable[..., JSON]) -> JSON:

@@ -16,8 +16,10 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Concatenate, Literal, Protocol, Self
 
 import jax
@@ -31,7 +33,10 @@ from jax.typing import ArrayLike, DTypeLike
 
 from dew._cache import persist_compilations
 from dew._coordination import agreed
+from dew._files import is_uri, staged
 from dew._records import (
+    ADDED,
+    JSON,
     UNREAD,
     earlier_fields,
     integer,
@@ -569,7 +574,44 @@ def saved_artifact(checkpoints: Checkpoints, step: int) -> Mapping[str, object] 
     (`dew.decision.DecisionRunConfig.earlier_checkpointed`). The packages it trusts are imported first, by its
     reader."""
     record = checkpoints.artifact(step)
-    return None if record is None else earlier_shapes(named_fields(record, 'checkpoint artifact'))
+    if record is None:
+        return None
+    return earlier_shapes(named_fields(record, 'checkpoint artifact'))
+
+
+def hold_tokenizer(artifact: JSON, run: str) -> None:
+    """Hold the Hugging Face tokenizer `artifact`, a step's inference declaration a checkpoint of the run in
+    `run` carries, names in the run itself (`held_place`), once: copied by the first process from where this
+    process read it (`dew.data.text.pinned_directory`, the objective's own tokenizer, never resolved by its
+    name again), its files first and `HELD_FILES` last, a local run's directory published whole
+    (`dew._files.staged`). The record keeps the tokenizer's name and files as they are; a load finds the
+    held copy by them (`tokenizer_here`) on any host."""
+    from dew.data.text import HELD_FILES, held_place, pinned_directory
+
+    match artifact:
+        case {"tokenizer_files": dict(files)} if jax.process_index() == 0:
+            hashed = {str(path): str(digest) for path, digest in files.items()}
+            target = held_place(run, hashed)
+            source = pinned_directory(hashed)
+            if source is None or (target / HELD_FILES).exists():
+                return
+            if is_uri(run):
+                _held_files(target, source, hashed)
+                return
+            with staged(Path(target)) as building:
+                _held_files(epath.Path(building), source, hashed)
+        case _:
+            return
+
+
+def _held_files(target: epath.Path, source: str, files: Mapping[str, str]) -> None:
+    from dew.data.text import HELD_FILES
+
+    """`files` of the tokenizer directory `source` written in `target`, `HELD_FILES` naming them last."""
+    for path in files:
+        (target / path).parent.mkdir(parents=True, exist_ok=True)
+        (target / path).write_bytes((Path(source) / path).read_bytes())
+    (target / HELD_FILES).write_text(json.dumps(dict(files), sort_keys=True))
 
 
 def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -614,6 +656,16 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     if isinstance(layout, Mapping) and "name" in layout and "class" not in layout:
         current["layout"] = {"class": f"dew.decision.layout:{named(layout['name'], 'layout.name')}",
                              "fields": named_fields(layout.get("fields", {}), "layout.fields")}
+    tokenizer = current.get("tokenizer")
+    if isinstance(tokenizer, str) and "tokenizer_files" not in current:
+        # A run saved before runs held their tokenizers states no hashes, and may name its tokenizer by the
+        # hub snapshot directory of the host that read it: named as the pinned resolver finds it on any host,
+        # its repo and commit (`dew.data.text.snapshot_here`), fetched where this host's cache lacks it. That
+        # first resolution trusts the hub's files at that commit, which no recorded hash can check; the run
+        # holds them from its next save (`hold_tokenizer`).
+        from dew.data.text import snapshot_here
+
+        current["tokenizer"] = snapshot_here(tokenizer)
     laid = current.get("layout")
     fields = laid.get("fields") if isinstance(laid, Mapping) else None
     if isinstance(laid, Mapping) and isinstance(fields, Mapping) and fields.get("segments") is not None and (
@@ -807,7 +859,8 @@ def saved_settings[SettingsT](record: Mapping[str, object], settings: type[Setti
 class TaskSettings:
     """What every generation run records beside its model: `seq_len`, its training row length,
     `max_new_tokens`, its task's response budget (0 for none), and its host processor's source:
-    `tokenizer` names the run tokenizer (`recorded_tokenizer`) and `processor` a checkpoint's own
+    `tokenizer` says where the run tokenizer is found (`recorded_tokenizer`), `tokenizer_files` what it is,
+    and `processor` a checkpoint's own
     processor source (`recorded_processor`), the run's source's; either may be None. Each task's settings
     add what its generation reads."""
 
@@ -815,6 +868,9 @@ class TaskSettings:
     max_new_tokens: int
     tokenizer: str | None
     processor: SourceReference | None = dataclasses.field(metadata={"derived": "source"})
+    tokenizer_files: Mapping[str, str] | None = dataclasses.field(default=None, metadata={ADDED: True})
+    """What the run tokenizer is: each of its files' hash (`recorded_files`), which the files a load finds
+    where `tokenizer` says they are must hash to; None where a run recorded none, as runs before it."""
 
     def __post_init__(self) -> None:
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 0:
@@ -936,12 +992,24 @@ class RunProcessor:
 def recorded_tokenizer(processor: Processor | None) -> str | None:
     """The tokenizer name a run's record keeps for `processor`, which
     `_saved_processor` rebuilds through `tokenizer_for`: a run tokenizer's
-    own name, byte or Hugging Face. Any other processor records none, and the
+    own name, byte or Hugging Face, which a checkpoint then holds in the run itself
+    (`hold_tokenizer`). Any other processor records none, and the
     run loads as weights that take ids."""
     from dew.data.text import ByteTokenizer, HFTokenizer
 
     if isinstance(processor, RunProcessor) and isinstance(processor.tokenizer, ByteTokenizer | HFTokenizer):
         return processor.tokenizer.name
+    return None
+
+
+def recorded_files(processor: Processor | None) -> Mapping[str, str] | None:
+    """What the Hugging Face tokenizer of `processor` is, as a run's record keeps it: each of its files'
+    hash (`PinnedTokenizer.files`), which a load holds the files it finds to (`HFTokenizer.files`) and runs
+    compare by; None for any other processor."""
+    from dew.data.text import HFTokenizer
+
+    if isinstance(processor, RunProcessor) and isinstance(processor.tokenizer, HFTokenizer):
+        return processor.tokenizer.pinned.files
     return None
 
 
@@ -954,15 +1022,18 @@ def recorded_processor(processor: Processor | None) -> SourceReference | None:
     return processor.source if isinstance(processor, SourceProcessor) else None
 
 
-def _saved_processor(settings: TaskSettings, config: ModelConfig) -> Processor | None:
+def _saved_processor(settings: TaskSettings, config: ModelConfig, run: str) -> Processor | None:
     """Build the run's host processor: the checkpoint's own, reloaded from the
-    source it recorded beside `config`'s model, or its run tokenizer."""
+    source it recorded beside `config`'s model, or its run tokenizer, the copy the run in `run` holds
+    where it holds one (`HFTokenizer.held`)."""
     from dew.data.text import tokenizer_for
     from dew.interop.pretrained import load_processor
 
     if settings.processor is not None:
         return load_processor(settings.processor, config.build())
-    return None if settings.tokenizer is None else RunProcessor(tokenizer_for(settings.tokenizer))
+    found = None if settings.tokenizer is None else tokenizer_for(
+        settings.tokenizer, files=settings.tokenizer_files, held=run)
+    return None if found is None else RunProcessor(found)
 
 
 def resident(model: nn.Module, variables: Variables) -> Variables:
@@ -1034,7 +1105,7 @@ class _NativeTextTask(SavedRunTask, InItsForm):
         model = config.build()
         checked(model, held)
         variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        return model, packed_owned(model, variables), held, _saved_processor(held, config)
+        return model, packed_owned(model, variables), held, _saved_processor(held, config, run.directory)
 
     def _decoded[GenerationT: (Generation, CanvasGeneration)](self, generated: GenerationT) -> GenerationT:
         """`generated` carrying the processor's row decoder, or none without a processor."""

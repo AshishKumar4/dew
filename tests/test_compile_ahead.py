@@ -362,15 +362,23 @@ print(json.dumps({"digest": program_digest(owned_program(checked_module.checked)
 
 def test_a_programs_digest_is_one_in_every_process_and_its_trees_part_programs(tmp_path):
     """A program's digest (`program_digest`) states its trees node by node: a checkified program, whose error
-    tree holds a traceback JAX prints by its address, digests the same in two processes, as its lowered
-    text is the same; and two programs of one text whose trees differ (a mapping of other keys, or of one
+    tree holds a traceback JAX prints by its address and whose frames name where its code is installed,
+    digests the same in two processes of the code installed in two places, as its lowered text is the same,
+    its frames stated by module, line and function (`dew._stated.traceback_frames`), and apart from one
+    whose check sits a line further down, which a kept program's failing check would report;
+    and two programs of one text whose trees differ (a mapping of other keys, or of one
     enumeration's members labelling its results the other way round) digest apart, since an executable
     takes and gives its leaves by its trees."""
     from dew.nn.kernels.options import owned_program, program_digest
 
-    (tmp_path / "checked_module.py").write_text(CHECKED_MODULE)
-    first, second = (process_support.fresh(DIGESTED, cwd=tmp_path)["digest"] for _ in range(2))
-    assert first == second
+    places = [tmp_path / "one", tmp_path / "other" / "install", tmp_path / "moved"]
+    # The third's check a line further down its file.
+    texts = [CHECKED_MODULE, CHECKED_MODULE, CHECKED_MODULE.replace("def _doubled", "\ndef _doubled")]
+    for place, text in zip(places, texts, strict=True):
+        place.mkdir(parents=True)
+        (place / "checked_module.py").write_text(text)
+    first, second, moved = (process_support.fresh(DIGESTED, cwd=place)["digest"] for place in places)
+    assert first == second != moved
     values = jnp.ones(3)
     one = owned_program(lambda tree: tree["a"] * 2).lower({"a": values})
     other = owned_program(lambda tree: tree["b"] * 2).lower({"b": values})
@@ -400,6 +408,8 @@ def test_a_kept_programs_failed_check_raises_where_handed_as_where_kept(tmp_path
 
 
 ORPHANED_START = """
+import atexit
+import os
 import threading
 
 import jax
@@ -409,7 +419,7 @@ from dew.nn.kernels import options
 from dew.nn.kernels.templates import report
 
 # A start's compile, XLA's own, of a program long enough to compile that it is in flight when the run is
-# refused: its thread is shown to have entered XLA's compile, and not to have left it.
+# refused: its thread is shown to have entered XLA's compile.
 begun, ended = threading.Event(), threading.Event()
 compiled = report.attempted
 
@@ -423,6 +433,11 @@ def attempted(lowered, held):
 
 
 report.attempted = attempted
+# Registered before the compile begins, so the exit runs it after its wait for the compile and before JAX's
+# own cleanup: 3 where the compile had ended by then, 5 where the exit went on with it running, and 4 where
+# it had ended before the refusal, whose exit then says nothing of the wait.
+early = threading.Event()
+atexit.register(lambda: os._exit(4 if early.is_set() else 3 if ended.is_set() else 5))
 
 
 def long(x):
@@ -433,20 +448,21 @@ def long(x):
 
 options.compiling(jax.jit(long), jnp.ones(2))
 begun.wait()
-# Refused before its start was taken, with an exit status of its own, its compile still running (else the
-# exit's timing says nothing of it, and the run says so by another status).
-raise SystemExit(4 if ended.wait(0.5) else 3)
+# Refused before its start was taken, its compile still running (else the exit's timing says nothing of it,
+# and the exit hook says so by its own status).
+if ended.wait(0.5):
+    early.set()
+raise SystemExit(1)
 """
 """A run that begins its start's compile beside its planning and is refused before it takes the start."""
 
 
-@pytest.mark.parametrize("run", range(8))
-def test_a_run_refused_before_its_start_is_taken_exits_with_its_refusal_while_its_compile_runs(run):
+def test_a_run_refused_before_its_start_is_taken_exits_once_its_compile_ends():
     """A run whose start's compile is begun beside its planning (`options.compiling`) and which is refused
-    before it takes the start, its compile still running, exits with its refusal's status once that compile
-    ends (`_exit_waits`): JAX's exit cleanup and the C runtime's exit tore XLA down under it, and 12 of 48
-    such exits ended by a segmentation fault (row 6837). A status of 4 says the compile ended before the
-    refusal, and the cell then proves nothing."""
+    before it takes the start, its compile still running, exits once that compile ends, saying it waits:
+    JAX's exit cleanup and the C runtime's exit tore XLA down under the running compile, and 12 of 48 such
+    exits ended by a segmentation fault (row 6837). The child's own exit hook, run after the wait and before
+    JAX's cleanup, states whether the compile had ended: deterministically, where a crash came 1 in 4."""
     import process_support
 
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(process_support.REPO_ROOT / "src"),
@@ -618,6 +634,44 @@ def test_a_program_kept_over_a_numpy_scalar_is_not_handed_for_a_0d_array_of_its_
     programs.save(path)
     with kept(path):
         assert fresh()(Factor(np.array(1, np.float32)), values).tolist() == [3.0] * 3
+
+
+def counting_state(values: jax.Array):
+    """The state of an optimizer whose factory makes its state's class at each call (`counting`), begun for
+    `values`: a program whose results' tree no file of programs states."""
+    from optim_support import counting
+
+    return counting(1e-2).init(values)
+
+
+def test_a_program_whose_trees_no_file_states_compiles_where_programs_are_handed_and_is_kept_by_none(
+        tmp_path):
+    """A program whose results are an optimizer's state of a class its factory makes (`counting`), a node
+    no process names, is one no file of programs holds: a block that keeps programs refuses it, and a block
+    handed a file, or programs compiled ahead, compiles and runs it; a training step over that state
+    compiled ahead is refused (`Unestablished`, which names it). The keeping block pickled the class's
+    tree before stating it, and raised on Python 3.12 (train 964)."""
+    from optim_support import counting
+
+    from dew._stated import Unestablished
+    from dew.nn.kernels.options import owned_program, taking
+    from dew.training.ahead import compile_ahead, keeping, kept
+
+    values = jnp.ones(3)
+    path = tmp_path / "programs.dew-aot"
+    with keeping() as programs:
+        owned_program(counting_state)(values)
+    programs.save(path)
+    assert len(programs.refused) == 1 and programs.kept == {}
+    with kept(path):
+        assert int(owned_program(counting_state)(values).steps) == 0
+    with taking({}):
+        assert int(owned_program(counting_state)(values).steps) == 0
+    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER)
+    trainer = Trainer(LMObjective(model, SEQ_LEN), counting(1e-2), key=jax.random.key(0),
+                      mesh=MeshSpec().build(gpus("sm80")))
+    with pytest.raises(Unestablished):
+        compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
 
 
 @dataclasses.dataclass(frozen=True, eq=False)

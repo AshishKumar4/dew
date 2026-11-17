@@ -41,6 +41,7 @@ from dew.distributed.placement import Layout, MeshSpec, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
+from dew.nn.kernels import options
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
@@ -280,6 +281,68 @@ def lm(split=None, accumulation=1, objective=LMObjective, *, seq=SEQ, width=16, 
                               split=split, accumulation=accumulation))
 
 
+def test_a_step_whose_optimizer_state_is_a_class_made_in_its_factory_plans_and_steps():
+    """A step whose optimizer keeps its state in a class its factory makes, as an optax-style factory may: a
+    node no process names, which no file of programs states, is planned and compiled within this process by
+    the program as JAX holds it (`program_key`), so the run plans and steps, where the plan's key of its
+    executables stated its trees for a file and raised (train 961's F1)."""
+    from optim_support import counting
+
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ)
+    trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), counting(1e-2), key=jax.random.key(0)))
+    state = trained(trainer, steps=2)
+    assert int(state.opt_state.steps) == 2
+
+
+def test_a_second_trainer_of_one_step_plans_on_the_executable_the_first_compiled():
+    """A second trainer of a process, its step the same program on the same devices as an earlier one's,
+    plans on the executable the earlier compiled (`dew.nn.kernels.options.hold`): its plan compiles nothing
+    and reads nothing back from the persistent compilation cache, which the compile telemetry would name
+    (`Compiles`, a backend compile or a cache read alike), where every new trainer read its step back (4.4 s
+    of a small model's 11.9 s start on CPU, row 6995); it steps as the first."""
+    from dew.telemetry.compiles import Compiles
+
+    first = trained(lm(split=1), steps=1)
+    second = lm(split=1)
+    with Compiles(None) as compiles:
+        state = trained(second, steps=1)
+    assert [program.name for program in compiles.programs if program.kind == "compiled"
+            and program.name == "jit(step)"] == []
+    for one, other in zip(jax.tree.leaves(first.variables), jax.tree.leaves(state.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(one), np.asarray(other))
+
+
+def scaled_on_the_host(scale: float) -> optax.GradientTransformation:
+    """Plain descent whose rate a host callback answers (`jax.pure_callback`): `scale` is the callback's
+    closure, so two of other scales trace one program text calling other callbacks."""
+    def update(updates, state, params=None):
+        del params
+        rate = jax.pure_callback(lambda: np.float32(1e-2 * scale), jax.ShapeDtypeStruct((), jnp.float32))
+        return jax.tree.map(lambda update: -rate * update, updates), state
+
+    return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+
+
+def test_a_second_trainer_whose_step_calls_another_host_callback_runs_its_own():
+    """Two trainers of one step whose optimizers differ only in what their host callback answers (a rate
+    `jax.pure_callback` reads from its closure, of one program text) each step by their own callback: the
+    process holds an executable by the callbacks its program calls (`dew.nn.kernels.options.program_key`),
+    where the second ran the first's executable, its rate, a wrong result with nothing to show it (the
+    base review of c5eb090ed's F1)."""
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ)
+
+    def run(scale: float):
+        return one_device(Trainer(LMObjective(model, seq_len=SEQ), scaled_on_the_host(scale),
+                                  key=jax.random.key(0), split=1))
+
+    once, twice = (trained(run(scale), steps=1) for scale in (1.0, 2.0))
+    # From one start over one batch: the second's step at its own rate lands elsewhere.
+    assert not all(np.array_equal(np.asarray(one), np.asarray(two)) for one, two in zip(
+        jax.tree.leaves(once.variables["params"]), jax.tree.leaves(twice.variables["params"]), strict=True))
+
+
 def trained(trainer, steps=3, batch=None):
     """The state after `steps` steps of `batch`, BATCH where None."""
     batch = BATCH if batch is None else batch
@@ -309,6 +372,8 @@ def needs(monkeypatch, trainer, run=None):
         trained(trainer, steps=0)
     else:
         run()
+    # Measured as in a process apart: the run a test then counts compiles nothing of it.
+    options.unhold()
     return LIMIT - trainer.plan["probes"][0]["headroom"]
 
 
@@ -1427,6 +1492,8 @@ def test_a_tight_start_compiles_twice_cold_and_once_warm(monkeypatch, tmp_path, 
     with Compiles("step") as compiles:
         trained(cold_run, steps=0)
     assert compiles.count == cold and cold_run.plan["split"] == between[1]
+    # A warm process: the cold one's record, none of its executables.
+    options.unhold()
     with Compiles("step") as compiles:
         trained(warm, steps=0)
     assert compiles.count == 1 and warm.plan["split"] == between[1]

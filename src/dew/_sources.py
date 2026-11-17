@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import abc
 import dataclasses
+import enum
 import functools
 import importlib.metadata
 import inspect
@@ -14,7 +15,7 @@ import site
 import sys
 import sysconfig
 import types
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
@@ -217,8 +218,8 @@ MISSING = dataclasses.MISSING
 
 class GeneratedField(NamedTuple):
     """A field a class generator (`dataclasses`, attrs) recorded on a class: its name, its default and its
-    default factory, each `MISSING` where it has none, and for an attrs field the rest of what attrs
-    recorded of it (`parts`, `generated_fields`), each by its name; none for a dataclass's."""
+    default factory, each `MISSING` where it has none, and every other part its generator recorded of it
+    (`parts`), each by its name (`generated_fields`)."""
 
     name: str
     default: Any
@@ -251,12 +252,6 @@ def field_names(held: type) -> list[str]:
     return [field.name for field in vars(held)["__attrs_attrs__"]]
 
 
-ATTRS_UNSTATED = frozenset({"name", "default", "counter", "type", "on_setattr"})
-"""An attrs field's parts (its `Attribute`'s slots) `generated_fields` states apart or not at all: its name
-and default (`GeneratedField`'s own), the order attrs counted it in, its annotation, which attrs runs nothing
-of, and its own `on_setattr`, for which the hook the class's generated `__setattr__` runs on it stands."""
-
-
 def _setattr_hooks(held: type) -> Mapping[str, Callable]:
     """The hook the `__setattr__` attrs generated for `held` runs on each field it hooks, by the field's name:
     the field's own `on_setattr` or the class's, held in that method's closure alone (its `sa_attrs`, each
@@ -271,15 +266,109 @@ def _setattr_hooks(held: type) -> Mapping[str, Callable]:
     return {}
 
 
+DATACLASS_OPTIONS = {name: parameter.default for name, parameter
+                     in inspect.signature(dataclasses.dataclass).parameters.items() if name != "cls"}
+"""What `dataclasses.dataclass` makes a class with unless told otherwise (eq, order, frozen, ...), read from
+its signature: a class's departures from it are part of what it is (`generation_options`)."""
+
+ATTRS_COMPARISONS = {"eq": "__eq__", "order": "__lt__"}
+"""An attrs class's comparison options by the method each writes into it, and so whether it was given each:
+attrs makes a class with equality and without ordering unless told otherwise (`attrs.define`'s eq=True,
+order=False)."""
+
+ATTRS_DEFAULTS = {"eq": True, "order": False}
+"""What `attrs.define` makes a class with unless told otherwise, of `ATTRS_COMPARISONS`."""
+
+
+ATTRS_PROPS_UNSTATED = frozenset({"on_setattr_hook", "field_transformer"})
+"""The parts of attrs' record of how it made a class (`__attrs_props__`, attrs 25.4 and later) whose effect
+its fields state: the hook each field's setter runs (`generated_fields`' effective hook) and the fields a
+transformer made."""
+
+
+def generation_options(held: type) -> tuple[tuple[str, bool | str], ...]:
+    """How a class generator made `held` itself, each option by its name, as the generator records it, which
+    with its fields (`generated_fields`) is what the methods it wrote are written from: a dataclass's options
+    apart from `DATACLASS_OPTIONS` (eq, order, frozen, unsafe_hash, ...); an attrs class's every recorded
+    option (`__attrs_props__`: frozen, slotted, hashability, ...) but `ATTRS_PROPS_UNSTATED`, or under an
+    attrs that records none, its equality and ordering by the methods it holds (`ATTRS_COMPARISONS`) apart
+    from `ATTRS_DEFAULTS`. The code it wrote is stated by none of them: attrs writes a process's salted
+    string hash into a hashable class's `__hash__` (train 974's review). Empty for a dataclass made as
+    `dataclasses.dataclass` makes one by default, or a class no generator made (base review of 67fd128db:
+    an eq=False went unstated, and a step comparing its instances read other rows)."""
+    params = vars(held).get("__dataclass_params__")
+    if params is not None:
+        return tuple((name, getattr(params, name)) for name, default in DATACLASS_OPTIONS.items()
+                     if getattr(params, name) != default)
+    props = vars(held).get("__attrs_props__")
+    if props is not None:
+        return tuple((name, _option(getattr(props, name))) for name in vars(type(props))["__slots__"]
+                     if name not in ATTRS_PROPS_UNSTATED)
+    if "__attrs_attrs__" in vars(held):
+        given = {name: vars(held).get(method) is not None for name, method in ATTRS_COMPARISONS.items()}
+        return tuple((name, value) for name, value in given.items() if value != ATTRS_DEFAULTS[name])
+    return ()
+
+
+def _option(value: bool | enum.Enum) -> bool | str:
+    """An option attrs records of a class (`__attrs_props__`) as an identity states it: a flag as it is, a
+    choice of its (`KeywordOnly`, `Hashability`) by its value's name."""
+    return value.name if isinstance(value, enum.Enum) else value
+
+
+def annotation_text(annotation: Hashable) -> str:
+    """An annotation as an identity states it: a string as written, a class by its module and name, any other
+    (a generic alias, a union, a typing form) by the text Python gives it, which names what it holds."""
+    match annotation:
+        case str():
+            return annotation
+        case type() if not isinstance(annotation, types.GenericAlias):
+            return f"{annotation.__module__}.{annotation.__qualname__}"
+        case _:
+            return repr(annotation)
+
+
+def _field_value[Value](name: str, value: Value) -> Value | str | dict:
+    """A part of a field as its generator recorded it, as an identity states it: its annotation as text
+    (`annotation_text`), its metadata as the mapping it is, a dataclass's field kind (a field, a class or an
+    init variable, one of its sentinels) by its name, anything else as it is."""
+    if name == "type" and isinstance(value, Hashable):
+        return annotation_text(value)
+    if isinstance(value, types.MappingProxyType):
+        return dict(value)
+    if type(value).__name__ == "_FIELD_BASE":
+        return str(value)
+    return value
+
+
+ATTRS_UNSTATED = frozenset({"name", "default", "on_setattr"})
+"""An attrs field's parts its `Attribute` records that `generated_fields` states apart: its name, its
+default, split into a default and a factory, and its setter hook, which the hook its class's setter runs on
+it states (`attrs.setters.NO_OP` among them, a bare sentinel no identity names; train 974's review)."""
+
+DATACLASS_UNSTATED = frozenset({"name", "default", "default_factory"})
+"""A dataclass field's parts its `dataclasses.Field` records that `generated_fields` states apart."""
+
+
 def generated_fields(held: type) -> list[GeneratedField]:
     """The fields a class generator recorded on `held` itself, in order, its bases' among them and an
-    override's default its own: a dataclass's (`dataclasses.fields`, its class and init variables, which
-    are no fields, apart) or an attrs class's (`__attrs_attrs__`, a default `attrs.Factory`'s factory its
-    factory, the rest of what attrs recorded of it its parts). Empty for a class no generator made
-    itself."""
+    override's default its own: a dataclass's (`dataclasses.fields`, its class and init variables, which are
+    no fields, apart) or an attrs class's (`__attrs_attrs__`, a default `attrs.Factory`'s factory its
+    factory). Each with every other part its generator records of it (`parts`): every slot of its
+    `dataclasses.Field` or `attrs.Attribute`, by value, whichever this Python and this attrs record (its
+    annotation, keyword-only flag, comparison flags and keys, converter, validator, metadata, alias, ...),
+    so a part added later is stated too, and an attrs field's hook its class's generated `__setattr__` runs.
+    Empty for a class no generator made itself (the evening audit of 2026-11-16: a field's keyword-only
+    flag, a factory's `takes_self` and an annotation a converter reads went unstated; train 955's review: a
+    class-level hook)."""
     if "__dataclass_fields__" in vars(held):
-        return [GeneratedField(field.name, field.default, field.default_factory)
-                for field in dataclasses.fields(held)]
+        found = []
+        for field in dataclasses.fields(held):
+            slots = vars(type(field))["__slots__"]
+            parts = tuple((name, _field_value(name, getattr(field, name)))
+                          for name in slots if name not in DATACLASS_UNSTATED)
+            found.append(GeneratedField(field.name, field.default, field.default_factory, parts))
+        return found
     if attrs_made(held):
         # attrs is loaded where a class of it exists; its sentinel and factory type are its own.
         attr = sys.modules["attr"]
@@ -287,19 +376,14 @@ def generated_fields(held: type) -> list[GeneratedField]:
         found = []
         for field in vars(held)["__attrs_attrs__"]:
             default, factory = field.default, MISSING
+            parts = [(name, _field_value(name, getattr(field, name)))
+                     for name in vars(type(field))["__slots__"] if name not in ATTRS_UNSTATED]
             if isinstance(default, attr.Factory):
+                # A factory by what it calls and whether it is handed the instance it fills.
                 default, factory = MISSING, default.factory
-            # Every other slot of its `Attribute` (converter, validator, eq and order flags and keys, hash,
-            # init, repr, metadata, keyword-only, alias, whatever this attrs records) but `ATTRS_UNSTATED`,
-            # and the hook the class's generated `__setattr__` runs on it, the class's own where the field
-            # sets none (train 955's review: a class-level hook and an `eq=False` went unstated).
-            parts = []
-            for name in vars(type(field))["__slots__"]:
-                if name in ATTRS_UNSTATED:
-                    continue
-                parts.append((name, getattr(field, name)))
+                parts.append(("takes_self", field.default.takes_self))
             if (hook := hooks.get(field.name)) is not None:
-                parts.append(("on_setattr", hook))
+                parts.append(("effective_on_setattr", hook))
             found.append(GeneratedField(field.name, MISSING if default is attr.NOTHING else default, factory,
                                         tuple(parts)))
         return found

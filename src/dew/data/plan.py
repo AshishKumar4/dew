@@ -259,7 +259,9 @@ class StepIdentity:
             if _sources.generated_instance(step)
             else {}
         )
-        if frozen and dataclasses.is_dataclass(step) and not isinstance(step, type):
+        if frozen:
+            # A generated instance (a dataclass's, an attrs class's) by its fields, never its repr, which
+            # elides a long array's middle (train 963's review).
             config = json.dumps(structured(step), sort_keys=True)
         code = (0,) if inspect.isfunction(step) and declared is None and modules else ()
         named = cls(name, config, exact, modules, declared, dependencies, code,
@@ -430,6 +432,16 @@ def _described(value) -> tuple[JSON, bool]:
             held = getattr(value, field.name)
             if field.repr or (field.metadata.get(ADDED) and held != field.default):
                 described[field.name], own = _described(held)
+                alone = alone and own
+        return described, alone
+    if _sources.generated_instance(value):
+        # An attrs class's instance, field by field as its generator records them, each its `repr` shows.
+        kind = type(value)
+        described = {"class": f"{kind.__module__}.{kind.__qualname__}"}
+        alone = True
+        for field in _sources.generated_fields(kind):
+            if dict(field.parts).get("repr", True) is not False:
+                described[field.name], own = _described(getattr(value, field.name, None))
                 alone = alone and own
         return described, alone
     if isinstance(value, _Dependencies):

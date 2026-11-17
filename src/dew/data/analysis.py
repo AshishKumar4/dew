@@ -1095,6 +1095,7 @@ def _checked(
 ) -> bool:
     """Walk the stages once, refusing what no lowering takes where it stands,
     and say whether the order must be cut per share."""
+    from dew.data.handoff import pooled
     random = next((_identity(stage).name for stage in ancestry if isinstance(stage, RandomMap)), None)
     indexed, batched, workers, host = read != "streamed", False, False, False
     canonical = True
@@ -1155,20 +1156,30 @@ def _checked(
             if refused is not None:
                 raise ValueError(f"cache prefix in {name} must hold deterministic record steps and views of "
                                  f"the inputs: {refused}")
+            declared = [_identity(step).name for step in prefix
+                        if isinstance(step, (Map, FlatMap)) and step.pool == "processes"]
+            if declared:
+                raise ValueError(f"cache prefix in {name} holds {declared} on processes of their own, and a "
+                                 "cache fills in its reading process, writing each input as its steps make "
+                                 "it; declare the pool after the cache, or run them on threads "
+                                 "(pool='threads')")
         laid = laid or (read == "memory" and cuts((stage,)) and examples_bound((*ran, *prefix)) is not None)
         if (isinstance(stage, Shuffle) and stage.window is None and stage.streamed is None and not indexed
                 and not promotion and not laid):
             raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window= or streamed=")
         if isinstance(stage, Slice) and not indexed and not promotion:
             raise ValueError(f"{type(stage).__name__} in {name} needs an indexed pipeline")
+        # A stage on a pool of its own hands its records on as its pool makes them: a stream, cut per
+        # share.
+        on_pool = pooled(stage) and index >= eager
         streams = isinstance(stage, (Interleave, Workers, BatchStage, TokenBudget)) or (
             _drops(stage) and index >= eager
-        )
+        ) or on_pool
         # A cache reads as the stages it holds would: by index and in one order where they keep one
         # record for each input, as a stream and per share where they drop or expand them.
         streamed_cache = isinstance(stage, Artifact) and not _indexed_cache(prefix, read)
         indexed = indexed and not (streams or (streamed_cache and read != "memory"))
-        shared = _drops(stage) or isinstance(stage, (Interleave, TokenBudget)) or streamed_cache
+        shared = _drops(stage) or isinstance(stage, (Interleave, TokenBudget)) or streamed_cache or on_pool
         per_share = per_share or shared or (isinstance(stage, Workers) and not batched)
         batched = _check_batch(stage, batched=batched, name=name)
         if isinstance(stage, Workers):

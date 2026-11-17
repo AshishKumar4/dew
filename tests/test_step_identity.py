@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import json
+import os
+import subprocess
 import sys
 from uuid import uuid4
 
@@ -412,7 +415,7 @@ class Plain:
     scale: ClassVar[int] = 1
 
 
-@attrs.define(frozen=True)
+@attrs.define(frozen=True{attrs_eq})
 class Ranged:
     span: int = {span}
     marks: list = attrs.Factory(lambda: [{mark}])
@@ -461,6 +464,43 @@ class Keyed:
         attrs.validators.instance_of({kinds}), attrs.validators.ge(0)))
 
 
+@dataclasses.dataclass(frozen=True, eq={eq})
+class Compared:
+    value: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class Fielded:
+    value: int = dataclasses.field(default=1, compare={compare})
+    other: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class KeywordOnly:
+    value: int = dataclasses.field(default=1, kw_only={keyword})
+
+
+@attrs.define(frozen=True)
+class SelfMade:
+    made: list = attrs.Factory(lambda *handed: [len(handed)], takes_self={takes_self})
+
+
+@attrs.define(frozen=True)
+class Typed:
+    value: {annotation} = attrs.field(default=2, converter=attrs.Converter(
+        lambda value, field: value * (2 if field.type is int else 3), takes_field=True))
+
+
+@attrs.define(frozen=True)
+class Aliased:
+    value: int = attrs.field(default=1, alias="{alias}")
+
+
+@attrs.define
+class Untouched:
+    value: int = attrs.field(default=1, on_setattr=attrs.setters.NO_OP)
+
+
 @dataclasses.dataclass(frozen=True)
 class Shifting:
     held: object = Holder()
@@ -472,17 +512,22 @@ class Shifting:
                  + Plain.by * Plain.scale + Ranged().span + Ranged().marks[0] + Ranged().scaled
                  + hooked.scaled + int(Keyed(1) == Keyed(3)) + int(Keyed(1) < Keyed(3)) + Keyed(1).checked
                  + classhooked.scaled + int(Flagged(1) == Flagged(3)) + int(HELD is not None)
-                 + Piped().value + self.held.count)
+                 + int(Compared() == Compared()) + int(Fielded(1) == Fielded(3)) + int(Ranged() == Ranged())
+                 + Piped().value + self.held.count + len(KeywordOnly.__match_args__) + SelfMade().made[0]
+                 + Typed().value + Aliased(**{{Aliased.__attrs_attrs__[0].alias: 4}}).value
+                 + Untouched().value)
         return {{**row, "id": row["id"] + total}}
 """
 """A class step of the user's file building classes generators made, each with a default or a factory its
 code reads: a slotted dataclass's field and its name-mangled field, a slotted child's override of its base's
 default, a default factory, plain or slotted, a plain dataclass's default and class variable, an attrs class's
-default, factory, converter, setter hook, eq and order keys and validators of attrs' own."""
+default, factory, converter, setter hook, eq and order keys and validators of attrs' own, and a field attrs'
+setter leaves as it is (`attrs.setters.NO_OP`)."""
 
 GENERATED_AT = {"by": 1, "scale": 1, "over": 20, "value": 3, "slots": "", "span": 2, "mark": 5, "factor": 7,
                 "hook": 7, "modulus": 2, "sign": 1, "kinds": "int", "classhook": 7, "flag": "True",
-                "pipe": 3}
+                "eq": "True", "compare": "True", "pipe": 3, "attrs_eq": "", "keyword": "False",
+                "takes_self": "False", "annotation": "int", "alias": "value"}
 
 
 @pytest.mark.parametrize(("edit", "assigned"), [
@@ -490,14 +535,16 @@ GENERATED_AT = {"by": 1, "scale": 1, "over": 20, "value": 3, "slots": "", "span"
     ({"value": 55, "slots": ", slots=True"}, None), ({"span": 200}, None), ({"mark": 500}, None),
     ({"factor": 70}, None), ({"hook": 70}, None), ({"modulus": 20}, None), ({"sign": -10}, None),
     ({"kinds": "(int, float)"}, None), ({"classhook": 70}, None), ({"flag": "False"}, None),
-    ({"pipe": 30}, None),
-    ({}, ("by", 10)), ({}, ("scale", 10))],
+    ({}, ("by", 10)), ({}, ("scale", 10)), ({"eq": "False"}, None), ({"compare": "False"}, None),
+    ({"pipe": 30}, None), ({"attrs_eq": ", eq=False"}, None), ({"keyword": "True"}, None),
+    ({"takes_self": "True"}, None), ({"annotation": "float"}, None), ({"alias": "renamed"}, None)],
     ids=["slotted field", "mangled field", "slotted child's override", "factory", "slotted factory",
          "attrs default", "attrs factory", "attrs converter", "attrs setter hook", "attrs eq key",
          "attrs order key", "attrs validators", "attrs class setter hook", "attrs eq flag",
-         "attrs nested converter",
-         "a default set at run time",
-         "a class variable set at run time"])
+         "a default set at run time", "a class variable set at run time", "dataclass eq option",
+         "dataclass field compare flag", "attrs nested converter", "attrs eq option",
+         "dataclass keyword-only field", "attrs factory taking self", "attrs annotation a converter reads",
+         "an attrs field part named nowhere (its alias)"])
 def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factory_changed(
         tmp_path, monkeypatch, edit, assigned):
     """A step of a class of the user's file, stated by its members, whose code builds classes of the file
@@ -510,8 +557,15 @@ def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factor
     and eq and order keys, which its generated methods hold; its validators of attrs' own (`instance_of`,
     `and_`) made the step inexact, refusing an unchanged exact resume (train 953's); a class-level setter
     hook and a field's eq flag went unstated, and an unset field of an attrs instance the step reads crashed
-    its statement (train 955's); a converter nested in `pipe` left the step inexact, and so did an attrs
-    instance the step's dataclass holds (train 957's)."""
+    its statement (train 955's); a dataclass's eq option and a field's compare flag, which decide what its
+    comparisons read, went unstated, the resume reading other rows (the base review of 67fd128db); a
+    converter nested in `pipe` left the step inexact, and so did an attrs instance the step's dataclass
+    holds (train 957's). A dataclass field's keyword-only flag, which its
+    generated `__init__` and `__match_args__` read, an attrs factory's `takes_self` and an annotation a
+    converter reads went unstated, each a part of a field no hand list named (the evening audit of
+    2026-11-16); every part is stated now, an attrs field's alias among them, which no code of Dew names. A
+    field whose setter attrs leaves as it is (`attrs.setters.NO_OP`, a bare sentinel) left the step inexact,
+    refusing an unchanged exact resume (train 974's review)."""
     module = tmp_path / f"generated_{uuid4().hex}.py"
     # Saved and edited under the same slotting, so an edit changes the factory alone.
     start = {**GENERATED_AT, **{name: value for name, value in edit.items() if name == "slots"}}
@@ -535,6 +589,37 @@ def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factor
         resumed_changes(reader(), state)
     (changed,) = resumed_changes(reader("relaxed"), state)
     assert changed.startswith("code.")
+
+
+STATED_IN_A_PROCESS = """import importlib
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from dew.data.plan import StepIdentity
+
+identity = StepIdentity.of(importlib.import_module(sys.argv[2]).Shifting())
+print(json.dumps([identity.exact, identity.config, list(identity.held), list(identity.code)]))
+"""
+
+
+def test_a_generated_classs_step_is_stated_alike_in_processes_of_different_string_hashing(tmp_path):
+    """The step of `GENERATED`, which reaches hashable attrs classes, is stated alike, exactly, by two fresh
+    processes of different string hashing, so a position one saves resumes exactly in the other. attrs
+    writes a hashable class's `__hash__` with this process's salted string hash, and the generated
+    methods' code was stated, differing in every process: an exact resume of an unchanged pipeline was
+    refused (train 974's review)."""
+    module = tmp_path / f"generated_{uuid4().hex}.py"
+    module.write_text(GENERATED.format(**GENERATED_AT))
+    stated = []
+    for seed in ("1", "2"):
+        done = subprocess.run([sys.executable, "-c", STATED_IN_A_PROCESS, str(tmp_path), module.stem],
+                              capture_output=True, text=True, check=False,
+                              env={**os.environ, "PYTHONHASHSEED": seed, "JAX_PLATFORMS": "cpu"})
+        assert done.returncode == 0, done.stderr[-3000:]
+        stated.append(json.loads(done.stdout.strip().splitlines()[-1]))
+    assert stated[0] == stated[1]
+    assert stated[0][0] is True
 
 
 SCRIPTED = """import dataclasses
@@ -641,13 +726,11 @@ def test_a_notebooks_step_compiles_and_reads_its_rows(monkeypatch):
     assert loader.plan is not None and not loader.plan.manifest.exact
 
 
-@pytest.mark.parametrize("saved", ["without held", "held in its code list", "held apart",
-                                   "reached as before"])
+@pytest.mark.parametrize("saved", ["without held", "held in its code list", "held apart"])
 def test_a_position_saved_before_reached_code_is_held_to_what_it_saved(tmp_path, monkeypatch, saved):
     """A position saved before steps' reached code was saved under its own key (`reached`): one saved before
     any held code (`without held`), one main saved for an hour with each step's class text appended to its
-    code list (`held in its code list`), one saved since with it under `held` (`held apart`) and one saved
-    with the code it reaches stated as Dew stated it before (`reached as before`, `REACHED_AS`) hold nothing
+    code list (`held in its code list`) and one saved since with it under `held` (`held apart`) hold nothing
     that proves the code the step reaches unchanged, so an exact resume is refused, changed or not, and a
     relaxed one reads on naming the step (Main: missing evidence is not proof of unchanged code; train 909's
     F8: the class text read as changed code)."""
@@ -663,14 +746,12 @@ def test_a_position_saved_before_reached_code_is_held_to_what_it_saved(tmp_path,
         return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
 
     place = json.loads(saved_after_one(reader))[_position.ENVELOPE]
-    plan = {name: value for name, value in place["plan"].items() if name not in ("reached", "reached_as")}
+    plan = {name: value for name, value in place["plan"].items() if name != "reached"}
     if saved == "held in its code list":
         plan["code"] = [[*code, *held] for code, held in zip(plan["code"], place["plan"]["reached"],
                                                                strict=True)]
     if saved == "held apart":
         plan["held"] = place["plan"]["reached"]
-    if saved == "reached as before":
-        plan["reached"] = place["plan"]["reached"]
     position = json.dumps({_position.ENVELOPE: {**place, "plan": plan}}).encode()
     with pytest.raises(ValueError):
         resumed_changes(reader(), position)
@@ -762,103 +843,52 @@ def test_an_exact_resume_holds_the_code_a_steps_methods_reach(tmp_path, monkeypa
     assert changed.startswith("code.")
 
 
-HELPERS = """import re
-from pathlib import Path
+REMAPPED = """import attrs
+import dataclasses
 
-ROOT = Path("/data")
-PATTERN = re.compile("[a-z]+")
-WORDS = {{2, 3, 5, 7, 11, 13}}
+import numpy as np
 
 
-def delta():
-    return {by}
+@attrs.define(frozen=True, eq=False)
+class Remap:
+    table: np.ndarray
+
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + int(self.table[int(row["id"])])}}
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class Holding:
+    remap: Remap
+
+    def __call__(self, row):
+        return self.remap(row)
+
+
+def step(changed, held):
+    table = np.arange(2000)
+    if changed:
+        table[1000] = -1
+    return Holding(Remap(table)) if held else Remap(table)
 """
 
 
-def _held_in_a_process(directory, seed: str) -> str:
-    """The held code of a function step that names `HELPERS`' module, read in a fresh process whose string
-    hashing is seeded by `seed`."""
-    import json
-    import os
-    import subprocess
-    import sys
-
-    script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import helping, stepping; "
-              "from dew.data.plan import StepIdentity; "
-              "named = StepIdentity.of(stepping.shifted); print(json.dumps([named.exact, list(named.held)]))")
-    ran = subprocess.run([sys.executable, "-c", script, str(directory)], capture_output=True, text=True,
-                         check=True, env={**os.environ, "PYTHONHASHSEED": seed})
-    return json.loads(ran.stdout.splitlines()[-1])
-
-
-def test_a_function_step_naming_a_module_is_held_by_what_it_reads_of_it_alike_in_every_process(tmp_path):
-    """A function step that names a module of the user's (`helping.delta()`, `helping.WORDS`) is held by the
-    attributes it reads of it, alike in two processes of other string hashing (a set of numbers, whose order
-    no hash seed decides, stated in the order it holds them, which the code may read), and exact beside
-    members it never reads that no statement holds (a path, a compiled pattern); `delta` changed, its held
-    code changes. The module's every member was stated, its pattern refusing the step (train 912's review,
-    F4)."""
-    (tmp_path / "helping.py").write_text(HELPERS.format(by=1))
-    (tmp_path / "stepping.py").write_text(
-        "import helping\n\n\ndef shifted(row):\n"
-        "    return {**row, 'id': row['id'] + helping.delta() + len(helping.WORDS)}\n")
-    first, second = (_held_in_a_process(tmp_path, seed) for seed in ("1", "2"))
-    assert first == second and first[0] is True and first[1]
-    (tmp_path / "helping.py").write_text(HELPERS.format(by=10))
-    assert _held_in_a_process(tmp_path, "1")[1] != first[1]
-
-
-@pytest.mark.parametrize("holder", [
-    "def shifted(row, settings=helping):\n    return {**row, 'id': row['id'] + settings.delta()}\n",
-    "import dataclasses\n\n\n@dataclasses.dataclass(frozen=True)\nclass Holding:\n    settings = helping\n\n"
-    "    def __call__(self, row):\n        return {**row, 'id': row['id'] + self.settings.delta()}\n\n\n"
-    "shifted = Holding()\n",
-    "def shifted(row, settings=(helping,)):\n    return {**row, 'id': row['id'] + settings[0].delta()}\n",
-    "import dataclasses\n\n\n@dataclasses.dataclass(frozen=True)\nclass Settings:\n    modules: tuple\n\n\n"
-    "SETTINGS = Settings((helping,))\n\n\n"
-    "def shifted(row):\n    return {**row, 'id': row['id'] + SETTINGS.modules[0].delta()}\n",
-], ids=["a default", "a class attribute", "a container", "a record of the user's"])
-def test_a_step_reading_a_module_it_holds_holds_what_it_reads_of_it(tmp_path, holder):
-    """A step that reads a module of the user's it holds, through a default argument (`settings=helping`),
-    a class attribute (`settings = helping`), a container (`settings=(helping,)`) or a record of the
-    user's whose field holds it (`SETTINGS.modules[0]`, the head review's round 2 F7), holds the attributes
-    it names of it, as one reading it by a
-    global does: `helping.delta` changed, the step's held code changes. The module was stated by its name
-    alone, the step exact across the change (the round-2 review's F4, train 921's review's F9)."""
-    (tmp_path / "helping.py").write_text(HELPERS.format(by=1))
-    (tmp_path / "stepping.py").write_text("import helping\n\n\n" + holder)
-    first = _held_in_a_process(tmp_path, "1")
-    assert first[0] is True
-    (tmp_path / "helping.py").write_text(HELPERS.format(by=10))
-    assert _held_in_a_process(tmp_path, "1")[1] != first[1]
-
-
-READING = {"a computed name": ("def read(row):\n    return getattr({settings}, 'scale')\n", "read"),
-           "a class's default": ("import dataclasses\n\n\n@dataclasses.dataclass(frozen=True)\n"
-                                 "class Reading:\n    settings: object = {settings}\n\n"
-                                 "    def __call__(self, row):\n        return row + self.settings.scale\n",
-                                 "Reading")}
-"""Code of the user's reading a module of the user's other than by the names its own code states: by a name it
-computes (`getattr`), and through a class's field default its methods read an attribute of."""
-
-
-@pytest.mark.parametrize("reading", READING)
-def test_a_module_read_past_its_codes_own_names_is_stated_by_what_is_read(tmp_path, monkeypatch, reading):
-    """Code of the user's that reads a module of the user's by a name it computes (`getattr(settings,
-    "scale")`), or through a dataclass's field default its method reads an attribute of
-    (`self.settings.scale`), is stated with that attribute: set on the module at run time, its file
-    unchanged, the statement changes. Filtered to the names its code reads, the statement held none of it
-    (the round-3 head review's F11), and the default was stated without its methods' names, the module by
-    its name alone (the round-4's F2)."""
-    from dew._stated import stated
-
-    text, name = READING[reading]
-    settings = tmp_path / f"settings_{uuid4().hex}.py"
-    settings.write_text("scale = 1\n")
-    user = tmp_path / f"user_{uuid4().hex}.py"
-    user.write_text(f"import {settings.stem}\n\n\n" + text.format(settings=settings.stem))
+@pytest.mark.parametrize("held", [False, True], ids=["attrs step", "dataclass holding an attrs instance"])
+def test_an_exact_resume_refuses_an_attrs_step_whose_long_array_changed(tmp_path, monkeypatch, held):
+    """An attrs step holding an array of 2000 entries, or a dataclass step holding it, is stated by its
+    fields, each array by its content: one entry changed past its repr's elision refuses an exact resume,
+    and the unchanged step resumes exactly. Its repr, which elides an array's middle past 1000 entries,
+    stated it and the changed step resumed (train 963's review)."""
+    module = tmp_path / f"remapped_{uuid4().hex}.py"
+    module.write_text(REMAPPED.format())
     monkeypatch.syspath_prepend(str(tmp_path))
-    held, reader = importlib.import_module(settings.stem), importlib.import_module(user.stem)
-    before = stated(vars(reader)[name], "step")
-    held.scale = 2
-    assert stated(vars(reader)[name], "step") != before
+    remapped = importlib.import_module(module.stem)
+
+    def reader(changed=False):
+        pipeline = Pipeline(ROWS).map(remapped.step(changed, held)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(changed=True), state)

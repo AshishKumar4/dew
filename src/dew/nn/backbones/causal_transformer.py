@@ -2408,6 +2408,12 @@ class CausalTransformer(LinearProducts):
         return decoder_refusals.forked(self, train)
 
     @nn.nowrap
+    def prefix_sharing_refusal(self, train: bool = False) -> str | None:
+        """Why rows that begin alike should not be packed over their shared prefixes, in training where
+        `train` (`decoder_refusals.prefix_sharing`)."""
+        return decoder_refusals.prefix_sharing(self, train)
+
+    @nn.nowrap
     def split_prefill_refusal(self) -> str | None:
         """Why a prompt's later piece would not read what its whole prefill reads
         (`decoder_refusals.split_prefill`)."""

@@ -135,7 +135,7 @@ def _shown(log: float) -> str:
 def _scaled_rms(rows, xp=np):
     """Each row's root mean square of finite values, the row scaled by its largest first, so no square
     overflows (row 1628): zero for a row of zeros. In numpy, or in `xp` (jax.numpy, inside check 1's
-    programs on a GPU, `reference_error._computed_here`)."""
+    programs, `_computed_here`)."""
     rows = xp.abs(xp.asarray(rows, xp.float64))
     largest = xp.max(rows, axis=1, keepdims=True) if rows.shape[1] else xp.zeros((len(rows), 1))
     scale = xp.where(largest > 0, largest, 1.0)
@@ -879,8 +879,10 @@ def log_mean_square(errors, xp=np):
     largest = xp.max(xp.abs(errors))
     finite = xp.isfinite(largest) & (largest > 0)
     held = xp.where(finite, largest, 1.0)
-    scaled = 2 * xp.log(held) + xp.log(xp.mean(xp.square(errors / held)))
-    return xp.where(finite, scaled, xp.where(largest == 0, -xp.inf, 2 * xp.log(largest)))
+    # Each case's logs of its own operands alone: a zero's -inf selected, never computed (NumPy warns of it).
+    scaled = 2 * xp.log(held) + xp.log(xp.where(finite, xp.mean(xp.square(errors / held)), 1.0))
+    unscaled = 2 * xp.log(xp.where(largest == 0, 1.0, largest))
+    return xp.where(finite, scaled, xp.where(largest == 0, -xp.inf, unscaled))
 
 
 def _largest_share(rows, xp=np):
