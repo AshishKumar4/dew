@@ -1681,16 +1681,18 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
         return held.tokens, held.raw_log_probs
 
     def by_itself(dtype):
+        # Each adapter's task widened once for every draw, where each draw's every request widened and
+        # placed its variables again (row 7446).
+        tasks = alone if dtype == "float32" else {
+            name: dataclasses.replace(task, model=task.model.clone(dtype=jnp.float64),
+                                      variables=widened(task.variables)) for name, task in alone.items()}
+
         @as_given
         def drawn_alone(keys):
             out = []
             for prompt, name, key in zip(prompts, names, keys, strict=True):
-                task = alone[name]
-                if dtype == "float64":
-                    task = dataclasses.replace(task, model=task.model.clone(dtype=jnp.float64),
-                                               variables=widened(task.variables))
                 with jax.enable_x64(new_val=dtype == "float64"):
-                    out.append(drawn_of(task(np.asarray([prompt]), 6, key=int(key))))
+                    out.append(drawn_of(tasks[name](np.asarray([prompt]), 6, key=int(key))))
             return tuple(out)
 
         return drawn_alone
