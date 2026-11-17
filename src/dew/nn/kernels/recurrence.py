@@ -33,6 +33,7 @@ from dew.nn.precision import (
     l2norm,
     rms_statistics,
     rms_weighted,
+    softplus,
     stochastic_bf16,
 )
 
@@ -196,7 +197,7 @@ def _held(updated, key, value, dtype):
 
 def _gated_decay(gate, log_a, bias):
     """The gates' log decay `-exp(log_a) softplus(gate + bias)`, in the operands' dtype."""
-    return -jnp.exp(log_a) * jax.nn.softplus(gate + bias)
+    return -jnp.exp(log_a) * softplus(gate + bias)
 
 
 def gated(gates: Gates, gate, log_a, bias, beta):
@@ -205,7 +206,7 @@ def gated(gates: Gates, gate, log_a, bias, beta):
     Mamba2's (`-exp(log_a)` times the clipped step, and the step)."""
     if gates.write == 'sigmoid' and gates.limit is None:
         return _gated_decay(gate, log_a, bias), jax.nn.sigmoid(beta)
-    step = jax.nn.softplus(gate + bias)
+    step = softplus(gate + bias)
     if gates.limit is not None:
         step = jnp.clip(step, *gates.limit)
     return -jnp.exp(log_a) * step, step if gates.write == 'step' else jax.nn.sigmoid(beta)
