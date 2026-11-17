@@ -494,9 +494,21 @@ def test_a_unet_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp
                          ids=cell_ids(HIERARCHICAL_MMDIT_CELLS))
 @pytest.mark.check1_shards(seeds=8, per_task=3)
 def test_a_hierarchical_mmdit_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
-    """`test_architecture_trains_on_every_layout_as_on_one_device` over the hierarchical
-    MMDiT."""
-    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the hierarchical MMDiT, its arms'
+    `fit` checked by a test of their own (`test_a_hierarchical_mmdit_fits_as_its_drawn_steps`): a map task
+    of one draw took 261 to 375 s and the one beside the layout's `fit` 608 s (train CI at de27b8e32, row
+    7457), its fixed cost the arms' programs and the fit's checkpoints and evaluations."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path, fits=False)
+
+
+@pytest.mark.parametrize("arm", ["one device", "layout"])
+@pytest.mark.parametrize(("case", "steps", "layout"), HIERARCHICAL_MMDIT_CELLS,
+                         ids=cell_ids(HIERARCHICAL_MMDIT_CELLS))
+def test_a_hierarchical_mmdit_fits_as_its_drawn_steps(case, steps, layout, arm, tmp_path):
+    """The hierarchical MMDiT's `fit`, on one device and on each layout, leaves what its drawn steps leave
+    on the cell's own batch (`assert_fits_as_drawn`): what its check 1 judges is the run's
+    (`test_a_hierarchical_mmdit_trains_on_every_layout_as_on_one_device`), each arm a test of its own."""
+    assert_fits_on_the_layout(case, steps, layout, arm == "layout", tmp_path)
 
 
 @pytest.mark.parametrize(("case", "steps", "layout"), QWEN35_CELLS, ids=cell_ids(QWEN35_CELLS))
@@ -542,9 +554,10 @@ def test_a_glm4_moe_decoder_trains_on_every_layout_as_on_one_device(case, steps,
     assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
 
 
-def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
+def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path, *, fits: bool = True):
     """A cell of `test_architecture_trains_on_every_layout_as_on_one_device`: `case` trained `steps` steps
-    on `layout` as on one device (check 1)."""
+    on `layout` as on one device (check 1), each arm's `fit` checked beside its draws where `fits`, else
+    by a test of its own (`assert_fits_on_the_layout`)."""
     trainer, encoder = make_trainer(case, tmp_path / "initial", MeshSpec(), devices=1)
     initial = trainer.initial_state()
 
@@ -585,9 +598,11 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
     # Each arm's steps on the cell's own batch in its own order, run first, so each compiles here as `fit`
     # compiles its own and not under the draws' contexts: what `fit` is checked against.
     own = (next(batches(case, encoder)()), np.arange(width))
-    ran = {} if judging() else {arm: stepped(*own) for arm, stepped in drawn.items()}
+    ran = {} if judging() or not fits else {arm: stepped(*own) for arm, stepped in drawn.items()}
     assert_as_exact(drawn[layout], drawn["one device"], draw, label, seeds=seeds, truth_fn=truth,
                     orders=orders)
+    if not fits:
+        return
     fits = f"{label}: fit's own steps and placement"
     arms = {"one device": (MeshSpec(), 1, 0), layout: (mesh, None, seeds - 1)}
 
@@ -607,6 +622,20 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
     if pooled is not None:
         held = sorted(arm for arms in pooled for arm in arms)
         assert held == sorted(drawn), f"{fits}: the map tasks held {held}, not every arm"
+
+
+def assert_fits_on_the_layout(case, steps, layout, placed: bool, tmp_path):
+    """One arm's `fit` of a cell of `test_architecture_trains_on_every_layout_as_on_one_device` against its
+    drawn steps on the cell's own batch (`assert_fits_as_drawn`), as the cell checks it beside its draws:
+    the layout's where `placed`, else one device's."""
+    trainer, encoder = make_trainer(case, tmp_path / "initial", MeshSpec(), devices=1)
+    initial = trainer.initial_state()
+    width = residual_width(initial.variables, trainer.objective.parameter_axes) if case.is_lm else 0
+    mesh, devices = (LAYOUTS[layout], None) if placed else (MeshSpec(), 1)
+    ours = drawn_steps(case, tmp_path, mesh, devices, initial, steps)(next(batches(case, encoder)()),
+                                                                        np.arange(width))
+    assert_fits_as_drawn(case, tmp_path, mesh, devices, jax.tree.map(jnp.copy, initial), steps, ours,
+                         placed=placed)
 
 
 def assert_fits_as_drawn(case, tmp_path, mesh: MeshSpec, devices, state, steps: int, ours, *, placed: bool):
