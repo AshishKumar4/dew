@@ -335,6 +335,88 @@ def test_two_sums_join_into_one_where_the_model_prices_it_cheaper():
                     "two sums", seeds=16)
 
 
+def _clamped_products(x, a, b, lower, upper, operand=jnp.tanh):
+    """A clamped value (of `operand(x)`) read by two products of bounded values, which the pass joins into
+    one product of their sum."""
+    clamped = jax.lax.clamp(lower, operand(x), upper)
+    return jnp.sum(clamped * jnp.tanh(a), axis=-1) + jnp.sum(clamped * jnp.tanh(b), axis=-1)
+
+
+CLAMP_EDGES = np.asarray([np.inf, -np.inf, 0.0, -0.0, 0.3, 1.0, -2.0, 5.0, 2.0 ** -140], np.float32)
+"""A clamp's operands at its edges: both infinities, signed zeros (a bound at 0's), values between, on and
+past bounds of 0 and 1, and a subnormal; a NaN beside them in one row of their program (`_clamp_edges`)."""
+
+
+def _clamp_edges() -> jax.Array:
+    """`CLAMP_EDGES` over a 64 by 128 program, a NaN in its first row alone, so every other row's sums are
+    finite and the first's carries the NaN through."""
+    edges = np.resize(CLAMP_EDGES, (64, 128))
+    edges[0, 0] = np.nan
+    return jnp.asarray(edges)
+
+
+def _clamp_draw(seed: int) -> tuple[jax.Array, ...]:
+    """A clamp's finite edges and bounds (0, 1, and +-0.5) beside drawn values, over a 64 by 128 program, and
+    the two products' operands."""
+    rng = np.random.default_rng(seed)
+    finite = CLAMP_EDGES[np.isfinite(CLAMP_EDGES)]
+    x = rng.choice(np.concatenate([finite, [0.5, -0.5], rng.standard_normal(16)]), (64, 128))
+    return (jnp.asarray(x, jnp.float32), *rows(seed, (64, 128), (64, 128)))
+
+
+@pytest.mark.parametrize("bounds", ["scalar", "crossed", "array", "of an unbounded operand"])
+def test_a_rewritten_clamps_derivative_is_zero_at_its_bounds_and_its_program_on_par(bounds):
+    """A clamp is an operation of its own (`Term.clamp`), emitted as itself: the pass joins two products a
+    clamped value is read by, scalar, crossed (lower above upper) and array bounds, and of an operand nothing
+    bounds (a clamp is bounded by its bounds alone, an infinity clamped to one). Its derivative is zero
+    exactly wherever the written program's is, at a bound and past one, and a NaN where it is one, over the
+    clamp's edges (a maximum and a minimum would halve it at a bound: 0.76 where it is 0, row 7286's
+    finding); the rewritten program and its gradient are on par with the written ones (check 1)."""
+    x = _clamp_edges()
+    a, b = rows(5, x.shape, x.shape)
+    def scalars(*values):
+        return lambda a, b: tuple(jnp.asarray(value, a.dtype) for value in values)
+
+    # The bounds in the operands' dtype (a clamp's are its operand's), check 1's truth's float64 among them.
+    bounded = {"scalar": scalars(0, 1), "crossed": scalars(1, 0),
+               # Bounds of their own values, bounded (a clamp's magnitude is its bounds'), x's shape.
+               "array": lambda a, b: (-0.5 * jnp.abs(jnp.tanh(b)), jnp.abs(jnp.tanh(a))),
+               "of an unbounded operand": scalars(-0.5, 0.5)}[bounds]
+    operand = (lambda x: x) if bounds == "of an unbounded operand" else jnp.tanh
+
+    def clamped(x, a, b):
+        return _clamped_products(x, a, b, *bounded(a, b), operand=operand)
+
+    def gradient(form):
+        return jax.grad(lambda x, a, b: jnp.sum(form(x, a, b)))
+
+    assert cheaper_spliced(clamped, x, a, b)
+    rewritten = algebra.rewritten(clamped)
+    found, wanted = (np.asarray(jax.jit(gradient(form))(x, a, b)) for form in (rewritten, clamped))
+    held = wanted == 0
+    np.testing.assert_array_equal(found[held], wanted[held])
+    np.testing.assert_array_equal(np.isnan(found), np.isnan(wanted))
+    for arm, reference in ((rewritten, clamped), (gradient(rewritten), gradient(clamped))):
+        assert_as_exact(jax.jit(arm), jax.jit(reference), _clamp_draw, f"a clamp's products, {bounds}",
+                        seeds=16)
+
+
+def test_a_clamp_is_priced_as_a_maximum_and_a_minimum_of_its_operand_read_once():
+    """A clamped value's price (`cost.work`) is its operand's and two operations an element, a maximum's and
+    a minimum's, its operand read once: as an operation the language did not speak, a clamp was a leaf of its
+    own, its output read again and none of its arithmetic counted (row 7286)."""
+    def priced(fn):
+        region = terms.region(jax.make_jaxpr(fn)(jnp.ones((64, 128), jnp.float32)))
+        graph, bundle, _ = program.graphed(region)
+        _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                                 cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
+        return price.work
+
+    plain = priced(jnp.tanh)
+    clamped = priced(lambda x: jax.lax.clamp(np.float32(-0.5), jnp.tanh(x), np.float32(0.5)))
+    assert (clamped.operations - plain.operations, clamped.device_bytes) == (2 * 64 * 128, plain.device_bytes)
+
+
 def test_products_with_a_shared_operand_join_into_one():
     """Two matrix products with one shared operand (`dot_general`), summed, are spliced into a form the model
     prices cheaper (one product of the shared operand with the summed other), their operands bounded
