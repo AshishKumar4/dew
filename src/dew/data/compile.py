@@ -61,6 +61,7 @@ from dew.data.analysis import (
     _volatile,
     _written,
     reach,
+    rejects,
     same_stage,
     written,
 )
@@ -482,20 +483,14 @@ def _one_example_until(pipeline: Pipeline, *, passes: bool = False) -> int:
     step that packs or windows records or makes several rows of each (`_expands`), else its batch's, else
     its end. A bound in examples stands there (`_bounded`), and a memory read's epochs are bounded ahead of
     it (`_held_ahead`). With `passes`, where a pass of a run's epochs is counted (`_pass_examples`) and
-    bounded: also before the first step that rejects a record it cannot make (`_rejects`: an image that
+    bounded: also before the first step that rejects a record it cannot make (`rejects`: an image that
     does not decode), so a pass is one walk over the source's records, each read whether or not it decoded,
     its consumption carried on by the next row kept and its rejection counted (`data/rejected/`); a run
     bounded in examples counts those it kept."""
     batched = _until(pipeline.stages, (BatchStage, TokenBudget))
     return next((index for index, stage in enumerate(pipeline.stages[:batched])
-                 if isinstance(stage, (Pack, Windows)) or _expands(stage) or (passes and _rejects(stage))),
+                 if isinstance(stage, (Pack, Windows)) or _expands(stage) or (passes and rejects(stage))),
                 batched)
-
-
-def _rejects(stage: Stage) -> bool:
-    """Whether `stage` drops a record it cannot make (`rejects`: a decode's failure), keeping every other
-    one for one."""
-    return isinstance(stage, (Map, MapWithIndex, RandomMap)) and stage.rejects
 
 
 def _lays_out(pipeline: Pipeline) -> bool:
@@ -705,7 +700,7 @@ def _measure(
     ahead = None if epochs is None or not training else _held_ahead(branches[0], read)
     examples = _UNCOUNTED if ahead is not None else examples
     if examples is not None and training:
-        branches = (_bounded(branches[0], examples, passes=ahead is not None), *branches[1:])
+        branches = (_bounded(branches[0], examples), *branches[1:])
         if ahead == "layout":
             branches = (_rebound(branches[0], _UNCOUNTED, epochs), *branches[1:])
     if any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch)):
@@ -859,7 +854,7 @@ def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective
     since = Mirrored.now()
     written = None if examples is None or not _lays_out(train) else examples
     if written is not None:
-        train = _bounded(train, written, passes=epochs is not None)
+        train = _bounded(train, written)
     counts: dict[str, CorpusCounts] = {}
     validation_counts: dict[str, CorpusCounts] = {}
     measured = _measure(
@@ -944,14 +939,15 @@ def _staged(
             original = _rebound(original, count)
     elif epochs is not None and measured.ahead == "expansion":
         # Bounded before the expansion it would hold, it now holds the examples a pass reaches it with.
-        passes = _pass_examples(train, read, build)
+        passes = _pass_examples(train, read, build, passes=False)
         if passes is not None:
             original, train = _rebound(original, epochs * passes), _rebound(train, epochs * passes)
             build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
     elif epochs is not None:
         # Epochs of a read with a record count count it, read endlessly; of one with none, the source
         # examples a pass holds, its prepared rows as held, bounded to that many passes (`_bounded`).
-        passes = None if epoch_records(train, build) is not None else _pass_examples(train, read, build)
+        passes = None if epoch_records(train, build) is not None else _pass_examples(train, read, build,
+                                                                                     passes=True)
         original, train = ((_endless(original), _endless(train)) if passes is None else
                            (_bounded(original, epochs * passes, passes=True),
                             _bounded(train, epochs * passes, passes=True)))
@@ -965,7 +961,7 @@ _UNCOUNTED = 1 << 62
 count, set to its epochs' passes once it holds them (`_rebound`, `_staged`)."""
 
 
-def _pass_examples(train: Pipeline, read: Read, build: _Build) -> int | None:
+def _pass_examples(train: Pipeline, read: Read, build: _Build, *, passes: bool) -> int | None:
     """The source examples one pass of a training read with no record count holds (`Loader.pass_examples`,
     `dew.data.epochs.epoch_records`): those reaching where a bound in examples stands (`_bounded`:
     the first step that packs or windows them or makes several rows of each, else the batch), before any
@@ -976,11 +972,13 @@ def _pass_examples(train: Pipeline, read: Read, build: _Build) -> int | None:
     concatenation, its members' added. None
     for a mixture by tokens, a memory read that laid its examples out as it held them, or where a
     step before that place drops or adds one, or keeps them by a rule not yet bound, or nothing states
-    the count."""
+    the count. With `passes`, that place is where a run's epochs bound its pass (`_bounded`), before a step
+    that rejects a record it cannot make; a mixture's or concatenation's members are counted as their rows
+    leave them, where the bound after the mix counts them, so a member that rejects counts none ahead."""
     source = train.source
     if isinstance(source, Phases):
         return None
-    at = _one_example_until(train, passes=True)
+    at = _one_example_until(train, passes=passes)
     # Every step before the bound's place reads the pass, a repeat's included; its slices and limits before
     # the first repeat bound it.
     if any(_drops(stage) or isinstance(stage, Native)
@@ -998,7 +996,8 @@ def _pass_examples(train: Pipeline, read: Read, build: _Build) -> int | None:
             # A mix by tokens draws each part as its tokens fall short (`TokenDeficit`), which no count of its
             # examples states ahead.
             return None
-        sizes = [_pass_examples(child, read, build) for child in source.pipelines]
+        # A member's pass where the bound after the mix counts it: its rows as they leave the member.
+        sizes = [_pass_examples(child, read, build, passes=False) for child in source.pipelines]
         known = [size for size in sizes if size is not None]
         if len(known) != len(sizes):
             return None
@@ -1006,7 +1005,7 @@ def _pass_examples(train: Pipeline, read: Read, build: _Build) -> int | None:
     elif isinstance(source, Concatenated):
         # Its members' passes one after another, each read once; one a member repeats is no pass of its own.
         sizes = [None if any(isinstance(stage, Repeat) for stage in _steps(child))
-                 else _pass_examples(child, read, build) for child in source.pipelines]
+                 else _pass_examples(child, read, build, passes=False) for child in source.pipelines]
         known = [size for size in sizes if size is not None]
         if len(known) != len(sizes):
             return None
@@ -1044,7 +1043,7 @@ def _held_ahead(train: Pipeline, read: Read) -> str | None:
     # The steps the read runs as it holds its rows, as the analysis places them once its configured steps
     # bind (after a cache it fills), a configured step among them where it binds to such a step.
     eager = _analyzed(train, read, bound=True).eager
-    at = _one_example_until(train, passes=True)
+    at = _one_example_until(train)
     if at >= eager:
         return None
     if _expands(train.stages[at]):
