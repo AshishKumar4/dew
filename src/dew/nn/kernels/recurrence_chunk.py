@@ -1004,8 +1004,11 @@ def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta,
     """The portable math's chunked op (`xla_mainloop`) under `hooks`' readout: a readout apart from its
     group's writes (`Hooks.reads` 'apart', the group a token's `Hooks.ranks`) the scan's own
     (`scan.Scan.group`: each rank reads the state after its token's decay less every rank's write of its
-    token, no write read and taken back off)."""
+    token, no write read and taken back off), its walk's chunk the largest multiple of the group within the
+    call's, so no chunk cuts a group (a rank-three call's 64 tokens, 63)."""
     group = hooks.ranks if hooks.reads == 'apart' else 1
+    if tiles.chunk % group:
+        tiles = dataclasses.replace(tiles, chunk=max(group, tiles.chunk // group * group))
     return xla_mainloop(tiles, query, key, value, g, beta, state, starts, firsts, scale=scale,
                         delta=hooks.delta, dtype=dtype, bound=hooks.inverse_bound, forked=forked,
                         reads=hooks.reads, own=own, group=group)
