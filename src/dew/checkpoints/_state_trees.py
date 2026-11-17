@@ -126,9 +126,9 @@ def _delta_planes(average: jax.Array, live: jax.Array) -> jax.Array:
     return jnp.stack([(delta >> (8 * plane)).astype(jnp.uint8) for plane in range(width)])
 
 
-def _planes_of(averages: Sequence[jax.Array], lives: Sequence[jax.Array]) -> list[jax.Array]:
+def _planes_of(averages: Sequence[jax.Array], lives: Sequence[jax.Array]) -> tuple[jax.Array, ...]:
     """Each of `averages` as `_delta_planes` against the weight it follows in `lives`."""
-    return [_delta_planes(average, live) for average, live in zip(averages, lives, strict=True)]
+    return tuple(_delta_planes(average, live) for average, live in zip(averages, lives, strict=True))
 
 
 def _from_delta_planes(planes, live):
@@ -322,14 +322,19 @@ def _with_ema_deltas(state_tree: Mapping[str, object]) -> tuple[Mapping[str, obj
                   if _stored_as_delta(average, live)]
         if not chosen:
             continue
-        # One program over every leaf the average writes so (`_planes_of`), one compile a save's tree where a
-        # program a leaf's signature compiled each (31 of a tiny DiT's first save, 3.4 of its 7.3 s).
-        encode = program(_planes_of, out_shardings=[_planes_sharding(leaves[index].sharding)
-                                                    for index in chosen])
-        encoded = encode([leaves[index] for index in chosen], [lives[index] for index in chosen])
-        for index, planes in zip(chosen, encoded, strict=True):
-            decoded_ahead(planes, lives[index], leaves[index].dtype)
-            leaves[index] = planes
+        # One program over the leaves the average writes so on each set of devices (`_planes_of`; a pipelined
+        # run's stages each hold theirs), where a program a leaf's signature compiled each (31 of a tiny DiT's
+        # first save, 3.4 of its 7.3 s).
+        together: dict[frozenset, list[int]] = {}
+        for index in chosen:
+            together.setdefault(frozenset(leaves[index].sharding.device_set), []).append(index)
+        for indices in together.values():
+            encode = program(_planes_of, out_shardings=tuple(_planes_sharding(leaves[index].sharding)
+                                                             for index in indices))
+            encoded = encode([leaves[index] for index in indices], [lives[index] for index in indices])
+            for index, planes in zip(indices, encoded, strict=True):
+                decoded_ahead(planes, lives[index], leaves[index].dtype)
+                leaves[index] = planes
         state_tree = _with(state_tree, path, jax.tree.unflatten(structure, leaves))
         recorded[_named(path)] = [jax.tree_util.keystr(paths_leaves[index][0]) for index in chosen]
     return state_tree, recorded
