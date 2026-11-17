@@ -547,14 +547,14 @@ class TrainerConfig:
         a share of the run (which `fit` resolves) or None as given."""
         if value is None or isinstance(value, int) or is_share(value):
             return value
-        counted = dataset.epochs is not None and bool(dataset.pass_examples)
-        if value == PASSES and dataset.steps_per_epoch is None and not counted:
+        passed = dataset.pass_examples if dataset.epochs is not None else None
+        if value == PASSES and dataset.steps_per_epoch is None and not passed:
             _log.info("--trainer.%s passes: the run counts none of its data's passes (no record count, and "
                       "no --trainer.epochs over source examples), so it runs at the run's end (%s)",
                       field_name, _AT_END)
             return _AT_END
-        if dataset.steps_per_epoch is None and counted:
-            return Counted(dataset.pass_examples, "examples")
+        if dataset.steps_per_epoch is None and passed:
+            return Counted(passed, "examples")
         if dataset.steps_per_epoch is None:
             raise ValueError(
                 f"--trainer.{field_name} epoch needs a dataset with a record count; this "
