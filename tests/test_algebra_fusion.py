@@ -297,6 +297,26 @@ def test_a_named_products_consumers_are_its_epilogue_its_name_the_launchs_residu
                         truth_fn=with_gradients(lambda *x: named_gate(*(a.astype(jnp.float64) for a in x))))
 
 
+def named_rows(x, w):
+    """A sine of rows named for remat before it, then their product: a name on a prologue's value."""
+    from jax.ad_checkpoint import checkpoint_name
+
+    return jnp.sin(checkpoint_name(x, "rows")) @ w
+
+
+def test_a_name_on_a_products_rows_stays_outside_its_prologue():
+    """A remat name on the value a product's prologue reads (`named_rows`) bounds the prologue, which still
+    fuses the sine after it on an H100 whose template a call names: a producer's stage runs no name (a name
+    pulled into it was refused there, and the sine's operand formed whole)."""
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), \
+            generation.routes() as found:
+        traced = jax.jit(algebra.rewritten(named_rows, kernels=True)).trace(*shapes)
+    assert any(route.choice == "gemm_prologue" and route.kernel == "fused" for route in found), [
+        (route.choice, route.kernel) for route in found]
+    assert not [equation for equation in traced.jaxpr.jaxpr.eqns if equation.primitive is jax.lax.sin_p]
+
+
 def test_a_starts_forward_nothing_reads_is_never_written_as_a_kernel():
     """A start-like program (row 6783): a region that makes a parameter and computes a grouped product from
     it, as a flax init's block makes its parameters inside its forward (here a checkpointed one), the
