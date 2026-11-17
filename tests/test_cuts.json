@@ -21,9 +21,6 @@
 "tests/test_algebra_fusion.py::test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes[a causal window]",
 "tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
 ],
-"tests/test_algebra_laws.py": [
-"tests/test_algebra_laws.py::test_every_structure_of_the_backward_tile_is_certified[True-False-True]"
-],
 "tests/test_algebra_scan.py": [
 "tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[gated_delta-before]",
 "tests/test_algebra_scan.py::test_a_turned_scans_adjoint_is_the_token_scans_gradient[apart-ranks]",
@@ -34,31 +31,25 @@
 "tests/test_alignment.py::test_the_objective_adds_the_weighted_alignment_to_the_denoising_mean[mlp]"
 ],
 "tests/test_architectures.py": [
-"tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer+gemma4_moe]",
-"tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer+glm4_moe]",
-"tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer+gpt_oss]",
-"tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer+moe]",
-"tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer+qwen35]",
-"tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+deepseek_v2-1-step-fsdp]",
+"tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[hierarchical_mmdit-1-step-fsdp-one device]",
+"tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[hierarchical_mmdit-2-steps-data-layout]",
+"tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[hierarchical_mmdit-2-steps-data-one device]",
+"tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[unet_3d-1-step-data-layout]",
+"tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[unet_3d-2-steps-fsdp-layout]",
+"tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer+gemma3n]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+deepseek_v2-2-steps-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+gemma3n-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+gemma3n-2-steps-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+gemma4_moe-1-step-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+llama4-1-step-fsdp]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+llama4-2-steps-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+mla-1-step-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+moe-1-step-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+moe-2-steps-fsdp]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer-2-steps-data]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer-2-steps-stage]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[hybrid_dit-1-step-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[hybrid_dit-2-steps-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[jepa_encoder-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[jepa_encoder-2-steps-data]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[jepa_video_encoder-1-step-data]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[jepa_video_encoder-2-steps-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_dit-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_dit-1-step-stage]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_dit-2-steps-data]",
@@ -1037,9 +1028,6 @@
 "tests/test_causal_transformer.py::test_padding_in_a_packed_row_reaches_no_query",
 "tests/test_causal_transformer.py::test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart"
 ],
-"tests/test_chain.py": [
-"tests/test_chain.py::test_each_stage_continues_the_last"
-],
 "tests/test_check2.py": [
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_a_decay_a_key_dimension_and_refuses_one_a_head",
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_a_decay_a_key_dimensions_fast_backward",
@@ -1054,9 +1042,6 @@
 ],
 "tests/test_checkpoint_averaging.py": [
 "tests/test_checkpoint_averaging.py::test_runs_that_agree_average_to_their_own_weights_and_a_runs_average_is_read_where_it_keeps_one[data]"
-],
-"tests/test_checkpoint_ranking.py": [
-"tests/test_checkpoint_ranking.py::test_each_key_the_scores_yield_reads_its_own_score_back"
 ],
 "tests/test_chunk_adaptation.py": [
 "tests/test_chunk_adaptation.py::test_a_chain_steps_each_level_as_equation_71_at_its_own_window[1-3-documents]",
@@ -1143,6 +1128,9 @@
 "tests/test_contracts_gemm.py::test_a_quantized_convolution_holds_every_order_it_takes[1-normal]",
 "tests/test_contracts_gemm.py::test_a_transposed_hooks_custom_derivative_holds_every_order[normal]",
 "tests/test_contracts_gemm.py::test_an_nvfp4_projection_holds_every_reverse_order[near the largest]"
+],
+"tests/test_contracts_norms.py": [
+"tests/test_contracts_norms.py::test_the_fused_norms_and_products_hold_every_order[near the largest]"
 ],
 "tests/test_contracts_objectives.py": [
 "tests/test_contracts_objectives.py::test_the_lm_heads_hold_every_order_of_their_gradient[near the largest-fused]",
@@ -1424,9 +1412,6 @@
 "tests/test_decode_attention.py::test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_config[32-window-natural-32]",
 "tests/test_decode_attention.py::test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_config[32-window-natural-4]"
 ],
-"tests/test_decode_cache.py": [
-"tests/test_decode_cache.py::test_mixer_prefill_and_resume_follow_each_rows_real_tokens[recurrent]"
-],
 "tests/test_decoder_export.py": [
 "tests/test_decoder_export.py::test_a_dense_decoder_written_from_its_model_holds_its_sources_tensors",
 "tests/test_decoder_export.py::test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its_format[gpt2]",
@@ -1667,9 +1652,9 @@
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[supplied]",
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_with_longer_windows_owes_the_updates_after_it_at_their_pace",
 "tests/test_dreamer.py::test_a_dreamer_runs_cooldown_leaves_its_replay_as_the_run_left_it",
-"tests/test_dreamer.py::test_a_dreamer_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it",
-"tests/test_dreamer.py::test_an_agent_learns_its_world_from_its_replay[gru-simulator]",
+"tests/test_dreamer.py::test_a_rollout_from_demonstrations_takes_no_prefill_and_writes_on_them",
 "tests/test_dreamer.py::test_an_agent_learns_its_world_from_its_replay[gru]",
+"tests/test_dreamer.py::test_an_agent_learns_its_world_from_its_replay[transformer-pixels]",
 "tests/test_dreamer.py::test_an_agent_learns_its_world_from_its_replay[transformer]",
 "tests/test_dreamer.py::test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole[gru]",
 "tests/test_dreamer.py::test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole[transformer]",
@@ -1731,8 +1716,8 @@
 "tests/test_fla_gdn.py::test_a_remat_policy_changes_no_gradient[None]",
 "tests/test_fla_gdn.py::test_a_remat_policy_changes_no_gradient[policy2]",
 "tests/test_fla_gdn.py::test_both_routes_return_the_operands_common_dtype[bf16 keys 256 wide]",
-"tests/test_fla_gdn.py::test_dews_fla_rule_runs_packed_documents_as_their_own_sequences[False-True]",
-"tests/test_fla_gdn.py::test_the_oracle_a_chunk_at_a_time_computes_the_token_recurrence",
+"tests/test_fla_gdn.py::test_dews_fla_rule_runs_packed_documents_as_their_own_sequences[False-False]",
+"tests/test_fla_gdn.py::test_the_dqkwg_kernel_is_flas[shape0-float32]",
 "tests/test_fla_gdn.py::test_the_port_keeps_the_kernel_contract_on_a_mesh[tensor-split1-per head]",
 "tests/test_fla_gdn.py::test_the_rule_runs_at_every_geometry[forward mode]"
 ],
@@ -1740,9 +1725,6 @@
 "tests/test_flaxdiff_family_source.py::test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs[simple_mmdit/published]",
 "tests/test_flaxdiff_family_source.py::test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs[unet_3d/published]",
 "tests/test_flaxdiff_family_source.py::test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs[video_dit/published]"
-],
-"tests/test_flight.py": [
-"tests/test_flight.py::test_a_step_pays_passes_ends_and_finishes_as_the_race_rules"
 ],
 "tests/test_flow_grpo.py": [
 "tests/test_flow_grpo.py::test_a_transitions_density_keeps_a_residual_whose_square_overflows",
@@ -1780,7 +1762,7 @@
 "tests/test_forked_calls.py::test_a_tree_call_reads_each_token_as_its_path_decoded_alone[chain-mamba]",
 "tests/test_forked_calls.py::test_a_tree_call_reads_each_token_as_its_path_decoded_alone[one-token-mamba2]",
 "tests/test_forked_calls.py::test_a_tree_call_rounds_a_quantized_memory_as_each_path_decoded_alone[branching]",
-"tests/test_forked_calls.py::test_a_tree_token_a_row_does_not_hold_passes_its_parents_state_on[kimi_delta_attention]",
+"tests/test_forked_calls.py::test_a_tree_token_a_row_does_not_hold_passes_its_parents_state_on[gated_delta_net]",
 "tests/test_forked_calls.py::test_a_tree_token_a_row_does_not_hold_passes_its_parents_state_on[lightning_attention]",
 "tests/test_forked_calls.py::test_a_tree_token_a_row_does_not_hold_passes_its_parents_state_on[mamba2]",
 "tests/test_forked_calls.py::test_a_tree_token_a_row_does_not_hold_passes_its_parents_state_on[mamba]",
@@ -2894,8 +2876,8 @@
 "tests/test_pretrained_sources.py::test_the_hub_census_routes_a_config_as_the_loader_does",
 "tests/test_pretrained_sources.py::test_the_probe_runs_the_first_layers_that_hold_every_kind_its_depth_builds[falcon_h1-fields4-2]",
 "tests/test_pretrained_sources.py::test_the_probe_shrinks_the_sizes_a_type_couples[falcon_h1-fields1]",
-"tests/test_pretrained_sources.py::test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest",
-"tests/test_pretrained_sources.py::test_tier_three_runs_dews_attention_where_every_layer_asks_the_interface_for_it"
+"tests/test_pretrained_sources.py::test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest[bert-decoder]",
+"tests/test_pretrained_sources.py::test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest[cohere-gptq]"
 ],
 "tests/test_quantization.py": [
 "tests/test_quantization.py::test_a_grouped_convolution_quantizes_each_group_on_its_own_range[4-float32]",
@@ -3296,6 +3278,9 @@
 "tests/test_rl_expert_balance.py": [
 "tests/test_rl_expert_balance.py::test_a_policy_runs_balance_flag_builds_a_policy_that_balances_its_routers[dpo]"
 ],
+"tests/test_rl_methods.py": [
+"tests/test_rl_methods.py::test_each_method_is_its_papers_objective[grpo--]"
+],
 "tests/test_router_statistics.py": [
 "tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains",
 "tests/test_router_statistics.py::test_all_padding_has_no_router_support_or_bias_effect[trunk-pad_id-False]",
@@ -3447,10 +3432,10 @@
 "tests/test_saved_runs.py::test_reading_a_saved_run_opens_no_device_before_its_process_is_prepared"
 ],
 "tests/test_saved_sources.py": [
+"tests/test_saved_sources.py::test_a_decision_run_starts_from_a_saved_chat_format_decision_run",
 "tests/test_saved_sources.py::test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export",
 "tests/test_saved_sources.py::test_a_decision_run_starts_from_a_saved_run_whose_export_is_its_native_release",
 "tests/test_saved_sources.py::test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task",
-"tests/test_saved_sources.py::test_a_lettered_run_over_a_qwen35_backbone_exports_a_release_a_run_starts_from",
 "tests/test_saved_sources.py::test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time[looped]",
 "tests/test_saved_sources.py::test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time[scanned]",
 "tests/test_saved_sources.py::test_a_pool_reads_a_saved_decision_runs_release_through_one_publisher",
@@ -3563,9 +3548,6 @@
 "tests/test_sd3_source.py::test_native_sd3_matches_the_source_forward_and_every_gradient[plain]",
 "tests/test_sd3_source.py::test_native_sd3_matches_the_source_forward_and_every_gradient[rect_cropped]"
 ],
-"tests/test_sensenova_loop.py": [
-"tests/test_sensenova_loop.py::test_its_logits_are_on_par_with_the_remote_codes"
-],
 "tests/test_served_episodes.py": [
 "tests/test_served_episodes.py::test_a_served_cohort_draws_what_its_policy_draws_whole[greedy-attention]",
 "tests/test_served_episodes.py::test_a_served_cohort_draws_what_its_policy_draws_whole[greedy-hybrid]",
@@ -3666,9 +3648,6 @@
 ],
 "tests/test_ssd_kernel.py": [
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk-resets]"
-],
-"tests/test_stage_blocks.py": [
-"tests/test_stage_blocks.py::test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes[hybrid_dit-fsdp2_stage2]"
 ],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
@@ -3868,7 +3847,7 @@
 "tests/test_trainer.py": [
 "tests/test_trainer.py::test_a_fit_places_its_device_prefetch_and_plans_its_step_beside_them",
 "tests/test_trainer.py::test_a_schedule_stage_past_the_models_context_is_refused",
-"tests/test_trainer.py::test_a_token_only_run_uses_the_schedules_own_horizon[schedule1]"
+"tests/test_trainer.py::test_a_tree_of_any_kind_of_mapping_is_held_as_dicts_where_it_enters[write-back-dict-list]"
 ],
 "tests/test_training_dtypes.py": [
 "tests/test_training_dtypes.py::test_ema_storage_dtype_and_precision_survive_real_updates_and_restart[mixed]",
