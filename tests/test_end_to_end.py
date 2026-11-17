@@ -677,7 +677,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     from diffusion_support import images_of, saved_after_one_step
 
     from dew.config import ObjectiveConfig, SourceOptions, TrainerConfig
-    from dew.config.diffusion import DiffusionRunConfig
+    from dew.config.diffusion import DEFAULT_MODEL_CONFIG, DiffusionRunConfig
     from dew.inputs import TextCondition
     from dew.interop.autoencoders.pretrained import PretrainedAutoencoder
     from dew.registry import ModelConfig
@@ -720,7 +720,8 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     # its weights and running statistics (ledger 2791): its own saved task decodes with them, the weights
     # stored as a storage override asks, the statistics as the run kept them.
     started = replace(config, pretrained=str(run), source=SourceOptions(step="latest"), text=None,
-                      autoencoder=None, objective=ObjectiveConfig("diffusion", {
+                      model=ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)), autoencoder=None,
+                      objective=ObjectiveConfig("diffusion", {
                           "solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
     saved_after_one_step(started, lambda task: batch_for(task, 32), tmp_path / "started", 1e-2)
     again = TextToImage.from_run(str(tmp_path / "started"))
