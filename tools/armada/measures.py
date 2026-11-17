@@ -121,13 +121,14 @@ def measured_short(measures: dict[str, dict | None], budget: float) -> dict[str,
             if math.isfinite(need := gpu_needs(recorded, math.inf)[1]) and need > budget}
 
 
-def unschedulable(prepared: dict[str, float], budget: float, total: float, device: str) -> dict[str, str]:
-    """Each unit whose prepared programs need more than `budget`, its lane's share of the `device` GPU's
-    `total`, and what its row says. A prepared need is an admission's requirement, not a hint: never cut to
-    the share, as a measured peak is so its next run measures it again (`gpu_needs`), since run below it
-    the accounting says it will not fit, and it runs out (Main, 2026-11-17: the sinks flows did)."""
+def unschedulable(prepared: dict[str, float], budget: float, whole: float, device: str) -> dict[str, str]:
+    """Each unit whose prepared programs need more than `budget`, its lane's share of the `device` GPU, and
+    what its row says: whether a lane of the whole GPU, given `whole`, would hold it. A prepared need is an
+    admission's requirement, not a hint: never cut to the share, as a measured peak is so its next run
+    measures it again (`gpu_needs`), since run below it the accounting says it will not fit, and it runs
+    out (Main, 2026-11-17: the sinks flows did)."""
     gib = 2 ** 30
     return {name: f"unschedulable on {device}: its prepared programs need {need / gib:.2f} GiB, past this "
-                  f"lane's {budget / gib:.1f} GiB" + ("" if need > total else f"; a slot of the GPU's whole "
-                                                       f"{total / gib:.1f} GiB holds it")
+                  f"lane's {budget / gib:.1f} GiB" + ("" if need > whole else f"; a lane of the whole GPU's "
+                                                       f"{whole / gib:.1f} GiB holds it")
             for name, need in prepared.items() if need > budget}

@@ -749,15 +749,15 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     # Its children each take a share's fraction: what it holds is of its raised share, 7 GiB twice over.
     assert ci.gpu_needs({"depends": [], "peak": 2 * gib, "shares": 1, "pools": 0}, 40 * gib, 7 * gib) == (
         7 * gib, 14 * gib)
-    # A program past the lane's 40 GiB, within the GPU's 80, and one past the GPU: neither runs, each red as
-    # its file, its row naming its need and the GPU.
-    for need, temporaries in ((50, 24), (98, 48)):
+    # Programs past the lane's 40 GiB: none runs, each red as its file, its row naming its need and the GPU,
+    # and saying a lane of the whole GPU holds it only where that lane's 60 GiB (JAX's 75%) does.
+    for need, temporaries, whole in ((50, 24, True), (70, 34, False), (98, 48, False)):
         filed((gib, gib, temporaries * gib))
         runs = len(lane_runs(tmp_path, "test_flow"))
         _, row = lane()
         assert len(lane_runs(tmp_path, "test_flow")) == runs and row["exitCode"] == 1
         assert row["kind"] == "whole" and f"{need:.2f} GiB" in row["output"]
-        assert ci.device_class() in row["output"]
+        assert ci.device_class() in row["output"] and ("holds it" in row["output"]) == whole
 
 def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measured_class_held_it(
         ci, tmp_path, monkeypatch, cache_worker, capsys):

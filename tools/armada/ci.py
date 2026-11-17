@@ -2174,8 +2174,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     tests = list(units)
 
     measures = lane_measures(python, units, held, token)
-    prepared = gpu_measures.prepared_needs(python, tests)  # Each no less than its prepared programs' need,
-    unheld = gpu_measures.unschedulable(prepared, budget, total, held)  # and none run below it.
+    prepared = gpu_measures.prepared_needs(python, tests)  # Each no less than its prepared programs' need.
+    unheld = gpu_measures.unschedulable(prepared, budget, float(WHOLE_GPU) * total, held)  # Nor below it.
     tests = [name for name in tests if name not in unheld]
     needed = {name: gpu_needs(measures[name], budget, prepared.get(name, 0.0)) for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
