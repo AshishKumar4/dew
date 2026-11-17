@@ -81,15 +81,18 @@ FORMED = [
     recurrence.Hooks(decay='vector', delta=False, reads='before', own_weight=True),
     recurrence.Hooks(decay='scalar', reads='before'),
     recurrence.Hooks(decay='vector', delta=False, write_gate=True, own_weight=True),
+    recurrence.Hooks(decay='none', delta=False, reads='before'),
 ]
 """The launch's other prologue values: Mamba2's step gates clipped with the skip, the gated delta rule's
 gates with a clipped step, a scale without the l2 norm and one under it, a rated decay with the
 skip and the norm (`recurrence_chunk.chunk`'s SSD), and the readout's timing and its own write's weight
 (`Hooks.reads`, `Hooks.own_weight`): RWKV6's (a decay a key dimension read before the update, its bonus),
-the delta rule read before its update, and a write gate's own write weighed in a readout after it."""
+the delta rule read before its update, a write gate's own write weighed in a readout after it, and a
+readout of the state entering its token alone, undecayed and with no delta rule: its key walk sums one
+term (`step._summed_keys`), which a tuple of one wrapped again failed to trace (audit 2026-11-17)."""
 
-FORMED_SEEDS = dict(zip(FORMED, (8, 16, 8, 8, 16, 16, 16, 16), strict=True))
-"""The formed sites' seeds, sized independently by `seeds_for` on armada (2026-10-21)."""
+FORMED_SEEDS = dict(zip(FORMED, (8, 16, 8, 8, 16, 16, 16, 16, 8), strict=True))
+"""The formed sites' seeds, sized independently by `seeds_for` on armada (2026-10-21; the last 2026-11-17)."""
 
 BF16_SEEDS = {HOOKS[0]: 8, HOOKS[-1]: 16}
 """The bf16-state sites' seeds, sized by `seeds_for` on armada (2026-10-20), including every output."""
