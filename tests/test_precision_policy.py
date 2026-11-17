@@ -940,6 +940,27 @@ def test_dews_own_transcendentals_are_as_exact_as_jaxs_across_their_range(name, 
         assert_as_exact(jax.jit(mine), jax.jit(jaxs), draw, f"{name}'s {part} {span} {dtype}", seeds=8)
 
 
+@pytest.mark.tpu(reason="a TPU flushes subnormal floats, which a CPU keeps")
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=str)
+def test_softplus_keeps_its_tail_on_a_tpu(dtype):
+    """Dew's softplus near x = -87 on a TPU, which flushes subnormals: `y = e^x` is a normal float there and
+    half of it is not, so a series whose leading term doubled `y / (2 + y)` was zero where float64's softplus
+    is a normal float (5895 of 65536 fp32 points over [-87.3, -80] on a v5e, Main's tail review); its
+    leading term `y / (1 + y / 2)` is never zero there, and the softplus is on par with JAX's from float64
+    (check 1)."""
+    from dew.nn import precision
+
+    def draw(seed):
+        x = np.random.default_rng(seed).uniform(-87.3, -80.0, 4096).astype(np.float32)
+        return (jnp.asarray(x, dtype),)
+
+    (x,) = draw(0)
+    normal = np.log1p(np.exp(np.asarray(x, np.float64))) >= float(jnp.finfo(dtype).tiny)
+    assert not np.any(np.asarray(jax.jit(precision.softplus)(x))[normal] == 0)
+    assert_as_exact(jax.jit(precision.softplus), jax.jit(jax.nn.softplus), draw, f"softplus's tail {dtype}",
+                    seeds=8)
+
+
 def test_a_routes_declaration_is_the_runs_configured_precision_where_the_call_states_none():
     """A run's configured product precision (`Numerics.matmul`, `run_precision`) is each route's declaration
     where a call states none (`dew.nn.precision.effective_precision`): attention hands a call to the
