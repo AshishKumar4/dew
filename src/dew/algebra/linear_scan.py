@@ -477,10 +477,12 @@ class Chunk(Expr):
     def state(self) -> Chunk: ...
 
     @classmethod
-    def gram(cls, left: Chunk, right: Chunk, strict: i64Like, between: Chunk) -> Chunk: ...
-    """Each pair's decayed contraction `sum_k left_ik right_jk between_ijk`, `j < i` where `strict`, else
-    `j <= i` (`scan._paired`). The decay it reads is its operand (`decay("between")`), as every node's that
-    reads one is: a form's price holds each decay's exponentials once, shared by the nodes that read it."""
+    def gram(cls, left: Chunk, right: Chunk, apart: i64Like, between: Chunk) -> Chunk: ...
+    """Each pair's decayed contraction `sum_k left_ik right_jk between_ijk`, `j // apart < i // apart` where
+    `apart` (a strict pairing's, `j < i`, groups of one; a readout's apart from its group's writes,
+    `scan.Scan.group`), else `j <= i` (`scan._paired`). The decay it reads is its operand
+    (`decay("between")`), as every node's that reads one is: a form's price holds each decay's exponentials
+    once, shared by the nodes that read it."""
 
     @method(cost=1)
     def rows(self, scale: Chunk) -> Chunk: ...
@@ -537,14 +539,15 @@ def decayed_by(part: str) -> Chunk:
     return Chunk.decay(part, Chunk.prefix())
 
 
-def _identities(corrects: bool, scalar: bool, values_read: bool = False):
+def _identities(corrects: bool, scalar: bool, values_read: bool = False, apart: int = 0):
     """The identities of the module's account, `wy` where tokens correct the state. A `scalar` decay's
     memory is read and then decayed, `(Q h) exp(G)`, as the template's output (`recurrence_algebra.
     chunk_output`): a memory past fp32's range reads finite, within 2.5 times the fp32 recurrence's distance
     from float64 (1.50e-1 at 2^124 against its 6.1e-2), where its queries decayed first read six times it
     (ledger 2344, 12e501086c8). A decay a key's decays each key before the read. A readout along the state's
     `values_read` takes each output along the keys: the entering state read and decayed along them, and each
-    earlier write's keys decayed to the token, scaled by its values' read (`spread`)."""
+    earlier write's keys decayed to the token, scaled by its values' read (`spread`). A readout `apart` from
+    its group's writes (`scan.Scan.group`) pairs each token with the earlier groups' writes alone."""
     values = Chunk.token("U")
     given, other, lower, left, right = vars_("given other lower left right", Chunk)
     h = Chunk.entering()
@@ -560,8 +563,11 @@ def _identities(corrects: bool, scalar: bool, values_read: bool = False):
         corrected = Chunk.solve(system, values.minus(
             Chunk.token("C").times(entering).rows(Chunk.token("s")).matmul(h)))
         found.append(rewrite(Chunk.loop(values)).to(Chunk.plain(corrected)))
+    if values_read and apart:
+        raise Refused("a readout along the state's values apart from its group's writes has no chunk form "
+                      "here")
     local = (Chunk.spread(queries, given, Chunk.token("B"), between) if values_read
-             else Chunk.gram(queries, Chunk.token("B"), 0, between).matmul(given))
+             else Chunk.gram(queries, Chunk.token("B"), apart, between).matmul(given))
     found += [
         rewrite(Chunk.plain(given)).to(Chunk.pair(
             memory.plus(local).plus(Chunk.token("R")),
@@ -587,6 +593,8 @@ class Extents:
     values: int
     decay_keys: int
     values_read: bool = False
+    apart: int = 0
+    """The tokens of the group a readout reads apart from (`scan.Scan.group`), 0 for none."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -596,6 +604,8 @@ class Form:
     outputs: Chunk
     state: Chunk
     price: cost.Seconds
+    apart: int = 0
+    """Its extents' `apart`, by which its token loop reads (`scan._looped`)."""
 
 
 @function(merge=lambda old, new: old)
@@ -625,7 +635,8 @@ def _shapes(extents: Extents):
         for made in (a.rows(b), a.times(b), a.plus(b), a.minus(b), Chunk.solve(b, a),
                      Chunk.substituted(b, a))]
     found += [fixed(made, tokens, tokens)
-              for made in (Chunk.gram(a, b, 0, d), Chunk.gram(a, b, 1, d), Chunk.doubled(a))]
+              for made in (*(Chunk.gram(a, b, apart, d) for apart in {0, 1, extents.apart}),
+                           Chunk.doubled(a))]
     found += [fixed(made, keys, values) for made in (Chunk.decayed(a, d), Chunk.written(a, b, d), a.state())]
     found += [fixed(made, tokens, keys) for made in (Chunk.spread(a, b, e, d), Chunk.applied(a, b))]
     found.append(fixed(a.outputs(), tokens, keys if extents.values_read else values))
@@ -660,7 +671,8 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precisi
     graph.register(root, *_leaves(extents))
     sized = program.node_count(graph)
     saturated = program.run_within(
-        graph, _identities(corrects, extents.decay_keys == 1, extents.values_read) | _shapes(extents),
+        graph, _identities(corrects, extents.decay_keys == 1, extents.values_read, extents.apart)
+        | _shapes(extents),
         saturation.sized(sized, _depth(root)), "a scan's chunk")
 
     def marginal(egraph: EGraph, node) -> cost.Seconds:
@@ -677,7 +689,7 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precisi
     shape_of = functools.partial(_shape_of, graph)
     price = cost.Seconds(_priced((outputs, state), extents, shape_of, precision), schedule)
     kernel_report.record_rewrite(program.reported(graph, sized, saturated, began, price.value))
-    return Form(outputs, state, price)
+    return Form(outputs, state, price, extents.apart)
 
 
 def _shape_of(graph: EGraph, value: Chunk) -> tuple[int, int]:

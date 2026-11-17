@@ -900,7 +900,9 @@ def _analyzed(
     one canonical pass, so its split is whole. With `bound`, a cache after
     configured steps is analyzed as it is once they bind: each binds to the
     step its declaration states (`_bind`), and a prefix no cache can key is
-    refused, so the cache holds what they make."""
+    refused, so the cache holds what they make; and a memory read runs a configured step that binds to
+    an eager one (any that draws nothing) as it holds its rows, as it will once the step binds, so the
+    order after it is the held rows' (a global shuffle of a table a holdout selects)."""
     source = pipeline.source
     nested = children(pipeline)
     joined = isinstance(source, Concatenated)
@@ -932,7 +934,10 @@ def _analyzed(
         if _drawn_cut(stages, eager) and examples_bound((*ran, *stages[:eager])) is not None:
             # A shuffle draws the windows a layout cuts counted examples across: each share lays its own.
             break
-        held = 1 if isinstance(stages[eager], _EAGER) else _held_bound(stages, eager)
+        # Analyzed `bound`, a configured step counts as the step it binds to, eager unless it draws.
+        stage = stages[eager]
+        once_bound = bound and isinstance(stage, Configured) and not stage.random
+        held = 1 if isinstance(stage, _EAGER) or once_bound else _held_bound(stages, eager)
         if not held:
             break
         eager += held

@@ -781,7 +781,7 @@ Every family is in scope (owner). Each of these is a value or specialization of 
 #### Mamba3: rotating basis and trapezoidal multi-write
 - **Transition value.** decay kind `complex_pairs`: the state's key axis is paired (K/2 complex dims), each pair decayed and rotated by `ρ_t e^{iθ_t}`. That is a diagonal decay over complex scalars, so a specialization of the per-key class with complex values.
   - Write form `trapezoid`: `W_t = α_t k_t v_tᵀ + γ_t k_{t−1} v_{t−1}ᵀ`, current and previous token. This is the design's multi-write/previous-token write. MIMO rank r is the rank-r write.
-  - Erase none or delta (if the authors' variant has one), and readout after.
+  - Erase none or delta (if the authors' variant has one), and the readout apart from the token's own writes (`Hooks.reads` 'apart', its ranks `Hooks.ranks`): the scores strictly lower, a token's group of ranks' pairs left out (`i // R > j // R`), and the token's own writes added at `γ_t` beside the op on its unturned keys and queries, as mamba_ssm's SISO and MIMO kernels split them. Read after with the next token's trapezoid weight folded into each write and taken back off its own output, a document's first token cancelled to 22 times the recurrence's error (row 7402).
 - **Algebra signature.** `decays(g, resets) -> pairs` with complex g (`log ρ + iθ`) of shape `[C, K/2]`. The pairs are `exp(gc_i − gc_j)` in complex arithmetic, done as real 2×2 rotations: two real products per pair.
   - The range contract applies to `log ρ` only, since θ is unbounded but |e^{iθ}| = 1.
   - `intra`, `carry` and `readout` take the K axis as (K/2, 2) and apply the 2×2 rotation blocks.

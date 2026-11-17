@@ -286,6 +286,39 @@ def test_epochs_of_a_read_whose_objective_makes_rows_of_its_examples_are_passes_
     assert recorded(evaluated) == {"examples": 12}
 
 
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_the_default_cadence_is_each_pass_where_the_run_counts_them_and_its_end_where_it_counts_none(read):
+    """A config's default validation and checkpoint cadence (`passes`) is a pass's end where the run counts
+    its data's passes: a pass's 12 source examples for a run of epochs over a read whose objective makes
+    rows of them, a pass's 3 steps for a read with a record count; and the run's end ("100%") for the same
+    read bounded in steps, which counts none, where a written "epoch" is refused. The default was "epoch",
+    so a steps-bounded decision run was refused at its defaults (the decision recipe's documented
+    command)."""
+    from data_support import Questioned
+
+    from dew.config import TrainerConfig
+    from dew.data.compile import fitted
+    from dew.training.budget import recorded
+
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids}, shard_rows=4)).shuffle(seed=3, window=12).read(read).batch(8)
+    objective = _pulled(Questioned()).data()
+    passes, _ = fitted(chain, None, objective=objective, epochs=2)
+    by_epochs = TrainerConfig(epochs=2)
+    assert recorded(by_epochs.eval_interval(passes)) == recorded(by_epochs.checkpoint_interval(passes)) == {
+        "examples": 12}
+    stepped, _ = fitted(chain, None, objective=objective, steps=4)
+    assert (stepped.records, stepped.pass_examples) == (None, None)
+    by_steps = TrainerConfig(steps=4)
+    assert by_steps.eval_interval(stepped) == by_steps.checkpoint_interval(stepped) == "100%"
+    with pytest.raises(ValueError):
+        TrainerConfig(steps=4, eval_every="epoch").eval_interval(stepped)
+    with pytest.raises(ValueError):
+        TrainerConfig(steps=4, checkpoint_every="epoch").checkpoint_interval(stepped)
+    records = compile(Pipeline(Memory({"id": ids})).batch(4), read="memory")
+    assert by_steps.eval_interval(records) == by_steps.checkpoint_interval(records) == 3
+
+
 def test_epochs_of_a_read_it_packs_as_its_rows_arrive_are_passes_over_its_documents():
     """A run of three epochs over 10 documents a pack lays out as they arrive, read per share, so its
     read has no record count: an epoch is a pass over its 10 documents, so the run trains on the examples

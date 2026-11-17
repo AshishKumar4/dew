@@ -953,28 +953,45 @@ def test_a_program_finds_every_quantized_tower_its_models_hold():
     assert [found.dtype for found in quantizations(nested)] == ["int8"]
 
 
-def test_a_diffusion_step_compiles_for_the_quantized_text_tower_it_encodes_with():
-    """A text-to-image objective's programs run its conditions' encoders and its autoencoder beside its
-    denoiser (`Objective.towers`), so the options its step and its samples compile with read a quantized
-    text tower (`compiler_options`) as they read a quantized denoiser."""
+@pytest.mark.parametrize("kind", ["diffusion", "decision"])
+def test_a_step_compiles_for_the_quantized_text_tower_it_encodes_with(kind):
+    """An objective's programs run its inputs' condition encoders beside its model (`Objective.towers`): a
+    text-to-image objective's text tower, a decision objective's configured context encoder; so the
+    options its step and its samples compile with read a quantized tower (`compiler_options`) as they
+    read a quantized model. A decision objective listed its backbone and head alone, so an int8 context
+    encoder escaped the int8 Triton GEMM guard (row 7617)."""
     from pathlib import Path
 
+    from dew.data.text import ByteTokenizer
+    from dew.decision.layout import Specials
+    from dew.decision.model import state_width
+    from dew.decision.objective import DecisionObjective
     from dew.diffusion import presets
     from dew.inputs import Condition, Field, InputSpec
+    from dew.interop import Pretrained
     from dew.interop.encoders import CLIPText
     from dew.nn.backbones.dit import SimpleDiT
+    from dew.nn.cross_attention import CrossAttention
     from dew.nn.kernels.options import quantizations
     from dew.objectives.diffusion import DiffusionObjective
 
     pytest.importorskip("qwix")
-    encoder = CLIPText.from_pretrained(str(Path(__file__).parent / "fixtures" / "clip" / "tiny"))
+    fixtures = Path(__file__).parent / "fixtures"
+    encoder = CLIPText.from_pretrained(str(fixtures / "clip" / "tiny"))
 
     def objective(tower):
-        return DiffusionObjective(SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
-                                            mlp_ratio=1),
-                                  presets.Flow(), InputSpec(Field("image", (8, 8, 3)),
-                                                            {"textcontext": Condition(tower)}),
-                                  guidance=None, steps=2)
+        if kind == "diffusion":
+            return DiffusionObjective(SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
+                                                mlp_ratio=1),
+                                      presets.Flow(), InputSpec(Field("image", (8, 8, 3)),
+                                                                {"textcontext": Condition(tower)}),
+                                      guidance=None, steps=2)
+        source = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
+        blocks = CrossAttention((0,), 16, context_features=state_width(tower))
+        return DecisionObjective(source.with_cross_attention(blocks, key=0), tokenizer=ByteTokenizer(),
+                                 specials=Specials(begin=None, separator=10, marker=0, marker_text="\x00",
+                                                   pad=255),
+                                 context_encoder=tower)
 
     assert quantizations(*objective(encoder).towers()) == []
     tower = Quantization(dtype="int8").apply(encoder.transformer)

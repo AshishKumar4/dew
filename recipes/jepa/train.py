@@ -15,9 +15,20 @@ from dew.config.jepa import JepaRunConfig
 from dew.data import presets
 from dew.data.sources import source
 
-TRAIN, HELD = source("tfds://oxford_flowers102").holdout(split="validation")
-FLOWERS = TRAIN.shuffle(seed=0).repeat().pipe(presets.images, 224, batch=64)
-VALIDATION = HELD.pipe(presets.images, 224, batch=64)
+
+def flowers():
+    """Oxford flowers, its validation split held out."""
+    return source("tfds://oxford_flowers102").holdout(split="validation")
+
+
+def default(train, held) -> JepaRunConfig:
+    """The recipe's run over `train`'s and `held`'s images, `held`'s labels scoring the probes: a curated
+    corpus, whose every image decodes, one that does not stopping the run (`rejects=False`), so the run
+    counts its passes ahead, as its epochs need."""
+    return JepaRunConfig(
+        data=train.shuffle(seed=0).repeat().pipe(presets.images, 224, batch=64, rejects=False),
+        validation=held.pipe(presets.images, 224, batch=64, rejects=False))
+
 
 if __name__ == "__main__":
-    JepaRunConfig.cli(default=JepaRunConfig(data=FLOWERS, validation=VALIDATION)).run()
+    JepaRunConfig.cli(default=default(*flowers())).run()

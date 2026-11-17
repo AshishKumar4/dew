@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from arm_arithmetic import summed_as_run
 from flax import linen as nn
 from model_support import decoder, float64_twin
 from reference_error import as_given, assert_as_exact, widened
@@ -180,16 +181,22 @@ def clears_margin(model, params, prompt, lengths, tokens, sampling, positions=No
 def generation_draw(model, params, sampling, steps: int, *, margin: bool, progress: Progress = END,
                     **prompt_shape):
     """Check 1's draw of drawn prompts, a key and the tokens `generate` draws from them: with `margin`,
-    the first of the seed's attempts whose steps clear MARGIN."""
+    the first of the seed's attempts whose steps clear MARGIN. Drawn in the arithmetic its arms replay it in
+    (`summed_as_run`), so `generated` draws the same tokens bit for bit: drawn in the suite's wide arithmetic,
+    a step's log probabilities 3e-6 apart from the arm's flipped a sampled token at a near tie (train 1000's
+    return of a Mamba-3 head, its mamba3 registered cell's row 15)."""
     def draw(seed):
         for attempt in range(64 if margin else 1):
             prompt, lengths = drawn_prompts(seed, attempt, int(model.vocab_size), **prompt_shape)
             key = jax.random.key_data(jax.random.fold_in(jax.random.key(seed), attempt))
-            result = generate(model, params, prompt_inputs({"prompt": prompt, "prompt_length": lengths}),
-                              steps, key=jax.random.wrap_key_data(key), sampling=sampling, progress=progress)
-            tokens = np.asarray(result.tokens)[:, prompt.shape[1]:]
-            if not margin or clears_margin(model, params, prompt, lengths, tokens, sampling,
-                                           progress=progress):
+            inputs = prompt_inputs({"prompt": prompt, "prompt_length": lengths})
+            with summed_as_run():
+                result = generate(model, params, inputs, steps, key=jax.random.wrap_key_data(key),
+                                  sampling=sampling, progress=progress)
+                tokens = np.asarray(result.tokens)[:, prompt.shape[1]:]
+                cleared = not margin or clears_margin(model, params, prompt, lengths, tokens, sampling,
+                                                      progress=progress)
+            if cleared:
                 return prompt, lengths, np.asarray(key), tokens
         raise AssertionError(f"no draw of seed {seed} clears MARGIN")
     return draw
