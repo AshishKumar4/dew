@@ -228,7 +228,7 @@ def dew_points(args):
                 "load_seconds": load_seconds,
                 "weights": {"split_over": sorted(split),
                             "devices": len({device for sharding in shardings for device in sharding.device_set})}}
-    layout = KVCache(page_size=16 if args.kv == "paged" else None)
+    layout = KVCache(page_size=args.page_size if args.kv == "paged" else None)
     points = []
     for slots in args.slots:
         count = args.requests or max(64, 2 * slots)
@@ -447,6 +447,7 @@ def main():
     parser.add_argument("--admission", type=int, default=0)
     parser.add_argument("--decode-steps", type=int, default=1)
     parser.add_argument("--kv", choices=("dense", "paged"), default="dense")
+    parser.add_argument("--page-size", type=int, default=16, help="a paged cache's slots a page (--kv paged)")
     parser.add_argument("--mesh", type=json.loads, default=None,
                         help='Dew: the weights placed on a mesh of these MeshSpec fields ({"tensor": 2})')
     parser.add_argument("--profile", action="store_true")
@@ -494,7 +495,8 @@ def main():
               "prompt": args.prompt, "output": args.output, "vocab_limit": args.vocab_limit,
               "sampling": {"temperature": 0, "ignore_eos": True}, "warm_output": args.output,
               "transport": "HTTP streaming" if args.backend == "vllm" else "in-process",
-              "decode_steps": args.decode_steps, "kv": args.kv, "mesh": args.mesh,
+              "decode_steps": args.decode_steps, "kv": args.kv,
+              **({"page_size": args.page_size} if args.kv == "paged" else {}), "mesh": args.mesh,
               "host": platform.processor(), "sweep": points}
     args.out.write_text(json.dumps(record, indent=2) + "\n")
 

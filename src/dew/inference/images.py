@@ -154,6 +154,10 @@ class ImageSettings:
     # dewml/hybrid-dit-176m's published record predates the fields below.
     end_to_end: JSON = None
     grid: JSON = None
+    grid_process: bool = field(default=False, metadata={"derived": "preset"})
+    """Whether `process` is the grid's own training process at the grid's tokens
+    (`DiffusionObjective.grid_process`: a run over a published pipeline naming no preset), which a run over
+    another size takes at its tokens; a record before it states none, its process kept as it trained."""
 
     def __post_init__(self) -> None:
         from dew._records import integer
@@ -196,6 +200,9 @@ class TextToImage(SavedRunTask, InItsForm):
     grid: Callable[[int], tuple[Process, jax.Array]] | None = None
     final_denoise: bool = True
     finish: Callable[[Variables, jax.Array], jax.Array] | None = None
+    grid_process: bool = False
+    """Whether `process` is `grid`'s own training process at its tokens (`DiffusionObjective.grid_process`,
+    `PipelineSource.grid_process`)."""
 
     def __post_init__(self) -> None:
         # A tree split for training, an adapter's, is read whole.
@@ -234,12 +241,14 @@ class TextToImage(SavedRunTask, InItsForm):
         return cls(objective.model, objective.process, objective.inputs,
                    without_loss_heads(variables), autoencoder,
                    steps=objective.steps, guidance=objective.guidance, solver=objective.solver,
-                   grid=objective.grid, final_denoise=objective.final_denoise)
+                   grid=objective.grid, final_denoise=objective.final_denoise,
+                   grid_process=objective.grid_process)
 
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
                    layout: Layout | None = None, dtype: DTypeLike | None = None,
-                   param_dtype: DTypeLike | None = None, variables: Variables | None = None) -> TextToImage:
+                   param_dtype: DTypeLike | None = None, variables: Variables | None = None,
+                   published: bool = False) -> TextToImage:
         """Load the run `run` (its checkpoint pinned, `SavedRun.pinned`), built from the inference record
         its checkpoint holds (`Checkpoints.artifact`) the way the recipe built it; the run's `run.json`
         is not read. `from_run` loads one from its directory.
@@ -255,8 +264,10 @@ class TextToImage(SavedRunTask, InItsForm):
         `dtype` sets the compute dtype of the model, the encoders and the VAE.
         `param_dtype` sets the dtype the parameters are stored in; None keeps
         the checkpoint's dtypes exactly. Supplied `variables`, a tree of the
-        run's own form (a run that started from it saved them), are bound in
-        place of the checkpoint's, which is not read.
+        run's own form, are bound in place of the checkpoint's, which is not
+        read; with `published`, of the form this task holds it in (a run that
+        started from it saved them), a tuned autoencoder's weights and running
+        statistics under `autoencoder` (`EndToEnd.tuned`).
         """
         from dew._records import record as fields
         from dew.diffusion.schedules.source import SourceGrid
@@ -286,16 +297,27 @@ class TextToImage(SavedRunTask, InItsForm):
         end_to_end = settings.end_to_end
         autoencoder = None
         if autoencoder_record is not None and end_to_end is not None:
-            from dew.objectives.diffusion.end_to_end import AUTOENCODER, EndToEnd
-            tuning = from_record(EndToEnd, fields(end_to_end, 'end_to_end'), dtypes=False)
-            frozen = AutoEncoder.bound(autoencoder_record, params=params['params'][AUTOENCODER])
-            autoencoder, params = tuning.tuned(frozen, params)
+            from dew.objectives.diffusion.end_to_end import (
+                AUTOENCODER,
+                TUNED_WEIGHTS,
+                EndToEnd,
+                TunedAutoEncoder,
+            )
+            if published:
+                # The tuned autoencoder as a run started from this one holds it: its weights and running
+                # statistics under `autoencoder` (`EndToEnd.tuned`).
+                frozen = AutoEncoder.bound(autoencoder_record, params=params['autoencoder'][TUNED_WEIGHTS])
+                autoencoder = TunedAutoEncoder(frozen, params['autoencoder'])
+            else:
+                tuning = from_record(EndToEnd, fields(end_to_end, 'end_to_end'), dtypes=False)
+                frozen = AutoEncoder.bound(autoencoder_record, params=params['params'][AUTOENCODER])
+                autoencoder, params = tuning.tuned(frozen, params)
         elif autoencoder_record is not None:
             autoencoder = AutoEncoder.bound(autoencoder_record, params=params['autoencoder'])
         grid = None if settings.grid is None else from_record(SourceGrid, fields(settings.grid, 'grid'))
         return cls(config.build(), settings.process, inputs, without_loss_heads(params), autoencoder,
                    steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver,
-                   grid=grid, final_denoise=grid is None)
+                   grid=grid, final_denoise=grid is None, grid_process=settings.grid_process)
 
     @classmethod
     def from_flaxdiff(cls, directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
@@ -997,10 +1019,12 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
                      ) -> tuple[tuple[str, ...], ...]:
     """The parameter roots of a recorded run's tree, which a storage override
     casts: the denoiser's, each condition encoder's own collections and the
-    autoencoder's. The rest keep the dtypes they were saved in."""
+    autoencoder's parameters (`AutoEncoder.parameter_collections`). The rest keep the dtypes they were
+    saved in."""
     from dew._records import record
     from dew.batch import PARAMETER_ROOTS
     from dew.inputs.condition import ConditionEncoder
+    from dew.nn.autoencoders import AutoEncoder
     from dew.registry import component
 
     roots: list[tuple[str, ...]] = list(PARAMETER_ROOTS)
@@ -1010,7 +1034,10 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
         roots.extend([("encoders", keyword)] if collections is None else
                      [("encoders", keyword, collection) for collection in collections])
     if autoencoder is not None:
-        roots.append(("autoencoder",))
+        held = component(AutoEncoder, autoencoder)[0].parameter_collections
+        # A tuned autoencoder's weights, not its running statistics (`AutoEncoder.parameter_collections`).
+        roots.extend([("autoencoder",)] if held is None
+                     else [("autoencoder", collection) for collection in held])
     return tuple(roots)
 
 
