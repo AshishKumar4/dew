@@ -1208,8 +1208,8 @@ class Decide(SavedRunTask, InItsForm):
         finalists: dict[str, list[str]] = {}
         for name, groups in wide.items():
             kept = []
-            for part in range(len(groups)):
-                answer = answers[f"{name}/{part}"]
+            for piece in range(len(groups)):
+                answer = answers[f"{name}/{piece}"]
                 assert isinstance(answer, ChoiceAnswer)
                 seen = dict(zip(answer.options, map(float, answer.probabilities), strict=True))
                 first[name] |= seen
