@@ -57,8 +57,8 @@ transformers (a release's) alike."""
 def stated_revision(metadata: Mapping[str, object]) -> Mapping[str, object] | None:
     """A store's tokenizer identity (`tokenizer_revision`) where it states its files' hashes, or None."""
     match metadata.get("tokenizer_revision"):
-        case {"files": _} as revision:
-            return revision
+        case Mapping() as revision if "files" in revision:
+            return {str(key): value for key, value in revision.items()}
         case _:
             return None
 
@@ -74,7 +74,7 @@ def tokenizer_contract(stated: Iterable[tuple[str, Mapping[str, object]]]) -> di
     for name, metadata in stated:
         revision = stated_revision(metadata)
         by_files = revision is not None and first is not None
-        if by_files and not same_tokenizer(revision, first):
+        if revision is not None and first is not None and not same_tokenizer(revision, first):
             raise ValueError(f"{name}'s tokenizer files differ from the first store's; stores read together "
                              "must share the tokenizer contract, whose ids they hold")
         for key in TOKENIZER_CONTRACT:
