@@ -241,6 +241,19 @@ def test_a_split_convs_bias_holds_its_orders(edge):
                         f"a split conv's bias {edge}", truth_fn=whole, plain_fn=whole, without=FORWARD_ORDERS)
 
 
+@pytest.mark.parametrize("edge", sorted(EDGES))
+def test_a_convs_bias_holds_every_order(edge):
+    """A conv's bias spread over its rows and tokens (`short_conv.conv_bias`: reverse mode one compensated
+    sum, row 1710): every order runs, finite wherever float64 is a normal float32 and the plain broadcast
+    is."""
+    conv_bias = short_conv.conv_bias
+    (bias,) = normal_draw(1710, (8,), scale=EDGES[edge])
+    (direction,) = normal_draw(1711, (8,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(1712, (2, 5, 8))
+    assert_contract(lambda bias: conv_bias(bias, (2, 5)), (bias,), (direction,), cotangent,
+                    f"a conv's bias {edge}", plain_fn=lambda bias: jnp.broadcast_to(bias, (2, 5, 8)))
+
+
 # The ports near float32's largest: their reverse derivatives are NaN at entries the recurrence keeps finite,
 # the gated delta rule's where fla's own chunked form keeps them too (ledger 2656).
 @pytest.mark.parametrize("taken", list(ORDER_SETS))

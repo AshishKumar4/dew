@@ -77,6 +77,9 @@ PROFILE_STOP = Path(__file__).with_name("profile_stop_worker.py")
 """The worker of the pools whose profile window one rank cannot stop."""
 EXAMPLES_CLOCK = Path(__file__).with_name("examples_clock_worker.py")
 """The worker of the pools that run on the examples clock."""
+SEARCHED_AGAIN = Path(__file__).with_name("searched_again_worker.py")
+"""The worker of the pool whose plan, made before its state was placed, one process alone would search
+again once placed."""
 READ_ROUNDS = Path(__file__).with_name("read_rounds_worker.py")
 """The worker of the pool that counts the rounds a fit agrees its reads in."""
 REPLICA_KEY = Path(__file__).with_name("replica_key_worker.py")
@@ -446,6 +449,20 @@ def test_the_mesh_covers_every_process_in_the_pool(two_processes):
                                         "tensor": 1, "sequence": 1, "stage": 1}
         assert report["mesh_devices"] == MESH_DEVICES
         assert report["mesh_process_indices"] == [0, 1]
+
+
+@pytest.mark.distributed
+def test_a_plan_one_process_alone_would_search_again_once_placed_is_searched_again_by_every_one(tmp_path):
+    """A fresh fit's plan made before its state is placed is searched again where the placed devices' room
+    covers one of its misses: where process 0's do and process 1's do not (`searched_again_worker`), both
+    search again and step one plan, the search's coordination rounds paired across them, where process 0
+    searched alone and process 1 stepped the held plan: the processes' rounds crossed or hung (train 993's
+    F1). Its premise first: the batch whole needs more than two microbatches by more than the state each
+    process places, so process 1 is short of the whole by more than placing frees."""
+    reports = run_pool("searched_again", tmp_path / "out", 2, script=SEARCHED_AGAIN, devices=1, timeout=900)
+    assert reports[0]["delta"] > 0, reports[0]
+    assert [report["searched_again"] for report in reports] == [True, True], reports
+    assert reports[0]["plan"] == reports[1]["plan"] == [2, None], reports
 
 
 @pytest.mark.distributed

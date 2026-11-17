@@ -90,17 +90,14 @@ def theta(state) -> np.ndarray:
     return found
 
 
-def test_a_decision_run_whose_passes_grow_by_phase_is_its_phases_runs_and_resumes_as_one(tmp_path):
+def test_a_decision_runs_first_phase_is_a_one_pass_runs_over_its_first_source(tmp_path):
     """The run's first phase is a one-pass run's over the first source alone, bit for bit (its rows that
-    source's, its steps at one pass), its implicit loop's θ untouched
-    while every step runs one pass (its gradient zero) and moved from the second phase's first step; stopped
-    after step 3, inside its second phase, and resumed, it lands where the run nobody stopped lands; its saved
-    run loads with the last phase's two passes. A count list whose length is not the data's phases is
-    refused before anything loads."""
+    source's, its steps at one pass), its implicit loop's θ untouched while every step runs one pass (its
+    gradient zero). A count list whose length is not the data's phases is refused before anything loads.
+    Its own cell apart from the resume's: one cell of both trained five runs (row 5531, 311 s in CI)."""
     with pytest.raises(ValueError):
         run(tmp_path, (1, 2, 3), phased(tmp_path))
-    data = phased(tmp_path)
-    first, _ = trained(run(tmp_path, STEPS, data), tmp_path, "first", trainer={"steps": PHASE})
+    first, _ = trained(run(tmp_path, STEPS, phased(tmp_path)), tmp_path, "first", trainer={"steps": PHASE})
     # The comparisons below hold on numbers: NaN equals NaN to them.
     assert all(np.all(np.isfinite(leaf)) for leaf in parameters(first).values())
     alone, _ = trained(run(tmp_path, 1, asked(tickets(tmp_path, "first", "billing"))), tmp_path, "alone",
@@ -110,6 +107,12 @@ def test_a_decision_run_whose_passes_grow_by_phase_is_its_phases_runs_and_resume
         np.testing.assert_array_equal(leaf, parameters(alone)[name], err_msg=name)
     assert not np.any(theta(first)), "θ's gradient is zero while each step runs one pass"
 
+
+def test_a_decision_run_whose_passes_grow_by_phase_resumes_as_one(tmp_path):
+    """The phased run's implicit loop's θ moves from the second phase's first step; stopped after step 3,
+    inside its second phase, and resumed, it lands where the run nobody stopped lands, bit for bit; its
+    saved run loads with the last phase's two passes."""
+    data = phased(tmp_path)
     whole, _ = trained(run(tmp_path, STEPS, data), tmp_path, "whole", trainer={"steps": 4})
     assert all(np.all(np.isfinite(leaf)) for leaf in parameters(whole).values())
     assert np.any(theta(whole)), "θ moves once a step runs two passes"
@@ -121,7 +124,6 @@ def test_a_decision_run_whose_passes_grow_by_phase_is_its_phases_runs_and_resume
         np.testing.assert_array_equal(leaf, parameters(resumed)[name], err_msg=name)
     loaded = Decide.from_run(str(tmp_path / "runs" / "stopped"))
     assert loaded.model.backbone.loop.steps == STEPS[-1]
-
 
 
 @pytest.mark.parametrize("phase", range(len(STEPS)), ids=[f"{passes}-passes" for passes in STEPS])

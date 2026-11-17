@@ -71,6 +71,7 @@ from .precision import (
     compensated_sum,
     float32_dot_general,
     l2norm,
+    silu,
 )
 from .sharding import (
     HEADS,
@@ -207,10 +208,11 @@ def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, seg
         before = jnp.pad(segments, ((0, 0), (K - 1, 0)))[:, tap:tap + length]
         return jnp.where((before == segments)[..., None], window, 0)
 
+    spread_bias = None if bias is None else short_conv.conv_bias(bias.astype(wide), x.shape[:2])
     windows = short_conv.preactivation([read(tap) for tap in range(K)], [taps[:, tap] for tap in range(K)],
-                                       None if bias is None else bias.astype(wide))
+                                       spread_bias)
     if activation:
-        windows = nn.silu(windows)
+        windows = silu(windows)
     if valid is not None:
         windows = jnp.where(valid[:, :, None], windows, 0)
     return conv_pieces(windows, parts, dtype)
@@ -279,11 +281,11 @@ def entered_conv1d(x, kernel, valid, documents, held, entered, *, bias=None, par
         return jnp.where((rank >= taps_count - 1 - tap)[..., None], inside, behind)
 
     taps = kernel.astype(wide)
+    spread_bias = None if bias is None else short_conv.conv_bias(bias.astype(wide), x.shape[:2])
     windows = short_conv.preactivation([read(tap) for tap in range(taps_count)],
-                                       [taps[:, tap] for tap in range(taps_count)],
-                                       None if bias is None else bias.astype(wide))
+                                       [taps[:, tap] for tap in range(taps_count)], spread_bias)
     if activation:
-        windows = nn.silu(windows)
+        windows = silu(windows)
     windows = jnp.where(real[:, :, None], windows, 0)
     return conv_pieces(windows, parts, dtype)
 

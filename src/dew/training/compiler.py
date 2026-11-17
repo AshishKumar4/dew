@@ -16,19 +16,20 @@ import numpy as np
 from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew._records import JSON, boolean, json_value, listed, record
+from dew._coordination import from_every_process
+from dew._records import JSON, boolean, integer, json_value, listed, record
 from dew.batch import CLOSES_WINDOW, Batch
 from dew.distributed.batches import batch_layout, batch_shardings, batch_signature
 from dew.distributed.placement import Validation
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import gpu_target
-from dew.nn.kernels.options import hold
+from dew.nn.kernels.options import hold, trace_context
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
 from dew.state import Accumulation, TrainState, apart, occupied, together
 from dew.telemetry.instrumentation import StepFlops
-from dew.training._candidates import Stepping, candidate_for, lowered_for
+from dew.training._candidates import Stepping, _shaped, candidate_for, lowered_for
 from dew.training._lowering import Lowered, routed
 from dew.training.distributed import link_figure, link_figures, resumed_link_figures
 from dew.training.memory import (
@@ -122,6 +123,15 @@ def admitted_placed(planned: Planned, mesh: Mesh) -> tuple[bool, int | None]:
     return fit, headroom
 
 
+class Plan(NamedTuple):
+    """Where a step's plan stands (`StepCompiler._plans`): the rung it compiles at (`rung_record`) and the
+    split it reads its batch in, or a resumed checkpoint's rung for its layout (`resumed`, no split)."""
+
+    rung: JSON
+    split: int | None
+    resumed: bool = False
+
+
 class Unplaced(NamedTuple):
     """A fresh run's first step planned before its state was placed (`StepCompiler.planned_unplaced`): the
     signature of the batch it was planned over, its plan and what its compile found, and the record of its
@@ -131,6 +141,16 @@ class Unplaced(NamedTuple):
     planned: Planned
     compiled: Compiled
     keep: Callable[[], None]
+
+    def probes(self) -> tuple[tuple[Mapping[str, object], ...], int]:
+        """Its search's probes (`dew.training.planning.Probe.record`) and the index of its own: the last that
+        fit at its split and rung (a walk past it may have missed after, a descent's split before it)."""
+        probes = listed(record(self.compiled.plan, "plan")["probes"], "probes", read=record, what="probes")
+        rung = json.dumps(self.planned.rung, sort_keys=True)
+        own = max(index for index, probe in enumerate(probes)
+                  if probe["fits"] is True and probe["split"] == self.planned.split
+                  and json.dumps({name: probe[name] for name in self.planned.rung}, sort_keys=True) == rung)
+        return probes, own
 
 
 class CompiledStep(Protocol):
@@ -199,31 +219,42 @@ class StepCompiler[L, E]:
         # The ladder's rungs past the objective's head and remat that a step fit at (no narrow copies, XLA's
         # defaults) stay for later compiles; a resumed run starts at its checkpoint's rung (`climb_to`).
         self._narrow, self._xla_defaults = True, False
+        # The Newton-Schulz stacks the step joins at a time where the run states none (`ns_group`).
+        self._ns_group: int | None = None
         self._resumed_rung: JSON = None
         # The rung each newly met shape starts from, as the first compile found the objective: its modules,
-        # head tile, XLA option choice and record (`at_base_rung`); then the rung each shape compiled at, by
-        # layout, and the rungs a resumed checkpoint recorded for its shapes.
+        # head tile, XLA option choice and record (`at_base_rung`).
         self._base_rung: tuple[tuple[nn.Module, ...], tuple[int, int] | None, bool, dict[str, JSON]] | None
         self._base_rung = None
-        self._shape_rungs: dict[str, JSON] = {}
-        self._resumed_shapes: dict[str, JSON] = {}
         self._resumed_links: dict[str, float | None] = {}
         # A fresh run's first step planned over its state's shapes before the state is placed
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
         self._unplaced: Unplaced | None = None
-        # The plan each step's search found in this process, its rung and split by the batch's layout and the
-        # pass count it runs (`_plan_key`): the rung and split every later search of that step starts at
-        # (`_planned`), so a process searches a step once.
-        self._plans: dict[tuple[str, int | None], JSON] = {}
+        # Where each step's plan stands, by the batch's layout and the pass count it runs (`_plan_key`): the
+        # rung and split this process's search found, which every later search of that step starts at
+        # (`_planned`), so a process searches a step once; or the rung a resumed checkpoint recorded for
+        # its layout (`resume_rung`, any pass count: `None`), which its first compile climbs to
+        # (`at_base_rung`). A checkpoint records each layout's rung from it (`checkpoint_rung`).
+        self._plans: dict[tuple[str, int | None], Plan] = {}
         # Whether the next compile plans a phase afresh at an update's end
         # (`dew.training.trainer.Trainer._compiled_for`): the empty window its state holds binds no split
         # (`resumed_stepping`), the new step's window built over it.
         self.afresh = False
+        # The loss's shape-only traces (`loss_shaped`), until the next plan is made: the run's fit check's
+        # (`Trainer._whole_validated`) and its plan's candidates' read one trace.
+        self._loss_shapes: dict[Hashable, tuple[tuple, bool]] = {}
 
     @property
     def narrow(self) -> bool:
         """Whether the step keeps its narrow copies, at the rung it stands at."""
         return self._narrow
+
+    @property
+    def ns_group(self) -> int | None:
+        """The Newton-Schulz stacks of one shape the step joins at a time where its run states none, at the
+        rung it stands at (`dew.newton_schulz.released`): None joins them all. Every trace of the step reads
+        it (`StepSettings.ns_group`, `Trainer._settings`)."""
+        return self._ns_group
 
     @property
     def stated_links(self) -> Mapping[str, Link]:
@@ -235,7 +266,7 @@ class StepCompiler[L, E]:
         modules' remat (`recompute_record`) and whether the step keeps XLA's default options
         (`dew.training.planning.FitSearch.ladder`). A checkpoint records it, since each decides the program
         a step runs."""
-        return rung_record(self.objective, self._xla_defaults, narrow=self._narrow)
+        return rung_record(self.objective, self._xla_defaults, narrow=self._narrow, ns_group=self._ns_group)
 
     def checkpoint_rung(self) -> JSON:
         """The rung a checkpoint records: the run's own, which every newly met
@@ -245,7 +276,8 @@ class StepCompiler[L, E]:
         link figures by placement (`link_figures`), a resume's own there."""
         base = self.rung() if self._base_rung is None else self._base_rung[3]
         links = link_figures(self._bandwidths)
-        return {**base, 'shapes': dict(self._shape_rungs), **({'links': links} if links else {})}
+        shapes: dict[str, JSON] = {layout: plan.rung for (layout, _), plan in self._plans.items()}
+        return {**base, 'shapes': shapes, **({'links': links} if links else {})}
 
     def resume_rung(self, rung: JSON) -> None:
         """Take a checkpoint's rung (`checkpoint_rung`): the objective climbs
@@ -256,8 +288,8 @@ class StepCompiler[L, E]:
         self._resumed_links = {} if rung is None else resumed_link_figures(rung)
         if rung is not None:
             shapes = record(record(rung, 'rung').get('shapes', {}), 'rung shapes')
-            self._resumed_shapes = {name: json_value(shape, f'rung of {name}')
-                                    for name, shape in shapes.items()}
+            self._plans.update({(name, None): Plan(json_value(shape, f'rung of {name}'), None, resumed=True)
+                                for name, shape in shapes.items()})
 
     def at_base_rung(self, batch: Batch) -> JSON:
         """Put the objective at the rung a newly met shape starts from, and
@@ -277,12 +309,13 @@ class StepCompiler[L, E]:
             self.objective.substitute(list(modules))
             self.objective.restore_head(tile, fused=bool(rung['head_fused']))
             self._xla_defaults, self._narrow = defaults, bool(rung['narrow'])
+            self._ns_group = None if rung['ns_group'] is None else integer(rung['ns_group'], "rung ns_group")
             # The base modules at the pass count the step being compiled runs, whatever they were taken at.
             self.phase_passes.restored(self.objective)
-        recorded = self._resumed_shapes.get(batch_layout(batch))
-        if recorded is None:
+        recorded = self._plan_of(batch)
+        if recorded is None or not recorded.resumed:
             return None
-        self.climb_to(recorded)
+        self.climb_to(recorded.rung)
         return self.rung()
 
     def climb_to(self, rung: JSON) -> None:
@@ -301,6 +334,10 @@ class StepCompiler[L, E]:
             fields.get("xla_defaults", False), "rung xla_defaults"
         )
         self._narrow = self._narrow and boolean(fields.get("narrow", True), "rung narrow")
+        # A group the record states is a release its run made: kept, as the ladder never joins them again.
+        group = fields.get("ns_group")
+        if group is not None:
+            self._ns_group = integer(group, "rung ns_group")
         self._resumed_rung = self.rung()
 
 
@@ -380,14 +417,36 @@ class StepCompiler[L, E]:
         mesh = settings.device_mesh
         fit, headroom = (False, None) if held is None or held.signature != batch_signature(batch) else (
             admitted_placed(held.planned, mesh))
+        probes, own = ([], 0) if held is None else held.probes()
+        before = probes[own]["headroom"] if probes else None
+        if held is not None and fit and headroom is not None and isinstance(before, int):
+            # The placed devices hold more room than the search read where the start copied held arrays and
+            # let their sources go: each candidate it saw miss holds the same bytes, so one whose miss that
+            # room covers fits there, and the plan is searched again on the placed devices. Devices that
+            # state no memory read none, and the held plan stands.
+            more = headroom - before
+            short = [(probe, -missed) for probe in probes
+                     if probe["fits"] is False and isinstance(missed := probe["headroom"], int)]
+            covered = [probe for probe, by in short if by <= more]
+            _log.info("the step its search judged before the state was placed has %d bytes more room placed; "
+                      "its misses were short by %s", more, [by for _, by in short])
+            # Every process searches again or none does: each reads its own devices' room, and a search
+            # runs its coordination rounds in every process alike (`FitSearch.gather`).
+            if any(from_every_process(bool(covered))):
+                _log.warning("a step its search judged before the state was placed misses by less than the "
+                             "room the placed devices hold beside it (%d bytes more in this process): it is "
+                             "searched again there (%s)", more,
+                             "; ".join(f"split {probe['split']} at remat {probe['remat']}"
+                                       for probe in covered) or "another process's misses")
+                fit = False
+                self._plans.pop(self._plan_key(batch), None)
         if held is not None and fit:
             # Planned and compiled while the state was built (`planned_unplaced`), and judged now the state is
             # placed: its plan, kept and its rung recorded, its record holding what the devices read.
             planned, compiled = held.planned, held.compiled
             held.keep()
             plan = record(compiled.plan, "plan")
-            *earlier, kept = listed(plan["probes"], "probes", read=record, what="probes")
-            probes = [*earlier, {**kept, "headroom": headroom}]
+            probes = [*probes[:own], {**probes[own], "headroom": headroom}, *probes[own + 1:]]
             memory = memory_record(planned.executable, local_devices(mesh), planned.candidate.held, fits=True)
             compiled = dataclasses.replace(compiled, plan={**plan, "probes": probes}, memory=memory)
         else:
@@ -439,13 +498,16 @@ class StepCompiler[L, E]:
         links = self.links(mesh)
         shaped = self.at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
-        with stepping.traced_on(mesh, links) as schedule, held_objects():
-            planned, flops, plan, validation, keep = self._planned(stepping, state, batch, mesh, schedule,
-                                                                   resumed, trials, frontier, unplaced,
-                                                                   provisional or unplaced is not None)
-            split, candidate = planned.split, planned.candidate
-            self._shape_rungs[batch_layout(batch)] = self.rung()
-            memory = memory_record(planned.executable, local_devices(mesh), candidate.held, fits=True)
+        try:
+            with stepping.traced_on(mesh, links) as schedule, held_objects():
+                planned, flops, plan, validation, keep = self._planned(
+                    stepping, state, batch, mesh, schedule, resumed, trials, frontier, unplaced,
+                    provisional or unplaced is not None)
+                split, candidate = planned.split, planned.candidate
+                memory = memory_record(planned.executable, local_devices(mesh), candidate.held, fits=True)
+        finally:
+            # The plan made, its loss's traces are read no more (`loss_shaped`).
+            self._loss_shapes.clear()
         return planned, Compiled(split, plan, memory, planned.executable, flops and split * flops, links,
                                  validation), keep
 
@@ -453,6 +515,12 @@ class StepCompiler[L, E]:
         """The step a plan is kept for (`_plans`): its batch's layout and the pass count it runs
         (`PhasePasses.current`), a phase of other passes another program."""
         return batch_layout(batch), self.phase_passes.current
+
+    def _plan_of(self, batch: Batch) -> Plan | None:
+        """Where the step over `batch` stands (`_plans`): its own plan, or its layout's rung a resumed
+        checkpoint recorded; None where neither."""
+        layout, passes = self._plan_key(batch)
+        return self._plans.get((layout, passes), self._plans.get((layout, None)))
 
     def runner(self, stepping: Stepping, planned: Planned,
                mesh: Mesh) -> CompiledStep:
@@ -517,6 +585,33 @@ class StepCompiler[L, E]:
                 return (stepped, *(whole(outputs) if split > 1 else outputs[0]))
         return run
 
+    def loss_shaped(self, stepping: Stepping, schedule: Schedule) -> Stepping:
+        """`stepping` whose loss's shape-only trace (`Trainer._loss_shape`) is made once for what decides
+        it: the window and split, the objective's rung, the trace's context (`options.trace_context`) and
+        the state's and batch's types; read again by the run's fit check and its plan's candidates (a
+        candidate lowered again past a spilled kernel, `Relowered`, or at its narrow copies). Kept until the
+        next plan is made (`_planned`). Row 6320: nine identical traces, 61.6 s, of a 4B decision step's
+        start (LF-PROMO3); the fit check's and the plan's were two of a CPU start's. Each trace is kept with
+        what it told the `schedule` it ran under, whether a pipeline ran (`Schedule.pipelined`), which a read
+        of it tells the schedule it is read under: a stage axis is refused where no pipeline ran
+        (`StageLocal.refuse_unpipelined`), and a kept trace runs nothing."""
+        traced = self._loss_shapes
+
+        def loss_shape(view, rows, window: int, split: int, *, held=stepping.loss_shape) -> tuple:
+            rung = rung_record(self.objective, xla_defaults=False, narrow=True)
+            key = (window, split, json.dumps(rung, sort_keys=True), trace_context(), _shaped(view),
+                   _shaped(rows))
+            if key not in traced:
+                before, schedule.pipelined = schedule.pipelined, False
+                shapes = held(view, rows, window, split)
+                traced[key] = shapes, schedule.pipelined
+                schedule.pipelined = before or schedule.pipelined
+            shapes, pipelined = traced[key]
+            schedule.pipelined = schedule.pipelined or pipelined
+            return shapes
+
+        return dataclasses.replace(stepping, loss_shape=loss_shape)
+
     def _planned(self, stepping: Stepping, state: TrainState, batch: Batch,
                  mesh: Mesh, schedule: Schedule, resumed: JSON, trials: Trials | None,
                  frontier: bool, unplaced: int | None, provisional: bool
@@ -531,23 +626,13 @@ class StepCompiler[L, E]:
         replicated = NamedSharding(mesh, P())
         placement = batch_shardings(mesh, batch)
         candidates = splits(stepping.shape.rows, batch, mesh, settings.microbatches, stepping.shape.split)
-        # The loss's shape-only trace (`Trainer._loss_shape`), once a split and rung: a candidate lowered
-        # again (past a spilled kernel, `Relowered`; at its narrow copies) reads the shapes it read, which
-        # its split, window and rung decide, the state and batch this plan's (row 6320: nine identical
-        # traces, 61.6 s, of a 4B decision step's start, LF-PROMO3).
-        traced: dict[tuple[int, int, str], tuple] = {}
+        stepping = self.loss_shaped(stepping, schedule)
 
-        def loss_shape(view, rows, window: int, split: int, *, held=stepping.loss_shape) -> tuple:
-            rung = rung_record(self.objective, xla_defaults=False, narrow=True)
-            key = (window, split, json.dumps(rung, sort_keys=True))
-            if key not in traced:
-                traced[key] = held(view, rows, window, split)
-            return traced[key]
-
-        stepping = dataclasses.replace(stepping, loss_shape=loss_shape)
-
-        def lower(split: int, narrow: bool) -> Candidate:
-            return candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow)
+        def lower(split: int, narrow: bool, ns_group: int | None) -> Candidate:
+            # Its Newton-Schulz stacks joined as the rung asked releases them (`StepSettings.ns_group`).
+            grouped = dataclasses.replace(stepping, settings=dataclasses.replace(stepping.settings,
+                                                                                 ns_group=ns_group))
+            return candidate_for(grouped, state, batch, schedule, placement, replicated, split, narrow)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -555,8 +640,9 @@ class StepCompiler[L, E]:
         source = record_path
         if self.ahead is not None and self.ahead.plan is not None:
             recorded, source = self.ahead.plan, "the ahead step"
-        elif (searched := self._plans.get(self._plan_key(batch))) is not None:
-            recorded, source = searched, "this process's search of the step"
+        elif (searched := self._plan_of(batch)) is not None and not searched.resumed:
+            recorded = {**record(searched.rung, 'plan'), 'split': searched.split}
+            source = "this process's search of the step"
         before = self.rung()
         self.climb_to(recorded)
         self._resumed_rung = None
@@ -568,7 +654,8 @@ class StepCompiler[L, E]:
         search = FitSearch(
             lower, lambda candidate: step_options(
                 self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
-            self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
+            self.objective, mesh, self._xla_defaults, self._narrow, self._ns_group,
+            None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self.ahead,
             provisional=provisional, unplaced=unplaced)
         planned, probes = search.admitted(
@@ -581,13 +668,13 @@ class StepCompiler[L, E]:
             _log.info("above the plan, fitting at fewer microbatches: %s", probe.named())
         # Consume the artifact only after its program was accepted; a refusal leaves it pending.
         self.ahead = search.ahead
-        self.objective.substitute(list(planned.modules))
-        self.objective.restore_head(planned.tile, fused=planned.fused)
-        self._xla_defaults, self._narrow = planned.xla_defaults, planned.narrow
+        planned.at.put(self.objective)
+        self._xla_defaults, self._narrow = planned.at.xla_defaults, planned.at.narrow
+        self._ns_group = planned.at.ns_group
         if runs := pgle_runs():
             trials = Trials(state, batch, owned=False) if trials is None else trials
             run = self.runner(stepping, planned, mesh)
-            relower = functools.partial(lower, planned.split, planned.narrow)
+            relower = functools.partial(lower, planned.split, planned.at.narrow, planned.at.ns_group)
             asked = search.compiled_key(planned.candidate.lowered, planned.options)
             planned = planned.guided(trials.profiled(run, planned, mesh, runs), runs, mesh, relower)
             # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
@@ -597,7 +684,10 @@ class StepCompiler[L, E]:
         # plan's fit check counted them before any is built (`Candidate.held`).
         validation = stepping.validation(planned.candidate.prepared)
         chosen = {**self.rung(), 'split': planned.split}
-        self._plans[self._plan_key(batch)] = chosen
+        layout, passes = self._plan_key(batch)
+        # This process's plan of the step, in place of a resumed checkpoint's rung for its layout.
+        self._plans.pop((layout, None), None)
+        self._plans[(layout, passes)] = Plan(self.rung(), planned.split)
         flops, counted = plan_flops(recorded, planned.executable)
         keep = (functools.partial(keep_rung, record_path, key, {**chosen, 'flops': counted})
                 if record_path is not None else lambda: None)

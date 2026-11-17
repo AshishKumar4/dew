@@ -1,4 +1,5 @@
 --index-url https://pypi.org/simple
+--extra-index-url https://pypi.dewml.dev/staging/0.12.0.1.post106/5e21634c37f4e1a4/simple/
 --extra-index-url https://pypi.dewml.dev/simple
 
 absl-py==2.5.1 \
@@ -1400,8 +1401,8 @@ jaraco-functools==4.6.0 \
     # via
     #   -c locks/cpu.txt
     #   cheroot
-jax==0.12.0.1.post97 \
-    --hash=sha256:257d13c0c8fec88c631829c7d1e66fd8db5de4c96b2e952b1192b763ac5fd958
+jax==0.12.0.1.post106 \
+    --hash=sha256:2f5fac648337afcf3405541607ac135539d91d920c6a9e20bbcc8ea4bcb8cab9
     # via
     #   -c constraints.txt
     #   -c locks/cpu.txt
@@ -1411,7 +1412,7 @@ jax==0.12.0.1.post97 \
     #   orbax-checkpoint
     #   qwix
     #   tokamax
-jaxlib==0.12.0.1 \
+jaxlib==0.12.0.1 ; (os_name != 'nt' and sys_platform == 'darwin') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux') \
     --hash=sha256:00acba6d262f20110289e5d3384cd92298ae362226b66f77f92c518fab55c2c6 \
     --hash=sha256:085c5196ac9e735a9313dee67a536e70ca09fe61c4ce19e694849509add2ecac \
     --hash=sha256:3011a4ef1fc3dbe7c03fee30dee8f0b85a9ce92e5673271f5065d4cb400587a5 \
@@ -1436,6 +1437,21 @@ jaxlib==0.12.0.1 \
     --hash=sha256:fdc56999ba690bd915f7029613269848eaaf85d231ec8abc46610d3b840c189c
     # via
     #   -c locks/cpu.txt
+    #   dewml (pyproject.toml)
+    #   jax
+    #   optax
+    #   qwix
+    #   tokamax
+jaxlib==0.12.0.1.post103 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') \
+    --hash=sha256:1e0764265f12b6dd0e32b129ff508aea8d31916148976abb218a2d6cb16ffc81 \
+    --hash=sha256:36b55e1ec088752e827f755c22a23341ffa4842346614dce56cb61163b5368ca \
+    --hash=sha256:46b13d7b736001cde4ac4954fe5c4cf806f667bf6ba890cc8e0745009879e6f3 \
+    --hash=sha256:4988c9daa76711f29824c0b20975c06ec1a74552bda9ffef07145ab5e0041093 \
+    --hash=sha256:8fe1c417b81ee4c2c5971f82ed1b485d653fee27252c96e1cf49ea558a2ed644 \
+    --hash=sha256:92d515d3c1ed6d84c69418b2546f56d0e8fbff865e1461f3ed084902d4387336
+    # via
+    #   -c locks/cpu.txt
+    #   dewml (pyproject.toml)
     #   jax
     #   optax
     #   qwix

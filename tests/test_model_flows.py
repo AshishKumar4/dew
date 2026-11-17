@@ -1,10 +1,11 @@
 """The GPU tier's model flows as a CPU reads them (tests/model_flows.py, row 5461): each flow's model
 builds at its widths, its Dew arm takes the routes it is for as each GPU generation's target chooses them,
-its reference arm the reference path alone, and its truth computes in float64; and check 1's prepared
-truths (`reference_error.stored_truths`) judge as the truths a site computes itself, a missing or stale
-one refused."""
+its reference arm the reference path alone, and its truth computes in float64; and check 1's truths
+computed by programs compiled ahead (`truths_ahead.compiled_truths`) judge as the truths a site computes
+itself, a missing or stale program refused."""
 
 import dataclasses
+import json
 import os
 import sys
 import tempfile
@@ -16,9 +17,9 @@ import jax.numpy as jnp
 import model_flows
 import numpy as np
 import pytest
-from map_judge import site_id
 from process_support import relayed
-from reference_error import MissingTruth, assert_as_exact, stored_truths
+from reference_error import assert_as_exact, over_windows, windows
+from truths_ahead import MissingTruth, compiled_truths
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
@@ -102,18 +103,16 @@ def store():
 
 @pytest.mark.parametrize("name", [flow.name for flow in model_flows.FLOWS])
 def test_a_flows_truth_computes_in_float64(name, store, monkeypatch):
-    """The flow's truths prepared on a CPU as its node prepares them, its first draw's of each program held to
-    float64 (check 1's `_of_float64`), each site's first stage written to the store: here at the fewest
-    seeds check 1 takes (`parity.FEWEST_SEEDS`), where its node's prepare writes its declared count (a
-    params-sized gradient a draw, which at the sinks flows' 128 would write 9 GB a flow on this CPU)."""
+    """The flow's truths prepared on a CPU as its node prepares them (`model_flows.judge`, here compiled for
+    this CPU, a node's for its GPU): each program's first draw's truth held to float64 (check 1's
+    `_of_float64`, a narrow one refused) and every program its sites' truths and terms take compiled into the
+    store, at the fewest seeds check 1 takes (`parity.FEWEST_SEEDS`)."""
     fewest = dict.fromkeys(model_flows.KINDS, FEWEST_SEEDS)
     flow = dataclasses.replace(model_flows.flow_named(name), seeds=fewest)
     monkeypatch.setenv(model_flows.TRUTHS, str(store))
     monkeypatch.setenv(model_flows.PREPARE, "1")
     for kind in model_flows.KINDS:
         model_flows.judge(flow, {}, kind)
-    written = sorted((model_flows.store_of(flow) / "truths").iterdir())
-    assert [len(list(site.glob("*.truth"))) for site in written] == list(fewest.values())
 
 
 @pytest.mark.parametrize("lane", [True, False], ids=["the lane's", "a user's"])
@@ -135,12 +134,12 @@ def test_a_flow_holds_in_a_process_of_its_variant_alone(lane):
     assert ran.returncode == 0, ran.output[-3000:]
 
 
-def test_a_parts_prepare_compiles_a_flows_programs_for_its_nodes_gpu_and_writes_its_truths(store,
+def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_its_nodes_gpu(store,
                                                                                           monkeypatch):
     """A GPU part's prepare as its node's CPU runs it (`DEW_TIER_PREPARE=1`): a flow prepared in a process
     of its own (`model_flows.prepared_apart`) over the node's serialized topology (here a compile-only
     A100's, serialized as a host serializes its own), its Dew and reference programs compiled for that GPU
-    and its truths written to the tier's store, and what it took reported."""
+    and its truths' programs compiled into the tier's store, and what it took reported."""
     from jax.experimental import topologies
 
     from dew.nn.kernels.generation import compile_only_gpus
@@ -150,12 +149,19 @@ def test_a_parts_prepare_compiles_a_flows_programs_for_its_nodes_gpu_and_writes_
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(model_flows.TRUTHS, str(store / "tier"))
     monkeypatch.setenv(model_flows.PREPARE, "1")
+    monkeypatch.setenv(model_flows.UNIT, "a selective scan's unit")
     flow = model_flows.flow_named("selective scan")
     took = model_flows.prepared_apart(flow)
     store = model_flows.store_of(flow)
     assert took is not None and took["written_bytes"] > 0 and took["seconds"] > 0
     assert (store / "dew.programs").is_file() and (store / "reference.programs").is_file()
     assert len(list((store / "truths").iterdir())) == 2
+    # Its programs' needs in the allocator's admission terms (`dew.training.memory.admitted`), filed under
+    # the unit the tier sizes a worker for.
+    [needs] = (store.parent / "needs").iterdir()
+    filed = json.loads(needs.read_text())
+    stated = json.loads((store / model_flows.NEED).read_text())["programs"]
+    assert (filed["unit"], filed["programs"]) == ("a selective scan's unit", stated)
 
 
 def _site(salt: int = 5461):
@@ -177,35 +183,91 @@ def _site(salt: int = 5461):
 
 
 def test_a_prepared_site_judges_as_one_that_computes_its_truth_and_refuses_a_missing_or_stale_one(tmp_path):
-    """A site prepared (`stored_truths(prepare=True)`, every stage's draws: a later job's, `later`) writes
-    every draw's truth and runs no arm; judged from that store it passes as it passes computing its own; a
-    store of another stamp, or none, is a red (`MissingTruth`), never a truth computed in its place."""
+    """A site prepared (`compiled_truths(prepare=True)`) compiles its truth's programs for every shape its
+    stages' draws take and runs no arm; judged from that store it passes as it passes computing its own; a
+    store of another stamp, of another site, or of other shapes than a draw's is a red (`MissingTruth`),
+    never a program compiled in its place."""
     dew, reference, draw = _site()
-    later_sites = {site_id("a prepared product"), site_id("another product")}
-    with stored_truths(tmp_path, prepare=True, stamp="a", later=later_sites):
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
         assert_as_exact(None, reference, draw, "a prepared product", seeds=8)
         with pytest.raises(ValueError):
             assert_as_exact(None, reference, draw, "a prepared product", seeds=8)
     assert len(list(tmp_path.iterdir())) == 1
     assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
-    with stored_truths(tmp_path, prepare=False, stamp="a", later=later_sites):
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
-    with stored_truths(tmp_path, prepare=False, stamp="b", later=later_sites), pytest.raises(MissingTruth):
+    with compiled_truths(tmp_path, prepare=False, stamp="b"), pytest.raises(MissingTruth):
         assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
-    with stored_truths(tmp_path, prepare=False, stamp="a", later=later_sites), pytest.raises(MissingTruth):
+    with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
         assert_as_exact(dew, reference, draw, "another product", seeds=8)
-    # The same site over another seed stream: draws its prepare did not make.
-    _, _, other = _site(5462)
-    with stored_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
-        assert_as_exact(dew, reference, other, "a prepared product", seeds=8)
+
+    def wider(seed):
+        a, b = draw(seed)
+        return np.concatenate([a, a]), b
+
+    with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
+        assert_as_exact(dew, reference, wider, "a prepared product", seeds=8)
+
+
+def test_a_compiled_sites_run_traces_none_of_its_truth(tmp_path):
+    """Judged from programs compiled ahead (`compiled_truths(prepare=False)`), a site's run computes every
+    draw's truth with them and runs none of its truth's code, which its prepare alone traced; computing its
+    own truths, a site traces it."""
+    dew, reference, draw = _site()
+    traced = []
+
+    def truth(a, b):
+        traced.append(None)
+        return jnp.dot(a, b)
+
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(None, reference, draw, "a product's truth", seeds=8, truth_fn=truth)
+    assert traced
+    traced.clear()
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(dew, reference, draw, "a product's truth", seeds=8, truth_fn=truth)
+    assert not traced
+    assert_as_exact(dew, reference, draw, "a product's truth", seeds=8, truth_fn=truth)
+    assert traced
+
+
+def test_a_window_loops_truth_is_computed_window_by_window_from_its_windows_program(tmp_path):
+    """A site over windows (`over_windows`) prepared compiles its truth's program at one window's shapes, and
+    its terms' at the whole draw's (a program of its own, or its window function's walk, `terms=True`), and
+    its run computes every window's truth with the one, as the loop runs them, and the terms with the other:
+    it passes as it passes computing its own."""
+    dew, reference, draw = _site()
+    windowed = windows(draw, 2)
+
+    def terms(a, b):
+        # A product's terms, row by row: each output's products' root sum of squares.
+        return jnp.sqrt(jnp.sum(jnp.square(a[..., :, :, None] * b[..., None, :, :]), axis=-2))
+
+    def stacked(a, b):
+        # The reference's product of the window's stack too, which a walk over the whole draw reads.
+        return jnp.matmul(*(operand.astype(jnp.bfloat16).astype(operand.dtype) for operand in (a, b)))
+
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(None, over_windows(reference), windowed, "a product over windows", seeds=8)
+        assert_as_exact(None, over_windows(reference), windowed, "a product over windows, its terms",
+                        seeds=8, terms=terms)
+        assert_as_exact(None, over_windows(stacked), windowed, "a product over windows, walked", seeds=8,
+                        terms=True)
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(over_windows(dew), over_windows(reference), windowed, "a product over windows",
+                        seeds=8)
+        assert_as_exact(over_windows(dew), over_windows(reference), windowed,
+                        "a product over windows, its terms", seeds=8, terms=terms)
+        assert_as_exact(over_windows(dew), over_windows(stacked), windowed,
+                        "a product over windows, walked", seeds=8, terms=True)
 
 
 def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
     """A site whose truth holds rows that cancel (its last rows a product less the same product summed in
     two halves, zero in float64 but for its rounding) is sized by its terms (check 1's `_cancelling_terms`):
-    prepared, its store holds the terms its truth program gave beside the truth, and judged from the store
-    it reads them as a site's own terms program (`_SiteTerms.of`): it passes as it passes computing them,
-    and an arm that leaves a term in a cancelling row fails by the same rule."""
+    prepared, its store holds its truth's float64 walk compiled beside its truth, which its run decides on
+    at its first draw and sizes every draw's rows by: it passes as it passes computing them, and an arm that
+    leaves a term in a cancelling row fails by the same rule."""
     def draw(seed):
         rng = np.random.default_rng([5463, seed])
         return (rng.standard_normal((16, 32)).astype(np.float32),
@@ -218,13 +280,12 @@ def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
     def leaving_a_term(a, b):
         return cancelling(a, b).at[16].add(a[0, 0] * b[0, :])
 
-    later_sites = {site_id("a cancelling product")}  # every stage's draws prepared
-    with stored_truths(tmp_path, prepare=True, stamp="a", later=later_sites):
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
         assert_as_exact(None, cancelling, draw, "a cancelling product", seeds=8)
     assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
     with pytest.raises(GateFailure) as computing:
         assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product", seeds=8)
-    with stored_truths(tmp_path, prepare=False, stamp="a", later=later_sites):
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
         with pytest.raises(GateFailure) as stored:
             assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product", seeds=8)

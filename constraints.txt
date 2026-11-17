@@ -9,10 +9,15 @@
 # ("Dew's JAX build").
 # Every CI and development install takes this one build.
 # Return to a release once one ships the fixes.
+# A release under test: the index's staging of it, the fork's projects' pages of the index with the release's
+# files at their GitHub assets and their sha256s, which /simple lists only once a pin locking them has passed
+# main's train (row 6829). Named before the index, so it answers for the fork's projects and the index for
+# every other; the next pin removes it.
+--extra-index-url https://pypi.dewml.dev/staging/0.12.0.1.post106/5e21634c37f4e1a4/simple/
 # BEGIN package index (site/scripts/gen_install.py)
 --extra-index-url https://pypi.dewml.dev/simple
 # END package index
-jax==0.12.0.1.post97
+jax==0.12.0.1.post106
 
 # The CA bundle requests, httpx and the Hub verify TLS with: 2026.10.19 dropped emSign ECC Root CA - G3,
 # whose intermediates' private keys were compromised in October 2026 (tests/test_trust_store.py).
