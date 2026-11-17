@@ -41,7 +41,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   configures, as a resumed one does. A run refused before it takes the start it began compiling beside its
   planning exits at its refusal instead of waiting for that compile (97 s for a 4B start). A QK-Clip inside
   `optax.MultiSteps(...).gradient_transformation()`, which Optax builds as a transformation of no extra
-  arguments, is handed the attention logits' maxima: it stepped unclipped.
+  arguments and which runs its inner update at the window's last call alone, is clipped by the largest
+  logits of every microstep of its window: each step's commit folds its maxima into the clip's state
+  (`dew.optim.pooled_update`, `QKClipState.pooled`), where it stepped unclipped. Under `optax.apply_every`,
+  which runs the clip every call, a post-step effect acts only where the update applied
+  (`dew.optim.stepped`): the weights were rescaled on every call whose update it zeroes. A checkpoint saved before the
+  clip's state held them restores with none pooled.
 
 - A run handed a step file compiled without its GPU kind's tuned choices (`AheadOfTime.tuned` false: one
   compiled on compile-only GPUs outside a prepare) no longer runs it: it compiles its step on its own
