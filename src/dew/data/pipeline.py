@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import io
 import itertools
 import math
+import pickle
+import sys
 import time
 import types
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -25,6 +28,7 @@ import numpy as np
 
 from dew._records import ADDED, JSON, integer, json_value, record, text
 from dew.batch import Batch
+from dew.data.concurrent import PoolKind
 from dew.data.dataset import WORKER_BUFFER, Records, phase_ends
 
 if TYPE_CHECKING:
@@ -700,6 +704,71 @@ class Map:
     identity: str | None = None
     rejects: bool = False
     configured: Bound | None = None
+    pool: PoolKind | None = None
+    """The pool its step runs on, several records at once (`dew.data.concurrent.Pool`); None where it runs
+    where its read runs. How it runs, no part of what it computes or its identity."""
+
+
+def _pooled(steps: Sequence[_Step], pool: PoolKind | None) -> None:
+    """Refuse, as the stage is declared, a pool its steps cannot run on: a process pool for a step no process
+    it starts could be handed (a configuration that cannot run): one that does not pickle, or one that
+    pickles by a name in `__main__` where that is no module a process started afresh can import (a
+    notebook's cell, `python -c`: `_main_named`); or any pool for a cut into chunks, whose counts the
+    reading process keeps (`Chunked`), or a configured step."""
+    from dew.data.text import Chunks
+
+    if pool is None:
+        return
+    for step in steps:
+        if isinstance(step, (Configured, Chunks)):
+            raise ValueError(f"{_named_step(step)} runs where its read runs; it takes no pool")
+        if pool == "processes":
+            try:
+                named = _main_named(step)
+            except (pickle.PicklingError, TypeError, AttributeError) as error:
+                raise ValueError(f"{_named_step(step)} runs on processes (pool='processes'), and it does not "
+                                 f"pickle ({error}); run it on threads (pool='threads'), or define it at a "
+                                 "module's top level") from error
+            if named and not _main_importable():
+                raise ValueError(f"{_named_step(step)} runs on processes (pool='processes'), and it reaches "
+                                 f"{named} of __main__, which no process it starts can import (a notebook's "
+                                 "cell, python -c); define them in a module, or run it on threads "
+                                 "(pool='threads')")
+
+
+class _MainNames(pickle.Pickler):
+    """A pickler noting each class and function it pickles by its name in `__main__` (`named`), which a
+    process unpickling it imports `__main__` to find."""
+
+    def __init__(self, file: io.BytesIO):
+        super().__init__(file)
+        self.named: list[str] = []
+
+    def persistent_id(self, pickled) -> None:
+        # Every object pickled passes here first; None pickles it as pickle would.
+        if isinstance(pickled, type | types.FunctionType) and pickled.__module__ == "__main__":
+            self.named.append(pickled.__qualname__)
+
+
+def _main_named(step: _Step) -> list[str]:
+    """The classes and functions of `__main__` that `step` pickles by name (`_MainNames`)."""
+    pickler = _MainNames(io.BytesIO())
+    pickler.dump(step)
+    return pickler.named
+
+
+def _main_importable() -> bool:
+    """Whether a process started afresh imports this one's `__main__`, as `multiprocessing.spawn` prepares a
+    child: by its module's name where it has one, but a package's `__main__` (run with `-m`), which spawn
+    does not import again, else by its file, which a notebook and `python -c` have none of. Read without
+    asking spawn, which would fix the process's start method (train 977's review). A name defined only
+    under `if __name__ == "__main__":` passes here and fails the read as its process dies
+    (`dew.data.concurrent._Processes`)."""
+    main = vars(sys.modules["__main__"])
+    spec = main.get("__spec__")
+    if spec is not None:
+        return not (spec.name == "__main__" or spec.name.endswith(".__main__"))
+    return main.get("__file__") is not None
 
 
 def examples_bound(stages: Sequence[object]) -> int | None:
@@ -741,6 +810,8 @@ class FlatMap:
     """Whether this is an objective's step that makes several rows of each source example (a decision
     layout's row a question): a corpus counts its source examples before it (`Accepted`), and a run's
     `examples=` bound stands before it (`dew.data.compile._bounded`)."""
+    pool: PoolKind | None = None
+    """The pool its step runs on (`Map.pool`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1209,7 +1280,7 @@ class Dataset:
         return dataclasses.replace(after, piped=(*kept, dataclasses.replace(called, start=0, input=before)))
 
     def map(self, *steps: RecordStep | Configured | HostStep, batched: bool = False, batch_size: int = 1000,
-            identity: str | None = None) -> Pipeline:
+            identity: str | None = None, pool: PoolKind | None = None) -> Pipeline:
         """One record to one: each step returns its record's replacement. A
         step that drops records (returns `Rejected`) goes through `filter_map`.
 
@@ -1217,7 +1288,14 @@ class Dataset:
         of columns, each a list, and returns columns of as many rows, which
         replace or join the record's own (Hugging Face's `map(batched=True)`).
         After `batch`, a step reads each training batch on the host.
+
+        With `pool`, a record step runs on a pool of its own, several records at
+        once, delivered in their order (data.md §10): `"threads"` for a step that
+        waits on IO, `"processes"` for one that holds the CPU (its step must pickle).
         """
+        if pool is not None and (batched or self.batched):
+            raise ValueError("pool= runs a record step on a pool of its own; a batched step or one after "
+                             "batch runs where its read runs")
         if self.batched:
             if batched:
                 raise ValueError("after batch, map already reads the training batch")
@@ -1240,7 +1318,9 @@ class Dataset:
                 raise TypeError(f"{_named_step(step)} draws from a generator; apply it with random_map")
             if not isinstance(step, Configured) and _declares_rejects(step):
                 raise TypeError(f"{_named_step(step)} drops records; apply it with filter_map")
-        return self._then(*(step if isinstance(step, Configured) else Map(step, identity) for step in steps))
+        _pooled(steps, pool)
+        return self._then(*(step if isinstance(step, Configured) else Map(step, identity, pool=pool)
+                            for step in steps))
 
     def random_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
         """One record to one, each step drawing from the record's generator
@@ -1254,16 +1334,18 @@ class Dataset:
                 raise TypeError(f"{_named_step(step)} drops records; apply it with random_filter_map")
         return self._then(*(RandomMap(step, identity) for step in steps))
 
-    def filter_map(self, *steps: RecordStep, identity: str | None = None) -> Pipeline:
+    def filter_map(self, *steps: RecordStep, identity: str | None = None,
+                   pool: PoolKind | None = None) -> Pipeline:
         """One record to none or one: each step returns its record's
         replacement or `Rejected(reason)`, which drops it, counted by reason
         in the reader's checkpointed counts, as `images.fetch` and
-        `images.DecodeImage` do."""
+        `images.DecodeImage` do. `pool` runs it on a pool of its own (`map`)."""
         for step in steps:
             if isinstance(step, pygrain.RandomMapTransform):
                 raise TypeError(f"{_named_step(step)} draws from a generator; "
                                 "apply it with random_filter_map")
-        return self._then(*(Map(step, identity, rejects=True) for step in steps))
+        _pooled(steps, pool)
+        return self._then(*(Map(step, identity, rejects=True, pool=pool) for step in steps))
 
     def random_filter_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
         """One record to none or one, each step drawing from the record's
@@ -1299,16 +1381,22 @@ class Dataset:
         return self._then(Filter(predicate, reason or _reason(predicate), identity))
 
     def flat_map(self, step: ExpandStep | ColumnStep, *, batched: bool = False,
-                 batch_size: int = 1000, identity: str | None = None) -> Pipeline:
+                 batch_size: int = 1000, identity: str | None = None,
+                 pool: PoolKind | None = None) -> Pipeline:
         """One record to any number: the step returns a record's records. With
         `batched`, it reads `batch_size` records at a time as a dict of columns
-        and returns columns of any length, the records that replace them."""
+        and returns columns of any length, the records that replace them.
+        `pool` runs a record step on a pool of its own (`map`)."""
+        if pool is not None and batched:
+            raise ValueError("pool= runs a record step on a pool of its own; a batched step runs where its "
+                             "read runs")
         if batched:
             (columns,) = _columns((step,))
             return self._then(Batched(columns, batch_size, identity, same_rows=False))
         if not _expands(step):
             raise TypeError(f"{_named_step(step)} is not a record expansion function or transform")
-        return self._then(FlatMap(step, identity))
+        _pooled((step,), pool)
+        return self._then(FlatMap(step, identity, pool=pool))
 
     @property
     def batched(self) -> bool:

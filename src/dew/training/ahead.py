@@ -67,7 +67,7 @@ from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
 from dew._devices import COMPILE_ONLY_MEMORY, device_memory
 from dew._records import JSON, boolean, record
-from dew._stated import Unestablished
+from dew._stated import Unestablished, traceback_frames
 from dew.batch import Batch
 from dew.nn.kernels import options
 from dew.nn.kernels.generation import (
@@ -88,13 +88,13 @@ from dew.nn.kernels.options import (
     owned_program,
     program_digest,
     shapes_of,
+    stated_digest,
     taking,
 )
 from dew.nn.kernels.selection import Unlowerable
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, compiled_memory, step_flops
-from dew.training import identity
 from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
@@ -212,8 +212,9 @@ class HeldTraceback:
 
 
 def _held_traceback(traceback: Traceback) -> tuple[type[HeldTraceback], tuple[tuple[str, ...]]]:
-    """A traceback of JAX's reduced to its frames (`HeldTraceback`), as a program file holds it."""
-    return HeldTraceback, (tuple(str(frame) for frame in traceback.frames),)
+    """A traceback of JAX's reduced to its frames (`HeldTraceback`, `dew._stated.traceback_frames`), as a
+    program file holds it."""
+    return HeldTraceback, (tuple(traceback_frames(traceback)),)
 
 
 def filed(value: Executable | AheadPrograms | AheadOfTime) -> bytes:
@@ -289,7 +290,7 @@ class AheadProgram:
         """The executable, loaded onto `devices`, for a run whose program lowered as `lowered`: refused
         where that is another program than this one, and admitted as a compiled one is
         (`dew.communicators.admit`)."""
-        if program_digest(lowered) != self.program:
+        if stated_digest(lowered) != self.program:
             raise NotTheStepCompiledAhead(
                 "the sampled step compiled ahead is another program than the one this run compiles: compile "
                 "it ahead from this run's config, with its inspection")
@@ -484,7 +485,7 @@ class AheadOfTime:
         """The executable, loaded (`loaded`), for a run whose step lowered as `lowered`: refused where
         that is another program than the one compiled ahead, a config, a data shape, a rung or a Dew
         that differs, which the executable would not run as the run's step."""
-        if program_digest(lowered) != self.program:
+        if stated_digest(lowered) != self.program:
             raise NotTheStepCompiledAhead(
                 "the step compiled ahead is another program than the one this run compiles first: compile it "
                 "ahead from this run's config and data (--trainer.compile-ahead), with this Dew, and no plan "
@@ -548,7 +549,7 @@ class BuildTarget:
     """A CPU target's own processor (`host_cpu`): XLA compiles a CPU's program to the instruction sets of
     the host that compiles it, so its executable runs on a host of the same ones. None for a GPU's or a
     TPU's, whose program is its devices' (a TPU's target is its kind's generation and its devices), and for
-    a CPU host that states no processor, which programs kept by their calls refuse (`cpu_stated`)."""
+    a CPU host that states no processor, for which no program is kept (`cpu_stated`)."""
     plugin: str = ""
     """The build of each CUDA PJRT plugin installed where they were compiled (`dew._cache.plugin_builds`),
     empty for a target of no CUDA GPU, a CPU's or a TPU's, whose programs no CUDA plugin compiles."""
@@ -631,13 +632,10 @@ class AheadPrograms:
 
     target: BuildTarget
     programs: dict[str, Executable]
-    process: identity.Process | None = None
-    """The process that traced `kept` (`dew.training.identity.Process`), None for a file of named
-    programs alone."""
-    kept: dict[str, KeptProgram] = dataclasses.field(default_factory=dict)
-    """The programs a process compiled at Dew's compile point, each by the digest of its call's identity
-    (`KeptProgram`, `keeping`): a process that is their target and their `process` runs each for the same
-    call, tracing nothing (`kept`)."""
+    kept: dict[str, KeptProgram] | None = None
+    """The programs a process compiled at Dew's compile point, each by its fingerprint (`KeptProgram`,
+    `keeping`): a process of their target runs each for a call that lowers to that program under those
+    options (`kept`); None for a file of named programs alone."""
 
     def save(self, path: str | Path) -> None:
         """Write the programs to `path`, for `load` in a process of their target."""
@@ -645,13 +643,11 @@ class AheadPrograms:
 
     @staticmethod
     def load(path: str | Path) -> AheadPrograms:
-        """The programs `save` wrote to `path`: one saved before a file held programs by their calls
-        (`kept`) holds its named programs alone."""
+        """The programs `save` wrote to `path`."""
         programs = _saved(path, AheadPrograms, "programs")
-        kept = vars(programs).get("kept", {})
         _current(path, "programs", [*programs.programs.values(),
-                                    *(each.program.executable for each in kept.values())])
-        return programs if "kept" in vars(programs) else AheadPrograms(programs.target, programs.programs)
+                                    *(each.executable for each in (programs.kept or {}).values())])
+        return programs
 
     def loaded(self) -> dict[str, jax.stages.Compiled]:
         """Each program, by its name, loaded onto this process's first `BuildTarget.devices` devices, the ones
@@ -693,22 +689,22 @@ def host_cpu() -> str | None:
 
 
 def cpu_stated(target: BuildTarget, devices: Sequence) -> None:
-    """Refuse programs kept by their calls for a CPU whose host states no processor (`host_cpu`): two
-    such hosts of other instruction sets would read as one target."""
+    """Refuse to keep programs for a CPU whose host states no processor (`host_cpu`): two such hosts of
+    other instruction sets would read as one target."""
     if devices[0].platform == "cpu" and target.cpu is None:
         raise ValueError("this host states no processor features (no /proc/cpuinfo), so a CPU program "
-                         "cannot be kept for it or handed on it")
+                         "cannot be kept for it")
 
 
 @dataclasses.dataclass(frozen=True)
 class KeptProgram:
-    """A program a process compiled at Dew's compile point, kept for a later process (`keeping`): the
-    identity of the call it compiled for (`dew.training.identity.call_identity`), which a call is handed
-    it by, its executable with its lowering's digest (`AheadProgram`), which `kept`'s `verify` proves it
-    by, and the ids of the devices it runs on, as its executable states them."""
+    """A program a process compiled at Dew's compile point, kept for a later process (`keeping`) by its
+    fingerprint (`dew.nn.kernels.options.program_digest` under the options it compiled with): its
+    function's name (`OuterProgram.called`), its executable and the ids of the devices it runs on, as its
+    executable states them."""
 
-    call: JSON
-    program: AheadProgram
+    called: str
+    executable: Executable
     devices: tuple[int, ...]
     """The ids of the devices it runs on, among the devices of its file's target (`jax.devices()`)."""
 
@@ -719,30 +715,33 @@ class KeptProgram:
         if missing := [number for number in self.devices if number not in held]:
             raise ValueError(f"a kept program runs on devices {list(self.devices)}, and this process holds "
                              f"none of {missing}")
-        return self.program.executable.loaded([held[number] for number in self.devices])
+        return self.executable.loaded([held[number] for number in self.devices])
 
 
 class Keeping:
-    """The programs Dew's compile point compiles while `keeping` is open, each kept by its call's identity,
-    for `save`. `refused` names each it could not keep and why (a call with no stated identity, an
-    executable XLA does not serialize): those compile again where the file is handed."""
+    """The programs Dew's compile point compiles while `keeping` is open, each kept by its fingerprint, for
+    `save`. `refused` names each it could not keep and why (a tree no file states, an executable XLA does
+    not serialize): those compile again where the file is handed."""
 
     def __init__(self) -> None:
         self.kept: dict[str, KeptProgram] = {}
         self.refused: dict[str, str] = {}
 
-    def heard(self, program: OuterProgram, key: Hashable, args: tuple, kwargs: dict,
-              lowered: jax.stages.Lowered, executable: jax.stages.Compiled) -> None:
-        """Keep `executable`, which `program`'s call under `key` compiled from `lowered`
+    def heard(self, program: OuterProgram, lowered: jax.stages.Lowered,
+              executable: jax.stages.Compiled) -> None:
+        """Keep `executable`, which `program` compiled from `lowered`
         (`dew.nn.kernels.options.keeping`)."""
-        del args, kwargs
-        named = f"{identity.called(program)} ({len(self.refused)})"
+        named = f"{program.called} ({len(self.refused)})"
         try:
-            call = identity.call_identity(program, key)
-            serialized = Executable.of(executable)
+            # Stated before it is serialized: a tree of a node no process names (a class made inside a
+            # function) is a program no file holds, which pickling its trees refuses by no error of its own
+            # (an AttributeError on Python 3.12).
+            fingerprint = program_digest(lowered, program.options)
         except Unestablished as refusal:
             self.refused[named] = str(refusal)
             return
+        try:
+            serialized = Executable.of(executable)
         except (NotImplementedError, ValueError) as refusal:
             # As `compile_programs` reads it: an array a program closed over is a constant of its
             # program, which no executable serializes.
@@ -756,20 +755,17 @@ class Keeping:
             self.refused[named] = f"it runs on {sorted({device.platform for device in ran})} devices, " \
                                   "outside the process's default backend"
             return
-        devices = tuple(device.id for device in ran)
-        program_kept = AheadProgram(program_digest(lowered), serialized)
-        self.kept[identity.digest(call)] = KeptProgram(call, program_kept, devices)
+        self.kept[fingerprint] = KeptProgram(program.called, serialized, tuple(device.id for device in ran))
 
     def save(self, path: str | Path) -> AheadPrograms:
-        """Write the programs kept so far to `path` with this process's target and record, for `kept` in
-        a process of both; returns what it wrote. Each program it could not keep is logged with its
-        reason (`refused`)."""
+        """Write the programs kept so far to `path` with this process's target, for `kept` in a process of
+        it; returns what it wrote. Each program it could not keep is logged with its reason (`refused`)."""
         for named, reason in self.refused.items():
             _log.warning("the program %s is not kept, and compiles where the file is handed: %s", named,
                          reason)
         target = BuildTarget.of(jax.devices())
         cpu_stated(target, jax.devices())
-        programs = AheadPrograms(target, {}, identity.Process.here(), dict(self.kept))
+        programs = AheadPrograms(target, {}, dict(self.kept))
         programs.save(path)
         return programs
 
@@ -778,70 +774,50 @@ class Keeping:
 def keeping() -> Iterator[Keeping]:
     """Within the block, every program this thread compiles at Dew's compile point
     (`dew.nn.kernels.options.OuterProgram`: a scoring task's passes, a server's steps, an evaluation's
-    programs) is kept by the identity of the call it compiled for, and the `Keeping` it yields saves them:
+    programs) is kept by its fingerprint, and the `Keeping` it yields saves them:
 
         with keeping() as programs:
             server = ScoringServer.from_task(task, variables)
         programs.save("scoring.dew-aot")
 
-    A later process of the same target, code and settings hands them back (`kept`) and traces none of
-    them. A program compiled before the block, or handed or taken within it, is not among them. The
-    block compiles with JAX's persistent cache off (`dew._cache.uncached`): an executable XLA loaded
-    from that cache serializes without its kernels (on a CPU it then loads and fails at its first call,
-    "Function ... not found"; plain JAX, 2026-11-09), so each kept one is compiled here."""
+    A later process of the same target hands them back (`kept`). A program compiled before the block, or
+    taken within it, is not among them. The block compiles with JAX's persistent cache off
+    (`dew._cache.uncached`): an executable XLA loaded from that cache serializes without its kernels (on a
+    CPU it then loads and fails at its first call, "Function ... not found"; plain JAX, 2026-11-09), so
+    each kept one is compiled here."""
     kept = Keeping()
     with uncached(), options.keeping(kept.heard):
         yield kept
 
 
 @contextlib.contextmanager
-def kept(path: str | Path, *, verify: bool = False) -> Iterator[AheadPrograms]:
-    """Within the block, a call at Dew's compile point whose identity
-    (`dew.training.identity.call_identity`) one of the programs kept at `path` was compiled for
-    (`keeping`) runs that executable, loaded onto the devices it was compiled for, and traces, lowers and
-    compiles nothing; a call the file holds no program for compiles as without it.
+def kept(path: str | Path) -> Iterator[AheadPrograms]:
+    """Within the block, a call at Dew's compile point runs the executable kept at `path` (`keeping`) for
+    the program it lowers to under its options, loaded onto the devices it was compiled for: the call
+    traces and lowers as it would, and its fingerprint (`dew.nn.kernels.options.program_digest`) finds the
+    kept executable, which runs in place of its compile (`options.taking`). Nothing is trusted but that
+    fingerprint and the target: a call whose code, arguments, settings or the facts its trace read lower to
+    another program finds none, and compiles as without the file, never running a stale executable. As
+    JAX's own persistent cache does, keyed by the same lowered program, options and target; a file carries
+    them where no cache is shared.
 
-    Refused before any call, naming what differs, where this process is not the one the file was kept in:
-    its devices, JAX, jaxlib, XLA flags and host (`BuildTarget.held`), or its Python, Dew's source, a
-    distribution's version, another module's source, a setting of JAX's, an environment variable of Dew's
-    or a fact its traces read (`dew.training.identity.Process.held`). A stale executable is a wrong
-    result with nothing to show it, so what an identity cannot state is not kept (`Keeping.refused`); what
-    it covers is `dew.training.identity`'s to say. Code that changes what a trace computes by assigning
-    module state at run time is outside the identity, as it is outside `jax.jit`'s cache.
-
-    With `verify`, each call handed a program also lowers its own and holds the two to one digest
-    (`program_digest`), at the cost of the trace the file saves: the proof, for this file and this
-    process, that the identity covered what the trace read (`NotTheKeptProgram` where it did not)."""
+    A file kept for another target (its devices, JAX, jaxlib, XLA flags or host, `BuildTarget.differences`)
+    hands nothing, said once: every call compiles. A file of programs compiled ahead by name, none kept by
+    their programs (`compile_programs`), is refused as it is handed."""
     programs = AheadPrograms.load(path)
-    if programs.process is None:
-        raise ValueError(f"{path} holds programs compiled ahead by name, none kept by its call (`keeping`)")
-    cpu_stated(programs.target, jax.devices())
-    programs.target.held(jax.devices())
-    programs.process.held()
-
-    def give(program: OuterProgram, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled | None:
-        try:
-            found = programs.kept.get(identity.digest(identity.call_identity(program, key)))
-        except Unestablished as refusal:
-            _log.info("a call with no stated identity is handed no kept program, and compiles: %s", refusal)
-            return None
-        if found is None:
-            return None
-        if verify and program_digest(program.lower(*args, **kwargs)) != found.program.program:
-            raise NotTheKeptProgram(
-                f"{identity.called(program)} lowers here to another program than the one kept at "
-                f"{path} for the same identity: something its trace reads is outside the identity "
-                "(`dew.training.identity`); declare what it reads (`traced_fact`) and keep the programs "
-                "again")
-        return found.loaded()
-
-    with options.handing(give):
+    if programs.kept is None:
+        raise ValueError(f"{path} holds programs compiled ahead by name, none kept by its program "
+                         "(`keeping`)")
+    here = BuildTarget.of(jax.devices())
+    differences = ([] if here.cpu is not None or jax.devices()[0].platform != "cpu"
+                   else ["this host states no processor"]) + programs.target.differences(here)
+    if differences:
+        _log.warning("the programs kept at %s were compiled for another target than this process's, and "
+                     "every call compiles: %s", path, "; ".join(differences))
         yield programs
-
-
-class NotTheKeptProgram(ValueError):
-    """A call whose identity a kept program was compiled for lowers to another program (`kept`'s
-    `verify`): its trace read something its identity does not state."""
+        return
+    with options.taking({fingerprint: each.loaded for fingerprint, each in programs.kept.items()}):
+        yield programs
 
 
 def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDtypeStruct]]],
@@ -1188,16 +1164,17 @@ def later_phases[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batc
 
 class LaterPlans:
     """The later data phases' steps of a run (`later_phases`), each planned and compiled on a thread of this
-    process once the run's first step is dispatched, over its state's shapes as they stand at an update's
-    end and the batch each phase delivers (`phase_batch`), at the split the run was given or the planner's
-    own, its objective a copy at its pass count (`PhasePasses.apart`), so the loop's objectives and plan are
-    never touched. What each compiled is handed to that phase's boundary (`taken`), whose plan, made there
-    against the devices' allocators as they stand, finds each candidate's trace (`candidate_for`) and
-    executable (`FitSearch.compiled`) made: the GPUs no longer idle while it compiles (336 s at a 4B
-    decision run's second phase on a GH200, M-MC-3q). One thread, joined: each phase's at its boundary,
-    every phase's as the run ends, however it ends. A phase whose plan failed off the loop says so at its
-    boundary, which plans it as it would have. A pooled run, a host-master or rollout run, one that tunes
-    its kernels or runs PGLE plans its phases at their boundaries."""
+    process once the run's first step is dispatched, over its state's shapes as they stand at an update's end
+    and the batch each phase delivers (`phase_batch`), at the split the run was given or the planner's own,
+    its objective a copy at its pass count (`PhasePasses.apart`), so the loop's objectives and plan are never
+    touched. Each holds every executable it compiled, those that missed on the devices the running phase holds
+    among them (`FitSearch.provisional`), and the phase's boundary waits for it (`waited`), whose plan, made
+    there against the devices' allocators as they stand, finds each candidate's trace (`candidate_for`) and
+    executable (`dew.nn.kernels.options.held`) made: the GPUs no longer idle while it compiles (336 s at a 4B
+    decision run's second phase on a GH200, M-MC-3q). One thread, joined: each phase's at its boundary, every
+    phase's as the run ends, however it ends. A phase whose plan failed off the loop says so at its boundary,
+    which plans it as it would have. A pooled run, a host-master or rollout run, one that tunes its kernels or
+    runs PGLE plans its phases at their boundaries."""
 
     def __init__(self, futures: Mapping[int, Future]) -> None:
         self.futures = dict(futures)
@@ -1227,7 +1204,7 @@ class LaterPlans:
         # hold per thread), its context variables copied.
         entered = carried()
 
-        def planned(phase: int) -> dict:
+        def planned(phase: int) -> None:
             with entered():
                 return _phase_plan(trainer, shapes, split_fields(phase_batch(trainer, batch, phase))[0],
                                    counts[phase])
@@ -1241,18 +1218,18 @@ class LaterPlans:
         _log.info("planning the steps of data phases %s off the loop", begun)
         return cls(futures)
 
-    def taken(self, passes: int | None) -> dict | None:
-        """The executables the phase whose step runs `passes` compiled (`FitSearch.compiled`), its plan
-        waited for; None where none was planned or its plan failed, said."""
+    def waited(self, passes: int | None) -> None:
+        """The plan of the phase whose step runs `passes` waited for, so the executables it compiled, which
+        the process holds (`dew.nn.kernels.options.held`), are there for the boundary's plan; one that
+        failed said, the boundary planning it as it would have."""
         future = self.futures.pop(passes, None) if passes is not None else None
         if future is None:
-            return None
+            return
         try:
-            return future.result()
+            future.result()
         except Exception as error:  # the boundary plans the phase as it would have
             _log.warning("planning the step of %d passes off the loop failed; its boundary plans it: %r",
                          passes, error)
-            return None
 
     def stopped(self) -> None:
         """Every phase's plan waited for as the run ends, a pending one not begun, one that failed said."""
@@ -1265,23 +1242,22 @@ class LaterPlans:
 
 
 def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
-                                 passes: int) -> dict:
-    """The executables a plan of `trainer`'s step at `passes` compiled over `state`'s shapes and `batch`
-    (`LaterPlans`), on a compiler and objective of its own; what it compiled before a refusal where no
-    candidate fit the devices as they stand off the loop, which the boundary judges again."""
+                                 passes: int) -> None:
+    """A plan of `trainer`'s step at `passes` over `state`'s shapes and `batch` (`LaterPlans`), on a compiler
+    and objective of its own, its executables held by the process (`dew.nn.kernels.options.hold`), those it
+    compiled before a refusal where no candidate fit the devices as they stand off the loop among them, which
+    the boundary judges again."""
     from dew.training.compiler import StepCompiler
     from dew.training.planning import PlanRefused
 
     phases = trainer.phase_passes.apart(passes)
     compiler = StepCompiler(phases.base, trainer._compiler.links(trainer.device_mesh), None, phases)
     stepping = dataclasses.replace(trainer._stepping(phases.base, compiler), shape=trainer._afresh_shape())
-    executables: dict = {}
     try:
-        compiler._plan(stepping, state, batch, None, executables=executables)
+        compiler._plan(stepping, state, batch, None, provisional=True)
     except PlanRefused as refused:
         _log.info("the step of %d passes fits no plan off the loop; its boundary plans it: %s", passes,
                   refused)
-    return executables
 
 def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
                                  partition: DataPartition | None = None) -> Batch:
@@ -1410,7 +1386,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
     except Unlowerable as refused:
         raise refused.refusing("step") from refused
     # The sampled step as the search compiled it, its program what it lowered then.
-    sampled = None if planned.sampled is None else AheadProgram.of(*planned.sampled)
+    sampled = (None if planned.sampled is None
+               else AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable))
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     memory = compiled_memory(compiled)

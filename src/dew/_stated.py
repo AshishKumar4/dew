@@ -1,9 +1,9 @@
 """One statement of a user's code and the values it reads, as plain data equal in every process that holds an
-equal value (`stated`): what a traced program's identity holds of its function and call
-(`dew.training.identity`) and what holds a data step's own code (`dew.data.plan.StepIdentity`), which reads no
-training module. A function or a class of the user's own code (`dew._sources.own_source`) is its name with
-what it reads, walked through every function, class and module of the user's it reaches; anything else by
-its type and value, or refused (`Unestablished`).
+equal value (`stated`): what a rung record's key holds of a model (`dew.training.rungs`), a program's trees as
+its digest states them (`dew.nn.kernels.options.program_digest`) and what holds a data step's own code
+(`dew.data.plan.StepIdentity`), which reads no training module. A function or a class of the user's own code
+(`dew._sources.own_source`) is its name with what it reads, walked through every function, class and module of
+the user's it reaches; anything else by its type and value, or refused (`Unestablished`).
 
 This module is the boundary where Dew reads values it has no type for: any object a call names, any module a
 process loaded. Its private readers ask each what Python's object model says of it (its module, its name, its
@@ -11,10 +11,10 @@ file, its slots) and refuse what answers nothing."""
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import hashlib
 import logging
+import os
 import sys
 import types
 from collections.abc import Callable, Hashable, Mapping
@@ -23,6 +23,7 @@ from pathlib import Path
 import jax
 import numpy as np
 from jax.experimental.layout import Format, Layout
+from jaxlib import xla_client
 
 from dew import _hashing, _sources
 from dew._records import JSON
@@ -30,13 +31,13 @@ from dew.algebra import terms
 
 
 class Unestablished(ValueError):
-    """A value a call's identity cannot state without tracing the call (`stated`): what a save leaves
-    out, naming it (`dew.training.ahead.Keeping.refused`), and a handing compiles as without its file."""
+    """A value with no stated form (`stated`): a program whose trees hold one is one a save leaves out,
+    naming it (`dew.training.ahead.Keeping.refused`), and a handing compiles as without its file."""
 
 
 def _coded(module: str | None, at: str) -> str:
-    """`module`, the module a class or function at `at` is defined in, where its code is a file a process
-    record digests or a version states (`Process`): refused where it has none (a notebook's or a shell's
+    """`module`, the module a class or function at `at` is defined in, where its code is a file or a version
+    states it: refused where it has none (a notebook's or a shell's
     `__main__`), as its code could change with nothing to show it."""
     # A module with no file of its own is its nearest package's (an extension module's submodule).
     names = (module or "").split(".")
@@ -85,7 +86,7 @@ def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
     """`value` as an identity states it: a JSON value equal in every process that holds an equal value.
 
     A class, a module's function or any object its module holds under its own name is that name (`_named`:
-    its code is the process record's, `Process`), and one of a user's own code with what it reads (`_own`);
+    its code named by where it is defined), and one of a user's own code with what it reads (`_own`);
     a function no module holds (a lambda, a local one) is its code (`_code`) with what it reads (`reads`); a
     dataclass its type and fields; a number its type and bits, an array of NumPy's its dtype, shape and
     bytes; a mapping's pairs and a set's members in the order it holds them, which a trace may read; a
@@ -93,7 +94,7 @@ def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
     a mesh, a sharding and a partition as the algebra's structural key states them
     (`dew.algebra.terms.parameter_key`, the one owner of a placement as plain data); JAX's other values of
     a call's key (an abstract value, a tree's structure node by node, a format, a device) by their parts. A
-    value among `known` (by its `id`) is what its caller says of it (`call_identity`).
+    value among `known` (by its `id`) is what its caller says of it.
 
     Refused, naming `at` and the value's type, for anything else, an array of JAX's among them (a constant
     of the program, which its executable cannot serialize): an object with no such form could differ
@@ -140,8 +141,7 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         module = _coded(value.__module__, at)
         return ["class", module, value.__qualname__]
     if isinstance(value, (tuple, list, set, frozenset, Mapping, functools.partial, types.MethodType)) or (
-            not isinstance(value, type) and (dataclasses.is_dataclass(value)
-                                             or "__attrs_attrs__" in vars(type(value)))):
+            _sources.generated_instance(value)):
         # A container met again within itself (a mapping one of whose values is that mapping, a registry
         # holding a function that reads it) is a reference back to where the path met it, as a function
         # met again is itself: finite, where walking it recursed past Python's limit and crashed the read
@@ -173,17 +173,19 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         module = _coded(value.__module__, at)
         return ["function", module, value.__qualname__, _code(value.__code__),
                 reads(value, at, known, walking)]
-    if dataclasses.is_dataclass(value):
+    if _sources.generated_instance(value):
+        # An instance of a class a generator made (a dataclass's, attrs', its validators' among them) by its
+        # fields: one unset (an attrs field with no init) is None.
         return ["record", again(type(value), at=at),
-                [[field.name, again(getattr(value, field.name, None), at=f"{at}.{field.name}")]
-                 for field in dataclasses.fields(value)]]
+                [[name, again(getattr(value, name, None), at=f"{at}.{name}")]
+                 for name in _sources.field_names(type(value))]]
     key = terms.parameter_key(value)
     if isinstance(key, tuple) and key[0] != "object":
         return ["native", _plain(key, at)]
     if (parts := _parts(value, at, again)) is not None:
         return parts
-    if (made := _attrs_made(value, at, again)) is not None:
-        return made
+    if (converted := _converter(value, at, again)) is not None:
+        return converted
     raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} has no form an "
                         "identity can state")
 
@@ -215,12 +217,46 @@ def _data(value, at: str) -> JSON | None:
     return None
 
 
+def _traceback(value) -> JSON | None:
+    """A traceback of JAX's by its frames (`traceback_frames`): a checkified program's error tree holds each
+    check's in its node data, which tells where a check that fails was; None for any other value."""
+    if not isinstance(value, xla_client.Traceback):
+        return None
+    frames: list[JSON] = list(traceback_frames(value))
+    return ["traceback", frames]
+
+
+def traceback_frames(traceback) -> list[str]:
+    """Each frame of a JAX `traceback` as its module, line and function (`dotted.module:12 (function)`), where
+    its code is wherever the run is installed: so two programs whose checks sit on other lines are two, and
+    one of the same code is one across installs. The one statement of a traceback, a program file's too
+    (`dew.training.ahead.HeldTraceback`)."""
+    return [f"{_frame_module(frame.file_name)}:{frame.line_num} ({frame.function_name})"
+            for frame in traceback.frames]
+
+
+def _frame_module(file: str) -> str:
+    """The module a frame's `file` is, by the longest import path entry it lies under (`a/b.py` under it is
+    `a.b`), each entry as Python reads it (`''` the working directory, as under `-c`, a REPL or a notebook),
+    else its file's name: no directory where the run is installed, and one module however Python was
+    launched."""
+    real = os.path.realpath(file)
+    roots = [root for entry in sys.path
+             if real.startswith(root := os.path.join(os.path.realpath(entry or os.curdir), ""))]
+    if not roots:
+        return os.path.basename(file)
+    relative = os.path.splitext(real[len(max(roots, key=len)):])[0]
+    return relative.replace(os.sep, ".").removesuffix(".__init__")
+
+
 def _parts(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     """One of JAX's values that a call's key holds and the algebra's key does not state, by its parts
     (each through `again`, `stated` as its caller walks): a tree's structure, a format,
     one device's sharding, a device, and any other of JAX's by its attributes where it holds them plainly
-    (an axis environment's sizes and names), the layout XLA chooses (`Layout.AUTO`). None for a value that
-    is none of them."""
+    (an axis environment's sizes and names), the layout XLA chooses (`Layout.AUTO`), a traceback
+    (`_traceback`). None for a value that is none of them."""
+    if (frames := _traceback(value)) is not None:
+        return frames
     if isinstance(value, type(jax.tree.structure(()))):
         return _tree(value, at, again)
     if isinstance(value, Format):
@@ -312,40 +348,34 @@ def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, .
             if _sources.own_source(maker.__module__) else None)
     entry: list[JSON] = [_coded(held.__module__, at), held.__qualname__, _members(held, at, known, walking),
                          fields, made]
-    return entry
+    # How its generator made it, as it records its options (`generation_options`).
+    options = _sources.generation_options(held)
+    return [*entry, dict(options)] if options else entry
 
 
-def _attrs_made(value, at: str, again: Callable[..., JSON]) -> JSON | None:
-    """An instance of a class attrs made (its own validators, `attrs.validators.instance_of`'s and
-    `and_`'s among them) by its type and its fields' values, as a dataclass's record is, and an
-    `attrs.Converter` by its converter and how it is called; None for any other value, or where attrs is
-    not loaded (no such value exists then). Refused before, a step whose attrs class held a validator of
-    attrs' own was inexact (train 953's review)."""
+def _converter(value, at: str, again: Callable[..., JSON]) -> JSON | None:
+    """An `attrs.Converter` (attrs 24.1 and later) by its converter and how it is called, wherever the walk
+    meets one: a field's own, or one nested in `attrs.converters.pipe` or `optional`'s closure; None for any
+    other value. Unwrapped in a field's own slot alone, a nested one left its step inexact (train 957's
+    review)."""
     attr = sys.modules.get("attr")
-    if attr is None:
+    converter_type = None if attr is None else vars(attr).get("Converter")
+    if converter_type is None or not isinstance(value, converter_type):
         return None
-    if "__attrs_attrs__" in vars(type(value)):
-        return ["attrs", again(type(value), at=at),
-                [[field.name, again(getattr(value, field.name), at=f"{at}.{field.name}")]
-                 for field in vars(type(value))["__attrs_attrs__"]]]
-    if isinstance(value, attr.Converter):
-        return ["converter", again(value.converter, at=at), value.takes_self, value.takes_field]
-    return None
+    return ["converter", again(value.converter, at=f"{at}'s converter"), value.takes_self, value.takes_field]
 
 
 def _field(held: type, field: _sources.GeneratedField, at: str, known: Mapping[int, JSON],
            walking: tuple[int, ...]) -> JSON:
     """A generated field (`dew._sources.generated_fields`) as an identity states it: its name, default and
-    default factory, and the hooks attrs runs on its value where it has any (its converter, validator,
-    `on_setattr`, eq and order keys), each by its part's name. A field with no hooks, every dataclass's, is
-    stated as it was before them, so a position saved then holds (train 953's review)."""
+    default factory, and every other part its generator recorded of it, each by its part's name."""
     stated: list[JSON] = [field.name,
                           _field_part(field.default, f"{at} ({held.__name__}.{field.name})", known, walking),
                           _field_part(field.factory, f"{at} ({held.__name__}.{field.name} factory)", known,
                                       walking)]
-    if field.hooks:
+    if field.parts:
         stated.append({part: _stated(value, f"{at} ({held.__name__}.{field.name} {part})", known, walking)
-                       for part, value in field.hooks})
+                       for part, value in field.parts})
     return stated
 
 

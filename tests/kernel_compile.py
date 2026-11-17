@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import functools
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -38,6 +39,7 @@ from sharded import collective_axes
 
 from dew import _cache
 from dew._builds import generation_builds
+from dew._devices import cuda_builds
 from dew.nn.kernels import grouped_matmul
 from dew.nn.kernels.generation import assumed, capability, compile_only_gpus, gpu_target
 from dew.nn.kernels.lowered import kernel_calls, triton_kernels
@@ -92,7 +94,7 @@ class Report:
     compiles a module once a process, so a later compile of it prints no PTX of its own; the digest its name
     carries, its kernel's identity within the launch that traced it (`report.named`), or None; ptxas's notes
     of a performance loss it fails for (`ptxas_read`, `LOSSES`); and what its machine code breaks of the SASS
-    rules (`report.sass_findings`, read where nvdisasm is installed)."""
+    rules (`report.sass_findings_of`, read where nvdisasm is installed)."""
     kernel: str
     shared: int | None
     tmem: int | None
@@ -109,6 +111,15 @@ class Report:
     binary_frame: int | None = None
     """Its registers a thread and stack frame's bytes as its executable's binary carries them
     (`report.Binary`): this process's assembly, which `inherited` reads where no PTX of it was dumped."""
+    threads: int | None = None
+    decreased: int | None = None
+    raised: int | None = None
+    """Its threads a block, the registers its producer lowers to and its consumers raise to, as its binary
+    states them (`report.Binary`: its `.nv.info` and its machine code's USETMAXREG), its program's facts
+    whatever assembler made it; None where it states none (a launch of no producer, or no disassembler)."""
+    cap: int | None = None
+    """The registers its launch runs a thread at, as its compile states them (`_compiled_here`'s), None where
+    unstated."""
 
     @property
     def traced(self) -> str:
@@ -117,10 +128,11 @@ class Report:
 
     def failure(self, shared_limit: int, tmem_limit: int) -> str | None:
         """Why the kernel is not within a multiprocessor's `shared_limit` bytes and `tmem_limit` tensor memory
-        columns without spilling registers, with its warpgroup MMAs in flight together and its register raises
-        taken, or None where it is: a kernel ptxas serializes runs its MMAs one at a time, its registers and
-        spills clean (row 3615; the kernel challenge's C7511 at 112 registers, C7512 at 96), and one whose
-        raises it ignores keeps its consumers at the entry's registers (C7507, row 4071)."""
+        columns without spilling registers, within its launch's register cap (`cap`), with its warpgroup MMAs
+        in flight together and its register raises taken, or None where it is: a kernel ptxas serializes runs
+        its MMAs one at a time, its registers and spills clean (row 3615; the kernel challenge's C7511 at 112
+        registers, C7512 at 96), and one whose raises it ignores keeps its consumers at the entry's registers
+        (C7507, row 4071)."""
         if self.unread:
             return f"its reports state no {', '.join(self.unread)}"
         if self.losses:
@@ -129,6 +141,8 @@ class Report:
                  else "serializes its warpgroup MMAs") + f" ({code})" for code in self.losses)
         if self.sass:
             return "its machine code holds " + "; ".join(self.sass)
+        if self.registers is not None and self.cap is not None and self.registers > self.cap:
+            return f"{self.registers} registers a thread, above its launch's {self.cap}"
         if (self.shared is not None and self.tmem is not None and self.shared <= shared_limit
                 and self.tmem <= tmem_limit and self.spilled == 0):
             return None
@@ -169,7 +183,10 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
             sass=tuple(binary.sass or ()) if binary is not None else (),
             launched=binary.launched if binary is not None else None,
             binary_registers=binary.registers if binary is not None else None,
-            binary_frame=binary.frame if binary is not None else None))
+            binary_frame=binary.frame if binary is not None else None,
+            threads=binary.threads if binary is not None else None,
+            decreased=binary.decreased if binary is not None else None,
+            raised=binary.raised if binary is not None else None))
     return found_reports
 
 
@@ -526,6 +543,28 @@ class Gated(str):
     own gathers the session's cells of one capability by (`compiled_apart`)."""
 
 
+
+def stated_outputs(lowered: jax.stages.Lowered, target: str | None = None) -> list[tuple[int, list | None]]:
+    """Each custom call of `lowered` (of the call target `target`, every one where None), in the order JAX
+    lowered them, a call no run reaches among them (`_read`'s `unrun`: XLA compiles it all the same): the
+    outputs it defines (its results less those aliasing an operand, a ref it writes in place) and the
+    dimensions it states them by (`outputs.OUTPUT_DIMS`, parsed: a list an output, its every dimension's
+    `[operand, axis]` pairs; None where it states none), as XLA's compiler reads its frontend attribute."""
+    from jax.extend.mlir import ir
+
+    from dew.nn.kernels import lowered as reading
+    from dew.nn.kernels.templates.outputs import OUTPUT_DIMS
+
+    def read(called: str, operation) -> tuple[int, list | None] | None:
+        if target is not None and called != target:
+            return None
+        aliased = (len(ir.ArrayAttr(operation.attributes["output_operand_aliases"]))
+                   if "output_operand_aliases" in operation.attributes else 0)
+        stated = reading._frontend(operation.attributes).get(OUTPUT_DIMS)
+        return len(operation.results) - aliased, None if stated is None else json.loads(stated)
+
+    return [call for call, _ in reading._read_calls(lowered, read, unrun=True)]
+
 def gate_generations(dtype=jnp.bfloat16, *, stated: bool = False, scoped: bool = False, tpu: bool = False,
                      needs: Callable[[Any, Any], bool] | None = None) -> tuple[Gated, ...]:
     """The generations a compile gate's cells take for a template's launches of `dtype` (its launch's
@@ -556,7 +595,11 @@ def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     own reports dumped (`_dumped`): its name, the generation's shared-memory and tensor-memory limits
     (`GpuTarget.tmem_columns`, 0 where it has none), and each of its kernels' report (`mosaic_kernels`),
     or the error. In a process that compiled Mosaic kernels for another capability
-    (`_BINARY_CAPABILITY`) these are the records its process of its own gives (`compiled_apart`)."""
+    (`_BINARY_CAPABILITY`) these are the records its process of its own gives (`compiled_apart`), and so where
+    a module of its kernels was compiled in this process before the gate's, outside it, so that no PTX of
+    it was dumped (`_undumped`: an earlier test certified the same launch; Mosaic compiles a module once a
+    process): the test's own process, which compiles it first (train 957's red, the B200 gathered cells'
+    producer read as None)."""
     wanted = capability(generation)
     test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" ", 1)[0]
     call = _CALLS[test]
@@ -567,7 +610,14 @@ def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     found = _compiled_here(cases, generation)
     if apart_records.RECORDS in os.environ:
         apart_records.written(Path(os.environ[apart_records.RECORDS]), test, call, found)
+    elif _undumped(found):
+        return compiled_apart(wanted, test, call, alone=True)
     return found
+
+
+def _undumped(found: list[dict]) -> bool:
+    """Whether a kernel of `found`'s records has no PTX this process dumped (`_compiled_here`'s `dumped`)."""
+    return any(not kernel["dumped"] for record in found for kernel in record.get("kernels", ()))
 
 
 _CALLS: Counter[str] = Counter()
@@ -579,13 +629,17 @@ _APART: dict[tuple[int, int] | str, Path] = {}
 ran where that test states no capability of the gate's (`compiled_apart`)."""
 
 
-def compiled_apart(wanted: tuple[int, int], test: str, call: int) -> list[dict]:
+def compiled_apart(wanted: tuple[int, int], test: str, call: int, *, alone: bool = False) -> list[dict]:
     """The records of `test`'s `call`-th Mosaic GPU compile, for a capability other than the one this process
     compiles for, from a pytest process of its own: one a capability, the first test to ask it starting it
     with every test of the session whose cells state it (`_stated`), so a test of another capability costs
     no process of its own; a test it did not run (one that states no capability of the gate's) its own.
     Read only where the test passed there, as its records are written before its own checks and teardown
-    (row 1877)."""
+    (row 1877). With `alone`, the test's own process, which runs it and nothing before it."""
+    if alone:
+        if test not in _APART:
+            _APART[test] = _ran_apart([test])
+        return apart_records.read(_APART[test], test, call)
     if wanted not in _APART:
         _APART[wanted] = _ran_apart([test, *(item.nodeid for item in apart_records.SESSION
                                              if item.nodeid != test and _stated(item) == wanted)])
@@ -624,12 +678,13 @@ module: Mosaic compiles a module once a process, so a later case of the same mod
 (`inherited`)."""
 
 
-def inherited(kernel: dict, compiled: dict[str, dict]) -> dict:
+def inherited(kernel: dict, compiled: dict[str, dict], generation: str) -> dict:
     """`kernel`'s record (`mosaic_kernels`) with its registers and spills, their only source: as the GPU
     compiles its PTX, this compile's (`compiled`, by its name and launch, `report.launch_name`), which this
     process keeps by its module (`COMPILED`), or, where Mosaic compiled the same module before in this process
-    and so printed no PTX, that compile's. Its binary is this process's compile, which may not be the GPU's
-    (`RELOCATABLE`): a kernel neither covers keeps them unread."""
+    and so printed no PTX, that compile's. A kernel neither covers takes its executable's binary's where this
+    process's builds are every build `generation`'s GPUs run (`_assembles_for`), its verdict then theirs;
+    elsewhere it keeps them unread, another compiler's verdict no evidence of the GPU's."""
     name = report.launch_name(kernel["kernel"], kernel["launch"])
     if name in compiled:
         if kernel["module"] is not None:
@@ -637,14 +692,23 @@ def inherited(kernel: dict, compiled: dict[str, dict]) -> dict:
         return {**kernel, **compiled[name]}
     if kernel["module"] in COMPILED:
         return {**kernel, **COMPILED[kernel["module"]], "ptxas": "an earlier compile of its module"}
-    if kernel["binary_registers"] is not None:
-        # No PTX of it in this process (its module compiled before the gate's): this process's assembly, its
-        # executable's binary (`report.binaries`), as certification reads it.
+    if kernel["binary_registers"] is not None and _assembles_for(generation):
+        # No PTX of it in this process (its module compiled before the gate's): its executable's binary
+        # (`report.binaries`), as certification reads it, where this process's builds are every build the
+        # generation's GPUs run (`_assembles_for`; train 956 F1, train 960 F1).
         return {**kernel, "registers": kernel["binary_registers"], "spilled": kernel["binary_frame"],
                 "ptxas": "its executable's binary"}
     unread = [*kernel["unread"], *(field for field in ("registers", "spills")
                                    if field not in kernel["unread"])]
     return {**kernel, "registers": None, "spilled": None, "unread": unread}
+
+
+def _assembles_for(generation: str) -> bool:
+    """Whether this process's Mosaic GPU binaries are the verdict of every build `generation`'s GPUs run: its
+    CUDA builds installed (`dew._devices.cuda_builds`) theirs exactly (`dew._builds.generation_builds`), the
+    gate judging a kernel by its worst result under each (an H100 runs cuda13 and cuda12, whose spills differ,
+    rows 5671, 5759, 5761; a B200 cuda13 alone)."""
+    return tuple(cuda_builds()) == generation_builds(generation)
 
 
 PTX: dict[str, str] = {}
@@ -692,13 +756,9 @@ def assemblers(generation: str) -> tuple[Path, ...]:
     12.9 held (rows 5671, 5759 and 5761)."""
     return tuple(ptxas_of(build) for build in generation_builds(generation))
 
-RAISED = re.compile(r"setmaxnreg\.inc\.sync\.aligned\.u32 (\d+);")
-"""A raise's registers (`setmaxnreg.inc`'s), as a kernel record states them (`raised`)."""
-DECREASED = re.compile(r"setmaxnreg\.dec\.sync\.aligned\.u32 (\d+);")
-"""A producer's decrease's registers, as a kernel record states them (`decreased`)."""
-
-THREADS = re.compile(r"\.maxntid (\d+),")
-"""A kernel's threads a block (`.maxntid`'s first), as a kernel record states them (`threads`)."""
+PROGRAMS = re.compile(r"\.minnctapersm (\d+)")
+"""The programs a multiprocessor holds of a kernel at once (`.minnctapersm`, Mosaic's `min_blocks_per_sm`), as
+ptxas bounds its registers by them (`cap`)."""
 
 
 RELOCATABLE = not resources.RAISES_HONORED
@@ -775,21 +835,23 @@ def _compiled_here(cases, generation: str) -> list[dict]:
                 and (launch := report.traced(kernel["launched"])) is not None
                 and (stated := launch.kernels.get(kernel["kernel"])) is not None}
             compiled = _compiled_reports(directory, generation)
-            record["kernels"] = [inherited(kernel, compiled) for kernel in kernels]
+            record["kernels"] = [inherited(kernel, compiled, generation) for kernel in kernels]
             printed = {path.stem: path.read_text() for path in Path(directory).glob("*.ptx")}
             for kernel in record["kernels"]:
                 name = report.launch_name(kernel["kernel"], kernel["launch"])
                 if kernel["module"] is not None and name in printed:
                     PTX[kernel["module"]] = printed[name]
-                # The registers its consumers raise to, as its PTX states (`setmaxnreg.inc`); None where they
-                # raise none or no PTX was printed for it.
                 ptx = printed.get(name, PTX.get(kernel["module"], ""))
-                kernel["raised"] = int(raise_.group(1)) if (raise_ := RAISED.search(ptx)) else None
-                # The registers its producer lowers to, as its PTX states (`setmaxnreg.dec`); None likewise.
-                kernel["decreased"] = int(lower.group(1)) if (lower := DECREASED.search(ptx)) else None
-                # Its threads a block, as its PTX states (`.maxntid`); None likewise. A record compiled in a
-                # process of its own (`compiled_apart`) carries it where this process's `PTX` holds none.
-                kernel["threads"] = int(threads.group(1)) if (threads := THREADS.search(ptx)) else None
+                # Whether this process dumped its PTX: none where its module compiled before the gate's.
+                kernel["dumped"] = bool(ptx)
+                # The registers its launch runs a thread at, as its compile states them: its consumers' raise
+                # where it raises, else its threads' share of the multiprocessor's registers at the programs
+                # it is launched to hold (`resources.thread_share`); None where its binary states no threads.
+                programs = int(held.group(1)) if (held := PROGRAMS.search(ptx)) else 1
+                with assumed(gpu_target(generation)):
+                    kernel["cap"] = (kernel["raised"] if kernel["raised"] is not None
+                                     else None if kernel["threads"] is None
+                                     else resources.thread_share(kernel["threads"], programs))
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         found.append(record)
     return found

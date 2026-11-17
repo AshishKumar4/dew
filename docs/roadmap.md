@@ -17,6 +17,10 @@ This page is generated from the maintainers' findings ledger as each change land
 - Splash's float32 forward at width 256 does not compile on a v5e. [6992]
 - The attention template's Mosaic TPU forward does not compile for a v5e training step at width 64, full, float16. [6993]
 - Paged decode on a v5e does not compile. [6994]
+- Splash's training step on a v5e is not finite in its value gradient. [7226]
+- Splash in float16 does not compile on a v5e. [7227]
+- JAX's paged decode at width 64 does not lower on a v5e. [7228]
+- A first sm80 accurate-form attention backward with a bias pays 3-4 minutes of certification compiles before its route falls back to another mainloop. [7279]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -30,11 +34,14 @@ This page is generated from the maintainers' findings ledger as each change land
 - Convolution repairs above their owner. [5665]
 - The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
 - The sm100 training backward runs Ampere's mma.sync two-launch backward at 32x32 tiles where the template holds a certified tcgen05 backward it does not route. [6918]
+- finished_merged's derivative as to a slice of zero total is 0 where the merge formula's is (o - out) e^(m - M) / W. [7124]
+- The kernel gate reads no resource report of a fp32 decode's plain-forward kernels. [7263]
+- The Mosaic attention backward on sm80 spills at every tile it offers for the accurate form with a bias (key-bias width 64 bf16, tile-bias width 128 fp16 GQA…. [7280]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
 - Native TPU GEMM dispatch. [1560]
-- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 5895, 5988, 6008, 6010]
+- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 5895, 6008, 6010]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product (a float32 output), a legitimate…. [4860]
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5278, 5327]
 - Derived resources: tiles, registers, residency and issued work. [5567]
@@ -42,6 +49,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Block-selected attention's other selections as mixers. [6301]
 - Mosaic has no float32 forward at width 256 on Hopper. [6508]
 - The attention backward's derivation proposes a spilling attention_dkv_fused at width 64 on sm100 and sm80. [6944]
+- CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
@@ -69,7 +77,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556, 5558]
+- Time to first step: the compile path's re-derivations. [5556]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5361]
 - XLA:CPU edges. [1591]
@@ -90,7 +98,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
-- The in-context memory reads no forks. [6969]
 
 ## Algebra
 
@@ -102,13 +109,12 @@ This page is generated from the maintainers' findings ledger as each change land
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
 - Tools/layout_parity.py:816-839 keeps a second accuracy policy. [793]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
-- Released checkpoints judged on GPUs. [1703, 1549]
+- Released checkpoints judged on GPUs. [1703]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - Saved runs carried across. [2791, 2792]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 - The saved data plan as recorded rules, one last version, and the resume modes. [6861]
-- The float64 terms walk (tests/float64_terms.py scanned_steps and its eager evaluation) runs a scanned model's float64 truth one eager step at a time on a GPU. [7096]
 
 ## Tutorials and docs
 

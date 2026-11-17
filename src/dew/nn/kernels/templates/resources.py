@@ -61,6 +61,10 @@ class ByLaunch:
         """`launch`'s cap, None where its derivation alone decides."""
         return dict(self.caps).get(launch)
 
+    def only(self, launches: Collection[str]) -> Self:
+        """The caps of `launches` alone, what they read of these."""
+        return type(self)(tuple((name, cap) for name, cap in self.caps if name in launches))
+
     def without(self, launches: Collection[str]) -> Self:
         """These but `launches`', each its derivation's own again."""
         return type(self)(tuple((name, cap) for name, cap in self.caps if name not in launches))
@@ -413,11 +417,17 @@ SSD query/key launch, 161 us at two, 216 to 226 at one, FS-WHY3-h100), so a rais
 
 def entry_registers(warpgroups: int, programs: int = 1) -> int:
     """The registers a thread of a program of `warpgroups` warpgroups launches with, `programs` of it held by
-    a multiprocessor at once: their threads' share of its registers (`Multiprocessor.registers`, 64K) in the
-    allocator's steps (8), at most the thread's (255): 168 at three warpgroups and one program, 128 at two
+    a multiprocessor at once (`thread_share`): 168 at three warpgroups and one program, 128 at two
     warpgroups and two."""
+    return thread_share(warpgroups * THREADS, programs)
+
+
+def thread_share(threads: int, programs: int = 1) -> int:
+    """The registers a thread of a program of `threads` threads launches with, `programs` of it held by a
+    multiprocessor at once: their threads' share of its registers (`Multiprocessor.registers`, 64K) in the
+    allocator's steps (8), at most the thread's (255)."""
     held = facts()
-    share = held.registers // (programs * warpgroups * THREADS)
+    share = held.registers // (programs * threads)
     return min(held.thread_registers, share // held.register_step * held.register_step)
 
 

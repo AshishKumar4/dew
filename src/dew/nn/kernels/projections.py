@@ -41,6 +41,7 @@ from dew.nn.sharding import (
     on_shards,
     placed_layout,
     seen_whole,
+    shard_shapes,
 )
 
 
@@ -146,7 +147,6 @@ def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, along) -> ja
     matrix, the groups' sizes and the bias whole on every device and the matrix's and bias's gradients
     summed over the devices (the map's transpose). Experts' sizes count every device's rows together, each
     group's after the last's: a device's groups are its share of each (`_local_sizes`)."""
-    from dew.mesh import mesh_axes
 
     names = mesh_axes(along)
 
@@ -438,8 +438,8 @@ def shard_placement(lhs: jax.Array, matrices: tuple[jax.Array, ...], paths: tupl
     if split is None or layout is None:
         return None
     mesh = jax.sharding.get_abstract_mesh()
-    shards = math.prod(mesh.shape[axis] for entry in split for axis in mesh_axes(entry))
-    rows = jax.ShapeDtypeStruct((math.prod(lhs.shape[:-1]) // shards, lhs.shape[-1]), lhs.dtype)
+    held = shard_shapes((lhs,), (split,))[0]
+    rows = jax.ShapeDtypeStruct((math.prod(held.shape[:-1]), held.shape[-1]), lhs.dtype)
     return split, {1 + index: layout.leaf_spec(mesh, path, each)
                    for index, (path, each) in enumerate(zip(paths, matrices, strict=True))}, rows
 
@@ -448,6 +448,16 @@ def kernel_path(layer) -> tuple:
     """The variables path of `layer`'s kernel (`('params', *its scope, 'kernel')`), as the layout reads a
     parameter's (`Layout.leaf_spec`)."""
     return tuple(jax.tree_util.DictKey(name) for name in ('params', *layer.scope.path, 'kernel'))
+
+
+def extents(lhs_shape: tuple[int, ...], rhs_shape: tuple[int, ...], dimension_numbers) -> tuple[int, int]:
+    """A layer's product's depth and width as matrices (`jax.lax.dot_general`'s `dimension_numbers` over
+    operands of these shapes), the extents a recipe reads (`recipe_refusal`), `recipe_general`'s and a
+    wrapped product's refusal's alike (`dew.nn.dense`): the depth the product of the left operand's
+    contracting axes, the width the product of the kernel's free axes, neither contracting nor batch."""
+    (contracted, against), (_, batched_rhs) = (tuple(map(tuple, pair)) for pair in dimension_numbers)
+    return (math.prod(lhs_shape[axis] for axis in contracted),
+            math.prod(rhs_shape[axis] for axis in range(len(rhs_shape)) if axis not in against + batched_rhs))
 
 
 def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype) -> jax.Array | None:
@@ -467,8 +477,7 @@ def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype)
     free_rhs = [axis for axis in range(rhs.ndim) if axis not in against + batched_rhs]
     groups = math.prod(lhs.shape[axis] for axis in batched)
     count = math.prod(lhs.shape[axis] for axis in free)
-    depth = math.prod(lhs.shape[axis] for axis in contracted)
-    width = math.prod(rhs.shape[axis] for axis in free_rhs)
+    depth, width = extents(lhs.shape, rhs.shape, dimension_numbers)
     rows = jnp.transpose(lhs, (*batched, *free, *contracted)).reshape(groups * count, depth)
     matrices = jnp.transpose(rhs, (*batched_rhs, *against, *free_rhs)).reshape(groups, depth, width)
     out = (recipe_projection(rows, matrices, jnp.full((groups,), count, jnp.int32), out_dtype=out_dtype)

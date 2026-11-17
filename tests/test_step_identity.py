@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import json
+import os
+import subprocess
 import sys
 from uuid import uuid4
 
@@ -412,7 +415,7 @@ class Plain:
     scale: ClassVar[int] = 1
 
 
-@attrs.define(frozen=True)
+@attrs.define(frozen=True{attrs_eq})
 class Ranged:
     span: int = {span}
     marks: list = attrs.Factory(lambda: [{mark}])
@@ -424,6 +427,36 @@ class Hooked:
     scaled: int = attrs.field(default=1, on_setattr=lambda instance, attribute, value: value * {hook})
 
 
+@attrs.define(on_setattr=lambda instance, attribute, value: value * {classhook})
+class ClassHooked:
+    scaled: int = 1
+
+
+@attrs.define(frozen=True)
+class Flagged:
+    value: int = attrs.field(eq={flag})
+    other: int = 0
+
+
+@attrs.define(frozen=True)
+class Piped:
+    value: int = attrs.field(default=1, converter=attrs.converters.pipe(
+        attrs.Converter(lambda value: value * {pipe})))
+
+
+@attrs.define(frozen=True)
+class Holder:
+    count: int = 1
+
+
+@attrs.define
+class Unset:
+    late: int = attrs.field(init=False)
+
+
+HELD = Unset()
+
+
 @attrs.define(frozen=True, order=True)
 class Keyed:
     value: int = attrs.field(eq=lambda value: value % {modulus}, order=lambda value: value * {sign})
@@ -431,34 +464,87 @@ class Keyed:
         attrs.validators.instance_of({kinds}), attrs.validators.ge(0)))
 
 
+@dataclasses.dataclass(frozen=True, eq={eq})
+class Compared:
+    value: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class Fielded:
+    value: int = dataclasses.field(default=1, compare={compare})
+    other: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class KeywordOnly:
+    value: int = dataclasses.field(default=1, kw_only={keyword})
+
+
+@attrs.define(frozen=True)
+class SelfMade:
+    made: list = attrs.Factory(lambda *handed: [len(handed)], takes_self={takes_self})
+
+
+@attrs.define(frozen=True)
+class Typed:
+    value: {annotation} = attrs.field(default=2, converter=attrs.Converter(
+        lambda value, field: value * (2 if field.type is int else 3), takes_field=True))
+
+
+@attrs.define(frozen=True)
+class Aliased:
+    value: int = attrs.field(default=1, alias="{alias}")
+
+
+@attrs.define
+class Untouched:
+    value: int = attrs.field(default=1, on_setattr=attrs.setters.NO_OP)
+
+
 @dataclasses.dataclass(frozen=True)
 class Shifting:
+    held: object = Holder()
+
     def __call__(self, row):
-        hooked = Hooked()
-        hooked.scaled = 2
+        hooked, classhooked = Hooked(), ClassHooked()
+        hooked.scaled = classhooked.scaled = 2
         total = (Offset().by * Offset()._Offset__scale + Child().over + int(Listed().values[0])
                  + Plain.by * Plain.scale + Ranged().span + Ranged().marks[0] + Ranged().scaled
-                 + hooked.scaled + int(Keyed(1) == Keyed(3)) + int(Keyed(1) < Keyed(3)) + Keyed(1).checked)
+                 + hooked.scaled + int(Keyed(1) == Keyed(3)) + int(Keyed(1) < Keyed(3)) + Keyed(1).checked
+                 + classhooked.scaled + int(Flagged(1) == Flagged(3)) + int(HELD is not None)
+                 + int(Compared() == Compared()) + int(Fielded(1) == Fielded(3)) + int(Ranged() == Ranged())
+                 + Piped().value + self.held.count + len(KeywordOnly.__match_args__) + SelfMade().made[0]
+                 + Typed().value + Aliased(**{{Aliased.__attrs_attrs__[0].alias: 4}}).value
+                 + Untouched().value)
         return {{**row, "id": row["id"] + total}}
 """
 """A class step of the user's file building classes generators made, each with a default or a factory its
 code reads: a slotted dataclass's field and its name-mangled field, a slotted child's override of its base's
 default, a default factory, plain or slotted, a plain dataclass's default and class variable, an attrs class's
-default, factory, converter, setter hook, eq and order keys and validators of attrs' own."""
+default, factory, converter, setter hook, eq and order keys and validators of attrs' own, and a field attrs'
+setter leaves as it is (`attrs.setters.NO_OP`)."""
 
 GENERATED_AT = {"by": 1, "scale": 1, "over": 20, "value": 3, "slots": "", "span": 2, "mark": 5, "factor": 7,
-                "hook": 7, "modulus": 2, "sign": 1, "kinds": "int"}
+                "hook": 7, "modulus": 2, "sign": 1, "kinds": "int", "classhook": 7, "flag": "True",
+                "eq": "True", "compare": "True", "pipe": 3, "attrs_eq": "", "keyword": "False",
+                "takes_self": "False", "annotation": "int", "alias": "value"}
 
 
 @pytest.mark.parametrize(("edit", "assigned"), [
     ({"by": 20}, None), ({"scale": 30}, None), ({"over": 300}, None), ({"value": 55}, None),
     ({"value": 55, "slots": ", slots=True"}, None), ({"span": 200}, None), ({"mark": 500}, None),
     ({"factor": 70}, None), ({"hook": 70}, None), ({"modulus": 20}, None), ({"sign": -10}, None),
-    ({"kinds": "(int, float)"}, None), ({}, ("by", 10)), ({}, ("scale", 10))],
+    ({"kinds": "(int, float)"}, None), ({"classhook": 70}, None), ({"flag": "False"}, None),
+    ({}, ("by", 10)), ({}, ("scale", 10)), ({"eq": "False"}, None), ({"compare": "False"}, None),
+    ({"pipe": 30}, None), ({"attrs_eq": ", eq=False"}, None), ({"keyword": "True"}, None),
+    ({"takes_self": "True"}, None), ({"annotation": "float"}, None), ({"alias": "renamed"}, None)],
     ids=["slotted field", "mangled field", "slotted child's override", "factory", "slotted factory",
          "attrs default", "attrs factory", "attrs converter", "attrs setter hook", "attrs eq key",
-         "attrs order key", "attrs validators", "a default set at run time",
-         "a class variable set at run time"])
+         "attrs order key", "attrs validators", "attrs class setter hook", "attrs eq flag",
+         "a default set at run time", "a class variable set at run time", "dataclass eq option",
+         "dataclass field compare flag", "attrs nested converter", "attrs eq option",
+         "dataclass keyword-only field", "attrs factory taking self", "attrs annotation a converter reads",
+         "an attrs field part named nowhere (its alias)"])
 def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factory_changed(
         tmp_path, monkeypatch, edit, assigned):
     """A step of a class of the user's file, stated by its members, whose code builds classes of the file
@@ -469,7 +555,17 @@ def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factor
     and so did a value set at run time, a class variable and an attrs class's fields (train 950's), and an
     attrs field's converter, which its generated `__init__` alone holds (train 951's), and its setter hook
     and eq and order keys, which its generated methods hold; its validators of attrs' own (`instance_of`,
-    `and_`) made the step inexact, refusing an unchanged exact resume (train 953's)."""
+    `and_`) made the step inexact, refusing an unchanged exact resume (train 953's); a class-level setter
+    hook and a field's eq flag went unstated, and an unset field of an attrs instance the step reads crashed
+    its statement (train 955's); a dataclass's eq option and a field's compare flag, which decide what its
+    comparisons read, went unstated, the resume reading other rows (the base review of 67fd128db); a
+    converter nested in `pipe` left the step inexact, and so did an attrs instance the step's dataclass
+    holds (train 957's). A dataclass field's keyword-only flag, which its
+    generated `__init__` and `__match_args__` read, an attrs factory's `takes_self` and an annotation a
+    converter reads went unstated, each a part of a field no hand list named (the evening audit of
+    2026-11-16); every part is stated now, an attrs field's alias among them, which no code of Dew names. A
+    field whose setter attrs leaves as it is (`attrs.setters.NO_OP`, a bare sentinel) left the step inexact,
+    refusing an unchanged exact resume (train 974's review)."""
     module = tmp_path / f"generated_{uuid4().hex}.py"
     # Saved and edited under the same slotting, so an edit changes the factory alone.
     start = {**GENERATED_AT, **{name: value for name, value in edit.items() if name == "slots"}}
@@ -493,6 +589,37 @@ def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factor
         resumed_changes(reader(), state)
     (changed,) = resumed_changes(reader("relaxed"), state)
     assert changed.startswith("code.")
+
+
+STATED_IN_A_PROCESS = """import importlib
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from dew.data.plan import StepIdentity
+
+identity = StepIdentity.of(importlib.import_module(sys.argv[2]).Shifting())
+print(json.dumps([identity.exact, identity.config, list(identity.held), list(identity.code)]))
+"""
+
+
+def test_a_generated_classs_step_is_stated_alike_in_processes_of_different_string_hashing(tmp_path):
+    """The step of `GENERATED`, which reaches hashable attrs classes, is stated alike, exactly, by two fresh
+    processes of different string hashing, so a position one saves resumes exactly in the other. attrs
+    writes a hashable class's `__hash__` with this process's salted string hash, and the generated
+    methods' code was stated, differing in every process: an exact resume of an unchanged pipeline was
+    refused (train 974's review)."""
+    module = tmp_path / f"generated_{uuid4().hex}.py"
+    module.write_text(GENERATED.format(**GENERATED_AT))
+    stated = []
+    for seed in ("1", "2"):
+        done = subprocess.run([sys.executable, "-c", STATED_IN_A_PROCESS, str(tmp_path), module.stem],
+                              capture_output=True, text=True, check=False,
+                              env={**os.environ, "PYTHONHASHSEED": seed, "JAX_PLATFORMS": "cpu"})
+        assert done.returncode == 0, done.stderr[-3000:]
+        stated.append(json.loads(done.stdout.strip().splitlines()[-1]))
+    assert stated[0] == stated[1]
+    assert stated[0][0] is True
 
 
 SCRIPTED = """import dataclasses
@@ -714,3 +841,54 @@ def test_an_exact_resume_holds_the_code_a_steps_methods_reach(tmp_path, monkeypa
         resumed_changes(reader(), state)
     (changed,) = resumed_changes(reader("relaxed"), state)
     assert changed.startswith("code.")
+
+
+REMAPPED = """import attrs
+import dataclasses
+
+import numpy as np
+
+
+@attrs.define(frozen=True, eq=False)
+class Remap:
+    table: np.ndarray
+
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + int(self.table[int(row["id"])])}}
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class Holding:
+    remap: Remap
+
+    def __call__(self, row):
+        return self.remap(row)
+
+
+def step(changed, held):
+    table = np.arange(2000)
+    if changed:
+        table[1000] = -1
+    return Holding(Remap(table)) if held else Remap(table)
+"""
+
+
+@pytest.mark.parametrize("held", [False, True], ids=["attrs step", "dataclass holding an attrs instance"])
+def test_an_exact_resume_refuses_an_attrs_step_whose_long_array_changed(tmp_path, monkeypatch, held):
+    """An attrs step holding an array of 2000 entries, or a dataclass step holding it, is stated by its
+    fields, each array by its content: one entry changed past its repr's elision refuses an exact resume,
+    and the unchanged step resumes exactly. Its repr, which elides an array's middle past 1000 entries,
+    stated it and the changed step resumed (train 963's review)."""
+    module = tmp_path / f"remapped_{uuid4().hex}.py"
+    module.write_text(REMAPPED.format())
+    monkeypatch.syspath_prepend(str(tmp_path))
+    remapped = importlib.import_module(module.stem)
+
+    def reader(changed=False):
+        pipeline = Pipeline(ROWS).map(remapped.step(changed, held)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(changed=True), state)

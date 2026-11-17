@@ -27,9 +27,10 @@ from dew.decision.layout import (
     Encoded,
     Layout,
     QuestionField,
-    QuestionLayout,
+    ReadsEarlierLayouts,
     Specials,
     context_tokens,
+    per_question,
     question_fields,
     with_context,
 )
@@ -39,7 +40,7 @@ NONE_OF_THE_ABOVE = "none of the above"
 
 
 @dataclass(frozen=True)
-class Encoding:
+class Encoding(ReadsEarlierLayouts):
     """How a labelled example becomes the row a step packs and trains on.
 
     A row is its own tokens, at most `max_len`, one slot per question it lays
@@ -164,7 +165,7 @@ class Encoding:
             rows = self._rows(example, asked, rng, tokens)
         if len(rows) != 1:
             # A row over one state that its options' drawn order splits, their lines read as other tokens
-            # (`QuestionLayout.shared_state`), is laid out in their own order, as Fit admitted it.
+            # (`SegmentLayout.shared_state`), is laid out in their own order, as Fit admitted it.
             rows = self._rows(example, asked, None, tokens)
         # A run over a backbone that reads no context leaves an example's own context unread.
         rows = with_context(rows, self.tokenizer, None if self.context_length is None else example.context,
@@ -356,7 +357,7 @@ def _declined(rows: Iterable[FittedRow]) -> dict[str, int]:
 
 
 @dataclass(frozen=True)
-class Fit(pygrain.MapTransform):
+class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
     layout: Layout
     tokenizer: Tokenizer
     specials: Specials
@@ -486,7 +487,7 @@ class Fit(pygrain.MapTransform):
         laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state,
                                 request=example.questions)
         if len(laid) != 1:
-            # A row over one state its added options leave no room in (`QuestionLayout.shared_state`).
+            # A row over one state its added options leave no room in (`SegmentLayout.shared_state`).
             return "unfit"
         return drawn_refusal(self.layout, laid[0], self.context_length, row.cuts)
 
@@ -522,7 +523,7 @@ class Fit(pygrain.MapTransform):
         "none of the above" (`Encoding`), and the most context tokens it reads: the longest of the row as
         it is, with the option added beside every answered choice's options, and with it in place of
         each one's right option. A row of a question each is these three exactly, since its layout may
-        trim its options together (`QuestionLayout`), so that adding one can shorten the row; a row of
+        trim its options together (`SegmentLayout`), so that adding one can shorten the row; a row of
         several questions lays them out untrimmed, where adding the option beside every one is the
         longest: it lengthens each question by the option or leaves it as it is (`_none_of_the_above`),
         and the state takes the room the rest leaves. A schema read as the row's context lengthens as
@@ -688,7 +689,7 @@ class EvaluateRows(pygrain.MapTransform):
 
 
 @dataclass(frozen=True)
-class ConfigureLayout:
+class ConfigureLayout(ReadsEarlierLayouts):
     layout: Layout
     tokenizer: Tokenizer
     specials: Specials
@@ -737,7 +738,7 @@ def _along(layout: Layout, grouped: bool = False, trained: bool = True) -> tuple
     """The fields along the questions of `layout`'s rows (`QUESTION_FIELDS`), with a training row's gold
     (`TRAINING_FIELDS`) where they are `trained`: its readout's where its options stand under labels,
     and their consistency groups' where they carry them (`grouped`)."""
-    labelled = isinstance(layout, QuestionLayout) and layout.labels is not None
+    labelled = per_question(layout) and layout.labels is not None
     carried = ("always", *(("trained",) if trained else ()), *(("labelled",) if labelled else ()),
                *(("grouped",) if grouped else ()))
     declared = (*QUESTION_FIELDS, *TRAINING_FIELDS)
@@ -761,16 +762,16 @@ def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, g
     `context_segments`): a window holds rows while both its streams do. A
     `trained` row carries its gold along its questions; a scored one
     (`model_row`) carries the model's fields alone."""
-    parallel = isinstance(layout, QuestionLayout) and layout.parallel
+    parallel = per_question(layout) and layout.parallel
     # A row of questions over one state lays each at its own row's positions, each question's own part a
-    # document continuing the shared part (`QuestionLayout.shares`, `Encoded.forked`).
-    forked = isinstance(layout, QuestionLayout) and layout.shares
+    # document continuing the shared part (`SegmentLayout.shares`, `Encoded.forked`).
+    forked = per_question(layout) and layout.shares
     # With siblings, each question's document continuing the one before it (`Encoded.forked_parents`).
-    chained = forked and isinstance(layout, QuestionLayout) and layout.siblings
+    chained = forked and per_question(layout) and layout.siblings
     # Rows in streams over one state lay each question at its own row's positions too
-    # (`QuestionLayout.streamed`).
-    positioned = parallel or forked or (isinstance(layout, QuestionLayout) and layout.streamed)
-    blocked = isinstance(layout, QuestionLayout) and layout.blocks
+    # (`SegmentLayout.streamed`).
+    positioned = parallel or forked or (per_question(layout) and layout.streamed)
+    blocked = per_question(layout) and layout.blocks
     streamed = layout.attention is not None
     along = tuple((name, bounds.questions) for name in _along(layout, grouped, trained))
     if context_window is not None:
@@ -867,9 +868,9 @@ def _row_starts(along: np.ndarray, owners: np.ndarray) -> np.ndarray:
 
 def forked_documents(layout: Layout, bounds: Bounds) -> int | None:
     """The most documents a window of `layout`'s rows holds where they ask questions over one state
-    (`QuestionLayout.shares`): a shared part a row and an own part a question, within `bounds`; None for
+    (`SegmentLayout.shares`): a shared part a row and an own part a question, within `bounds`; None for
     rows of one document."""
-    if not (isinstance(layout, QuestionLayout) and layout.shares):
+    if not (per_question(layout) and layout.shares):
         return None
     return bounds.segments + bounds.questions
 

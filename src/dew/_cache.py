@@ -28,19 +28,24 @@ from dew._devices import cuda_builds, deterministic_ops_requested, xla_flag
 _log = logging.getLogger(__name__)
 
 def holding[Key: Hashable, Value](cache: collections.OrderedDict[Key, Value], key: Key,
-                                  made: Callable[[], Value], held: int) -> Value:
-    """`cache`'s entry at `key`, made (`made()`) where it holds none, outside the lock every held value shares
-    (`_HOLDING`: compiles trace on several threads, and a value made may hold another), the least recently
-    read dropped past `held`, each cache's own bound. Two threads missing one key at once each make it, the
-    later kept: a held value is a function of its key, so either is the same. How a process holds what it
-    decides and derives once for what it reads: the algebra's kernel decisions, written programs,
+                                  made: Callable[[], Value], held: int,
+                                  still: Callable[[Value], bool] | None = None) -> Value:
+    """`cache`'s entry at `key`, made (`made()`) where it holds none, or where `still` finds the one it holds
+    no longer what `made` would make (a held trace whose facts answer otherwise now), outside the lock every
+    held value shares (`_HOLDING`: compiles trace on several threads, and a value made may hold another), the
+    least recently read dropped past `held`, each cache's own bound. Two threads missing one key at once each
+    make it, the later kept: a held value is a function of its key, so either is the same. How a process holds
+    what it decides and derives once for what it reads: the algebra's kernel decisions, written programs,
     recognitions, window derivations and scan forms (`dew.algebra`), a declared walk's forms
-    (`derive.derived`), a launch's derived config (`templates.base`), a module's counted work
-    (`dew.nn.flops`) and a keyed objective's traced work (`objectives.base.traced_update_flops`)."""
+    (`derive.derived`), a launch's derived config (`templates.base`), a module's counted work (`dew.nn.flops`)
+    and a keyed objective's traced work (`objectives.base.traced_update_flops`)."""
     with _HOLDING:
-        if key in cache:
+        # The held value boxed, so a value of None is held too.
+        found = (cache[key],) if key in cache else None
+        if found is not None:
             cache.move_to_end(key)
-            return cache[key]
+    if found is not None and (still is None or still(found[0])):
+        return found[0]
     value = made()
     with _HOLDING:
         cache[key] = value
@@ -255,8 +260,7 @@ def keep_lowerings(path: str) -> None:
 
 UNCACHED = ("jax_enable_compilation_cache",)
 """The settings of JAX's that `uncached` turns off for its block: whether a compile reads and writes the
-persistent cache, which no program reads, so a program's identity states none of them
-(`dew.training.identity.settings`)."""
+persistent cache, which no program reads."""
 
 
 @contextlib.contextmanager
@@ -388,8 +392,7 @@ other, and check 1 drives both (docs/design/algebra.md §6.9)."""
 
 WHOLE = _context(default_value=False)
 """Whether a model runs its layer stack and sequences whole (`dew.nn.sharding.whole`), keyed on as `ALGEBRA`
-is: a trace reads it, so a call's identity states it with JAX's trace context, and a program traced whole
-is never run staged."""
+is: a trace reads it, so JAX's trace context holds it, and a program traced whole is never run staged."""
 
 PLACING = _context(None)
 """What places the traced program's parameters (`dew.nn.sharding.placing`: a trainer's layout, or
@@ -411,9 +414,8 @@ traces, and reports its routes, again."""
 
 RECORDING = (KERNEL_SEEN, KERNEL_ROUTES)
 """The contexts a trace records into (`KERNEL_SEEN`, `KERNEL_ROUTES`): JAX keys its trace caches on their
-values' identities so a cached trace records again, and the program is the same under any of them, so a
-program's identity states none (`dew.training.ahead.call_identity`), as the persistent cache's key reads
-none."""
+values' identities so a cached trace records again, and the program is the same under any of them, as
+the persistent cache's key reads none."""
 
 KERNEL_PINS = _context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
@@ -453,7 +455,7 @@ quantized call. In this context their traces are kept apart."""
 def carried() -> Callable[[], contextlib.AbstractContextManager[None]]:
     """This thread's trace-affecting states as they stand (every context of Dew's but those a trace records
     into, `RECORDING`, and every setting of JAX's that holds
-    per thread, its matmul precision and x64 among them, as `dew.training.identity.settings` reads them),
+    per thread, its matmul precision and x64 among them),
     entered again by what this returns in another thread: a run's numerics and kernel choices
     (`dew.config.RunConfig.traced`) among them, so a program it traces there is the one its loop traces,
     under the same keys."""

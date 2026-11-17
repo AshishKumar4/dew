@@ -71,7 +71,6 @@ from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kv_cache import Opened, compute_dtype
 from dew.nn.linear import (
     DepthwiseConv1d,
-    as_projected,
     decode_kernel,
     decode_step,
     fused_token,
@@ -82,7 +81,7 @@ from dew.nn.linear import (
 )
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step, log_index
-from dew.nn.precision import at_least_fp32, float32_dot_general, rms_statistics, rms_weighted
+from dew.nn.precision import at_least_fp32, float32_dot_general, rms_statistics, rms_weighted, softplus
 from dew.nn.residuals import Residual
 from dew.nn.sharding import sequence_shards
 
@@ -418,7 +417,7 @@ class Mamba2(nn.Module):
                                 ((taps, bias, *heads),))
             if valid is not None:
                 out = jnp.where(valid[:, :, None], out, 0)
-            return self.out_proj(as_projected(self._gated(out, gate), gate.dtype))
+            return self.out_proj(self._gated(out, gate).astype(gate.dtype))
         state = (self.num_heads, self.state_size, self.head_dim)
         token = None
         # An initialization runs the general path, where the layer makes its parameters.
@@ -431,7 +430,7 @@ class Mamba2(nn.Module):
                         state_dtype=wide, conv_dtype=wide, dtype=compute, token=token)
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
-        return self.out_proj(as_projected(self._gated(out, gate), gate.dtype))
+        return self.out_proj(self._gated(out, gate).astype(gate.dtype))
 
 
 
@@ -457,7 +456,7 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     xs = xs.reshape(batch, length, num_heads, head_dim)
     B = B.reshape(batch, length, n_groups, state_size)
     C = C.reshape(batch, length, n_groups, state_size)
-    step = jnp.clip(nn.softplus(dt + dt_bias), *time_step_limit)
+    step = jnp.clip(softplus(dt + dt_bias), *time_step_limit)
     if valid is not None:
         # A zero step neither decays nor writes the state.
         step = jnp.where(valid[:, :, None], step, 0.0)

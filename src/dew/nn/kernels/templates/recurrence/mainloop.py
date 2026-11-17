@@ -48,7 +48,7 @@ import contextvars
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from typing import NamedTuple
 
 import jax
@@ -167,6 +167,15 @@ class Tiles:
     @property
     def output_block(self) -> int:
         return self.block_v if self.block_o is None else self.block_o
+
+    def at(self, kernels: Collection[str]) -> "Tiles":
+        """What a launch building `kernels` is given of them: all of them but the other launches' producers
+        and residents, its kernels' caps alone at each level (the call's tiles and its forward's), so a
+        producer's raise or a launch's program fewer leaves every other launch given what it was
+        (`template.Mosaic.emitted`, `tuning.lowered_once`)."""
+        return dataclasses.replace(self, producers=self.producers.only(kernels),
+                                   residents=self.residents.only(kernels),
+                                   forward=None if self.forward is None else self.forward.at(kernels))
 
 
 def per_key_refusal(dtype, *, rounded: bool) -> str | None:
@@ -296,6 +305,12 @@ class Call:
         """The registers the producer of the launch `launching` makes (`launch_kernel`'s, named for it)
         lowers to (`Tiles.producers`), None at the least."""
         return self.producers.of(f"recurrence{launching.__name__}")
+
+    def at(self, kernels: Collection[str]) -> "Call":
+        """What a launch building `kernels` is given of it: all of it but the other launches' producers and
+        residents (`Tiles.at`)."""
+        return dataclasses.replace(self, producers=self.producers.only(kernels),
+                                   residents=self.residents.only(kernels))
 
     @property
     def gated_keys(self) -> bool:
@@ -632,10 +647,18 @@ STATIC = ("call", "tiles", "scale", "keeps", "applies", "out_dtype", "solves")
 and its constants; its every other argument an array or None."""
 
 
-lowered_once = tuning.lowered_once(STATIC, configured=("call", "tiles"), at="tiles",
-                                   unless=lambda: PLANNED.get() is not None)
+def building(kernels: Callable[[Callable], Collection[str]]) -> Callable[[Callable], Callable]:
+    """`lowered_once` for launches building the `kernels` of their function: each given its call and tiles
+    narrowed to those kernels' producers (`Call.at`, `Tiles.at`)."""
+    return tuning.lowered_once(STATIC, configured=("call", "tiles"), at="tiles",
+                               kernels=lambda launch, given: kernels(launch),
+                               unless=lambda: PLANNED.get() is not None)
+
+
+lowered_once = building(lambda launch: (f"recurrence{launch.__name__}",))
 """A launch lowered once a configuration (`tuning.lowered_once`): a launch's program closes over its call,
-so each call traced its own and a hybrid model's step lowered its layers' identical kernels one by one.
+so each call traced its own and a hybrid model's step lowered its layers' identical kernels one by one. Its
+one kernel is `recurrence<function>`, `launch_kernel`'s name for it (`building` where a launch names its own).
 Planning (`template.planned`) traces every call, each launch recording itself (`launch_kernel`). Its kernels
 are emitted at its `tiles`, a training config's own or its forward's (`Tiles.forward`, a forward alone's),
 which their names read."""
@@ -1288,7 +1311,7 @@ def _weighted_held(call: Call, block: int) -> Held:
            if call.delta else []),))
 
 
-@lowered_once
+@building(lambda launch: ("recurrence_weighted", "recurrence_decayed_keys"))
 def _weighted(k, v, a, hi, lo, beta, taken, call: Call):
     """`(w [R, HV * Dk], u [R, HV * Dv])` as `call.held` (`algebra.weighted`): the inverse against the decayed
     write-gated keys and against the write-gated values; under a decay a key dimension the keys alone,
@@ -1707,7 +1730,7 @@ def _last_write(call: Call, keys: Operand, k_ref, row, final_token, key_columns,
 
     def key_rows(i):
         views = keys.vectors(k_ref, row + final_token, key_columns + i * call.block, call.block)
-        return functools.reduce(jnp.add, (family.rows_of(view).astype(jnp.float32) for view in views))
+        return product.whole([family.rows_of(view) for view in views])
 
     ends = family.iota(gated.shape, 0) == final_token
     return key_rows, columns(jnp.where(ends, gated, 0.0)), final_token

@@ -9,6 +9,7 @@ import dataclasses
 import functools
 import gc
 import os
+import subprocess
 import time
 import weakref
 
@@ -145,6 +146,7 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_pat
 
 RECURRENT_AHEAD = """
 import json
+import sys
 import jax
 import optax
 from token_support import token_rows
@@ -155,41 +157,60 @@ from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
 from dew.training.ahead import compile_ahead
 
-lowered = []
+# Each program lowered, by name, and each Mosaic GPU kernel Pallas lowered afresh, by its module's text.
+import hashlib
+from jax._src.pallas.mosaic_gpu import lowering as pallas_lowering
+events, modules = [], []
 jax.monitoring.register_event_duration_secs_listener(
-    lambda event, seconds, *, fun_name=None, **_: lowered.append(fun_name)
+    lambda event, seconds, *, fun_name=None, **_: events.append(fun_name)
     if event == "/jax/core/compile/jaxpr_to_mlir_module_duration" else None)
+afresh = pallas_lowering.lower_unpipelined_jaxpr_to_module
+
+
+def lowered_afresh(*args, **kwargs):
+    lowered = afresh(*args, **kwargs)
+    modules.append(hashlib.sha256(str(lowered.module).encode()).hexdigest())
+    return lowered
+
+
+pallas_lowering.lower_unpipelined_jaxpr_to_module = lowered_afresh
 # Qwen3.5-4B's linear attention: 16 key heads and 32 value heads, each 128 wide, over a row of 12,288 tokens.
 model = CausalTransformer(vocab_size=64, emb_features=512, num_layers=1, num_heads=4, head_dim=128,
                           mlp_features=512, max_seq_len=12288, dtype="bfloat16", mixer=GatedDeltaNetMixer())
 trainer = Trainer(LMObjective(model, 12288), optax.adam(1e-3), key=jax.random.key(0),
-                  mesh=MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30)))
+                  mesh=MeshSpec().build(compile_only_gpus(sys.argv[1], 1, 80 * 2**30)))
 compile_ahead(trainer, token_rows(64, 1, 12289))
-print(json.dumps({"lowered": lowered}))
+print(json.dumps({"events": events, "modules": modules}))
 """
-"""A one-layer decoder of Qwen3.5-4B's gated delta net compiled ahead for a compile-only H100, each program
-it lowered by name."""
+"""A one-layer decoder of Qwen3.5-4B's gated delta net compiled ahead for a compile-only GPU of the generation
+argv[1] names: each program it lowered by name, and each Mosaic GPU kernel lowered afresh by its module's
+text."""
 
 
-@lowers("sm90")
-def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path):
-    """A one-layer decoder of the 4B's gated delta net, its step compiled ahead for a compile-only H100
-    (`RECURRENT_AHEAD`), twice over one cache: at its derived tiles its output launch spills (8 bytes at 128
-    registers under the cuda12 build's ptxas), and each process lowers the step once. Certification compiles
-    a launch with its outputs live, as a step reads them, so it refuses the spilling config and steps the
-    launch's producer down at trace, each rung compiled alone; and a later process reads the verdicts stored,
-    compiling nothing to certify. Certification that dropped the outputs never compiled the output launch,
-    and the program's compile stepped it down a whole-step relowering a rung, again in every process
-    (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm). Each certification's program is named by its
-    launch and config (`certified_<op>_l<launch>_c<config>`), so a start's events tell its rungs apart: the
-    cold process lowers each once, two configs of the output launch among them, and the warm one none."""
+@pytest.mark.parametrize("target", [pytest.param("sm90", marks=lowers("sm90")),
+                                    pytest.param("sm100", marks=lowers("sm100"))])
+def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target):
+    """A one-layer decoder of the 4B's gated delta net, its step compiled ahead for a compile-only H100 and a
+    compile-only B200 (`RECURRENT_AHEAD`), twice over one cache: each process lowers the step once, the cold
+    one certifies each launch's configs once each (whatever its walk takes: a config refused steps the
+    launch's producer down at trace, each rung compiled alone with its outputs live, as a step reads them),
+    and the warm one reads the verdicts stored, certifying nothing. Certification that dropped the outputs
+    never compiled the output launch, and the program's compile stepped it down a whole-step relowering a
+    rung, again in every process (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm). Each
+    certification's program is named by its launch, direction and config
+    (`certified_<op>_l<launch>_c<config>[_reverse]`), so a start's events tell each apart. Each kernel is
+    lowered afresh once in the cold process: the step's kernels certification lowered are the lowerings it
+    made (a launch's trace held, `tuning.lowered_once`, bound into the step as certification traced it,
+    under the step's own mesh), where the step lowered its kernels again, each a cache miss, 34 of a 4B's 36
+    kernels on a B200 the ones certification had made (FS-CERTSPLIT4: 27 s of its lowering)."""
     cache = tmp_path / "cache"
-    cold, warm = (fresh(RECURRENT_AHEAD, cache_dir=cache)["lowered"] for _ in range(2))
+    runs = [fresh(RECURRENT_AHEAD, target, cache_dir=cache) for _ in range(2)]
+    cold, warm = (run["events"] for run in runs)
+    modules = runs[0]["modules"]
+    assert len(set(modules)) == len(modules), collections.Counter(modules).most_common(3)
     assert [run.count("jit(step)") for run in (cold, warm)] == [1, 1], (cold, warm)
     certified = [name for name in cold if name.startswith("jit(certified_")]
-    assert len(set(certified)) == len(certified), certified
-    configs = collections.Counter(name.rsplit("_c", 1)[0] for name in set(certified))
-    assert max(configs.values()) >= 2, certified
+    assert certified and len(set(certified)) == len(certified), certified
     assert not [name for name in warm if name.startswith("jit(certified_")], warm
 
 
@@ -769,6 +790,44 @@ def test_a_launch_traced_under_a_compile_only_gpus_mesh_is_certified_on_that_gpu
 
 
 @lowers("sm90")
+def test_a_runs_launch_traced_outside_its_mesh_is_certified_on_the_gpu_it_targets():
+    """A launch a run traces outside its mesh (its start's, `Trainer._started`) is certified on the GPU the
+    run targets (`report.targeting`, a compile-only H100's mesh) and on no other, on any host. Certified on
+    a host's own GPU, a GH200's start compiling ahead for an H100 certified five launches twice, apart, its
+    step's trace again on the mesh's (row 6824)."""
+    class Targeted(TwoKernels):
+        """`TwoKernels`, a launch of its own: certified here, whatever this process certified before."""
+
+    op = Targeted()
+    devices, lowered = _paired_step(op)
+    before = {id(each) for each in report.certifications()}
+    with generation.assumed("sm90"), report.targeting(devices):
+        lowered()
+    [certified] = [each for each in report.certifications()
+                   if id(each) not in before and each.op == type(op).__name__]
+    assert certified.device == devices.devices.flat[0], certified.device
+
+
+@pytest.mark.gpu(reason="certifies and runs a kernel on this host's GPU")
+def test_a_plain_jit_on_this_gpu_certifies_its_launch_there_and_runs():
+    """A Dew kernel called under a plain jit on this GPU, no mesh and no run naming a target, is certified
+    on the device the call runs on (JAX's default device) and runs there: a target a run names
+    (`report.targeting`) leaves a plain call's certification where it was. Its arithmetic is
+    test_norm_swiglu's."""
+    from dew.nn.norms import stream_rms_normalized
+
+    # Rows of no other test's, so this process certifies the launch here.
+    x = jax.random.normal(jax.random.key(0), (232, 384), jnp.bfloat16)
+    scale = jnp.ones((384,), jnp.bfloat16)
+    before = {id(each) for each in report.certifications()}
+    jax.jit(lambda x, scale: stream_rms_normalized(
+        x, None, scale, 1e-6, jnp.bfloat16, scale_offset=False, scale_after_cast=False, fp32_statistics=True,
+        implementation="pallas")[1])(x, scale).block_until_ready()
+    certified = [each for each in report.certifications() if id(each) not in before]
+    assert certified and {each.device for each in certified} == {jax.devices()[0]}, certified
+
+
+@lowers("sm90")
 def test_a_round_of_rungs_traced_under_a_compile_only_gpus_mesh_is_certified_on_that_gpu():
     """A round of a launch's configs certified at once (`report.certified_together`, a ladder's rounds past
     its first rung) under a compile-only H100's mesh, no device named to certify on: each certified on that
@@ -1055,6 +1114,20 @@ def test_the_sass_rules_find_what_ptxas_left_of_a_kernel(listing, found):
     assert "register operand A before its group retired" in finding
 
 
+def test_the_compile_gate_fails_a_kernel_above_the_register_cap_its_launch_runs_at():
+    """A kernel allocating more registers a thread than the cap its launch runs at (its record's `cap`, as its
+    compile states it: its consumers' raise, else its threads' share of the multiprocessor's registers at the
+    programs it is launched to hold), spilling nothing, is a kernel the gate fails, and one at its cap passes
+    (row 6670): an allocation above the launch's leaves a multiprocessor fewer programs than it was planned
+    for."""
+    import kernel_compile as kc
+
+    held = kc.Report("kernel", 1024, 0, 168, 0, cap=168)
+    assert held.failure(232448, 512) is None
+    over = dataclasses.replace(held, registers=192)
+    assert "above its launch's 168" in over.failure(232448, 512)
+
+
 CONSUMERS_SPILL_LISTING = """
 .text.recurrence_scores_back_mosaic_gpu_kernel:
         /*0000*/                   LDC R1, c[0x0][0x28] ;
@@ -1100,3 +1173,81 @@ def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read
     (found,) = kc.reports({}, [unread])
     assert "machine code" in found.unread
     assert found.failure(232448, 0) is not None
+
+
+class SpillingFirst(Uncounted):
+    """`Uncounted` with the grouped forward's own candidates, its space the tile its derivation takes and a
+    paired product's widest, 128 x 256 at two stages, which spills in every compile (two accumulators of 128
+    registers a thread): a launch whose tuner meets a spilling candidate beside one that holds."""
+
+    def candidate(self, ba, config, target):
+        return super(Uncounted, self).candidate(ba, config, target)
+
+    def _get_autotuning_configs(self, ba):
+        return {ba.heuristics_config, widest(ba.heuristics_config)}
+
+
+def widest(derived):
+    """`derived`'s paired product at its widest, 128 x 256 at two stages (`SpillingFirst`)."""
+    columns = derived.grid_block_n * derived.block_n
+    return dataclasses.replace(derived, block_n=256, grid_block_n=columns // 256, stages=2)
+
+
+@lowers("sm90")
+def test_a_tuner_times_no_candidate_the_gpus_assembler_refuses():
+    """The configs a measuring tuner times (`tuning._candidates`) are those its launch's certification holds
+    (`report.certified`, as a run's derivation certifies its config): a paired launch's widest tile, which
+    spills in every compile, is never timed nor chosen, where uncertified it was timed as slow as its spills
+    and could be picked; the tile its derivation takes, which holds, is."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    op = SpillingFirst()
+    operands = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
+        ((ROWS, FEATURES), jnp.bfloat16), ((EXPERTS, FEATURES, WIDTH), jnp.bfloat16),
+        ((EXPERTS,), jnp.int32))]
+    with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]), report.refusals():
+        bound = op.bind(*operands, paired=jax.ShapeDtypeStruct((EXPERTS, FEATURES, WIDTH), jnp.bfloat16),
+                        out_dtype="bfloat16", trans_rhs=False, interpret=False,
+                        hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u))
+        derived = bound.heuristics_config
+        # The widest is a config a pin may name, which uncertified the tuner timed.
+        assert op.pinnable(bound, widest(derived))
+        assert tuning._candidates(op, bound) == [derived]
+
+
+RECONFIGURING_PTX = """
+.version 8.8
+.target sm_90a
+.address_size 64
+
+.visible .entry reconfiguring() .maxntid 384, 1, 1 .maxnreg 168
+{
+	.reg .b32 %r<2>;
+	.reg .pred %p<2>;
+	mov.u32 %r1, %tid.x;
+	setp.lt.u32 %p1, %r1, 128;
+	@%p1 bra PRODUCER;
+	setmaxnreg.inc.sync.aligned.u32 232;
+	ret;
+PRODUCER:
+	setmaxnreg.dec.sync.aligned.u32 40;
+	ret;
+}
+"""
+
+
+def test_a_binary_states_its_threads_and_the_registers_its_roles_reconfigure_to(tmp_path):
+    """A kernel of 384 threads whose producer lowers to 40 registers and whose consumers raise to 232
+    (`setmaxnreg`), assembled for an H100 by the gate's ptxas (`kernel_compile.assemblers`): its binary
+    (`report._binary`, decoded) states its threads from its `.nv.info` and the two counts from its machine
+    code (USETMAXREG), the facts the compile gate reads where no PTX of a kernel was dumped (row 7105)."""
+    from kernel_compile import assemblers
+
+    source = tmp_path / "reconfiguring.ptx"
+    source.write_text(RECONFIGURING_PTX)
+    cubin = tmp_path / "reconfiguring.cubin"
+    subprocess.run([str(assemblers("sm90")[0]), "-arch=sm_90a", str(source), "-o", str(cubin)], check=True)
+    binary = report._binary("reconfiguring", cubin.read_bytes(), decoded=True)
+    assert (binary.threads, binary.decreased, binary.raised) == (384, 40, 232), binary
+

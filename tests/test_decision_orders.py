@@ -14,8 +14,9 @@ from test_decision_objective import EXAMPLES, SPECIALS, TOKENIZER, tiny_backbone
 from dew.data import Loading, Memory
 from dew.data.compile import compile
 from dew.data.dataset import Checkpointable, DataPartition
-from dew.decision import DecisionObjective, JointLayout, decisions
+from dew.decision import DecisionObjective, decisions
 from dew.decision.config import DecisionRunConfig
+from dew.decision.layout import SegmentLayout
 
 TINY = Path(__file__).parent / "fixtures" / "laya" / "tiny"
 
@@ -28,7 +29,7 @@ def windows(seed: int, count: int, *, resumed: int | None = None) -> list[np.nda
     `seed`, by a fresh objective and loader, as a run of any model seed builds them (the loader takes
     the data seed alone); `resumed`, a position to resume from after that many windows, read by a
     fresh reader."""
-    layout = JointLayout(max_len=1024)
+    layout = SegmentLayout.joint_row(max_len=1024)
     data = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
                              specials=SPECIALS, layout=layout, segments=1).data()
     chain = Memory([{"example": example} for example in EXAMPLES]).pipe(decisions).repeat(2).batch(ROWS)

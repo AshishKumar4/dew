@@ -44,12 +44,12 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels.recurrence import Hooks, skip_added
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
-from dew.nn.linear import as_projected, forked_scan
+from dew.nn.linear import forked_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.mixers.mamba2 import MambaRMSNormGated
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import at_least_fp32, float32_dot_general
+from dew.nn.precision import at_least_fp32, float32_dot_general, softplus
 from dew.nn.residuals import Residual
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import sequence_shards
@@ -534,7 +534,7 @@ class Mamba3(nn.Module):
             ranked = t.reshape(batch, length, self.mimo_rank, self.n_groups, self.state_size)
             normed = _per_head(norm(ranked).astype(wide), self.num_heads)
             keys.append(_biased(normed, jnp.swapaxes(bias, 0, 1)).astype(projected.dtype))
-        step = nn.softplus(_biased(dt.astype(wide), self.dt_bias))
+        step = softplus(_biased(dt.astype(wide), self.dt_bias))
         decay = jnp.minimum(-_heavy_tail(A.astype(wide)), -self.A_floor)
         rates = (jnp.tanh(angles.astype(wide)) * jnp.pi)[:, :, None]
         x, z = (t.reshape(batch, length, 1, self.num_heads, self.head_dim) for t in (x, z))
@@ -616,7 +616,7 @@ class Mamba3(nn.Module):
             out = out * nn.silu(z.astype(wide))
         if self.mimo_rank > 1:
             out = jnp.einsum('bsrhp,hrp->bshp', out, self.mimo_o)
-        out = as_projected(out.reshape(batch, length, self.intermediate_size), projected.dtype)
+        out = out.reshape(batch, length, self.intermediate_size).astype(projected.dtype)
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
         return self.out_proj(out)

@@ -48,7 +48,6 @@ from .kv_cache import Opened, compute_dtype
 from .linear import (
     DepthwiseConv1d,
     RMSNormGated,
-    as_projected,
     decode_delta_rule,
     decode_kernel,
     fused_token,
@@ -260,14 +259,15 @@ class KimiDeltaAttention(nn.Module):
                             dtype=projected.dtype if ported else wide, token=token)
         if token is not None:
             # The fused step gated and normalized its output (`FUSED`), in its epilogue's dtype.
-            return self.o_proj(as_projected(out, projected.dtype))
-        out = self.o_norm(as_projected(out, projected.dtype), gate).reshape(B, S, self.qkv_features)
+            return self.o_proj(out.astype(projected.dtype))
+        # The scan read back in its projections' dtype, as Kimi's delta attention reads it.
+        out = self.o_norm(out.astype(projected.dtype), gate).reshape(B, S, self.qkv_features)
         return self.o_proj(out)
 
     def _fused_token(self, taps, g, beta, gate, valid, starts, operand):
         """A decode token's conv, update and gated norm in one launch (`linear.fused_token` under
         `FUSED`): its decay a key dimension, write gate and output gate a row's, as the layer forms them, its
-        output read back in `operand`, the input projection's dtype, before the norm (`as_projected`)."""
+        output read back in `operand`, the input projection's dtype, before the norm."""
         hooks = dataclasses.replace(FUSED, output=recurrence.OutputNorm(self.norm_eps, 'sigmoid',
                                                                         read_in=jnp.dtype(operand).name))
         return fused_token(hooks, taps,

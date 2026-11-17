@@ -172,17 +172,18 @@ def test_a_run_records_where_its_optimizers_split_sent_each_parameter():
 
 
 def test_a_runs_start_reports_each_phase_it_took_once():
-    """A run's start reports the seconds each phase took (the data's preparation, the step's compile, the
-    evaluations' warming) once, beside its first logged step's scalars, none after; and a fresh start that
-    took the lowering begun beside its step's compile says so (`startup/start_overlapped`): its algebra
-    passed once, not again only to match the begun compile (train 914's F1, row 6847)."""
+    """A run's start reports each phase's seconds (data, state's start, first read, fit check, compile,
+    placement, evaluations' warming) and the rest to its first step (`startup/other_seconds`) once, beside
+    its first logged step's scalars; a fresh start that took the lowering begun beside its compile says so
+    (`startup/start_overlapped`): its algebra passed once (row 6847)."""
     tracker = RecordingTracker()
     trainer = make_trainer(objective=Features(), tracker=tracker)
     trainer.fit(dataset(val=val_batches(3)), steps=3, log_every=1, eval_every=2)
     reported = [{name: value for name, value in scalars.items() if name.startswith("startup/")}
                 for _, scalars in tracker.scalars]
     [first] = [phases for phases in reported if phases]
-    seconds = {"startup/data_seconds", "startup/compile_seconds", "startup/warm_seconds"}
+    seconds = {f"startup/{name}_seconds"
+               for name in ("data", "start", "read", "check", "compile", "place", "warm", "other")}
     assert set(first) == seconds | {"startup/start_overlapped"} and first["startup/start_overlapped"] == 1
     assert all(first[name] >= 0 for name in seconds) and reported[0] == first
     # A run that logs no step reports its start with its outcome, once.
@@ -1127,9 +1128,10 @@ print(json.dumps(runs))
 def test_a_run_resumed_at_another_rate_steps_at_it_on_the_compiled_step(tmp_path, grouped):
     """A run trained at one peak rate, resumed from its checkpoint at a
     second and then a third: each resumed step moves the parameters by its
-    configured rate, not the checkpoint's, and the third compiles nothing:
-    the rate is an operand of the optimizer's state, so the step it runs is
-    the executable the persistent cache holds. The second resume pays for the
+    configured rate, not the checkpoint's, and the third compiles and reads
+    back nothing: the rate is an operand of the optimizer's state, so the
+    step it runs is the executable the process holds from the second's
+    (`dew.nn.kernels.options.hold`). The second resume pays for the
     restore's own programs, which the first run never compiled. In a fresh
     process, with a cache of its own."""
     root = Path(__file__).resolve().parents[1]
@@ -1139,7 +1141,7 @@ def test_a_run_resumed_at_another_rate_steps_at_it_on_the_compiled_step(tmp_path
         env=environment, capture_output=True, text=True, timeout=600)
     assert done.returncode == 0, done.stderr[-3000:]
     runs = json.loads(done.stdout.splitlines()[-1])
-    assert runs["fast"]["misses"] == 0 and runs["fast"]["hits"] >= 1
+    assert (runs["fast"]["misses"], runs["fast"]["hits"]) == (0, 0)
     for start, slow, fast in zip(*(runs[name]["params"] for name in ("first", "slow", "fast")), strict=True):
         start, slow, fast = (np.asarray(leaf, np.float32) for leaf in (start, slow, fast))
         assert np.all(slow != start)

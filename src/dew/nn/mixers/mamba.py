@@ -46,10 +46,10 @@ from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.kernels import chunked_launch, recurrence_algebra, recurrence_chunk
 from dew.nn.kv_cache import Opened, compute_dtype
-from dew.nn.linear import DepthwiseConv1d, as_projected, held_scan, scan_cache
+from dew.nn.linear import DepthwiseConv1d, held_scan, scan_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general
+from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, softplus
 from dew.nn.residuals import Residual
 from dew.nn.sharding import rows_like, sequence_shards
 from dew.nn.ssm import affine_spans
@@ -252,7 +252,7 @@ class Mamba(nn.Module):
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
         gated = out * nn.silu(gate.astype(wide))
-        return self.out_proj(as_projected(gated, gate.dtype))
+        return self.out_proj(gated.astype(gate.dtype))
 
     def _scan(self, convolved, *, starts, valid, held, forked=None):
         """The selective scan of the convolved `[B, S, D]` inner channels:
@@ -302,7 +302,7 @@ class _StepProjection(nn.Module):
         product = functools.partial(jnp.matmul, precision=self.precision)
         widened = accumulated(product, raw.astype(dtype), kernel.astype(dtype))
         wide = at_least_fp32(widened.dtype)
-        return nn.softplus(widened.astype(wide) + bias.astype(wide))
+        return softplus(widened.astype(wide) + bias.astype(wide))
 
 
 def log_index(key, shape):

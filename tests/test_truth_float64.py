@@ -9,7 +9,9 @@ import numpy as np
 import pytest
 from arm_arithmetic import float64_held, stored_as
 from check1_judge import STAGES_LOG
-from reference_error import NarrowTruth, as_given, assert_as_exact
+from reference_error import NarrowTruth, as_given, assert_as_exact, over_windows, windows
+
+from dew.parity import GateFailure
 
 WEIGHT = np.random.default_rng(5430).normal(size=(64, 8)).astype(np.float32)
 """A parameter the arms close over, as a model's variables are."""
@@ -192,6 +194,8 @@ INJECTED = {
     "a scan's fp32 carry weighing a later step": (product, drawn, weighed_by_a_carry, ""),
     "a native kernel's result": (product, drawn, through_a_kernel, ""),
     "a NumPy truth in float32": (product, drawn, as_given(in_numpy(np.float32)), ""),
+    "an fp32 product widened at the end, over windows": (over_windows(product), windows(drawn, 2),
+                                                         over_windows(computed_narrow), ""),
 }
 """Truths that are a second fp32 run, each with the leaf its refusal names."""
 
@@ -209,12 +213,32 @@ def test_a_truth_that_computes_in_float64_is_judged(name):
     assert_as_exact(arm, arm, draw, name, seeds=8, truth_fn=truth)
 
 
+def multiplied(x, weight):
+    """Each row's first eight values times the weight's first row, elementwise: no product sums them."""
+    return x[:, :8] * weight[0]
+
+
+def off_in_its_imaginary_part(x, weight):
+    """`multiplied` with each value's imaginary part a thousandth too large, its real part exact."""
+    out = multiplied(x, weight)
+    return out + jnp.complex64(1j) * (jnp.imag(out) * jnp.float32(1e-3))
+
+
+def test_an_error_in_a_complex_values_imaginary_part_alone_fails():
+    """A complex output is judged by its values' magnitudes: an arm whose real parts are the reference's
+    and whose imaginary parts are a thousandth off fails, where reading the real parts alone passes it.
+    Elementwise: a complex product under JAX's F32_F32_F32 preset, which check 1 runs CPU arms under
+    (`summed_as_run`), loses its imaginary part in both arms (row 7191)."""
+    with pytest.raises(GateFailure):
+        assert_as_exact(off_in_its_imaginary_part, multiplied, turned, "off in its imaginary part", seeds=8)
+
+
 @pytest.mark.parametrize("name", INJECTED)
 def test_a_truth_that_is_a_second_fp32_run_is_refused_by_its_leaf(name):
     """The injected faults: a truth that computes in fp32 (a model of a fixed dtype, an fp32 product
-    widened at the end, a float32 leaf, the same float32 draw read as a value at the top or from a call, a
-    scan's float32 carry that weighs a later step, a native kernel's result, a float32 NumPy truth) is
-    refused before any verdict,
+    widened at the end, alone or window by window, a float32 leaf, the same float32 draw read as a value at
+    the top or from a call, a scan's float32 carry that weighs a later step, a native kernel's result, a
+    float32 NumPy truth) is refused before any verdict,
     naming the leaf, where an arm on par with itself would otherwise pass against it."""
     arm, draw, truth, leaf = INJECTED[name]
     with pytest.raises(NarrowTruth) as refused:

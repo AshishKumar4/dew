@@ -67,7 +67,13 @@ from dew.batch import (
 )
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
-from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
+from dew.inference.tasks import (
+    Processor,
+    TextSettings,
+    recorded_files,
+    recorded_processor,
+    recorded_tokenizer,
+)
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.looping import exit_objective
 from dew.nn.continuum import feedforward_levels
@@ -887,6 +893,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                             max_new_tokens=0 if samples is None else samples.max_new_tokens,
                             sampling=self.sampled(Sampling() if samples is None else samples.sampling),
                             tokenizer=recorded_tokenizer(self.processor),
+                            tokenizer_files=recorded_files(self.processor),
                             processor=recorded_processor(self.processor), prefix=self.prefix)
 
     def _refuse_blocks(self, prepared: ModelInputs, depths: bool) -> None:
@@ -905,11 +912,10 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     def shares_prefixes(self, train: bool = False) -> bool:
         """Whether rows that begin alike are scored over one copy of their prefix (`token_scores` of rows
         whose coordinates carry forks, `dew.data.forked_rows.ForkedRows`): where the model computes each
-        document over its ancestors as its own row does
-        (`ForkedCalls`; in a training step with `train`, no dropout drawing), no in-context step reads
-        a row's tokens in its order."""
+        document over its ancestors as its own row does, at no more work than the rows laid whole
+        (`ForkedCalls.prefix_sharing_refusal`; in a training step with `train`, no dropout drawing)."""
         return (self.adaptation is None
-                and isinstance(self.model, ForkedCalls) and self.model.fork_refusal(train) is None)
+                and isinstance(self.model, ForkedCalls) and self.model.prefix_sharing_refusal(train) is None)
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      coordinates: Coordinates | None = None, routing: bool = False,

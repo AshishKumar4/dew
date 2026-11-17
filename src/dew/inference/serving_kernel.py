@@ -764,11 +764,10 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
     program = _compiled(automatic(resident), automatic(carried), rows, compiler_options(model) or None)
     arguments = (model, params, pad_id, placement, steps, abstract(resident), abstract(carried), None,
                  transforms, stopping, grammar, progress)
-    # A program a block hands (`dew.training.ahead.kept`) is neither tuned nor traced again.
-    compiled = program.handed(*arguments)
-    if compiled is None:
-        tune(lambda: program.lower(*arguments))
-        compiled = program.compiled(*arguments)
+    # Tuned first: a program a block hands (`dew.training.ahead.kept`) is the one its tuned lowering is, which
+    # its compile finds by its fingerprint and runs, compiling nothing.
+    tune(lambda: program.lower(*arguments))
+    compiled = program.compiled(*arguments)
     formats = joined(*compiled.output_formats[1][:2])
     return formats, _reusable(compiled, formats)
 

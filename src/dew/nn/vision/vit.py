@@ -148,7 +148,7 @@ class ViTLayout:
     patch_size: int
     temporal_patch_size: int
     spatial_merge_size: int
-    norm_type: Literal["rms", "layer", "fast_layer"]
+    norm_type: Literal["rms", "layer"]
     norm_eps: float | None
     norm_bias: bool
     mlp_bias: bool

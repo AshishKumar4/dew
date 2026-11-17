@@ -39,7 +39,7 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, Chunk, chunk
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
-from dew.nn.linear import as_projected, fork_start, forked_scan
+from dew.nn.linear import fork_start, forked_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
@@ -181,7 +181,7 @@ class LightningAttention(nn.Module):
             start = fork_start(None if held is None else held.value,
                                (batch, self.num_heads, self.head_dim, self.head_dim), wide)
             out = forked_scan((query, key, value), forked_rule, tokens, start)
-            out = self.norm(as_projected(out.reshape(batch, length, self.features), qkv.dtype))
+            out = self.norm(out.reshape(batch, length, self.features).astype(qkv.dtype))
             return self.out_proj(nn.sigmoid(self.output_gate(x)) * out)
         if held is not None and length == 1:
             out, _, final = recurrence.step_reference(LIGHTNING, recurrence.Step(
@@ -198,7 +198,7 @@ class LightningAttention(nn.Module):
             kept(held, final.astype(held.value.dtype), STATE)
         # The recurrence's output under both names a remat policy reads it by (`RESIDUALS`).
         out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
-        out = self.norm(as_projected(out.reshape(batch, length, self.features), qkv.dtype))
+        out = self.norm(out.reshape(batch, length, self.features).astype(qkv.dtype))
         return self.out_proj(nn.sigmoid(self.output_gate(x)) * out)
 
 

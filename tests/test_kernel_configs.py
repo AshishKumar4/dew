@@ -1493,7 +1493,7 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     # is read as missing, not as within.
     complete = "Resources(smem_scratch_bytes=1024, tmem_scratch_cols=0, tmem_collective_scratch_cols=0)"
     compiled = {"a": {"registers": 168, "spilled": 0}, "b": {"registers": 255, "spilled": 40}}
-    a, b, c = (inherited(dataclasses.asdict(found), compiled) for found in reports(
+    a, b, c = (inherited(dataclasses.asdict(found), compiled, "sm90") for found in reports(
         {"a": complete, "c": "Resources(smem_scratch_bytes=1024)"},
         [report.Binary("a", None, 168, 0, shared=1024), report.Binary("b", None, 255, 40, shared=1024)]))
     assert not a["unread"]
@@ -1504,9 +1504,32 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     with pytest.raises(ValueError):
         reports({"a": complete}, [report.Binary("a", None, 168, 0, shared=512)])
     # A complete estimate and its PTX's compile without a binary: no compiled kernel, read as missing.
-    (unbound,) = (inherited(dataclasses.asdict(found), compiled) for found in reports({"a": complete}, []))
+    (unbound,) = (inherited(dataclasses.asdict(found), compiled, "sm90")
+                  for found in reports({"a": complete}, []))
     assert "binary" in unbound["unread"]
     assert mosaic_failures([{**record, "kernels": [unbound]}])
+
+
+def test_a_kernel_no_ptx_covers_takes_its_binarys_figures_only_under_every_build_its_gpus_run(monkeypatch):
+    """A kernel whose module this process compiled before the gate, so no PTX of it was dumped, takes its
+    registers and spills from its executable's binary only where this process's CUDA builds are every build
+    the generation's GPUs run, the gate judging a kernel by its worst result under each: cuda13 alone for a
+    B200, which takes them; cuda12 alone for an H100, which runs cuda13 too, whose ptxas spills where
+    cuda12's held and holds where it spilled (rows 5671, 5759, 5761), and for a B200, which runs cuda13
+    alone: unread."""
+    import kernel_compile
+    from kernel_compile import inherited, reports
+
+    complete = "Resources(smem_scratch_bytes=1024, tmem_scratch_cols=0, tmem_collective_scratch_cols=0)"
+    (found,) = reports({"a": complete}, [report.Binary("a", None, 168, 0, shared=1024)])
+    judged = {}
+    for builds, gpu in ((["cuda13"], "sm100"), (["cuda12"], "sm90"), (["cuda12"], "sm100")):
+        monkeypatch.setattr(kernel_compile, "cuda_builds", lambda builds=builds: builds)
+        judged[builds[0], gpu] = inherited(dataclasses.asdict(found), {}, gpu)
+    taken = judged["cuda13", "sm100"]
+    assert (taken["registers"], taken["spilled"]) == (168, 0) and not taken["unread"], taken
+    for record in (judged["cuda12", "sm90"], judged["cuda12", "sm100"]):
+        assert record["registers"] is None and {"registers", "spills"} <= set(record["unread"]), record
 
 
 def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
