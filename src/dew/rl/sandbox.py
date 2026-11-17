@@ -295,7 +295,7 @@ class Program:
         if not self.command or any(not isinstance(part, str) or not part for part in self.command):
             raise ValueError("a program command is a nonempty argv tuple")
         for name in self.files:
-            if not name or not inside(name) or name.endswith("/"):
+            if not inside(name, directory=False):
                 raise ValueError(f"program file {name!r} must be a relative path inside the job directory")
         object.__setattr__(self, "files", MappingProxyType(dict(self.files)))
 

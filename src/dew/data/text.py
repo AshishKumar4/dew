@@ -975,7 +975,7 @@ def confined_files(files: Mapping[str, str]) -> dict[str, str]:
     before a file is read or written by it: a saved run's record is outside input, and a path out of the
     directory would copy into, or out of, an unrelated place (`copy_checked`)."""
     for path in files:
-        if not inside(path) or path.endswith("/"):
+        if not inside(path, directory=False):
             raise ValueError(f"a recorded tokenizer file must be a path within its directory, not {path!r}")
     return dict(files)
 
