@@ -747,13 +747,14 @@ def stored(cache):
 
 
 def test_a_slot_is_reused_over_the_same_cache():
-    """The cache is one allocation for the server's life: the step donates
+    """A server's cache of whole rows ('whole', each row's cache a slot of
+    its own) is one allocation for the server's life: the step donates
     it, so its key and value buffers are updated in place, and a row that
     finishes gives its slot to the next request. The capacity is wider
     than the prompt bucket, so a reused slot keeps its former occupant's
     keys past the new prompt, hidden by the validity the admission wrote."""
     bound = task()
-    server = Server.from_task(bound, slots=2, capacity=128, admission=1)
+    server = Server.from_task(bound, slots=2, capacity=128, admission=1, kv_cache="whole")
     before = stored(server.cache)
     assert before
     shapes = [leaf.shape for leaf in jax.tree.leaves(server.cache)]
