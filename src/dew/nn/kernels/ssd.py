@@ -240,7 +240,8 @@ def _windowed(x, b, c, a, origin, through):
 def _opened(given_ref, table, entry, load, document, zero):
     """The memory a document opening at a token enters: its one-based table slot's (`given_ref`'s first,
     then the stored `table`'s; zero at slot zero), its entry write added where the call gives one (`entry`:
-    each document's keys `[R, N]`, values `[P, R]` and weight `[1, 1]`, `_written`)."""
+    each document's keys `[R, N]`, values `[P, R]` and weight `[1, 1]`, a term's three factors at a time,
+    `_product`)."""
     count = given_ref.shape[0]
     taken = zero
     for slot in range(count):
@@ -251,15 +252,24 @@ def _opened(given_ref, table, entry, load, document, zero):
     if entry is None:
         return taken
     key, value, weight = (ref[document] for ref in entry)
-    return taken + _written(key * weight, value)
+    return taken + sum(_product(weight, value[:, r:r + 1], key[r:r + 1, :]) for r in range(key.shape[0]))
 
 
-def _written(key, value):
-    """`sum_r value_r key_r^T` `[P, N]` of a document's entry write's terms (keys `[R, N]`, weighed before
-    the products, values `[P, R]`): a term's outer product at a time, a few terms each a column of the values
-    against a row of the keys (no product contracting so few). Weighed after, keys and values of 2^80 under
-    a weight of 2^-100 took the products past fp32 to inf where the write is 2^60 (base review 200f6ca65)."""
-    return sum(value[:, r:r + 1] * key[r:r + 1, :] for r in range(key.shape[0]))
+def _exponent(x) -> jax.Array:
+    """`x`'s binary exponent from its bits, -127 for a zero (and a subnormal)."""
+    return ((jax.lax.bitcast_convert_type(x, jnp.int32) >> 23) & 0xFF) - 127
+
+
+def _product(a, b, c) -> jax.Array:
+    """`a b c`, broadcast, its first product the pair whose exponents sum nearest zero, so no partial product
+    leaves fp32's range where the whole is in it: a document's entry write `weight value_r key_r^T` (a term's
+    outer product at a time, a few terms) and its adjoint's terms. In any one order, keys and values of 2^80
+    under a weight of 2^-100 overflowed where the write is 2^60, keys of 2^-80 under the same weight
+    underflowed where it is 2^-80, and a value of 2^100 against a memory's gradient of 2^60 overflowed where
+    the keys' gradient is 2^120 (base reviews 200f6ca65, 7047162e7)."""
+    ea, eb, ec = (_exponent(jnp.asarray(x, jnp.float32)) for x in (a, b, c))
+    ab, ac, bc = jnp.abs(ea + eb), jnp.abs(ea + ec), jnp.abs(eb + ec)
+    return jnp.where((ab <= ac) & (ab <= bc), (a * b) * c, jnp.where(ac <= bc, (a * c) * b, (b * c) * a))
 
 
 def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, a_ref, state_ref, given_ref,
@@ -374,16 +384,17 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, 
             key, value, weight = (ref[document] for ref in entry)
             taken = (load >= 0).astype(jnp.float32)
             dkey, dvalue, dweight = dentry
-            # Each term's gradients, its key row's and its value column's, through the outer products, each
-            # contracted against the memory's gradient first: the weight's the key rows' read of the values'
-            # contraction, no unweighted product formed (`_written`).
-            rows, weighed = range(key.shape[0]), key * weight
-            read = jnp.concatenate(
-                [jnp.sum(value[:, r:r + 1] * dmemory, axis=0, keepdims=True) for r in rows], axis=0)
-            dkey[document] = dkey[document] + taken * weight * read
+            # Each term's gradients, its key row's, its value column's and the weight's, each a sum of
+            # three-factor products formed range-preserving (`_product`), no two-factor partial of them.
+            rows = range(key.shape[0])
+            dkey[document] = dkey[document] + taken * jnp.concatenate(
+                [jnp.sum(_product(weight, value[:, r:r + 1], dmemory), axis=0, keepdims=True) for r in rows],
+                axis=0)
             dvalue[document] = dvalue[document] + taken * jnp.concatenate(
-                [jnp.sum(dmemory * weighed[r:r + 1, :], axis=1, keepdims=True) for r in rows], axis=1)
-            dweight[document] = dweight[document] + taken * jnp.sum(read * key, keepdims=True)
+                [jnp.sum(_product(weight, key[r:r + 1, :], dmemory), axis=1, keepdims=True) for r in rows],
+                axis=1)
+            dweight[document] = dweight[document] + taken * sum(
+                jnp.sum(_product(value[:, r:r + 1], key[r:r + 1, :], dmemory), keepdims=True) for r in rows)
         return (jnp.where(inside, dx + wx, dx), jnp.where(inside, db + wb, db),
                 jnp.where(inside, dc + wc, dc), jnp.where(within, da + wa, da),
                 jnp.where(load < 0, dmemory, dprev))
