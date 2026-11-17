@@ -250,6 +250,14 @@ class PipelineSource(Protocol):
         ...
 
 
+def _trains_its_grid(source: PipelineSource, process, grid) -> bool:
+    """Whether an objective over `source` given `process` and `grid` trains its process over its grid
+    (`DiffusionObjective.grid_process`): each the source's own object, None or omitted where the source
+    supplies it, and the source's process its grid's."""
+    return (source.grid_process and (process is None or process is source.process)
+            and (grid is OMITTED or grid is source.grid))
+
+
 class DiffusionObjective(Objective[Ratio]):
     """Trains a denoising diffusion model: draw a noise level, corrupt, predict, and weight the loss."""
 
@@ -262,10 +270,10 @@ class DiffusionObjective(Objective[Ratio]):
 
     grid_process: bool
     """Whether it trains its pipeline's own process over its grid, read once as it is built: the source's
-    process object itself (`process` None, or the source's own given back, as a run naming no preset
-    passes it) where that is its grid's (`PipelineSource.grid_process`). A process given over the
-    source's, even an equal one, is the run's own, kept as it is at another size
-    (`dew.interop.pipeline_assembly.resized`)."""
+    process and grid objects themselves (each None or omitted, or the source's own given back, as a run
+    naming no preset passes its process) where its process is its grid's (`PipelineSource.grid_process`).
+    A process or grid given over the source's, even an equal one, is the run's own, its process kept as
+    it is at another size (`dew.interop.pipeline_assembly.resized`)."""
 
     def data(self, tokenizer=None) -> ObjectiveData:
         """Each batch's captions tokenized for the conditions, on the host, as
@@ -449,8 +457,7 @@ class DiffusionObjective(Objective[Ratio]):
         collection. A published task includes the tuned autoencoder, with those
         statistics as its latent normalization.
         """
-        grid_process = (isinstance(model, PipelineSource) and model.grid_process
-                        and (process is None or process is model.process))
+        grid_process = isinstance(model, PipelineSource) and _trains_its_grid(model, process, grid)
         if isinstance(model, PipelineSource):
             source = model
             model = source.model

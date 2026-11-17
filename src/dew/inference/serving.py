@@ -623,12 +623,14 @@ slots, each row's cache whole ('whole'), or None, the server's default layout.""
 def served_layout(task: TextGeneration, capacity: int, kv_cache: KVCache | PageSize = None) -> KVCache | None:
     """The cache layout `Server.from_task` lays `task`'s rows of `capacity` slots in for its `kv_cache`
     (`_laid`), None for a model of no layout, whose rows are whole; and where it names none, that layout
-    only where a server over it keeps a prefix cache (`_reuses_prefixes`), None where not: what a caller
-    serving the task only where its server shares prompts' pages reads, as an episode cohort does
+    only where a server over it keeps a prefix cache (`_reuses_prefixes`) and the model's max_seq_len
+    holds a row of `capacity` in its whole pages (`_holds`), None where not: what a caller serving the
+    task only where its server shares prompts' pages reads, as an episode cohort does
     (`dew.objectives.rl.RolloutScheduler.episodes`)."""
     *_, strategy = resolve(*task.controls(), task.strategy)
     layout = _laid(task.model, kv_cache, capacity, strategy, None)
-    if kv_cache is None and not _reuses_prefixes(task.model, layout, strategy, None):
+    if kv_cache is None and not (_reuses_prefixes(task.model, layout, strategy, None)
+                                 and layout is not None and _holds(task.model, capacity, layout.page_size)):
         return None
     return layout
 
@@ -1820,10 +1822,16 @@ def _laid(model: nn.Module, kv_cache: KVCache | PageSize, capacity: int, strateg
     if own is None or own.page_size is not None:
         return own
     paged = dataclasses.replace(own, page_size=PAGE_SIZE)
+    return paged if _holds(model, capacity, PAGE_SIZE) and _reuses_prefixes(model, paged, strategy,
+                                                                             prefill_mesh) else own
+
+
+def _holds(model: nn.Module, capacity: int, page_size: int | None) -> bool:
+    """Whether `model`'s max_seq_len holds a row of `capacity` slots in whole pages of `page_size`
+    (`_rounded`), which `_served_layout` refuses where it does not."""
     ceiling = cache_ceiling(model)
-    held = (ceiling is not None and type(capacity) is int and capacity > 0
-            and _rounded(capacity, ceiling, PAGE_SIZE) >= capacity)
-    return paged if held and _reuses_prefixes(model, paged, strategy, prefill_mesh) else own
+    return (ceiling is not None and type(capacity) is int and capacity > 0
+            and _rounded(capacity, ceiling, page_size) >= capacity)
 
 
 def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
