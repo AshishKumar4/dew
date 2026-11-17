@@ -92,22 +92,23 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
 
-- Dew requires its JAX build 0.12.0.1.post104 and, on Linux x86_64 and aarch64, its own jaxlib build
-  0.12.0.1.post103, with its CUDA and PJRT plugins 0.12.0.1.post103 (post96's until now). A GPU compile takes
-  a device memory limit past which it stops after buffer assignment, emitting no code, and states the memory
-  its whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
-  executables' buffer assignment, which jaxlib's client of it reads, so `Compiled.peak_live()` lists the
-  buffers live at a GPU program's peak (bytes, shape, dtype, parameter, output or temporary, the instruction
-  and its `op_name`, its checkpoint names and the axes each dimension descends from). jax adds
-  `jax_threefry_rolled_lowering`, off unless set: GPU threefry lowered as rolled loops over its rounds, as on
-  CPU. Four wrong results are fixed: XLA:CPU's YNNPACK unary kernels read a broadcast input past its end, a
-  bfloat16 conversion of a broadcast scalar differing from one process to the next (row 5495); XLA:GPU's
-  Triton GEMM fusion of a residual add took the residual as its accumulator's start, a scanned stack's
-  float32 error 1.2 to 1.9 times the unscanned one's (row 6759), which a Pallas Triton kernel's own
-  accumulation still folds, as Triton does; Mosaic GPU converted an integer to a boolean by its low bit, 2 to
-  False (row 6941), and negates a boolean as its integer's exclusive or with 1; and XLA's HLO evaluator left a
-  float32 dot over an empty contraction uninitialized, zeros now (row 6942). Elsewhere jaxlib stays the
-  stock 0.12.0.1.
+- Dew requires its JAX build 0.12.0.1.post106 and, on Linux x86_64 and aarch64, its own jaxlib build
+  0.12.0.1.post103, with its CUDA and PJRT plugins 0.12.0.1.post103 (post96's until now). A GPU compile takes a
+  device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
+  whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
+  executables' buffer assignment, which jaxlib's client of it reads, so `Compiled.peak_live()` lists the buffers
+  live at a GPU program's peak (bytes, shape, dtype, parameter, output or temporary, the instruction and its
+  `op_name`, its checkpoint names and the axes each dimension descends from). jax adds
+  `jax_threefry_rolled_lowering`, off unless set: GPU threefry lowered as rolled loops over its rounds, as on CPU.
+  Four wrong results are fixed: XLA:CPU's YNNPACK unary kernels read a broadcast input past its end, a bfloat16
+  conversion of a broadcast scalar differing from one process to the next (row 5495); XLA:GPU's Triton GEMM fusion
+  of a residual add took the residual as its accumulator's start, a scanned stack's float32 error 1.2 to 1.9 times
+  the unscanned one's (row 6759), which a Pallas Triton kernel's own accumulation still folds, as Triton does;
+  Mosaic GPU converted an integer to a boolean by its low bit, 2 to False (row 6941), and negates a boolean as its
+  integer's exclusive or with 1; and XLA's HLO evaluator left a float32 dot over an empty contraction
+  uninitialized, zeros now (row 6942). Pallas Triton lowers an optimization barrier, a one-element slice, boolean
+  reductions and hijax primitives (the attention's merge kernel), and which devices a process sees no longer
+  splits a Mosaic GPU lowering's key (row 6717). Elsewhere jaxlib stays the stock 0.12.0.1.
 
 - A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
   anything, where its run states no `ns_group`: a step that fits only with them joined one at a time takes
