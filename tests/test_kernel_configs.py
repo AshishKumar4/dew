@@ -1731,3 +1731,22 @@ def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
         for got in outputs:
             for value, want in zip(got, expected, strict=True):
                 np.testing.assert_array_equal(value, want)
+
+
+@pytest.mark.parametrize("dense", [True, False], ids=["dense", "grouped"])
+def test_a_grouped_calls_walk_takes_every_column_tile_and_a_dense_ones_a_power_of_two(dense):
+    """An H100's Mosaic GEMM forward of 4096 rows by 1024 to 768 columns (`MosaicGmm.derived`): a grouped
+    call's (four groups) planar snake walks every column tile a band, each row block read once (row 5666,
+    M-EM-68); a dense call's (`gemm`'s `group_sizes=None`, one group) a power of two of them, as a dense
+    walk's band is (`resources.band`; row 7348: a dense call had taken the grouped band)."""
+    launch = grouped_matmul.MosaicGmm()
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    groups = 1 if dense else 4
+    arguments = launch.bind(shaped((4096, 1024)), shaped((groups, 1024, 768)),
+                            jax.ShapeDtypeStruct((groups,), jnp.int32), out_dtype="bfloat16", trans_rhs=False,
+                            interpret=False, dense=dense)
+    with report.refusals(), generation.assumed("sm90"):
+        tile = launch.derived(arguments, generation.gpu_target())
+    columns = 768 // tile.block_n  # three or six: no power of two, so the two bands differ
+    assert (tile.grid_block_n & (tile.grid_block_n - 1) == 0) if dense else tile.grid_block_n == columns, tile
+

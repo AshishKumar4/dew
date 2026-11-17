@@ -176,8 +176,8 @@ CONSUMERS = 2
 
 
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
-            candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None,
-            ragged: bool = False, units: tuple[int, int, int] = (1, 1, 1)) -> Tiles | None:
+            candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None, ragged: bool = False,
+            units: tuple[int, int, int] = (1, 1, 1), dense: bool = False) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its bundles
     in preference order, which share its facts but their loaders and registers) for a call whose output has
     `rows` rows (a group's, on average, where `grouped`: a product's rows split among its groups) and `width`
@@ -186,7 +186,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     docs/design/kernel-templates.md §7); `depths`, where given, the steps the launch's stage takes in place of
     the family's (a packed matrix's decode, `NVFP4_STEP`); `ragged`, rows a tile need not divide (a kernel
     gradient's whose last row tile is partial, `tgmm`); `units`, what the rows, the columns and the step are
-    whole multiples of besides (a call's side vectors' copy units, `mosaic.Transport.vector_unit`).
+    whole multiples of besides (a call's side vectors' copy units, `mosaic.Transport.vector_unit`); `dense`, a
+    call whose rows are one group's (`gmm`'s `dense`), its walk banded as a dense walk's (`resources.band`).
     `candidate(tile)` is the launch's legality apart from its resources (its granularity, its blocks dividing
     the call, its side operands' copies), and `launch_of(tile)` the launch whose ring and residency the
     planner sizes (`resources.plan`: its allocations a stage, its registers within a consumer's) on `target`.
@@ -253,7 +254,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         role = math.lcm(family.role_rows * consumers, units[0])
         most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
         shaped = functools.partial(_shaped, consumers=consumers, programs=programs, rows=rows, width=width,
-                                   multiprocessors=multiprocessors, grouped=grouped)
+                                   multiprocessors=multiprocessors, grouped=grouped and not dense)
         held_tile = functools.partial(_held_tile, role=role, steps=steps, busy=busy, shaped=shaped,
                                       candidate=candidate, launch_of=launch_of, layouts=layouts,
                                       target=target, programs=programs)

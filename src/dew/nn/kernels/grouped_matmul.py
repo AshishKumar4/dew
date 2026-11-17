@@ -786,6 +786,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                                                               and (admits is None or admits(tile))),
                                       launch_of=lambda tile: self.launch_of(ba, tile),
                                       grouped=depth is not None, depths=self.STEPS,
+                                      dense=bool(ba.arguments.get('dense')),
                                       ragged=self._ragged(ba, tried[0]),
                                       units=self._vector_units(ba, tried[0]))
             if tile is not None:
