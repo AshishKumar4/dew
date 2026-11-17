@@ -741,3 +741,25 @@ def test_a_restored_state_drops_its_templates_copies():
     assert isinstance(restored, TrainState)
     assert restored.compute is None
 
+
+
+@pytest.mark.parametrize("resident,beside,temporaries", [(0, 0, 1), (3 << 30, 1 << 30, 5 << 30),
+                                                         (12345, 678, 91011)])
+def test_a_gpu_of_the_memory_a_step_needs_admits_it_and_one_byte_less_does_not(monkeypatch, resident, beside,
+                                                                                temporaries):
+    """`needed` is the inverse of `admitted`: a GPU stated to hold the bytes it returns admits the step
+    (headroom zero or more, read by `admitted` through that GPU's stated memory), and one stated a byte
+    fewer does not; the bytes a pool of GPUs is sized by, through the one admission the planner reads."""
+    from dew import _devices
+    from dew.training.memory import admitted, needed
+
+    device = jax.devices()[0]
+    least = needed(device, resident, beside, temporaries)
+
+    def headroom(memory: int) -> int:
+        monkeypatch.setitem(_devices.COMPILE_ONLY_MEMORY, device, memory)
+        spare = admitted([device], resident, beside, temporaries)
+        assert spare is not None
+        return spare
+
+    assert headroom(least) >= 0 > headroom(least - 1)
