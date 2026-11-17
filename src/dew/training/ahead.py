@@ -1390,9 +1390,13 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
                 starts = started(trainer, start, planned, plan)
     except Unlowerable as refused:
         raise refused.refusing("step") from refused
-    # The sampled step as the search compiled it, its program what it lowered then.
-    sampled = (None if planned.sampled is None
-               else AheadProgram.of(planned.sampled.digest, planned.sampled.executable))
+    # The sampled step as the search compiled it, its program what it lowered then (the plan unreleased, its
+    # lowering held), digested as the step's is: a program no file can hold is refused by name.
+    sampled = None
+    if planned.sampled is not None:
+        if planned.sampled.lowered is None:
+            raise ValueError("the sampled step's plan was released before it was compiled ahead")
+        sampled = AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     memory = compiled_memory(compiled)
