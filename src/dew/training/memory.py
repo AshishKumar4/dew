@@ -341,7 +341,16 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     stats = compiled_memory(executable)
     if stats is None:
         return None
-    return admitted(devices, stats.argument - built, placed_beside(stats, held), stats.temp, placed=placed)
+    return admitted(devices, *admission(stats, held, built), placed=placed)
+
+
+def admission(stats: CompiledMemory, held: int = 0, built: int = 0) -> tuple[int, int, int]:
+    """A compiled program's terms as the allocator admits it (`admitted`): its resident bytes, its argument
+    bytes less the `built` bytes of them its first call builds in place; the bytes placed beside its
+    temporaries (`placed_beside`: its outputs that write over no donated argument and the `held` bytes kept
+    outside it); and its temporaries, one allocation. A step's fit (`step_headroom`) and a GPU part's need
+    (tests/model_flows.py's `need`) read it alike."""
+    return stats.argument - built, placed_beside(stats, held), stats.temp
 
 
 def placed_beside(stats: CompiledMemory, held: int) -> int:

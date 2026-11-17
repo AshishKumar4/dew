@@ -240,7 +240,7 @@ class LaterUnits(AssertionError):
 
 def ask_later(label: str, held: int, stop: int) -> None:
     """Where LATER names a file, raise `LaterUnits` for site `label`, whose judgement needs units `held` to
-    `stop` it does not hold (a judge's pool, or a GPU run's prepared first stage), its ask appended to the
+    `stop` it does not hold (a judge's pool), its ask appended to the
     file first, a line a site, so a process that asks for several keeps each; else nothing (the pool is
     short, `PoolRefused`)."""
     asked = os.environ.get(LATER)
