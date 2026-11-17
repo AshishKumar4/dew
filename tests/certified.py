@@ -1646,10 +1646,10 @@ def _held(eqn, operands, results, findings, at) -> None:
                             f"first at {first}: {shown[first]!r}")
 
 
-def assert_certified(fn, draw, label: str, *, seeds: int) -> None:
-    """Check 2 of the gate: `fn` on `draw(seed)`'s inputs for each of `seeds`, run one primitive at a
-    time (`certified`), every element of every equation within its own operation's contract and every
-    primitive covered by one."""
-    for seed in range(seeds):
+def assert_certified(fn, draw, label: str, *, seeds: int | range) -> None:
+    """Check 2 of the gate: `fn` on `draw(seed)`'s inputs for each of `seeds` (the first that many, or
+    those of a range, a test's share of its draws), run one primitive at a time (`certified`), every
+    element of every equation within its own operation's contract and every primitive covered by one."""
+    for seed in range(seeds) if isinstance(seeds, int) else seeds:
         _, findings = certified(fn, *draw(seed))
         assert not findings, f"{label}, seed {seed}: " + "; ".join(findings[:8])
