@@ -2164,23 +2164,23 @@ def run_options(tmp_path: Path, ref: str, policy: str, option: str) -> list[str]
     return [word for word in run if word.startswith(option)]
 
 
-def test_a_base_push_runs_at_a_targeted_runs_priority_and_main_above_every_lanes(tmp_path):
-    """A push to base/kernels runs its suite at a targeted run's priority, 0, with the suite's ordinary
-    deadline, so it is graded: at a lane's whole-suite priority (-10) with the background deadline it waited
-    behind every train, precheck and lane run and ran out its 6,000 s ungraded, every one of the eleven runs
-    that started from 2026-11-09 to 11-12, each about 115 tasks after reuse, all queued (the owner's rule,
-    2026-11-01: every push to base is graded, a red its committer's the same day). Trains keep their own
-    priority above it; a lane's branch runs at the default; a train's CI is the queue's gates on the hub,
-    which set its own (runbooks/hub.md)."""
-    def priority(ref: str) -> list[str]:
-        return run_options(tmp_path, ref, "off", "--priority")
+def test_a_base_push_runs_above_every_lanes_run_and_no_higher_than_main(tmp_path):
+    """A push to base/kernels runs its suite above a lane's run, with the suite's ordinary deadline, so it is
+    graded: at a lane's whole-suite priority (-10) with the background deadline it waited behind every train,
+    precheck and lane run and ran out its 6,000 s ungraded, every one of the eleven runs that started from
+    2026-11-09 to 11-12 (the owner's rule, 2026-11-01: every push to base is graded, a red its committer's the
+    same day); and at a targeted run's 0 its judges' draws waited out their deadline behind lane work
+    (2026-11-16). It runs no higher than main's own push, below which trains keep theirs (the queue's gates on
+    the hub set a train's, runbooks/hub.md)."""
+    def level(ref: str) -> int:
+        # armada's default where the workflow names none.
+        given = run_options(tmp_path, ref, "off", "--priority")
+        return int(given[0].partition("=")[2]) if given else 0
 
-    assert priority("base/kernels") == ["--priority=0"]
-    assert priority("fix/lane") == []
-    # A push to main the queue did not grade is its tip's only test.
-    assert priority("main") == ["--priority=5"]
-    # A base push, on the pool armada gives it, has the suite's ordinary deadline.
-    assert run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline") == ["--deadline=2700"]
+    assert level("fix/lane") < level("base/kernels") <= level("main")
+    # A base push, on the pool armada gives it, has the suite's ordinary deadline: main's.
+    assert (run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline")
+            == run_options(tmp_path / "main-deadline", "main", "on", "--deadline"))
     assert run_options(tmp_path / "base-pool", "base/kernels", "on", "--pool") == []
 
 

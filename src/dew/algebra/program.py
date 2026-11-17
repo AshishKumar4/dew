@@ -173,6 +173,14 @@ def _passed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
     return made
 
 
+def traced_as(traced: jax.stages.Traced, closed: jcore.Jaxpr) -> jax.stages.Traced:
+    """jit's own trace `traced` of a program, its program `closed` (its rewritten one, `rewritten_program`, of
+    the same arguments and results): what it lowers, compiles and runs is `closed`, never traced again (row
+    6977: a replay of the rewritten program was a whole second trace, 1.18 s of a decision step's 7.5)."""
+    return jax.stages.Traced(traced._meta_tys_flat, {**traced._params, "jaxpr": closed}, traced._in_tree,
+                             traced.out_tree, traced._consts, traced._fun_sourceinfo)
+
+
 def replaying(closed: jcore.Jaxpr, structure, numbers: Iterable[int],
               names: Iterable[str]) -> Callable:
     """A function of a program's arguments computing `closed` (its rewritten program, `rewritten_program`)

@@ -790,6 +790,13 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
     return Work()
 
 
+def looped(roots: tuple[Chunk, ...]) -> bool:
+    """Whether a form under `roots` runs the token loop (`Chunk.loop`, `Chunk.plain`): the chunk's tokens a
+    step each, in sequence."""
+    return any(get_callable_args(node, constructor) is not None for node in _nodes(roots)
+               for constructor in (Chunk.loop, Chunk.plain))
+
+
 def reads_state(node: Chunk) -> bool:
     """Whether `node` reads the entering state."""
     return any(get_callable_args(each, constructor) is not None for each in _nodes((node,))
