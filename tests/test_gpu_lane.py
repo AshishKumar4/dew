@@ -713,6 +713,14 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     filed((gib, gib // 2, gib // 4), (gib, gib, int(2.5 * gib)))
     share, row = lane()
     assert (share, row["output"], row["exitCode"]) == (7 * gib, "", 0)
+    # A GH200 part's flows as their prepare filed them (2026-11-17, MAINGPU-8063e3557-PART3of9's
+    # needs/117ca29968591c89.json, its two largest of 80 programs: a 1.71 GiB terms walk beside its arms), its
+    # least pool 3.59 GiB of pool bytes: it runs, given that, never its GPU's memory read as pool (which red
+    # test_gpu_flows on the sm90 tier as needing 34.88 GiB, rows 7460 and 7461).
+    mib = 2 ** 20
+    filed((76 * mib, 107 * mib, 1836 * mib), (76 * mib, 107 * mib, 1428 * mib))
+    share, row = lane()
+    assert (share, row["output"], row["exitCode"]) == ((76 + 107 + 2 * 1836) * mib, "", 0)
     # Its children each take a share's fraction: what it holds is of its raised share, 7 GiB twice over.
     assert ci.gpu_needs({"depends": [], "peak": 2 * gib, "shares": 1, "pools": 0}, 40 * gib, 7 * gib) == (
         7 * gib, 14 * gib)
