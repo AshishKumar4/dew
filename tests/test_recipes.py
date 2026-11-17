@@ -5,16 +5,16 @@ command is red: the decision recipe's `--trainer.steps 2000` was refused at its 
 which no test of the recipes ran."""
 
 import ast
-import json
 import shlex
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from objective_data import IMAGES
 from run_kinds import QWEN_TINY, TINY_LAYA, pictures
 from tool_support import REPO_ROOT, load
 
-from dew.data import Files, Memory
+from dew.data import TFDS, Memory
 from dew.data.text import export_tokens
 
 RECIPES = ("decision/train", "diffusion/train", "jepa/train", "lm/train", "lm/rigel", "lm/mixture")
@@ -49,15 +49,13 @@ def scaled(args: list[str], sizes: dict[str, str]) -> list[str]:
     return out
 
 
-def tickets(root: Path):
+def tickets():
     """A table of support tickets as BANKING77's rows are, each a `text` and its `label_text`, a tenth
     held out."""
     asked = [("charged twice for March", "billing"), ("the site is down", "technical"),
              ("how much is the pro plan", "sales"), ("refund my last invoice", "billing")]
-    table = root / "tickets.jsonl"
-    table.write_text("".join(json.dumps({"text": f"{text}, ticket {index}", "label_text": label}) + "\n"
-                             for index in range(40) for text, label in asked))
-    return Files(str(table), format="json").holdout(0.1)
+    return Memory([{"text": f"{text}, ticket {index}", "label_text": label}
+                   for index in range(40) for text, label in asked]).holdout(0.1)
 
 
 def byte_store(root: Path, name: str) -> str:
@@ -84,7 +82,7 @@ def decision(args: list[str], root: Path) -> Callable[[], object]:
                           "--lora.rank": "2"})
     sized = sized if "--pretrained" in sized else ["--pretrained", pretrained, *sized]
     config = DecisionRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs")],
-                                   default=recipe.default(*tickets(root)))
+                                   default=recipe.default(*tickets()))
     return config.run
 
 
@@ -107,7 +105,8 @@ def jepa(args: list[str], root: Path) -> Callable[[], object]:
     sized = scaled(args, {"data.images.size": "16", "data.images.batch": "8", "--trainer.epochs": "1",
                           "--probe-classes": "2", **IMAGE_MODEL})
     config = JepaRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs")],
-                               default=recipe.default(*pictures()))
+                               default=recipe.default(*TFDS("dew_images", path=str(IMAGES), split="train")
+                                                      .holdout(split="test")))
     return config.run
 
 
@@ -131,10 +130,11 @@ def rigel(args: list[str], root: Path) -> Callable[[], object]:
                               len(args) - at)]
     stores = {directory: byte_store(root, name)
               for name, directory in zip(named[::2], named[1::2], strict=True)}
-    sizes = {"--width": "128", "--steps": "2", "--batch-size": "8", "--seq-len": "16"}
+    # Eight steps, the fewest whose rescaled phases each end past the one before.
+    sizes = {"--width": "128", "--steps": "8", "--batch-size": "8", "--seq-len": "16"}
     sized = [stores.get(word, word) for word in scaled(args, sizes)]
     rigel_flags = [*sized, *(["--width", "128"] if "--width" not in sized else []),
-                   *(["--steps", "2"] if "--steps" not in sized else []), "--tokenizer", "byte"]
+                   *(["--steps", "8"] if "--steps" not in sized else []), "--tokenizer", "byte"]
     sized_run = ["--model.num-layers", "4", "--model.layer-types", "mamba", "mamba", "mamba", "attention",
                  "--max-new-tokens", "0", *TRAINED, "--trainer.checkpoint-dir", str(root / "runs")]
     return lambda: recipe.main([*scaled(rigel_flags, {"--trainer.checkpoint-dir": str(root / "runs")}),

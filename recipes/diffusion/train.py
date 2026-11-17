@@ -21,6 +21,8 @@ from dew.data.sources import source
 
 TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}",
              "This is a photo of a {} flower", "A photo of a {} flower")
+VALIDATION_TEMPLATE = "a photo of a {label}"
+"""The held-out images' one caption template, the first of `TEMPLATES`."""
 
 
 def flowers():
@@ -29,12 +31,13 @@ def flowers():
 
 
 def default(train, held) -> DiffusionRunConfig:
-    """The recipe's run over labelled images, `train`'s and `held`'s, each captioned by its class."""
-    caption = images.caption(templates=TEMPLATES)
+    """The recipe's run over labelled images, `train`'s and `held`'s, each captioned by its class: a
+    training image by a template drawn for it, a held-out one by the first, so every validation reads the
+    same captions (a drawn caption in validation is refused, its draws having no record index to follow)."""
     return DiffusionRunConfig(
         data=train.shuffle(seed=0).repeat().pipe(presets.images, 128, batch=32, augment=True,
-                                                 caption=caption),
-        validation=held.pipe(presets.images, 128, batch=32, caption=caption))
+                                                 caption=images.caption(templates=TEMPLATES)),
+        validation=held.pipe(presets.images, 128, batch=32, caption=images.caption(VALIDATION_TEMPLATE)))
 
 
 if __name__ == "__main__":
