@@ -46,6 +46,8 @@ from dew.decision.renderer import (
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
+    from dew.inputs.condition import ConditionEncoder
+
 
 class TokenizerSpecials(Protocol):
     """What `Specials.of` reads off a tokenizer, as a transformers tokenizer
@@ -336,23 +338,33 @@ def render(value: JSON) -> str:
             return json.dumps(value, ensure_ascii=False)
 
 
-def context_tokens(tokenizer: Tokenizer, context: JSON | None) -> np.ndarray:
-    """A context's tokens, whole, as a row reads them: its text's (`render`), without specials, and none
-    for no context. A row keeps those its cross-attention has room for (`with_context`)."""
+def context_tokens(reader: "Tokenizer | ConditionEncoder", context: JSON | None) -> np.ndarray:
+    """A context's tokens, whole, as a row reads them: its text's (`render`) by the decision's tokenizer,
+    without specials, or by the encoder a run configures for its context (`DecisionModel.context`, a
+    `ConditionEncoder`), its own tokenization's real tokens; none for no context. A row keeps those its
+    cross-attention has room for (`with_context`)."""
+    from dew.inputs.condition import ConditionEncoder
+
     if context is None:
         return np.zeros(0, np.int32)
-    return np.asarray(rendered_chunks([Chunk(render(context))], tokenizer, "pieces").tokens, np.int32)
+    match reader:
+        case ConditionEncoder():
+            codes = reader.tokenize([render(context)])
+            return np.asarray(codes["input_ids"][0][np.asarray(codes["attention_mask"][0]) != 0], np.int32)
+        case _:
+            return np.asarray(rendered_chunks([Chunk(render(context))], reader, "pieces").tokens, np.int32)
 
 
-def with_context(rows: Sequence[Encoded], tokenizer: Tokenizer, context: JSON | None,
+def with_context(rows: Sequence[Encoded], tokenizer: "Tokenizer | ConditionEncoder", context: JSON | None,
                  length: int | None) -> list[Encoded]:
     """`rows` with the context a backbone's cross-attention of `length` context tokens reads beside
     each (None: a backbone with none): a schema laid out as the rows' context (`Schema.stream`), read
     whole, then `context`, a request's or an example's own, in the room the schema leaves, or `length`
     where no schema is; of a context longer than its room its first tokens, the rest cut and counted
     (`Encoded.context_cut`, a `context` cut a run's data report counts and a served answer states). The
-    one resolution of a row's context, which a run's encoding and a task's admission both read. Refused
-    (ValueError): a context with no cross-attention to read it, and a schema longer than `length`."""
+    one resolution of a row's context, which a run's encoding and a task's admission both read, its
+    context tokenized by `tokenizer`, the decision's or the run's context encoder (`context_tokens`).
+    Refused (ValueError): a context with no cross-attention to read it, and a schema longer than `length`."""
     if any(row.spans_in_context for row in rows):
         if length is None:
             raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
