@@ -15,6 +15,7 @@ import lane_environment
 import jax
 import jax.numpy as jnp
 import model_flows
+import tier_wire
 import numpy as np
 import pytest
 from process_support import relayed
@@ -109,8 +110,8 @@ def test_a_flows_truth_computes_in_float64(name, store, monkeypatch):
     store, at the fewest seeds check 1 takes (`parity.FEWEST_SEEDS`)."""
     fewest = dict.fromkeys(model_flows.KINDS, FEWEST_SEEDS)
     flow = dataclasses.replace(model_flows.flow_named(name), seeds=fewest)
-    monkeypatch.setenv(model_flows.TRUTHS, str(store))
-    monkeypatch.setenv(model_flows.PREPARE, "1")
+    monkeypatch.setenv(tier_wire.TRUTHS, str(store))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
     for kind in model_flows.KINDS:
         model_flows.judge(flow, {}, kind)
 
@@ -147,9 +148,9 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
     topology = store / "topology.bin"
     topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
-    monkeypatch.setenv(model_flows.TRUTHS, str(store / "tier"))
-    monkeypatch.setenv(model_flows.PREPARE, "1")
-    monkeypatch.setenv(model_flows.UNIT, "a selective scan's unit")
+    monkeypatch.setenv(tier_wire.TRUTHS, str(store / "tier"))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    monkeypatch.setenv(tier_wire.UNIT, "a selective scan's unit")
     flow = model_flows.flow_named("selective scan")
     took = model_flows.prepared_apart(flow)
     store = model_flows.store_of(flow)

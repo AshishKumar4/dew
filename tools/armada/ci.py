@@ -165,6 +165,11 @@ def check1_wire():
     stages log (STAGES). Loaded where a plan shards a site, so a checkout of the harness alone (a page
     generator's scratch copy) imports this file."""
     return _loaded(HERE.parents[1] / "tests" / "check1_wire.py")
+@functools.cache
+def tier_wire():
+    """The GPU tier's prepare-to-lane contract, its one owner (tests/tier_wire.py): the prepare's word and
+    unit, and where its truths and needs are filed. Loaded where a lane prepares, as `check1_wire` is."""
+    return _loaded(HERE.parents[1] / "tests" / "tier_wire.py")
 PARITY_STAGES = HERE.parents[1] / "src" / "dew" / "parity_stages.py"
 child_groups = _loaded(HERE / "child_groups.py")
 session = _loaded(HERE / "session.py")
@@ -2058,8 +2063,8 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
                 "output": "not prepared: its lane's prepare had no time left for it"}]}))
             return 0
         return tested(python, [file], group, verdict, mine, "off", session.GRACE, "",
-                      {"JAX_PLATFORMS": "cpu", gpu_measures.wire().PREPARE: "1", "OMP_NUM_THREADS": threads,
-                       **(VARIANTS[variant][1] if variant else {}), gpu_measures.wire().UNIT: name},
+                      {"JAX_PLATFORMS": "cpu", tier_wire().PREPARE: "1", "OMP_NUM_THREADS": threads,
+                       **(VARIANTS[variant][1] if variant else {}), tier_wire().UNIT: name},
                       recorded=False, variant=variant)
 
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
@@ -2159,7 +2164,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     tests = list(units)
 
     measures = lane_measures(python, units, held, token)
-    prepared = gpu_measures.prepared_needs(python, tests)  # Each no less than its prepared programs' need.
+    prepared = gpu_measures.prepared_needs(python, tests, tier_wire())  # No less than its programs' need.
     unheld = gpu_measures.unschedulable(prepared, budget, float(WHOLE_GPU) * total, held)  # Nor below it.
     tests = [name for name in tests if name not in unheld]
     needed = {name: gpu_needs(measures[name], budget, prepared.get(name, 0.0)) for name in tests}
