@@ -467,19 +467,18 @@ def test_a_scoring_server_reports_the_share_of_each_pass_shapes_tokens_its_rows_
 
 
 def test_a_pass_that_overruns_a_window_count_runs_the_rest_in_a_pass_of_its_own(decide):
-    """A server's pass whose rows take one window past a declared count (`Decide.pass_shapes`: 1, 8, 64 and
-    the most, a length's) runs the rows in that count's windows and leaves the rest to a pass of its own
-    shape (`PassPlan.taken`), so it computes fewer tokens than the next count's whole pass would: a
-    server's last pass of 512 requests held 29% of its 32 windows' tokens, a fifth of every pass's tokens
-    padding (row 3330). Every request is answered as a server of it alone answers it, to its responses'
-    rounding."""
+    """A server's pass whose rows fill every window of a declared count (`Decide.pass_shapes`: 1, 8, 64 and
+    the most, a length's) and take one past it runs the rows in that count's windows and leaves the rest
+    to a pass of its own shape (`PassPlan.taken`), computing fewer tokens than the next count's whole pass:
+    a server's last pass of 512 requests held 29% of its 32 windows' tokens, a fifth of every pass's tokens
+    padding (row 3330). Every request is answered as it is alone in every field a batch cannot move."""
     import itertools
 
-    from test_decision_batches import CASES
+    from test_decision_batches import CASES, discrete
 
     laid, _ = decide.scoring()
     plan, bodies = decide.planned(), []
-    # Requests until their rows take one window past a declared count of their length.
+    # Requests until their rows fill a declared count's windows and take one past them.
     for body in itertools.islice(itertools.cycle(CASES.values()), 4096):
         assert all(plan.add(row.encoded) for row in laid.admit(body).rows)
         bodies.append(body)
@@ -491,24 +490,10 @@ def test_a_pass_that_overruns_a_window_count_runs_the_rest_in_a_pass_of_its_own(
     server = ScoringServer.from_task(task, variables)
     futures = [server.submit(body) for body in bodies]
     server.run()
-    computed = sum(passes.windows * shape.length for shape, passes in task.passes.shapes.items())
-    assert sum(passes.passes for passes in task.passes.shapes.values()) > 1
-    assert computed < whole.rows * whole.length
-
-    def close(served, alone) -> bool:
-        match served, alone:
-            case dict(), dict():
-                return served.keys() == alone.keys() and all(close(served[key], alone[key]) for key in served)
-            case float(), float():
-                return abs(served - alone) <= 2e-3
-            case _:
-                return served == alone
-
-    lone = {}
-    for body in CASES.values():
-        alone = ScoringServer.from_task(*decide.scoring())
-        answered = alone.submit(body)
-        alone.run()
-        lone[id(body)] = answered.result()["answers"]
-    assert all(close(future.result()["answers"], lone[id(body)])
+    shapes = task.passes.shapes
+    computed = sum(passes.windows * shape.length for shape, passes in shapes.items())
+    assert sum(passes.passes for passes in shapes.values()) == 2 and computed < whole.rows * whole.length
+    lone = {id(body): discrete(json.loads(json.dumps(decide.systemone(body)))) for body in CASES.values()}
+    assert all(discrete(future.result()) == lone[id(body)]
                for body, future in zip(bodies, futures, strict=True))
+
