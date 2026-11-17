@@ -122,10 +122,20 @@ _GOLDEN = np.uint64(0x9E3779B97F4A7C15)
 
 def _mixed(x: jax.Array) -> jax.Array:
     """SplitMix64's finalizer of uint64 `x`: a word each bit of `x` reaches half the time (Steele, Lea and
-    Flood, "Fast splittable pseudorandom number generators", 2014), the taps' counter-based generator."""
+    Flood, "Fast splittable pseudorandom number generators", 2014), the taps' counter-based generator; in
+    JAX's arithmetic or NumPy's, wrapping alike (a draw's keys are NumPy's, `_keys`)."""
     x = (x ^ (x >> 30)) * np.uint64(0xBF58476D1CE4E5B9)
     x = (x ^ (x >> 27)) * np.uint64(0x94D049BB133111EB)
     return x ^ (x >> 31)
+
+
+def _keys(seed: int) -> tuple[np.uint64, list[np.uint64]]:
+    """The keys of `rounding_scale`'s evaluations at `seed`: the untapped one's and each of its DRAWS
+    draws', mixed on the host (`_mixed` in NumPy's uint64, which wraps as JAX's does), so a scale makes
+    no host-to-device round trip a key."""
+    with np.errstate(over="ignore"):
+        key = _mixed(np.uint64(seed))
+        return key, [_mixed(key + _GOLDEN * np.uint64(draw + 1)) for draw in range(DRAWS)]
 
 
 def _signs(key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
@@ -146,17 +156,17 @@ def rounding_scale(fn, *args, seed: int = 0):
     weighs alike for every arm. The program is traced at `args` as given, its roundings those formats', and
     evaluated in float64; a non-floating output's scale is None. A static program (no branch or loop its
     values pick) evaluates compiled, once a signature and matmul precision; any other walks eagerly."""
-    # The program as written: traced with the algebra pass off, a reference's (`arm_arithmetic.unrewritten`).
-    written = unrewritten(fn)
-    closed = jax.make_jaxpr(written)(*args)
-    tree = jax.tree.structure(jax.eval_shape(written, *args))
+    # The program as written: traced with the algebra pass off, a reference's (`arm_arithmetic.unrewritten`),
+    # its outputs' tree read from the same trace.
+    closed, shapes = jax.make_jaxpr(unrewritten(fn), return_shape=True)(*args)
+    tree = jax.tree.structure(shapes)
     # Traced in the caller's arithmetic (its default matmul precision among it), replayed in float64's own.
     traced = str(jax.config.jax_default_matmul_precision)
     with evaluated_on(jax.tree.leaves(args)), jax.enable_x64(new_val=True), \
             jax.default_matmul_precision("highest"):
         leaves = [jnp.asarray(_widened(leaf)) for leaf in jax.tree.leaves(args)]
         consts = [_widened(value) for value in closed.consts]
-        key = _mixed(jnp.asarray(seed, jnp.uint64))
+        keys = _keys(seed)
         if _static(closed.jaxpr):
             signature = (jax.tree.structure(args), tuple((np.shape(leaf), jnp.result_type(leaf),
                                                           getattr(jax.typeof(leaf), "weak_type", False))
@@ -169,34 +179,37 @@ def rounding_scale(fn, *args, seed: int = 0):
                 # one copy of `fn`, not one of each draw's.
                 held[signature] = jax.jit(lambda consts, leaves, key, scale: walked(
                     jaxpr, consts, leaves, TapRule(key, scale)))
-            outputs, scales = _scaled(closed.jaxpr, functools.partial(held[signature], consts, leaves), key)
+            outputs, scales = _scaled(closed.jaxpr, functools.partial(held[signature], consts, leaves), keys)
         else:
             # Its runs of static steps between a branch and a loop compiled, the rule passed in (`_span`).
             outputs, scales = _scaled(closed.jaxpr, lambda key, scale: walked(
-                closed.jaxpr, consts, leaves, TapRule(key, jnp.float64(scale)), compiling=True), key)
+                closed.jaxpr, consts, leaves, TapRule(key, jnp.float64(scale)), compiling=True), keys)
     return (tree.unflatten([np.asarray(value) for value in outputs]),
             tree.unflatten([None if scale is None else np.asarray(scale) for scale in scales]))
 
 
-def _scaled(jaxpr, tapped, key):
+def _scaled(jaxpr, tapped, keys):
     """`jaxpr`'s untapped float64 outputs and each floating output's scale (`rounding_scale`), from
-    `tapped(key, scale)`, its evaluation with every rounding moved by `scale` times a draw keyed by `key`:
-    the root mean square of each draw's displacement from the untapped evaluation, each element taken
-    relative to its largest displacement, so no square overflows and a nonfinite displacement stays
-    nonfinite."""
+    `tapped(key, scale)`, its evaluation with every rounding moved by `scale` times a draw keyed by `key`
+    (`keys`: the untapped evaluation's and each draw's, `_keys`): the root mean square of each draw's
+    displacement from the untapped evaluation (`_spread`)."""
+    key, drawn = keys
     plain = tapped(key, 0.0)
-    draws = [tapped(_mixed(key + _GOLDEN * jnp.asarray(draw + 1, jnp.uint64)), 1.0) for draw in range(DRAWS)]
-    scales = []
-    for at, (var, value) in enumerate(zip(jaxpr.outvars, plain, strict=True)):
-        if not jnp.issubdtype(var.aval.dtype, jnp.floating):
-            scales.append(None)
-            continue
-        moved = jnp.stack([jnp.abs(draw[at] - value) for draw in draws])
-        largest = jnp.max(moved, axis=0)
-        held = jnp.where(largest > 0, largest, 1)
-        scales.append(jnp.where(largest > 0, largest * jnp.sqrt(jnp.mean(jnp.square(moved / held), axis=0)),
-                                largest))
-    return plain, scales
+    draws = [tapped(each, 1.0) for each in drawn]
+    return plain, [_spread(value, *(draw[at] for draw in draws))
+                   if jnp.issubdtype(var.aval.dtype, jnp.floating) else None
+                   for at, (var, value) in enumerate(zip(jaxpr.outvars, plain, strict=True))]
+
+
+@jax.jit
+def _spread(value, *draws):
+    """The root mean square of each draw's displacement from `value`, each element taken relative to its
+    largest displacement, so no square overflows and a nonfinite displacement stays nonfinite: one program
+    a shape, where its operations eagerly were a dispatch each."""
+    moved = jnp.stack([jnp.abs(draw - value) for draw in draws])
+    largest = jnp.max(moved, axis=0)
+    held = jnp.where(largest > 0, largest, 1)
+    return jnp.where(largest > 0, largest * jnp.sqrt(jnp.mean(jnp.square(moved / held), axis=0)), largest)
 
 
 def _widened(leaf):

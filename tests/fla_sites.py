@@ -8,6 +8,9 @@ on a GPU and records (tests/fixtures/fla/gdn_seeded.npz), and the rule's hooks.
 - `near two`: write gates near two on aligned keys (test_recurrence_mosaic).
 - `stability/<name>/<regime>/<product>`: test_recurrence_stability's regimes of the delta rule with a decay,
   the forward's draws and the gradient's (`stressed`, `cotangents`).
+- `rwkv6/<dtype>/<layout>`: RWKV6's recurrence (`RWKV6`: a decay a key dimension, read before its update,
+  its own write weighed), test_recurrence_chunk's draws of one sequence and of packed documents, against
+  fla-core's `chunk_rwkv6`.
 """
 
 import dataclasses
@@ -28,6 +31,15 @@ RECORDED = Path(__file__).resolve().parent / "fixtures" / "fla" / "gdn_seeded.np
 
 LEAVES = ("out", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0")
 """A recorded site's leaves: the output and final memory, then each operand's gradient."""
+
+OWN_LEAVES = ("out", "final", "dq", "dk", "dv", "dg", "down", "dh0")
+"""A site's leaves whose readout weighs its own write and reads no write gate (`RWKV6`'s): the own weight's
+gradient in the write gate's place."""
+
+RWKV6 = recurrence.Hooks(decay='vector', delta=False, reads='before', own_weight=True, scale=128 ** -0.5)
+"""RWKV6's recurrence as fla-core's `chunk_rwkv6` computes it: `o_t = scale q_t^T (S_{t-1} + (u k_t)
+v_t^T)`, `S_t = exp(w_t) S_{t-1} + k_t v_t^T` (fla/ops/rwkv6/recurrent_naive.py), its scale fla's default
+of keys 128 wide."""
 
 FORWARD = ("out", "final")
 """A forward's site's leaves."""
@@ -51,17 +63,17 @@ class Site(NamedTuple):
         """The seed's draw as host arrays, the recording's inputs."""
         operands, (out, final) = self.draw(seed)
         named = {"q": operands.query, "k": operands.key, "v": operands.value, "g": operands.log_decay,
-                 "beta": operands.beta, "h0": operands.state, "dy": out, "dfinal": final}
-        if operands.starts is not None:
-            named["starts"] = operands.starts
-        return {name: np.asarray(value) for name, value in named.items()}
+                 "beta": operands.beta, "own": operands.own, "h0": operands.state, "dy": out, "dfinal": final,
+                 "starts": operands.starts}
+        return {name: np.asarray(value) for name, value in named.items() if value is not None}
 
 
 def chunk_of(arrays: dict) -> tuple[Chunk, tuple]:
     """A site's arrays as the operands and cotangents they were drawn as (`Site.arrays`)."""
     starts = arrays.get("starts")
-    return (Chunk(arrays["q"], arrays["k"], arrays["v"], log_decay=arrays["g"], beta=arrays["beta"],
-                  state=arrays["h0"], starts=None if starts is None else jnp.asarray(starts)),
+    return (Chunk(arrays["q"], arrays["k"], arrays["v"], log_decay=arrays["g"], beta=arrays.get("beta"),
+                  own=arrays.get("own"), state=arrays["h0"],
+                  starts=None if starts is None else jnp.asarray(starts)),
             (arrays["dy"], arrays["dfinal"]))
 
 
@@ -82,7 +94,7 @@ def ruled(rule: Callable[[Chunk], tuple], arrays: dict, leaves: tuple[str, ...] 
         (out, final), pull = jax.vjp(run, given)
         (grads,) = pull((cotangents[0].astype(out.dtype), cotangents[1].astype(final.dtype)))
         found = {"out": out, "final": final, "dq": grads.query, "dk": grads.key, "dv": grads.value,
-                 "dg": grads.log_decay, "dbeta": grads.beta, "dh0": grads.state}
+                 "dg": grads.log_decay, "dbeta": grads.beta, "down": grads.own, "dh0": grads.state}
     return {name: found[name] for name in leaves}
 
 
@@ -147,10 +159,29 @@ def _stability_sites() -> dict[str, Site]:
     return sites
 
 
+def _rwkv6_sites() -> dict[str, Site]:
+    """RWKV6's sites (`RWKV6`): test_recurrence_chunk's draws of one sequence and of packed documents, in bf16
+    and fp32, each with its own weight, which the draw gives under `Hooks.own_weight`."""
+    import test_recurrence_chunk as chunked
+
+    sites = {}
+    for label, dtype in (("bf16", jnp.bfloat16), ("fp32", jnp.float32)):
+        for layout, packed in (("one sequence", False), ("packed", True)):
+            def draw(seed, dtype=dtype, packed=packed):
+                # Values 16 wide: fla-core's rwkv6 backward takes a value block of at least 16 (its dA
+                # kernel's `tl.dot(do, v)`, K >= 16).
+                (operands,) = chunked.draw(RWKV6, packed, seed, value_width=16)
+                return dataclasses.replace(operands, **{name: getattr(operands, name).astype(dtype)
+                                                        for name in ("query", "key", "value")})
+
+            sites[f"rwkv6/{label}/{layout}"] = Site(RWKV6, _with_cotangents(draw), OWN_LEAVES)
+    return sites
+
+
 @functools.cache
 def sites() -> dict[str, Site]:
     """Every recorded site by name."""
-    return {**_mosaic_sites(), **_stability_sites()}
+    return {**_mosaic_sites(), **_stability_sites(), **_rwkv6_sites()}
 
 
 def the_template_is_as_exact_as_fla(rule: Callable[[Chunk], tuple], site: str,

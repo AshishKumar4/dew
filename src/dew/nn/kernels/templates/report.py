@@ -836,8 +836,11 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
                                        kernel_bodies(call for call in calls if call.kind == "triton").items()}
     if not modules:
         return {}
-    return {name: (modules[name], binary)
-            for binary in binaries(xla_compiled(lowered, None))
+    # Compiled to be read, never run (`read_offline`): its kernels' binaries are what it states, so a prepare
+    # for devices no run has tuned (`for_devices`) certifies as any compile does, its fusions untuned.
+    with read_offline():
+        compiled = xla_compiled(lowered, None)
+    return {name: (modules[name], binary) for binary in binaries(compiled)
             if (name := launch_name(binary.kernel, binary.launch)) in modules}
 
 
@@ -968,14 +971,14 @@ def _commit(proposal: Recorded) -> None:
     _add(rewritten=proposal.rewritten, passes=proposal.passes)
 
 
-def _add(**records: Sequence) -> None:
-    """Each of `records`, a `Recorded` field's entries, added to this context's registry and to every
-    `recording` open in it; a miss once a holder (`_record`), each other record as often as it is made."""
+def _add(*, missed: Sequence["Miss"] = (), rewritten: Sequence = (), passes: Sequence[float] = ()) -> None:
+    """`Recorded` entries added to this context's registry and to every `recording` open in it: a miss once
+    a holder (`_record`), each rewrite and pass as often as it is made."""
     with _GUARD:
         for held in (_registry(), *_RECORDING.get()):
-            for name, entries in records.items():
-                found = getattr(held, name)
-                found.extend(entry for entry in entries if name != "missed" or entry not in found)
+            held.missed.extend(miss for miss in missed if miss not in held.missed)
+            held.rewritten.extend(rewritten)
+            held.passes.extend(passes)
 
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",

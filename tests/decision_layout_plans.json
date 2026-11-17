@@ -1,0 +1,239 @@
+{
+ "joint": {
+  "cache": [],
+  "code": [
+   [],
+   []
+  ],
+  "derived": {
+   "0/shards": "32e6cd2c65e61e5d"
+  },
+  "exact": true,
+  "lowering": "per-share",
+  "manifest": {
+   "codec": 1,
+   "fill": {},
+   "schema": 1,
+   "source": {
+    "sources": [
+     {
+      "identity": null,
+      "rows": 4,
+      "sha256": "42c29fba422c65293dca9c0df4f7680a5ed4dbef4f1db6314027ba19acc1d15f",
+      "shard_rows": 1024,
+      "store": "memory"
+     }
+    ]
+   },
+   "steps": [
+    {
+     "config": "{\"bounds\": null, \"class\": \"dew.decision.rows.Fit\", \"context_length\": null, \"context_window\": null, \"grouped\": false, \"head\": {\"attention_impl\": \"auto\", \"class\": \"dew.decision.head.DecisionHead\", \"dropout_rate\": 0.0, \"dtype\": null, \"features\": 64, \"layers\": 2, \"name\": null, \"precision\": null}, \"layout\": {\"class\": \"dew.decision.layout.JointLayout\", \"framing\": {\"chat_template\": null, \"class\": \"dew.decision.layout.Framing\", \"options\": {\"mapping\": []}, \"prefill\": \"JOINT SCHEMA DECISIONS:\", \"system\": \"Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options.\", \"template\": true, \"thinking\": false}, \"max_len\": 16384, \"max_state_tokens\": 7, \"segments\": [{\"class\": \"dew.decision.layout.Text\", \"text\": \"STATE:\\n\"}, {\"class\": \"dew.decision.layout.Media\"}, {\"class\": \"dew.decision.layout.State\", \"keep\": \"start\", \"max_tokens\": null, \"render\": \"compact\"}, {\"class\": \"dew.decision.layout.Schema\", \"stream\": \"row\"}, {\"class\": \"dew.decision.layout.Text\", \"text\": \"\\n\"}]}, \"none_of_the_above\": 0.0, \"scored\": false, \"specials\": {\"begin\": 254, \"class\": \"dew.decision.layout.Specials\", \"marker\": 0, \"marker_text\": \"\\u0000\", \"pad\": 255, \"separator\": 253}, \"tokenizer\": {\"encoding\": \"utf-8\", \"eos\": 255, \"name\": \"byte\"}}",
+     "declared": null,
+     "dependencies": {
+      "tokenizer": {
+       "encoding": "utf-8",
+       "eos": 255,
+       "name": "byte"
+      }
+     },
+     "exact": true,
+     "name": "dew.decision.rows.Fit"
+    },
+    {
+     "config": "{\"batch_fn\": null, \"class\": \"dew.data.pipeline.BatchStage\", \"drop_remainder\": true, \"size\": 2}",
+     "declared": null,
+     "dependencies": {},
+     "exact": true,
+     "name": "dew.data.pipeline.BatchStage"
+    }
+   ],
+   "tokenizer": {
+    "0/dew.decision.rows.Fit": {
+     "tokenizer": {
+      "encoding": "utf-8",
+      "eos": 255,
+      "name": "byte"
+     }
+    }
+   }
+  },
+  "members": {},
+  "order": {
+   "read": "streamed",
+   "seed": 0,
+   "source": "memory:42c29fba422c65293dca9c0df4f7680a5ed4dbef4f1db6314027ba19acc1d15f",
+   "stages": [
+    1
+   ]
+  },
+  "reached": [
+   [],
+   []
+  ],
+  "rejections": "drop",
+  "rules": {
+   "identity": "structured"
+  },
+  "topology": {},
+  "version": 15,
+  "volatile": false
+ },
+ "marker": {
+  "cache": [],
+  "code": [
+   [],
+   []
+  ],
+  "derived": {
+   "0/shards": "32e6cd2c65e61e5d"
+  },
+  "exact": true,
+  "lowering": "per-share",
+  "manifest": {
+   "codec": 1,
+   "fill": {},
+   "schema": 1,
+   "source": {
+    "sources": [
+     {
+      "identity": null,
+      "rows": 4,
+      "sha256": "42c29fba422c65293dca9c0df4f7680a5ed4dbef4f1db6314027ba19acc1d15f",
+      "shard_rows": 1024,
+      "store": "memory"
+     }
+    ]
+   },
+   "steps": [
+    {
+     "config": "{\"bounds\": null, \"class\": \"dew.decision.rows.Fit\", \"context_length\": null, \"context_window\": null, \"grouped\": false, \"head\": {\"attention_impl\": \"auto\", \"class\": \"dew.decision.head.DecisionHead\", \"dropout_rate\": 0.0, \"dtype\": null, \"features\": 64, \"layers\": 2, \"name\": null, \"precision\": null}, \"layout\": {\"blocks\": false, \"class\": \"dew.decision.layout.MarkerLayout\", \"framing\": null, \"head_max_len\": null, \"labels\": null, \"max_len\": 96, \"option_tokens\": null, \"order\": null, \"parallel\": true, \"segments\": null, \"split\": null, \"unit\": \"pieces\"}, \"none_of_the_above\": 0.0, \"scored\": false, \"specials\": {\"begin\": 254, \"class\": \"dew.decision.layout.Specials\", \"marker\": 0, \"marker_text\": \"\\u0000\", \"pad\": 255, \"separator\": 253}, \"tokenizer\": {\"encoding\": \"utf-8\", \"eos\": 255, \"name\": \"byte\"}}",
+     "declared": null,
+     "dependencies": {
+      "tokenizer": {
+       "encoding": "utf-8",
+       "eos": 255,
+       "name": "byte"
+      }
+     },
+     "exact": true,
+     "name": "dew.decision.rows.Fit"
+    },
+    {
+     "config": "{\"batch_fn\": null, \"class\": \"dew.data.pipeline.BatchStage\", \"drop_remainder\": true, \"size\": 2}",
+     "declared": null,
+     "dependencies": {},
+     "exact": true,
+     "name": "dew.data.pipeline.BatchStage"
+    }
+   ],
+   "tokenizer": {
+    "0/dew.decision.rows.Fit": {
+     "tokenizer": {
+      "encoding": "utf-8",
+      "eos": 255,
+      "name": "byte"
+     }
+    }
+   }
+  },
+  "members": {},
+  "order": {
+   "read": "streamed",
+   "seed": 0,
+   "source": "memory:42c29fba422c65293dca9c0df4f7680a5ed4dbef4f1db6314027ba19acc1d15f",
+   "stages": [
+    1
+   ]
+  },
+  "reached": [
+   [],
+   []
+  ],
+  "rejections": "drop",
+  "rules": {
+   "identity": "structured"
+  },
+  "topology": {},
+  "version": 15,
+  "volatile": false
+ },
+ "state_first": {
+  "cache": [],
+  "code": [
+   [],
+   []
+  ],
+  "derived": {
+   "0/shards": "32e6cd2c65e61e5d"
+  },
+  "exact": true,
+  "lowering": "per-share",
+  "manifest": {
+   "codec": 1,
+   "fill": {},
+   "schema": 1,
+   "source": {
+    "sources": [
+     {
+      "identity": null,
+      "rows": 4,
+      "sha256": "42c29fba422c65293dca9c0df4f7680a5ed4dbef4f1db6314027ba19acc1d15f",
+      "shard_rows": 1024,
+      "store": "memory"
+     }
+    ]
+   },
+   "steps": [
+    {
+     "config": "{\"bounds\": null, \"class\": \"dew.decision.rows.Fit\", \"context_length\": null, \"context_window\": null, \"grouped\": false, \"head\": {\"attention_impl\": \"auto\", \"class\": \"dew.decision.head.DecisionHead\", \"dropout_rate\": 0.0, \"dtype\": null, \"features\": 64, \"layers\": 2, \"name\": null, \"precision\": null}, \"layout\": {\"blocks\": false, \"class\": \"dew.decision.layout.StateFirstLayout\", \"framing\": null, \"head_max_len\": null, \"labels\": null, \"max_len\": 96, \"option_tokens\": null, \"order\": null, \"parallel\": false, \"segments\": null, \"split\": null, \"unit\": \"pieces\"}, \"none_of_the_above\": 0.0, \"scored\": false, \"specials\": {\"begin\": 254, \"class\": \"dew.decision.layout.Specials\", \"marker\": 0, \"marker_text\": \"\\u0000\", \"pad\": 255, \"separator\": 253}, \"tokenizer\": {\"encoding\": \"utf-8\", \"eos\": 255, \"name\": \"byte\"}}",
+     "declared": null,
+     "dependencies": {
+      "tokenizer": {
+       "encoding": "utf-8",
+       "eos": 255,
+       "name": "byte"
+      }
+     },
+     "exact": true,
+     "name": "dew.decision.rows.Fit"
+    },
+    {
+     "config": "{\"batch_fn\": null, \"class\": \"dew.data.pipeline.BatchStage\", \"drop_remainder\": true, \"size\": 2}",
+     "declared": null,
+     "dependencies": {},
+     "exact": true,
+     "name": "dew.data.pipeline.BatchStage"
+    }
+   ],
+   "tokenizer": {
+    "0/dew.decision.rows.Fit": {
+     "tokenizer": {
+      "encoding": "utf-8",
+      "eos": 255,
+      "name": "byte"
+     }
+    }
+   }
+  },
+  "members": {},
+  "order": {
+   "read": "streamed",
+   "seed": 0,
+   "source": "memory:42c29fba422c65293dca9c0df4f7680a5ed4dbef4f1db6314027ba19acc1d15f",
+   "stages": [
+    1
+   ]
+  },
+  "reached": [
+   [],
+   []
+  ],
+  "rejections": "drop",
+  "rules": {
+   "identity": "structured"
+  },
+  "topology": {},
+  "version": 15,
+  "volatile": false
+ }
+}
