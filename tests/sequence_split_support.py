@@ -39,19 +39,17 @@ sums over all of them."""
 
 
 
-def assert_split_as_whole(module, variables, row: str, seeds: int, site: str, *, width: int, shards: int = 4,
-                          call_fields: dict | None = None):
+def assert_split_as_whole(module, variables, row: str, seeds: int, site: str, *, width: int, shards: int = 4):
     """Under a sequence axis of `shards`, `module` with `variables` runs the rows `SPLIT_ROWS[row]` as it
     runs them on one device: a padded slot neither reads nor advances the conv or the state, each real
     token's conv reading the real tokens before it in its document across gaps and shards, and padded
     slots emit zero. Output and input gradient are check 1's against the unsplit layer, from float64, over
-    `seeds` draws of hidden states `width` wide, and so are the parameters' gradients. `call_fields` are the
-    call's others (`MixerCall`), a lightning layer's `depth`."""
+    `seeds` draws of hidden states `width` wide, and so are the parameters' gradients."""
     valid, segments = SPLIT_ROWS[row]
     fields = {"valid": jnp.asarray(np.broadcast_to(valid, (SPLIT_BATCH, 32)))}
     if segments is not None:
         fields["segments"] = jnp.asarray(np.broadcast_to(segments, (SPLIT_BATCH, 32)), jnp.int32)
-    call = MixerCall(AttentionMetadata(coordinates=coordinates(**fields)), **(call_fields or {}))
+    call = MixerCall(AttentionMetadata(coordinates=coordinates(**fields)))
 
     def draw(seed):
         rng = np.random.default_rng([0x5E9, seed])

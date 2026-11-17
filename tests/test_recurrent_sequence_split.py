@@ -77,50 +77,18 @@ LIGHTNING = LightningAttention(emb_features=WIDTH, num_heads=2, head_dim=8, slop
                                chunk_size=4)
 """MiniMax's lightning layer at a small geometry, the second of a stack of four."""
 
-LIGHTNING_CALL = {"depth": jnp.ones((SPLIT_BATCH, 32), jnp.int32)}
-"""The lightning layer's place in its stack, which sets its heads' rates."""
 
-
-@pytest.mark.mesh
-@pytest.mark.parametrize("row", sorted(SEEDS))
-def test_a_lightning_layer_split_over_the_sequence_runs_its_rows_as_whole_ones(row):
-    """Under a sequence axis of 4, a lightning layer runs each row as on one device, each shard from the
-    memory the earlier ones leave it (`lightning._sequence_memory`, row 7400), where it refused the axis."""
-    hidden = jnp.zeros((1, 32, WIDTH), jnp.float32)
-    variables = jax.tree.map(np.asarray, LIGHTNING.init(jax.random.key(7), hidden, MixerCall(
-        depth=jnp.ones((1, 32), jnp.int32))))
-    assert_split_as_whole(LIGHTNING, variables, row, SEEDS[row], f"lightning split over the sequence, {row}",
-                          width=WIDTH, call_fields=LIGHTNING_CALL)
-
-
-FORK_ROWS = [[3, 4, 5, 6, 7, 8, 9, 10, 11], [3, 4, 5, 6, 7, 8, 9, 12], [20, 21, 22, 23, 24]]
-"""Two rows over one prompt of seven tokens, and a row of its own."""
-
-FORK_SEEDS = 32
-"""Each mixer's declared draws over forks under the axis."""
-
-
-@pytest.mark.mesh
-@pytest.mark.parametrize("name", [*sorted(DECODE_MIXERS), "lightning"])
-def test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device(name):
-    """Under a sequence axis of 4, a call over forks runs whole, each document continuing its parent's state
-    across the axis (`linear.sequence_split`, row 7400), where `held_scan`'s forked path refused the axis:
-    its output and every gradient are check 1's against the same call on one device, from float64."""
-    from dew.data.forked_rows import ForkedRows
-    from dew.nn.inputs import AttentionMetadata
-
-    module = LIGHTNING if name == "lightning" else DECODE_MIXERS[name]
-    forks = ForkedRows.pack(FORK_ROWS, 24)
-    batch, length = forks.tokens.shape
-    depth = jnp.ones((batch, length), jnp.int32) if name == "lightning" else None
-    call = MixerCall(AttentionMetadata(coordinates=forks.coordinates), depth=depth)
-    hidden = jnp.zeros((batch, length, WIDTH), jnp.float32)
-    variables = jax.tree.map(np.asarray, module.init(jax.random.key(7), hidden, MixerCall(depth=depth)))
+def assert_as_on_one_device(module, call: MixerCall, shape: tuple[int, int], seeds: int, site: str):
+    """Under a sequence axis of 4, `module` called with `call` over hidden states of `shape` `[B, S]` and
+    `WIDTH` wide computes as on one device: its output and every gradient check 1's against the same call
+    on one device, from float64."""
+    depth = None if call.depth is None else jnp.ones((1, shape[1]), jnp.int32)
+    variables = jax.tree.map(np.asarray, module.init(jax.random.key(7), jnp.zeros((1, shape[1], WIDTH)),
+                                                     MixerCall(depth=depth)))
 
     def draw(seed):
         rng = np.random.default_rng([0x7400, seed])
-        return (rng.standard_normal((batch, length, WIDTH)).astype(np.float32),
-                rng.standard_normal((batch, length, WIDTH)).astype(np.float32))
+        return tuple(rng.standard_normal((*shape, WIDTH)).astype(np.float32) for _ in range(2))
 
     def pulled(model):
         def run(params, hidden, cotangent):
@@ -141,8 +109,51 @@ def test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device(na
         with jax.enable_x64(new_val=True):
             return wide(*widened((variables, hidden, cotangent)))
 
-    assert_as_exact(split, lambda hidden, cotangent: whole(variables, hidden, cotangent), draw,
-                    f"{name} over forks under a sequence axis", seeds=FORK_SEEDS, truth_fn=truth)
+    assert_as_exact(split, lambda hidden, cotangent: whole(variables, hidden, cotangent), draw, site,
+                    seeds=seeds, truth_fn=truth)
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("row", sorted(SEEDS))
+def test_a_lightning_layer_split_over_the_sequence_runs_its_rows_as_whole_ones(row):
+    """Under a sequence axis of 4, a lightning layer runs each row of `SEEDS`' as on one device, each shard
+    from the memory the earlier ones leave it (`lightning._sequence_memory`, row 7400), where it refused the
+    axis: real tokens, packed documents, right padding and an interior shard of padding."""
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata
+
+    valid, segments = SPLIT_ROWS[row]
+    tokens = coordinates(valid=jnp.asarray(np.broadcast_to(valid, (SPLIT_BATCH, 32))),
+                         segments=None if segments is None else jnp.asarray(
+                             np.broadcast_to(segments, (SPLIT_BATCH, 32)), jnp.int32))
+    call = MixerCall(AttentionMetadata(coordinates=tokens), depth=jnp.ones((SPLIT_BATCH, 32), jnp.int32))
+    assert_as_on_one_device(LIGHTNING, call, (SPLIT_BATCH, 32), SEEDS[row],
+                            f"lightning split over the sequence, {row}")
+
+
+FORK_ROWS = [[3, 4, 5, 6, 7, 8, 9, 10, 11], [3, 4, 5, 6, 7, 8, 9, 12], [20, 21, 22, 23, 24]]
+"""Two rows over one prompt of seven tokens, and a row of its own."""
+
+FORK_SEEDS = 32
+"""Each mixer's declared draws over forks under the axis."""
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", [*sorted(DECODE_MIXERS), "lightning"])
+def test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device(name):
+    """Under a sequence axis of 4, a call over forks runs whole, each document continuing its parent's state
+    across the axis (`linear.sequence_split`, row 7400), where `held_scan`'s forked path refused the axis
+    (`assert_as_on_one_device`)."""
+    from dew.data.forked_rows import ForkedRows
+    from dew.nn.inputs import AttentionMetadata
+
+    module = LIGHTNING if name == "lightning" else DECODE_MIXERS[name]
+    forks = ForkedRows.pack(FORK_ROWS, 24)
+    batch, length = forks.tokens.shape
+    depth = jnp.ones((batch, length), jnp.int32) if name == "lightning" else None
+    call = MixerCall(AttentionMetadata(coordinates=forks.coordinates), depth=depth)
+    assert_as_on_one_device(module, call, (batch, length), FORK_SEEDS,
+                            f"{name} over forks under a sequence axis")
 
 
 CONV_SEEDS = 96
