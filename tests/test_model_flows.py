@@ -184,16 +184,17 @@ def _site(salt: int = 5461):
 
 
 def test_a_prepared_site_judges_as_one_that_computes_its_truth_and_refuses_a_missing_or_stale_one(tmp_path):
-    """A site prepared (`compiled_truths(prepare=True)`) compiles its truth's programs for every shape its
-    stages' draws take and runs no arm; judged from that store it passes as it passes computing its own; a
-    store of another stamp, of another site, or of other shapes than a draw's is a red (`MissingTruth`),
-    never a program compiled in its place."""
+    """A site prepared (`compiled_truths(prepare=True)`) compiles its truth's programs and its arms' for every
+    shape its stages' draws take and runs no arm; judged from that store it passes as it passes computing
+    its own; a store of another stamp, of another site, of other shapes than a draw's, or of another Dew arm
+    than the run's is a red (`MissingTruth`), never a program compiled in its place."""
     dew, reference, draw = _site()
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
-        assert_as_exact(None, reference, draw, "a prepared product", seeds=8)
+        assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
         with pytest.raises(ValueError):
-            assert_as_exact(None, reference, draw, "a prepared product", seeds=8)
-    assert len(list(tmp_path.iterdir())) == 1
+            assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
+    # The site's truths and its arms, each held apart.
+    assert len(list(tmp_path.iterdir())) == 2
     assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
@@ -209,6 +210,12 @@ def test_a_prepared_site_judges_as_one_that_computes_its_truth_and_refuses_a_mis
     with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
         assert_as_exact(dew, reference, wider, "a prepared product", seeds=8)
 
+    def rounded_twice(a, b):
+        return dew(a, b).astype(jnp.bfloat16).astype(jnp.float32)
+
+    with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
+        assert_as_exact(rounded_twice, reference, draw, "a prepared product", seeds=8)
+
 
 def test_a_compiled_sites_run_traces_none_of_its_truth(tmp_path):
     """Judged from programs compiled ahead (`compiled_truths(prepare=False)`), a site's run computes every
@@ -222,7 +229,7 @@ def test_a_compiled_sites_run_traces_none_of_its_truth(tmp_path):
         return jnp.dot(a, b)
 
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
-        assert_as_exact(None, reference, draw, "a product's truth", seeds=8, truth_fn=truth)
+        assert_as_exact(dew, reference, draw, "a product's truth", seeds=8, truth_fn=truth)
     assert traced
     traced.clear()
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
@@ -230,6 +237,33 @@ def test_a_compiled_sites_run_traces_none_of_its_truth(tmp_path):
     assert not traced
     assert_as_exact(dew, reference, draw, "a product's truth", seeds=8, truth_fn=truth)
     assert traced
+
+
+def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
+    """Judged from programs compiled ahead (`compiled_truths(prepare=False)`), a site's run computes every
+    draw's arms with them and runs none of its arms' code, which its prepare alone traced (a GPU run then
+    traces, lowers and compiles none of them); computing its own, a site traces both. Its verdict is the
+    one a site computing its arms reaches."""
+    dew, reference, draw = _site()
+    traced: list[str] = []
+
+    def dew_arm(a, b):
+        traced.append("dew")
+        return dew(a, b)
+
+    def reference_arm(a, b):
+        traced.append("reference")
+        return reference(a, b)
+
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
+    assert set(traced) == {"dew", "reference"}
+    traced.clear()
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
+    assert not traced
+    assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
+    assert set(traced) == {"dew", "reference"}
 
 
 def test_a_window_loops_truth_is_computed_window_by_window_from_its_windows_program(tmp_path):
@@ -249,10 +283,12 @@ def test_a_window_loops_truth_is_computed_window_by_window_from_its_windows_prog
         return jnp.matmul(*(operand.astype(jnp.bfloat16).astype(operand.dtype) for operand in (a, b)))
 
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
-        assert_as_exact(None, over_windows(reference), windowed, "a product over windows", seeds=8)
-        assert_as_exact(None, over_windows(reference), windowed, "a product over windows, its terms",
-                        seeds=8, terms=terms)
-        assert_as_exact(None, over_windows(stacked), windowed, "a product over windows, walked", seeds=8,
+        assert_as_exact(over_windows(dew), over_windows(reference), windowed, "a product over windows",
+                        seeds=8)
+        assert_as_exact(over_windows(dew), over_windows(reference), windowed,
+                        "a product over windows, its terms", seeds=8, terms=terms)
+        assert_as_exact(over_windows(dew), over_windows(stacked), windowed, "a product over windows, walked",
+                        seeds=8,
                         terms=True)
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(over_windows(dew), over_windows(reference), windowed, "a product over windows",
@@ -282,14 +318,15 @@ def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
         return cancelling(a, b).at[16].add(a[0, 0] * b[0, :])
 
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
-        assert_as_exact(None, cancelling, draw, "a cancelling product", seeds=8)
+        assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
+        assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product, a term left", seeds=8)
     assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
     with pytest.raises(GateFailure) as computing:
         assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product", seeds=8)
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
         with pytest.raises(GateFailure) as stored:
-            assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product", seeds=8)
+            assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product, a term left", seeds=8)
     # Sized by its terms the row fails the sized rows' rule; read without them it would fail the rule of
     # rows of float64 zero.
     assert [finding.rule for finding in stored.value.findings] == [
