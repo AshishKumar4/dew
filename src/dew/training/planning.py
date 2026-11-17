@@ -450,7 +450,7 @@ class Rung:
 
     def put(self, objective) -> None:
         """`objective` at this rung: its modules and its head's tile and fusion. The options and copies are
-        its compiler's or its search's to set (`FitSearch.at`, `StepCompiler._at_plan`)."""
+        its compiler's or its search's to set (`FitSearch.at`, `StepCompiler._planned`)."""
         objective.substitute(list(self.modules))
         objective.restore_head(self.tile, fused=self.fused)
 
@@ -756,8 +756,7 @@ class FitSearch[LossT, EffectsT]:
     the split, its candidate, executable and the options it compiled under, and its sampled step. The plan
     is the one at the rung `searched` settles on (`found`)."""
     sampled: SampledStep | None = None
-    """The last measured candidate's sampled step (`measured`)."""
-    """The fitted plan's sampled step, which summarizes what the run inspects (`Candidate.sampled`)."""
+    """The last measured candidate's sampled step (`measured`), which summarizes what the run inspects."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
     is that program (`AheadOfTime.taken`), lowered as its own compile lowered it (`handed`: within its
