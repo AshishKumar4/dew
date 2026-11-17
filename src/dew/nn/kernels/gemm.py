@@ -1439,6 +1439,9 @@ def _prologue_cotangents(prologue, lhs, arrays, axes_of, group_sizes, d_operand)
     nonempty = jnp.sum(group_sizes) > 0
 
     def kept(array, axis):
+        # An axis of no rows (a call of none, row 7610) holds no row to keep and none to take in its place.
+        if array.shape[axis] == 0:
+            return array
         shape = [1] * array.ndim
         shape[axis] = array.shape[axis]
         return jnp.where(routed.reshape(shape), array, jax.lax.slice_in_dim(array, 0, 1, axis=axis))
