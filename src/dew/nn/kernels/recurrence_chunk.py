@@ -261,17 +261,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                       max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
             else:
                 size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
-                reads = hooks.reads
-                if reads == 'apart':
-                    decay = accurate_exp(jnp.asarray(g, work))
-                    decay = decay if g.ndim == query.ndim else decay[..., None]
-                    query, reads = query.astype(work) * decay, 'before'
-                out, final = xla_mainloop(Tiles(size), query, key, wide, g, beta, state, starts, firsts,
-                                          scale=scale, delta=hooks.delta, dtype=work,
-                                          bound=hooks.inverse_bound, forked=carried, reads=reads,
-                                          own=given['own'] if hooks.own_weight else None)
-                if hooks.ranks > 1:
-                    out = out - scale * _group_read(query, key, wide, g, beta, hooks.ranks)
+                out, final = _portable(hooks, Tiles(size), query, key, wide, g, beta, state, starts, firsts,
+                                       scale=scale, dtype=work, forked=carried,
+                                       own=given['own'] if hooks.own_weight else None)
             out = out.astype(work)
             return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
 
@@ -1011,6 +1003,24 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                     product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4,
                     forked=forked is not None, readout=readout, apart=apart)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
+
+
+def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta, state, starts, firsts, *,
+              scale: float, dtype, forked, own):
+    """The portable math's chunked op (`xla_mainloop`) under `hooks`' readout: a readout apart from its
+    token's writes (`Hooks.reads` 'apart') as its decayed query's read of the state entering the token,
+    `(g q)^T S`, exactly the state after the update less the token's write, and of a group of more than one
+    token (`Hooks.ranks`) less the group's earlier writes (`_group_read`)."""
+    reads = hooks.reads
+    if reads == 'apart':
+        decay = accurate_exp(jnp.asarray(g, dtype))
+        query, reads = query.astype(dtype) * (decay if g.ndim == query.ndim else decay[..., None]), 'before'
+    out, final = xla_mainloop(tiles, query, key, value, g, beta, state, starts, firsts, scale=scale,
+                              delta=hooks.delta, dtype=dtype, bound=hooks.inverse_bound, forked=forked,
+                              reads=reads, own=own)
+    if hooks.ranks > 1:
+        out = out - scale * _group_read(query, key, value, g, beta, hooks.ranks)
+    return out, final
 
 
 def _group_read(query, key, value, g, beta, group: int) -> jax.Array:
