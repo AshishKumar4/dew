@@ -7,6 +7,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A decision's context is an ordinary condition of its objective's inputs (`DecisionObjective.inputs`), and a
+  run may configure its encoder as any registered condition encoder (`--context-text.encoder`,
+  `--context-text.checkpoint`, as a diffusion run's text condition), in place of the backbone's own token table
+  or pass: its tokenization reads the context, its states reach the context layers at its width, its weights
+  are the model's `context` module, a run records it and its task rebuilds it.
 - Programs a process keeps (`dew.training.ahead.keeping`) are kept and handed by their fingerprint: the
   digest of the lowered program, its trees and its arguments' types under the XLA options it compiled
   with (`dew.nn.kernels.options.program_digest`), with the target they were built for (`BuildTarget`).
