@@ -38,15 +38,17 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.ad_checkpoint import checkpoint_name
 
-from dew.mesh import LayoutRefused
+from dew.mesh import SEQUENCE_AXIS, LayoutRefused
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.kernels import chunked_launch, recurrence_algebra, recurrence_chunk
+from dew.nn.kernels.recurrence_chunk import RESET_DECAY
 from dew.nn.kv_cache import Opened, compute_dtype
-from dew.nn.linear import DepthwiseConv1d, held_scan, scan_cache
+from dew.nn.linear import DepthwiseConv1d, held_scan, over_sequence, scan_cache, sequence_conv
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, softplus
@@ -235,10 +237,10 @@ class Mamba(nn.Module):
         tokens = coordinates_of(attention_metadata, batch, length)
         valid = tokens.valid
         shards = sequence_shards()
-        if shards > 1:
+        if shards > 1 and decode and tokens.forks is None:
             raise LayoutRefused(
-                f"mamba scans whole sequences, and the mesh splits them {shards} ways over its "
-                "sequence axis; run it on a mesh with sequence=1")
+                f"mamba under a sequence axis of {shards} runs whole training sequences; a decode step "
+                "holds one state per row. Decode on a mesh with sequence=1.")
         if valid is not None:
             x = jnp.where(valid[:, :, None], x, 0)
         mixed, gate = jnp.split(self.in_proj(x), 2, axis=-1)
@@ -246,20 +248,44 @@ class Mamba(nn.Module):
         # casts them, or in the model's own dtype where it is wider.
         wide = at_least_fp32(mixed.dtype)
         taps, bias = self.conv1d()
-        out = held_scan(self, mixed, taps, bias, self._scan, (self.intermediate_size, self.state_size),
-                        decode=decode, coordinates=tokens, spec=self.cache_spec(batch) if decode else None,
-                        state_dtype=wide, conv_dtype=wide, dtype=wide)
+        if shards > 1 and tokens.forks is None:
+            # Each shard convolves its slice reading the real tokens before it from the earlier ones
+            # (`sequence_conv`); the step, B and C come token by token outside; each shard scans from
+            # zero, then from the state the earlier ones leave it (`_sequence_scan`), as Mamba-2's does.
+            convolved = over_sequence(functools.partial(_sequence_conv, dtype=wide), shards,
+                                      (mixed.astype(wide), tokens.segments, valid), ((taps, bias),))
+            xs, step, B, C = self._projected(convolved, valid)
+            out = over_sequence(functools.partial(_sequence_scan, chunk_size=self.chunk_size), shards,
+                                (xs, step, B, C, tokens.starts),
+                                ((-jnp.exp(jnp.asarray(self.A_log, wide)), jnp.asarray(self.D, wide)),))
+            # The scan's output as `held_scan` names it, a mixer's 'context' and a recurrence's 'scan'.
+            out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+        else:
+            out = held_scan(self, mixed, taps, bias, self._scan, (self.intermediate_size, self.state_size),
+                            decode=decode, coordinates=tokens,
+                            spec=self.cache_spec(batch) if decode else None, state_dtype=wide,
+                            conv_dtype=wide, dtype=wide)
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
         gated = out * nn.silu(gate.astype(wide))
         return self.out_proj(gated.astype(gate.dtype))
 
     def _scan(self, convolved, *, starts, valid, held, forked=None):
-        """The selective scan of the convolved `[B, S, D]` inner channels:
-        the raw step, B and C from `x_proj`, then the step through
-        `dt_proj`. Returns `[B, S, D]` before the gate and the state leaving
-        it; a forked call's documents from its table (`forked` its `(loads,
-        stores, held)`, `held` its given states, `recurrence_chunk.selective_scan`)."""
+        """The selective scan of the convolved `[B, S, D]` inner channels (`_projected`). Returns `[B, S,
+        D]` before the gate and the state leaving it; a forked call's documents from its table (`forked`
+        its `(loads, stores, held)`, `held` its given states, `recurrence_chunk.selective_scan`)."""
+        xs, step, B, C = self._projected(convolved, valid)
+        wide = xs.dtype
+        # The scan on the kernel its selector gives each product (`recurrence_chunk.SELECTIVE`).
+        return recurrence_chunk.selective_scan(
+            xs, step, -jnp.exp(jnp.asarray(self.A_log, wide)), B, C, jnp.asarray(self.D, wide), held, starts,
+            portable=functools.partial(selective_scan, chunk_size=self.chunk_size),
+            **({} if forked is None else dict(zip(("loads", "stores", "held"), forked, strict=True))))
+
+    def _projected(self, convolved, valid):
+        """The scan's operands from the convolved `[B, S, D]` inner channels, token by token: the channels
+        (padding zero), the step (the raw step, B and C from `x_proj`, then the raw step through
+        `dt_proj`; zero on padding), B and C."""
         xs = convolved
         if valid is not None:
             xs = jnp.where(valid[:, :, None], xs, 0)
@@ -271,12 +297,33 @@ class Mamba(nn.Module):
         if valid is not None:
             # A zero step neither decays nor writes the state.
             step = jnp.where(valid[:, :, None], step, 0.0)
-        wide = xs.dtype
-        # The scan on the kernel its selector gives each product (`recurrence_chunk.SELECTIVE`).
-        return recurrence_chunk.selective_scan(
-            xs, step, -jnp.exp(jnp.asarray(self.A_log, wide)), B, C, jnp.asarray(self.D, wide), held, starts,
-            portable=functools.partial(selective_scan, chunk_size=self.chunk_size),
-            **({} if forked is None else dict(zip(("loads", "stores", "held"), forked, strict=True))))
+        return xs, step, B, C
+
+
+def _sequence_conv(mixed, segments, valid, taps, bias, *, dtype):
+    """This shard's slice of the conv, inside a `shard_map` that holds the sequence axis manual
+    (`over_sequence`): each real token reading the `K-1` real tokens before it in its document, from the
+    earlier shards too (`sequence_conv`)."""
+    return sequence_conv(mixed, taps, bias, segments, valid, dtype=dtype)
+
+
+def _sequence_scan(xs, step, B, C, starts, A, D, *, chunk_size: int):
+    """This shard's slice of the selective scan, inside a `shard_map` that holds the sequence axis manual
+    (`over_sequence`): run from zero, the state it leaves and its span's log decay `A sum(dt)` (a document
+    start in it zeroing the decay, `RESET_DECAY`) give the state the earlier shards leave it
+    (`recurrence_algebra.entering`, each channel's and state's decay its own: the span laid as `[B, D N]`
+    decays of `[1, 1]` memories), and the scan runs again from that state, a start in it dropping it as on
+    one device."""
+    _, leaving = selective_scan(xs, step, A, B, C, D, None, starts, chunk_size)
+    batch, channels, states = leaving.shape
+    decay = jnp.sum(step, axis=1)[..., None] * A                    # [B, D, N]
+    if starts is not None:
+        decay = jnp.where(jnp.any(starts, axis=1)[:, None, None], RESET_DECAY, decay)
+    span = recurrence_algebra.Span(decay.reshape(batch, channels * states),
+                                   leaving.reshape(batch, channels * states, 1, 1))
+    entering = recurrence_algebra.entering(span, SEQUENCE_AXIS).reshape(batch, channels, states)
+    out, _ = selective_scan(xs, step, A, B, C, D, entering, starts, chunk_size)
+    return out
 
 
 class _StepProjection(nn.Module):
