@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import generations
+from generation_support import COMPILES_ON_CPU, generations
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.gated_mlp import fused_products
@@ -71,6 +71,7 @@ def test_a_composed_mlp_holds_check_1_with_its_gradients(generation_name):
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("generation_name", ["sm90", "sm100"])
 def test_a_composed_mlps_training_step_compiles_within_its_resources(generation_name):
     """A gated MLP's three products composed on the template's hooks (`_composed`) at the 4B's MLP (2560 to
