@@ -1661,7 +1661,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     stood = followed.visited(followed.log_events(log)) if expired or not report.is_file() else []
     running = stood[-1] if stood else None
     for name in tests:
-        own = [case for case in cases if grading.file_of(case) == name]
+        own = [case for case in cases if grading.of(case, name)]
         red, failed, cause = grading.graded(name, own, cases, counts.get(name, {}), report.is_file(),
                                             returncode, deadline if expired else None, running, pid.is_file(),
                                             running)
