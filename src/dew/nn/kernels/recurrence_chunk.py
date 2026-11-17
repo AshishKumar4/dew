@@ -207,10 +207,11 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         firsts = forked.firsts
         max_segments = firsts.shape[1]
     readout = hooks.reads == 'after' and not hooks.own_weight
-    # A readout apart from its token's own write (Mamba-3's) the template forms under a decay a head without
-    # the delta rule (`mainloop.Call.apart`); the portable math as the decayed query's read of the state
-    # entering the token, `(g q)^T S`, exactly the state after the update less the token's write.
-    apart = hooks.reads == 'apart' and not hooks.own_weight
+    # A readout apart from its token's own write (Mamba-3's) the template forms under a decay a head or none
+    # without the delta rule (`mainloop.Call.apart`); any other the portable math takes, as the decayed
+    # query's read of the state entering the token, `(g q)^T S`, exactly the state after the update less
+    # the token's write.
+    apart = hooks.reads == 'apart' and not hooks.own_weight and hooks.decay != 'vector' and not hooks.delta
     if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None and readout:
         # Each of its routes adds the skip, the port in its kernels.
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, firsts, chunk_size,
