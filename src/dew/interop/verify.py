@@ -53,14 +53,7 @@ from flax import traverse_util as flax_traverse
 from dew import _records
 from dew._cache import package_digest
 from dew._isolated import Isolated, prepared_script
-from dew.interop import (
-    codecs,
-    decoder_config,
-    decoder_parts,
-    hf_decoders as decoders,
-    parts,
-    sources,
-)
+from dew.interop import codecs, decoder_config, decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.probe import BATCH, LENGTH, probe_ids
 from dew.nn.blocks import padded_row
