@@ -108,7 +108,7 @@ def test_each_row_holds_its_questions_at_their_spans_and_its_state_as_far_as_it_
                     named = [json.loads(text(written[low:high]))["option_id"] for low, high in spans]
                     assert len(set(named)) == len(named) == len(question.options)
                     continue
-                shown = [question.options[slot] for slot in laid.slots]
+                shown = [question.options[slot] for slot in laid.order]
                 for (low, high), option in zip(spans, shown, strict=True):
                     if layout.labels is None:
                         assert (high - low, written[low]) == (1, SPECIALS.marker)
