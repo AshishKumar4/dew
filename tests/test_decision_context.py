@@ -402,6 +402,15 @@ class Conditioning(CharTable):
     keyword = "conditioning"
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class Wide(CharTable):
+    """A character table whose states are the tiny Laya backbone's width, 128 features."""
+
+    @classmethod
+    def from_pretrained(cls, checkpoint: str = "char_table", **settings) -> "Wide":
+        return super().from_pretrained(checkpoint, **{"features": 128, **settings})
+
+
 def configured(tokens: int = 12, *, trained: bool = False) -> DecisionObjective:
     """A decision over the tiny Llama whose context is encoded by a configured encoder (`CharTable`, a
     character table of 16 features) in place of the backbone's own, read by fresh cross-attention before
@@ -913,3 +922,23 @@ def test_a_run_from_a_saved_run_holds_its_configured_encoders_weights_frozen_or_
         assert "context" not in second.variables.get(other, {})
     with pytest.raises(ValueError):
         dataclasses.replace(decision(tmp_path, drawn=False), context_text_trained=True).prepare()
+
+
+def test_a_shared_cross_attention_reads_a_configured_encoder_of_the_backbones_width(tmp_path):
+    """`--context-form shared` reads a configured encoder's states in the layer's own attention, at the
+    backbone's width: an encoder of that width (`Wide`, 128 features as the tiny Laya backbone) trains a
+    step, and one of another width (char_table's 16) is refused by the layer's own width check. Every
+    configured encoder was refused under the shared form (row 7613)."""
+    from run_kinds import decision, trained
+
+    from dew.inputs.spec import TextCondition
+
+    run = dataclasses.replace(decision(tmp_path, drawn=False), context_layers=(0,), context_length=32,
+                              context_form="shared", calibrate=False,
+                              context_text=TextCondition(encoder=f"{__name__}:Wide", checkpoint="char_table"))
+    state, _ = trained(run, tmp_path, "shared")
+    assert "context" in state.variables[FROZEN]
+    table = TextCondition(encoder="char_table", checkpoint="char_table")
+    narrow = dataclasses.replace(run, context_text=table)
+    with pytest.raises(ValueError):
+        trained(narrow, tmp_path, "narrow")
