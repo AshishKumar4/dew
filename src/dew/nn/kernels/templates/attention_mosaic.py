@@ -1513,19 +1513,25 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return None
         if (walked := self.walked(ba, target)) is not None:
             return walked
-        query, key = ba.arguments["query"], ba.arguments["key"]
-
-        def fits(config: BackwardTiles) -> bool:
-            return self.takes(ba, config, target)
-
-        derive = functools.partial(_derived, least_held=_role_rows)
-
+        query = ba.arguments["query"]
         # The dK/dV launch on the layout whose consumers feed their rings where one is, its two consumers
         # splitting each slot's queries (`split_queries`); else on the dQ launch's.
         fed = [layout for layout in self._layouts(target.generation, query.dtype) if split_queries(layout)]
         # The dK/dV launch's consumers a backward's at most (`BACKWARD_CONSUMERS`), whatever its layout's.
         dkv = ({"dkv_family": fed[0].name, "dkv_consumers": min(fed[0].consumers, BACKWARD_CONSUMERS)}
                if fed else {})
+        return self._one_launch(ba, target, family, fed, dkv) or self._two_launches(ba, target, family, dkv)
+
+    def _one_launch(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, family: mosaic.Family,
+                    fed: list, dkv: dict) -> BackwardTiles | None:
+        """`derived`'s one launch: on the fed layout with its consumers (FlashAttention 3's CTA), keys first
+        on the dQ launch's layout, or a key block its consumers share; None where none holds."""
+        query, key = ba.arguments["query"], ba.arguments["key"]
+
+        def fits(config: BackwardTiles) -> bool:
+            return self.takes(ba, config, target)
+
+        derive = functools.partial(_derived, least_held=_role_rows)
         # The one launch, legal where the form, the hooks, the widths, the registers and the mode allow
         # (`legal`), the first that holds (design §7: legality steps down, nothing is ranked). Queries first
         # on the layout whose consumers feed their rings, each consumer its own keys over the query stream
@@ -1563,6 +1569,18 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             if config := derive(layout, query.dtype, key.shape[1], query.shape[1], sharing, fits,
                                   overlapped=True):
                 return config
+        return None
+
+    def _two_launches(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, family: mosaic.Family,
+                      dkv: dict) -> BackwardTiles | None:
+        """`derived`'s two launches, the dQ launch then the keys-first dK/dV one; None where none holds."""
+        query, key = ba.arguments["query"], ba.arguments["key"]
+
+        def fits(config: BackwardTiles) -> bool:
+            return self.takes(ba, config, target)
+
+        derive = functools.partial(_derived, least_held=_role_rows)
+
         # The fewest dK/dV programs a key block's widths split among whose share of the sums its consumer's
         # registers hold (`BackwardTiles.columns`: a width of 256's whole dK and dV sums pass them).
         # Its logits' queries a stream of their own, else where that passes the block staged a step
@@ -1571,9 +1589,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # launch's tiles that many rows a side (an A100's heads 256 wide: every 64-row tile's two stages of
         # queries and output cotangents beside its resident keys and values past its 166,912 bytes, the
         # two launches at 32 x 32 150,560, et-bwd256sm80).
-        # Fewer rows a consumer for a call with no score hook: a hook's parameters and pullback tiles laid out
-        # at a role's rows, sliced at fewer, fail to lower (an A100's accurate dQ under a temperature at 32 x
-        # 32: "slice size (32) ... divisible by the tile size (64)", acchook3; FS-A100CHECK1d's row-indexed).
+        # Fewer rows a consumer for a call with no score hook, or on a family reading its fragments from
+        # registers under a hook reading no query's place (`_fewer_hooked`): a row-indexed hook's term sliced
+        # at fewer rows fails to lower (FS-A100CHECK1d's row-indexed).
         # Whole columns at fewer rows before a column split at the role's: a split recomputes each step's
         # score products once a share, where fewer rows keep the work and halve the tile (an A100's
         # bf16 backward 128 wide at 32 x 32 whole took 0.82 to 0.88 of 64 x 64 in two shares, 1 x 8192

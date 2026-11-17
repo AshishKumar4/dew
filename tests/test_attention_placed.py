@@ -286,7 +286,7 @@ def test_a_tcgen05_devices_backward_derives_its_walked_launches(name):
         residuals = jax.eval_shape(lambda q, k, v: attention_mosaic.forward(
             q, k, v, spans, residuals=template.Kept.SPLIT), query, key, key)[1:]
         op, args = attention_mosaic._backward_call(query, key, key, spans, None, query, tuple(residuals),
-                                                   scale=None, natural=attention_mosaic.NATURAL)
+                                                   scale=None, natural=attention_mosaic.NATURAL, accurate=False)
         ba, target = op.bind(*args, interpret=False), generation.gpu_target()
         walked, derived = op.walked(ba, target), op.derived(ba, target)
     if name == "sm100":
