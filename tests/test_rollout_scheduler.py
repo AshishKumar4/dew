@@ -417,3 +417,21 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
         assert watched.results[sample].status is Status.CANCELLED and not watched.results[sample].calls
     assert all(rollout.status is Status.INFRA_ERROR and not rollout.calls
                for rollout in watched.rollouts if int(rollout.task) % 5 == 1)
+
+
+def test_a_served_rollouts_server_shares_its_prompts_pages_by_default():
+    """A served rollout's server (`RolloutScheduler.serve`) that names no page size pages its cache where
+    paging computes what the model computes, its prefix cache on as a paged server keeps one, so a group's
+    samples of one prompt prefill it once (row 5375); a model whose LongRoPE rebuilds a crossing request
+    keeps each row's cache whole."""
+    from model_support import serving_task
+
+    from dew.nn.rope import LongRopeScaling
+
+    task = serving_task(capacity=64)
+    assert RolloutScheduler.serve(task, slots=4, capacity=64).reuses_prefixes
+    # Factors for each of a head's 8 widths' rotated pairs.
+    scaling = LongRopeScaling(short_factor=(1.0,) * 4, long_factor=(2.0,) * 4,
+                              original_max_position_embeddings=16)
+    rebuilding = dataclasses.replace(task, model=task.model.clone(rope_scaling=scaling))
+    assert not RolloutScheduler.serve(rebuilding, slots=4, capacity=64).reuses_prefixes
