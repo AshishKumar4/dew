@@ -1098,27 +1098,28 @@ def test_a_saved_runs_tokenizer_record_naming_a_file_out_of_its_directory_is_ref
     (run / "saved_runs" / "victim").mkdir(parents=True)
     (run / "saved_runs" / "victim" / "run.json").write_bytes(planted)
     with pytest.raises(ValueError):
-        tokenizer_for("org/name", files=files, held=str(run)).pinned
+        tokenizer_for("org/name", files=files, held=str(run)).dependencies()
     assert victim.read_text() == "the host's own run"
     assert not (cache / "dew" / "tokenizers").exists() or not any((cache / "dew" / "tokenizers").iterdir())
 
 
-def test_a_held_tokenizer_file_linking_out_of_its_directory_is_refused(tmp_path):
-    """A run's held tokenizer whose file is a link out of its directory, to a file whose hash the record
-    states, is refused as it is copied (`copy_checked`): the copy reads the tokenizer's own files alone."""
-    from etils import epath
+def test_a_runs_held_tokenizer_file_linking_out_of_its_directory_is_refused(tmp_path, monkeypatch):
+    """A saved run's held tokenizer whose file is a link out of its directory, to a file of the hash the
+    record states, is refused as the run's tokenizer is read, before it is copied: the copy reads the
+    run's own files alone (the morning audit of 2026-11-17, PRODUCT-AM-01)."""
+    from dew.data.text import HELD_FILES, held_place, tokenizer_for
 
-    from dew.data.text import copy_checked
-
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     outside = tmp_path / "outside.json"
     outside.write_text("{}")
-    source = tmp_path / "held"
-    source.mkdir()
-    (source / "tokenizer.json").symlink_to(outside)
+    files = {"tokenizer.json": hashlib.sha256(b"{}").hexdigest()}
+    held = held_place(str(tmp_path / "run"), files)
+    held.mkdir(parents=True)
+    (held / HELD_FILES).write_text(json.dumps(files))
+    (held / "tokenizer.json").symlink_to(outside)
     with pytest.raises(ValueError):
-        copy_checked(epath.Path(source), epath.Path(tmp_path / "copy"),
-                     {"tokenizer.json": hashlib.sha256(b"{}").hexdigest()})
-    assert not (tmp_path / "copy").exists()
+        tokenizer_for("org/name", files=files, held=str(tmp_path / "run")).dependencies()
+    assert not (tmp_path / "cache" / "dew" / "tokenizers").exists()
 
 
 def test_a_run_holds_its_objectives_own_tokenizer_checked_file_by_file(tmp_path):

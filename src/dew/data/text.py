@@ -357,7 +357,9 @@ class HFTokenizer:
         if self.files is not None and self.held is not None:
             place = held_place(self.held, self.files)
             if (place / HELD_FILES).exists():
-                # The copy its run holds, as a directory of this host's (a run on a bucket among them).
+                # The copy its run holds, as a directory of this host's (a run on a bucket among them), its
+                # files its own: a run is outside input, and a link out would copy another file in.
+                _unlinked(place, self.files)
                 source = cached_tokenizer(place, self.files)
         pinned = pin_tokenizer(source, local_files_only=self.local_files_only)
         if self.files is not None and pinned.files != self.files:
@@ -979,17 +981,23 @@ def confined_files(files: Mapping[str, str]) -> dict[str, str]:
     return dict(files)
 
 
+def _unlinked(held: epath.Path, files: Mapping[str, str]) -> None:
+    """Refuse (ValueError) a run's held tokenizer copy (`held_place`) a file of which a link takes out of
+    its directory; a bucket's holds no links."""
+    if is_uri(str(held)):
+        return
+    root = Path(held).resolve()
+    for path in files:
+        if not Path(held / path).resolve().is_relative_to(root):
+            raise ValueError(f"the tokenizer the run holds at {held} links {path} out of its directory")
+
+
 def copy_checked(source: epath.Path, target: epath.Path, files: Mapping[str, str]) -> None:
     """Each of a tokenizer's `files` copied from the directory `source` into `target`, each read and checked
-    against its hash before it is written: a path out of the directory (`confined_files`), or a local file
-    a link takes out of it, is refused, and a file missing, or whose bytes differ, naming it. The one copier
-    of a tokenizer's files, into a run (`dew.inference.tasks.hold_tokenizer`) and into this host's cache
-    (`cached_tokenizer`)."""
-    files = confined_files(files)
-    for path, digest in files.items():
-        local = not is_uri(str(source))
-        if local and not Path(source / path).resolve().is_relative_to(Path(source).resolve()):
-            raise ValueError(f"the tokenizer at {source} links {path} out of its directory")
+    against its hash before it is written: a path out of the directory (`confined_files`), a file missing,
+    or one whose bytes differ, is refused, naming it. The one copier of a tokenizer's files, into a run
+    (`dew.inference.tasks.hold_tokenizer`) and into this host's cache (`cached_tokenizer`)."""
+    for path, digest in confined_files(files).items():
         contents = (source / path).read_bytes()
         if hashlib.sha256(contents).hexdigest() != digest:
             raise ValueError(f"the tokenizer at {source} differs from its record in {path}")
