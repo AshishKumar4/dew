@@ -76,10 +76,10 @@ def test_a_position_saved_under_14_resumes_where_it_stopped(read):
         changed.close()
 
 
-def test_a_position_saved_under_14_resumes_and_saves_one_of_15_that_resumes_again():
+def test_a_position_saved_under_14_resumes_and_saves_one_of_this_dews_that_resumes_again():
     """A seeded mix's position main saved under plan 14 resumes in this Dew's read onto the rows read next,
-    and the position it saves in turn, of plan 15, holds each stage of its order once, at the step of its
-    manifest that describes it, and resumes again onto the rows after."""
+    and the position it saves in turn, of this Dew's plan (16), holds each stage of its order once, at the
+    step of its manifest that describes it, and resumes again onto the rows after."""
     from saved_positions_support import mixture
 
     ids = _read(mixture(), 0, 8)
@@ -94,7 +94,7 @@ def test_a_position_saved_under_14_resumes_and_saves_one_of_15_that_resumes_agai
             resumed.close()
         plan = json.loads(saved)["dew_data_plan"]
         stages = plan["order"]["stages"]
-        assert plan["version"] == 15 and stages and all(isinstance(stage, int) for stage in stages)
+        assert plan["version"] == 16 and stages and all(isinstance(stage, int) for stage in stages)
 
 
 SAVED_BEFORE_THE_MOVE = Path(__file__).with_name("fixtures") / "positions" / "main-cdc45f8f9"
@@ -261,8 +261,8 @@ def test_a_position_saved_before_reached_code_is_refused_exact_and_read_on_relax
 
 SAVED_UNDER_15 = Path(__file__).with_name("fixtures") / "positions" / "main-72141706a"
 """Positions main saved at 72141706a, under plan 15, which described a step without the fields its repr
-hides, of the chains `saved_positions_support` builds (`tools/positions_saved_by_main.py`): a read and
-phases through such a step (`Remapped`)."""
+hides, of the chains `hidden_field_positions` builds: a read and phases through such a step
+(`Remapped`)."""
 
 
 @pytest.mark.parametrize("saved", ["hidden", "hidden_phases"])
@@ -272,7 +272,7 @@ def test_a_position_saved_under_15_resumes_as_it_was_read(saved):
     (plan 16), read by its plan as 15 described its steps (`Plan.under`), and reads what a read of the same
     chain stopped where it stopped reads after it; the record of a run saved since plan 15 hit PlanChanged
     on its steps (train 1013's review, F3)."""
-    from saved_positions_support import SAVED
+    from hidden_field_positions import SAVED
 
     loader, steps = SAVED[saved]
     streams = [loader().train(DataPartition()) for _ in range(2)]
