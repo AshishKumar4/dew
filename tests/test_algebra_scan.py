@@ -1170,14 +1170,14 @@ def ranked_turned_draw(seed):
 def wound_draw(seed):
     """`turned_draw`'s inputs, each chunk's first token turning 2^26 radians more: its chunk's turns past it
     summed to fp32's ulp of 8 there, each rounding a part of a radian or more, which its frame keeps
-    (`scan._framed`, `_rotation`)."""
+    (`scan._framed`, `rotation`)."""
     x, dt, B, C, turn = turned_draw(seed)
     return x, dt, B, C, turn.at[::CHUNK].add(2.0 ** 26)
 
 
 def far_draw(seed):
     """`turned_draw`'s inputs, each chunk's third token turning 2^100 radians more, a finite fp32 angle no
-    exact product with 2 pi's float32 pair reduces (`scan._within_pi`)."""
+    exact product with 2 pi's float32 pair reduces (`scan.within_pi`)."""
     x, dt, B, C, turn = turned_draw(seed)
     return x, dt, B, C, turn.at[2::CHUNK].add(2.0 ** 100)
 
