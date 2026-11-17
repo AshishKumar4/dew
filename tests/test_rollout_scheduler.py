@@ -482,6 +482,10 @@ def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
     declared_layout = layout(declared)
     assert declared_layout is not None and declared_layout.page_size == 8
     assert layout(dataclasses.replace(declared, strategy=Beam(width=2))) is None
+    # A model whose max_seq_len holds no row of the cohort's 12 slots in its own whole pages of 8 is drawn
+    # whole, which a server over them would refuse.
+    short = serving_task(capacity=12)
+    assert layout(dataclasses.replace(short, model=short.model.with_kv_cache(KVCache(page_size=8)))) is None
 
 
 def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):

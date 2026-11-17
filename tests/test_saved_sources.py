@@ -655,7 +655,7 @@ def test_a_run_naming_its_own_resolution_shift_keeps_its_process_at_another_size
     size, where its source's follows its grid there: the run's shift equals the grid's at its own size,
     its own shift's constants a mu flat in the token count at the grid's own mu there, so no shift's value
     tells the two apart, and the record its objective writes does (`DiffusionObjective.grid_process`,
-    ledger 2792)."""
+    ledger 2792), as it does for an objective given a grid of its own."""
     from diffusion_stubs import batch_for
     from diffusion_support import images_of, saved_after_one_step
     from interop_support import extract_fixture
@@ -664,12 +664,17 @@ def test_a_run_naming_its_own_resolution_shift_keeps_its_process_at_another_size
     from dew.diffusion.presets import Flow, ResolutionShift
     from dew.interop.pretrained import PretrainedPipeline
     from dew.interop.saved_sources import RunPipeline
+    from dew.objectives.diffusion import DiffusionObjective
 
     archive, folder = PUBLISHED["flux"]
     directory = extract_fixture(Path(__file__).parent / "fixtures" / f"{archive}.tar.xz", tmp_path / archive)
     directory = directory / folder
     own = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
     assert isinstance(own, PretrainedPipeline)
+    # An objective over the pipeline trains its process over its grid; one given another grid, even an
+    # equal one, trains the pipeline's process over a grid of its own.
+    assert DiffusionObjective(own, ema_decay=None).grid_process
+    assert not DiffusionObjective(own, ema_decay=None, grid=dataclasses.replace(own.grid)).grid_process
     flow = own.grid.schedule.policy.flow
     assert flow is not None and flow.dynamic and own.grid.tokens is not None
     mu = flow.mu(own.grid.tokens)
