@@ -497,6 +497,12 @@ def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wi
     np.testing.assert_array_equal(np.asarray(grads[0].query), np.asarray(grads[1].query))
 
 
+def bucketed(s, q_pos, k_pos, bucket):
+    """A score hook of an int32 key parameter: a key's bucket, its low bit a bias."""
+    del q_pos, k_pos
+    return s + (bucket & 1).astype(s.dtype)
+
+
 def test_an_integer_parameter_keys_and_runs():
     """A hook reading an int32 key parameter (a bucket's low bit) keys its launches at that dtype and
     runs, forward and backward, on par with the reference arithmetic from float64."""
@@ -504,11 +510,7 @@ def test_an_integer_parameter_keys_and_runs():
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     buckets = jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32), (ROWS, 4, keys))
-
-    def score_mod(s, q_pos, k_pos, bucket):
-        return s + (bucket & 1).astype(s.dtype)
-
-    hooks = template.Hooks(score_mod, (template.Param(buckets, template.Kind.KEY),))
+    hooks = template.Hooks(bucketed, (template.Param(buckets, template.Kind.KEY),))
     draw_qkv = drawing(queries, keys, jnp.float32)
 
     def draw(seed):

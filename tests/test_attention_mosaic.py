@@ -21,13 +21,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import attention_terms
+from fla_gdn_support import KernelCase
 from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS
 from jax.extend import core as jcore
 from jax.sharding import Mesh
+from kernel_compile import compile_mosaic_kernels, mosaic_failures
 from reference_error import assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
-from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
+from test_attention_triton import (BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, bucketed, gate_of, hooks_for,
+                                   score_hooks)
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
@@ -1374,45 +1377,33 @@ def test_a_hooked_launchs_keyed_configs_are_its_derived_ones(launch):
         assert keyed.heuristics_config == ba.heuristics_config
 
 
-def _bucketed(s, q_pos, k_pos, bucket):
-    """A score hook of an int32 key parameter (a key's bucket, its parity a bias)."""
-    del q_pos, k_pos
-    return s + (bucket & 1).astype(s.dtype)
-
-
-def _row_indexed(s, q_pos, k_pos):
-    """A score hook reading its query's place (a unit column of it, `q_pos[:, :1]`)."""
-    del k_pos
-    return s + 0.01 * q_pos[:, :1].astype(s.dtype)
-
-
-@pytest.mark.parametrize("keyed", [False, True], ids=["live", "keyed"])
-def test_a_hooked_sm80_backward_takes_fewer_rows_where_its_hook_reads_no_querys_place(keyed):
-    """An sm80 accurate-form backward under a score hook (`attention_mosaic._backward_call`, the route's
-    builder) derives fewer rows a consumer than a role's under a hook of an int32 key parameter, and a role's
-    rows under one reading its query's place, which found no layout at fewer: its legality reads the
-    builder's reading of the hook (`MosaicBackward.score_reads`), so a keyed launch (`KernelOp.keyed`, the
-    hook its fingerprint) derives as its live call does, tracing nothing."""
+@COMPILES_ON_CPU
+def test_a_hooked_sm80_backward_of_an_integer_parameter_compiles_at_fewer_rows_as_keyed_too():
+    """An sm80 accurate-form backward under a hook of an int32 key parameter (`bucketed`), built by the
+    route's builder (`attention_mosaic._backward_call`), derives fewer rows a consumer than a role's, keyed
+    (`KernelOp.keyed`, its hook a fingerprint) as live, and its launches at that config lower and compile on a
+    compile-only A100 within its resources: its legality reads the builder's reading of the hook
+    (`MosaicBackward.score_reads`), where a retrace there took the parameter as float32 and a keyed launch's
+    fingerprint as the hook (base review 24f8395d6)."""
     tokens, heads = 256, 4
     spans = template.spans(tokens, tokens, 1, causal=True)
     query = jnp.zeros((1, tokens, heads, 64), jnp.bfloat16)
     buckets = template.Param(jnp.zeros((1, heads, tokens), jnp.int32), template.Kind.KEY)
-    derived = {}
     with generation.assumed("sm80"):
         target = generation.gpu_target()
-        for name, hooks in (("bucketed", template.Hooks(_bucketed, (buckets,))),
-                            ("row-indexed", template.Hooks(_row_indexed))):
-            op, args = attention_mosaic._backward_call(query, query, query, spans, hooks, query,
-                                                       _residuals(query.shape), scale=None,
-                                                       natural=attention_mosaic.NATURAL, accurate=True)
-            ba = op.bind(*args, interpret=False)
-            if keyed:
-                ba = op.keyed(ba)
-                assert isinstance(ba.op.score_mod, str)
-            derived[name] = ba.op.derived(ba, target)
-        role = attention_mosaic.bundle_of(derived["row-indexed"], jnp.bfloat16).role_rows
-    assert min(derived["bucketed"].block_q, derived["bucketed"].block_k) < role, derived
-    assert min(derived["row-indexed"].block_q, derived["row-indexed"].block_k) >= role, derived
+        op, args = attention_mosaic._backward_call(query, query, query, spans,
+                                                   template.Hooks(bucketed, (buckets,)), query,
+                                                   _residuals(query.shape), scale=None,
+                                                   natural=attention_mosaic.NATURAL, accurate=True)
+        ba = op.bind(*args, interpret=False)
+        keyed = op.keyed(ba)
+        config = op.derived(ba, target)
+        assert keyed.op.derived(keyed, target) == config
+        role = attention_mosaic.bundle_of(config, jnp.bfloat16).role_rows
+        assert min(config.block_q, config.block_k) < role
+        case = KernelCase("bucketed backward", lambda: op.lowering(ba, config))
+        found = compile_mosaic_kernels([case], "sm80")
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)
 
 
 @pytest.mark.parametrize("accurate", [False, True], ids=["fast", "accurate"])
