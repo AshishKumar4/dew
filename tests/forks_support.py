@@ -31,10 +31,11 @@ FORKED_SEEDS = 32
 """Check 1's declared seeds for documents continuing another's memory and history against each one's row: at
 12, the one-token layout's parameter gradients, sums over a few tokens, were left unresolved over 60."""
 
-FORKED_ROWS = 8
+FORKED_ROWS = 16
 """The rows a draw lays its layout out in, each its own draw: a parameter's gradient sums over every row's
 tokens, where over the one-token layout's six alone Mamba-2's `A_log` was left unresolved over 160 seeds,
-its draws' log ratios spread 0.71 (check 1 asks for larger inputs there, not more seeds)."""
+its draws' log ratios spread 0.71 (check 1 asks for larger inputs there, not more seeds), and over eight
+rows' 0.49 with its decays' exp Dew's own (row 7062)."""
 
 
 def assert_forks_as_own_rows(module, variables, width: int, layout: str, label: str) -> None:
