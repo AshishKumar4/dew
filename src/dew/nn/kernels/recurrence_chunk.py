@@ -244,11 +244,11 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             wide, own = _read_once(value, work)
             fused = kernel == 'mosaic_gpu' and not hooks.delta
             if kernel == 'mosaic_gpu':
-                out, final = template_rule(query, key, own, g, beta, state, starts, firsts,
-                                           skip if fused else None, forked=carried,
-                                           max_segments=max_segments, scale=scale, delta=hooks.delta,
-                                           wide=fused_wide, bound=hooks.inverse_bound, rounded=rounded,
-                                           apart=apart)
+                out, final = _on_template(query, key, own, g, beta, state, skip if fused else None, turn,
+                                          starts=starts, firsts=firsts, forked=carried,
+                                          max_segments=max_segments, scale=scale, delta=hooks.delta,
+                                          wide=fused_wide, bound=hooks.inverse_bound, rounded=rounded,
+                                          apart=apart)
             elif kernel == 'fla':
                 out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
                                       max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
@@ -353,9 +353,10 @@ READOUT_HANDOFF = ("a readout of the state entering its token, or weighing its t
 """Why a kernel of the chunked op hands a call of another readout over to the portable math."""
 
 TURN_HANDOFF = ("a state that turns its key pairs (`recurrence.Hooks.turns`: Mamba-3's rotating basis), "
-                "whose turns the portable math's forms read (`scan.Scan.turn`) and neither the port's "
-                "kernels nor the template's mainloop turn")
-"""Why a kernel of the chunked op hands a turned call over to the portable math."""
+                "whose turns the portable math's forms read (`scan.Scan.turn`) and the port's kernels do not "
+                "turn")
+"""Why a port's kernel hands a turned call over to the portable math."""
+
 
 
 PORT_FORKED = Refusal('forked', "a forked call, whose documents enter earlier documents' finals of the same "
@@ -512,7 +513,6 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
                 "run's fast forms (`fast_rounding`)", row=INHERENT, kind='handoff'),
     Requirement('readout', lambda case: case.readout or case.apart > 0, READOUT_HANDOFF, row='ledger 6128',
                 kind='handoff'),
-    Requirement('turns', lambda case: not case.turns, TURN_HANDOFF, row='ledger 7419', kind='handoff'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
 call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Template.eligible`: dtypes,
@@ -1255,6 +1255,37 @@ def template_call(query, key, value, g, beta, state=None, starts=None, firsts=No
                                                  forked, **options)
     arguments, keywords = bound(*shard_shapes(operands, specs))
     return base.call((template.MOSAIC,), *arguments, **keywords)
+
+
+def _launched_template(query, key, value, g, beta, state, skip, entry, *, starts, firsts, forked, **options):
+    """`template_rule`'s `(output, final memory)` with its operands first (`turned.call`'s launch), a forked
+    call's entry write `entry` its documents' (`Forked.entry`)."""
+    if forked is not None:
+        forked = dataclasses.replace(forked, entry=entry)
+    return template_rule(query, key, value, g, beta, state, starts, firsts, skip, forked=forked, **options)
+
+
+def _on_template(query, key, value, g, beta, state, skip, turn, *, starts, firsts, forked, scale: float,
+                 apart: int, **options):
+    """The chunked op's `(output, final memory)` on the template (`template_rule`), a turned call's (`turn`
+    given) with its keys and queries turned into its documents' frames, a value head's each (its turns'), a
+    forked one's documents' entry keys too, and its turns' gradient in the crossing form
+    (`templates.recurrence.turned`)."""
+    from .templates.recurrence import turned
+
+    launch = functools.partial(_launched_template, starts=starts, firsts=firsts, forked=forked, scale=scale,
+                               apart=apart, **options)
+    entry = None if forked is None else forked.entry
+    if turn is None:
+        return launch(query, key, value, g, beta, state, skip, entry)
+    heads = value.shape[2]
+    query, key = (jnp.repeat(t, heads // t.shape[2], axis=2) for t in (query, key))
+    if entry is not None:
+        entry = (jnp.repeat(entry[0], heads // entry[0].shape[3], axis=3), *entry[1:])
+    documents = None if forked is None else (forked.firsts, forked.loads, forked.stores)
+    return turned.call(launch, query, key, value, g, beta, state, skip, turn, starts, scale=scale,
+                       group=max(apart, 1), documents=documents, held=0 if forked is None else forked.held,
+                       entry=entry)
 
 
 def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, forked: Forked | None,

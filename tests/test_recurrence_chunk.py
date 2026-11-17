@@ -614,8 +614,9 @@ def narrowed_draw(hooks, seed: int):
                                             if getattr(operands, name) is not None}), seeded
 
 
-FORKED_TEMPLATE = [HOOKS[4], HOOKS[8], FORMED[4]]
-"""The forked call's forms on the template: the gated delta rule, Kimi delta attention and Mamba2's SSD."""
+FORKED_TEMPLATE = [HOOKS[4], HOOKS[8], FORMED[4], TURNED]
+"""The forked call's forms on the template: the gated delta rule, Kimi delta attention, Mamba2's SSD and a
+turned state (Mamba-3's, each document's frame on from its source's, `templates.recurrence.turned`)."""
 
 
 def the_templates_forked_documents_are_as_exact_as_each_alone(hooks):

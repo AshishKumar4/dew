@@ -15,6 +15,7 @@ from ssd_support import stepwise_scan
 
 from dew.algebra import SATURATION, scan
 from dew.nn.kernels import generation, recurrence, recurrence_chunk, short_conv, ssd
+from dew.nn.kernels.templates.recurrence import turned
 from dew.nn.mixers.mamba2 import chunk_ssd
 
 DELTA_RULE_EDGES = {"normal": 1.0, "the largest its chunk holds": 2.0**62, "near the largest": 2.0**63,
@@ -600,3 +601,59 @@ def test_the_derived_delta_rules_chunk_adjoint_holds_its_orders(edge):
     cotangent = jax.random.normal(draws[0], (tokens, keys_))
     assert_contract(gradient, primals, direction, cotangent, f"the derived delta-rule adjoint {edge}",
                     truth_fn=tokenwise, plain_fn=tokenwise)
+
+
+TURNED_STARTS = np.zeros((1, 40), bool)
+TURNED_STARTS[0, [0, 17]] = True
+"""The turned call's contract's two packed documents."""
+
+
+def _framed_scores(query, key, value, starts):
+    """A turned call's `(output, final memory in its last frame)` in plain arithmetic from its frames' keys
+    and queries (`query`, `key` `[B, T, H, K]`), its decay `exp(-0.05)` a token, write gate one, scale one, a
+    readout after its update: every pair of one document summed whole, no chunk."""
+    length = query.shape[1]
+    ids = jnp.cumsum(jnp.asarray(starts, jnp.int32), axis=1)
+    same = (ids[:, :, None] == ids[:, None, :]) & jnp.tril(jnp.ones((length, length), bool))[None]
+    lag = jnp.arange(length)[:, None] - jnp.arange(length)[None, :]
+    weight = jnp.where(same, jnp.exp(-0.05 * lag)[None], 0.0)
+    out = jnp.einsum('bsu,bshk,buhk,buhv->bshv', weight, query, key, value)
+    last = (ids == ids[:, -1:]) * jnp.exp(-0.05 * (length - 1 - jnp.arange(length)))[None]
+    return out, jnp.einsum('bu,buhk,buhv->bhkv', last, key, value)
+
+
+def _turned_plainly(query, key, value, turn):
+    """`_framed_scores` of keys and queries turned by their documents' summed turns, each plainly (the
+    contract's truth and plain formula)."""
+    ids = jnp.cumsum(jnp.asarray(TURNED_STARTS, jnp.int32), axis=1)
+    within = (ids[:, :, None] == ids[:, None, :]) & jnp.tril(jnp.ones((ids.shape[1],) * 2, bool))[None]
+    angle = jnp.einsum('bsu,buha->bsha', within.astype(turn.dtype), turn)
+    cos, sin = jnp.cos(angle), jnp.sin(angle)
+    out, held = _framed_scores(*(scan.rotated(x, cos, sin) for x in (query, key)), value, TURNED_STARTS)
+    return out, scan.rotated(held, cos[:, -1, :, None], -sin[:, -1, :, None], axis=-2)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_turned_template_call_holds_every_order(edge):
+    """A turned call on the template (`templates.recurrence.turned.call`: its keys and queries in their
+    documents' frames, its turns' gradient in the crossing form) over a plain launch of the template's
+    arithmetic (`_framed_scores`), its keys, queries and values at `edge` and its turns of up to 3 radians:
+    each order it runs (reverse, its rule a custom one) finite where the plain formula's is
+    (`_turned_plainly`, its float64 the truth; row 7419)."""
+    shapes = ((1, 40, 1, 6),) * 2 + ((1, 40, 1, 2),)
+    operands = normal_draw(7419, *shapes, scale=EDGES[edge])
+    turn = jnp.asarray(np.random.default_rng(7419).uniform(-3.0, 3.0, (1, 40, 1, 2)), jnp.float32)
+    direction = normal_draw(7420, *shapes, (1, 40, 1, 2), scale=EDGES[edge])
+    cotangent = normal_draw(7421, (1, 40, 1, 2), (1, 1, 6, 2))
+    ones, decays = jnp.ones((1, 40, 1), jnp.float32), jnp.full((1, 40, 1), -0.05, jnp.float32)
+
+    def launch(query, key, value, g, beta, state, skip):
+        del g, beta, state, skip
+        return _framed_scores(query, key, value, TURNED_STARTS)
+
+    def rule(query, key, value, turn):
+        return turned.call(launch, query, key, value, decays, ones, None, None, turn, TURNED_STARTS,
+                           scale=1.0, group=1)
+
+    assert_contract(rule, (*operands, turn), direction, cotangent, f"a turned template call {edge}",
+                    truth_fn=_turned_plainly, plain_fn=_turned_plainly, without=REVERSE_ONLY)

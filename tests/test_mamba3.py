@@ -76,17 +76,16 @@ def draw(rank: int, seed: int):
     return *(hosted(t) for t in (x, dt, A, B, C, lam, theta, state)), jax.tree.map(hosted, cotangent)
 
 
-def entering(state, pairs: int, rank: int) -> Carried:
-    """`state` `[B, H, P, N]` as a call's carried state, its `pairs` angles zero and no previous token."""
+def entering(state, rank: int) -> Carried:
+    """`state` `[B, H, P, N]` as a call's carried state, no previous token."""
     batch, heads, width, size = state.shape
     zeros = functools.partial(jnp.zeros, dtype=state.dtype)
-    return Carried(state, zeros((batch, heads, pairs)), zeros((batch, heads, rank, size)),
-                   zeros((batch, heads, rank, width)))
+    return Carried(state, zeros((batch, heads, rank, size)), zeros((batch, heads, rank, width)))
 
 
 def chunked(x, dt, A, B, C, lam, theta, state, *, starts):
     """`chunk_mamba3` from `state` (`entering`): its output and final state."""
-    out, carried = chunk_mamba3(x, dt, A, B, C, lam, theta, entering(state, theta.shape[-1], x.shape[2]),
+    out, carried = chunk_mamba3(x, dt, A, B, C, lam, theta, entering(state, x.shape[2]),
                                 starts=starts, chunk_size=CHUNK)
     return out, carried.state
 
@@ -121,7 +120,7 @@ def continued(x, dt, A, B, C, lam, theta, state):
     operands = (x, dt, A, B, C, lam, theta)
     rest, starts = PREFILL + STEPPED, marks(CONTINUED)
     out, carried = chunk_mamba3(*(t[:, :PREFILL] for t in operands),
-                                entering(state, theta.shape[-1], x.shape[2]), chunk_size=CHUNK)
+                                entering(state, x.shape[2]), chunk_size=CHUNK)
     outs = [out]
     for token in range(PREFILL, rest):
         out, carried = step_mamba3(*(t[:, token] for t in operands), carried, begins=starts[:, token])
