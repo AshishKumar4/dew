@@ -647,8 +647,8 @@ def test_a_turned_template_call_holds_every_order(edge):
     cotangent = normal_draw(7421, (1, 40, 1, 2), (1, 1, 6, 2))
     ones, decays = jnp.ones((1, 40, 1), jnp.float32), jnp.full((1, 40, 1), -0.05, jnp.float32)
 
-    def launch(query, key, value, g, beta, state, skip):
-        del g, beta, state, skip
+    def launch(query, key, value, g, beta, state, skip, entry):
+        del g, beta, state, skip, entry
         return _framed_scores(query, key, value, TURNED_STARTS)
 
     def rule(query, key, value, turn):

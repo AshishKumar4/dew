@@ -827,18 +827,19 @@ def test_a_turned_call_on_the_template_is_on_par_with_the_portable_math_interpre
     keys turned into their documents' frames and its turns' gradient in the crossing form
     (`templates.recurrence.turned`), against the portable math's (`scan.Scan.turn`, its turns' gradient the
     replay's): output, final memory and every operand's gradient, the turns' among them, from float64 over
-    one sequence or packed documents each beginning a token's ranks (check 1, row 7419), under the run's
-    forms."""
-    forms = generation.numerics().forms
-
+    one sequence or packed documents each beginning a token's ranks (check 1, row 7419), its queries, keys,
+    values and write gate in bf16 under the run's fast forms, as the template's fast backward trains it
+    (`mainloop_backward.fast_backward_form`)."""
     def on(route, operands, starts=None):
         return chunk_on(route, TURNED, dataclasses.replace(operands, starts=starts))
 
     def drawn(seed):
         (operands,) = hooked_draw(TURNED, packed=False, seed=seed)
+        operands = dataclasses.replace(operands, **{name: getattr(operands, name).astype(jnp.bfloat16)
+                                                    for name in ('query', 'key', 'value', 'beta')})
         return operands, cotangents(operands, seed)
 
-    assert_packed_on_par(formed(forms, functools.partial(on, 'mosaic_gpu')), functools.partial(on, 'xla'),
+    assert_packed_on_par(formed('fast', functools.partial(on, 'mosaic_gpu')), functools.partial(on, 'xla'),
                          drawn, f'{TURNED} on the template', packed=packed, documents=((0, 24, 40), (10, 48)),
                          length=LENGTH, seeds=32)
 
