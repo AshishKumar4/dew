@@ -375,6 +375,16 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
                          length=LENGTH, seeds=32)
 
 
+def test_a_turned_states_forked_documents_are_as_exact_as_each_alone():
+    """A state that turns its key pairs (`Hooks.turns`) over a forked call through the portable math, each
+    document taking up its table slot's memory with its entry write added, its stored finals in the walk's
+    table (Mamba-3's prefix and its questions, a true-frame memory each: `scan.Scan.turn`'s walk turns each
+    chunk's leaving memory back from its frame), against each document a sequence of its own the recurrence
+    a token at a time (`assert_forked_on_par`, check 1)."""
+    assert_forked_on_par('xla', TURNED, functools.partial(entered_draw, TURNED, entries=True),
+                         f'xla {TURNED} a forked call\'s documents', seeds=32)
+
+
 DOCUMENTS = ((0, 23, 40), (0, 9, 48))
 """Each row's packed documents' first tokens under `draw`'s `packed`."""
 
@@ -449,7 +459,7 @@ def document_by_document(hooks, operands, run=None):
     the six documents' 18 sets of the GPU tier's three forms, and with the float64 truth's six traces took
     240 s of an H100 job's harness (MAINGPU-be0a83791-PART2of10, tests/arm_arithmetic.py:147)."""
     run = token_by_token if run is None else run
-    named = [name for name in ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'z')
+    named = [name for name in ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'z', 'turn')
              if getattr(operands, name) is not None]
     bounds = [tuple(zip(begins, (*begins[1:], operands.value.shape[1]), strict=True)) for begins in DOCUMENTS]
     longest = max(end - begin for row in bounds for begin, end in row)

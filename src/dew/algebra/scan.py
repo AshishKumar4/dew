@@ -446,8 +446,9 @@ def turned(x, turn, *, axis: int = -1):
     return rotated(x, jnp.cos(turn), -jnp.sin(turn), axis=axis)
 
 
-def _within_pi(turns):
-    """Each turn as an angle within pi of zero: itself where it is, else read back from its rotation
+def within_pi(turns):
+    """Each turn as an angle within pi of zero (a template's frame takes them so, as `_framed` does): itself
+    where it is, else read back from its rotation
     (`atan2` of its sine and cosine, their backend's full-range reduction), so a chunk's prefix of them
     (`_framed`) stays within its `C pi` however far a turn reaches. Summed whole, a turn of 2^26 left every
     later prefix 2.4e-7 radians off, a double float's precision there (the chunk's final state 6 times the
@@ -456,9 +457,9 @@ def _within_pi(turns):
     return jnp.where(jnp.abs(turns) <= np.pi, turns, jnp.arctan2(jnp.sin(turns), jnp.cos(turns)))
 
 
-def _rotation(high, low) -> tuple[jax.Array, jax.Array]:
+def rotation(high, low) -> tuple[jax.Array, jax.Array]:
     """`(cos, sin)` of the angle `high + low` (a double float, a chunk's prefix of turns within pi of zero,
-    `_within_pi`), the rotation by it composed of its two parts' (`e^{i hi} e^{i lo}`), each unit: read as
+    `within_pi`), the rotation by it composed of its two parts' (`e^{i hi} e^{i lo}`), each unit: read as
     `cos(high) - low sin(high)`, a low part past a radian left the rotation's magnitude 1.41."""
     cos, sin, cos_low, sin_low = jnp.cos(high), jnp.sin(high), jnp.cos(low), jnp.sin(low)
     return cos * cos_low - sin * sin_low, sin * cos_low + cos * sin_low
@@ -472,9 +473,9 @@ def _framed(tokens: dict, turns) -> tuple[dict, tuple]:
     token `t`), the state entering the chunk in its own frame (`Phi` none); the state leaving it turned back
     by `e^{-i Phi_last}`. Within a chunk the frame's angles are at most its turns' sum, and a turn's
     cotangent is the replay's (`Scan.turn`). `Phi` is a compensated prefix (`compensated`) of the turns each
-    within pi of zero (`_within_pi`), its rotation its double float's (`_rotation`): rounded to fp32, an
+    within pi of zero (`within_pi`), its rotation its double float's (`rotation`): rounded to fp32, an
     angle near a chunk's `C pi` is off by half its ulp, 64 times a turn's."""
-    cos, sin = _rotation(*compensated(_within_pi(turns.astype(at_least_fp32(turns.dtype))), axis=0))
+    cos, sin = rotation(*compensated(within_pi(turns.astype(at_least_fp32(turns.dtype))), axis=0))
     framed = {name: rotated(value, cos, sin) if name in ("B", "Q") else value
               for name, value in tokens.items()}
     return framed, (cos[-1], -sin[-1])
