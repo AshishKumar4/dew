@@ -474,11 +474,13 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token, 
         return token.tile(state_ref, start + k)
 
     def read(k, tile):
-        """The query's read of the state: decayed where it reads the state after the update."""
-        return (entry(0, k) * entry(2, k) if hooks.reads == 'after' else entry(0, k)) * tile
+        """The query's read of the state: decayed where it reads the state after the update (apart from its
+        own write too, `recurrence.Hooks.reads` 'apart')."""
+        return (entry(0, k) if hooks.reads == 'before' else entry(0, k) * entry(2, k)) * tile
 
     # The query's read of the write: whole where it reads the state after the update, and its own weight's
-    # added where given (row 3, `recurrence.update`), none where it reads the state entering the token alone.
+    # added where given (row 3, `recurrence.update`), none where it reads the state entering the token or
+    # apart from its own write alone.
     reads_write = hooks.reads == 'after' or hooks.own_weight
 
     def read_write(k, written):

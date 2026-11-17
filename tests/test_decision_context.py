@@ -18,7 +18,7 @@ from model_support import flat_tree
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, widened, without_ynn
 
-from dew.batch import FROZEN, thaw, unboxed
+from dew.batch import FROZEN, part, thaw, unboxed
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example
@@ -516,11 +516,20 @@ def test_a_configured_context_encoders_bundle_carries_it_and_its_trained_weights
     trained = {**drawn, "params": {**drawn["params"], "context": jax.tree.map(
         lambda leaf: leaf + 1.0, drawn["params"]["context"])}}
     task = Decide(objective.model, trained, layout, tokenizer, objective.specials, processor=source.processor)
-    again = Decide.released(PretrainedDecision.of(task))
+    bundle = PretrainedDecision.of(task)
+    again = Decide.released(bundle)
     for context in ("a first note", "ten"):
         np.testing.assert_array_equal(
             np.asarray(again("one two three", QUESTION, context=context)["pick"].probabilities),
             np.asarray(task("one two three", QUESTION, context=context)["pick"].probabilities))
+    # A load's transform of the bundle's trees (`map_variables`: a placement, a cast, shapes alone) reaches
+    # the encoder's weights as the backbone's and the head's, which the task declared again reads: they were
+    # left as they were (row 7471).
+    halved = Decide.released(bundle.map_variables(lambda tree: jax.tree.map(lambda leaf: leaf / 2, tree)))
+    for name in ("backbone", "head", "context"):
+        for got, want in zip(jax.tree.leaves(part(halved.variables, name)),
+                             jax.tree.leaves(part(again.variables, name)), strict=True):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want) / 2)
 
 
 def test_a_configured_context_encoder_beside_a_schema_read_in_context_is_refused():
@@ -840,7 +849,8 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
     text condition is, a pretrained tower (`clip_text`) among them, and trains a step with it frozen; an
     encoder that reads no text into the states context layers read (an audio tower, a denoiser's
     conditioner) and a diffusion run's field or unconditional text are refused. The run built the tower in
-    float32 and took any registered encoder, which failed at its first trace (theme 22's review)."""
+    float32 and took any registered encoder, which failed at its first trace (theme 22's review). Its task
+    loaded computes its encoder as the run did, or in the dtype the load asks for."""
     from run_kinds import decision, trained
     from test_text_encoders import TINY
 
@@ -854,8 +864,14 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
                               model=ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     objective = run.prepare().objective
     assert jnp.dtype(objective.model.context.encoder.dtype) == jnp.dtype("bfloat16")
-    state, _ = trained(run, tmp_path, "clip")
+    state, _ = trained(run, tmp_path, "clip", trainer={"checkpoint_final": True})
     assert "context" in state.variables[FROZEN] and "context" not in state.variables["params"]
+    # Loaded, the task's encoder computes as the run's did, or in the dtype the load asks for, as its
+    # backbone does: a load's dtype bound the backbone and head alone (row 7611).
+    for asked, computed in ((None, "bfloat16"), ("float32", "float32")):
+        loaded = Decide.from_run(str(tmp_path / "runs" / "clip"), dtype=asked)
+        assert jnp.dtype(loaded.model.context.encoder.dtype) == jnp.dtype(computed)
+        assert jnp.dtype(loaded.model.backbone.dtype) == jnp.dtype(computed)
     # A character table is taken; one differing from it in its declarations alone (`reads_captions`,
     # `keyword`) is refused, as an audio tower and a denoiser's conditioner are.
     table = TextCondition(encoder="char_table", checkpoint="char_table")

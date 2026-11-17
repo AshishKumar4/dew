@@ -1197,10 +1197,11 @@ _VERDICTS: dict[str, dict[str, _records.JSON]] = {}
 def stored_verdict(device_kind: str, key: str) -> Rebuilt | None:
     """Certification's verdict of the launch `key` names on GPUs of `device_kind` (`report.certified`), an
     accepted config's or a refused one's, as stored in the picks' store (`_store`'s file,
-    `kernel_picks_path`) and rebuilt (`decoded`), read once a process; none where the process keeps no picks,
-    none is stored, or this checkout cannot rebuild it (`Unreadable`: it certifies again)."""
-    if not _cache.keeps_picks():
-        return None
+    `kernel_picks_path`) and rebuilt (`decoded`), read once a process; none where none is stored, or this
+    checkout cannot rebuild it (`Unreadable`: it certifies again). Read under deterministic ops too, which
+    keep no picks (`dew._cache.keeps_picks`, measured timings): a verdict is what the assembler said of a
+    compile, the same in every process alike in what its key states, the run's XLA flags among them (row
+    7308: under --xla_gpu_deterministic_ops every warm start certified every launch again)."""
     with _LOADING:
         if device_kind not in _VERDICTS:
             _VERDICTS[device_kind] = {entry["certified"]: entry["verdict"]
@@ -1218,9 +1219,7 @@ def stored_verdict(device_kind: str, key: str) -> Rebuilt | None:
 def store_verdict(device_kind: str, key: str, verdict: dict[str, tuple[str, report.Binary]]) -> None:
     """`verdict` stored for the launch `key` names on GPUs of `device_kind` in the picks' store, as the picks
     are (`encoded`), one writer at a time, the file replaced whole (`_store`, whose picks keep a verdict as an
-    entry they do not read), where the process keeps picks."""
-    if not _cache.keeps_picks():
-        return
+    entry they do not read), under deterministic ops too (`stored_verdict`)."""
     written = encoded(verdict)
     path = _cache.kernel_picks_path(device_kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)

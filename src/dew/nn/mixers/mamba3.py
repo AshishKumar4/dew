@@ -15,9 +15,10 @@ token's `B` and `C` turned by its angle `phi_t`, `dt theta` summed over its docu
 state's turn between two tokens is their angles' difference, and the previous token's write folded into each
 token's own. Unrolled, token `u`'s value reaches a later token's output at weight `gamma_u + delta_{u+1}`
 (`delta = (1 - lambda) dt`, the next token's, zero past its document) times the decays between, and its own
-at `gamma_u` alone, so the chunked op writes at `gamma_u + delta_{u+1}` and each output takes back its own
-token's `delta_{u+1}` term (`chunk_mamba3`). The recurrence a token at a time on the complex state
-(`recurrent_mamba3`) is the definitional form and, in float64, check 1's truth."""
+at `gamma_u` alone, so the chunked op writes at `gamma_u + delta_{u+1}` and reads apart from each token's own
+writes (`Hooks.reads` 'apart'), which the token's output takes at `gamma_u` beside it (`_rank_terms`), as
+mamba_ssm's kernels do (strictly lower scores, `gamma q . k` apart). The recurrence a token at a time on the
+complex state (`recurrent_mamba3`) is the definitional form and, in float64, check 1's truth."""
 
 from __future__ import annotations
 
@@ -33,6 +34,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.algebra import scan
 from dew.batch import document_firsts, real_bounds
 from dew.mesh import LayoutRefused
 from dew.nn import rope
@@ -49,16 +51,21 @@ from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.mixers.mamba2 import MambaRMSNormGated
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import at_least_fp32, float32_dot_general, softplus
+from dew.nn.precision import at_least_fp32, compensated_add, float32_dot_general, softplus, two_product
 from dew.nn.residuals import Residual
 from dew.nn.scatter import gather_positions
 
 CHUNK_SIZE = 64
 """mamba_ssm's Mamba-3 `chunk_size` for a single input and output."""
 
-MAMBA3 = Hooks(decay='scalar', delta=False, write_gate=True, scale=1.0)
+MAMBA3 = Hooks(decay='scalar', delta=False, write_gate=True, scale=1.0, reads='apart')
 """Mamba-3's chunked form on the recurrence template: a decay a head (`dt A`), no delta rule, an explicit
-write gate (each token's folded trapezoid weight, `chunk_mamba3`)."""
+write gate (each token's folded trapezoid weight, `chunk_mamba3`), its readout apart from its token's own
+writes, a rank an op token each (`Hooks.ranks`, a call's), which `_rank_terms` weighs at the token's own
+gate (mamba_ssm's strictly lower scores and `gamma q . k` apart, `mamba3_siso_fwd.py`, and its MIMO's `i //
+R > j // R`, `mamba3_mimo_fwd.py`): read whole, the op weighed them at the folded gate and its rank terms
+took the next token's share back off, which cancelled at a document's first token, its output there 22
+times the recurrence's worst row from float64 (row 7402)."""
 
 
 def _within(starts, length: int, batch: int):
@@ -69,29 +76,51 @@ def _within(starts, length: int, batch: int):
     return ~jnp.asarray(starts, jnp.bool_).at[:, 0].set(True)
 
 
+TWO_PI = (np.float32(2 * np.pi), np.float32(2 * np.pi - float(np.float32(2 * np.pi))))
+"""2 pi as fp32's nearest and what it drops, a turn's whole in double-float."""
+
+
+def _wrapped(angle):
+    """A double-float angle `(hi, lo)` less its whole turns (`TWO_PI`, each turn's product exact, Dekker's),
+    about [0, 2 pi): its rounding a turn's however long the document, as mamba_ssm's `angle_dt` holds it."""
+    turns = jnp.floor(angle[0] * np.float32(1 / (2 * np.pi)))
+    whole, dropped = two_product(-turns, jnp.full_like(turns, TWO_PI[0]))
+    return compensated_add(angle, (whole, dropped - turns * TWO_PI[1]))
+
+
 def _angles(dt, theta, continues):
-    """Each token's angle `[B, S, H, R]` over its document: `dt theta` summed from the document's first token
-    through the token (`dt` zero where a token's turn acts on no state, `chunk_mamba3`), in `dt`'s dtype,
-    held in [0, 2 pi) as mamba_ssm's `angle_dt` holds it, so its rounding stays a turn's however long the
-    document."""
-    step = dt[..., None] * jnp.asarray(theta, dt.dtype)
+    """Each token's angle `[B, S, H, R]` over its document as a double-float `(hi, lo)` pair: `dt theta`
+    (each its exact product, `two_product`) summed from the document's first token through the token (`dt`
+    zero where a token's turn acts on no state, `chunk_mamba3`) and less its whole turns once summed
+    (`_wrapped`), in `dt`'s dtype: a double float's 48 bits hold a document's sum of turns of at most pi to
+    fp32's rounding past 2^20 tokens, so the scan's combines wrap nothing. The recurrence turns a token's
+    state by its own turn; keys and queries turned by an angle rounded once to fp32, half an ulp of 2 pi, put
+    the packed chunked form of rank two at 2.3 times its error from float64, its final state at 1.3 times
+    and its gradients to 2.1 times, where a double-float angle and its rotation of it (`rotated`'s
+    `residual`) hold them under (row 7402)."""
+    rates = jnp.broadcast_to(jnp.asarray(theta, dt.dtype), (*dt.shape, theta.shape[-1]))
+    high, low = two_product(jnp.broadcast_to(dt[..., None], rates.shape), rates)
+    # A segmented sum: a token that begins a document drops what came before it.
+    restarts = jnp.broadcast_to(~continues[:, :, None, None], high.shape)
+    return _wrapped(scan.compensated(high, low=low, axis=1, restarts=restarts))
 
-    def combine(left, right):
-        # A segmented sum: a token that begins a document drops what came before it.
-        (sum_left, keep_left), (sum_right, keep_right) = left, right
-        summed = jnp.where(keep_right, sum_left + sum_right, sum_right)
-        return jnp.remainder(summed, 2 * jnp.pi), keep_left & keep_right
 
-    keep = jnp.broadcast_to(continues[:, :, None, None], step.shape)
-    summed, _ = jax.lax.associative_scan(combine, (step, keep), axis=1)
-    return summed
+def _turned_by(angles, entering):
+    """Double-float `angles` turned on by `entering` (a pair, or an fp32 angle), wrapped (`_wrapped`)."""
+    entering = entering if isinstance(entering, tuple) else (entering, jnp.zeros_like(entering))
+    return _wrapped(compensated_add(angles, entering))
 
 
-def rotated(x, angles):
+def rotated(x, angles, residual=None):
     """`x` `[B, S, R, H, N]` with each adjacent pair of its first `2 A` dimensions turned by its angle
     (`angles` broadcast against `x` but its last axis, `A` wide), `(v_2j + i v_2j+1) e^{i phi}`, the rest
-    as given: `rope.rotate`'s adjacent pairs."""
-    return rope.rotate(x, jnp.cos(angles), jnp.sin(angles), pairs='adjacent')
+    as given: `rope.rotate`'s adjacent pairs. An angle's `residual`, what its fp32 rounding dropped
+    (`_angles`' pairs), turns it on to first order: `cos(phi + r) = cos phi - r sin phi`, `sin(phi + r) =
+    sin phi + r cos phi`."""
+    cos, sin = jnp.cos(angles), jnp.sin(angles)
+    if residual is not None:
+        cos, sin = cos - residual * sin, sin + residual * cos
+    return rope.rotate(x, cos, sin, pairs='adjacent')
 
 
 def _biased(value, bias):
@@ -128,16 +157,19 @@ def _ranked(t):
     return t.reshape(t.shape[0], -1, *t.shape[3:])
 
 
-def _rank_terms(queries, keys, x, gamma, following):
-    """What a token's own writes add to each of its ranks' outputs past the chunked op's (`chunk_mamba3`): its
-    rank `r` read its ranks through `r` at `gamma + delta` (the next token's `delta`) and none after, where
-    the recurrence reads all of them at `gamma` alone. `queries` and `keys` `[B, S, R, H, N]` as the op read
-    them, `x` `[B, S, R, H, P]`, `gamma` and `following` `[B, S, H]`."""
-    rank = x.shape[2]
-    overlap = jnp.einsum('bsrhn,bsuhn->bshru', queries, keys)
-    later = jnp.arange(rank)[None, :] > jnp.arange(rank)[:, None]
-    weight = jnp.where(later, gamma[..., None, None], -following[..., None, None])
-    return jnp.einsum('bshru,bsuhp->bsrhp', overlap * weight, x)
+def _rank_terms(own, x, gamma):
+    """What a token's own writes add to each of its ranks' outputs past the chunked op's (`chunk_mamba3`, its
+    readout apart from them, `MAMBA3`): every rank `u` of the token at `gamma`, as the recurrence reads them,
+    on `own`, the token's queries and keys unturned `(C, B)` `[B, S, R, G, N]` (one angle a token: its ranks'
+    overlaps are its turned ones', mamba_ssm's `qk_dot` on `q_pre . k_pre`), a group's overlaps formed once
+    for its heads in fp32 and the operands read in their own dtype. `x` `[B, S, R, H, P]` and `gamma` `[B, S,
+    H]` in the working dtype."""
+    batch, length, rank, heads, width = x.shape
+    groups = own[0].shape[-2]
+    overlap = jnp.einsum('bsrgn,bsugn->bsgru', *own, preferred_element_type=x.dtype)
+    weighed = (x * gamma[:, :, None, :, None]).reshape(batch, length, rank, groups, heads // groups, width)
+    out = jnp.einsum('bsgru,bsugjp->bsrgjp', overlap, weighed)
+    return out.reshape(x.shape)
 
 
 def _trapezoid(delta, real, resets):
@@ -200,8 +232,7 @@ def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, sta
         # The first document's angles from the carried angle on, and the carried token's writes again at
         # its first real token's `(1 - lambda) dt`, which the chunked op decays by the alphas to it.
         first = jnp.cumsum(resets.astype(jnp.int32), axis=1) == 0
-        entering = jnp.where(first[:, :, None, None], carried.angle[:, None], 0)
-        angles = jnp.remainder(angles + entering, 2 * jnp.pi)
+        angles = _turned_by(angles, jnp.where(first[:, :, None, None], carried.angle[:, None], 0))
         again = jnp.einsum('bhrn,bhrp->bhnp', carried.key, carried.value)
         held = jnp.swapaxes(carried.state, -1, -2) + entering_weight[:, :, None, None] * again
     out, final, keys = _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, held, starts,
@@ -216,7 +247,8 @@ def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, sta
                   else tuple(jnp.swapaxes(t, 1, 2) for t in (carried.key, carried.value)))
         any_real = jnp.any(valid, axis=1)[:, None, None, None]
         last = tuple(jnp.where(any_real, t, b) for t, b in zip(taken, before, strict=True))
-    return out, Carried(jnp.swapaxes(final, -1, -2), angles[:, -1], *(jnp.swapaxes(t, 1, 2) for t in last))
+    return out, Carried(jnp.swapaxes(final, -1, -2), angles[0][:, -1],
+                        *(jnp.swapaxes(t, 1, 2) for t in last))
 
 
 def _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, state, starts, *, work, operand,
@@ -224,13 +256,13 @@ def _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, state, star
     """The chunked op of a call's tokens (`chunk_mamba3`, `entered_mamba3`): `B` and `C` rotated by
     `angles` and rounded to the operands' dtype, the first rank's decay `unturned * A`, the write gate
     `lam dt + following`, from `state` (`[B, H, N, P]`, or a forked call's table's given memories `[B, S',
-    H, N, P]`) with `starts` `[B, S]` each document's first token, and the rank terms on the rounded keys and
-    queries the op read, so they cancel its own. A forked call's `forked` is `(loads, stores, held,
+    H, N, P]`) with `starts` `[B, S]` each document's first token, its readout apart from each token's own
+    writes, and the token's own at `gamma` (`_rank_terms`). A forked call's `forked` is `(loads, stores, held,
     entries)`, `entries(keys)` its documents' entry writes from the rotated keys (`Chunk.entry_key`).
     Returns `(output, final state, rotated keys)`."""
     batch, length, rank, heads, _ = x.shape
-    keys, queries = (rotated(_per_head(jnp.asarray(t, work), heads), angles[:, :, None]).astype(operand)
-                     for t in (B, C))
+    keys, queries = (rotated(_per_head(jnp.asarray(t, work), heads), *(a[:, :, None] for a in angles))
+                     .astype(operand) for t in (B, C))
     decay = jnp.zeros((batch, length, rank, heads), work).at[:, :, 0].set(unturned * jnp.asarray(A, work))
     gate = jnp.broadcast_to((lam * dt + following)[:, :, None], decay.shape)
     begins = None if starts is None else jnp.zeros((batch, length, rank), bool).at[:, :, 0].set(starts)
@@ -240,12 +272,12 @@ def _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, state, star
         entry_key, entry_value, entry_weight = entries(keys)
         table = {'loads': loads, 'stores': stores, 'held': held, 'entry_key': entry_key,
                  'entry_value': entry_value, 'entry_weight': entry_weight}
-    out, final = chunk(MAMBA3, Chunk(_ranked(queries), _ranked(keys), _ranked(jnp.asarray(x, operand)),
-                                     log_decay=_ranked(decay), beta=_ranked(gate), state=state,
-                                     starts=None if begins is None else _ranked(begins), **table),
+    out, final = chunk(dataclasses.replace(MAMBA3, ranks=rank),
+                       Chunk(_ranked(queries), _ranked(keys), _ranked(jnp.asarray(x, operand)),
+                             log_decay=_ranked(decay), beta=_ranked(gate), state=state,
+                             starts=None if begins is None else _ranked(begins), **table),
                        **({} if chunk_size is None else {'chunk_size': chunk_size}), dtype=work)
-    out = out.reshape(x.shape) + _rank_terms(queries.astype(work), keys.astype(work), jnp.asarray(x, work),
-                                             lam * dt, following)
+    out = out.reshape(x.shape) + _rank_terms((C, B), jnp.asarray(x, work), lam * dt)
     return out, final, keys
 
 
@@ -283,22 +315,24 @@ def entered_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, forked, starts,
     ended = jnp.maximum(last, 0)
     # Each document's angles' offset, its source's last angle: the documents in the row's order, a parent
     # before its children, a table of angles carried through them (the start's, then each stored one's).
-    reached = gather_positions(turned, ended)
+    reached = tuple(gather_positions(t, ended) for t in turned)
 
     def offset(table, document):
-        load, store, total = document
-        taken = jnp.where(load > 0, table[jnp.maximum(load - 1, 0)], 0)
-        leaving = jnp.remainder(total + taken, 2 * jnp.pi)
-        return _angle_stored(table, store, leaving), taken
+        # The table and its documents' angles as double-float pairs (`_angles`).
+        load, store, *total = document
+        taken = tuple(jnp.where(load > 0, t[jnp.maximum(load - 1, 0)], 0) for t in table)
+        leaving = _turned_by(tuple(total), taken)
+        return tuple(_angle_stored(t, store, a) for t, a in zip(table, leaving, strict=True)), taken
 
     angles_table = jnp.concatenate([carried.angle, jnp.zeros((batch, held, *carried.angle.shape[2:]),
                                                                carried.angle.dtype)], axis=1)
     _, offsets = jax.lax.scan(
         lambda table, document: jax.vmap(offset)(table, document),
-        angles_table, tuple(jnp.moveaxis(t, 1, 0) for t in (loads, stores, reached)))
-    offsets = jnp.moveaxis(offsets, 0, 1)
-    entering = jnp.take_along_axis(offsets, number[:, :, None, None], axis=1)
-    angles = jnp.remainder(turned + entering, 2 * jnp.pi)
+        (angles_table, jnp.zeros_like(angles_table)),
+        tuple(jnp.moveaxis(t, 1, 0) for t in (loads, stores, *reached)))
+    entering = tuple(jnp.take_along_axis(jnp.moveaxis(t, 0, 1), number[:, :, None, None], axis=1)
+                     for t in offsets)
+    angles = _turned_by(turned, entering)
     # Each stored slot's document, by the slot it stores in, to read its last token's keys and values.
     stored_by = jnp.zeros((batch, held + 1), jnp.int32).at[rows, stores].set(
         jnp.broadcast_to(jnp.arange(documents, dtype=jnp.int32), stores.shape), mode="drop")
@@ -482,7 +516,7 @@ class Mamba3(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """The in and out projections and the state's write and read a rank (`ssd_flops`): the trapezoid's
-        previous write folds into each token's own (`chunk_mamba3`)."""
+        previous write folds into each token's own (`chunk_mamba3`), its own writes read apart."""
         return (projection_flops(lengths, self.emb_features, sum(self.widths) + self.intermediate_size)
                 + self.mimo_rank * ssd_flops(lengths, self.num_heads, self.state_size, self.head_dim))
 

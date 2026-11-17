@@ -954,6 +954,31 @@ def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelC
     return config.with_dtype(dtype_name(resolve_dtype(dtype)))
 
 
+def saved_component(owner: Mapping[str, object], dtype: DTypeLike | None) -> Mapping[str, object]:
+    """A component a run recorded (a class record, `dew.registry.component`: a condition's encoder, an
+    autoencoder), with `dtype` overriding the computation it saved, as `saved_model` overrides the
+    model's: its own `dtype`, that of the model it wraps where it records one, and the autoencoder it wraps
+    (`TunedAutoEncoder`'s) computing in it too; as it was saved where `dtype` is None. Every component a
+    saved task binds computes in a load's dtype alike."""
+    from dew.registry import dtype_name, resolve_dtype
+
+    compute = dtype_name(resolve_dtype(dtype))
+    if compute is None:
+        return owner
+    recorded = dict(named_fields(owner["fields"], "fields"))
+    if "dtype" in recorded:
+        recorded["dtype"] = compute
+    wrapped = recorded.get("autoencoder")
+    if isinstance(wrapped, Mapping) and "fields" in wrapped:
+        # A wrapper's autoencoder (`TunedAutoEncoder`'s) computing in `dtype` too.
+        recorded["autoencoder"] = saved_component(wrapped, dtype)
+    model = recorded.get("model")
+    if isinstance(model, Mapping) and "dtype" in named_fields(model.get("fields", {}), "model.fields"):
+        wrapped = named_fields(model["fields"], "model.fields")
+        recorded["model"] = {**model, "fields": {**wrapped, "dtype": compute}}
+    return {**owner, "fields": recorded}
+
+
 @dataclass(frozen=True)
 class RunProcessor:
     """Adapts a run's tokenizer to the `Processor` interface a task uses.

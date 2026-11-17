@@ -27,7 +27,7 @@ from dew.artifacts import uint8_pixels
 from dew.batch import Variables, thaw
 from dew.diffusion.process import Conditioning, Process
 from dew.inference.scoring import ScoringRequest
-from dew.inference.tasks import InItsForm, SavedRun, SavedRunTask, traced_in_its_form
+from dew.inference.tasks import InItsForm, SavedRun, SavedRunTask, saved_component, traced_in_its_form
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, host_rows, local_rows, mesh_of, request_key
@@ -287,10 +287,10 @@ class TextToImage(SavedRunTask, InItsForm):
                           in fields(inputs_record['conditions'], 'conditions').items()}
             inputs_record = {**inputs_record, 'conditions': {
                 keyword: {**condition,
-                          'encoder': _computing(fields(condition['encoder'], 'encoder'), compute)}
+                          'encoder': saved_component(fields(condition['encoder'], 'encoder'), compute)}
                 for keyword, condition in conditions.items()}}
             if autoencoder_record is not None:
-                autoencoder_record = _computing(autoencoder_record, compute)
+                autoencoder_record = saved_component(autoencoder_record, compute)
         params = (restored_tree(run, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
                   if variables is None else variables)
         inputs = InputSpec.bound(inputs_record, params=params.get('encoders', {}))
@@ -1039,25 +1039,6 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
         roots.extend([("autoencoder",)] if held is None
                      else [("autoencoder", collection) for collection in held])
     return tuple(roots)
-
-
-def _computing(owner: Mapping[str, object], compute: str) -> Mapping[str, object]:
-    """A recorded encoder or autoencoder (a class record, `dew.registry.component`) computing in
-    `compute`: its own `dtype`, the dtype of the model it wraps where it records one, and the autoencoder it
-    wraps (`TunedAutoEncoder`'s) computing in it too."""
-    from dew._records import record
-
-    recorded = dict(record(owner['fields'], 'fields'))
-    if 'dtype' in recorded:
-        recorded['dtype'] = compute
-    wrapped = recorded.get('autoencoder')
-    if isinstance(wrapped, Mapping) and 'fields' in wrapped:
-        # A wrapper's autoencoder (`TunedAutoEncoder`'s) computing in `compute` too.
-        recorded['autoencoder'] = _computing(wrapped, compute)
-    model = recorded.get('model')
-    if isinstance(model, Mapping) and 'dtype' in record(model.get('fields', {}), 'model.fields'):
-        recorded['model'] = {**model, 'fields': {**record(model['fields'], 'model.fields'), 'dtype': compute}}
-    return {**owner, 'fields': recorded}
 
 
 def _time_grid(times) -> tuple[float, ...]:

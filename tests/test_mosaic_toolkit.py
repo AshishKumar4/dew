@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+from generation_support import COMPILES_ON_CPU, INTERPRETS
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
@@ -1273,6 +1273,7 @@ def test_the_gemms_kernel_bodies_run_on_a_tpu_core(case):
         jax.jit(call).trace(*abstract).lower(lowering_platforms=("tpu",))
 
 
+@COMPILES_ON_CPU
 def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_gates_cap_spill_free():
     """A persistent warpgroup-MMA walk, one consumer beside its producer, launched at each residency its
     family admits a multiprocessor on an H100 (`RegisterModel.most`) and compiled as the GPU gate compiles
