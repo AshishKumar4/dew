@@ -313,29 +313,48 @@ def test_a_prologues_sides_are_priced_by_their_arithmetic_as_xla_runs_them():
     assert exponential.fused_seconds > summed.fused_seconds, (exponential, summed)
 
 
-def test_an_elementwise_program_is_one_xla_launch_and_a_reductions_one():
-    """`algebra.program.priced` of a program of elementwise work alone (`x * scale`, a producer formed whole
-    before its GEMM) counts one kernel, its outputs' fusion, its fixed latency priced on an H100 (row 7284),
-    as a row sum's program counts its reduction's one: no program XLA runs launches none."""
-    from dew.algebra import program
+def test_an_elementwise_producer_formed_whole_prices_xlas_launch_of_it():
+    """`fused_gemm.analysis` on an H100 of a small product (128 x 128 x 128, a bias its consumer) whose
+    operand an elementwise producer forms (`x * scale`), against the same region given its operand: its
+    unfused price is XLA's launch forming the operand whole beside it, at least the part's fixed latency
+    more (row 7284: an elementwise program priced no launch), its bytes a few hundred nanoseconds at most."""
+    x, w = (jax.ShapeDtypeStruct((128, 128), jnp.bfloat16) for _ in range(2))
+    scale, bias = (jax.ShapeDtypeStruct((128,), jnp.bfloat16) for _ in range(2))
 
-    x, scale = jnp.zeros((8192, 4096), jnp.bfloat16), jnp.zeros((4096,), jnp.bfloat16)
-    target = generation.gpu_target("sm90")
-    elementwise = program.priced(jax.make_jaxpr(lambda x, scale: x * scale)(x, scale), target)
-    reduced = program.priced(jax.make_jaxpr(lambda x: jnp.sum(x, axis=1))(x), target)
-    assert (elementwise.work.kernels, reduced.work.kernels) == (1.0, 1.0), (elementwise.work, reduced.work)
+    def scaled(x, scale, w, bias):
+        return fused_gemm.product(x * scale, w, out_dtype=jnp.bfloat16) + bias
+
+    def given(x, w, bias):
+        return fused_gemm.product(x, w, out_dtype=jnp.bfloat16) + bias
+
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        formed = fused_gemm.analysis(scaled, x, scale, w, bias)
+        bare = fused_gemm.analysis(given, x, w, bias)
+    assert formed.unfused_seconds - bare.unfused_seconds >= target.fixed_seconds, (formed, bare)
 
 
-def test_an_xla_programs_price_is_what_its_outputs_read():
-    """`algebra.program.priced` of a program whose output reads a row sum, beside an exponential of the rows
-    no output reads, is the row sum's alone (row 7285: a prologue's side program, the producer read back
-    from its sides, priced its stage's dead exponential)."""
-    from dew.algebra import program
+def test_a_prologues_side_program_prices_what_its_sides_read():
+    """`fused_gemm.analysis` on an H100 of an 8192 x 4096 x 4096 bf16 product whose producer scales each row
+    by its sum, its stage `x` or an exponential read through a bitcast (an equation the algebra reads as
+    opaque, whose inputs a program's roots price): the sides XLA computes beside the launch are the row sums
+    alike, so the fused prices agree (the stage's work hidden under the launch's products), where the side
+    program priced the stage's dead equations (row 7285)."""
+    x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16)
 
-    x = jnp.zeros((8192, 4096), jnp.bfloat16)
-    dead = jax.make_jaxpr(lambda x: (jnp.sum(x, axis=1), jnp.exp(x)))(x)
-    read = dead.replace(jaxpr=dead.jaxpr.replace(outvars=dead.jaxpr.outvars[:1]))
-    alone = jax.make_jaxpr(lambda x: jnp.sum(x, axis=1))(x)
-    target = generation.gpu_target("sm90")
-    assert program.priced(read, target).value == program.priced(alone, target).value
+    def region(stage):
+        def fn(x, w):
+            scaled = stage(x) * jnp.sum(x, axis=1, keepdims=True)
+            return fused_gemm.product(scaled, w, out_dtype=jnp.bfloat16)
+        return fn
 
+    def bitcast(x):  # an exponential through a bitcast, which the algebra reads as an opaque equation
+        return jax.lax.bitcast_convert_type(jax.lax.bitcast_convert_type(jnp.exp(x), jnp.int16), jnp.bfloat16)
+
+    with generation.assumed("sm90"):
+        plain = fused_gemm.analysis(region(lambda x: x), x, w)
+        exponential = fused_gemm.analysis(region(bitcast), x, w)
+    for found in (plain, exponential):
+        assert found.prologue is not None and found.prologue.kernel == "fused", found.prologue
+    assert exponential.fused_seconds == plain.fused_seconds, (exponential, plain)
