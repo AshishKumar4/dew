@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import tokamax
+from process_support import fresh
 from reference_error import assert_computes_the_oracle
 from tuned import recorded
 
@@ -95,6 +96,37 @@ def test_a_pick_measured_under_another_jax_is_not_read(tmp_path, monkeypatch):
     with monkeypatch.context() as patched:
         patched.setattr(jax, "__version__", "0.0.0.other")
         assert len(tuning._read(theirs)[0]) == 1
+
+
+VERDICT = """
+import json, sys
+from dew import _cache
+from dew.nn.kernels import tuning
+from dew.nn.kernels.templates import report
+
+kind = "NVIDIA GH200 480GB"
+verdict = {"step_kernel_l0": ("module", report.Binary("step_kernel", "l0", registers=168, frame=24))}
+if sys.argv[1] == "store":
+    tuning.store_verdict(kind, "launch-key", verdict)
+print(json.dumps({"keeps_picks": _cache.keeps_picks(),
+                  "read": tuning.stored_verdict(kind, "launch-key") == verdict,
+                  "other": tuning.stored_verdict(kind, "another-key")}))
+"""
+"""A process storing a launch's certification verdict (`store`) or reading it alone, over the cache its
+environment names, printing what it read."""
+
+
+def test_a_certification_verdict_is_kept_under_deterministic_ops(tmp_path):
+    """A run under deterministic ops keeps no picks, which are measured timings, but keeps certification's
+    verdicts, which are what the assembler said of a compile, keyed by every input that decides it, the
+    run's XLA flags among them: a warm process reads the verdict a cold one stored (row 7308: under the
+    cuda lane's --xla_gpu_deterministic_ops a recurrent step's warm start certified every launch again)."""
+    cache, flags = tmp_path / "cache", "--xla_gpu_deterministic_ops=true"
+    cold = fresh(VERDICT, "store", cache_dir=cache, flags=flags)
+    warm = fresh(VERDICT, "read", cache_dir=cache, flags=flags)
+    assert not cold["keeps_picks"] and not warm["keeps_picks"]
+    assert cold["read"] and warm["read"]
+    assert warm["other"] is None
 
 
 def test_a_launch_whose_derived_config_lost_names_its_gap(tmp_path, monkeypatch):
