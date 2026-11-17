@@ -160,7 +160,11 @@ class Encoding:
             asked[name] = question
             if gold is not None:
                 golds[name] = gold
-        rows = self._contexted(example, self._rows(example, asked, rng, tokens))
+        rows = self._rows(example, asked, rng, tokens)
+        # A drawn row the layout refuses (a schema past the context, `Layout.refusal`) has no context to
+        # resolve; one it admits is read with its context, whose cut it may deepen (`drawn_refusal`).
+        rows = rows if dropped and any(self.layout.refusal(row, self.context_length) is not None
+                                       for row in rows) else self._contexted(example, rows)
         if dropped and (len(rows) != 1 or any(drawn_refusal(self.layout, row, self.context_length, admitted)
                                               is not None for row in rows)):
             # The added option made a row no run trains on (`Layout.refusal`: unfit, or options a
