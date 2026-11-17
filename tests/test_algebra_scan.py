@@ -40,22 +40,36 @@ OPERANDS = {"x": ("time", "width"), "dt": ("time",), "B": ("time", "state"), "C"
 DECLARED = scan.Scan(update, readout, OPERANDS, walked="time", state=((STATE, WIDTH), jnp.float32))
 
 
-def tokenwise(x, dt, B, C, reads: str = "after", group: int = 1):
+def tokenwise(x, dt, B, C, turn=None, reads: str = "after", group: int = 1):
     """The recurrence token by token (`lax.scan`), its outputs and final state, each token reading the state
     after it or entering it (`reads`, `Scan.reads`: RWKV-6's, before its decay and its write), or after its
     decay apart from every write of its `group` (Mamba-3's ranks: the state its group entered, decayed by
-    each of the group's tokens up to it)."""
+    each of the group's tokens up to it); where `turn` `[T, A]` is given, each token turning the state's
+    first key pairs before its decay (`Scan.turn`, `turned_reference`), the state its group entered too."""
     def one(carry, token):
         h, held, index = carry
-        x_t, dt_t, B_t, C_t = token
+        x_t, dt_t, B_t, C_t, turn_t = token
+        entering = h
+        if turn is not None:
+            h, held = turned_reference(h, turn_t), turned_reference(held, turn_t)
         after = update(h, x_t, dt_t, B_t, C_t, RATE, SKIP)
         held = jnp.exp(dt_t * RATE) * jnp.where(index % group == 0, h, held)
-        read = {"before": h, "after": after, "apart": held}[reads]
+        read = {"before": entering, "after": after, "apart": held}[reads]
         return (after, held, index + 1), readout(read, x_t, dt_t, B_t, C_t, RATE, SKIP)
 
     zero = jnp.zeros((STATE, WIDTH), x.dtype)
-    (final, _, _), outputs = jax.lax.scan(one, (zero, zero, 0), (x, dt, B, C))
+    turns = jnp.zeros_like(dt) if turn is None else turn
+    (final, _, _), outputs = jax.lax.scan(one, (zero, zero, 0), (x, dt, B, C, turns))
     return outputs, final
+
+
+def turned_reference(h, turn):
+    """`h` `[STATE, WIDTH]` with its first key rows' pairs, each the complex number `h_2j + i h_2j+1`, times
+    `e^{-i turn_j}` (`turn` `[A]`), the rest as they are: the rotating basis as `Scan.turn` defines it, in
+    complex arithmetic."""
+    pairs = turn.shape[-1]
+    turned = (h[0:2 * pairs:2] + 1j * h[1:2 * pairs:2]) * jnp.exp(-1j * turn)[:, None]
+    return h.at[0:2 * pairs:2].set(jnp.real(turned)).at[1:2 * pairs:2].set(jnp.imag(turned))
 
 
 RATE, SKIP = -0.7, 0.3
@@ -93,8 +107,9 @@ decay vanishes in float32 (`e^-1400`), with no reset: the state it reads enterin
 leaves its own write alone.""")
 
 
-def operands(x, dt, B, C) -> dict:
-    return {"x": x, "dt": dt, "B": B, "C": C, "rate": jnp.float32(RATE), "skip": jnp.float32(SKIP)}
+def operands(x, dt, B, C, turn=None) -> dict:
+    return {"x": x, "dt": dt, "B": B, "C": C, "rate": jnp.float32(RATE), "skip": jnp.float32(SKIP),
+            **({} if turn is None else {"turn": turn})}
 
 
 def chunk_of(values: dict, index: int, axes: dict = OPERANDS) -> dict:
@@ -120,12 +135,12 @@ two ranks consecutive, its step (its decay) on its first rank alone, the second'
 the state its token's first decayed.""")
 
 
-def ssd_walked(forms):
+def ssd_walked(forms, axes: dict = OPERANDS):
     """`forms`' chunk outputs and steps over every chunk in order from a zero state, finished: a function of
-    the SSD's inputs."""
-    def derived(x, dt, B, C):
-        values = operands(x, dt, B, C)
-        outputs, state = walk(forms, values, range(TOKENS // CHUNK), forms.init({}))
+    the SSD's inputs (and its turns, where `axes` holds them)."""
+    def derived(x, dt, B, C, turn=None):
+        values = operands(x, dt, B, C, turn)
+        outputs, state = walk(forms, values, range(TOKENS // CHUNK), forms.init({}), axes)
         return jnp.concatenate(outputs), forms.finish(state, values)
 
     return derived
@@ -863,30 +878,37 @@ def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient(reads, group, draw_f
     assert_as_exact(jax.jit(as_derived), jax.jit(as_tokens), draw_with_cotangents, label, seeds=16)
 
 
-def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16) -> None:
-    """`forms`' chunk adjoint of the delta rule `update_fn`, walked back from each chunk's entering state:
-    each token operand's gradient on par with the token-by-token scan's against the float64 truth (check
-    1), over `draw_fn`'s draws and a fixed cotangent's."""
-    names = ("q", "k", "v", "g", "beta")
-
-    def chunked(values, index):
-        return {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
-
+def assert_adjoint(forms, tokenwise_fn, names: tuple[str, ...], chunked, draw_fn, shapes: tuple,
+                   label: str, seeds: int = 16) -> None:
+    """`forms`' chunk adjoint, walked back from each chunk's entering state (`chunked(values, index)` a
+    chunk's operands): each of the token operands `names`' gradient on par with the token-by-token scan's
+    (`tokenwise_fn` of them in order) against the float64 truth (check 1), over `draw_fn`'s draws and a fixed
+    cotangent's of the outputs' and the final state's `shapes`."""
     derived = adjoint(forms, chunked, TOKENS // CHUNK)
 
     def draw_with_cotangents(seed):
-        return (*draw_fn(seed), *cotangents_of(seed, (TOKENS, VALUE), (KEY, VALUE)))
+        return (*draw_fn(seed), *cotangents_of(seed, *shapes))
 
-    def as_derived(q, k, v, g, beta, d_out, d_final):
-        grads = derived(dict(zip(names, (q, k, v, g, beta), strict=True)), (d_out, d_final))
+    def as_derived(*drawn):
+        grads = derived(dict(zip(names, drawn[:len(names)], strict=True)), drawn[len(names):])
         return tuple(grads[name] for name in names)
 
-    def as_tokens(q, k, v, g, beta, d_out, d_final):
-        values = dict(zip(names, (q, k, v, g, beta), strict=True))
-        grads = gradient_of(gated_tokenwise(update_fn), names)(values, (d_out, d_final))
+    def as_tokens(*drawn):
+        values = dict(zip(names, drawn[:len(names)], strict=True))
+        grads = gradient_of(tokenwise_fn, names)(values, drawn[len(names):])
         return tuple(grads[name] for name in names)
 
     assert_as_exact(jax.jit(as_derived), jax.jit(as_tokens), draw_with_cotangents, label, seeds=seeds)
+
+
+def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16) -> None:
+    """`forms`' chunk adjoint of the delta rule `update_fn`, on par with its token scan's
+    (`assert_adjoint`)."""
+    def chunked(values, index):
+        return {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
+
+    assert_adjoint(forms, gated_tokenwise(update_fn), ("q", "k", "v", "g", "beta"), chunked, draw_fn,
+                   ((TOKENS, VALUE), (KEY, VALUE)), label, seeds)
 
 
 @pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
@@ -1120,3 +1142,106 @@ def test_a_segmented_compensated_scan_of_double_floats_along_an_axis_holds_each_
         exact[:, t] = np.where(restarts[:, t], 0.0, before) + high[:, t].astype(np.float64) + low[:, t]
     np.testing.assert_array_equal(np.float64(summed_high) + np.float64(summed_low), exact)
     np.testing.assert_array_equal(np.asarray(summed_high), exact.astype(np.float32))
+
+
+PAIRS = 3
+"""A turned scan's key pairs (`Scan.turn`): six of the state's 16 key rows turned, the rest not."""
+
+TURNED = dataclasses.replace(DECLARED, operands={**OPERANDS, "turn": ("time", "pair")}, turn="turn")
+"""Mamba-2's update with each token turning the state's first `PAIRS` key pairs before its decay (Mamba-3's
+rotating basis), an operand neither its update nor its readout reads."""
+
+
+def turned_draw(seed):
+    """`draw`'s inputs and each token's turns, two to three radians each, a pair's sign its own: a chunk's
+    turns sum past 64 radians, where an fp32 angle's ulp is 8e-6."""
+    rng = np.random.default_rng(seed + 3)
+    turns = rng.uniform(2.0, 3.0, (TOKENS, PAIRS)) * rng.choice([-1.0, 1.0], PAIRS)
+    return (*draw(seed), jnp.asarray(turns, jnp.float32))
+
+
+def ranked_turned_draw(seed):
+    """`turned_draw`'s inputs as Mamba-3's ranks of two: each token's step and turns on its first rank
+    alone."""
+    x, dt, B, C, turn = turned_draw(seed)
+    return x, dt.at[1::2].set(0.0), B, C, turn.at[1::2].set(0.0)
+
+
+def wound_draw(seed):
+    """`turned_draw`'s inputs, each chunk's first token turning 2^26 radians more: its chunk's turns past it
+    summed to fp32's ulp of 8 there, each rounding a part of a radian or more, which its frame keeps
+    (`scan._framed`, `_rotation`)."""
+    x, dt, B, C, turn = turned_draw(seed)
+    return x, dt, B, C, turn.at[::CHUNK].add(2.0 ** 26)
+
+
+def far_draw(seed):
+    """`turned_draw`'s inputs, each chunk's third token turning 2^100 radians more, a finite fp32 angle no
+    exact product with 2 pi's float32 pair reduces (`scan._within_pi`)."""
+    x, dt, B, C, turn = turned_draw(seed)
+    return x, dt, B, C, turn.at[2::CHUNK].add(2.0 ** 100)
+
+
+TURNED_DRAWS = [("after", 1, turned_draw), ("after", 1, wound_draw), ("after", 1, far_draw),
+                ("before", 1, turned_draw), ("apart", 2, ranked_turned_draw)]
+"""A turned scan's walks reading after each token, also where a chunk's turns sum past 2^26 or a turn
+reaches 2^100, before it, and apart from its rank group's writes."""
+TURNED_IDS = ["after", "after-wound", "after-far", "before", "apart-ranks"]
+
+
+@pytest.mark.parametrize(("reads", "group", "draw_fn"), TURNED_DRAWS, ids=TURNED_IDS)
+def test_a_turned_scans_chunks_compute_the_token_scan(reads, group, draw_fn):
+    """A scan whose tokens turn the state's key pairs (`Scan.turn`), its derived chunk outputs and steps
+    over every chunk in order (each chunk read in its own frame, `scan._framed`): on par with the token scan
+    turning the state in complex arithmetic, outputs and final state, against the float64 truth (check 1),
+    each token reading after its update, before it, or apart from its rank group's writes."""
+    forms = scan.derive_scan(dataclasses.replace(TURNED, reads=reads, group=group), saturation=SATURATION)
+    scanned = functools.partial(tokenwise, reads=reads, group=group)
+    assert_as_exact(jax.jit(ssd_walked(forms, TURNED.operands)), jax.jit(scanned), draw_fn,
+                    f"ssd chunks turned{READING[reads]}", seeds=16)
+
+
+@pytest.mark.parametrize(("reads", "group", "draw_fn"), TURNED_DRAWS, ids=TURNED_IDS)
+def test_a_turned_scans_adjoint_is_the_token_scans_gradient(reads, group, draw_fn):
+    """A turned scan's chunk adjoint (`backward`), walked back over the chunks: each token operand's gradient,
+    its turns' among them, on par with the token scan's against the float64 truth (check 1): a turn's
+    cotangent the replay's, of the state entering its token and the cotangent leaving it, never a sum over
+    the chunk's tokens that cancels (row 7419)."""
+    declared = dataclasses.replace(TURNED, reads=reads, group=group)
+    forms = scan.derive_scan(declared, saturation=SATURATION)
+
+    def chunked(values, index):
+        return chunk_of({**values, "rate": jnp.float32(RATE), "skip": jnp.float32(SKIP)}, index,
+                        declared.operands)
+
+    scanned = functools.partial(tokenwise, reads=reads, group=group)
+    assert_adjoint(forms, scanned, ("x", "dt", "B", "C", "turn"), chunked, draw_fn,
+                   ((TOKENS, WIDTH), (STATE, WIDTH)), f"ssd adjoint turned{READING[reads]}")
+
+
+def test_two_turned_walks_merged_give_the_final_state():
+    """A turned scan's tokens walked in two halves, the second from a zero state, merged (`Walk.turn`: the
+    first half's state turned by the second's turns, then decayed): the final state on par with the token
+    scan's (check 1)."""
+    forms = scan.derive_scan(TURNED, saturation=SATURATION)
+    half = TOKENS // CHUNK // 2
+
+    def merged(x, dt, B, C, turn):
+        values = operands(x, dt, B, C, turn)
+        start = chunk_of(values, 0, TURNED.operands)
+        _, first = walk(forms, values, range(half), forms.init(start), TURNED.operands)
+        _, second = walk(forms, values, range(half, 2 * half), forms.init(start), TURNED.operands)
+        return forms.finish(forms.merge(first, second, values), values)
+
+    assert_as_exact(jax.jit(merged), jax.jit(lambda *xs: tokenwise(*xs)[1]), turned_draw, "ssd turned merged",
+                    seeds=16)
+
+
+@pytest.mark.parametrize("reads", ["after", "before"])
+def test_a_group_beside_a_readout_that_reads_none_of_it_is_refused(reads):
+    """A group of tokens (`Scan.group`) is what a readout apart from its writes reads none of: declared
+    beside a readout after or before its token, which would read it whole, its forms are refused, never
+    derived as if no group were declared (train 1004's review F3)."""
+    forms = scan.derive_scan(dataclasses.replace(DECLARED, reads=reads, group=2), saturation=SATURATION)
+    with pytest.raises(scan.Refused):
+        forms.prepare(chunk_of(operands(*draw(0)), 0))

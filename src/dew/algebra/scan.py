@@ -94,7 +94,16 @@ class Scan:
     mamba_ssm's tilelang mamba3_mimo_fwd excluding a token's whole R x R block), whose own block a model adds
     itself. A rank reading a lower rank of its own token at its gate and taking the gate's part back off
     cancelled catastrophically (one row 13 times its reference in 48 seeds, row 7402). No correction reads
-    apart: its tokens write their own state."""
+    apart: its tokens write their own state.
+    `turn`, where given, names an operand neither reads, `[..., A]` along the walked axis: each token's turn
+    of the state's first `2 A` key rows, `A` adjacent pairs `(2j, 2j + 1)`, each a complex number `h_2j + i
+    h_2j+1` the token multiplies by `e^{-i turn}` before its decay (Mamba-3's rotating basis,
+    kernel-templates.md's `complex_pairs`: a complex decay a pair), which the scan applies as it applies a
+    reset: its chunk forms read each token in the frame its chunk's turns so far set (`_framed`), a decay
+    a pair's magnitude its head's, so a turn's cotangent is formed by the token update's replay alone, of
+    the state entering it and the cotangent leaving it, the pairs crossing it (row 7419: a turn read as an
+    angle summed over a document cancelled across its tokens to 120 times the recurrence's error). No
+    correction, decay a key's or readout along the state's values turns here."""
 
     update: Callable
     readout: Callable
@@ -105,6 +114,7 @@ class Scan:
     ranges: Mapping[str, float | tuple[float, float]] = dataclasses.field(default_factory=dict)
     reads: Reads = "after"
     group: int = 1
+    turn: str | None = None
 
 
 def _traced(declaration: Scan, function: Callable, names: tuple[str, ...], chunk: Mapping):
@@ -149,7 +159,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     product) forming and joining a walk's transfer. The same forms without one take Dew's products, the
     portable route's; a chunk's transition, which a walk that carries its transfer composes (`prepare(chunk,
     transition=True)`), is always Dew's, formed chunk-parallel."""
-    names = tuple(name for name in declaration.operands if name != declaration.reset)
+    names = tuple(name for name in declaration.operands if name not in (declaration.reset, declaration.turn))
+    # The operands a chunk's adjoint gives a cotangent of: the update's and the turn's.
+    differentiated = names + ((declaration.turn,) if declaration.turn is not None else ())
     shape, dtype = declaration.state
     if len(shape) != 2:
         raise Refused("a state of rank other than two (keys by values) has no chunk form here")
@@ -161,9 +173,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     def affine_of(chunk: Mapping):
         key = (tuple((tuple(chunk[name].shape), str(chunk[name].dtype)) for name in names), derive.context())
-        return _cache.holding(decomposed, key, lambda: linear_scan.parts(
+        return _turnable(declaration, _cache.holding(decomposed, key, lambda: linear_scan.parts(
             _traced(declaration, declaration.update, names, chunk),
-            _traced(declaration, declaration.readout, names, chunk), saturation), derive.FORMS_HELD)
+            _traced(declaration, declaration.readout, names, chunk), saturation), derive.FORMS_HELD))
 
     def parts(chunk: Mapping):
         affine = affine_of(chunk)
@@ -179,7 +191,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         if not shapes:
             return empty
         corrected = affine_of(shapes).correction is not None
-        return Walk(*empty, jnp.eye(shape[0], dtype=carried) if corrected else None)
+        return Walk(*empty, jnp.eye(shape[0], dtype=carried) if corrected else None,
+                    _unturned(declaration, shapes, carried))
 
     splits: collections.OrderedDict = collections.OrderedDict()  # the least recently prepared first
 
@@ -188,6 +201,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         decays = _decays(exponent, affine.base2)
         natural = _walked(exponent, affine.base2)
         tokens, entering = _read_entering(declaration, chunk, dict(zip(TOKENS, values, strict=True)))
+        turned = None
+        if declaration.turn is not None:
+            tokens, turned = _framed(tokens, _walked_tokens(declaration, chunk)[0][declaration.turn])
         apart = _apart(declaration, affine, tokens["B"].shape[0])
         extents = linear_scan.Extents(tokens["B"].shape[0], shape[0], shape[1], exponent.shape[-1],
                                       affine.values_read, apart)
@@ -205,7 +221,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             declaration, names, chunk, affine, form, tuple(held), given, jax.ShapeDtypeStruct(shape, carried),
             extents.tokens, saturation), splits_held)
         prepared = Prepared((natural, split.prepare(*given, issue=issue or _issued)), split, corrected,
-                            entering=entering, values_read=affine.values_read)
+                            entering=entering, values_read=affine.values_read, turned=turned)
         if not (corrected and transition):
             return prepared
         return dataclasses.replace(prepared, transition=_transition(prepared, jnp.zeros(shape, carried)))
@@ -230,7 +246,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     def backward(chunk, state, d_state, d_outputs):
         # The reset's booleans held, no operand of the derivative.
         _, pullback = jax.vjp(lambda h, operands: replay({**chunk, **operands}, h), state[1],
-                              {name: chunk[name] for name in names})
+                              {name: chunk[name] for name in differentiated})
         return pullback((d_outputs, d_state))
 
     return Derived(init, _stepped, merge, finish, mapped,
@@ -238,11 +254,34 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
                    replay=replay)
 
 
+def _turnable(declaration: Scan, affine):
+    """`affine`, the declaration's token map, refused where its tokens turn the state (`Scan.turn`) under a
+    correction, a decay a key's or a readout along the state's values."""
+    if declaration.turn is not None and (affine.correction is not None or affine.per_key
+                                         or affine.values_read):
+        raise Refused("a turn under a correction, a decay a key's or a readout along the state's values has "
+                      "no chunk form here")
+    return affine
+
+
+def _unturned(declaration: Scan, shapes: Mapping, dtype) -> tuple | None:
+    """A walk's turn before any token's (`Walk.turn`): each pair's rotation one, where the declaration turns
+    (`Scan.turn`), else None."""
+    if declaration.turn is None:
+        return None
+    pairs = shapes[declaration.turn].shape[-1:]
+    return jnp.ones(pairs, dtype), jnp.zeros(pairs, dtype)
+
+
 def _apart(declaration: Scan, affine, tokens: int) -> int:
     """The tokens of the group a readout reads apart from (`Scan.group`, 0 where it reads after its write or
-    before its token): refused where its tokens correct the state (each writes its own) or a chunk of
-    `tokens` cuts a group (its memory would hold its own group's earlier writes)."""
+    before its token): refused where its tokens correct the state (each writes its own), a chunk of `tokens`
+    cuts a group (its memory would hold its own group's earlier writes), or a group of more than one token
+    is declared beside another readout, which reads none of it (train 1004's review F3)."""
     if declaration.reads != "apart":
+        if declaration.group != 1:
+            raise Refused(f"a group of {declaration.group} tokens under a readout {declaration.reads!r} its "
+                          "token: a group is what a readout apart from its writes reads none of")
         return 0
     if affine.correction is not None:
         raise Refused("a readout apart from its group's writes under a correction has no chunk form here")
@@ -257,6 +296,9 @@ def _stepped(state, prepared: Prepared, issue=None):
     decay, h = state[:2]
     natural, values = prepared.values
     (leaving,) = prepared.split.carry(values, h, issue)
+    if prepared.turned is not None:
+        # The state leaving the chunk in its own frame, turned back from the chunk's (`_framed`).
+        leaving = rotated(leaving, *prepared.turned, axis=0)
     decay = _held(decay + natural.astype(decay.dtype))
     if not isinstance(state, Walk):
         return decay, leaving
@@ -267,7 +309,7 @@ def _stepped(state, prepared: Prepared, issue=None):
                       "(`prepare(chunk, transition=True)`)")
     transfer = (None if state.transfer is None
                 else (issue or _issued)("transfer_compose", prepared.transition, state.transfer))
-    return Walk(decay, leaving, transfer)
+    return Walk(decay, leaving, transfer, _composed(state.turn, prepared.turned))
 
 
 def _at_token(declaration: Scan, names: Sequence[str], affine, token: Mapping) -> tuple:
@@ -328,6 +370,9 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             entering = _read(read, q, affine.values_read) + r
         floor = vanishing(z.dtype, affine.base2)
         h = jnp.where((z <= floor)[:, None], 0.0, h)
+        if declaration.turn is not None:
+            # The token's turn before its decay, of the state and of what its group entered.
+            h, apart = (turned(x, step[declaration.turn], axis=0) for x in (h, apart))
         decay = jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],))
         if group:
             # A token apart from its group's writes reads the state its group entered, decayed by every token
@@ -356,7 +401,8 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
     return outputs, h
 
 
-@functools.partial(jax.tree_util.register_dataclass, data_fields=["values", "transition", "entering"],
+@functools.partial(jax.tree_util.register_dataclass,
+                   data_fields=["values", "transition", "entering", "turned"],
                    meta_fields=["split", "corrected", "values_read"])
 @dataclasses.dataclass(frozen=True)
 class Prepared:
@@ -374,6 +420,73 @@ class Prepared:
     token's part free of the state, which its outputs take (`derive_scan`'s `mapped`); else None."""
     values_read: bool = False
     """Whether its readout reads the state along its values (`linear_scan.Parts.values_read`)."""
+    turned: tuple | None = None
+    """Where its declaration turns (`Scan.turn`), the rotation that takes the state from its chunk's frame
+    back to its own (`_framed`), `(cos, sin)` of `e^{-i Phi}` `[A]`, `Phi` the chunk's turns' sum."""
+
+
+def rotated(x, cos, sin, *, axis: int = -1):
+    """`x` with each adjacent pair `(2j, 2j + 1)` of its first `2 A` entries along `axis`, the complex number
+    `x_2j + i x_2j+1`, multiplied by `cos_j + i sin_j` (`cos`, `sin` `[..., A]`, broadcast against `x`'s pairs
+    with `axis` moved last), the rest as given: a turned state's rotation (`Scan.turn`), RoPE's adjacent
+    pairs' arithmetic (`dew.nn.rope.rotate`), on every pair's row at once."""
+    from dew.nn import rope
+
+    moved = jnp.moveaxis(x, axis, -1)
+    pairs = cos.shape[-1]
+    rows = moved.reshape(-1, moved.shape[-1])
+    cos, sin = (jnp.broadcast_to(part, (*moved.shape[:-1], pairs)).reshape(-1, pairs) for part in (cos, sin))
+    return jnp.moveaxis(rope.rotate(rows, cos, sin, pairs="adjacent").reshape(moved.shape), -1, axis)
+
+
+def turned(x, turn, *, axis: int = -1):
+    """`x` turned by `turn` `[..., A]` (`Scan.turn`): each of its first `A` pairs along `axis` times
+    `e^{-i turn}`, `(a, b) -> (a cos + b sin, b cos - a sin)` (`rotated`), at any size of turn its
+    backend's sine and cosine take (their full-range reduction)."""
+    return rotated(x, jnp.cos(turn), -jnp.sin(turn), axis=axis)
+
+
+def _within_pi(turns):
+    """Each turn as an angle within pi of zero: itself where it is, else read back from its rotation
+    (`atan2` of its sine and cosine, their backend's full-range reduction), so a chunk's prefix of them
+    (`_framed`) stays within its `C pi` however far a turn reaches. Summed whole, a turn of 2^26 left every
+    later prefix 2.4e-7 radians off, a double float's precision there (the chunk's final state 6 times the
+    token scan's worst row); taken off by 2 pi's float32 pair, a turn of 2^127 overflowed its product's
+    split (NaN), and one of 2^50 drifted 7.7 radians by the pair's own rounding."""
+    return jnp.where(jnp.abs(turns) <= np.pi, turns, jnp.arctan2(jnp.sin(turns), jnp.cos(turns)))
+
+
+def _rotation(high, low) -> tuple[jax.Array, jax.Array]:
+    """`(cos, sin)` of the angle `high + low` (a double float, a chunk's prefix of turns within pi of zero,
+    `_within_pi`), the rotation by it composed of its two parts' (`e^{i hi} e^{i lo}`), each unit: read as
+    `cos(high) - low sin(high)`, a low part past a radian left the rotation's magnitude 1.41."""
+    cos, sin, cos_low, sin_low = jnp.cos(high), jnp.sin(high), jnp.cos(low), jnp.sin(low)
+    return cos * cos_low - sin * sin_low, sin * cos_low + cos * sin_low
+
+
+def _framed(tokens: dict, turns) -> tuple[dict, tuple]:
+    """A chunk's token values in its frame (`Scan.turn`), and the rotation back from it at the chunk's end
+    (`Prepared.turned`). With `Phi_t` the chunk's turns through token `t` (`turns` `[C, A]`), the state after
+    token `t` in the frame `e^{i Phi_t} h_t` is the turnless recurrence's over writes and readers each turned
+    on by `e^{i Phi_t}`: its writes `B` and its readers `Q` (`_read_entering`'s: a reader of the state after
+    token `t`), the state entering the chunk in its own frame (`Phi` none); the state leaving it turned back
+    by `e^{-i Phi_last}`. Within a chunk the frame's angles are at most its turns' sum, and a turn's
+    cotangent is the replay's (`Scan.turn`). `Phi` is a compensated prefix (`compensated`) of the turns each
+    within pi of zero (`_within_pi`), its rotation its double float's (`_rotation`): rounded to fp32, an
+    angle near a chunk's `C pi` is off by half its ulp, 64 times a turn's."""
+    cos, sin = _rotation(*compensated(_within_pi(turns.astype(at_least_fp32(turns.dtype))), axis=0))
+    framed = {name: rotated(value, cos, sin) if name in ("B", "Q") else value
+              for name, value in tokens.items()}
+    return framed, (cos[-1], -sin[-1])
+
+
+def _composed(first: tuple | None, second: tuple | None) -> tuple | None:
+    """Two pairs' rotations `(cos, sin)` applied in turn (`Walk.turn`, `Prepared.turned`), their complex
+    product; either where the other is None."""
+    if first is None or second is None:
+        return first if second is None else second
+    (cos, sin), (then_cos, then_sin) = first, second
+    return cos * then_cos - sin * then_sin, cos * then_sin + sin * then_cos
 
 
 def _read_entering(declaration: Scan, chunk: Mapping, tokens: dict) -> tuple[dict, tuple | None]:
@@ -416,6 +529,9 @@ class Walk(NamedTuple):
     decay: jax.Array
     h: jax.Array
     transfer: jax.Array | None
+    turn: tuple | None = None
+    """Where its declaration turns (`Scan.turn`), the rotation its tokens' turns applied to each pair of the
+    entering state, `(cos, sin)` of `e^{-i sum turn}` `[A]`, else None."""
 
 
 def _merged(a, b, carried, issue: Callable) -> Walk:
@@ -426,17 +542,20 @@ def _merged(a, b, carried, issue: Callable) -> Walk:
     its own, each touched by it alone)."""
     if not (isinstance(a, Walk) and isinstance(b, Walk)):
         raise Refused("a merge of walks init did not start from their operands' shapes")
+    # The state before the later walk turned by its tokens' turns, then decayed (a pair's decay one).
+    entering = a.h if b.turn is None else rotated(a.h, *b.turn, axis=0)
     if b.transfer is None:
-        h = jnp.exp(b.decay)[:, None] * a.h + b.h
+        h = jnp.exp(b.decay)[:, None] * entering + b.h
         transfer = None if a.transfer is None else jnp.exp(b.decay)[:, None] * a.transfer
     else:
         h = issue("transfer_apply", b.transfer, a.h) + b.h
         transfer = (issue("transfer_decay", jnp.exp(a.decay), b.transfer) if a.transfer is None
                     else issue("transfer_compose", b.transfer, a.transfer))
+    turn = _composed(a.turn, b.turn)
     if carried is None:
-        return Walk(_held(a.decay + b.decay), h, transfer)
+        return Walk(_held(a.decay + b.decay), h, transfer, turn)
     return Walk(_held(a.decay + b.decay), h.astype(carried),
-                None if transfer is None else transfer.astype(carried))
+                None if transfer is None else transfer.astype(carried), turn)
 
 
 def _transition(prepared: Prepared, h: jax.Array) -> jax.Array:
@@ -570,6 +689,11 @@ def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
         # No bound where it passes float64's range (16 unit keys over 256 tokens: 17**255).
         power = max(chunk_size - 1, 0) * math.log2(1.0 + entry)
         bounded["inverse"] = math.inf if power >= 1024 else 2.0 ** power
+    if declaration.turn is not None:
+        # A write and a reader turned on into the chunk's frame (`_framed`): each entry at most its pair's
+        # norm, sqrt(2) times the bound of each.
+        bounded.update({tokens_at[name]: bounded[tokens_at[name]] * math.sqrt(2.0) for name in ("B", "Q")
+                        if tokens_at[name] in bounded})
     return {**dict.fromkeys(range(DECAYS), 1.0), **bounded}
 
 
