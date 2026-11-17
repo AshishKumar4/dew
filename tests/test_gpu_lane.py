@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import jax
 import pytest
 import tier_wire
 from armada_support import LANE_TEST, cached, fetcher, gpu_driver, gpu_lane_at, interpreter, loaded
@@ -662,29 +663,30 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
         ci, tmp_path, monkeypatch, cache_worker):
     """A lane unit whose prepare filed its programs' memory (`tier_wire.needs_file`, its prepare told
     which unit it is by DEW_TIER_UNIT) is given no less than the least pool at which Dew's admission
-    (dew.training.memory `needed`) takes the most demanding of them, beside what its runs measured: a part's
-    float64 truths, which no run of it held, are admitted before they run (2026-11-17: two flows' 1.71 GiB
-    terms walk beside 1.1 GiB of arms ran out of a 2.84 GiB share). One past the lane's share is not run
-    below it: its row is red, naming its need and the GPU (Main, 2026-11-17)."""
+    (dew.training.memory `needed`, the GPU's memory, read as its pool's share by `allocator_limit`) takes the
+    most demanding of them, beside what its runs measured: a part's float64 truths, which no run of it held, are
+    admitted before they run (2026-11-17: two flows' 1.71 GiB terms walk beside 1.1 GiB of arms ran out of a
+    2.84 GiB share). One past the lane's share is not run below it: its row is red, naming its need and the GPU
+    (Main, 2026-11-17). Dew's own functions read it, here as the lane does, on a lane a tenth of its GPU, where
+    a need read in the wrong units is ten times off (rows 7460, 7461: red unschedulable at 34.88 GiB)."""
+    from dew._devices import allocator_limit
+    from dew.training.memory import needed
+
     url, stored, _ = cache_worker
     gpu_lane_at(tmp_path, monkeypatch, url, 0)
     (tmp_path / "tests/test_flow.py").write_text(LANE_TEST)
     interpreter(tmp_path, "3.12")
     fetcher(tmp_path)
-    # Dew's admission standing in, in the checkout's src/ as the lane reads it, in Dew's own units: `needed`
-    # the GPU's memory whose pool admits a program (its resident and beside bytes and twice its temporaries,
-    # as a stranding allocator's), `allocator_limit` the pool's share of a GPU's memory, the lane's half.
-    share = "float(__import__('os').environ['XLA_PYTHON_CLIENT_MEM_FRACTION'])"
-    for module, source in (("__init__", ""), ("training/__init__", ""),
-                           ("_devices", f"def allocator_limit(memory):\n    return int(memory * {share})\n"),
-                           ("training/memory", "def needed(device, resident, beside, temporaries):\n"
-                                               "    return int((resident + beside + 2 * temporaries)"
-                                               f" / {share})\n")):
-        (tmp_path / "src" / "dew" / f"{module}.py").parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / "src" / "dew" / f"{module}.py").write_text(source)
     truths = tmp_path / "truths"
     monkeypatch.setenv(tier_wire.TRUTHS, str(truths))
-    gib, total = 2 ** 30, 81920 * 2 ** 20
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.1")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    gib, mib, total = 2 ** 30, 2 ** 20, 81920 * 2 ** 20
+    budget, whole = 0.1 * total, float(ci.WHOLE_GPU) * total
+
+    def admitted(*programs: tuple[int, int, int]) -> int:
+        """Dew's admission of `programs` on this process's device, in its pool's bytes, as the lane reads it."""
+        return allocator_limit(max(needed(jax.local_devices()[0], r, b, m) for r, b, m in programs))
 
     def measured() -> None:
         # Its measured 2 GiB, as each run here records its own (with no GPU, none) over it.
@@ -709,30 +711,30 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     # Its measured 2 GiB alone: 3.5 GiB, its peak and headroom.
     share, row = lane()
     assert (share, row["output"]) == (2 * gib * 1.25 + gib, "")
-    # Its arms, and its float64 walk beside them, whose stranded temporaries need 7 GiB: given those.
-    filed((gib, gib // 2, gib // 4), (gib, gib, int(2.5 * gib)))
-    share, row = lane()
-    assert (share, row["output"], row["exitCode"]) == (7 * gib, "", 0)
     # A GH200 part's flows as their prepare filed them (2026-11-17, MAINGPU-8063e3557-PART3of9's
-    # needs/117ca29968591c89.json, its two largest of 80 programs: a 1.71 GiB terms walk beside its arms), its
-    # least pool 3.59 GiB of pool bytes: it runs, given that, never its GPU's memory read as pool (which red
-    # test_gpu_flows on the sm90 tier as needing 34.88 GiB, rows 7460 and 7461).
-    mib = 2 ** 20
-    filed((76 * mib, 107 * mib, 1836 * mib), (76 * mib, 107 * mib, 1428 * mib))
-    share, row = lane()
-    assert (share, row["output"], row["exitCode"]) == ((76 + 107 + 2 * 1836) * mib, "", 0)
+    # needs/117ca29968591c89.json, its two largest of 80 programs), and arms beside a float64 walk: each run,
+    # given no less than Dew's admission of them.
+    for programs in (((76 * mib, 107 * mib, 1836 * mib), (76 * mib, 107 * mib, 1428 * mib)),
+                     ((gib, gib // 2, gib // 4), (gib, gib, 5 * gib))):
+        filed(*programs)
+        share, row = lane()
+        assert admitted(*programs) <= budget
+        assert (row["output"], row["exitCode"]) == ("", 0)
+        assert share == pytest.approx(max(2 * gib * 1.25 + gib, admitted(*programs)), abs=mib)
     # Its children each take a share's fraction: what it holds is of its raised share, 7 GiB twice over.
     assert ci.gpu_needs({"depends": [], "peak": 2 * gib, "shares": 1, "pools": 0}, 40 * gib, 7 * gib) == (
         7 * gib, 14 * gib)
-    # Programs past the lane's 40 GiB: none runs, each red as its file, its row naming its need and the GPU,
-    # and saying a lane of the whole GPU holds it only where that lane's 60 GiB (JAX's 75%) does.
-    for need, temporaries, whole in ((50, 24, True), (70, 34, False), (98, 48, False)):
-        filed((gib, gib, temporaries * gib))
+    # Programs past the lane's share: none runs, each red as its file, its row naming its need and the GPU, and
+    # saying a lane of the whole GPU holds it only where that lane's (JAX's 75%) does.
+    for temporaries in (12 * gib, 70 * gib):
+        filed((gib, gib, temporaries))
+        need = admitted((gib, gib, temporaries))
         runs = len(lane_runs(tmp_path, "test_flow"))
         _, row = lane()
-        assert len(lane_runs(tmp_path, "test_flow")) == runs and row["exitCode"] == 1
-        assert row["kind"] == "whole" and f"{need:.2f} GiB" in row["output"]
-        assert ci.device_class() in row["output"] and ("holds it" in row["output"]) == whole
+        assert need > budget and len(lane_runs(tmp_path, "test_flow")) == runs and row["exitCode"] == 1
+        assert row["kind"] == "whole" and f"{need / gib:.2f} GiB" in row["output"]
+        assert ci.device_class() in row["output"] and ("holds it" in row["output"]) == (need <= whole)
+
 
 def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measured_class_held_it(
         ci, tmp_path, monkeypatch, cache_worker, capsys):
