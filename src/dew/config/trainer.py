@@ -109,7 +109,7 @@ _log = logging.getLogger(__name__)
 
 PASSES = "passes"
 """The default validation and checkpoint cadence: at each pass's end where the run counts its data's passes
-(as `epoch`), otherwise once, at the run's end (`100%`), as `TrainerConfig._interval` resolves it at the
+(as `epoch`), otherwise once, at the run's end (`100%`), as `TrainerConfig.interval` resolves it at the
 start, which records and logs what it became (docs/design/training.md, cadences). `epoch`, written, is
 strict: a run whose data counts no pass refuses it."""
 
@@ -529,7 +529,7 @@ class TrainerConfig:
 
     def eval_interval(self, dataset: Loader) -> int | str | Counted | None:
         """Return the steps between validation passes over `data`, or None for never."""
-        return self._interval(self.eval_every, dataset, "eval-every")
+        return self.interval(self.eval_every, dataset, "--trainer.eval-every")
 
     def checkpoint_interval(self, dataset: Loader) -> int | str | Counted | datetime.timedelta | None:
         """Return the steps, or a recorded duration such as 30m, between checkpoints."""
@@ -538,26 +538,28 @@ class TrainerConfig:
             if value.total_seconds() <= 0:
                 raise ValueError("checkpoint_every duration must be positive")
             return value
-        return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
+        return self.interval(self.checkpoint_every, dataset, "--trainer.checkpoint-every")
 
-    def _interval(self, value, dataset: Loader, field_name: str) -> int | str | Counted | None:
-        """Steps for `epoch`, or the source examples a pass holds where the run reads its epochs as
-        passes over them (`Loader.epochs`, `Loader.pass_examples`); for `passes`, the same where the run
-        counts its data's passes, and the run's end (`_AT_END`) where it counts none, which it logs; steps,
-        a share of the run (which `fit` resolves) or None as given."""
+    def interval(self, value, dataset: Loader, option: str) -> int | str | Counted | None:
+        """A cadence (`eval_every`, `checkpoint_every`, a split's `RunConfig.val_every`) the command
+        line's `option` (`--trainer.eval-every`) sets, resolved against `dataset`: steps for `epoch`, or
+        the source examples a pass holds where the run reads its epochs as passes over them
+        (`Loader.epochs`, `Loader.pass_examples`); for `passes`, the same where the run counts its data's
+        passes, and the run's end (`_AT_END`) where it counts none, which it logs; steps, a share of the
+        run (which `fit` resolves) or None as given."""
         if value is None or isinstance(value, int) or is_share(value):
             return value
         passed = dataset.pass_examples if dataset.epochs is not None else None
         if value == PASSES and dataset.steps_per_epoch is None and not passed:
-            _log.info("--trainer.%s passes: the run counts none of its data's passes (no record count, and "
-                      "no --trainer.epochs over source examples), so it runs at the run's end (%s)",
-                      field_name, _AT_END)
+            _log.info("%s passes: the run counts none of its data's passes (no record count, and no "
+                      "--trainer.epochs over source examples), so it runs at the run's end (%s)", option,
+                      _AT_END)
             return _AT_END
         if dataset.steps_per_epoch is None and passed:
             return Counted(passed, "examples")
         if dataset.steps_per_epoch is None:
             raise ValueError(
-                f"--trainer.{field_name} epoch needs a dataset with a record count; this "
+                f"{option} epoch needs a dataset with a record count; this "
                 f"one streams without one, so give the interval in steps or None")
         return dataset.epoch_steps(window=self.accumulation)
 
