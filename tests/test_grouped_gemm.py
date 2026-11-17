@@ -511,7 +511,9 @@ def test_a_paired_products_input_gradient_adds_its_parts_on_the_launch_its_plain
         with generation.assumed(generation_name):
             assert gemm._keeps_launch(cotangents[1], second, sizes, gemm._added, (prior,), (jnp.bfloat16,),
                                       (jnp.bfloat16,), options), generation_name
-        with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
+        # Interpreted on the host's CPU, whatever GPU it has (row 7130).
+        with (generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"),
+              jax.default_device(jax.devices("cpu")[0])):
             [d_tokens] = jax.vjp(paired, tokens)[1](cotangents)
         np.testing.assert_array_equal(np.asarray(d_tokens), np.asarray(wide.astype(jnp.bfloat16)),
                                       err_msg=generation_name)
@@ -985,6 +987,7 @@ def test_the_tuners_group_sizes_route_every_row(groups):
     assert sizes.sum() == 300 and (sizes >= 0).all() and (groups == 1 or sizes[0] == 0), sizes
 
 
+@pytest.mark.mesh(devices=8)
 def test_a_ragged_products_portable_route_places_its_output_on_an_explicit_mesh():
     """XLA's ragged products on a CPU (`gemm.gemm` and its reverse pass, `gemm.gemm_t`, the portable route a
     fused producer's analysis replays) of rows an Explicit data axis splits, as a device step's are
@@ -1069,7 +1072,10 @@ def test_a_gathered_projections_reverse_pass_reads_its_rows_where_they_lie(scatt
     stacked = (3,) if layered else ()
     matrices = jnp.asarray(rng.integers(-3, 4, size=(2, *stacked, 3, 128, 128)), jnp.bfloat16)
     layer = jnp.asarray(2, jnp.int32) if layered else None
-    with generation.assumed(name), generation.chosen(grouped_matmul="mosaic"):
+    # Interpreted on the host's CPU, whatever GPU it has: a B200's kernels compiled for a GH200 abort its
+    # process (row 7130).
+    with (generation.assumed(name), generation.chosen(grouped_matmul="mosaic"),
+          jax.default_device(jax.devices("cpu")[0])):
         a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, scattered=scattered,
                                                               interpret_on_cpu=True, layer=layer)
 
