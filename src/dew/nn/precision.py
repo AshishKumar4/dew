@@ -430,6 +430,41 @@ def rounds_products() -> bool:
     return numerics().forms == "fast" and asks_default_precision(None, configured=True)
 
 
+@jax.custom_jvp
+def softplus(x) -> jax.Array:
+    """`jax.nn.softplus(x)`, `log(1 + exp(x))`, as its larger part plus `log1p` of the smaller's exponential
+    `y` in (0, 1], the `log1p` by its series in `s = y / (2 + y)`, at most a third, `2 (s + s^3 / 3 + s^5 /
+    5 + ...)` to its working dtype's rounding (`_series_terms`): a backend's own `log1p` is no part of it,
+    a v5e's 1.4e-4 from float64 (its `log` alike), which held a Mamba-2 layer's output at 2.9e-5 from
+    float64 where this holds it at 1.4e-6 (row 7062). Formed in at least float32 and rounded once to `x`'s
+    dtype; its derivative the logistic, as JAX's."""
+    given = jnp.asarray(x)
+    x = given.astype(at_least_fp32(given.dtype))
+    y = jnp.exp(-jnp.abs(x))
+    s = y / (2.0 + y)
+    square = s * s
+    series = jnp.zeros_like(s)
+    for odd in range(_series_terms(x.dtype), 0, -2):
+        series = series * square + 1.0 / odd
+    return (jnp.maximum(x, 0) + 2.0 * s * series).astype(given.dtype)
+
+
+def _series_terms(dtype) -> int:
+    """The last odd power `softplus`'s series keeps in `dtype`: past it the next term relative to the
+    first, `s^(n + 1) / (n + 2)` at `s`'s most, a third, is under `dtype`'s rounding (15 terms to s^29 in
+    float64, 7 to s^13 in float32)."""
+    rounding, last = float(jnp.finfo(dtype).eps), 1
+    while (1 / 3) ** (last + 1) / (last + 2) >= rounding:
+        last += 2
+    return last
+
+
+@softplus.defjvp
+def _softplus_jvp(primals, tangents):
+    (x,), (tangent,) = primals, tangents
+    return softplus(x), jax.nn.sigmoid(x) * tangent
+
+
 def iteration_dtype() -> jnp.dtype:
     """The dtype an optimizer's matrix iteration (Muon's and M3's Newton-Schulz, `dew.newton_schulz`)
     multiplies in under the run's numerics: in its fast forms, bfloat16 for any 16-bit compute dtype (the
