@@ -303,7 +303,8 @@ class DecisionRunConfig(DecoderRunConfig):
     def _context_derived(self, dtype: str) -> Mapping[str, object]:
         """The objective's context arguments: how its backbone encodes a row's context, or the encoder a
         run configures (`context_text`, built in the run's compute `dtype`, one that encodes text as
-        `_refuse_unread_context` holds it) and whether its weights train (`context_text_trained`)."""
+        `_refuse_unread_context` holds it) and whether its weights train (`context_text_trained`, which
+        `build_run` reads as well for an encoder its start carries)."""
         if self.context_layers is None:
             return {}
         if self.context_text is None:
@@ -324,8 +325,6 @@ class DecisionRunConfig(DecoderRunConfig):
             raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
         if self.context_text is not None and self.context_layers is None:
             raise ValueError("--context-text encodes the context context layers read; set --context-layers")
-        if self.context_text_trained and self.context_text is None:
-            raise ValueError("--context-text-trained trains a configured context encoder; set --context-text")
         text = self.context_text
         if text is not None and (text.field, text.unconditional) != (TextCondition.field,
                                                                      TextCondition.unconditional):
@@ -391,6 +390,13 @@ class DecisionRunConfig(DecoderRunConfig):
             derived["tokenizer"] = start.decision_tokenizer
             start = start.backbone()
         release = isinstance(start, PretrainedDecision)
+        # A configured context encoder trains as the run says, the run's own (`_context_derived`) or the one a
+        # saved run or release it starts from carries (`PretrainedDecision.context`).
+        if isinstance(start, PretrainedDecision) and start.context is not None:
+            derived["context_trained"] = self.context_text_trained
+        elif self.context_text_trained and self.context_text is None:
+            raise ValueError("--context-text-trained trains a configured context encoder, which neither the "
+                             "run (--context-text) nor its start carries")
         # Whether a fresh head's rows lie in blocks, as the loaded checkpoint and the run declare it.
         blocked = not release and reads_blocks(start.config, self.source.overrides())
         # The backbone's own transformations, a release's as a fresh backbone's: its head and layout
