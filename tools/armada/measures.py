@@ -22,17 +22,18 @@ def measured(recorded: dict | None) -> bool:
     return recorded is not None and recorded.get("depends") is not None and recorded.get("peak") is not None
 
 
-def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
+def gpu_needs(recorded: dict | None, budget: float, least: float = 0.0) -> tuple[float, float]:
     """The GPU share a test file's process is given, as `XLA_PYTHON_CLIENT_MEM_FRACTION` of it, and what
     the file holds with its children, by its last run's `recorded` peak (tools/armada/executed.py's
     `gpu_peak`, or a child's that took its fraction, the larger) and `GPU_HEADROOM`: a child that took
     the share's fraction holds one more share, and one that named its own fraction the pool it held.
     A file no run measured, one that started a process it did not follow, and one whose last run left
-    no report (`measured`) take all of `budget`."""
+    no report (`measured`) take all of `budget`. A share is no less than `least` (its prepared programs' need,
+    `prepared_needs`), and what the file holds with its children is of that share."""
     if not measured(recorded):
         return budget, budget
     factor, slack = GPU_HEADROOM
-    share = min(recorded["peak"] * factor + slack, budget)
+    share = min(max(recorded["peak"] * factor + slack, least), budget)
     return share, min(share * (1 + recorded.get("shares", 0)) + recorded.get("pools", 0), budget)
 
 
@@ -109,14 +110,8 @@ def prepared_needs(python: str, names: Iterable[str]) -> dict[str, float]:
     return {name: float(need) for name, need in json.loads(read.stdout).items()}
 
 
-def prepared_shares(needed: dict[str, tuple[float, float]], prepared: dict[str, float],
-                    budget: float) -> tuple[dict[str, float], dict[str, float], dict[str, str]]:
-    """Each unit's share and what it holds (`needed`, by `gpu_needs`), each no less than its least pool by
-    Dew's admission of its prepared programs (`prepared`, `prepared_needs`), within `budget`; and, for a unit
-    whose programs need more than the budget, what its row says (2026-11-10: a need cut to a lane without a
-    word read as the test's own failure)."""
-    shares = {name: min(max(share, prepared.get(name, 0.0)), budget) for name, (share, _) in needed.items()}
-    holds = {name: max(held, shares[name]) for name, (_, held) in needed.items()}
-    short = {name: f"admitted at {budget / 2 ** 30:.1f} GiB, below the {need / 2 ** 30:.2f} GiB its prepared "
-                   "programs need" for name, need in prepared.items() if need > budget}
-    return shares, holds, short
+def prepared_short(prepared: dict[str, float], budget: float) -> dict[str, str]:
+    """For each unit whose prepared programs need more than `budget`, what its row says (2026-11-10: a need
+    cut to a lane without a word read as the test's own failure)."""
+    return {name: f"admitted at {budget / 2 ** 30:.1f} GiB, below the {need / 2 ** 30:.2f} GiB its prepared "
+                  "programs need" for name, need in prepared.items() if need > budget}

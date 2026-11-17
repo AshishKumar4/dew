@@ -2174,17 +2174,16 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     tests = list(units)
 
     measures = lane_measures(python, units, held, token)
-    needed = {name: gpu_needs(measures[name], budget) for name in tests}
-    shares, holds, unready = gpu_measures.prepared_shares(needed, gpu_measures.prepared_needs(python, tests),
-                                                          budget)
+    prepared = gpu_measures.prepared_needs(python, tests)  # Each no less than its prepared programs' need.
+    needed = {name: gpu_needs(measures[name], budget, prepared.get(name, 0.0)) for name in tests}
+    shares = {name: share for name, (share, _) in needed.items()}
+    holds = {name: held for name, (_, held) in needed.items()}
     # A file measured holding more than the lane's share is given all of it, and its row says so: what it
     # was admitted at is the lane's reservation, not its need (2026-11-10: a 5.9 GiB need given a 4 GiB lane
     # without a word, and its run out of memory read as the test's).
-    short = {name: f"admitted at {budget / 2 ** 30:.1f} GiB, below its measured need of "
-                   f"{need / 2 ** 30:.1f} GiB"
-             for name in tests
-             if math.isfinite(need := gpu_needs(measures[name], math.inf)[1]) and need > budget}
-    short = unready | short
+    short = gpu_measures.prepared_short(prepared, budget) | {
+        name: f"admitted at {budget / 2 ** 30:.1f} GiB, below its measured need of {need / 2 ** 30:.1f} GiB"
+        for name in tests if math.isfinite(need := gpu_needs(measures[name], math.inf)[1]) and need > budget}
     common = lane_inputs(python)  # Before any test writes under tests/, the inputs every file's key hashes.
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
 

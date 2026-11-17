@@ -744,6 +744,9 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     # Its arms, and its float64 walk beside them, whose stranded temporaries need 7 GiB: given those.
     filed((gib, gib // 2, gib // 4), (gib, gib, int(2.5 * gib)))
     assert lane() == (7 * gib, "")
+    # Its children each take a share's fraction: what it holds is of its raised share, 7 GiB twice over.
+    assert ci.gpu_needs({"depends": [], "peak": 2 * gib, "shares": 1, "pools": 0}, 40 * gib, 7 * gib) == (
+        7 * gib, 14 * gib)
     # A program past the lane's 40 GiB: given all 40, its row saying what it needed.
     filed((gib, gib, 24 * gib))
     share, said = lane()
