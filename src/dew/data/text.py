@@ -440,10 +440,11 @@ class HFTokenizer:
     def save_pretrained(self, directory) -> None:
         """Write this tokenizer's own files into an export directory.
 
-        The tokenizer writes tokenizer.json, tokenizer_config.json and its
-        vocabulary itself, so the export copies no files by hand and the
-        result loads in anything that reads the HF layout.
-        """
+        The tokenizer writes tokenizer.json, tokenizer_config.json and its vocabulary itself, as it holds
+        them (a run's processor may have set its special tokens and template), so the export copies no files
+        by hand and the result loads in anything that reads the HF layout. Its files' hashes are not its
+        run's: runs compare tokenizers through one canonical form where the hashes differ
+        (`canonical_files`)."""
         self.tokenizer.save_pretrained(str(directory))
 
     def __repr__(self):
@@ -969,13 +970,23 @@ def cached_tokenizer(source: epath.Path, files: Mapping[str, str], *, named: str
     return str(local)
 
 
+def canonical_files(tokenizer: HFTokenizer) -> dict[str, str]:
+    """The hashes of `tokenizer`'s files as this host's transformers writes them (`save_pretrained` of the
+    tokenizer it loads), each path in its directory: one canonical form, which two copies of one tokenizer
+    share whatever bytes each holds, a copy transformers wrote again among them."""
+    with tempfile.TemporaryDirectory(prefix="dew-canonical-") as written:
+        tokenizer.tokenizer.save_pretrained(written)
+        return {str(path.relative_to(written)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in sorted(Path(written).rglob("*")) if path.is_file()}
+
+
 def confined_files(files: Mapping[str, str]) -> dict[str, str]:
     """A record's tokenizer files (each path to its hash) whose paths all stand within the tokenizer's
     directory, a file's (`dew._files.inside`), not a directory's. Any other is refused (ValueError)
     before a file is read or written by it: a saved run's record is outside input, and a path out of the
     directory would copy into, or out of, an unrelated place (`copy_checked`)."""
     for path in files:
-        if not inside(path) or path.endswith("/"):
+        if not inside(path, directory=False):
             raise ValueError(f"a recorded tokenizer file must be a path within its directory, not {path!r}")
     return dict(files)
 

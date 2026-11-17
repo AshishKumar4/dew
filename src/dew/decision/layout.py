@@ -326,6 +326,13 @@ class ContextReader:
         return self.encoder.dependencies()
 
 
+def reader_of(tokenizer: Tokenizer, configured: "ContextReader | None") -> "Tokenizer | ContextReader":
+    """What a row's context is tokenized by (`context_tokens`): a run's configured context encoder's
+    tokenization (`DecisionModel.context_reader`), else the decision's tokenizer. The one choice of it the
+    data's steps (`Encoding`, `Fit`) and a task (`Decide`) read."""
+    return tokenizer if configured is None else configured
+
+
 def context_tokens(reader: "Tokenizer | ContextReader", context: JSON | None) -> tuple[np.ndarray, int]:
     """A context's tokens as a row reads them, and how many it is whole: its text's (`render`) by the
     decision's tokenizer, without specials, all of them; or by a run's configured context encoder

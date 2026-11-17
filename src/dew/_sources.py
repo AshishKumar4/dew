@@ -349,12 +349,16 @@ def _arguments(annotation: Hashable) -> tuple[Hashable, ...]:
 def _annotated_parts(annotation: Hashable) -> tuple:
     """A form holding `typing.Annotated` metadata as the values it holds, which an identity states as it
     states any value (`dew._stated`: a module's function by its name, an object by its form): an
-    `Annotated` as its annotation's own statement and its metadata, any other form as its origin and its
-    arguments' statements (`annotation_text`)."""
-    held = vars(annotation)
+    `Annotated` as its annotation's own statement and its metadata, any other form as its own type, its
+    origin and its arguments' statements (`annotation_text`), a union among them."""
     if typing.get_origin(annotation) is typing.Annotated:
-        return ("annotated", annotation_text(held["__origin__"]), *held["__metadata__"])
-    return ("form", typing.get_origin(annotation), *map(annotation_text, _arguments(annotation)))
+        annotated, *metadata = typing.get_args(annotation)
+        return ("annotated", annotation_text(annotated), *metadata)
+    # The form's own type beside its origin: `list[...]` and `typing.List[...]` share their origin, and a
+    # converter reading a field's annotation (`attrs.Attribute.type`) tells them apart.
+    form = type(annotation)
+    return ("form", f"{form.__module__}.{form.__qualname__}", typing.get_origin(annotation),
+            *map(annotation_text, _arguments(annotation)))
 
 
 def _field_value[Value](name: str, value: Value) -> Value | str | tuple | dict:

@@ -19,7 +19,7 @@ from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
 from dew.decision.head import DecisionHead, Head
 from dew.decision.inputs import OPTION_TILE, DecisionInputs
-from dew.decision.layout import Bounds, ContextReader, Layout, Specials, default_layout, per_question
+from dew.decision.layout import Bounds, Layout, Specials, default_layout, per_question
 from dew.decision.model import BackboneContext, DecisionModel, encoded_width
 from dew.decision.questions import KINDS, Score
 from dew.decision.rows import (
@@ -279,9 +279,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             return 0.0
         if not isinstance(condition.encoder, CountedCondition):
             raise MissingFlopsCount(f"{type(condition.encoder).__name__} has no conditioning_flops(tokens)")
-        segments = batch.get("context_segments")
-        lengths = (np.asarray(batch["context_lengths"]) if segments is None
-                   else np.concatenate([np.bincount(row)[1:] for row in np.asarray(segments)]))
+        lengths = self._row_contexts(batch)
         lengths = lengths[lengths > 0]
         width = encoded_width(condition.encoder)
         mask = (np.arange(width)[None, :] < lengths[:, None]).astype(np.int32)
@@ -330,8 +328,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         # The rows' passes (`_reads`): the decision pass, every exit where the loss weighs them, and the
         # second pass where `input_lm` reads them again (`input_terms`), trained as the first.
         reads, exits = self._reads(model), self._exits(model)
-        trained = 3 * (self._cross_flops(exits, batch) + self._heads(model) * self._head_flops(model, batch)
-                       + self._encoder_flops(batch))
+        # A configured context encoder runs forward alone where it is frozen (`context_trained`).
+        trained = (3 * (self._cross_flops(exits, batch) + self._heads(model) * self._head_flops(model, batch))
+                   + (3 if self.context_trained else 1) * self._encoder_flops(batch))
         if isinstance(model.backbone, CountedTraining):
             # An adapter trains through the context's pass too.
             own = 0.0 if context is None else model.backbone.training_flops(context)
@@ -346,7 +345,10 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             return (sum(frozen_training_flops(counted_flops(backbone, lengths),
                                               parameter_flops(backbone, lengths)) for backbone in reads)
                     + frozen_training_flops(head, head) + self._context_flops(model, batch) + trained - held)
-        return super().training_flops(model, batch)
+        # Three passes of everything the model counts (`model_flops`), a frozen context encoder's forward
+        # alone among them.
+        frozen_encoder = 0.0 if self.context_trained else 2 * self._encoder_flops(batch)
+        return super().training_flops(model, batch) - frozen_encoder
 
     def _backbone_frozen(self) -> bool:
         """Whether the held tree trains none of the backbone's own parameters: every backbone
@@ -371,7 +373,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  segments: int | None = 16, context_encoder: ContextEncoder | ConditionEncoder | None = None,
                  consistency: float = 0.0, context_window: int | None = None,
                  none_of_the_above_options: int = 3, input_lm: float = 0.0,
-                 pass_weights: PassWeighting | None = None, exit_entropy: float | None = None):
+                 pass_weights: PassWeighting | None = None, exit_entropy: float | None = None,
+                 context_trained: bool = False):
         held: Variables | None = None
         options: int | None = None
         self.image_processor = None
@@ -427,6 +430,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             head, labels = head.labelled(layout.labels, tokenizer)
             layout = dataclasses.replace(layout, labels=labels)
         self.model = _decision_model(module, head, context_encoder)
+        # A configured context encoder's weights train with the run, else held frozen, forward alone.
+        self.context_trained = context_trained
         if layout is None:
             if not isinstance(module, TokenModel):
                 raise ValueError(
@@ -513,8 +518,10 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         if "head" not in parts:
             parts["head"] = self.model.initialize_head(head_key, parts["backbone"], tokens)
         if self.model.context is not None and "context" not in parts:
-            # A configured context encoder's weights, as it holds them (`ConditionEncoder.params`).
-            parts["context"] = {"params": self.model.context.encoder.params}
+            # A configured context encoder's weights, as it holds them (`ConditionEncoder.params`): trained
+            # where the run trains them (`context_trained`), else frozen, as a diffusion run's towers are.
+            held = "params" if self.context_trained else FROZEN
+            parts["context"] = {held: self.model.context.encoder.params}
         return joined(parts)
 
     @property
@@ -866,7 +873,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def _data(self, layout: Layout, bounds: Bounds) -> ObjectiveData:
         """`data` as `layout` lays rows out within `bounds`."""
         grouped = bool(self.consistency)
-        configured = None if self.model.context is None else ContextReader(self.model.context.encoder)
+        configured = self.model.context_reader
         training = ConfigureLayout(layout, self.tokenizer, self.specials, self.shuffle_options,
                                    self.none_of_the_above, train=True, context_length=self.context_length,
                                    grouped=grouped, none_of_the_above_options=self.none_of_the_above_options,
