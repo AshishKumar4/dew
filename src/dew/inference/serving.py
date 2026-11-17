@@ -605,6 +605,12 @@ def _unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bool = Fa
     return None
 
 
+def serves_paged(model: nn.Module) -> bool:
+    """Whether a server paging its cache computes what `model` computes (`_unserved_modes`): a caller that
+    names no layout of its own pages where it does (`dew.objectives.rl.RolloutScheduler.serve`)."""
+    return _unserved_modes(model, paged=True) is None
+
+
 def _served_mesh(task: TextGeneration) -> Mesh | None:
     """The mesh `task`'s weights lie on, which a server serves on."""
     return mesh_of(task.variables)

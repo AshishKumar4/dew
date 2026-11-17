@@ -594,6 +594,11 @@ class Scorer(Protocol):
     def shares_prefixes(self, train: bool = False) -> bool: ...
 
 
+PAGE_SIZE = 16
+"""The slots a page of a served rollout's cache holds where neither the run nor the model's layout names
+one (`RolloutScheduler.serve`): vLLM's default block, small beside a prompt so a group shares most of it."""
+
+
 class RolloutScheduler:
     """Admits complete groups of rollouts from `acquisition` and packs them into the trainer's batches.
 
@@ -732,9 +737,9 @@ class RolloutScheduler:
         at the run's progress at its updates (`LMObjective.policy`). The proximal policy is rescored
         under the trainer's weights, so a `max_lag` above 0 needs `objective.behavior_importance`. A
         reward-side reference penalty (`GRPOObjective.reward_kl`) is `objective`'s own, as `sampled`'s.
-        With `page_size` the server pages its cache in pages of that many slots and shares prompt pages
-        where the model admits it, as a paged server does by default (`Server.from_task`'s
-        `prefix_cache`), so a group's samples of one prompt prefill it once
+        The server pages its cache in pages of `page_size` slots, or by default wherever the model pages
+        (`serve`), and shares prompt pages where the model admits it, as a paged server does by default
+        (`Server.from_task`'s `prefix_cache`), so a group's samples of one prompt prefill it once
         (`dew.inference.pages.Pages.waits`). A run over
         several processes serves from one server over its mesh, each process's rows seated on its own
         devices, which every process steps together as it admits each call's groups and reloads at each
@@ -765,17 +770,21 @@ class RolloutScheduler:
     @staticmethod
     def serve(policy: TextGeneration, *, slots: int, capacity: int, page_size: int | None = None) -> Server:
         """The server a served rollout draws `policy`'s completions from (`served`): `slots` rows of
-        `capacity` slots, its cache in pages of `page_size` slots where given, its prefix cache then on as a
-        paged server keeps one by default wherever the model admits it, so a group's samples of one prompt
-        prefill it once; each row's cache whole where none is."""
-        from dew.inference.serving import Server
+        `capacity` slots, its cache in pages of `page_size` slots, or of the model's own layout's or
+        `PAGE_SIZE` where none is named and paging computes what the model computes (`serves_paged`), its
+        prefix cache then on as a paged server keeps one by default wherever the model admits it, so a
+        group's samples of one prompt prefill it once (row 5375); each row's cache whole where the model
+        does not page."""
+        from dew.inference.serving import Server, serves_paged
         from dew.nn.kv_cache import KVCache
         from dew.nn.protocols import Layered
 
-        if page_size is None:
-            return Server.from_task(policy, slots=slots, capacity=capacity)
-        # The policy's own cache layout, its format kept, in pages.
+        # The policy's own cache layout, its format kept.
         declared = policy.model.kv_cache if isinstance(policy.model, Layered) else KVCache()
+        if page_size is None:
+            if not serves_paged(policy.model):
+                return Server.from_task(policy, slots=slots, capacity=capacity)
+            page_size = declared.page_size or PAGE_SIZE
         return Server.from_task(policy, slots=slots, capacity=capacity,
                                 kv_cache=dataclasses.replace(declared, page_size=page_size))
 
