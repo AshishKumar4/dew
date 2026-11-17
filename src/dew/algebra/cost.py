@@ -114,12 +114,12 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
     if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == CONTRACTED["mul"]:
         # Its reader's fused multiply-add computes it (`rules._contracted`).
         return Work()
-    for constructor, operands in ((Term.binary, (0, 2)), (Term.compare, (0, 2)), (Term.select, (0, 1, 2))):
+    # Each elementwise constructor's operands and its operations an element (a clamp's a maximum and a
+    # minimum).
+    for constructor, operands, each in ((Term.binary, (0, 2), 1), (Term.compare, (0, 2), 1),
+                                        (Term.select, (0, 1, 2), 1), (Term.clamp, (0, 1, 2), 2)):
         if (args := get_callable_args(node, constructor)) is not None:
-            return Work(operations=made(graph, [args[index] for index in operands], held))
-    if (args := get_callable_args(node, Term.clamp)) is not None:
-        # A maximum and a minimum an element.
-        return Work(operations=2 * made(graph, list(args), held))
+            return Work(operations=each * made(graph, [args[index] for index in operands], held))
     return Work()
 
 

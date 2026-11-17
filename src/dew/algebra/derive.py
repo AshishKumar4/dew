@@ -305,6 +305,18 @@ def _exponentials(scaled: bool = False) -> list:
     return found
 
 
+def _ternary_walking(ternary, t: Term, x: Term, y: Term, z: Term, a) -> list:
+    """`_walking`'s rules of a term of three operands made by `ternary` (`Term.select`, `Term.clamp`)."""
+    made = eq(t).to(ternary(x, y, z))
+    return [
+        *(rule(made, eq(walked(held)).to(a)).then(set_(walked(t)).to(a)) for held in (x, y, z)),
+        rule(made, local(x), local(y), local(z)).then(local(t)),
+        rule(made, unwalked(x), unwalked(y), unwalked(z)).then(unwalked(t)),
+        *(rule(made, *(kind(held) for kind, held in zip(kinds, (x, y, z), strict=True))).then(anchor(t))
+          for kinds in itertools.product((local, anchor), repeat=3) if anchor in kinds),
+    ]
+
+
 def _walking(scaled: bool = False):
     """The facts' rules (the module's account); `scaled`, with an exponential of a difference times a positive
     literal among what scales (`_exponentials`)."""
@@ -338,24 +350,9 @@ def _walking(scaled: bool = False):
         rule(eq(t).to(x.unary(name, p)), eq(walked(x)).to(a)).then(set_(walked(t)).to(a)),
         rule(eq(t).to(x.convert(p)), eq(walked(x)).to(a)).then(set_(walked(t)).to(a)),
         rule(eq(t).to(x.shaped(name, p)), eq(walked(x)).to(a), lays(p, a, b)).then(set_(walked(t)).to(b)),
-        rule(eq(t).to(x.select(y, z)), eq(walked(x)).to(a)).then(set_(walked(t)).to(a)),
-        rule(eq(t).to(x.select(y, z)), eq(walked(y)).to(a)).then(set_(walked(t)).to(a)),
-        rule(eq(t).to(x.select(y, z)), eq(walked(z)).to(a)).then(set_(walked(t)).to(a)),
-        rule(eq(t).to(x.select(y, z)), local(x), local(y), local(z)).then(local(t)),
-        rule(eq(t).to(x.select(y, z)), unwalked(x), unwalked(y), unwalked(z)).then(unwalked(t)),
-        rule(eq(t).to(x.select(y, z)), anchor(x), anchor(y), anchor(z)).then(anchor(t)),
-        rule(eq(t).to(x.select(y, z)), local(x), local(y), anchor(z)).then(anchor(t)),
-        rule(eq(t).to(x.select(y, z)), anchor(x), local(y), anchor(z)).then(anchor(t)),
-        rule(eq(t).to(x.select(y, z)), anchor(x), anchor(y), local(z)).then(anchor(t)),
-        rule(eq(t).to(x.select(y, z)), anchor(x), local(y), local(z)).then(anchor(t)),
-        # A clamp, its bounds and operand each walked, local, unwalked or an anchor as a selection's are.
-        rule(eq(t).to(x.clamp(y, z)), eq(walked(x)).to(a)).then(set_(walked(t)).to(a)),
-        rule(eq(t).to(x.clamp(y, z)), eq(walked(y)).to(a)).then(set_(walked(t)).to(a)),
-        rule(eq(t).to(x.clamp(y, z)), eq(walked(z)).to(a)).then(set_(walked(t)).to(a)),
-        rule(eq(t).to(x.clamp(y, z)), local(x), local(y), local(z)).then(local(t)),
-        rule(eq(t).to(x.clamp(y, z)), unwalked(x), unwalked(y), unwalked(z)).then(unwalked(t)),
-        *(rule(eq(t).to(x.clamp(y, z)), *(kind(held) for kind, held in zip(kinds, (x, y, z), strict=True)))
-          .then(anchor(t)) for kinds in itertools.product((local, anchor), repeat=3) if anchor in kinds),
+        # A selection and a clamp, each of three operands: walked where one is, local or unwalked where all
+        # are, an anchor where one is and every other is local or an anchor.
+        *(each for ternary in (Term.select, Term.clamp) for each in _ternary_walking(ternary, t, x, y, z, a)),
         # Reductions: over other axes the walked axis moves; over the walked axis alone a walked one.
         rule(eq(t).to(x.reduce(name, axes, p)), eq(walked(x)).to(a), reduces(p, a, b)).then(
             set_(walked(t)).to(b)),
