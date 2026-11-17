@@ -1607,7 +1607,7 @@ class Binary:
     stack frame's bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), the
     dynamic shared memory its launch asks for (a Mosaic kernel proto's `smem_bytes`, a custom kernel's
     `shared_memory_bytes`), None where its proto states none, and, read `decoded`, what its machine code
-    breaks of the SASS rules (`sass_findings`), None where no disassembler read it."""
+    breaks of the SASS rules (`sass_findings_of`), None where no disassembler read it."""
     kernel: str
     launch: str | None
     registers: int
@@ -1655,7 +1655,7 @@ def binaries(executable: jax.stages.Compiled, *, decoded: bool = False, spills: 
     kernel's code in it. Nothing is read from or written to the process's environment or disk: a compile
     that set Mosaic's dump settings around itself handed its directory to every other thread's compile and
     removed it under them ('Directory not empty', row 2790), and the settings turn on every dump Mosaic has
-    (row 2816). `decoded`, each binary's SASS findings too (`sass_findings`, the compile gate's), each
+    (row 2816). `decoded`, each binary's SASS findings too (`sass_findings_of`, the compile gate's), each
     cubin disassembled from a file of its own; `spills`, each spilling binary's roles its spill stands in
     (`Binary.spilled_in`, certification's: its ladder steps by them), its cubin disassembled alike."""
     runtime = executable.runtime_executable()
@@ -1839,7 +1839,7 @@ def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = Fal
 
 
 def disassembler() -> Path | None:
-    """NVIDIA's nvdisasm, which the SASS rules read a kernel's machine code through (`sass_findings`): the
+    """NVIDIA's nvdisasm, which the SASS rules read a kernel's machine code through (`sass_listing`): the
     nvdisasm wheel's (`nvidia/cu13/bin`), which the `ci` extra installs in every lock the suite runs on, or
     the PATH's; None where neither is installed, a user's install among them."""
     spec = importlib.util.find_spec("nvidia")
@@ -1861,13 +1861,6 @@ def sass_listing(elf: bytes) -> str | None:
         cubin.flush()
         listing = subprocess.run([str(tool), "-c", cubin.name], capture_output=True, text=True, check=True)
     return listing.stdout
-
-
-def sass_findings(elf: bytes) -> tuple[str, ...] | None:
-    """What the machine code of the cubin `elf` breaks of the SASS rules (`sass_findings_of`, its listing,
-    `sass_listing`); None where no disassembler is installed, the rules unread."""
-    listing = sass_listing(elf)
-    return None if listing is None else sass_findings_of(listing)
 
 
 PRODUCER, CONSUMERS = "producer", "consumers"

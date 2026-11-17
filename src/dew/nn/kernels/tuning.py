@@ -1104,13 +1104,23 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments):
     return op.operands(shapes, 0), fill
 
 
+def _candidates(op: KernelOp, ba: tokamax.BoundArguments) -> list[Hashable]:
+    """The configs of `ba`'s launch (at its key's shapes) the tuner times (`_measured`): each of the op's
+    space the call takes (`KernelOp.pinnable`: one it refuses, measured, raised `Unpinnable` and ended the
+    run, row 5326, a Triton forward's 128 x 128 tile holding 320 registers a thread) and the GPU's assembler
+    does not refuse alone, as a run's derivation certifies a config (`report.certified`: it spills, or
+    serializes its warpgroup MMAs), all certified in one round; a config certification cannot compile alone
+    stays, its own compile the judge. Uncertified, a spilling config was timed, as slow as its spills, and
+    could be chosen."""
+    pinnable = [config for config in ba.autotuning_configs if op.pinnable(ba, op.completed(ba, config))]
+    refused = report.certified_together(op, ba, [op.completed(ba, config) for config in pinnable])
+    return [config for config, spilling in zip(pinnable, refused, strict=True) if not spilling]
+
+
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
-    """Every config of `ba`'s launch (at its key's shapes) the launch can take (`KernelOp.pinnable`), each
-    compiled on a thread and timed alone: the device time CUPTI reads for the launch's own
-    kernels (`dew.telemetry.benchmark.device_time`), each run behind an
-    eviction, so every config starts with its operands out of cache. A config of the op's space the call
-    refuses is no candidate: measured, its launch raised `Unpinnable` and ended the run (row 5326, a
-    Triton forward's 128 x 128 tile holding 320 registers a thread)."""
+    """Every candidate config of `ba`'s launch (`_candidates`), each compiled on a thread and timed alone: the
+    device time CUPTI reads for the launch's own kernels (`dew.telemetry.benchmark.device_time`), each run
+    behind an eviction, so every config starts with its operands out of cache."""
     from dew.telemetry.benchmark import CuptiHeld, NoKernels, behind, device_time, eviction
 
     arrays, fill = materialized(op, ba)
@@ -1124,9 +1134,9 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
             return configured(*args, **kwargs)
 
         start = time.perf_counter()
-        # A candidate's lowering and its compile timed apart, the compile of its config as it is: a config
-        # that spills is measured slow, never refused and lowered afresh (`OuterProgram.compiled`). The
-        # launch runs behind the flush, which reads the whole buffer through the cache.
+        # A candidate's lowering and its compile timed apart, the compile of its config as it is, never
+        # refused and lowered afresh (`OuterProgram.compiled`). The launch runs behind the flush, which reads
+        # the whole buffer through the cache.
         # Without command buffers, which CUPTI does not read whole (`benchmark.Ungraphed`).
         lowered = owned_program(behind(launched), step=UNGRAPHED_OPTIONS).lower(flush, (arrays,))
         middle = time.perf_counter()
@@ -1135,7 +1145,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
 
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     read = {}
-    configs = [config for config in ba.autotuning_configs if op.pinnable(ba, op.completed(ba, config))]
+    configs = _candidates(op, ba)
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
         futures = {config: pool.submit(compiled, config) for config in configs}
     # CUPTI reads every run, the flush's own first. It takes one subscriber, so
