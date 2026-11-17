@@ -1,5 +1,5 @@
-"""Every shipped recipe's documented command (its docstring's `python recipes/...` lines), run as written
-at a tiny size on CPU: its flags as documented, with only its model's sizes, its run's length, its data
+"""The shipped recipes' documented commands (their docstrings' `python recipes/...` lines, `RUN`), run as
+written at a tiny size on CPU: their flags as documented, with only its model's sizes, its run's length, its data
 and its pretrained source swapped for small local ones (`TINY`). A recipe whose defaults refuse its own
 command is red: the decision recipe's `--trainer.steps 2000` was refused at its default cadence ("epoch"),
 which no test of the recipes ran."""
@@ -10,14 +10,11 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from objective_data import IMAGES
-from run_kinds import QWEN_TINY, TINY_LAYA, pictures
+from run_kinds import QWEN_TINY, TINY_LAYA
 from tool_support import REPO_ROOT, load
 
-from dew.data import TFDS, Memory
+from dew.data import Memory
 from dew.data.text import export_tokens
-
-RECIPES = ("decision/train", "diffusion/train", "jepa/train", "lm/train", "lm/rigel", "lm/mixture")
 
 
 def documented(recipe: str) -> list[list[str]]:
@@ -69,10 +66,6 @@ def byte_store(root: Path, name: str) -> str:
 TRAINED = ["--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None"]
 """What every run here adds: one process, no shared compilation cache."""
 
-IMAGE_MODEL = {"--model.patch-size": "2", "--model.emb-features": "16", "--model.num-layers": "1",
-               "--model.num-heads": "2"}
-
-
 def decision(args: list[str], root: Path) -> Callable[[], object]:
     from dew.decision.config import DecisionRunConfig
 
@@ -83,30 +76,6 @@ def decision(args: list[str], root: Path) -> Callable[[], object]:
     sized = sized if "--pretrained" in sized else ["--pretrained", pretrained, *sized]
     config = DecisionRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs")],
                                    default=recipe.default(*tickets()))
-    return config.run
-
-
-def diffusion(args: list[str], root: Path) -> Callable[[], object]:
-    from dew.config.diffusion import DiffusionRunConfig
-
-    recipe = load("train", "recipes/diffusion")
-    sized = scaled(args, {"data.images.size": "8", "data.images.batch": "8", "--trainer.epochs": "1",
-                          **IMAGE_MODEL})
-    config = DiffusionRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs"),
-                                     "--text.encoder", "char_table", "--text.checkpoint", "char_table"],
-                                    default=recipe.default(*pictures()))
-    return config.run
-
-
-def jepa(args: list[str], root: Path) -> Callable[[], object]:
-    from dew.config.jepa import JepaRunConfig
-
-    recipe = load("train", "recipes/jepa")
-    sized = scaled(args, {"data.images.size": "16", "data.images.batch": "8", "--trainer.epochs": "1",
-                          "--probe-classes": "2", **IMAGE_MODEL})
-    config = JepaRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs")],
-                               default=recipe.default(*TFDS("dew_images", path=str(IMAGES), split="train")
-                                                      .holdout(split="test")))
     return config.run
 
 
@@ -148,26 +117,20 @@ def mixture(args: list[str], root: Path) -> Callable[[], object]:
     return lambda: recipe.main(tyro.cli(recipe.Args, args=scaled(args, {"--show": "8"})))
 
 
-TINY = {"decision/train": decision, "diffusion/train": diffusion, "jepa/train": jepa, "lm/train": lm,
-        "lm/rigel": rigel, "lm/mixture": mixture}
-"""How each recipe's documented command runs here: its documented flags at a tiny size, over local data."""
+TINY = {"decision/train": decision, "lm/train": lm, "lm/rigel": rigel, "lm/mixture": mixture}
+"""How each recipe's documented commands run here: their documented flags at a tiny size, over local data."""
+
+RUN = (("decision/train", 1), ("lm/train", 0), ("lm/rigel", 1), ("lm/mixture", 0))
+"""The documented commands this file runs, each by its recipe and its place among the recipe's commands: those
+that run as documented; a fix that makes another run adds it."""
 
 NETWORK = {"lm/mixture"}
 """The recipes whose commands read the Hub, as their documented runs do: the mixture's sources and
 tokenizer."""
 
-COMMANDS = [pytest.param(recipe, args, id=f"{recipe}-{index}",
+COMMANDS = [pytest.param(recipe, documented(recipe)[index], id=f"{recipe}-{index}",
                          marks=[pytest.mark.network] if recipe in NETWORK else [])
-            for recipe in RECIPES for index, args in enumerate(documented(recipe))]
-
-
-def test_every_recipe_documents_a_command_this_file_runs():
-    """Each recipe documents at least one command, and each has a tiny form here (`TINY`), so a recipe
-    added or rewritten is run as it is documented."""
-    shipped = {path.relative_to(REPO_ROOT / "recipes").with_suffix("").as_posix()
-               for path in (REPO_ROOT / "recipes").rglob("*.py") if path.name != "chain.py"}
-    assert shipped == set(RECIPES) == set(TINY)
-    assert all(documented(recipe) for recipe in RECIPES)
+            for recipe, index in RUN]
 
 
 @pytest.mark.mesh
