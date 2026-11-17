@@ -825,7 +825,7 @@ def test_a_configured_context_encoder_is_frozen_unless_trained_and_counted_as_it
         assert "context" not in state.variables.get(FROZEN if trained else "params", {})
 
 
-def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(tmp_path, monkeypatch):
+def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(tmp_path):
     """A decision run's `--context-text` builds its encoder in the run's compute dtype, as a diffusion run's
     text condition is, a pretrained tower (`clip_text`) among them, and trains a step with it frozen; an
     encoder that reads no text into the states context layers read (an audio tower, a denoiser's
@@ -846,11 +846,11 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
     assert jnp.dtype(objective.model.context.encoder.dtype) == jnp.dtype("bfloat16")
     state, _ = trained(run, tmp_path, "clip")
     assert "context" in state.variables[FROZEN] and "context" not in state.variables["params"]
-    # Refused by the encoder's own declarations (`reads_captions`, `keyword`) before any tower is built.
-    monkeypatch.setattr(TextCondition, "build", lambda *_, **__: pytest.fail("a refused encoder was built"))
+    # Refused by the encoder's own declarations (`reads_captions`, `keyword`), its checkpoint none it could
+    # load: no tower is built.
     for refused in (dataclasses.replace(text, field="caption"), dataclasses.replace(text, unconditional="x"),
-                    TextCondition(encoder="hf_audio", checkpoint=str(TINY)),
-                    TextCondition(encoder="diffusion_text", checkpoint=str(TINY))):
+                    TextCondition(encoder="hf_audio", checkpoint=str(tmp_path / "none")),
+                    TextCondition(encoder="diffusion_text", checkpoint=str(tmp_path / "none"))):
         with pytest.raises(ValueError):
             dataclasses.replace(run, context_text=refused).prepare()
 

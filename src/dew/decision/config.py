@@ -58,8 +58,15 @@ from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, SharedCrossAttention
 from dew.nn.protocols import CountedCondition, RematChoosing
 from dew.optim import OptimConfig
-from dew.registry import (ModelConfig, class_record, dtype_name, encoders, from_record, import_path,
-                          record_argument)
+from dew.registry import (
+    ModelConfig,
+    class_record,
+    dtype_name,
+    encoders,
+    from_record,
+    import_path,
+    record_argument,
+)
 from dew.state import TrainState
 
 if TYPE_CHECKING:

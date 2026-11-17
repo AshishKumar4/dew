@@ -1170,9 +1170,9 @@ class Decide(SavedRunTask, InItsForm):
             played = {}
             for name, options in playing.items():
                 parts = -(-len(options) // group)
-                for part in range(parts):
-                    chosen = options[part * len(options) // parts:(part + 1) * len(options) // parts]
-                    played[f"{name}/{part}"] = _restricted(questions[name], chosen)
+                for piece in range(parts):
+                    chosen = options[piece * len(options) // parts:(piece + 1) * len(options) // parts]
+                    played[f"{name}/{piece}"] = _restricted(questions[name], chosen)
             answers = self._played(state, played, questions)
             remaining |= {name: [_choice(answers[key]) for key in played if key.rsplit("/", 1)[0] == name]
                           for name in playing}
