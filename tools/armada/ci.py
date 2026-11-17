@@ -1264,13 +1264,14 @@ def collect_entries(names: list[str], timings: dict, target: float) -> list[dict
             for index, held in enumerate(names[at::count] for at in range(count))]
 
 
-def stale_row(python: str, name: str, group: str, why: str) -> dict:
-    """Kept row `name` (in `group`'s group) said stale, not run (`grading.STALE`), with `why`: a row armada
-    reads as not passed, so its run is graded, and the queue runs it again."""
-    return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0,
-            "output": f"stale, not run: the plan kept it on a record this task did not find, {why}",
+def stale_row(python: str, name: str, group: str, why: str, kind: str = grading.STALE) -> dict:
+    """Row `name` (in `group`'s group) not run, red as `kind`, saying `why`: `grading.STALE`, a kept row this
+    task did not find, graded and run again by the queue; "whole", a unit its lane cannot hold."""
+    said = (f"stale, not run: the plan kept it on a record this task did not find, {why}"
+            if kind == grading.STALE else why)
+    return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0, "output": said,
             "tests": {}, "ynn_switched": [], "cells": {}, "timings": {row(python, name, ""): 0.0},
-            **grading.red_as(grading.STALE, [])}
+            **grading.red_as(kind, [])}
 
 
 def stale_cost(name: str, group: str, reading: Reading) -> float:
@@ -2155,11 +2156,10 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     the lane before any file runs."""
     subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch"], check=True)
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
-    # The memory the GPU gives a process: all of it less what its driver and firmware keep, the total XLA
-    # takes a pool's fraction of (within nvidia-smi's rounding to a MiB), and the one a node's session gave
-    # this lane its fraction of. Counted of the GPU's whole memory, a file's share was a pool short of it by
-    # what the driver keeps (2026-11-11: a GH200's 1,103 of 97,871 MiB made a 5.91 GiB share a 5.84 GiB pool,
-    # which ran out).
+    # The memory the GPU gives a process, less what its driver and firmware keep: the total XLA and a node's
+    # session take this lane's fraction of (within nvidia-smi's MiB). Of the GPU's whole memory, a share was
+    # a pool short by what the driver keeps (2026-11-11: a GH200's 1,103 of 97,871 MiB made a 5.91 GiB share
+    # a 5.84 GiB pool, which ran out).
     [total] = ((int(whole) - int(kept)) * 2 ** 20 for whole, kept in
                (answer.split(",") for answer in gpu_query("memory.total,memory.reserved")))
     # A job holding the whole GPU is given no fraction (a node sets one for a part of a GPU alone, dew-ops'
@@ -2174,16 +2174,13 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     tests = list(units)
 
     measures = lane_measures(python, units, held, token)
-    prepared = gpu_measures.prepared_needs(python, tests)  # Each no less than its prepared programs' need.
+    prepared = gpu_measures.prepared_needs(python, tests)  # Each no less than its prepared programs' need,
+    unheld = gpu_measures.unschedulable(prepared, budget, total, held)  # and none run below it.
+    tests = [name for name in tests if name not in unheld]
     needed = {name: gpu_needs(measures[name], budget, prepared.get(name, 0.0)) for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
-    # A file measured holding more than the lane's share is given all of it, and its row says so: what it
-    # was admitted at is the lane's reservation, not its need (2026-11-10: a 5.9 GiB need given a 4 GiB lane
-    # without a word, and its run out of memory read as the test's).
-    short = gpu_measures.prepared_short(prepared, budget) | {
-        name: f"admitted at {budget / 2 ** 30:.1f} GiB, below its measured need of {need / 2 ** 30:.1f} GiB"
-        for name in tests if math.isfinite(need := gpu_needs(measures[name], math.inf)[1]) and need > budget}
+    short = gpu_measures.measured_short({name: measures[name] for name in tests}, budget)
     common = lane_inputs(python)  # Before any test writes under tests/, the inputs every file's key hashes.
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
 
@@ -2216,6 +2213,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                 del running[future]
     rows = [{**verdict, "output": f"{short[name]}\n{verdict.get('output', '')}"} if name in short else verdict
             for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
+    rows += [stale_row(python, file, varied(group, variant), unheld[name], "whole")
+             for name, (file, group, variant) in units.items() if name in unheld]
     out.write_text(json.dumps({"rows": rows}))
     return 0
 

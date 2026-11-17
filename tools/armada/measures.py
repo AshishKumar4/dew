@@ -5,6 +5,7 @@ Dew's admission of the programs its prepare filed."""
 import concurrent.futures
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -110,8 +111,23 @@ def prepared_needs(python: str, names: Iterable[str]) -> dict[str, float]:
     return {name: float(need) for name, need in json.loads(read.stdout).items()}
 
 
-def prepared_short(prepared: dict[str, float], budget: float) -> dict[str, str]:
-    """For each unit whose prepared programs need more than `budget`, what its row says (2026-11-10: a need
-    cut to a lane without a word read as the test's own failure)."""
-    return {name: f"admitted at {budget / 2 ** 30:.1f} GiB, below the {need / 2 ** 30:.2f} GiB its prepared "
-                  "programs need" for name, need in prepared.items() if need > budget}
+def measured_short(measures: dict[str, dict | None], budget: float) -> dict[str, str]:
+    """Each unit measured holding more than `budget`, its lane's share, which it is given all of
+    (`gpu_needs`), and what its row says (2026-11-10: a 5.9 GiB need given a 4 GiB lane without a word, and
+    its run out of memory read as the test's)."""
+    gib = 2 ** 30
+    return {name: f"admitted at {budget / gib:.1f} GiB, below its measured need of {need / gib:.1f} GiB"
+            for name, recorded in measures.items()
+            if math.isfinite(need := gpu_needs(recorded, math.inf)[1]) and need > budget}
+
+
+def unschedulable(prepared: dict[str, float], budget: float, total: float, device: str) -> dict[str, str]:
+    """Each unit whose prepared programs need more than `budget`, its lane's share of the `device` GPU's
+    `total`, and what its row says. A prepared need is an admission's requirement, not a hint: never cut to
+    the share, as a measured peak is so its next run measures it again (`gpu_needs`), since run below it
+    the accounting says it will not fit, and it runs out (Main, 2026-11-17: the sinks flows did)."""
+    gib = 2 ** 30
+    return {name: f"unschedulable on {device}: its prepared programs need {need / gib:.2f} GiB, past this "
+                  f"lane's {budget / gib:.1f} GiB" + ("" if need > total else f"; a slot of the GPU's whole "
+                                                       f"{total / gib:.1f} GiB holds it")
+            for name, need in prepared.items() if need > budget}

@@ -701,8 +701,8 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     which unit it is by DEW_TIER_UNIT) is given no less than the least pool at which Dew's admission
     (dew.training.memory `needed`) takes the most demanding of them, beside what its runs measured: a part's
     float64 truths, which no run of it held, are admitted before they run (2026-11-17: two flows' 1.71 GiB
-    terms walk beside 1.1 GiB of arms ran out of a 2.84 GiB share). Past the lane's share, it is given the
-    whole share and its row says why."""
+    terms walk beside 1.1 GiB of arms ran out of a 2.84 GiB share). One past the lane's share is not run
+    below it: its row is red, naming its need and the GPU (Main, 2026-11-17)."""
     url, stored, _ = cache_worker
     gpu_lane_at(tmp_path, monkeypatch, url, 0)
     (tmp_path / "tests/test_flow.py").write_text(LANE_TEST)
@@ -732,25 +732,32 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
         (truths / "needs" / f"{hashlib.sha256(name.encode()).hexdigest()[:16]}.json").write_text(
             json.dumps({"unit": name, "programs": listed}))
 
-    def lane() -> tuple[float, str]:
+    def lane() -> tuple[float, dict]:
         measured()
         out = tmp_path / "verdict.json"
         assert ci.gpu_lane("3.12", ["tests/test_flow.py"], out, cache="off", processes=1, deadline=600.0) == 0
         [row] = json.loads(out.read_text())["rows"]
-        return float(lane_runs(tmp_path, "test_flow")[-1][0]) * total, row["output"]
+        return float(lane_runs(tmp_path, "test_flow")[-1][0]) * total, row
 
     # Its measured 2 GiB alone: 3.5 GiB, its peak and headroom.
-    assert lane() == (2 * gib * 1.25 + gib, "")
+    share, row = lane()
+    assert (share, row["output"]) == (2 * gib * 1.25 + gib, "")
     # Its arms, and its float64 walk beside them, whose stranded temporaries need 7 GiB: given those.
     filed((gib, gib // 2, gib // 4), (gib, gib, int(2.5 * gib)))
-    assert lane() == (7 * gib, "")
+    share, row = lane()
+    assert (share, row["output"], row["exitCode"]) == (7 * gib, "", 0)
     # Its children each take a share's fraction: what it holds is of its raised share, 7 GiB twice over.
     assert ci.gpu_needs({"depends": [], "peak": 2 * gib, "shares": 1, "pools": 0}, 40 * gib, 7 * gib) == (
         7 * gib, 14 * gib)
-    # A program past the lane's 40 GiB: given all 40, its row saying what it needed.
-    filed((gib, gib, 24 * gib))
-    share, said = lane()
-    assert share == 40 * gib and "below the 50.00 GiB its prepared programs need" in said
+    # A program past the lane's 40 GiB, within the GPU's 80, and one past the GPU: neither runs, each red as
+    # its file, its row naming its need and the GPU.
+    for need, temporaries in ((50, 24), (98, 48)):
+        filed((gib, gib, temporaries * gib))
+        runs = len(lane_runs(tmp_path, "test_flow"))
+        _, row = lane()
+        assert len(lane_runs(tmp_path, "test_flow")) == runs and row["exitCode"] == 1
+        assert row["kind"] == "whole" and f"{need:.2f} GiB" in row["output"]
+        assert ci.device_class() in row["output"]
 
 def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measured_class_held_it(
         ci, tmp_path, monkeypatch, cache_worker, capsys):
