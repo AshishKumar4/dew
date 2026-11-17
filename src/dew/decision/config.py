@@ -66,7 +66,38 @@ from dew.state import TrainState
 
 if TYPE_CHECKING:
     from dew.checkpoints import Checkpoints
+    from dew.data.dataset import Loader
 
+
+def _data_summary(dataset: Loader) -> dict[str, object]:
+    """What a decision run's data left out or cut, as its data counters count them: the rows each layout
+    refused by reason, the rows and tokens each cut removed, and the draws of "none of the above" declined."""
+    found: dict[str, object] = {}
+    # The rows each layout refused, by reason, and the rows and tokens each cut removed, of the
+    # rows it delivered and the tokens of those it refused, as the run's data counters count them
+    # (`Layout.refusal`, `Encoded.cuts`, `Rejected.cut`).
+    for reason in ("unfit", "options_alike"):
+        refused = {name: counter.refused.get(reason, 0) for name, counter in dataset.counts.items()}
+        refused["held out"] = sum(counter.refused.get(reason, 0)
+                                  for counter in dataset.validation_counts.values())
+        if any(refused.values()):
+            found[reason] = refused
+    cut = {name: {kind: {"examples": counter.cut_examples[kind], "rows": counter.cut_rows[kind],
+                         "removed": counter.cut_removed[kind], "refused": counter.refused_cut[kind],
+                         "unit": cut_unit(kind)}
+                  for kind in {**counter.cut_rows, **counter.refused_cut}}
+           for name, counter in {**dataset.counts, **{f"{name} (held out)": counter for name, counter
+                                                       in dataset.validation_counts.items()}}.items()
+           if counter.cut_rows or counter.refused_cut}
+    if cut:
+        found["cut"] = cut
+    # The rows whose "none of the above" a training read declines where it draws it, by why their
+    # layout refuses it (`FittedRow.declined`); each such read trains on the row as it was admitted.
+    declined = {name: dict(counter.declined) for name, counter in dataset.counts.items()
+                if counter.declined}
+    if declined:
+        found["none_of_the_above_declined"] = declined
+    return found
 
 
 def encodes_text(kind: type) -> bool:
@@ -378,6 +409,8 @@ class DecisionRunConfig(DecoderRunConfig):
         start = self.looped(start)
         if self.context_layers is not None:
             # Drawn from a key of their own, apart from the adapter's and the head's.
+            encoder = derived["context_encoder"]
+            configured = encoder if isinstance(encoder, ConditionEncoder) else None
             start = start.with_cross_attention(self._context_blocks(configured), key=jax.random.fold_in(
                 jax.random.key(self.trainer.key), 1), frozen=self.context_frozen)
         start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
@@ -405,30 +438,7 @@ class DecisionRunConfig(DecoderRunConfig):
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
         dataset, held = self.compiled(objective.data(), self.chain(), self.validation)
         summary["records"] = dataset.records
-        # The rows each layout refused, by reason, and the rows and tokens each cut removed, of the
-        # rows it delivered and the tokens of those it refused, as the run's data counters count them
-        # (`Layout.refusal`, `Encoded.cuts`, `Rejected.cut`).
-        for reason in ("unfit", "options_alike"):
-            refused = {name: counter.refused.get(reason, 0) for name, counter in dataset.counts.items()}
-            refused["held out"] = sum(counter.refused.get(reason, 0)
-                                      for counter in dataset.validation_counts.values())
-            if any(refused.values()):
-                summary[reason] = refused
-        cut = {name: {kind: {"examples": counter.cut_examples[kind], "rows": counter.cut_rows[kind],
-                             "removed": counter.cut_removed[kind], "refused": counter.refused_cut[kind],
-                             "unit": cut_unit(kind)}
-                      for kind in {**counter.cut_rows, **counter.refused_cut}}
-               for name, counter in {**dataset.counts, **{f"{name} (held out)": counter for name, counter
-                                                           in dataset.validation_counts.items()}}.items()
-               if counter.cut_rows or counter.refused_cut}
-        if cut:
-            summary["cut"] = cut
-        # The rows whose "none of the above" a training read declines where it draws it, by why their
-        # layout refuses it (`FittedRow.declined`); each such read trains on the row as it was admitted.
-        declined = {name: dict(counter.declined) for name, counter in dataset.counts.items()
-                    if counter.declined}
-        if declined:
-            summary["none_of_the_above_declined"] = declined
+        summary.update(_data_summary(dataset))
 
         def calibrate(state: TrainState, directory: str) -> None:
             """Fit the task's temperatures on the held-out rows; process zero saves them into the run."""
