@@ -799,6 +799,8 @@ class RolloutScheduler:
         layout = (served_layout(policy, max_prompt_tokens + max_new_tokens, page_size)
                   if isinstance(policy, TextGeneration) and (policy.n == 1 or page_size is not None)
                   else None)
+        # A cohort over whole rows draws its policy whole.
+        layout = layout if layout is not None and layout.page_size is not None else None
         collector = EpisodeCollector(policy, environment, verifier, max_prompt_tokens, max_new_tokens,
                                      max_turns, sampling, record, journal, kv_cache=layout)
         return cls(Synchronous(collector), groups=groups, credit=credit, log=log, scorer=objective)

@@ -621,7 +621,8 @@ def served_layout(task: TextGeneration, capacity: int, page_size: PageSize = Non
     """The cache layout a server of `task`'s rows of `capacity` slots takes where its caller names a page size
     at most (a served rollout's, `dew.objectives.rl.RolloutScheduler.serve`, and an episode cohort's,
     `RolloutScheduler.episodes`): the model's own layout, its format kept, in pages of `page_size` slots;
-    None, each row's cache whole, for 'whole'; and where none is named, pages of the layout's own size or
+    unpaged, each row's cache whole, for 'whole' (None for a model of no layout to replace, whose rows are
+    whole); and where none is named, pages of the layout's own size or
     `PAGE_SIZE` wherever a server over pages draws as the task draws, rows whole where not: the model's
     layout replaceable (`Layered`), the task drawing by sampling (`Sample`; speculation and beams serve
     whole rows), paging changing nothing the model computes (`_unserved_modes`) and its max_seq_len
@@ -629,7 +630,9 @@ def served_layout(task: TextGeneration, capacity: int, page_size: PageSize = Non
     default, the requests over one prompt prefill it once (rows 5374, 5375)."""
     model = task.model
     if page_size == "whole":
-        return None
+        # The model's own layout unpaged, its format kept, which replaces a layout of pages it declares.
+        return (dataclasses.replace(model.kv_cache, page_size=None, pages=None, groups=1)
+                if isinstance(model, Layered) else None)
     if page_size is None:
         if not isinstance(model, Layered) or not (task.strategy is None or isinstance(task.strategy, Sample)):
             return None

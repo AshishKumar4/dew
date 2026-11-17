@@ -27,6 +27,7 @@ from dew.data.dataset import Loader, replayed, tapped
 from dew.inference import NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kv_cache import KVCache
 from dew.objectives.rl import EnvironmentSource, EpisodeStatus, GRPOObjective, Observation
 from dew.objectives.rl.scheduler import Asynchronous, RolloutScheduler
 from dew.objectives.rl.sessions import Status, pack
@@ -484,5 +485,9 @@ def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):
     assert served is not None and served.page_size == "whole"
     task = serving_task(capacity=64)
     assert not RolloutScheduler.serve(task, slots=4, capacity=64, page_size=served.page_size).reuses_prefixes
+    # A model that declares pages of its own is served whole all the same.
+    paged = dataclasses.replace(task, model=task.model.with_kv_cache(KVCache(page_size=8)))
+    assert RolloutScheduler.serve(paged, slots=4, capacity=64).reuses_prefixes
+    assert not RolloutScheduler.serve(paged, slots=4, capacity=64, page_size="whole").reuses_prefixes
     config.save(str(tmp_path / "whole"))
     assert LMRunConfig.load(str(tmp_path / "whole")).rollout == config.rollout
