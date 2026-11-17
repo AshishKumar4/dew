@@ -42,14 +42,7 @@ from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed_at
 from dew.nn.inputs import cu_seqlens
 from dew.nn.nested import nested
-from dew.nn.precision import (
-    accurate_exp,
-    asks_default_precision,
-    at_least_fp32,
-    exact_products,
-    l2norm,
-    rounds_products,
-)
+from dew.nn.precision import asks_default_precision, at_least_fp32, exact_products, l2norm, rounds_products
 from dew.nn.residuals import Residual
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, shard_shapes, varying_like
 
@@ -576,7 +569,7 @@ def _chunked(named: dict, starts, chunk_size: int, work) -> dict:
 
 def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, firsts=None, *,
                  scale: float, delta: bool, dtype=None, bound: float | None = None,
-                 forked: Forked | None = None, reads: Reads = 'after', own=None):
+                 forked: Forked | None = None, reads: Reads = 'after', own=None, group: int = 1):
     """The recurrence template's plain-JAX mainloop: the recurrence over `config.chunk`-token chunks by the
     forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
@@ -593,7 +586,8 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     it stores at documents' last chunks (`_walk`), the final memory the row's last. `bound`,
     the layer's write gate's largest where its keys are of unit norm (`recurrence.Hooks.inverse_bound`), is
     the declaration's range facts (`scan.Scan.ranges`). The readout reads the memory entering its token where
-    `reads` is 'before' (`recurrence.Hooks.reads`), and `own` `[Hv, Dk]`, where given, weighs the token's
+    `reads` is 'before' (`recurrence.Hooks.reads`), or after its decay apart from every write of its `group`
+    where 'apart' (`scan.Scan.group`: Mamba-3's ranks), and `own` `[Hv, Dk]`, where given, weighs the token's
     own write in it (`Hooks.own_weight`), each head's given every chunk."""
     dtype, work, query, key = _grouped(query, key, value, dtype)
     rows, length, heads, columns = value.shape
@@ -606,7 +600,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     declared = (_delta_forms, (("delta", delta), ("scale", scale), ("per_key", g.ndim == 4),
                                 ("width", width), ("columns", columns), ("work", jnp.dtype(work)),
                                 ("reset", starts is not None), ("bound", bound), ("reads", reads),
-                                ("own", own is not None)))
+                                ("own", own is not None), ("group", group)))
     held = 0 if forked is None else forked.held
     given = dict(zip(("q", "k", "v", "g", "beta"), (query, key, value, g, beta), strict=True))
     operands = _chunked(given, starts, config.chunk, work)
@@ -645,12 +639,13 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
 
 @functools.lru_cache(maxsize=FORMS_HELD)
 def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, columns: int, work: jnp.dtype,
-                 reset: bool, bound: float | None, reads: Reads = 'after', own: bool = False):
+                 reset: bool, bound: float | None, reads: Reads = 'after', own: bool = False, group: int = 1):
     """The delta rule's (or a plain linear recurrence's, without `delta`) chunk forms (`scan.derive_scan`) for
     these facts, every one its declaration reads: the update `h = D h - beta k (k^T D h) + beta k v^T` (`D h
     + beta k v^T` without the delta rule) of a `[width, columns]` state in `work`, `D = exp(g)` a head's or
     each key's (`per_key`), read `scale q^T h` (of the state entering the token where `reads` is 'before',
-    `scan.Scan.reads`; with the token's own write weighed a key, `scale ((q own) . (beta k)) v`, where
+    after its decay apart from every write of its `group` where 'apart', `scan.Scan.reads`, `Scan.group`;
+    with the token's own write weighed a key, `scale ((q own) . (beta k)) v`, where
     `own`), packed documents' resets where `reset`, and the range facts `bound` proves. Derived once for
     equal facts, the latest `FORMS_HELD` kept: built from a call's fresh
     closures, every layer's call derived its own forms, their decomposition and carry splits (`derive_scan`'s
@@ -677,7 +672,7 @@ def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, column
     # two tokens' corrections overlap by at most it (Cauchy-Schwarz).
     ranges = {"g": (-math.inf, 0.0), **({} if bound is None else {"k": 1.0, "beta": bound, "overlap": bound})}
     declaration = scan.Scan(update, readout, declared, walked="time", state=((width, columns), work),
-                            reset=RESET if reset else None, ranges=ranges, reads=reads)
+                            reset=RESET if reset else None, ranges=ranges, reads=reads, group=group)
     return scan.derive_scan(declaration, saturation=SATURATION)
 
 
@@ -1007,51 +1002,13 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
 def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta, state, starts, firsts, *,
               scale: float, dtype, forked, own):
     """The portable math's chunked op (`xla_mainloop`) under `hooks`' readout: a readout apart from its
-    token's writes (`Hooks.reads` 'apart') as its decayed query's read of the state entering the token,
-    `(g q)^T S` (a value head's decay, its queries and keys repeated to its value heads), exactly the state
-    after the update less the token's write, and of a group of more than one token (`Hooks.ranks`) less the
-    group's earlier writes (`_group_read`)."""
-    reads = hooks.reads
-    if reads == 'apart':
-        # The decay a value head's: its keys' queries and keys repeated to its value heads first.
-        query, key = (jnp.repeat(t, value.shape[2] // t.shape[2], axis=2) for t in (query, key))
-        decay = accurate_exp(jnp.asarray(g, dtype))
-        query, reads = query.astype(dtype) * (decay if g.ndim == query.ndim else decay[..., None]), 'before'
-    out, final = xla_mainloop(tiles, query, key, value, g, beta, state, starts, firsts, scale=scale,
-                              delta=hooks.delta, dtype=dtype, bound=hooks.inverse_bound, forked=forked,
-                              reads=reads, own=own)
-    if hooks.ranks > 1:
-        out = out - scale * _group_read(query, key, value, g, beta, hooks.ranks)
-    return out, final
-
-
-def _group_read(query, key, value, g, beta, group: int) -> jax.Array:
-    """What each token of a group of `group` consecutive tokens (`recurrence.Hooks.ranks`) reads of its
-    group's earlier tokens' writes, `sum_{u < r} beta_u exp(G_{r-1} - G_u) (q_r . k_u) v_u` `[B, T, H, V]`
-    (`G` the log decays summed within the group; `query` decayed by its own token's already): the portable
-    math's readout 'apart' at a group of more than one token is its read of the state entering the token
-    (`Scan.reads` 'before') less this, which cancels the group's earlier writes at their whole gate, their
-    rounding the token's (row 7402's portable part, until the scan's derivation reads a group's entering
-    state). Heads of keys and values alike (`_portable`'s)."""
-    batch, length, heads = value.shape[:3]
-
-    def grouped(t):
-        return jnp.reshape(t, (batch, length // group, group, *t.shape[2:]))
-
-    q, k, v, b, logs = (grouped(t) for t in (query, key, value, beta, jnp.asarray(g, query.dtype)))
-    summed = jnp.cumsum(logs, axis=2)
-    earlier = jnp.arange(group)[:, None] > jnp.arange(group)[None, :]
-    # Each pair's decay from the writer through the reader's predecessor, its exponent masked before the
-    # exp so no later pair's overflows; a key dimension's a key each.
-    lag = (summed - logs)[:, :, :, None] - summed[:, :, None]
-    lag = jnp.where(earlier.reshape(1, 1, group, group, *(1,) * (lag.ndim - 4)), lag, 0.0)
-    between = jnp.moveaxis(accurate_exp(lag), 4, 2)
-    if g.ndim == query.ndim:
-        pairs = jnp.einsum('btrhk,btuhk,bthruk->bthru', q, k, between)
-    else:
-        pairs = jnp.einsum('btrhk,btuhk->bthru', q, k) * between
-    weighed = jnp.where(earlier, pairs * jnp.moveaxis(b, 2, -1)[..., None, :], 0.0)
-    return jnp.reshape(jnp.einsum('bthru,btuhv->btrhv', weighed, v), (batch, length, heads, -1))
+    group's writes (`Hooks.reads` 'apart', the group a token's `Hooks.ranks`) the scan's own
+    (`scan.Scan.group`: each rank reads the state after its token's decay less every rank's write of its
+    token, no write read and taken back off)."""
+    group = hooks.ranks if hooks.reads == 'apart' else 1
+    return xla_mainloop(tiles, query, key, value, g, beta, state, starts, firsts, scale=scale,
+                        delta=hooks.delta, dtype=dtype, bound=hooks.inverse_bound, forked=forked,
+                        reads=hooks.reads, own=own, group=group)
 
 
 def _read_once(value, work) -> tuple[jax.Array, jax.Array]:
