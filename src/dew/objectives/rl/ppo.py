@@ -242,7 +242,7 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         own record and takes the policy half of the saved tree."""
         return self.actor.task_settings()
 
-    def run_tokenizer(self) -> Tokenizer | None:
+    def run_tokenizer(self) -> "Tokenizer | None":
         """The actor's tokenizer, whose files its settings state (`task_settings`) and a checkpoint holds
         (`dew.inference.tasks.hold_tokenizer`)."""
         return self.actor.run_tokenizer()
