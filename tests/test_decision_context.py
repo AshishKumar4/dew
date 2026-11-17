@@ -641,7 +641,8 @@ def test_a_context_past_its_cross_attentions_room_is_cut_and_its_caller_told():
     request's context tokens and those it read, whatever rows its questions take, and a run's data counts
     the cut (`data/cut/.../context`). It was refused, and refused a run's data inside its fitting (train
     985's review, F5); a served answer of three question rows summed their cuts, reporting 12 kept where
-    every row read 16, and one that forbids cuts answered from a cut context (train 986's review)."""
+    every row read 16, and one that forbids cuts answered from a cut context (train 986's review); a
+    Python caller's context was cut silently (train 990's review)."""
     from dew.decision.rows import Fit
 
     objective = conditioned(16, (0,))
@@ -651,8 +652,10 @@ def test_a_context_past_its_cross_attentions_room_is_cut_and_its_caller_told():
     [whole] = task._encoded("one two", QUESTION, context=exact)
     [cut] = task._encoded("one two", QUESTION, context=over)
     assert whole.context == cut.context and cut.cuts == {"context": 2}
-    assert task("one two", QUESTION, context=over)["pick"].probabilities.tolist() == task(
-        "one two", QUESTION, context=exact)["pick"].probabilities.tolist()
+    # A caller of the call is told too, as a served caller is in its answer.
+    with pytest.warns(UserWarning):
+        read = task("one two", QUESTION, context=over)["pick"].probabilities.tolist()
+    assert read == task("one two", QUESTION, context=exact)["pick"].probabilities.tolist()
     wire = {name: {"type": "choice", "instructions": "Which one?", "criteria": ["a", "b", "c"]}
             for name in ("pick", "other", "third")}
     served = task.systemone({"state": "one two", "questions": wire, "context": over})

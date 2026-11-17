@@ -214,8 +214,11 @@ class Encoded:
     """The tokens of the context the row reads beside its state, through a backbone's
     cross-attention, or None for none."""
     context_cut: int = 0
-    """The tokens of its example's or request's context that a schema in the row's context left no room
-    for (`with_context`), its first tokens read after the schema."""
+    """The tokens of its example's or request's context its room left out (`with_context`): its first tokens
+    are read, after a schema in the row's context where it has one."""
+    context_given: int = 0
+    """The tokens of its example's or request's context, whole (`with_context`), of which it read all but
+    `context_cut`."""
     spans_in_context: bool = False
     """Whether the questions' spans are positions in the context, which holds the schema
     (`Schema.stream`), rather than in the row."""
@@ -380,7 +383,7 @@ def with_context(rows: Sequence[Encoded], tokenizer: "Tokenizer | ConditionEncod
             # The schema first, so its spans stand where it laid them; the context in the room it leaves.
             kept = given[:length - len(row.context)]
             beside.append(dataclasses.replace(row, context=(*row.context, *kept.tolist()),
-                                              context_cut=len(given) - len(kept)))
+                                              context_cut=len(given) - len(kept), context_given=len(given)))
         return beside
     if context is None:
         return list(rows)
@@ -389,7 +392,8 @@ def with_context(rows: Sequence[Encoded], tokenizer: "Tokenizer | ConditionEncod
                          "backbone does not have")
     given = context_tokens(tokenizer, context)
     kept = tuple(given[:length].tolist())
-    return [dataclasses.replace(row, context=kept, context_cut=len(given) - len(kept)) for row in rows]
+    cut = len(given) - len(kept)
+    return [dataclasses.replace(row, context=kept, context_cut=cut, context_given=len(given)) for row in rows]
 
 def _conversation(state: JSON) -> bool:
     """Whether `state` is a conversation, a list of turns, which keeps its newest turns (Laya's agent)."""
