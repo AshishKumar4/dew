@@ -148,11 +148,14 @@ _FREE = frozenset({
     gpu.wait_load_tmem_p, gpu.wgmma_accumulator_deref_p, gpu.wgmma_accumulator_store_p, gpu.load_p,
     gpu.store_p, state.swap_p, gpu.async_load_tmem_p, gpu.async_store_tmem_p, state.get_p,
     pallas.program_id_p, tpu.dma_wait_p, gpu.wait_gmem_to_smem_p, pjit.reshard_p, lax.gather_p,
-    lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p})
+    lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p, lax.split_p,
+    lax.stack_p, lax.tile_p, lax.unstack_p})
 """What moves no data between memories and computes nothing a unit's rate prices: synchronization, layouts,
-indices, a value's elements rearranged among a role's registers (a gather's, a slice's, a concatenation's),
-and its reads and writes between its registers and its scoped refs, which its products' operands and its
-copies count."""
+indices, a value's elements rearranged among a role's registers (a gather's, a slice's, a concatenation's;
+every layout move the Pallas fuser tiles: a dynamic slice and its update, whose index arithmetic is scalar,
+which nothing counts, a split, a stack, a tile and an unstack, so a fused prologue's stage holds no
+operation the counter cannot price, `fused_gemm._split`), and its reads and writes between its registers
+and its scoped refs, which its products' operands and its copies count."""
 
 _PRODUCTS = frozenset({gpu.wgmma_ref_p, gpu.tcgen05_mma_p})
 """Tensor-core products whose operands' shapes their transforms state (`_product`)."""

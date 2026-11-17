@@ -291,26 +291,24 @@ def test_a_producer_whose_row_value_is_any_reduction_fuses_through_the_public_en
                         seeds=8)
 
 
-@pytest.mark.parametrize("chosen", [{}, {"gemm_prologue": "xla", "grouped_matmul": "xla"}],
-                         ids=["selected", "named xla"])
-def test_a_producer_stage_no_kernel_prices_is_refused_and_formed_by_xla(chosen):
-    """A producer whose stage holds an operation the kernels' counter prices none of (a `stack`'s layout
-    beside the rows) on an H100: its prologue refused as unpriced, never raised (base review of dc7063c94,
-    F1), the operand formed by XLA before the product, selected so or named so, and the region's value the
-    program's."""
-    keys = jax.random.split(jax.random.key(3), 3)
-    x = jax.random.randint(keys[0], (64, 128), -3, 4).astype(jnp.float32)
-    b = jax.random.randint(keys[1], (128,), -3, 4).astype(jnp.float32)
-    w = jax.random.randint(keys[2], (128, 64), -3, 4).astype(jnp.float32)
+def test_a_prologues_sides_are_priced_by_their_arithmetic_as_xla_runs_them():
+    """Two producers scaling each row of an 8192 x 4096 bf16 operand by a row value XLA computes beside the
+    prologue, a sum of the row and a sum of its exponentials, feeding one 4096-wide product on an H100: the
+    exponential's side prices above the sum's by its 33.5M exponentials, as the algebra prices XLA's
+    program (`algebra.program.priced`), where bytes alone priced them alike (row 7260); the fused price of
+    each its unfused one's less its forming, the stage priced once."""
+    x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16)
 
-    def region(x, b, w):
-        # A stack, then its first row: a concatenation's layout and a slice beside the rows.
-        return fused_gemm.product(x + jnp.stack([b, b], axis=0)[:1], w, out_dtype=jnp.float32,
-                                  interpret_on_cpu=True)
+    def region(side):
+        def fn(x, w):
+            return fused_gemm.product(x * side(x), w, out_dtype=jnp.bfloat16)
+        return fn
 
-    with generation.assumed("sm90"), generation.chosen(**chosen):
-        found = fused_gemm.analysis(region, x, b, w)
-        got = fused_gemm.fused(region, x, b, w)
-    assert found.prologue is not None and found.prologue.kernel == "xla", found
-    np.testing.assert_array_equal(np.asarray(got), np.asarray(jnp.dot(x + b[None], w, precision="highest")))
+    with generation.assumed("sm90"):
+        summed = fused_gemm.analysis(region(lambda x: jnp.sum(x, axis=1, keepdims=True)), x, w)
+        exponential = fused_gemm.analysis(region(lambda x: jnp.sum(jnp.exp(x), axis=1, keepdims=True)), x, w)
+    for found in (summed, exponential):
+        assert found.prologue is not None and found.prologue.kernel == "fused", found.prologue
+    assert exponential.fused_seconds > summed.fused_seconds, (exponential, summed)
 

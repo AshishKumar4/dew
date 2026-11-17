@@ -49,7 +49,7 @@ from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
 
 from dew import _cache, algebra
-from dew.algebra import cost as algebra_cost
+from dew.algebra import cost as algebra_cost, program as algebra_program
 from dew.nn import programs
 from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.generation import Choice
@@ -202,12 +202,17 @@ class Region:
 @dataclasses.dataclass(frozen=True)
 class Formed:
     """A prologue's priced parts (`priced`): its element stage's work on the whole operand, which the kernel's
-    prologue does tile by tile (`stage`, counted as a kernel's body is, `emission.emitted`), and the bytes of
-    the row or depth values XLA computes whole beside it (`side_bytes`, a norm's statistics): XLA's pass for
-    them is priced by what it reads and writes, a reduction over the rows, as XLA's fusion of any program is
-    (`algebra.cost.fused`), never by a kernel body's counter, which prices only what a kernel runs."""
+    prologue does tile by tile (`stage`, counted as a kernel's body is, `emission.emitted`); the program XLA
+    runs whole for the row or depth values beside it (`sides`, a norm's statistics, its outputs those values,
+    `side_bytes` their bytes; None where the stage reads its inputs alone); and the producer's whole program
+    (`whole`), XLA's where the operand is formed
+    before the launch. Each program XLA runs is priced by the algebra's one path (`algebra.program.priced`:
+    a reduction of an exponential an exponential an element, of a sum none), never by a kernel body's
+    counter, which prices only what a kernel runs (row 7260)."""
 
     stage: cost.Work
+    sides: jax_core.Jaxpr | None
+    whole: jax_core.Jaxpr
     side_bytes: float
 
 
@@ -219,11 +224,11 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     """`region`'s seconds on `target`, fused and unfused, from one model (`templates.cost`): the launch's
     units overlapped at the whole device's rates (its products in their tensor mode, its operands, captured
     arrays and outputs in device memory), plus its fixed launch (`GpuTarget.launch_seconds`), with its
-    producer's element stage and its consumers' work in it, beside XLA's fusion of the producer's row or
-    depth values where it has a prologue (a norm's statistics, reading the operand's base); and unfused, XLA's
-    fusion forming the operand whole (reading its base, writing it), the plain launch writing the product at
-    its result dtype, then XLA's fusion of the consumers reading it (`algebra.cost.fused`). None where the
-    target states no tensor rate."""
+    producer's element stage and its consumers' work in it, beside XLA's program of the producer's row or
+    depth values where it has a prologue (a norm's statistics); and unfused, XLA's program forming the
+    operand whole and writing it, the plain launch writing the product at its result dtype, then XLA's
+    fusion of the consumers reading it (`algebra.cost.fused`), each XLA program as the algebra prices it
+    (`algebra.program.priced`). None where the target states no tensor rate."""
     rates = cost.rates(target, device=True)
     if rates[0] is None:
         return None, None
@@ -242,8 +247,12 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     prologue, forming, sides = cost.Work(), 0.0, 0.0
     if formed is not None:
         prologue = formed.stage + cost.Work(device_bytes=formed.side_bytes)
-        forming = xla(formed.stage + cost.Work(device_bytes=2 * base, kernels=1.0))
-        sides = xla(cost.Work(device_bytes=base + formed.side_bytes, kernels=1.0))
+        # XLA's programs as the algebra prices them, beside the arrays they write: the operand formed whole,
+        # or its sides alone.
+        forming = xla(algebra_program.priced(formed.whole, target).work + cost.Work(device_bytes=base))
+        if formed.sides is not None:
+            sides = xla(algebra_program.priced(formed.sides, target).work
+                        + cost.Work(device_bytes=formed.side_bytes))
     fused_seconds = sides + launched(product + region.chain + prologue + cost.Work(
         device_bytes=operands + region.captured_bytes + region.output_bytes))
     unfused_seconds = forming + launched(product + cost.Work(device_bytes=operands + written))
@@ -442,15 +451,13 @@ def _split(producer, values):
     places = tuple(given.get(var) for var in (base, *sides))
     jvp = functools.partial(_whole_jvp, flat, tuple(leaves), places, tuple(array.shape for array in arrays))
     # Priced (`Formed`): the element stage the prologue runs, counted as a kernel's body is
-    # (`emission.emitted`), and the sides' bytes, which XLA's pass writes. A stage holding an operation the
-    # kernels' counter prices none of is no kernel's: refused (its selector then XLA's, or a call naming
-    # the fused kernel told why), never raised, whichever operation it is (a layout's, a reduction's).
-    staged_program = jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage)
-    try:
-        work = emission.emitted(staged_program, 1, None).fixed
-    except emission.Unpriced as unpriced:
-        return Refusal('unpriced', f"the kernels price no operation of the producer's stage: {unpriced}")
-    formed = Formed(work, float(sum(array.size * array.dtype.itemsize for array in squeezed)))
+    # (`emission.emitted`, which prices every operation the fuser tiles), and XLA's programs beside it.
+    work = emission.emitted(jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage), 1, None).fixed
+    # XLA's program of the sides: the producer's, read back from them (its extraction prices what they read
+    # alone); none where every side is an input the stage reads as given.
+    computed = any(not isinstance(var, jax_core.Literal) and var not in jaxpr.invars for var in sides)
+    formed = Formed(work, closed.replace(jaxpr=jaxpr.replace(outvars=list(sides))) if computed else None,
+                    closed, float(sum(array.size * array.dtype.itemsize for array in squeezed)))
     return arrays[0], function, squeezed, named, jvp, formed
 
 
