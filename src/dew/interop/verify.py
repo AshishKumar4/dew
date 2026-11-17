@@ -774,11 +774,20 @@ def _built(model_type: str, convention: str, family: decoder_parts.DecoderFamily
     left unread and its parameter count."""
     record, inert = _translate({**fields, 'model_type': model_type}, convention, family)
     model = models.build("causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"})
-    try:
-        template = abstract(lambda: model.init(jax.random.PRNGKey(0), jnp.zeros((1, 2), jnp.int32)))
-    except ValueError as error:
-        raise _Mismatch(f"{convention}'s model does not build at the probe's sizes ({error})") from error
-    return model, record, inert, sum(math.prod(leaf.shape) for leaf in jax.tree.leaves(template['params']))
+    key = json.dumps(record, sort_keys=True, default=repr)
+    if key not in _PARAMETER_COUNTS:
+        try:
+            template = abstract(lambda: model.init(jax.random.PRNGKey(0), jnp.zeros((1, 2), jnp.int32)))
+        except ValueError as error:
+            raise _Mismatch(f"{convention}'s model does not build at the probe's sizes ({error})") from error
+        _PARAMETER_COUNTS[key] = sum(math.prod(leaf.shape) for leaf in jax.tree.leaves(template['params']))
+    return model, record, inert, _PARAMETER_COUNTS[key]
+
+
+_PARAMETER_COUNTS: dict[str, int] = {}
+"""Each record's decoder's parameter count at the probe's sizes (`_built`), its initialization traced
+abstractly once a process for a record: a census asks for each configuration's candidates once in each
+order, and candidates of other types may state the same decoder."""
 
 
 def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.Module,
