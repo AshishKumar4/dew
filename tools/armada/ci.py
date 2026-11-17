@@ -2238,6 +2238,30 @@ def verdict_rows(verdict: dict) -> dict[str, list[dict]]:
     return rows
 
 
+def raised(record: dict[str, float], held: list[dict], marked: dict) -> dict[str, float]:
+    """What a file's red, cut-off or incomplete rows `held` time of its tests, as `folded` takes it: each
+    test a row timed past its record raises it, and a test a row its task's deadline cut off finished (all
+    but its last, which the deadline stopped, timed only as far as it ran) is taken where the record lacks
+    it; the run counts as no green one, so nothing it timed lowers an entry or drops one. A test that grew
+    past its record and makes its group outrun its deadline is timed so, or its group is cut by the old
+    time every run and dies at it again (Main, 2026-11-17: base/kernels' test_attention_mosaic_compile
+    groups, recorded at about 100 s, ran 12 to 25 min). A site's entries stay as they are
+    (`site_entries`)."""
+    taken: dict[str, float] = {}
+    for row_ in held:
+        timed = list(row_.get("tests", {}).items())
+        stopped = row_.get("kind") == "deadline"
+        finished = {node for node, _ in (timed[:-1] if stopped else timed)}
+        for node, seconds in timed:
+            if session.site_name(node, marked) in marked:
+                continue
+            if node in record and seconds > record[node]:
+                taken[node] = round(seconds, 3)
+            elif node not in record and stopped and node in finished:
+                taken[node] = round(seconds, 3)
+    return taken
+
+
 def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, float]:
     """The durations `record` with main's CI `verdict` (`armada verdict <sha> --json`) folded in, one test
     file at a time, each whole, as its floor Python's rows ran it. A file whose rows are all green and
@@ -2245,18 +2269,18 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     stale (`stale`, its total drifted among it). A group's key holds its tests, not their seconds
     (`cache_key`), and its cut stays as stored while its groups hold (`session.stored_bounds`), so a refreshed
     file reruns only the groups whose tests move, and every group of it where its group count changes. A file
-    with a red or missing row keeps its entries, as does a file the verdict did not run, and one the checkout
-    has changed since the verdict's commit, whose rows observed tests it may no longer hold (2026-10-31: train
-    370's fold replaced a head's 66 renamed test ids with main's old ones); a file the checkout no longer has
-    loses them. A file a task's deadline cut off, run whole, takes the times its row observed of the tests it
-    finished (all but the last, which the deadline stopped) where its record lacks them: no green run would
-    ever time it, and the plan cuts it by them, a test it never reached weighing their mean (2026-11-02:
-    base/kernels' test_algebra_laws, recorded nowhere, ran 46 of its ~70 tests and was cut off every run). A
-    reused row (the test cache) carries the times of the run that recorded it. Each train folds main's CI so
-    (the land queue), and nothing else writes the record. A site its file's marks shard (`sites`) keeps its
-    entries: its judge's row times its pooling, no measure of its draws, so its map tasks are weighed by
-    armada's measures of them, never by the record (`site_entries`), and a judge armada did not run is a row
-    of its task's name."""
+    with a red or missing row keeps its entries, but for what its rows timed past them (`raised`), as does a
+    file the verdict did not run, and one the checkout has changed since the verdict's commit, whose rows
+    observed tests it may no longer hold (2026-10-31: train 370's fold replaced a head's 66 renamed test ids
+    with main's old ones); a file the checkout no longer has loses them. A file a task's deadline cut off
+    takes the times its rows observed of the tests it finished (all but the last, which the deadline stopped)
+    where its record lacks them: no green run would ever time it, and the plan cuts it by them, a test it
+    never reached weighing their mean (2026-11-02: base/kernels' test_algebra_laws, recorded nowhere, ran 46
+    of its ~70 tests and was cut off every run). A reused row (the test cache) carries the times of the run
+    that recorded it. Each train folds main's CI so (the land queue), and nothing else writes the record. A
+    site its file's marks shard (`sites`) keeps its entries: its judge's row times its pooling, no measure of
+    its draws, so its map tasks are weighed by armada's measures of them, never by the record
+    (`site_entries`), and a judge armada did not run is a row of its task's name."""
     rows = verdict_rows(verdict)
     kept = {node: seconds for node, seconds in record.items() if Path(node.split("::")[0]).is_file()}
     for name, held in rows.items():
@@ -2264,15 +2288,11 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
         counts = {int(split_.split("/")[1]) for split_ in splits if split_}
         complete = splits == {""} or (len(counts) == 1 and splits == {f"{group}/{count}" for count in counts
                                                                       for group in range(1, count + 1)})
-        if splits == {""} and held[0].get("kind") == "deadline":
-            # Its last test, the one the deadline stopped, is timed only as far as it ran.
-            finished = list(held[0].get("tests", {}).items())[:-1]
-            kept.update({node: round(seconds, 3) for node, seconds in finished if node not in kept})
-            continue
+        marked = sites(name)
         if not complete or any(row_["exitCode"] != 0 or "tests" not in row_ for row_ in held):
+            kept.update(raised(kept, held, marked))
             continue
         observed = {node: seconds for row_ in held for node, seconds in row_["tests"].items()}
-        marked = sites(name)
         own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name
                and session.site_name(node, marked) not in marked}
         took = sum(row_["seconds"] for row_ in held)

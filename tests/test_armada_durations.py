@@ -299,3 +299,34 @@ def test_a_file_a_tasks_deadline_cut_off_takes_the_times_of_the_tests_it_finishe
     planned = sorted((entry["tests"], entry["split"]) for entry in ci.plan(240.0, {})
                      if entry["python"] == "3.12" and entry["tests"] == heavy)
     assert planned == [(heavy, "1/2"), (heavy, "2/2")]
+
+
+def test_a_recorded_test_that_grew_past_its_deadline_raises_its_record_and_the_next_plan_packs_it_alone(
+        ci, tmp_path, monkeypatch):
+    """A test recorded at 100 s that now takes 400 s makes the group the old time packed it in outrun its
+    task's deadline: the file is red and incomplete, so no green run would ever time it again, and its
+    group would die at the deadline every run (Main, 2026-11-17: base/kernels'
+    test_attention_mosaic_compile). The fold raises the entry to what the cut-off row timed of it,
+    lowering nothing, and the next plan packs it alone."""
+    grown = "tests/test_grown.py"
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240, "environment": {}}))
+    (tmp_path / grown).write_text("".join(f"def test_{name}():\n    pass\n" for name in "abcdef"))
+    record = {f"{grown}::test_a": 100.0, **{f"{grown}::test_{name}": 20.0 for name in "bcdef"}}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(record))
+    main = commit(tmp_path, "main")
+    before = [entry for entry in ci.plan(240.0, {}) if entry["python"] == "3.12" and grown in entry["tests"]]
+    # Its group ran test_a for 400 s, then test_b, which the deadline stopped; the other group was green.
+    rows = [{"name": f"3.12:{grown}#1/2", "exitCode": 1, "kind": "deadline", "seconds": 420.0,
+             "tests": {f"{grown}::test_a": 400.0, f"{grown}::test_b": 5.0}},
+            {"name": f"3.12:{grown}#2/2", "exitCode": 0, "seconds": 60.0,
+             "tests": {f"{grown}::test_{name}": 10.0 for name in "cde"}}]
+    verdict = tmp_path / "main.json"
+    verdict.write_text(json.dumps({"sha": main, "part": "all", "rows": rows}))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
+    assert ci.main() == 0
+    # Raised where it grew; the stopped test_b and the green group's faster times lower nothing.
+    assert json.loads((tmp_path / "tests/test_durations.json").read_text()) == {
+        **record, f"{grown}::test_a": 400.0}
+    after = [entry for entry in ci.plan(240.0, {}) if entry["python"] == "3.12" and grown in entry["tests"]]
+    heaviest = max(after, key=lambda entry: entry["weight"])
+    assert len(after) > len(before) and heaviest["weight"] < 400.0 + 20.0
