@@ -90,7 +90,7 @@ def pool_of(stages: Sequence[Stage]) -> Pool | None:
     threads = _threads(stages)
     if threads is not None:
         return Pool("threads", threads)
-    declared = [kind for kind in map(declared_pool, stages) if kind is not None]
+    declared: list[PoolKind] = [kind for kind in map(declared_pool, stages) if kind is not None]
     return Pool.declared(declared[0]) if declared else None
 
 
