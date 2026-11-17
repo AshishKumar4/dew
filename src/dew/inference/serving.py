@@ -605,10 +605,11 @@ def _unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bool = Fa
     return None
 
 
-PAGE_SIZE = 16
+PAGE_SIZE = 64
 """The slots a page holds where neither a caller nor the model's layout names a page size
-(`paged_layout`): vLLM's default block, small beside a prompt so the requests sharing it share most of
-it."""
+(`paged_layout`). A served GRPO batch of 8 prompts x 8 samples at Qwen3-0.6B's config on a GH200 (M-IG-11,
+64 new tokens, medians of 5 rounds, each arm alone): pages of 64 took 0.453 s at 512-token prompts and
+0.615 s at 2048 against a dense cache's 0.439 and 1.154, and pages of 16 0.509 and 0.703."""
 
 
 def paged_layout(model: nn.Module, capacity: int, page_size: int | None = None) -> KVCache | None:

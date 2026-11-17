@@ -53,7 +53,7 @@ class ServedRollout:
     updates. A `max_lag` above 0 trains on stale rollouts, which the objective's behavior importance
     weights (`--objective.behavior-importance`). With `page_size` the server pages its cache and shares
     prompt pages, so a group's samples of one prompt prefill it once; None pages the cache wherever the
-    model pages (`RolloutScheduler.serve`: the model's own layout's page size, else 16), and keeps each
+    model pages (`RolloutScheduler.serve`: the model's own layout's page size, else 64), and keeps each
     row's cache whole where it doesn't."""
 
     slots: int = 8

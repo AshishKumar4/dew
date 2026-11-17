@@ -460,5 +460,5 @@ def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
         return acquisition.collector.kv_cache
 
     paged = layout(task)
-    assert paged is not None and paged.page_size == 16
+    assert paged is not None and paged.page_size == 64
     assert layout(dataclasses.replace(task, n=2)) is None
