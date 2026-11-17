@@ -9,6 +9,7 @@ import dataclasses
 import functools
 import gc
 import os
+import subprocess
 import time
 import weakref
 
@@ -1155,3 +1156,40 @@ def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read
     (found,) = kc.reports({}, [unread])
     assert "machine code" in found.unread
     assert found.failure(232448, 0) is not None
+
+
+RECONFIGURING_PTX = """
+.version 8.8
+.target sm_90a
+.address_size 64
+
+.visible .entry reconfiguring() .maxntid 384, 1, 1 .maxnreg 168
+{
+	.reg .b32 %r<2>;
+	.reg .pred %p<2>;
+	mov.u32 %r1, %tid.x;
+	setp.lt.u32 %p1, %r1, 128;
+	@%p1 bra PRODUCER;
+	setmaxnreg.inc.sync.aligned.u32 232;
+	ret;
+PRODUCER:
+	setmaxnreg.dec.sync.aligned.u32 40;
+	ret;
+}
+"""
+
+
+def test_a_binary_states_its_threads_and_the_registers_its_roles_reconfigure_to(tmp_path):
+    """A kernel of 384 threads whose producer lowers to 40 registers and whose consumers raise to 232
+    (`setmaxnreg`), assembled for an H100 by the gate's ptxas (`kernel_compile.assemblers`): its binary
+    (`report._binary`, decoded) states its threads from its `.nv.info` and the two counts from its machine
+    code (USETMAXREG), the facts the compile gate reads where no PTX of a kernel was dumped (row 7105)."""
+    from kernel_compile import assemblers
+
+    source = tmp_path / "reconfiguring.ptx"
+    source.write_text(RECONFIGURING_PTX)
+    cubin = tmp_path / "reconfiguring.cubin"
+    subprocess.run([str(assemblers("sm90")[0]), "-arch=sm_90a", str(source), "-o", str(cubin)], check=True)
+    binary = report._binary("reconfiguring", cubin.read_bytes(), decoded=True)
+    assert (binary.threads, binary.decreased, binary.raised) == (384, 40, 232), binary
+
