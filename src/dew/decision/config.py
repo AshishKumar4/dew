@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import types
+import typing
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
 
@@ -52,9 +54,10 @@ from dew.decision.rows import option_width
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.inputs.condition import ConditionEncoder
-from dew.inputs.spec import TextCondition
+from dew.inputs.spec import Condition, TextCondition
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, SharedCrossAttention
+from dew.nn.dit import TextContext
 from dew.nn.protocols import CountedCondition, RematChoosing
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig, class_record, from_record, import_path, record_argument
@@ -62,6 +65,25 @@ from dew.state import TrainState
 
 if TYPE_CHECKING:
     from dew.checkpoints import Checkpoints
+
+
+
+def encodes_text(kind: type) -> bool:
+    """Whether encoders of `kind` read text into the states context layers read: its class a
+    `ConditionEncoder[str, TextContext]` (`char_table`, `clip_text`, `t5`), not a denoiser's conditioner,
+    which gives a condition of its own, nor an encoder of another input."""
+    declared = [base for klass in kind.__mro__ for base in types.get_original_bases(klass)
+                if typing.get_origin(base) is ConditionEncoder]
+    return any(typing.get_args(base) == (str, TextContext) for base in declared)
+
+
+def _text_encoder(condition: Condition) -> ConditionEncoder:
+    """`condition`'s encoder, refused (ValueError) where it reads no text into the states context layers
+    read (`encodes_text`)."""
+    if not encodes_text(type(condition.encoder)):
+        raise ValueError(f"--context-text.encoder {type(condition.encoder).__name__} encodes no text into "
+                         "the states context layers read; name one that does (char_table, clip_text, t5)")
+    return condition.encoder
 
 
 @dataclasses.dataclass(frozen=True)
@@ -215,10 +237,14 @@ class DecisionRunConfig(DecoderRunConfig):
     (`DecisionModel.context_encoder`): the backbone's token table, or the
     backbone's own pass over it. With `context_layers` alone."""
     context_text: TextCondition | None = dataclasses.field(default=None, metadata={ADDED: True})
-    """A configured encoder of the context in place of the backbone's own (`DecisionModel.context`): any
-    registered condition encoder and its checkpoint, as a diffusion run's text condition names one, its
-    tokenization the context's, each row's context encoded alone, its states read by the cross-attention at
-    its own width. With `context_layers` alone."""
+    """A configured encoder of the context in place of the backbone's own (`DecisionModel.context`): a
+    registered encoder of text into states (`char_table`, `clip_text`, `t5`) and its checkpoint, as a
+    diffusion run's text condition names one, computing in the run's dtype, its tokenization the
+    context's, each row's context encoded alone, its states read by the cross-attention at its own width,
+    its weights frozen unless `context_text_trained`. With `context_layers` alone."""
+    context_text_trained: bool = dataclasses.field(default=False, metadata={ADDED: True})
+    """Whether a configured context encoder's weights train with the run, else held frozen and run
+    forward alone, as a diffusion run's text encoders are."""
     context_form: Literal["idefics", "shared"] = "idefics"
     """The block each context layer runs: IDEFICS's gated block, an attention and a
     feed-forward of its own drawn beside the layer (`CrossAttention`), or the
@@ -268,6 +294,14 @@ class DecisionRunConfig(DecoderRunConfig):
             raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
         if self.context_text is not None and self.context_layers is None:
             raise ValueError("--context-text encodes the context context layers read; set --context-layers")
+        if self.context_text_trained and self.context_text is None:
+            raise ValueError("--context-text-trained trains a configured context encoder; set --context-text")
+        text = self.context_text
+        if text is not None and (text.field, text.unconditional) != (TextCondition.field,
+                                                                     TextCondition.unconditional):
+            raise ValueError("a decision's context encoder reads the row's context field and has no "
+                             "unconditional branch; --context-text.field and --context-text.unconditional "
+                             "are a diffusion run's")
         if not self.context_frozen and self.context_layers is None:
             raise ValueError("--no-context-frozen says how context layers hold the backbone; set "
                              "--context-layers")
@@ -307,9 +341,12 @@ class DecisionRunConfig(DecoderRunConfig):
         budgets = self._row_fields()
         self._refuse_unread_context()
         derived: dict[str, object] = {}
-        configured = None if self.context_text is None else self.context_text.build().encoder
+        text = self.context_text
+        configured = None if text is None else _text_encoder(text.build(dtype=dtype))
         if self.context_layers is not None:
             derived["context_encoder"] = self.context_encoder if configured is None else configured
+        if configured is not None:
+            derived["context_trained"] = self.context_text_trained
         from dew.decision.slot_source import reads_blocks
         from dew.decision.sources import PretrainedDecision
 
