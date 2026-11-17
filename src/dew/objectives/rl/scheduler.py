@@ -140,7 +140,7 @@ from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass, field
-from typing import ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -190,6 +190,10 @@ from .sessions import (
     session_metrics,
     varies,
 )
+
+if TYPE_CHECKING:
+    from dew.inference.serving import Server
+    from dew.inference.tasks import TextGeneration
 
 
 class Publisher(Protocol):
@@ -736,9 +740,6 @@ class RolloutScheduler:
         devices, which every process steps together as it admits each call's groups and reloads at each
         push (`NativeRolloutServer.waited`): its draws run between the trainer's steps, not beside them."""
         from dew.inference.rollouts import NativeRolloutServer
-        from dew.inference.serving import Server
-        from dew.nn.kv_cache import KVCache
-        from dew.nn.protocols import Layered
 
         from .sources import PromptSource
 
@@ -746,14 +747,8 @@ class RolloutScheduler:
         width = objective.seq_len + 1
 
         def built(variables: Variables, version: int) -> Server:
-            policy = objective.policy(variables, drawing, Progress(jnp.asarray(version, jnp.int32)))
-            if page_size is None:
-                return Server.from_task(policy, slots=slots, capacity=width)
-            # The policy's own cache layout, its format kept, in pages.
-            declared = policy.model.kv_cache if isinstance(policy.model, Layered) else KVCache()
-            # Its prefix cache as the server keeps one by default, wherever the model admits it.
-            return Server.from_task(policy, slots=slots, capacity=width,
-                                    kv_cache=dataclasses.replace(declared, page_size=page_size))
+            return cls.serve(objective.policy(variables, drawing, Progress(jnp.asarray(version, jnp.int32))),
+                             slots=slots, capacity=width, page_size=page_size)
 
         server = NativeRolloutServer.deferred(built, drawing)
         source = PromptSource(server, reward, decode=decode, max_new_tokens=max_new_tokens)
@@ -766,6 +761,23 @@ class RolloutScheduler:
         # The source and the server it built end with it: the reward pool, then the engine.
         scheduler._owned = (source.close, server.close)
         return scheduler
+
+    @staticmethod
+    def serve(policy: TextGeneration, *, slots: int, capacity: int, page_size: int | None = None) -> Server:
+        """The server a served rollout draws `policy`'s completions from (`served`): `slots` rows of
+        `capacity` slots, its cache in pages of `page_size` slots where given, its prefix cache then on as a
+        paged server keeps one by default wherever the model admits it, so a group's samples of one prompt
+        prefill it once; each row's cache whole where none is."""
+        from dew.inference.serving import Server
+        from dew.nn.kv_cache import KVCache
+        from dew.nn.protocols import Layered
+
+        if page_size is None:
+            return Server.from_task(policy, slots=slots, capacity=capacity)
+        # The policy's own cache layout, its format kept, in pages.
+        declared = policy.model.kv_cache if isinstance(policy.model, Layered) else KVCache()
+        return Server.from_task(policy, slots=slots, capacity=capacity,
+                                kv_cache=dataclasses.replace(declared, page_size=page_size))
 
     @classmethod
     def episodes(cls, policy: EpisodeInference, environment: EnvironmentFactory, verifier: Verifier, *,
