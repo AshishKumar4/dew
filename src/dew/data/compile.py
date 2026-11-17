@@ -31,7 +31,6 @@ from dew._position import unplaced
 from dew._records import JSON, integer, json_value
 from dew.batch import Batch
 from dew.data.analysis import (
-    _EAGER,
     _VIEWS,
     Measuring,
     _analyzed,
@@ -1029,11 +1028,8 @@ def _held_ahead(train: Pipeline, read: Read) -> str | None:
     if read != "memory" or isinstance(train.source, Combined):
         return None
     # The steps the read runs as it holds its rows, as the analysis places them once its configured steps
-    # bind (after a cache it fills), and a configured step's after them, which binds to such a step unless
-    # it draws (a random map).
+    # bind (after a cache it fills), a configured step among them where it binds to such a step.
     eager = _analyzed(train, read, bound=True).eager
-    while eager < len(train.stages) and _held_once_bound(train.stages[eager]):
-        eager += 1
     at = _one_example_until(train)
     if at >= eager:
         return None
@@ -1042,12 +1038,6 @@ def _held_ahead(train: Pipeline, read: Read) -> str | None:
     after = dataclasses.replace(train, stages=train.stages[eager:])
     laid = isinstance(train.stages[at], (Pack, Windows))
     return "layout" if laid and _analyzed(after, read).per_share else None
-
-
-def _held_once_bound(stage: Stage) -> bool:
-    """Whether a memory read holds what `stage` makes as it holds its rows: an eager step (`_EAGER`), or a
-    configured one, which binds to such a step unless it draws (a random map)."""
-    return isinstance(stage, _EAGER) or (isinstance(stage, Configured) and not stage.random)
 
 
 def _rebound(pipeline: Pipeline, examples: int, passes: int | None = None) -> Pipeline:
@@ -1414,7 +1404,10 @@ def _drawn_order(build: _Build, pipeline: Pipeline) -> Callable[[int], tuple[str
     """The twin of draws of the global order a training read of `pipeline` by `build` counts its records in
     (`_Build.batch_order`), by index: the corpus and the place its `index`th record was drawn at,
     where the corpus's chain first repeats (`place_of`); batched and through the stages after its batch
-    that hold a place in it as its batches are (`_Build.placed`), each record its batch's."""
+    that hold a place in it as its batches are (`_Build.placed`), each record its batch's. The twin is no
+    run's training read, so automatic loading reads it in the process (`Loading.unsized`), as a phase's
+    build is handed it before a read sizes its workers."""
+    build = dataclasses.replace(build, loading=build.loading.unsized())
     places = _drawn_records(build, pipeline)
     if build.lowering.rooted:
         places = _repeated(places, None, _name(pipeline), build.loading)
