@@ -157,7 +157,7 @@ from dew.data.plan import (
     identified,
     structured,
 )
-from dew.data.readers import GRAIN, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
+from dew.data.readers import GRAIN, Replayed, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
     Read,
     Rows,
@@ -1281,7 +1281,7 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
 
     for pipeline in pipelines:
         walk(pipeline, packed=False)
-    return tuple(Coordinated(fields[ids], None if unseen else bound, laid[ids])
+    return tuple(Coordinated.laid(fields[ids], None if unseen else bound, laid[ids])
                  for ids, bound in bounds.items())
 
 
@@ -1291,7 +1291,7 @@ def _held_coordinated(validation: Pipeline, training: tuple[Coordinated, ...]) -
     validation source may hold packed windows whose packing it does not show."""
     held = _coordinated(validation)
     declared = {step.fields[0] for step in held}
-    return held + tuple(Coordinated(step.fields, None, step.laid_out) for step in training
+    return held + tuple(Coordinated.laid(step.fields, None, step.laid_out) for step in training
                         if step.fields[0] not in declared)
 
 
@@ -2110,41 +2110,12 @@ def _share(batch: Batch, partition: DataPartition, *, held: bool) -> Batch:
     return FilledBatch(filled, real=real).map(take_batch(batch, np.arange(rows)[mine]))
 
 
-class _Replayed:
-    """A Grain iterator whose first element was read already (`native_loader`'s probe of the batch): it
-    gives that element first, then reads on, its position the one before it until it is given."""
-
-    def __init__(self, source: pygrain.DatasetIterator, first: Batch, before):
-        # The element and the position before it, let go once given: the stream holds no batch past it.
-        self._source, self._held = source, (first, before)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self) -> Batch:
-        if self._held is not None:
-            (first, _), self._held = self._held, None
-            return first
-        return next(self._source)
-
-    def get_state(self):
-        return self._source.get_state() if self._held is None else self._held[1]
-
-    def set_state(self, state) -> None:
-        self._held = None
-        self._source.set_state(state)
-
-    def close(self) -> None:
-        if isinstance(self._source, Closeable):
-            self._source.close()
-
-
 class _Shared(Forwarding):
     """The `partition`'s share of each batch a stream yields (`_share`), its position, stop and close
     the stream's; it never ends where it reads a map dataset repeated without end (`native`, `endless`),
     which says so of nothing it reads."""
 
-    def __init__(self, batches: pygrain.DatasetIterator | _Whole | _Replayed, partition: DataPartition, *,
+    def __init__(self, batches: pygrain.DatasetIterator | _Whole | Replayed, partition: DataPartition, *,
                  held: bool, endless: bool = False):
         self._source, self.partition, self.held, self._endless = batches, partition, held, endless
 
@@ -2185,7 +2156,7 @@ def native(handed: Handed, *, training: bool) -> Reader:
 def native_loader(handed: Handed) -> Loader:
     """The data handed to `fit` as it is (`native`) as the loader the run reads, its global batch
     its first element's rows. A Grain iterable is read once for that element: its run's first stream
-    gives it again and reads on (`_Replayed`), as the batch contract asks (training.md; row 6663)."""
+    gives it again and reads on (`Replayed`), as the batch contract asks (training.md; row 6663)."""
     if isinstance(handed, pygrain.IterDataset):
         probe = iter(handed)
         try:
@@ -2195,7 +2166,7 @@ def native_loader(handed: Handed) -> Loader:
             if isinstance(probe, Closeable):
                 probe.close()
             raise
-        replayed = [_Replayed(probe, first, before)]
+        replayed = [Replayed(probe, first, before)]
 
         def train(partition: DataPartition) -> Iterator[Batch]:
             return _Shared(replayed.pop() if replayed else iter(handed), partition, held=False)

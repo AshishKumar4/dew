@@ -456,3 +456,32 @@ class _FillShare:
     def __call__(self, batch: Batch) -> Batch:
         held, real = self.partition.held(rows_of(batch))
         return FilledBatch(self.partition.rows(self.batch), real=real).map(take_batch(batch, held))
+
+
+class Replayed:
+    """A Grain iterator whose first element was read already (`dew.data.compile.native_loader`'s probe of the batch): it
+    gives that element first, then reads on, its position the one before it until it is given."""
+
+    def __init__(self, source: pygrain.DatasetIterator, first: Batch, before):
+        # The element and the position before it, let go once given: the stream holds no batch past it.
+        self._source, self._held = source, (first, before)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> Batch:
+        if self._held is not None:
+            (first, _), self._held = self._held, None
+            return first
+        return next(self._source)
+
+    def get_state(self):
+        return self._source.get_state() if self._held is None else self._held[1]
+
+    def set_state(self, state) -> None:
+        self._held = None
+        self._source.set_state(state)
+
+    def close(self) -> None:
+        if isinstance(self._source, Closeable):
+            self._source.close()

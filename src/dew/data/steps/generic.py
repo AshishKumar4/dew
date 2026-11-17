@@ -77,9 +77,25 @@ class Coordinated(grain.MapTransform):
 
     fields: tuple[str, ...]
     max_segments: int | None
-    # Derived from the chain's own steps (a step over its windows that lays them out), which its plan
-    # describes, so it is no part of the step's description: a recorded plan reads as it did.
-    laid_out: bool = dataclasses.field(default=True, repr=False)
+
+    def __post_init__(self):
+        # Whether the read lays its windows out (`laid`): derived from the chain's own steps (a step over
+        # its windows that lays them out), which its plan describes, so no field of the step's: its
+        # statement, every field of it, reads as a plan main saved states it.
+        object.__setattr__(self, "_laid_out", True)
+
+    @classmethod
+    def laid(cls, fields: tuple[str, ...], max_segments: int | None, laid_out: bool) -> "Coordinated":
+        """The step over `fields`' windows, which the read lays out where `laid_out`, else states their
+        bound alone, its objective laying them out itself (`dew.data.pipeline.LaysOutWindows`)."""
+        made = cls(fields, max_segments)
+        object.__setattr__(made, "_laid_out", laid_out)
+        return made
+
+    @property
+    def laid_out(self) -> bool:
+        """Whether the read lays its windows out (`laid`), held beside the step's fields."""
+        return bool(vars(self)["_laid_out"])
 
     def map(self, element: Batch) -> Batch:
         from dew.batch import SegmentBound, coordinates
