@@ -723,7 +723,7 @@ def test_a_stage_on_processes_before_a_cache_is_refused_and_one_on_threads_fills
     """A stage declaring processes before a cache is refused as the read is compiled: a cache fills in its
     reading process, writing each input as its steps make it, so the processes would be unread; after the
     cache it reads. One declaring threads, which run in the reading process, fills the cache there, several
-    inputs at once where its read reads them so (indexed, memory). The
+    inputs at once, a streamed read's fill among them (train 977's review, F4). The
     fill ran the step in the reading process, the declared pool unread (the head review of theme 16, F5),
     and then threads were refused too (train 967's review, F5)."""
     catalog = Memory([{"id": index} for index in range(9)], shard_rows=9)
@@ -745,9 +745,8 @@ def test_a_stage_on_processes_before_a_cache_is_refused_and_one_on_threads_fills
                    .cache(str(tmp_path / "c")))
     assert [int(value) for value in filled["id"]] == [0, 1, 2]
     assert all(int(pid) == os.getpid() for pid in filled["pid"])
-    # Several inputs filled at once, as the declared threads run them, where one thread read each in turn;
-    # a streamed read's fill writes each input as its steps make it, in order.
-    assert (ACTIVE["most"] > 1) == (read != "streamed")
+    # Several inputs filled at once, as the declared threads run them, where one thread read each in turn.
+    assert ACTIVE["most"] > 1
 
 
 ACTIVE = {"now": 0, "most": 0}
