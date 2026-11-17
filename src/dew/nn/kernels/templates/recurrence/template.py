@@ -175,10 +175,10 @@ made last."""
 
 def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target: generation.GpuTarget,
              max_segments: int | None, delta: bool, backward: bool,
-             rounded: bool = False, values_gated: bool = False, wide: bool = False,
+             rounded: bool = False, wide: bool = False,
              ranged: bool = False, skip: jax.ShapeDtypeStruct | None = None,
-             forked: chunk_forward.ForkedTable | None = None, training_forward: bool = False
-             ) -> tuple[mainloop.Launch, ...]:
+             forked: chunk_forward.ForkedTable | None = None, training_forward: bool = False,
+             values_gated: bool = False) -> tuple[mainloop.Launch, ...]:
     """`planned` of a call over `shapes` (`jax.ShapeDtypeStruct`s or None) by `family`'s
     bundle on `target`, cached by the facts a plan reads of it (two targets of one family share no plan: an
     sm87's and an sm80's multiprocessors and shared memory differ), `PLANS_KEPT` of them. A ring's depth
