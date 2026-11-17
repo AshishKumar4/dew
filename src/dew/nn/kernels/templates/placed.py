@@ -196,7 +196,9 @@ class Tcgen05Placed(Tcgen05Rings):
                 summed.wait(summed.turn(slots.n - 1))
             self.write(self._turns(WEIGHTS)[slots.turn], weights)
             if scale is not None and adds and not slots.first:
-                _rescaled(self, acc, scale)
+                # A pass over the sums in tensor memory only where the step moves some row's (`Taken.moves`):
+                # a lazy walk keeps its anchor most steps (one warpgroup vote, `bar.red.or.pred`).
+                pl.when(scale.moves)(lambda: _rescaled(self, acc, scale))
             weighed.published(weighed.turn(slots.n))
             return acc
 

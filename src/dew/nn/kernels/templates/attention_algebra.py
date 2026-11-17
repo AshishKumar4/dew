@@ -1496,6 +1496,14 @@ class Taken:
         taken = acc if self.factor is None else self.coords.queries(self.factor, acc) * acc
         return taken if self.held is None else power2(taken, self.coords.queries(self.held.drop, acc))
 
+    @property
+    def moves(self) -> jax.Array | bool:
+        """Whether it moves any row's sums: some row's factor other than 1 or some row's scale changed (a
+        lazy walk's anchor kept leaves every factor exactly 1, `lazy_anchor`), so a mainloop holding its sums
+        apart (tensor memory) skips the pass over them where it moves none."""
+        moved = False if self.factor is None else jnp.any(self.factor != 1.0)
+        return moved if self.held is None else moved | jnp.any(self.held.drop != 0)
+
 
 Gathered = Callable[[jax.Array], jax.Array]
 """A training walk's value rows gathered by key: each row's `[bq, Dv]` at its anchor key `[bq]`."""
