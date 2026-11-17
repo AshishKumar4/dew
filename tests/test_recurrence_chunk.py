@@ -71,6 +71,7 @@ FORMED = [
     recurrence.Hooks(decay='vector', delta=False, write_gate=True, own_weight=True),
     recurrence.Hooks(decay='scalar', delta=False, write_gate=True, reads='apart'),
     recurrence.Hooks(decay='vector', delta=False, reads='apart'),
+    recurrence.Hooks(decay='scalar', delta=True, reads='apart'),
 ]
 """The prologue's and epilogue's hooks: the gated delta rule's gates and l2 norm, Mamba2's step gates
 clipped with the skip, the gated RMS norm after the l2 norm and after a plain scale, Mamba2's SSD as
@@ -80,7 +81,9 @@ readout of the memory entering its token (`Hooks.reads`): RWKV6's, a decay a key
 write weighed (`Hooks.own_weight`), and the delta rule's; a write gate's own write weighed in a readout
 after it, its own weight added to the query's read of the write, as the decode step adds it; and the
 readout apart from its token's own write ('apart', row 7402): Mamba-3's, a decay a head and a write gate,
-which the template forms, and a decay a key dimension's, which the portable math alone does."""
+which the template forms, a decay a key dimension's, and the delta rule's, its corrected write apart from the
+read (the state after its decay), which the portable math alone does (row 7608: its corrected scan refused an
+apart read, a crash)."""
 
 PACKED = (False, True)
 
@@ -149,7 +152,8 @@ def chunk_on(kernel: str, hooks, *args, **kwargs):
 
 SEEDS = dict(zip(((hooks, packed) for hooks in HOOKS + FORMED for packed in PACKED), (
     8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 64, 64, 16, 16, 16, 16, 8, 8, 64, 64, 8, 8, 8, 8, 8, 8,
-    64, 64, 128, 128, 16, 8, 16, 16, 64, 64, 32, 32, 32, 32, 8, 8, 16, 16, 16, 16, 16, 16, 32, 16, 8, 8),
+    64, 64, 128, 128, 16, 8, 16, 16, 64, 64, 32, 32, 32, 32, 8, 8, 16, 16, 16, 16, 16, 16, 32, 16, 8, 8,
+    16, 16),
     strict=True))
 """Each site's declared seeds (hooks in `HOOKS` then `FORMED` order, one sequence then packed), sized
 independently by `seeds_for` on armada (2026-10-21; the readouts apart 2026-11-17), on the draw with a
