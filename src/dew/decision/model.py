@@ -18,7 +18,7 @@ from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, ModelInputs
 from dew.nn.inspection import INSPECTED, QK, component, in_parts, observed_maxima
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
-from dew.nn.protocols import EXITS, Looped, TokenModel, VocabularyRows
+from dew.nn.protocols import EXITS, CountedCondition, Looped, TokenModel, VocabularyRows
 from dew.nn.visibility import block_ends, block_starts
 from dew.nn.wrapping import HeadedModel
 from dew.objectives.base import joined
@@ -131,7 +131,7 @@ class DecisionModel(HeadedModel):
                 # document alone.
                 segments, documents = context_documents(inputs.context, inputs.context_lengths,
                                                         inputs.context_segments, inputs.max_segments)
-                states = _apart(encoded, inputs.context, segments, documents, encoded_width(encoder))
+                states = _apart(encoded, inputs.context, segments, documents, encoded_tokens(encoder))
                 return {CONTEXT: states, CONTEXT_LENGTHS: inputs.context_lengths,
                         **({} if inputs.context_segments is None else {CONTEXT_SEGMENTS: segments})}
 
@@ -480,10 +480,19 @@ def document_lengths(segments: jax.Array, documents: int) -> jax.Array:
     return jnp.sum(segments[:, :, None] == jnp.arange(1, documents + 1), axis=1)
 
 
-def encoded_width(encoder: ConditionEncoder) -> int:
+def encoded_tokens(encoder: ConditionEncoder) -> int:
     """The tokens a configured context encoder reads a text at, its own tokenization's width, which a
     document of a row's context is encoded at (`_apart`)."""
     return len(encoder.tokenize([""])["input_ids"][0])
+
+
+def state_width(encoder: ConditionEncoder) -> int:
+    """The width of the states a configured context encoder hands the cross-attention, as it declares its
+    work (`CountedCondition.conditioning_flops`, `ConditionWork.features`)."""
+    if not isinstance(encoder, CountedCondition):
+        raise ValueError(f"{type(encoder).__name__} declares no conditioning_flops, whose features are the "
+                         "width its states reach the context layers at")
+    return encoder.conditioning_flops(encoder.tokenize([""])).features
 
 
 def _apart(encoded: Callable[[jax.Array, jax.Array], jax.Array], tokens: jax.Array, segments: jax.Array,

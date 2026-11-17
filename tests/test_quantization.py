@@ -964,7 +964,7 @@ def test_a_step_compiles_for_the_quantized_text_tower_it_encodes_with(kind):
 
     from dew.data.text import ByteTokenizer
     from dew.decision.layout import Specials
-    from dew.decision.model import encoded_width
+    from dew.decision.model import state_width
     from dew.decision.objective import DecisionObjective
     from dew.diffusion import presets
     from dew.inputs import Condition, Field, InputSpec
@@ -987,7 +987,7 @@ def test_a_step_compiles_for_the_quantized_text_tower_it_encodes_with(kind):
                                                                 {"textcontext": Condition(tower)}),
                                       guidance=None, steps=2)
         source = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
-        blocks = CrossAttention((0,), 16, context_features=encoded_width(tower))
+        blocks = CrossAttention((0,), 16, context_features=state_width(tower))
         return DecisionObjective(source.with_cross_attention(blocks, key=0), tokenizer=ByteTokenizer(),
                                  specials=Specials(begin=None, separator=10, marker=0, marker_text="\x00",
                                                    pad=255),
