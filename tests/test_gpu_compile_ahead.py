@@ -297,8 +297,8 @@ def test_a_fresh_state_placed_on_a_gpu_is_bitwise_its_draws_under_jaxs_default_l
     compile alone (row 6740)."""
     import optax
 
-    from dew import models
     from dew.objectives.lm import LMObjective
+    from dew.registry import models
     from dew.training import Trainer
 
     model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
