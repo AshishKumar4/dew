@@ -49,7 +49,7 @@ from dew.nn.kv_cache import Opened, compute_dtype
 from dew.nn.linear import DepthwiseConv1d, held_scan, scan_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, softplus
+from dew.nn.precision import accumulated, accurate_exp, at_least_fp32, float32_dot_general, silu, softplus
 from dew.nn.residuals import Residual
 from dew.nn.sharding import rows_like, sequence_shards
 from dew.nn.ssm import affine_spans
@@ -251,7 +251,7 @@ class Mamba(nn.Module):
                         state_dtype=wide, conv_dtype=wide, dtype=wide)
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
-        gated = out * nn.silu(gate.astype(wide))
+        gated = out * silu(gate.astype(wide))
         return self.out_proj(gated.astype(gate.dtype))
 
     def _scan(self, convolved, *, starts, valid, held, forked=None):
@@ -273,8 +273,9 @@ class Mamba(nn.Module):
             step = jnp.where(valid[:, :, None], step, 0.0)
         wide = xs.dtype
         # The scan on the kernel its selector gives each product (`recurrence_chunk.SELECTIVE`).
+        rate = -accurate_exp(jnp.asarray(self.A_log, wide))
         return recurrence_chunk.selective_scan(
-            xs, step, -jnp.exp(jnp.asarray(self.A_log, wide)), B, C, jnp.asarray(self.D, wide), held, starts,
+            xs, step, rate, B, C, jnp.asarray(self.D, wide), held, starts,
             portable=functools.partial(selective_scan, chunk_size=self.chunk_size),
             **({} if forked is None else dict(zip(("loads", "stores", "held"), forked, strict=True))))
 

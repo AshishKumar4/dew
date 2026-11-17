@@ -510,9 +510,10 @@ def test_a_gated_norm_broadcasts_its_gate_in_either_order(scale_wide):
     as the RMS norm's arithmetic orders it (`rms_statistics`, `rms_weighted`), where the module computes
     in float64 over fp32 inputs (ledger 3627), bit for bit: norm first, each group normalized in fp32 and
     weighted, the weighted norm rounded to fp32 before a gate broadcast over it multiplies it; gate first,
-    over a gate broadcasting the input's leading axis, the norm of the gated values' shape."""
+    over a gate broadcasting the input's leading axis, the norm of the gated values' shape. The gate's silu
+    is the module's own (`precision.silu`)."""
     from dew.nn.mixers.mamba2 import MambaRMSNormGated
-    from dew.nn.precision import rms_statistics
+    from dew.nn.precision import rms_statistics, silu
 
     rng = np.random.default_rng(0x3627)
     with jax.enable_x64(new_val=True):
@@ -525,14 +526,14 @@ def test_a_gated_norm_broadcasts_its_gate_in_either_order(scale_wide):
         normalized = (grouped * rms_statistics(grouped, 1e-5)[1]).reshape(x.shape)
         weighted = (normalized * weight if scale_wide
                     else normalized.astype(jnp.float64) * weight.astype(jnp.float64))
-        expected = (weighted.astype(jnp.float32) * jax.nn.silu(gate)).astype(jnp.float64)
+        expected = (weighted.astype(jnp.float32) * silu(gate)).astype(jnp.float64)
         assert out.dtype == jnp.float64
         np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
         # The gate-first order over a gate that broadcasts the input's leading axis: the norm takes the
         # gated values' shape.
         wide = jnp.asarray(rng.normal(size=(2, 4, 8)), jnp.float32)
         first = MambaRMSNormGated(groups=2, scale_wide=scale_wide, dtype=jnp.float64)
-        gated = x[:1] * jax.nn.silu(wide)
+        gated = x[:1] * silu(wide)
         grouped = gated.reshape(2, 4, 2, 4)
         normalized = (grouped * rms_statistics(grouped, 1e-5)[1]).reshape(gated.shape)
         expected = (normalized * weight if scale_wide
