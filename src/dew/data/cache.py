@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import collections
 import json
 import logging
 import os
@@ -25,7 +24,7 @@ import numpy as np
 
 from dew._builds import dew_cache_dir
 from dew._records import integer
-from dew.data.concurrent import Concurrently, Pool, Running
+from dew.data.concurrent import Concurrently, Pool
 from dew.data.dataset import Loading, Ranges
 from dew.data.declared import Declared
 from dew.data.generation import (
@@ -1002,8 +1001,9 @@ class _CachedIter(grain.IterDataset):
 
 class _CachedIterator(grain.DatasetIterator):
     """A shard's records through its cache: a fill's writes, or a generation's replay. A fill whose cached
-    steps declare a thread pool (`pool`) runs them on it over that many records at once, read ahead in
-    order, each written as its turn comes (`_ahead`); a replay runs no step, so reads none ahead."""
+    steps declare a thread pool (`pool`) runs them on it through the one in-order window
+    (`dew.data.concurrent.Concurrently`), each record beside its place (`_Placed`), each written as its turn
+    comes; a replay runs no step."""
 
     def __init__(
         self,
@@ -1021,12 +1021,9 @@ class _CachedIterator(grain.DatasetIterator):
         self.ordinal: int | None = 0
         """Its records' place in the shard, the key of each; None once a transparent read resumed, whose
         saved position holds no place, so the rest of its shard is computed and kept nowhere."""
-        self.ahead: collections.deque[tuple[Mapping[str, object], Record, Future[Outputs]]] = (
-            collections.deque())
-        """A pooled fill's records read ahead, each beside the position before it and its steps' outputs
-        in the making."""
-        self.running: Running[tuple[int, Record], Outputs] | None = None
-        self.ended = False
+        self.placed: _Placed | None = None
+        self.made: grain.DatasetIterator | None = None
+        """A pooled fill's window over its records beside their places, made as the fill first reads."""
 
     def __next__(self):
         # The writer opens with the first record, so building the iterator reads no storage: Grain
@@ -1036,75 +1033,53 @@ class _CachedIterator(grain.DatasetIterator):
         if self.writer is None:
             self.writer = self.opens() if self.ordinal is not None else _Computed()
         ordinal = 0 if self.ordinal is None else self.ordinal
-        if self.pool is not None and self.transform is not None and isinstance(self.writer, _Writer):
-            value, made = self._ahead(self.pool, self.transform, ordinal)
-        else:
-            try:
+        made: Transform | None = self.transform
+        try:
+            if self.pool is not None and self.transform is not None and isinstance(self.writer, _Writer):
+                if self.made is None:
+                    self.placed = _Placed(self.parent, ordinal)
+                    self.made = Concurrently.over(self.placed, _Kept(_Passthrough(self.transform)), self.pool)
+                value, outputs = next(self.made)
+                made = _Made(outputs)
+            else:
                 value = next(self.parent)
-            except StopIteration:
-                self.writer.finish()
-                raise
-            made = self.transform
+        except StopIteration:
+            self.writer.finish()
+            raise
         outputs = self.writer.process((self.shard.id, ordinal), ordinal, value, made)
         value = _projected(outputs, self.transform)
         if self.ordinal is not None:
             self.ordinal += 1
         return value
 
-    def _ahead(self, pool: Pool, transform: Transform, ordinal: int) -> tuple[Record, Transform]:
-        """The next record of a pooled fill and the outputs its steps made, as a transform handing them
-        on (`_Made`): up to the pool's size read ahead, each one's steps run on it, in order."""
-        while not self.ended and len(self.ahead) < pool.size:
-            before = self.parent.get_state()
-            try:
-                value = next(self.parent)
-            except StopIteration:
-                self.ended = True
-                break
-            if self.running is None:
-                self.running = pool.running(_Applied(_Passthrough(transform)))
-            self.ahead.append((before, value, self.running.submit((ordinal + len(self.ahead), value))))
-        if not self.ahead:
-            self._stopped()
-            assert self.writer is not None
-            self.writer.finish()
-            raise StopIteration
-        _, value, made = self.ahead[0]
-        outputs = made.result()
-        self.ahead.popleft()
-        return value, _Made(outputs)
-
-    def _stopped(self) -> None:
-        if self.running is not None:
-            self.running.stop()
-            self.running = None
-
     def get_state(self) -> Mapping[str, object]:
-        # Before the oldest record read ahead and not yet handed on, so a restore reads those again.
-        parent = self.ahead[0][0] if self.ahead else self.parent.get_state()
+        # A pooled fill's position is before the oldest record its window read and has not handed on.
+        parent = (self.parent if self.made is None else self.made).get_state()
         if self.transparent:
             return parent
         return {"parent": parent, "ordinal": self.ordinal}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        # The records read ahead are read again from the restored position; their outputs are dropped.
-        self.ahead.clear()
-        self.ended = False
         if self.transparent:
-            self.parent.set_state(state)
-            self.ordinal = None
+            self._restored(state, None)
             return
         ordinal = integer(state.get("ordinal"), "cached shard ordinal")
         parent = state.get("parent")
         if ordinal < 0 or not isinstance(parent, Mapping):
             raise ValueError("invalid cached shard iterator state")
-        self.parent.set_state(parent)
+        self._restored(parent, ordinal)
+
+    def _restored(self, parent: Mapping[str, object], ordinal: int | None) -> None:
+        # A pooled fill's window drops what it read ahead and reads on from the restored record's place.
+        if self.made is None or self.placed is None:
+            self.parent.set_state(parent)
+        else:
+            self.made.set_state(parent)
+            self.placed.place = 0 if ordinal is None else ordinal
         self.ordinal = ordinal
 
     def close(self) -> None:
-        self._stopped()
-        self.ahead.clear()
-        self.parent.close()
+        (self.parent if self.made is None else self.made).close()
         if self.writer is None:
             return
         if self.shard.rows is not None and self.ordinal == self.shard.rows:
@@ -1115,10 +1090,44 @@ class _CachedIterator(grain.DatasetIterator):
             self.writer.close()
 
 
+class _Placed(grain.DatasetIterator):
+    """A shard's records each beside its place, from `place` on, as a pooled fill's window reads them
+    (`_CachedIterator`); its position is its parent's, its place set by its owner on a restore."""
+
+    def __init__(self, parent: grain.DatasetIterator, place: int):
+        super().__init__(parent)
+        self.rows, self.place = parent, place
+
+    def __next__(self) -> tuple[int, Record]:
+        value = next(self.rows)
+        self.place += 1
+        return self.place - 1, value
+
+    def get_state(self) -> Mapping[str, object]:
+        return self.rows.get_state()
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self.rows.set_state(state)
+
+    def close(self) -> None:
+        self.rows.close()
+
+
+@dataclass(frozen=True)
+class _Kept:
+    """A record's cached steps run beside its place, the record kept beside their outputs, which the fill
+    writes in its turn (`_CachedIterator`)."""
+
+    transform: _Passthrough
+
+    def __call__(self, placed: tuple[int, Record]) -> tuple[Record, Outputs]:
+        return placed[1], self.transform(*placed)
+
+
 @dataclass(frozen=True)
 class _Made:
-    """A record's outputs its steps made already, on a fill's pool (`_CachedIterator._ahead`), as the
-    transform a writer runs on it."""
+    """A record's outputs its steps made already, on a fill's pool (`_CachedIterator`), as the transform a
+    writer runs on it."""
 
     outputs: Outputs
 

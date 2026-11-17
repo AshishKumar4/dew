@@ -169,6 +169,13 @@ class Concurrently[Element, Result](grain.IterDataset):
     def __iter__(self) -> grain.DatasetIterator:
         return _ConcurrentIterator(self._rows.__iter__(), self._step, self._pool)
 
+    @staticmethod
+    def over[Over, Made](rows: grain.DatasetIterator, step: Callable[[Over], Made],
+                         pool: Pool) -> grain.DatasetIterator:
+        """The window over an iterator already open (`rows`): a cache's fill runs its steps through it as
+        it reads its shard (`dew.data.cache._CachedIterator`)."""
+        return _ConcurrentIterator(rows, step, pool)
+
 
 class _ConcurrentIterator[Element, Result](grain.DatasetIterator):
     """Reads up to the pool's size of records ahead, each running on the pool: a bounded queue, which
