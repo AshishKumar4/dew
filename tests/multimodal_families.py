@@ -2,6 +2,7 @@
 (tools/multimodal_reference.py, a Torch-only environment) read one declaration."""
 
 FAMILIES = {
+    "gemma3": ("gemma3-native-tiny", "gemma3-native-tiny"),
     "gemma4": ("gemma4-native-tiny", "gemma4-native-tiny"),
     "qwen35": ("qwen35-native-tiny", "qwen35-native-tiny"),
     "llama4": ("llama4-native-tiny", "llama4-native-tiny"),
@@ -12,10 +13,18 @@ FAMILIES = {
 """Each family's directory of references under tests/fixtures/hf, beside their float64 truths
 (tools/multimodal_reference.py float64), and the checkpoint they were written from."""
 
+PROCESSOR_OPTIONS = {"gemma3": {"backend": "pil"}}
+"""The options each family's reference processor loads under, its source fixtures'
+(tools/multimodal_reference.py) and its drawn site's worker's (tools/multimodal_worker.py) alike: gemma3's
+image processor PIL's, whose pixels a torchvision one's differ from (a drawn site's truth recomputed on PIL
+pixels against a recording made on torchvision's: its sketch 0.733 away). Dew's own processor loads gemma3
+under PIL's too (`dew.interop.processors`), library code no test tool imports; the drawn site holds the two
+alike, its recorded truth recomputed on Dew's pixels."""
+
 OUTPUTS = ("logits", "loss", "pixel_gradient", "updated_logits")
 """The leaves a family's numerics give: its valid logits, its summed next-token loss, its pixel gradient
 and its logits after one SGD step of every parameter (tools/multimodal_reference.py's `numerics`)."""
-DRAWN = frozenset({"llama4"})
+DRAWN = frozenset({"gemma3", "llama4"})
 """The families on check 1 over drawn images and audio, every leaf of theirs (`OUTPUTS`) resolved and
 recorded as their site (`multimodal-<family>`, tools/multimodal_worker.py); the others hold their leaves
 on their source draw until each resolves."""

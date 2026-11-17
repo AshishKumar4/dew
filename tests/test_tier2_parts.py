@@ -310,41 +310,50 @@ def test_a_part_whose_code_differs_is_not_assembled(tmp_path):
 
 _LOADED = """
 import sys
+from pathlib import Path
 from dew.interop import Pretrained
-try:
-    Pretrained.load(sys.argv[1], subfolder=sys.argv[2] or None, dtype="float32", attention_impl="reference",
-                    trust_remote_code=True)
-except ValueError:
-    print("refused")
-else:
-    print("loaded")
+for source, subfolder in zip(sys.argv[2::2], sys.argv[3::2], strict=True):
+    try:
+        Pretrained.load(source, subfolder=subfolder or None, dtype="float32", attention_impl="reference",
+                        trust_remote_code=True)
+    except ValueError:
+        outcome = "refused"
+    else:
+        outcome = "loaded"
+    print("load", outcome, len(list(Path(sys.argv[1]).glob("*/mapping.json"))))
 """
-"""A load of the source `argv[1]` names, at the folder `argv[2]` selects, running its own code: its
-outcome printed, `loaded` or `refused` (the verification's refusal, a ValueError); any other failure
-fails the process."""
+"""Loads of the sources `argv[2::2]` name, each at the folder its next argument selects, in turn,
+running their own code: each one's outcome printed, `loaded` or `refused` (the verification's refusal, a
+ValueError), beside how many verifications the directory `argv[1]` then records; any other failure fails
+the process."""
 
 
-def _offline_load(root, source, subfolder: str = "") -> str:
-    """A load of `source` (at `subfolder`) in a process of its own, offline over the Hub cache at
-    `root`/hub with Dew's cache at `root`/cache: its outcome, `loaded` or `refused` (`_LOADED`)."""
+def _offline_loads(root, *loads: tuple[object, str]) -> list[tuple[str, int]]:
+    """Loads of each `(source, subfolder)` of `loads` in turn, in one process of their own, offline over the
+    Hub cache at `root`/hub with Dew's cache at `root`/cache: each one's outcome, `loaded` or `refused`,
+    and the verifications Dew's cache records after it (`_LOADED`)."""
     import os
     import subprocess
     import sys
 
     env = {**os.environ, "HF_HUB_CACHE": str(root / "hub"), "HF_HUB_OFFLINE": "1",
            "XDG_CACHE_HOME": str(root / "cache"), "JAX_PLATFORMS": "cpu"}
-    run = subprocess.run([sys.executable, "-c", _LOADED, str(source), subfolder], capture_output=True,
+    arguments = [str(each) for load in loads for each in load]
+    counted = root / "cache" / "dew" / "verified"
+    run = subprocess.run([sys.executable, "-c", _LOADED, str(counted), *arguments], capture_output=True,
                          text=True, env=env)
     assert run.returncode == 0, run.stderr[-2000:]
-    return run.stdout.split()[-1]
+    return [(outcome, int(count)) for kind, outcome, count in
+            (line.split() for line in run.stdout.splitlines() if line.startswith("load "))]
 
 
 def test_a_verification_of_remote_code_is_recorded_under_its_commit(tmp_path):
     """A passed verification of a repository's own code is recorded under the Hub commit the load
     fetched that code at, beside the config, transformers, torch and Dew it ran under, so the same code
     at another commit is verified and recorded again; a local directory's code, which no commit names,
-    is verified at each load and recorded under none. Each load runs offline over a Hub cache holding
-    the repository at a commit, in a process of its own."""
+    is verified at each load and recorded under none. The loads run offline over a Hub cache holding the
+    repository at two commits, in turn in one process of their own, each verification read from and
+    recorded in Dew's cache on disk."""
     from interop_support import hub_cache
 
     write_source(tmp_path / "repo", "renamed")
@@ -352,16 +361,8 @@ def test_a_verification_of_remote_code_is_recorded_under_its_commit(tmp_path):
     repos = [f"dew/renamed-{index}" for index in range(2)]
     for index, repo in enumerate(repos):
         hub_cache(tmp_path / "hub", repo, tmp_path / "repo", commit=f"{index}" * 40)
-    verified = tmp_path / "cache" / "dew" / "verified"
-
-    def load(source) -> None:
-        assert _offline_load(tmp_path, source) == "loaded"
-
-    load(tmp_path / "repo")
-    assert not list(verified.glob("*/mapping.json"))
-    for count, repo in enumerate(repos, 1):
-        load(repo)
-        assert len(list(verified.glob("*/mapping.json"))) == count
+    loads = [(tmp_path / "repo", ""), *((repo, "") for repo in repos)]
+    assert _offline_loads(tmp_path, *loads) == [("loaded", 0), ("loaded", 1), ("loaded", 2)]
 
 
 def test_each_code_folder_at_one_commit_is_verified_on_its_own(tmp_path):
@@ -378,8 +379,8 @@ def test_each_code_folder_at_one_commit_is_verified_on_its_own(tmp_path):
                for folder in ("plain", "hooked")]
     assert configs[0] == configs[1]
     hub_cache(tmp_path / "hub", "dew/renamed", tmp_path / "repo")
-    assert _offline_load(tmp_path, "dew/renamed", "plain") == "loaded"
-    assert _offline_load(tmp_path, "dew/renamed", "hooked") == "refused"
+    assert _offline_loads(tmp_path, ("dew/renamed", "plain")) == [("loaded", 1)]
+    assert _offline_loads(tmp_path, ("dew/renamed", "hooked")) == [("refused", 1)]
 
 
 @pytest.mark.parametrize("name", sorted(SOURCES))

@@ -12,7 +12,7 @@ from test_decision_render import QWEN, SPECIALS, STATE, TEAM, URGENCY
 
 from dew.data.text import HFTokenizer
 from dew.decision import Choice
-from dew.decision.layout import Instructions, OptionLines, QuestionLayout, State, Text
+from dew.decision.layout import Instructions, OptionLines, SegmentLayout, State, Text
 from dew.decision.slot_source import SlotSource
 from dew.registry import from_record, to_record
 
@@ -24,10 +24,11 @@ def qwen() -> HFTokenizer:
     return HFTokenizer(str(QWEN), local_files_only=True)
 
 
-def layout_of(segments, *, unit="whole", max_len=None) -> QuestionLayout:
+def layout_of(segments, *, unit="whole", max_len=None) -> SegmentLayout:
     """The slot release's layout with `segments` for its own: its framing, labels and length."""
     base = release()
-    return QuestionLayout(max_len=base.max_len if max_len is None else max_len, labels=base.labels, unit=unit,
+    return SegmentLayout.state_first_row(max_len=base.max_len if max_len is None else max_len,
+                                         labels=base.labels, unit=unit,
                           framing=base.framing, segments=tuple(segments))
 
 
@@ -78,7 +79,7 @@ def test_a_training_read_writes_the_summary_a_server_writes_for_its_request(qwen
     served = layout.rows(qwen, SPECIALS, STATE, {"team": TEAM, "urgency": URGENCY})[0]
     assert list(trained["tokens"]) == list(served.tokens)
 
-def question_first(over: int) -> QuestionLayout:
+def question_first(over: int) -> SegmentLayout:
     """The question, the state, then the question once more where the state holds `over` tokens or more."""
     from dew.decision.layout import Again
 
@@ -113,7 +114,7 @@ CONVERSATION = [{"role": "user", "content": "I was charged twice."},
                 {"role": "user", "content": "The visa."}]
 
 
-def turned(**given) -> QuestionLayout:
+def turned(**given) -> SegmentLayout:
     from dew.decision.layout import Turns
 
     turns = Turns(open="<|{role}|>\n", close="\n", roles={"assistant": "bot"})
@@ -204,11 +205,11 @@ def test_the_new_segments_are_records_and_a_layout_without_them_records_none_of_
                         State(turns=Turns(roles={"assistant": "bot"}), values=Values(empty="(none)")),
                         instructions, options_text, dataclasses.replace(options, values=Values(indexed=3)),
                         Again(over=100), cue))
-    assert from_record(QuestionLayout, to_record(layout, QuestionLayout)) == layout
+    assert from_record(SegmentLayout, to_record(layout, SegmentLayout)) == layout
     def earlier(record):
         """`record` as a run saved before the new fields wrote it: none of them."""
         if isinstance(record, dict):
             return {key: earlier(value) for key, value in record.items() if key not in ("values", "turns")}
         return [earlier(value) for value in record] if isinstance(record, list) else record
 
-    assert from_record(QuestionLayout, earlier(to_record(release(), QuestionLayout))) == release()
+    assert from_record(SegmentLayout, earlier(to_record(release(), SegmentLayout))) == release()

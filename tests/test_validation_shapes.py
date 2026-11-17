@@ -14,12 +14,12 @@ from dew.data.compile import fitted
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, decisions
-from dew.decision.layout import Specials, StateFirstLayout
+from dew.decision.layout import SegmentLayout, Specials
 from dew.decision.scoring import Brier, LogLoss, RankedProbability, Spherical
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
-LAYOUT = StateFirstLayout(max_len=96)
+LAYOUT = SegmentLayout.state_first_row(max_len=96)
 
 
 def asked(options: int, count: int) -> list[dict]:

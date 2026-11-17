@@ -1730,7 +1730,7 @@ def _last_write(call: Call, keys: Operand, k_ref, row, final_token, key_columns,
 
     def key_rows(i):
         views = keys.vectors(k_ref, row + final_token, key_columns + i * call.block, call.block)
-        return functools.reduce(jnp.add, (family.rows_of(view).astype(jnp.float32) for view in views))
+        return product.whole([family.rows_of(view) for view in views])
 
     ends = family.iota(gated.shape, 0) == final_token
     return key_rows, columns(jnp.where(ends, gated, 0.0)), final_token

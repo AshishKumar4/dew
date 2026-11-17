@@ -1104,13 +1104,23 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments):
     return op.operands(shapes, 0), fill
 
 
+def _candidates(op: KernelOp, ba: tokamax.BoundArguments) -> list[Hashable]:
+    """The configs of `ba`'s launch (at its key's shapes) the tuner times (`_measured`): each of the op's
+    space the call takes (`KernelOp.pinnable`: one it refuses, measured, raised `Unpinnable` and ended the
+    run, row 5326, a Triton forward's 128 x 128 tile holding 320 registers a thread) and the GPU's assembler
+    does not refuse alone, as a run's derivation certifies a config (`report.certified`: it spills, or
+    serializes its warpgroup MMAs), all certified in one round; a config certification cannot compile alone
+    stays, its own compile the judge. Uncertified, a spilling config was timed, as slow as its spills, and
+    could be chosen."""
+    pinnable = [config for config in ba.autotuning_configs if op.pinnable(ba, op.completed(ba, config))]
+    refused = report.certified_together(op, ba, [op.completed(ba, config) for config in pinnable])
+    return [config for config, spilling in zip(pinnable, refused, strict=True) if not spilling]
+
+
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
-    """Every config of `ba`'s launch (at its key's shapes) the launch can take (`KernelOp.pinnable`), each
-    compiled on a thread and timed alone: the device time CUPTI reads for the launch's own
-    kernels (`dew.telemetry.benchmark.device_time`), each run behind an
-    eviction, so every config starts with its operands out of cache. A config of the op's space the call
-    refuses is no candidate: measured, its launch raised `Unpinnable` and ended the run (row 5326, a
-    Triton forward's 128 x 128 tile holding 320 registers a thread)."""
+    """Every candidate config of `ba`'s launch (`_candidates`), each compiled on a thread and timed alone: the
+    device time CUPTI reads for the launch's own kernels (`dew.telemetry.benchmark.device_time`), each run
+    behind an eviction, so every config starts with its operands out of cache."""
     from dew.telemetry.benchmark import CuptiHeld, NoKernels, behind, device_time, eviction
 
     arrays, fill = materialized(op, ba)
@@ -1124,9 +1134,9 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
             return configured(*args, **kwargs)
 
         start = time.perf_counter()
-        # A candidate's lowering and its compile timed apart, the compile of its config as it is: a config
-        # that spills is measured slow, never refused and lowered afresh (`OuterProgram.compiled`). The
-        # launch runs behind the flush, which reads the whole buffer through the cache.
+        # A candidate's lowering and its compile timed apart, the compile of its config as it is, never
+        # refused and lowered afresh (`OuterProgram.compiled`). The launch runs behind the flush, which reads
+        # the whole buffer through the cache.
         # Without command buffers, which CUPTI does not read whole (`benchmark.Ungraphed`).
         lowered = owned_program(behind(launched), step=UNGRAPHED_OPTIONS).lower(flush, (arrays,))
         middle = time.perf_counter()
@@ -1135,7 +1145,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
 
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     read = {}
-    configs = [config for config in ba.autotuning_configs if op.pinnable(ba, op.completed(ba, config))]
+    configs = _candidates(op, ba)
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
         futures = {config: pool.submit(compiled, config) for config in configs}
     # CUPTI reads every run, the flush's own first. It takes one subscriber, so
@@ -1261,21 +1271,29 @@ def _store(device_kind: str, picks) -> None:
 
 
 _VERDICTS: dict[str, dict[str, _records.JSON]] = {}
-"""Each GPU model's certification verdicts this process read from its picks' store or stored there
+"""Each GPU model's certification verdicts this process read from its store or stored there
 (`stored_verdict`), by launch key, as the store holds them (`encoded`)."""
+
+
+def _verdicts_path(device_kind: str) -> str:
+    """The store of the certification verdicts of GPUs of `device_kind`, beside their picks
+    (`kernel_picks_path`): verdicts alone, each by what decides its compile (`report._verdict_key`), where
+    the picks are measured timings. A model's own (row 6717: an H100 and a GH200, which assemble alike,
+    share none until the ptxas each runs is known, row 7309)."""
+    return _cache.kernel_picks_path(f"certified {device_kind}")
 
 
 def stored_verdict(device_kind: str, key: str) -> Rebuilt | None:
     """Certification's verdict of the launch `key` names on GPUs of `device_kind` (`report.certified`), an
-    accepted config's or a refused one's, as stored in the picks' store (`_store`'s file,
-    `kernel_picks_path`) and rebuilt (`decoded`), read once a process; none where the process keeps no picks,
-    none is stored, or this checkout cannot rebuild it (`Unreadable`: it certifies again)."""
+    accepted config's or a refused one's, as stored (`_verdicts_path`) and rebuilt (`decoded`), read once a
+    process; none where the process keeps no picks, none is stored, or this checkout cannot rebuild it
+    (`Unreadable`: it certifies again)."""
     if not _cache.keeps_picks():
         return None
     with _LOADING:
         if device_kind not in _VERDICTS:
             _VERDICTS[device_kind] = {entry["certified"]: entry["verdict"]
-                                      for entry in _stored(_cache.kernel_picks_path(device_kind))
+                                      for entry in _stored(_verdicts_path(device_kind))
                                       if isinstance(entry, dict) and "certified" in entry}
         found = _VERDICTS[device_kind].get(key)
     try:
@@ -1287,13 +1305,12 @@ def stored_verdict(device_kind: str, key: str) -> Rebuilt | None:
 
 
 def store_verdict(device_kind: str, key: str, verdict: dict[str, tuple[str, report.Binary]]) -> None:
-    """`verdict` stored for the launch `key` names on GPUs of `device_kind` in the picks' store, as the picks
-    are (`encoded`), one writer at a time, the file replaced whole (`_store`, whose picks keep a verdict as an
-    entry they do not read), where the process keeps picks."""
+    """`verdict` stored for the launch `key` names on GPUs of `device_kind` (`_verdicts_path`), as the picks
+    are (`encoded`), one writer at a time, the file replaced whole, where the process keeps picks."""
     if not _cache.keeps_picks():
         return
     written = encoded(verdict)
-    path = _cache.kernel_picks_path(device_kind)
+    path = _verdicts_path(device_kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with filelock.FileLock(path + '.lock'):
         kept = [entry for entry in _stored(path)

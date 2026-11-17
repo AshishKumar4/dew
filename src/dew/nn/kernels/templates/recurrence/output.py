@@ -67,9 +67,7 @@ def _gated_queries(call: Call, refs: tuple, row, h, scale: float, staged) -> Non
 
     def read(operand, ref, column):
         tiles = [family.tile_of(view) for view in operand.views(ref, row, chunk, column, call.block)]
-        if len(tiles) == 1:
-            return tiles[0]
-        return functools.reduce(jnp.add, (tile.astype(jnp.float32) for tile in tiles))
+        return tiles[0] if len(tiles) == 1 else product.whole(tiles)
 
     for c, tile in enumerate(staged):
         column = c * call.block

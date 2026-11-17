@@ -1,4 +1,4 @@
-"""Decision rows in blocks (`QuestionLayout.blocks`, `Encoded.blocks`, `DecisionInputs.blocks`): a
+"""Decision rows in blocks (`SegmentLayout.blocks`, `Encoded.blocks`, `DecisionInputs.blocks`): a
 row's state and what precedes its question are block 0 and its question to the row's end block 1, as a
 published slot release's prefix and suffix are (serve.patch `block_ids`, `token_layout`), the padding
 in no block (-1); the blocks ride a batch, a pass's widening and a packed window with their row; and a
@@ -18,10 +18,10 @@ from test_decision_render import CHOICE_PROMPT, QWEN, SPECIALS, STATE, TEAM, rel
 
 from dew.data.dataset import DataPartition
 from dew.data.text import HFTokenizer
-from dew.decision import Choice, DecisionObjective, MarkerLayout, StateFirstLayout
+from dew.decision import Choice, DecisionObjective
 from dew.decision.head import DecisionHead
 from dew.decision.inputs import DecisionInputs
-from dew.decision.layout import Instructions, Labels, State, Text
+from dew.decision.layout import Instructions, Labels, SegmentLayout, State, Text
 from dew.decision.model import DecisionModel
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import AttentionMixer
@@ -72,7 +72,7 @@ def test_a_question_first_row_in_blocks_reads_its_question_then_its_state(qwen):
 def test_a_state_first_row_in_blocks_asks_its_question_from_its_head():
     """A state-first row's block 1 starts at its question's head, after its state, and a batch of such
     rows pads its blocks with -1, as a pass's widening does."""
-    layout = StateFirstLayout(max_len=256, blocks=True)
+    layout = SegmentLayout.state_first_row(max_len=256, blocks=True)
     rows = [layout.rows(TOKENIZER, BYTE_SPECIALS, state, {"team": Choice("Which team?", ["a", "b"])})[0]
             for state in ("short", "a much longer state than the first")]
     for row in rows:
@@ -89,7 +89,7 @@ def test_a_state_first_row_in_blocks_asks_its_question_from_its_head():
 def test_a_packed_window_holds_each_rows_blocks_where_it_packed_the_row():
     """Packed into windows, each row's tokens keep exactly the blocks the row has alone, rows of
     unequal states sharing windows, and the window's padding is in none."""
-    layout = StateFirstLayout(max_len=256, blocks=True)
+    layout = SegmentLayout.state_first_row(max_len=256, blocks=True)
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
                                   specials=BYTE_SPECIALS, layout=layout, shuffle_options=False)
     alone = {row.tokens: row.blocks for example in EXAMPLES
@@ -111,8 +111,8 @@ def test_a_packed_window_holds_each_rows_blocks_where_it_packed_the_row():
 def test_a_row_encoded_alone_is_split_as_its_layouts_rows_are():
     """A layout in blocks splits a row it encodes directly (`encode`) as its `rows` do, labelled rows
     too."""
-    for layout in (StateFirstLayout(max_len=256, blocks=True),
-                   StateFirstLayout(max_len=256, blocks=True, labels=Labels(variants=("{}",)))):
+    for layout in (SegmentLayout.state_first_row(max_len=256, blocks=True),
+                   SegmentLayout.state_first_row(max_len=256, blocks=True, labels=Labels(variants=("{}",)))):
         question = Choice("Which team?", ["a", "b"])
         state = layout.state(TOKENIZER, BYTE_SPECIALS, "some state")
         direct = layout.encode(TOKENIZER, BYTE_SPECIALS, question, state, name="team")
@@ -123,7 +123,7 @@ def test_a_row_encoded_alone_is_split_as_its_layouts_rows_are():
 def test_a_marker_row_in_blocks_reads_its_question_and_state_as_one_block():
     """A marker row asks its question before its state: its first block is what precedes the question
     (its begin token, or nothing), and the question, its options and the state are the second."""
-    layout = MarkerLayout(max_len=256, blocks=True)
+    layout = SegmentLayout.marker_row(max_len=256, blocks=True)
     [row] = layout.rows(TOKENIZER, BYTE_SPECIALS, "some state", {"team": Choice("Which team?", ["a", "b"])})
     start = row.questions[0].span[0]
     assert row.blocks == (0,) * start + (1,) * (len(row.tokens) - start)
@@ -152,7 +152,7 @@ def test_parallel_options_take_no_blocks():
     """Parallel options set what each token reads with a mask of their own, which block visibility
     does not compose with: a parallel layout refuses blocks."""
     with pytest.raises(ValueError):
-        StateFirstLayout(max_len=256, blocks=True, parallel=True)
+        SegmentLayout.state_first_row(max_len=256, blocks=True, parallel=True)
 
 
 def blocked_backbone(*, blocks: bool) -> CausalTransformer:
@@ -166,7 +166,7 @@ def test_a_decision_model_reads_its_rows_blocks_through_its_backbone():
     """A model over a backbone that reads blocks hands each row's blocks to it (`block_groups`): its
     states are the backbone's own over the row's blocks, exactly; a state token then reads the state's
     later tokens, which it does not under a backbone that reads none, nor in a row read in order."""
-    layout = StateFirstLayout(max_len=256, blocks=True)
+    layout = SegmentLayout.state_first_row(max_len=256, blocks=True)
     question = {"team": Choice("Which team?", ["a", "b"])}
     rows = [layout.rows(TOKENIZER, BYTE_SPECIALS, state, question)[0] for state in ("state one", "state two")]
     inputs = [DecisionInputs.collate([row], BYTE_SPECIALS.pad) for row in rows]

@@ -36,9 +36,10 @@ from .layout import (
     Instructions,
     Labels,
     OptionLines,
-    QuestionLayout,
+    SegmentLayout,
     State,
     Text,
+    per_question,
 )
 from .model import DecisionModel
 from .release import released_decision, released_length
@@ -225,7 +226,7 @@ class SlotSource(SourceKind):
         if mode is None or fields.get("untied", False):
             raise ValueError("the slot format holds its tied label readout or its slot-and-pointer head")
         layout = bundle.layout
-        if not isinstance(layout, QuestionLayout) or layout.labels is None:
+        if not per_question(layout) or layout.labels is None:
             raise ValueError("the slot format needs its whole-question layout")
         ids = _records.listed(fields["label_ids"], "label_ids", read=lambda value, _: value,
                              what="a list of label ids")
@@ -251,13 +252,13 @@ class SlotSource(SourceKind):
 
     @staticmethod
     def stated(bundle: PretrainedDecision
-               ) -> tuple[QuestionLayout | None, int, Calibration | None] | Unwritable:
+               ) -> tuple[SegmentLayout | None, int, Calibration | None] | Unwritable:
         """What the slot release states beside its files: its window, which the readout's prompt takes
         (`describe`), the layout whole where it is another than that prompt, and the calibration where the
         task has one; why it holds no task of `bundle`'s where its engine reads no row of its tokenizer's
         (`slot_names`)."""
         layout = bundle.layout
-        assert isinstance(layout, QuestionLayout) and layout.labels is not None
+        assert per_question(layout) and layout.labels is not None
         fields = _records.record(_records.record(bundle.head.record(), "head")["fields"], "head.fields")
         count = len(_records.listed(fields["label_ids"], "label_ids", read=lambda value, _: value,
                                     what="a list of label ids"))
@@ -287,9 +288,9 @@ class SlotSource(SourceKind):
     @staticmethod
     def layout(*, max_len: int = SLOT_WINDOW, keep: Literal["start", "end", "all"] = "all",
                labels: Labels = _LABELS,
-               blocks: bool = False) -> QuestionLayout:
+               blocks: bool = False) -> SegmentLayout:
         """The release's whole-prompt encoding with thinking disabled and its question last."""
-        return QuestionLayout(
+        return SegmentLayout.state_first_row(
             max_len=max_len, labels=labels, unit="whole", blocks=blocks,
             framing=Framing(system=SLOT_SYSTEM, prefill="", thinking=False),
             segments=(Text("<state>\n"), State(render="state", keep=keep), Text("\n</state>\n\n"),
@@ -342,7 +343,7 @@ class SlotSource(SourceKind):
         # calibration it states whole over that, whose labels the readout reads.
         layout, calibration = released_decision(
             directory, SlotSource.layout(max_len=released_length(directory, SLOT_WINDOW), labels=labels,
-                                         blocks=blocks), Calibration(), kind=QuestionLayout)
+                                         blocks=blocks), Calibration(), joint=False)
         read = layout.labels or labels
         _one_variant(mode, read)
         ids = read.ids(tokenizer, min(count, read.capacity(tokenizer)))

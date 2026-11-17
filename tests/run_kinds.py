@@ -28,7 +28,7 @@ from dew.data.pipeline import Rejected
 from dew.data.sources.tokens import TokenFiles
 from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig, Letters
-from dew.decision.layout import Labels, QuestionSegment, built_in
+from dew.decision.layout import Labels, QuestionSegment, built_in, per_question
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
 from dew.registry import ModelConfig
@@ -220,7 +220,7 @@ def prefixed(root: Path, drawn: bool) -> RunConfig:
 def state_then_question() -> tuple[QuestionSegment, ...]:
     """The built-in question row's segments (`built_in`) with the state first and the question's header
     straight after it, no separator between, so a state's last word and the header's first abut: a row
-    whose unit (`QuestionLayout.unit`) its tokens show."""
+    whose unit (`SegmentLayout.unit`) its tokens show."""
     begin, header, separator, lines, _, state, end = built_in(None, "question_first")
     return begin, state, header, separator, lines, end
 
@@ -349,7 +349,6 @@ def requested(task) -> object:
     generation's budget of two tokens, its answers: a decision's with a context beside its state where its
     backbone reads one."""
     from dew.decision import Choice
-    from dew.decision.layout import QuestionLayout
     from dew.decision.task import Decide
     from dew.inference.images import TextToImage
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
@@ -364,7 +363,7 @@ def requested(task) -> object:
         # source's vocabulary (diffusion-gemma-sft's 32).
         return task([[4, 5, 6, 7]], max_new_tokens=2, key=0)
     if isinstance(task, Decide):
-        # Options described, as a user's are, so a row's writing of them (`QuestionLayout.option_text`) shows.
+        # Options described, as a user's are, so a row's writing of them (`SegmentLayout.option_text`) shows.
         question = {"team": Choice("which team", {"billing": "invoices and charges",
                                                   "technical": "the site and the app",
                                                   "sales": "plans and prices"})}
@@ -372,7 +371,7 @@ def requested(task) -> object:
         # unless its layout reads the question there (`spans_in_context`), which reads no other.
         reads = task.context_length is not None and not task.layout.spans_in_context
         context = {"plan": "enterprise"} if reads else None
-        if isinstance(task.layout, QuestionLayout) and task.layout.shares:
+        if per_question(task.layout) and task.layout.shares:
             # Two questions, which a row over one state asks together, each reading the state once.
             question = {**question,
                         "urgent": Choice("how urgent", {"now": "blocks work", "later": "can wait"})}

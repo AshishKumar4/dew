@@ -117,8 +117,13 @@ and an fcmp), an erf XLA's own rational polynomial (xla/codegen/intrinsic/erf.cc
 expm1 CUDA's expm1f, whose fp32 SASS issues FMAs alone, no MUFU (sm80, probe FS-LIBM2: ten FFMAs and three
 FADDs, where an expf issues a MUFU.EX2)."""
 
-_REDUCTIONS = frozenset({lax.reduce_max_p, lax.reduce_min_p, lax.reduce_sum_p})
-"""Reductions, one operation an input element."""
+_REDUCTIONS = frozenset({lax.reduce_max_p, lax.reduce_min_p, lax.reduce_sum_p, lax.reduce_prod_p,
+                         lax.reduce_and_p, lax.reduce_or_p, lax.reduce_xor_p})
+"""Reductions of one operation an input element: an extreme, a sum or a product, and the bitwise and, or and
+xor (a mask's all, any and parity), so a producer's row value of any of them is priced (a fused region's
+prologue sides, `fused_gemm._split`). An extreme's index (argmax, argmin) carries its index beside each
+step's value, a compare and two selects as lowered: no rule here, its count its lowering's when a kernel
+reaches one."""
 
 APPROXIMATED = frozenset({lax.exp_p, lax.exp2_p, lax.log_p, lax.log2_p, lax.log1p_p, lax.tanh_p,
                           lax.logistic_p, lax.sin_p, lax.cos_p, lax.sqrt_p, lax.rsqrt_p, lax.pow_p})
@@ -143,11 +148,14 @@ _FREE = frozenset({
     gpu.wait_load_tmem_p, gpu.wgmma_accumulator_deref_p, gpu.wgmma_accumulator_store_p, gpu.load_p,
     gpu.store_p, state.swap_p, gpu.async_load_tmem_p, gpu.async_store_tmem_p, state.get_p,
     pallas.program_id_p, tpu.dma_wait_p, gpu.wait_gmem_to_smem_p, pjit.reshard_p, lax.gather_p,
-    lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p})
+    lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p, lax.split_p,
+    lax.stack_p, lax.tile_p, lax.unstack_p})
 """What moves no data between memories and computes nothing a unit's rate prices: synchronization, layouts,
-indices, a value's elements rearranged among a role's registers (a gather's, a slice's, a concatenation's),
-and its reads and writes between its registers and its scoped refs, which its products' operands and its
-copies count."""
+indices, a value's elements rearranged among a role's registers (a gather's, a slice's, a concatenation's;
+every layout move the Pallas fuser tiles: a dynamic slice and its update, whose index arithmetic is scalar,
+which nothing counts, a split, a stack, a tile and an unstack, so a fused prologue's stage holds no
+operation the counter cannot price, `fused_gemm._split`), and its reads and writes between its registers
+and its scoped refs, which its products' operands and its copies count."""
 
 _PRODUCTS = frozenset({gpu.wgmma_ref_p, gpu.tcgen05_mma_p})
 """Tensor-core products whose operands' shapes their transforms state (`_product`)."""
