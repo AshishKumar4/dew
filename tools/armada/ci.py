@@ -2255,9 +2255,8 @@ def raised(record: dict[str, float], held: list[dict], marked: dict) -> dict[str
         for node, seconds in timed:
             if session.site_name(node, marked) in marked:
                 continue
-            if node in record and seconds > record[node]:
-                taken[node] = round(seconds, 3)
-            elif node not in record and stopped and node in finished:
+            grew = node in record and seconds > record[node]
+            if grew or (node not in record and stopped and node in finished):
                 taken[node] = round(seconds, 3)
     return taken
 
