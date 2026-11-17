@@ -15,6 +15,7 @@ from pathlib import Path
 import lane_environment
 import apart_records
 import check1_wire
+import tier_wire
 
 # The lane's environment, before JAX reads it.
 os.environ.update(lane_environment.configured(os.environ))
@@ -255,7 +256,7 @@ def pytest_runtest_setup(item):
         # other in the lane's; both select a file's tests alike, so the tier cuts its groups alike.
         pytest.skip("runs in the lane's process" if users else "runs in a process that computes as a user's "
                     f"does ({lane_environment.USERS_ARITHMETIC}=1)")
-    if os.environ.get("DEW_TIER_PREPARE") == "1":
+    if os.environ.get(tier_wire.PREPARE) == "1":
         # A GPU part's prepare, on its node's CPU (tests/model_flows.py): a flow prepares there; every other
         # test of the part, a GPU's or not, has nothing to prepare and runs in the part's run.
         if item.get_closest_marker("prepares") is None:

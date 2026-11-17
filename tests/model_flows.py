@@ -34,6 +34,7 @@ from gpu_flow import Cell, run_cells
 from map_judge import site_id
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact
+from tier_wire import PREPARE, TRUTHS, UNIT, needs_file
 from truths_ahead import compiled_memory, compiled_truths
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -42,12 +43,6 @@ from dew.nn.kernels import generation
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
-PREPARE = "DEW_TIER_PREPARE"
-"""Set to 1, a flow prepares rather than runs (`preparing`): on the node's CPU, before its GPU run."""
-
-TRUTHS = "DEW_TIER_TRUTHS"
-"""The directory a part's prepare writes its flows' programs and their truths' to and its run reads them
-from."""
 
 PARAMS = "params.pickle"
 """The file of a flow's store holding the parameters its prepare drew (`Flow.params`)."""
@@ -538,11 +533,6 @@ NEED = "need.json"
 by which the GPU tier admits a part's worker to a slot (`dew.training.memory.admitted` of each)."""
 
 
-UNIT = "DEW_TIER_UNIT"
-"""The name the GPU tier runs a prepare's unit under (a file, or `<file>#G/N` for a group), which its lane
-sets in the prepare's environment: its flows' needs are filed under it (`unit_needs`)."""
-
-
 def unit_needs(programs: list[dict[str, int]]) -> None:
     """`programs` (`need`'s) added to the needs of the tier's unit this prepare runs (`UNIT`), one file a
     unit under the tier's store (`TRUTHS`'s `needs/`), from which its lane sizes the unit's worker by Dew's
@@ -551,7 +541,7 @@ def unit_needs(programs: list[dict[str, int]]) -> None:
     unit = os.environ.get(UNIT)
     if unit is None:
         return
-    path = Path(os.environ[TRUTHS]) / "needs" / f"{hashlib.sha256(unit.encode()).hexdigest()[:16]}.json"
+    path = needs_file(Path(os.environ[TRUTHS]), unit)
     path.parent.mkdir(parents=True, exist_ok=True)
     held = json.loads(path.read_text())["programs"] if path.exists() else []
     path.write_text(json.dumps({"unit": unit, "programs": [*held, *programs]}))

@@ -2013,7 +2013,7 @@ def lane_units(python: str, tests: list[str], within: float | None = None) -> di
 
 PREPARES = "prepares"
 """The mark of a GPU test whose part's prepare runs it first, on the node's CPU (`gpu_prepared`)."""
-PREPARING = {"DEW_TIER_PREPARE": "1", "JAX_PLATFORMS": "cpu"}
+PREPARING = {gpu_measures.wire.PREPARE: "1", "JAX_PLATFORMS": "cpu"}
 """What a lane's prepare runs its files under: the word tests/conftest.py reads to skip every test but those
 marked `PREPARES`, each of which then prepares rather than runs (tests/model_flows.py), on the CPU alone."""
 
@@ -2061,7 +2061,8 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
             return 0
         return tested(python, [file], group, verdict, mine, "off", session.GRACE, "",
                       {**PREPARING, "OMP_NUM_THREADS": threads, **(VARIANTS[variant][1] if variant else {}),
-                       **asked_environment(asked), gpu_measures.UNIT: name}, recorded=False, variant=variant)
+                       **asked_environment(asked), gpu_measures.wire.UNIT: name},
+                      recorded=False, variant=variant)
 
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
         for done in [pool.submit(prepared, name, verdict) for name, verdict in verdicts.items()]:

@@ -1,7 +1,6 @@
 """CI's GPU lane (tools/armada/ci.py `gpu-lane`): each test file in a process of its own, admitted on the
 GPU memory its runs measured, and tools/armada/gpu_holds.py, what a lane needs to run a file."""
 
-import hashlib
 import itertools
 import json
 import os
@@ -11,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from armada_support import LANE_TEST, cached, fetcher, gpu_driver, gpu_lane_at, interpreter, loaded
+import tier_wire
 from tool_support import load
 
 
@@ -110,7 +110,7 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
     gpu_lane_at(tmp_path, monkeypatch, url, 0)
     interpreter(tmp_path, "3.12")
     fetched = fetcher(tmp_path)
-    monkeypatch.setenv("DEW_TIER_TRUTHS", str(tmp_path / "truths"))
+    monkeypatch.setenv(tier_wire.TRUTHS, str(tmp_path / "truths"))
     # The harness's side, as the suite's own conftest has it: a prepare skips every test but those it
     # prepares.
     (tmp_path / "tests/conftest.py").write_text(
@@ -118,16 +118,17 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         "def pytest_configure(config):\n"
         "    config.addinivalue_line('markers', 'prepares: prepared on the CPU before its GPU run')\n"
         "def pytest_runtest_setup(item):\n"
-        "    if os.environ.get('DEW_TIER_PREPARE') == '1' and item.get_closest_marker('prepares') is None:\n"
+        f"    if os.environ.get('{tier_wire.PREPARE}') == '1' and\\\n"
+        "            item.get_closest_marker('prepares') is None:\n"
         "        pytest.skip('nothing to prepare')\n")
     (tmp_path / "tests/test_flows.py").write_text(
         "import os, pytest\n"
         "def said(name):\n"
-        "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
+        f"    kind = 'prepared' if os.environ.get('{tier_wire.PREPARE}') == '1' else 'ran'\n"
         "    with open(f'{kind}.log', 'a') as log:\n"
         "        log.write(' '.join([name, os.environ.get('JAX_PLATFORMS', '-'),\n"
-        "                            os.environ.get('DEW_TIER_TRUTHS', '-'),\n"
-        "                            os.environ.get('DEW_TIER_UNIT', '-')]) + chr(10))\n"
+        f"                            os.environ.get('{tier_wire.TRUTHS}', '-'),\n"
+        f"                            os.environ.get('{tier_wire.UNIT}', '-')]) + chr(10))\n"
         + "".join(f"{'@pytest.mark.prepares' + chr(10) if index % 2 else ''}"
                   f"def test_{index}():\n    said('test_{index}')\n" for index in range(6)))
     (tmp_path / "tests/test_plain.py").write_text(LANE_TEST)
@@ -183,7 +184,7 @@ def test_a_lanes_files_ask_beside_their_reports_and_a_follow_up_hands_each_the_a
     (tmp_path / "tests/test_flows.py").write_text(
         "import json, os\n"
         "def test_flow():\n"
-        "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
+        f"    kind = 'prepared' if os.environ.get('{tier_wire.PREPARE}') == '1' else 'ran'\n"
         f"    with open(f'{{kind}}.log', 'a') as log:\n"
         f"        log.write(str(os.environ.get('{wire.ASKED}')) + chr(10))\n"
         f"    if kind == 'ran':\n"
@@ -290,13 +291,14 @@ def test_a_file_with_tests_for_a_users_process_runs_them_in_a_process_of_their_o
         "    users = os.environ.get('DEW_TEST_USERS_ARITHMETIC') == '1'\n"
         "    if users != (item.get_closest_marker('users_process') is not None):\n"
         "        pytest.skip('another process of the lane runs it')\n"
-        "    if os.environ.get('DEW_TIER_PREPARE') == '1' and item.get_closest_marker('prepares') is None:\n"
+        f"    if os.environ.get('{tier_wire.PREPARE}') == '1' and\\\n"
+        "            item.get_closest_marker('prepares') is None:\n"
         "        pytest.skip('nothing to prepare')\n")
     (tmp_path / "tests/test_flows.py").write_text(
         "import os, pytest\n"
         "from pathlib import Path\n"
         "def said(name):\n"
-        "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
+        f"    kind = 'prepared' if os.environ.get('{tier_wire.PREPARE}') == '1' else 'ran'\n"
         # A file a run of its own, written whole: nothing a later run reads, so no record's input.
         "    users = os.environ.get('DEW_TEST_USERS_ARITHMETIC', '0')\n"
         "    Path(f'flow-{kind}-{name}-{os.getpid()}').write_text(users)\n"
@@ -697,7 +699,7 @@ def test_a_tier_cut_group_is_admitted_on_the_most_its_file_held_and_no_need_is_c
 
 def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare_filed(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A lane unit whose prepare filed its programs' memory (`NEEDS`, under the tier's store, its prepare told
+    """A lane unit whose prepare filed its programs' memory (`tier_wire.needs_file`, its prepare told
     which unit it is by DEW_TIER_UNIT) is given no less than the least pool at which Dew's admission
     (dew.training.memory `needed`) takes the most demanding of them, beside what its runs measured: a part's
     float64 truths, which no run of it held, are admitted before they run (2026-11-17: two flows' 1.71 GiB
@@ -708,14 +710,19 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     (tmp_path / "tests/test_flow.py").write_text(LANE_TEST)
     interpreter(tmp_path, "3.12")
     fetcher(tmp_path)
-    # Dew's admission standing in, in the lane's environment as the real one runs: a program's least pool its
-    # resident and beside bytes and twice its temporaries, as a stranding allocator's.
-    monkeypatch.setattr(ci.gpu_measures, "NEEDED", "import json, sys\n"
-                        "units = json.load(sys.stdin)\n"
-                        "print(json.dumps({name: max(p['resident'] + p['beside'] + 2 * p['temporaries'] "
-                        "for p in programs) for name, programs in units.items()}))\n")
+    # Dew's admission standing in, in the checkout's src/ as the lane reads it, in Dew's own units: `needed`
+    # the GPU's memory whose pool admits a program (its resident and beside bytes and twice its temporaries,
+    # as a stranding allocator's), `allocator_limit` the pool's share of a GPU's memory, the lane's half.
+    share = "float(__import__('os').environ['XLA_PYTHON_CLIENT_MEM_FRACTION'])"
+    for module, source in (("__init__", ""), ("training/__init__", ""),
+                           ("_devices", f"def allocator_limit(memory):\n    return int(memory * {share})\n"),
+                           ("training/memory", "def needed(device, resident, beside, temporaries):\n"
+                                               "    return int((resident + beside + 2 * temporaries)"
+                                               f" / {share})\n")):
+        (tmp_path / "src" / "dew" / f"{module}.py").parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "src" / "dew" / f"{module}.py").write_text(source)
     truths = tmp_path / "truths"
-    monkeypatch.setenv("DEW_TIER_TRUTHS", str(truths))
+    monkeypatch.setenv(tier_wire.TRUTHS, str(truths))
     gib, total = 2 ** 30, 81920 * 2 ** 20
 
     def measured() -> None:
@@ -727,10 +734,9 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
 
     def filed(*programs: tuple[int, int, int]) -> None:
         name = "tests/test_flow.py"
-        (truths / "needs").mkdir(parents=True, exist_ok=True)
         listed = [{"resident": r, "beside": b, "temporaries": m} for r, b, m in programs]
-        (truths / "needs" / f"{hashlib.sha256(name.encode()).hexdigest()[:16]}.json").write_text(
-            json.dumps({"unit": name, "programs": listed}))
+        tier_wire.needs_file(truths, name).parent.mkdir(parents=True, exist_ok=True)
+        tier_wire.needs_file(truths, name).write_text(json.dumps({"unit": name, "programs": listed}))
 
     def lane() -> tuple[float, dict]:
         measured()
