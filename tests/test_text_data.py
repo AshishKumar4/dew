@@ -1116,7 +1116,7 @@ def test_a_runs_held_tokenizer_file_linking_out_of_its_directory_is_refused(tmp_
     held = held_place(str(tmp_path / "run"), files)
     held.mkdir(parents=True)
     (held / HELD_FILES).write_text(json.dumps(files))
-    (held / "tokenizer.json").symlink_to(outside)
+    Path(held, "tokenizer.json").symlink_to(outside)
     with pytest.raises(ValueError):
         tokenizer_for("org/name", files=files, held=str(tmp_path / "run")).dependencies()
     assert not (tmp_path / "cache" / "dew" / "tokenizers").exists()
