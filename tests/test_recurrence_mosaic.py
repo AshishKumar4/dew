@@ -1567,16 +1567,10 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
     assert not mosaic_failures([record]), mosaic_failures([record])
 
 
-def _lost(kernel: dict) -> bool:
-    """Whether a compiled kernel's record (`kernel_compile`'s) is one a run's certification refuses: spilled,
-    or its warpgroup MMAs serialized (`report.Binary.refused`)."""
-    return bool(kernel.get("spilled")) or bool(report.SERIALIZED & set(kernel.get("losses", ())))
-
-
 def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:
     """The gate's cases of `group` on `target` (`compiled_cases`) and their records, compiled, then, for as
-    long as a required launch spills or serializes its warpgroup MMAs (`report.SERIALIZED`, which a run's
-    certification refuses, `report.Binary.refused`) at a config not refused before, its launch refused
+    long as a required launch spills or serializes its warpgroup MMAs (`report.refuses`, which a run's
+    certification reads too, `report.Binary.refused`) at a config not refused before, its launch refused
     (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps such a
     launch down through its derivation's configs (`report.settled`): a launch whose every config spills
     derives none and leaves the template. `refused` holds the calls the template's own model refuses (its
@@ -1590,7 +1584,8 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
     stepped: set = set()
     while True:
         spilling = {case.name: {kernel["kernel"] for kernel in record.get("kernels", ())
-                                if _lost(kernel) and kernel["kernel"] not in
+                                if report.refuses(kernel.get("spilled") or 0, kernel.get("losses", ()))
+                                and kernel["kernel"] not in
                                 refused_kernels(record, apart.get(case.name, set()))}
                     for case, record in zip(cases, found, strict=True) if case.required}
         # A case refused once at a config, and again at the config its derivation then gives (a launch's
