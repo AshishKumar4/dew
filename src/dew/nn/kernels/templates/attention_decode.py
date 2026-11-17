@@ -33,7 +33,7 @@ import jax.numpy as jnp
 from jax.extend import core as jaxpr_core
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, report
 from dew.nn.kernels.templates.attention import (
     Hooks,
     Initial,
@@ -200,18 +200,37 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
 def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
               target: generation.GpuTarget, table, sources, out_dtype, scales=None, splits: int = 1,
               chosen: Walk = WALKS["plain"], in_key: bool = False):
-    """The forward's derived config for a packed call's launch of the walk `chosen` names (`WALKS`) writing
-    `out_dtype` (the query's where None) over `splits` slices, at the key tile its walk streams at
-    (`MosaicForward.streaming`), with its op and bound arguments, the op its launch runs (`in_key` its
-    values' stream or the key's slot); None where none derives."""
+    """The forward's config for a packed call's launch of the walk `chosen` names (`WALKS`) writing
+    `out_dtype` (the query's where None) over `splits` slices, certified at the key tile its walk streams at
+    (`_certified_stream`), with its op and bound arguments, the op its launch runs (`in_key` its values'
+    stream or the key's slot); None where none derives or certification refuses every config."""
     op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
                                               out_dtype=out_dtype, masked=True, splits=splits, table=table,
                                               sources=sources, subtracted=True, scales=scales,
                                               scaled=chosen.scaled, bounded=chosen.bounded, in_key=in_key)
     ba = op.bind(*args, residuals=Kept.OUTPUT if out_dtype is not None else Kept.NONE, interpret=False)
-    config = op.derived(ba, target)
-    # A decode step's few rows a key head stream its keys (`MosaicForward.streaming`).
-    return None if config is None else (op.streaming(ba, config, target), op, ba)
+    config = _certified_stream(op, ba, target)
+    return None if config is None else (config, op, ba)
+
+
+def _certified_stream(op: attention_mosaic.MosaicForward, ba, target: generation.GpuTarget
+                      ) -> attention_mosaic.Tiles | None:
+    """The config a decode launch of `ba` runs, which its plan pins: the forward's own as certification holds
+    it (`taken`: a pin, a tuned pick, else the first derived config whose kernels hold), at the key tile a
+    decode step's few rows a key head stream at (`MosaicForward.streaming`), that tile's kernels certified in
+    turn: one that spills is refused (`report.refuse_launch`, which `streaming`'s legality reads), so the walk
+    streams at its next tile, else at the certified config itself. None where certification refuses every
+    config. A pinned raw proposal compiled uncertified (row 7259)."""
+    config = op.taken(ba)
+    if not isinstance(config, attention_mosaic.Tiles):
+        return None
+    seen = set()
+    while (streamed := op.streaming(ba, config, target)) != config and streamed not in seen:
+        seen.add(streamed)
+        if not (spilling := report.certified(op, ba, streamed)):
+            return streamed
+        report.refuse_launch(op, ba, streamed, {binary.kernel for binary in spilling})
+    return config
 
 
 def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | None) -> algebra.Forward:

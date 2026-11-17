@@ -20,7 +20,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Splash's training step on a v5e is not finite in its value gradient. [7226]
 - Splash in float16 does not compile on a v5e. [7227]
 - JAX's paged decode at width 64 does not lower on a v5e. [7228]
-- The template decode pins its derived config uncertified. [7259]
 - A first sm80 accurate-form attention backward with a bias pays 3-4 minutes of certification compiles before its route falls back to another mainloop. [7279]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
@@ -79,7 +78,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Training and parallelism
 
 - Time to first step: the compile path's re-derivations. [5556]
-- QK-Clip under optax.apply_every. [7262]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5361]
 - XLA:CPU edges. [1591]
@@ -100,8 +98,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
-- The in-context memory reads no forks. [6969]
-- One statement answered two questions. [7273]
 
 ## Algebra
 

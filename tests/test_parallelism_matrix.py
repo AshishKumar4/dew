@@ -43,6 +43,7 @@ them."""
 
 import jax
 import pytest
+from map_judge import marked_seeds
 from tool_support import load
 
 CELLS: dict[str, tuple[str, ...]] = {
@@ -158,11 +159,6 @@ def test_each_layout_of_a_model_matches_one_device_or_is_refused(model, layout, 
     """Each layout's first step on par with one device's over its model's SEEDS draws (check 1), its FLOPs
     an even split, or refused for the reason REFUSED gives."""
     assert_matches_one_device(model, layout, devices, references, SEEDS[model])
-
-
-def marked_seeds(request) -> int:
-    """The seeds a sharded cell declares: its test's `check1_shards` mark's, which CI's plan reads."""
-    return request.node.get_closest_marker("check1_shards").kwargs["seeds"]
 
 
 @pytest.mark.mesh(devices=8)

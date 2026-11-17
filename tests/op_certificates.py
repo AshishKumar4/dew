@@ -32,6 +32,7 @@ float64, and every float64 sum of magnitudes widened by its own worst-case error
 import contextlib
 import dataclasses
 import fractions
+import functools
 import math
 
 import ml_dtypes
@@ -236,8 +237,10 @@ def grid_index(x) -> np.ndarray:
     return np.where(np.signbit(np.asarray(x, np.float64)), -bits, bits)
 
 
+@functools.cache
 def gamma(terms: int, fmt: Format) -> float:
-    """γ(k) = ku/(1-ku), rounded up to a float64, or inf where ku ≥ 1."""
+    """γ(k) = ku/(1-ku), rounded up to a float64, or inf where ku ≥ 1: a function of its two arguments,
+    computed once each (exact rationals cost a check-2 walk a twentieth of its time a call)."""
     product = terms * fractions.Fraction(fmt.unit_roundoff)
     if product >= 1:
         return math.inf

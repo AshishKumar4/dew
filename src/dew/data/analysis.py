@@ -1171,11 +1171,12 @@ def _checked(
                 raise ValueError(f"cache prefix in {name} must hold deterministic record steps and views of "
                                  f"the inputs: {refused}")
             declared = [_identity(step).name for step in prefix
-                        if isinstance(step, (Map, FlatMap)) and step.pool is not None]
+                        if isinstance(step, (Map, FlatMap)) and step.pool == "processes"]
             if declared:
-                raise ValueError(f"cache prefix in {name} holds {declared} on pools of their own, and a "
+                raise ValueError(f"cache prefix in {name} holds {declared} on processes of their own, and a "
                                  "cache fills in its reading process, writing each input as its steps make "
-                                 "it; declare the pool after the cache, or no pool")
+                                 "it; declare the pool after the cache, or run them on threads "
+                                 "(pool='threads')")
         laid = laid or (read == "memory" and cuts((stage,)) and examples_bound((*ran, *prefix)) is not None)
         if (isinstance(stage, Shuffle) and stage.window is None and stage.streamed is None and not indexed
                 and not promotion and not laid):

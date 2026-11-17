@@ -15,9 +15,10 @@ records the derived order facts a resume checks.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import ClassVar
 
 import grain.python as pygrain
@@ -26,7 +27,7 @@ import numpy as np
 from dew._records import record
 from dew.batch import Batch
 from dew.data.analysis import _analyzed, _identity, _label, _name, written
-from dew.data.concurrent import ordered
+from dew.data.concurrent import Concurrently, Pool
 from dew.data.dataset import Ranges, Records
 from dew.data.facts import largest_bounds
 from dew.data.handoff import pool_of
@@ -177,7 +178,7 @@ def _memory_inputs(
             pooled = prefix.pool
             # A stage on a pool of its own among the cached steps fills that many inputs at once.
             filling = ((cached.record(index) for index in range(len(cached))) if pooled is None
-                       else ordered(pooled, cached.record, range(len(cached))))
+                       else _on_pool(pooled, cached.record, range(len(cached))))
             for index, outputs in enumerate(filling):
                 if not isinstance(outputs, tuple):
                     raise TypeError("cached input must return its tuple of expansion outputs")
@@ -202,6 +203,16 @@ def _memory_inputs(
                 identifier = source.identifiers[index] if isinstance(source, _Memory) else (index,)
                 rows.append((identifier, value))
     return rows, consumed
+
+
+def _on_pool[Element, Result](pool: Pool, step: Callable[[Element], Result], elements: Sequence[Element]
+                              ) -> Iterator[Result]:
+    """`step` over each of `elements` on `pool`, as a stream's stage runs it (`Concurrently`): at most the
+    pool's size in flight, each result handed on in the elements' order, the pool stopped once they are
+    handed on or the reading stops."""
+    with contextlib.closing(iter(Concurrently(pygrain.MapDataset.source(elements).to_iter_dataset(), step,
+                                              pool))) as made:
+        yield from made
 
 
 @dataclasses.dataclass(frozen=True)
@@ -275,9 +286,9 @@ def _memory_stages(
             expanded: list[tuple[tuple[int, ...], Record]] = []
             pool = pool_of((stage,))
             # A stage with a pool of its own runs that many records at once, handed on in their order as
-            # each is made (`ordered`).
+            # each is made (`_on_pool`).
             made = ((_outputs(stage, identifier[0], value, counts=counter) for identifier, value in rows)
-                    if pool is None else ordered(pool, _Fetched(stage), rows))
+                    if pool is None else _on_pool(pool, _Fetched(stage), rows))
             for (identifier, _), outputs in zip(rows, made, strict=True):
                 for child, output in enumerate(outputs):
                     if isinstance(output, Rejected):

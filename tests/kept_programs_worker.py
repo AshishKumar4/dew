@@ -1,15 +1,12 @@
 """A process that keeps the executables of the programs it compiles, or runs them handed
-(tests/test_compile_ahead.py): `python kept_programs_worker.py keep|take|verify|differences <file> <scale>
-<offset>`. The programs' functions and their static argument's class are `kept_module`'s, a module the
-test writes beside the file and puts on the path, so its source is a module's outside any installed
-distribution. Prints, as JSON, each program's answer with what was kept and refused, the traces and
-compiles the calls needed, the refusal a handing raised, or what the file's records hold otherwise than
-this process."""
+(tests/test_kept_programs.py): `python kept_programs_worker.py keep|take <file> <scale> <offset>`. The
+programs' functions and their static argument's class are `kept_module`'s, a module the test writes beside
+the file and puts on the path, so its source is a module's outside any installed distribution. Prints, as
+JSON, each program's answer with what was kept and refused, or the programs the calls compiled."""
 
 import json
 import sys
 
-import jax
 import jax.numpy as jnp
 import kept_module
 import numpy as np
@@ -17,7 +14,7 @@ import numpy as np
 from dew.nn.kernels.options import owned_program
 from dew.nn.sharding import measured_links
 from dew.telemetry.compiles import Compiles
-from dew.training.ahead import AheadPrograms, BuildTarget, NotTheKeptProgram, keeping, kept
+from dew.training.ahead import keeping, kept
 
 mode, path, scale, offset = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 values = jnp.arange(12, dtype=jnp.float32).reshape(3, 4)
@@ -31,6 +28,7 @@ applied = owned_program(kept_module.applied, static_argnums=(0,))
 chosen = owned_program(kept_module.chosen, static_argnums=(0,))
 # Two functions of one line and one code but for a constant.
 one, two = owned_program(lambda held: held + 1), owned_program(lambda held: held + 2)
+OURS = {"scaled", "shifted", "helped", "nested", "applied", "chosen", "<lambda>"}
 
 
 def answered() -> dict:
@@ -45,37 +43,24 @@ def answered() -> dict:
     return {name: np.asarray(answer).tolist() for name, answer in answers.items()}
 
 
-if mode == "differences":
-    programs = AheadPrograms.load(path)
-    assert programs.process is not None
-    here = BuildTarget.of(jax.devices())
-    found = {"target": [line.split()[0] for line in programs.target.differences(here)],
-             "process": sorted(programs.process.differences())}
-elif mode == "keep":
+if mode == "keep":
     with keeping() as programs:
         answers = answered()
-        # A function that reads an array outside its arguments has no identity a file can state, and
-        # neither has a call inside one of Dew's own contexts.
+        # A function that reads an array outside its arguments: the array a constant of its program.
         def outside():
             return values * 2
 
         owned_program(outside)()
+        # A call inside one of Dew's own contexts, kept by the program it lowers to as any other.
         with measured_links({}):
             scaled(kept_module.Scale(scale + 100), values)
     saved = programs.save(path)
-    # The functions of the calls that have no identity, by the names a refusal states them by.
-    unidentified = sorted(f"{function.__module__}.{function.__qualname__}"
-                          for function in (outside, kept_module.scaled))
-    found = {"answers": answers, "kept": len(saved.kept), "refused": sorted(programs.refused),
-             "reasons": programs.refused, "cpu": saved.target.cpu, "unidentified": unidentified}
+    found = {"answers": answers, "kept": len(saved.kept), "refused": programs.refused,
+             "cpu": saved.target.cpu}
 else:
-    try:
-        with kept(path, verify=mode == "verify"), Compiles(None) as compiles:
-            answers = answered()
-        ours = {"scaled", "shifted", "helped", "nested", "applied", "chosen", "<lambda>"}
-        found = {"answers": answers,
-                 "needed": sorted({program.name.removeprefix("jit(").removesuffix(")")
-                                   for program in compiles.programs} & ours)}
-    except NotTheKeptProgram as refusal:
-        found = {"refused": type(refusal).__name__}
+    with kept(path), Compiles(None) as compiles:
+        answers = answered()
+    found = {"answers": answers,
+             "compiled": sorted({program.name.removeprefix("jit(").removesuffix(")")
+                                 for program in compiles.programs if program.kind == "compiled"} & OURS)}
 print(json.dumps(found))

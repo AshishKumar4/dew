@@ -69,7 +69,8 @@ from dew.data.dataset import DataPartition, Loader, replayed
 from dew.data.preferences import pair_windows
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.data.text import ByteTokenizer
-from dew.decision import Choice, DecisionObjective, Example, MarkerLayout, Specials, StateFirstLayout
+from dew.decision import Choice, DecisionObjective, Example, Specials
+from dew.decision.layout import SegmentLayout
 from dew.diffusion import presets
 from dew.diffusion.discrete import MDLM
 from dew.inference.tasks import TextGeneration
@@ -698,7 +699,7 @@ def decision(family: Family, directory: Path) -> None:
     bidirectional one. The saved run answers as a `Decide` task."""
     held = loaded(family)
     tokenizer, specials = vocabulary(held)
-    layout = (StateFirstLayout if CAUSAL in family.facts else MarkerLayout)(
+    layout = (SegmentLayout.state_first_row if CAUSAL in family.facts else SegmentLayout.marker_row)(
         max_len=48, head_max_len=32, option_tokens=4)
     # A backbone that reads one document a row (no packing) holds one row a window (`segments`).
     windows = {} if PACKING in family.facts else {"segments": 1}
