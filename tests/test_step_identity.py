@@ -5,6 +5,7 @@ resume holds where it declares no identity."""
 from __future__ import annotations
 
 import dataclasses
+import functools
 import importlib
 import json
 import os
@@ -531,6 +532,12 @@ GENERATED_AT = {"by": 1, "scale": 1, "over": 20, "value": 3, "slots": "", "span"
                 "takes_self": "False", "annotation": "int", "alias": "value"}
 
 
+def shifting_reader(generated, resume="exact"):
+    """A read of `ROWS` through the step of `generated`'s `Shifting`, resuming as `resume` says."""
+    pipeline = Pipeline(ROWS).map(generated.Shifting()).shuffle(0).repeat().batch(2)
+    return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
+
+
 @pytest.mark.parametrize(("edit", "assigned"), [
     ({"by": 20}, None), ({"scale": 30}, None), ({"over": 300}, None), ({"value": 55}, None),
     ({"value": 55, "slots": ", slots=True"}, None), ({"span": 200}, None), ({"mark": 500}, None),
@@ -574,9 +581,7 @@ def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factor
     monkeypatch.syspath_prepend(str(tmp_path))
     generated = importlib.import_module(module.stem)
 
-    def reader(resume="exact"):
-        pipeline = Pipeline(ROWS).map(generated.Shifting()).shuffle(0).repeat().batch(2)
-        return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
+    reader = functools.partial(shifting_reader, generated)
 
     state = saved_after_one(reader)
     assert resumed_changes(reader(), state) == ()
@@ -605,9 +610,7 @@ def test_an_exact_resume_refuses_a_step_whose_annotated_field_changed_its_generi
     monkeypatch.syspath_prepend(str(tmp_path))
     generated = importlib.import_module(module.stem)
 
-    def reader(resume="exact"):
-        pipeline = Pipeline(ROWS).map(generated.Shifting()).shuffle(0).repeat().batch(2)
-        return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
+    reader = functools.partial(shifting_reader, generated)
 
     state = saved_after_one(reader)
     assert resumed_changes(reader(), state) == ()
