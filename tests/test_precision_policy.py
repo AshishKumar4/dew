@@ -920,9 +920,12 @@ def test_a_weighted_total_rounds_once_and_keeps_excluded_values_out(axis):
                          ids=str)
 def test_dews_own_transcendentals_are_as_exact_as_jaxs_across_their_range(name, dtype, span):
     """`dew.nn.precision.softplus` (its log1p by its own series), `silu` (`x / (1 + e^-x)`, no logistic) and
-    `accurate_exp` (`e^x` and `2^x` by its own sum), each past the backend's own (row 7062), and their
+    `accurate_exp` as a TPU takes it (`e^x` and `2^x` by its own sum, traced for an assumed v5e), each past
+    the backend's own (row 7062), and their
     derivatives on par with JAX's from float64 on this backend over each span of their range, large negative
     to large positive and near zero, their input in fp32 and bf16 (check 1)."""
+    from contract_support import on_a_tpu
+
     from dew.nn import precision
 
     def draw(seed):
@@ -930,8 +933,8 @@ def test_dews_own_transcendentals_are_as_exact_as_jaxs_across_their_range(name, 
         return (jnp.asarray(x, dtype),)
 
     ours, theirs = {"softplus": (precision.softplus, jax.nn.softplus), "silu": (precision.silu, jax.nn.silu),
-                    "exp": (precision.accurate_exp, jnp.exp),
-                    "exp2": (functools.partial(precision.accurate_exp, base2=True), jnp.exp2)}[name]
+                    "exp": (on_a_tpu(precision.accurate_exp), jnp.exp),
+                    "exp2": (on_a_tpu(functools.partial(precision.accurate_exp, base2=True)), jnp.exp2)}[name]
     for part, mine, jaxs in (("value", ours, theirs),
                              ("slope", jax.vmap(jax.grad(ours)), jax.vmap(jax.grad(theirs)))):
         assert_as_exact(jax.jit(mine), jax.jit(jaxs), draw, f"{name}'s {part} {span} {dtype}", seeds=8)
