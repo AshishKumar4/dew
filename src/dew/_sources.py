@@ -227,6 +227,15 @@ class GeneratedField(NamedTuple):
     parts: tuple[tuple[str, Any], ...] = ()
 
 
+def instance_fields(held: type) -> list[GeneratedField]:
+    """The fields an instance of `held`, a generated class (`generated`), holds: those its nearest class in
+    its method resolution order that a generator made itself recorded (`generated_fields`), so a subclass
+    no generator decorated holds its base's (train 1013's review)."""
+    made = next((base for base in held.__mro__ if "__dataclass_fields__" in vars(base) or attrs_made(base)),
+                held)
+    return generated_fields(made)
+
+
 def decides(field: GeneratedField) -> bool:
     """Whether `field` takes part in its instances' equality, as its generator records it: a dataclass
     field's `compare`, an attrs field's `eq`. A field that declares it does not (`compare=False`,

@@ -3,7 +3,8 @@ each step declaring its identity or defined here, so an edit elsewhere in the te
 resumable: under the plan version before this Dew's, phases on their own streams, a bounded mixture laid out
 and shuffled, a shuffled chain through a configured step taken to a bound, streamed and read into memory,
 and a seeded mix of two named corpora; before the condition encoders moved to dew.interop (row 5996), phases
-and a mix whose steps depend on one (`Conditioned`)."""
+and a mix whose steps depend on one (`Conditioned`); under plan 15, which described a step without the fields
+its repr hides, a read and phases through such a step (`Remapped`)."""
 
 import dataclasses
 from collections.abc import Mapping
@@ -71,6 +72,32 @@ def taken(count: int = 20, factor: int = 2, read: str = "streamed"):
     return compile(chain, read=read, loading=READ)
 
 
+@dataclasses.dataclass(frozen=True)
+class Remapped:
+    """A configured record step: each id plus its entry in `table`, a table its repr hides, as a large
+    array is, which plan 15 described the step without."""
+
+    table: np.ndarray = dataclasses.field(repr=False)
+
+    def __call__(self, row):
+        return {**row, "id": row["id"] + self.table[np.asarray(row["id"]) % len(self.table)]}
+
+
+def hidden(read: str = "streamed", changed: bool = False):
+    """40 ids shuffled through a step whose table its repr hides (`Remapped`), in batches of two; with
+    `changed`, its table another."""
+    table = np.arange(8, dtype=np.int32) * (3 if changed else 1)
+    rows = Memory({"id": np.arange(1, 41, dtype=np.int32)}, shard_rows=4)
+    return compile(Pipeline(rows).shuffle(seed=3, window=8).map(Remapped(table)).repeat().batch(2), read=read,
+                   loading=READ)
+
+
+def hidden_phases():
+    """`step_phases` with the first phase's rows through a step whose table its repr hides (`Remapped`)."""
+    return compile(phases((source(1).map(Remapped(np.arange(8, dtype=np.int32))), 3), (source(2), None)),
+                   read="indexed", loading=READ)
+
+
 def named(name: str, tag: int) -> Pipeline:
     """A corpus of 16 ids named `name`, each the `tag`th corpus's, read on without end."""
     return Pipeline(Memory({"id": np.arange(tag * 100, tag * 100 + 16, dtype=np.int32)}, shard_rows=4),
@@ -114,5 +141,6 @@ SAVED = {"step_phases": (step_phases, 2), "step_phases_later": (step_phases, 5),
          "bounded_mixture_strided": (lambda: bounded_mixture("strided"), 2),
          "bounded_mixture_held": (lambda: bounded_mixture("held"), 3), "taken": (taken, 3),
          "taken_in_memory": (lambda: taken(read="memory"), 3), "mixture": (mixture, 3),
-         "conditioned_phases": (conditioned_phases, 5), "conditioned_mixture": (conditioned_mixture, 3)}
+         "conditioned_phases": (conditioned_phases, 5), "conditioned_mixture": (conditioned_mixture, 3),
+         "hidden": (hidden, 3), "hidden_phases": (hidden_phases, 5)}
 """Each saved position's loader and the steps read before it was saved."""

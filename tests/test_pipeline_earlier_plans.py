@@ -2,6 +2,7 @@
 read by this Dew as its own; and one of 7, which it reads none of."""
 
 import dataclasses
+import itertools
 import json
 from pathlib import Path
 
@@ -256,3 +257,29 @@ def test_a_position_saved_before_reached_code_is_refused_exact_and_read_on_relax
         assert _ids(relaxed, 2) == _read(loader(), steps, 2)
     finally:
         relaxed.close()
+
+
+SAVED_UNDER_15 = Path(__file__).with_name("fixtures") / "positions" / "main-72141706a"
+"""Positions main saved at 72141706a, under plan 15, which described a step without the fields its repr
+hides, of the chains `saved_positions_support` builds (`tools/positions_saved_by_main.py`): a read and
+phases through such a step (`Remapped`)."""
+
+
+@pytest.mark.parametrize("saved", ["hidden", "hidden_phases"])
+def test_a_position_saved_under_15_resumes_as_it_was_read(saved):
+    """A position main saved under plan 15 of a read, or phases (their finished phase named by its plan's
+    identity), through a step whose table its repr hides resumes in this Dew, which states that table
+    (plan 16), read by its plan as 15 described its steps (`Plan.under`), and reads what a read of the same
+    chain stopped where it stopped reads after it; the record of a run saved since plan 15 hit PlanChanged
+    on its steps (train 1013's review, F3)."""
+    from saved_positions_support import SAVED
+
+    loader, steps = SAVED[saved]
+    streams = [loader().train(DataPartition()) for _ in range(2)]
+    list(itertools.islice(streams[0], steps))
+    streams[1].set_state((SAVED_UNDER_15 / f"{saved}.position").read_bytes())
+    after = [[np.asarray(batch["id"]).tolist() for batch in itertools.islice(stream, 6)]
+             for stream in streams]
+    for stream in streams:
+        stream.close()
+    assert after[1] == after[0] and after[0]

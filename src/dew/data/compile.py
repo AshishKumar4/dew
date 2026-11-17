@@ -148,6 +148,7 @@ from dew.data.pipeline import (
     with_stores,
 )
 from dew.data.plan import (
+    DECIDED,
     DataResume,
     Plan,
     StepIdentity,
@@ -155,6 +156,7 @@ from dew.data.plan import (
     earlier_readers,
     fingerprint,
     identified,
+    rule_in_force,
     structured,
 )
 from dew.data.readers import GRAIN, Replayed, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
@@ -1131,25 +1133,32 @@ def _compiled(
     # The plan of this read, whole: its manifest, its facts, its members' digests, its caches and its rules.
     described = [stage for stage in written(tuple(_steps(original)))
                  if not isinstance(stage, (Workers, Prefetch))]
-    manifest = _manifest({"sources": [source.fingerprint() for source in sources]}, sources,
-                         (*map(_identity, described), *map(StepIdentity.of, host)))
-    members = _member_manifests(train, build, host)
-    plan = Plan(
-        "global" if global_order else "per-share",
-        manifest,
-        # A named chain's own key, which its shuffles draw by (`_own_key`), so a position saved under
-        # another name is refused, as another permutation of its records.
-        {"read": read, "seed": seed, **({"named": build.named} if _keys_shuffles(build) else {}),
-         **build.lowering.order},
-        _derived(train, build),
-        cache=_cache_references(original, read),
-        members={key: fingerprint(member) for key, member in members.items()},
-        rules=build.rules(train),
-        volatile=any(_volatile(stage) for stage in (*_steps(original), *(
-            stage for source in sources for stage in _written(source, ())))),
-        # The steps it describes read a saved plan's earlier descriptions of them (`ReadsEarlier`).
-        earlier=earlier_readers(described, host),
-    )
+    def planned() -> Plan:
+        """The plan, its steps described under the field rule in force (`dew.data.plan.described_under`),
+        which a position saved under an earlier version is compared with (`Plan.under`)."""
+        manifest = _manifest({"sources": [source.fingerprint() for source in sources]}, sources,
+                             (*map(_identity, described), *map(StepIdentity.of, host)))
+        members = _member_manifests(train, build, host)
+        return Plan(
+            "global" if global_order else "per-share",
+            manifest,
+            # A named chain's own key, which its shuffles draw by (`_own_key`), so a position saved under
+            # another name is refused, as another permutation of its records.
+            {"read": read, "seed": seed, **({"named": build.named} if _keys_shuffles(build) else {}),
+             **build.lowering.order},
+            _derived(train, build),
+            cache=_cache_references(original, read),
+            members={key: fingerprint(member) for key, member in members.items()},
+            rules=build.rules(train),
+            volatile=any(_volatile(stage) for stage in (*_steps(original), *(
+                stage for source in sources for stage in _written(source, ())))),
+            # The steps it describes read a saved plan's earlier descriptions of them (`ReadsEarlier`).
+            earlier=earlier_readers(described, host),
+            # Rebuilt under an earlier rule, it is that rule's plan and builds no other.
+            rebuilt=planned if rule_in_force() >= DECIDED else None,
+        )
+
+    plan = planned()
     tuned = build.tuned(train, batches=batches)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
     build = tuned.pooled(train)

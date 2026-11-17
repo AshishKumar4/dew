@@ -961,6 +961,11 @@ class AttrsRoute:
         return row
 
 
+class SubclassRemap(DataclassRemap):
+    # Subclassed without a decorator: its instances hold their base's fields.
+    pass
+
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class DataclassRoute:
     handlers: dict
@@ -973,7 +978,7 @@ def remap(kind, changed=False, note=""):
     table = np.arange(8)
     if changed:
         table[1] = -1
-    return {{"attrs": AttrsRemap, "dataclass": DataclassRemap}}[kind](table, note)
+    return {{"attrs": AttrsRemap, "dataclass": DataclassRemap, "subclass": SubclassRemap}}[kind](table, note)
 
 
 def route(kind):
@@ -993,13 +998,14 @@ def hidden(tmp_path, monkeypatch):
     return importlib.import_module(module.stem)
 
 
-@pytest.mark.parametrize("kind", ["attrs", "dataclass"])
+@pytest.mark.parametrize("kind", ["attrs", "dataclass", "subclass"])
 def test_an_exact_resume_refuses_a_steps_hidden_field_that_changed_and_holds_one_that_decides_nothing(
         hidden, kind):
     """A step is stated by every field that decides its equality: a table it hides from its repr
     (`repr=False`, as a large array is) and that changed refuses an exact resume, where it resumed and read
     other rows; a field that declares it decides no equality (`eq=False`, `compare=False`: a note,
-    credentials) changes nothing it reads, and the run resumes exactly (train 966's review, F3)."""
+    credentials) changes nothing it reads, and the run resumes exactly (train 966's review, F3); a subclass
+    no decorator made holds its base's fields, which state it too (train 1013's review, F2)."""
     def reader(**settings):
         pipeline = Pipeline(ROWS).map(hidden.remap(kind, **settings)).shuffle(0).repeat().batch(2)
         return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())

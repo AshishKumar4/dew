@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import hashlib
@@ -447,6 +449,46 @@ def structured(value) -> JSON:
     return _described(value)[0]
 
 
+_RULE: contextvars.ContextVar[int] = contextvars.ContextVar("dew.data.plan._RULE")
+"""The plan version whose field rule `structured` describes a generated instance by, where one is set: an
+earlier one's, as a plan rebuilt under it reads a position saved under it (`described_under`); this Dew's
+(`DECIDED`) otherwise."""
+
+
+@contextlib.contextmanager
+def described_under(version: int):
+    """Describe steps within as a plan of `version` described them (`_stated_fields`)."""
+    token = _RULE.set(version)
+    try:
+        yield
+    finally:
+        _RULE.reset(token)
+
+
+def rule_in_force() -> int:
+    """The plan version whose field rule describes steps now (`_RULE`, `described_under`)."""
+    return _RULE.get(DECIDED)
+
+
+def _stated_fields(value) -> list[str]:
+    """The fields of `value`, a generated class's instance, its description states, by the rule of the
+    version it is described under (`_RULE`): since `DECIDED`, every field its instances hold
+    (`_sources.instance_fields`, a base's for an undecorated subclass) that decides their equality
+    (`_sources.decides`: all but `compare=False`, attrs' `eq=False`), an added one where set
+    (`dew._records.ADDED`); before, a dataclass's fields its repr shows or an added one set apart from its
+    default, an attrs class's own fields its repr shows."""
+    kind = type(value)
+    if rule_in_force() >= DECIDED:
+        return [field.name for field in _sources.instance_fields(kind)
+                if _sources.decides(field) and not (_added(field) and getattr(value, field.name, None)
+                                                    == field.default)]
+    if dataclasses.is_dataclass(value):
+        return [field.name for field in dataclasses.fields(value)
+                if field.repr or (field.metadata.get(ADDED) and getattr(value, field.name) != field.default)]
+    return [field.name for field in _sources.generated_fields(kind)
+            if dict(field.parts).get("repr", True) is not False]
+
+
 def _walked(value) -> bool:
     """Whether `_described` walks into `value`'s parts, where a part can lead back to it: a generated
     class's instance, a list, a tuple or a mapping."""
@@ -479,16 +521,11 @@ def _described(value, walking: tuple[int, ...] = ()) -> tuple[JSON, bool]:
             return met_again(value, walking), True
         walking = (*walking, id(value))
     if _sources.generated_instance(value):
-        # A dataclass's or an attrs class's instance, by its class and every field its generator records
-        # as deciding its equality (`_sources.decides`), an added one where set (`dew._records.ADDED`).
         kind = type(value)
         described: dict[str, JSON] = {"class": f"{kind.__module__}.{kind.__qualname__}"}
         alone = True
-        for field in _sources.generated_fields(kind):
-            held = getattr(value, field.name, None)
-            if not _sources.decides(field) or (_added(field) and held == field.default):
-                continue
-            described[field.name], own = _described(held, walking)
+        for field in _stated_fields(value):
+            described[field], own = _described(getattr(value, field, None), walking)
             alone = alone and own
         return described, alone
     if isinstance(value, _Dependencies):
@@ -906,13 +943,20 @@ described in place (`described`), beside the step of its manifest that describes
 plans are refused."""
 
 REFERENCED = 15
-"""The plan version this Dew records: each step's configuration described once, by its structure
+"""A plan version this Dew reads too: each step's configuration described once, by its structure
 (`structured`), in its manifest, and each stage of its order held by the place of the step that describes
-it (`referenced`)."""
+it (`referenced`), a generated instance by the fields its repr shows. A plan rebuilt under its rule reads
+it (`Plan.under`)."""
 
-PLAN_VERSIONS = (STRUCTURED, REFERENCED)
+DECIDED = 16
+"""The plan version this Dew records: `REFERENCED`'s record, a generated instance described by every field
+that decides its equality, a base's of an undecorated subclass among them (`_stated_fields`), where 15
+omitted those its repr hides (a large table, a reader) and an undecorated subclass's."""
+
+PLAN_VERSIONS = (STRUCTURED, REFERENCED, DECIDED)
 """The versions this Dew reads a plan of, the latest the one every plan records and every read reads by
-(`read_by`): the current one and the one before it, whose record alone differs. A run saved under an earlier
+(`read_by`): the current one and those before it, whose records differ, read by a plan rebuilt under their
+field rule (`Plan.under`). A run saved under an earlier
 version resumes with the Dew that wrote it, or goes on from its weights as a new run that reads its data
 afresh."""
 
@@ -982,6 +1026,18 @@ class Plan:
     earlier: tuple[Callable[[JSON], JSON], ...] = dataclasses.field(default=(), compare=False, repr=False)
     """The readers of earlier descriptions its live steps hold (`earlier_readers`), which a saved plan it
     compares is read by (`_read_saved`); no part of what the plan records."""
+    rebuilt: Callable[[], Plan] | None = dataclasses.field(default=None, compare=False, repr=False)
+    """This plan built again from its live steps, which describes them under the field rule in force
+    (`described_under`): what a position saved under an earlier version is compared with (`under`)."""
+
+    def under(self, version: int) -> Plan:
+        """This plan as a plan of `version` described its steps (`described_under`, `rebuilt`), to be read
+        within that rule: itself where `version` is this Dew's (`DECIDED`) or it holds no rebuild (one
+        rebuilt under an earlier rule holds none, `rule_in_force`)."""
+        if version >= DECIDED or self.rebuilt is None:
+            return self
+        with described_under(version):
+            return self.rebuilt()
 
     def record(self) -> dict[str, JSON]:
         """The plan as a position holds it, its order's stages held by their steps' places in its manifest
@@ -1010,7 +1066,11 @@ class Plan:
         as its parts' digests (`parts`), so a pool that disagrees is shown
         which part differs. The order's sources are named by the manifest's
         content, not by their descriptions: hosts that mount one dataset at
-        different paths read the same records."""
+        different paths read the same records. Under an earlier field rule (`described_under`), the plan
+        as that rule describes it (`under`)."""
+        earlier = self.under(rule_in_force())
+        if earlier is not self:
+            return earlier.identity()
         order = unplaced(self.spelled_order())
         return f"{json.dumps(order, sort_keys=True)} under plan {json.dumps(self.parts(), sort_keys=True)}"
 
@@ -1043,14 +1103,19 @@ class Plan:
         whose code changed and that declares no identity (`Manifest.code`). The code and machine that wrote
         a position are the checkpoint step's (`running_environment`), warned of where they changed
         (`environment_changes`); a position of the previous format, which held them, has its changes
-        returned and warned of (row 5862)."""
-        current = self.record()
+        returned and warned of (row 5862). A position saved under an earlier version is compared with this
+        plan as that version described its steps (`under`)."""
         written = saved.get("version")
         if written not in PLAN_VERSIONS:
             raise PlanChanged(
                 ("version",),
                 f"the saved data position was written under data plan version {written!r}, and this Dew "
                 f"reads versions {', '.join(map(str, PLAN_VERSIONS))} alone: {_RESUMED}")
+        if written < DECIDED and self.rebuilt is not None:
+            earlier = self.under(written)
+            with described_under(written):
+                return earlier.check(saved, resume=resume)
+        current = self.record()
         # Its rules first, and what else differs beside them, named together (`PlanChanged.differs`).
         rules = None
         try:
