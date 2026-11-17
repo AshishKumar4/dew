@@ -19,8 +19,8 @@ from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
 from dew.decision.head import DecisionHead, Head
 from dew.decision.inputs import OPTION_TILE, DecisionInputs
-from dew.decision.layout import Bounds, Layout, Specials, default_layout, per_question
-from dew.decision.model import BackboneContext, DecisionModel
+from dew.decision.layout import Bounds, ContextReader, Layout, Specials, default_layout, per_question
+from dew.decision.model import BackboneContext, DecisionModel, encoded_width
 from dew.decision.questions import KINDS, Score
 from dew.decision.rows import (
     ConfigureLayout,
@@ -270,17 +270,23 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     def _encoder_flops(self, batch: Batch) -> float:
         """A configured context encoder's forward over each row's context (`DecisionModel.context`,
-        `ConditionEncoder.conditioning_flops`), as a diffusion run counts its conditions'; none where the
-        backbone encodes it, whose work `_context_flops` counts."""
+        `ConditionEncoder.conditioning_flops`), as a diffusion run counts its conditions': each document of
+        a packed window's context alone, at the encoder's width, as the model's read encodes it
+        (`dew.decision.model._apart`); none where the backbone encodes it, whose work `_context_flops`
+        counts."""
         condition = self.model.context_condition(self.spans_in_context)
         if "context" not in batch or isinstance(condition.encoder, BackboneContext):
             return 0.0
-        context, lengths = np.asarray(batch["context"]), np.asarray(batch["context_lengths"])
-        mask = (np.arange(context.shape[1])[None, :] < lengths[:, None]).astype(np.int32)
         if not isinstance(condition.encoder, CountedCondition):
             raise MissingFlopsCount(f"{type(condition.encoder).__name__} has no conditioning_flops(tokens)")
-        work = condition.encoder.conditioning_flops({"input_ids": context, "attention_mask": mask})
-        return float(work.flops)
+        segments = batch.get("context_segments")
+        lengths = (np.asarray(batch["context_lengths"]) if segments is None
+                   else np.concatenate([np.bincount(row)[1:] for row in np.asarray(segments)]))
+        lengths = lengths[lengths > 0]
+        width = encoded_width(condition.encoder)
+        mask = (np.arange(width)[None, :] < lengths[:, None]).astype(np.int32)
+        tokens = {"input_ids": np.zeros_like(mask), "attention_mask": mask}
+        return float(condition.encoder.conditioning_flops(tokens).flops)
 
     def _context_flops(self, model, batch: Batch) -> float:
         """The backbone's forward over each row's context, where it reads one in a pass of its own."""
@@ -420,7 +426,6 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             # one its rows are laid out by, which names them where the layout names none.
             head, labels = head.labelled(layout.labels, tokenizer)
             layout = dataclasses.replace(layout, labels=labels)
-        self.model = _decision_model(module, head, context_encoder)
         if layout is None:
             if not isinstance(module, TokenModel):
                 raise ValueError(
@@ -428,6 +433,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                     "order; pass layout= (SegmentLayout.state_first_row if it does, marker_row if not)"
                 )
             layout = default_layout(module.causal, head.one_question)
+        self.model = _decision_model(module, head, context_encoder, layout)
         # The layout as stated, and as a request's questions train over one copy of its state where the
         # backbone and head read each question as its own row (`shared_for`), in a training step's form:
         # the two a run reads its rows by, by its data plan's version (`layout`).
@@ -859,7 +865,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def _data(self, layout: Layout, bounds: Bounds) -> ObjectiveData:
         """`data` as `layout` lays rows out within `bounds`."""
         grouped = bool(self.consistency)
-        configured = None if self.model.context is None else self.model.context.encoder
+        configured = None if self.model.context is None else ContextReader(self.model.context.encoder)
         training = ConfigureLayout(layout, self.tokenizer, self.specials, self.shuffle_options,
                                    self.none_of_the_above, train=True, context_length=self.context_length,
                                    grouped=grouped, none_of_the_above_options=self.none_of_the_above_options,
@@ -951,13 +957,20 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         )
 
 
-def _decision_model(module: nn.Module, head: Head,
-                    context_encoder: ContextEncoder | ConditionEncoder | None) -> DecisionModel:
+def _decision_model(module: nn.Module, head: Head, context_encoder: ContextEncoder | ConditionEncoder | None,
+                    layout: Layout) -> DecisionModel:
     """The model over `module` and `head`: a configured context encoder is the context's condition
     (`DecisionModel.context`), the backbone's own encodings named by `context_encoder`, as a run records
-    them."""
+    them. A configured encoder beside a layout that reads its schema as the row's context is refused
+    (ValueError): such a row's context is the backbone's own pass over the schema and the context after
+    it, in the backbone's tokens, so the encoder would read nothing."""
     match context_encoder:
         case ConditionEncoder() as configured:
+            if layout.spans_in_context:
+                raise ValueError(f"the layout reads its schema as the row's context, which the backbone's "
+                                 f"own pass encodes, so a configured context encoder "
+                                 f"({type(configured).__name__}) would read nothing; configure one or "
+                                 "the other")
             return DecisionModel(module, head, "table", Condition(configured, field="context"))
         case _:
             return DecisionModel(module, head, context_encoder or "table")

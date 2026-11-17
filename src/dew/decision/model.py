@@ -11,7 +11,7 @@ from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
 from dew.decision.head import Head, answer_states
 from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import HOWS
-from dew.inputs.condition import BackboneCall, BackboneEncoder
+from dew.inputs.condition import BackboneCall, BackboneEncoder, ConditionEncoder
 from dew.inputs.spec import Condition, encode_conditions
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, ModelInputs
@@ -118,14 +118,14 @@ class DecisionModel(HeadedModel):
                     return encode_conditions((("context", encoder),), weights, held,
                                              path="DecisionModel")["context"].hidden
 
-                if inputs.context_segments is None:
-                    return {CONTEXT: encoded(inputs.context, inputs.context_lengths),
-                            CONTEXT_LENGTHS: inputs.context_lengths}
-                # A window's rows' contexts end to end, each encoded alone (`_apart`), as the backbone's
-                # pass reads each document alone.
-                states = _apart(encoded, inputs.context, inputs.context_segments, inputs.max_segments)
+                # Each row's context a document of its own, a window's rows' contexts end to end, each
+                # encoded alone at the encoder's own width (`_apart`), as the backbone's pass reads each
+                # document alone.
+                segments, documents = context_documents(inputs.context, inputs.context_lengths,
+                                                        inputs.context_segments, inputs.max_segments)
+                states = _apart(encoded, inputs.context, segments, documents, encoded_width(encoder))
                 return {CONTEXT: states, CONTEXT_LENGTHS: inputs.context_lengths,
-                        CONTEXT_SEGMENTS: inputs.context_segments}
+                        **({} if inputs.context_segments is None else {CONTEXT_SEGMENTS: segments})}
 
     def reads_progress(self) -> bool:
         """Whether its backbone's computation changes over a run (`dew.nn.progress.ReadsProgress`)."""
@@ -457,22 +457,45 @@ def _array(applied: object) -> jax.Array:
     return applied
 
 
+def context_documents(tokens: jax.Array, lengths: jax.Array, segments: jax.Array | None,
+                      documents: int) -> tuple[jax.Array, int]:
+    """Each context token's document (1 to `documents`, 0 none) and how many a row holds at most: a packed
+    window's own (`DecisionInputs.context_segments`), or each row's context one document of its
+    `lengths`."""
+    if segments is not None:
+        return segments, documents
+    return (jnp.arange(tokens.shape[1])[None, :] < lengths[:, None]).astype(jnp.int32), 1
+
+
+def document_lengths(segments: jax.Array, documents: int) -> jax.Array:
+    """Each row's documents' token counts `[B, documents]`, by `segments` (`context_documents`)."""
+    return jnp.sum(segments[:, :, None] == jnp.arange(1, documents + 1), axis=1)
+
+
+def encoded_width(encoder: ConditionEncoder) -> int:
+    """The tokens a configured context encoder reads a text at, its own tokenization's width, which a
+    document of a row's context is encoded at (`_apart`)."""
+    return len(encoder.tokenize([""])["input_ids"][0])
+
+
 def _apart(encoded: Callable[[jax.Array, jax.Array], jax.Array], tokens: jax.Array, segments: jax.Array,
-           documents: int) -> jax.Array:
-    """`encoded` (tokens `[N, C]` and lengths `[N]` to states `[N, C, F]`) over each of a window's packed
-    documents alone: the tokens of each document `segments` `[B, C]` names (1 to `documents`, 0 none) moved
-    to a row of their own, encoded, and their states moved back to where the tokens stood, zeros where none
-    does; so a configured encoder keeps a window's rows' contexts apart, as the backbone's pass does."""
-    batch, width = tokens.shape
+           documents: int, width: int) -> jax.Array:
+    """`encoded` (tokens `[N, width]` and lengths `[N]` to states `[N, width, F]`) over each document of a
+    window's context alone: the tokens of each document `segments` `[B, C]` names (1 to `documents`, 0
+    none) moved to a row of their own `width` long, encoded, and their states moved back to where the
+    tokens stood, zeros where none does; so a configured encoder keeps a window's rows' contexts apart, as
+    the backbone's pass does, each at its own width (a document is at most that long: the encoder's
+    tokenization kept no more of it, `dew.decision.layout.context_tokens`)."""
+    batch, columns = tokens.shape
     owned = segments[:, :, None] == jnp.arange(1, documents + 1)
     place = jnp.sum((jnp.cumsum(owned, axis=1) - 1) * owned, axis=-1)
     document = jnp.clip(segments - 1, 0, documents - 1)
-    rows = jnp.broadcast_to(jnp.arange(batch)[:, None], (batch, width))
+    rows = jnp.broadcast_to(jnp.arange(batch)[:, None], (batch, columns))
     # A token of no document is dropped (an index past the documents').
     target = jnp.where(segments > 0, document, documents)
     apart = jnp.zeros((batch, documents, width), tokens.dtype)
     apart = apart.at[rows, target, place].set(tokens, mode="drop")
-    states = encoded(apart.reshape(batch * documents, width),
-                     jnp.sum(owned, axis=1).reshape(batch * documents))
-    states = states.reshape(batch, documents, width, -1)[rows, document, place]
+    lengths = document_lengths(segments, documents).reshape(-1)
+    states = encoded(apart.reshape(batch * documents, width), lengths)
+    states = states.reshape(batch, documents, width, -1)[rows, document, jnp.minimum(place, width - 1)]
     return jnp.where((segments > 0)[:, :, None], states, 0).astype(states.dtype)

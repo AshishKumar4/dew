@@ -48,6 +48,7 @@ from dew.decision.laya import LAYA
 from dew.decision.layout import (
     QUESTION_FIELDS,
     Bounds,
+    ContextReader,
     Encoded,
     Laid,
     Layout,
@@ -78,7 +79,6 @@ from dew.inference.tasks import (
     shape_bucket,
     traced_in_its_form,
 )
-from dew.inputs.condition import ConditionEncoder
 from dew.inputs.spec import Condition
 from dew.interop.processors import Processor
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
@@ -497,8 +497,10 @@ class Decide(SavedRunTask, InItsForm):
     def released(cls, bundle: "PretrainedDecision", *, name: str | None = None) -> Self:
         """The declared decision task over the bundle's own tree, its projections as the model holds
         them: what a run trains from a release (`DecisionObjective`), where `of` packs them to serve."""
-        model = DecisionModel(bundle.model, bundle.head, bundle.context_encoder)
-        variables = joined({"backbone": bundle.variables, "head": bundle.head_variables})
+        model = DecisionModel(bundle.model, bundle.head, bundle.context_encoder, bundle.context)
+        # A run's configured context encoder's trained weights, as its bundle carries them bound.
+        context = {} if bundle.context is None else {"context": {"params": bundle.context.encoder.params}}
+        variables = joined({"backbone": bundle.variables, "head": bundle.head_variables, **context})
         # A release lays its rows out as it states them, sharing a state only where it says so.
         return cls(model, variables, bundle.layout, bundle.decision_tokenizer, bundle.specials,
                    bundle.calibration, name=name or str(bundle.origin or bundle.source),
@@ -817,7 +819,7 @@ class Decide(SavedRunTask, InItsForm):
             raise ValueError("one request reads its context in context=; contexts= is a batch's, each "
                              "request's own")
         if images:
-            return self._seen(state, questions, images, context, request=request)[0]
+            return _told(*self._seen(state, questions, images, context, request=request))
         return _told(*self._answered([self._encoded(state, questions, context=context, request=request)],
                                      [questions])[0])
 
@@ -1034,10 +1036,10 @@ class Decide(SavedRunTask, InItsForm):
         return self.model.context_length
 
     @property
-    def context_reader(self) -> "Tokenizer | ConditionEncoder":
+    def context_reader(self) -> "Tokenizer | ContextReader":
         """What a request's context is tokenized by (`dew.decision.layout.context_tokens`): the model's
         configured context encoder (`DecisionModel.context`), else its tokenizer."""
-        return self.tokenizer if self.model.context is None else self.model.context.encoder
+        return self.tokenizer if self.model.context is None else ContextReader(self.model.context.encoder)
 
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None,

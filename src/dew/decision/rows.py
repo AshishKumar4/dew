@@ -24,6 +24,7 @@ from dew.decision.layout import (
     OPTIONS,
     QUESTION_FIELDS,
     Bounds,
+    ContextReader,
     Encoded,
     Layout,
     QuestionField,
@@ -35,7 +36,6 @@ from dew.decision.layout import (
     with_context,
 )
 from dew.decision.questions import Choice, Question
-from dew.inputs.condition import ConditionEncoder
 
 NONE_OF_THE_ABOVE = "none of the above"
 
@@ -81,12 +81,12 @@ class Encoding(ReadsEarlierLayouts):
     consistency term's rows; every row then carries them, an example of none with none in each."""
     none_of_the_above_options: int = field(default=0, repr=False, metadata={ADDED: True})
     """The fewest options a choice holds to draw a "none of the above" (`draws_none`); 0, every choice."""
-    context_encoder: ConditionEncoder | None = field(default=None, repr=False, metadata={ADDED: True})
+    context_encoder: ContextReader | None = field(default=None, repr=False, metadata={ADDED: True})
     """The encoder a run configures for its context (`DecisionModel.context`), whose tokenization a row's
     context is read by (`context_reader`); None, the decision's tokenizer."""
 
     @property
-    def context_reader(self) -> "Tokenizer | ConditionEncoder":
+    def context_reader(self) -> Tokenizer | ContextReader:
         """What a row's context is tokenized by (`dew.decision.layout.context_tokens`)."""
         return self.tokenizer if self.context_encoder is None else self.context_encoder
 
@@ -407,13 +407,13 @@ class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
     (`options_alike` in its cut record), where training leaves it out (`Layout.refusal`)."""
     none_of_the_above_options: int = field(default=0, repr=False, metadata={ADDED: True})
     """The fewest options a choice holds to draw a "none of the above" (`Encoding`, `draws_none`)."""
-    context_encoder: ConditionEncoder | None = field(default=None, repr=False, metadata={ADDED: True})
+    context_encoder: ContextReader | None = field(default=None, repr=False, metadata={ADDED: True})
     """The encoder a run configures for its context, whose tokenization a row's context is read by
     (`Encoding.context_encoder`); None, the decision's tokenizer."""
     rejects = True
 
     @property
-    def context_reader(self) -> "Tokenizer | ConditionEncoder":
+    def context_reader(self) -> Tokenizer | ContextReader:
         """What a row's context is tokenized by (`dew.decision.layout.context_tokens`)."""
         return self.tokenizer if self.context_encoder is None else self.context_encoder
 
@@ -486,8 +486,8 @@ class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
             # Its context as its encoding lays it out, a context cut to its room counted with its cuts.
             laid = with_context(laid, self.context_reader, example.context, self.context_length)
         contexts = [len(row.context or ()) for row in laid]
-        lost = 0 if self.context_length is not None else len(
-            context_tokens(self.context_reader, example.context))
+        _, whole = context_tokens(self.context_reader, example.context)
+        lost = 0 if self.context_length is not None else whole
         if lost:
             # A backbone that reads no context leaves the example's unread, counted as a cut of it.
             unread["context"] = lost
@@ -613,7 +613,7 @@ class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
 
 def _with_none(layout: Layout, tokenizer: Tokenizer, specials: Specials, row: FittedRow, fewest: int,
                drop: bool, names: Collection[str] | None = None,
-               context_length: int | None = None, reader: "Tokenizer | ConditionEncoder | None" = None,
+               context_length: int | None = None, reader: Tokenizer | ContextReader | None = None,
                ) -> tuple[int, int]:
     """The tokens and context tokens `row` lays out to with a "none of the above" (`Encoding`) beside each
     of its answered choices' options that draws one (`draws_none`, `fewest`), or in place of its right
@@ -744,7 +744,7 @@ class ConfigureLayout(ReadsEarlierLayouts):
     grouped: bool = False
     none_of_the_above_options: int = field(default=0, repr=False, metadata={ADDED: True})
     """The fewest options a choice holds to draw a "none of the above" (`Encoding`)."""
-    context_encoder: ConditionEncoder | None = field(default=None, repr=False, metadata={ADDED: True})
+    context_encoder: ContextReader | None = field(default=None, repr=False, metadata={ADDED: True})
     """The encoder a run configures for its context (`Encoding.context_encoder`)."""
 
     def __call__(self, metadata: Mapping[str, object]) -> LayoutRows | EvaluateRows:

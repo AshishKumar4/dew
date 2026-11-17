@@ -320,24 +320,44 @@ def render(value: JSON) -> str:
             return json.dumps(value, ensure_ascii=False)
 
 
-def context_tokens(reader: "Tokenizer | ConditionEncoder", context: JSON | None) -> np.ndarray:
-    """A context's tokens, whole, as a row reads them: its text's (`render`) by the decision's tokenizer,
-    without specials, or by the encoder a run configures for its context (`DecisionModel.context`, a
-    `ConditionEncoder`), its own tokenization's real tokens; none for no context. A row keeps those its
-    cross-attention has room for (`with_context`)."""
-    from dew.inputs.condition import ConditionEncoder
+class ContextReader:
+    """A run's configured context encoder (`DecisionModel.context`) as a data step or a task reads a row's
+    context with it (`context_tokens`): its tokenization, and its count of a text's tokens before that cuts
+    them (`ConditionEncoder.token_counts`). Its identity, which a data plan states, is the encoder's
+    tokenization's (`ConditionEncoder.dependencies`), not its weights, so a plan neither hashes a tower nor
+    changes as it trains."""
 
+    def __init__(self, encoder: "ConditionEncoder"):
+        self.encoder = encoder
+
+    def dependencies(self) -> Mapping[str, object]:
+        return self.encoder.dependencies()
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, ContextReader) and self.dependencies() == other.dependencies()
+
+    def __hash__(self) -> int:
+        return hash(json.dumps(self.dependencies(), sort_keys=True, default=str))
+
+
+def context_tokens(reader: "Tokenizer | ContextReader", context: JSON | None) -> tuple[np.ndarray, int]:
+    """A context's tokens as a row reads them, and how many it is whole: its text's (`render`) by the
+    decision's tokenizer, without specials, all of them; or by a run's configured context encoder
+    (`ContextReader`), the tokens its tokenization keeps and its count before that cut them; none for no
+    context. A row keeps those its cross-attention has room for (`with_context`), the rest a cut."""
     if context is None:
-        return np.zeros(0, np.int32)
+        return np.zeros(0, np.int32), 0
     match reader:
-        case ConditionEncoder():
-            codes = reader.tokenize([render(context)])
-            return np.asarray(codes["input_ids"][0][np.asarray(codes["attention_mask"][0]) != 0], np.int32)
+        case ContextReader(encoder=encoder):
+            codes = encoder.tokenize([render(context)])
+            kept = np.asarray(codes["input_ids"][0][np.asarray(codes["attention_mask"][0]) != 0], np.int32)
+            return kept, int(encoder.token_counts([render(context)])[0])
         case _:
-            return np.asarray(rendered_chunks([Chunk(render(context))], reader, "pieces").tokens, np.int32)
+            tokens = np.asarray(rendered_chunks([Chunk(render(context))], reader, "pieces").tokens, np.int32)
+            return tokens, len(tokens)
 
 
-def with_context(rows: Sequence[Encoded], tokenizer: "Tokenizer | ConditionEncoder", context: JSON | None,
+def with_context(rows: Sequence[Encoded], tokenizer: "Tokenizer | ContextReader", context: JSON | None,
                  length: int | None) -> list[Encoded]:
     """`rows` with the context a backbone's cross-attention of `length` context tokens reads beside
     each (None: a backbone with none): a schema laid out as the rows' context (`Schema.stream`), read
@@ -351,7 +371,7 @@ def with_context(rows: Sequence[Encoded], tokenizer: "Tokenizer | ConditionEncod
         if length is None:
             raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
                              "layers to read it (Pretrained.with_cross_attention)")
-        given = context_tokens(tokenizer, context)
+        given, whole = context_tokens(tokenizer, context)
         beside = []
         for row in rows:
             if row.context is None:
@@ -362,17 +382,18 @@ def with_context(rows: Sequence[Encoded], tokenizer: "Tokenizer | ConditionEncod
             # The schema first, so its spans stand where it laid them; the context in the room it leaves.
             kept = given[:length - len(row.context)]
             beside.append(dataclasses.replace(row, context=(*row.context, *kept.tolist()),
-                                              context_cut=len(given) - len(kept), context_given=len(given)))
+                                              context_cut=whole - len(kept), context_given=whole))
         return beside
     if context is None:
         return list(rows)
     if length is None:
         raise ValueError("a request's context is read by a backbone's cross-attention, which this "
                          "backbone does not have")
-    given = context_tokens(tokenizer, context)
+    given, whole = context_tokens(tokenizer, context)
     kept = tuple(given[:length].tolist())
-    cut = len(given) - len(kept)
-    return [dataclasses.replace(row, context=kept, context_cut=cut, context_given=len(given)) for row in rows]
+    return [dataclasses.replace(row, context=kept, context_cut=whole - len(kept), context_given=whole)
+            for row in rows]
+
 
 def _conversation(state: JSON) -> bool:
     """Whether `state` is a conversation, a list of turns, which keeps its newest turns (Laya's agent)."""
