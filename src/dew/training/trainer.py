@@ -2101,10 +2101,13 @@ class Trainer(Generic[Loss, Effects]):
         stream (`check_stream`), a ramp's at each of its stages. The checkpoints learn why no record rebuilds
         a run of this trainer on the data it was `stated` (`Checkpoints.python_run`), and its checkpoints'
         declaration is built (`_artifact`), resolving the tokenizer whose files it states and the checkpoints
-        hold (`Checkpoints.save`): a host that cannot resolve it refuses before step 0, naming it, not at the
-        first checkpoint (train 972's review)."""
+        hold (`Checkpoints.save`), held to be the objective's run tokenizer (`declared_tokenizer`): a host
+        that cannot resolve it, or an objective whose run tokenizer is not the one its record states, refuses
+        before step 0, not at the first checkpoint (train 972's and 978's reviews)."""
         if self.checkpoints is not None:
-            self._artifact()
+            from dew.inference.tasks import declared_tokenizer
+
+            declared_tokenizer(self._artifact(), self.objective.run_tokenizer())
             given = {"a rollout (rollout=)": _rollout_admitted(self.rollout),
                      "a custom step (step=)": self.step, "a tracker (tracker=)": self.tracker,
                      "recording each step's draws (record=True)": self.record or None}

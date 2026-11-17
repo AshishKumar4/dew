@@ -1070,6 +1070,6 @@ def test_a_run_holds_its_objectives_own_tokenizer_checked_file_by_file(tmp_path)
     held = held_place(str(run), files)
     assert (held / HELD_FILES).exists()
     assert {path: hashlib.sha256((held / path).read_bytes()).hexdigest() for path in files} == files
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         hold_tokenizer({"tokenizer": str(own), "tokenizer_files": {**files, "extra.json": "0" * 64}},
                        str(run / "other"), tokenizer)

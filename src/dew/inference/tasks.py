@@ -577,6 +577,27 @@ def saved_artifact(checkpoints: Checkpoints, step: int) -> Mapping[str, object] 
     return None if record is None else earlier_shapes(named_fields(record, 'checkpoint artifact'))
 
 
+def declared_tokenizer(artifact: JSON,
+                       tokenizer: Tokenizer | None) -> tuple[HFTokenizer, Mapping[str, str]] | None:
+    """The tokenizer a checkpoint declaring `artifact` holds, beside the files' hashes `artifact` states
+    (`tokenizer_files`): `tokenizer`, an objective's run tokenizer (`Objective.run_tokenizer`), whose files
+    must be those; None where `artifact` states none. One whose files are not the declared ones is refused
+    (TypeError), naming the objective's want: a wrapper that records another objective's task holds that
+    one's tokenizer. The rule a save holds by (`hold_tokenizer`) and a fit checks before its first step."""
+    from dew.data.text import HFTokenizer
+
+    match artifact:
+        case {"tokenizer_files": dict(files)}:
+            hashed = {str(path): str(digest) for path, digest in files.items()}
+            if not isinstance(tokenizer, HFTokenizer) or tokenizer.pinned.files != hashed:
+                raise TypeError("the run's record states a tokenizer's files its objective's run_tokenizer() "
+                                "does not hold: an objective recording another's task returns that one's "
+                                "tokenizer from run_tokenizer()")
+            return tokenizer, hashed
+        case _:
+            return None
+
+
 def hold_tokenizer(artifact: JSON, run: str, tokenizer: Tokenizer | None) -> None:
     """Hold `tokenizer`, the objective's own, in the run in `run` (`held_place`), once, where `artifact`, the
     step's inference declaration a checkpoint of the run carries, records its files (`tokenizer_files`), as
@@ -586,17 +607,14 @@ def hold_tokenizer(artifact: JSON, run: str, tokenizer: Tokenizer | None) -> Non
     local run's directory published whole (`dew._files.staged`). The record keeps the tokenizer's name and
     files as they are; a load finds the held copy by them (`HFTokenizer.held`) on any host. A declaration
     whose files are not `tokenizer`'s is refused: the run would hold another tokenizer than it records."""
-    from dew.data.text import HELD_FILES, HFTokenizer, copy_checked, held_place
+    from dew.data.text import HELD_FILES, copy_checked, held_place
 
-    match artifact:
-        case {"tokenizer_files": dict(files)} if jax.process_index() == 0:
-            hashed = {str(path): str(digest) for path, digest in files.items()}
-            if not isinstance(tokenizer, HFTokenizer) or tokenizer.pinned.files != hashed:
-                raise ValueError("the run records a tokenizer's files that are not its objective's own")
+    match declared_tokenizer(artifact, tokenizer):
+        case (held, hashed) if jax.process_index() == 0:
             target = held_place(run, hashed)
             if (target / HELD_FILES).exists():
                 return
-            source = epath.Path(tokenizer.pinned.directory)
+            source = epath.Path(held.pinned.directory)
             if is_uri(run):
                 copy_checked(source, target, hashed)
                 (target / HELD_FILES).write_text(json.dumps(hashed, sort_keys=True))
