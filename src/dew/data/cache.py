@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import operator
 import os
 import sqlite3
 import tempfile
@@ -890,16 +891,6 @@ class _Indexed:
 
 
 @dataclass(frozen=True)
-class _Applied:
-    """A transform over a record beside its place (`_Indexed`)."""
-
-    transform: _Passthrough
-
-    def __call__(self, placed: tuple[int, Record]) -> Outputs:
-        return self.transform(*placed)
-
-
-@dataclass(frozen=True)
 class _PassthroughReader:
     reader: ShardOpener
     transform: _Passthrough
@@ -908,9 +899,9 @@ class _PassthroughReader:
     def __call__(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
         if self.pool is None:
             return self.reader(shard, options).map_with_index(self.transform)
-        # A fetch with a pool of its own runs its records at once, in their order.
+        # A fetch with a pool of its own runs its records at once, in their order, handing on their outputs.
         indexed = self.reader(shard, options).map_with_index(_Indexed())
-        return Concurrently(indexed, _Applied(self.transform), self.pool)
+        return Concurrently(indexed, _Kept(self.transform), self.pool).map(operator.itemgetter(1))
 
 
 @dataclass(frozen=True)
@@ -1115,8 +1106,9 @@ class _Placed(grain.DatasetIterator):
 
 @dataclass(frozen=True)
 class _Kept:
-    """A record's cached steps run beside its place, the record kept beside their outputs, which the fill
-    writes in its turn (`_CachedIterator`)."""
+    """A record's steps run beside its place (`_Indexed`, `_Placed`), the record kept beside their outputs:
+    a cache's fill writes both in its turn (`_CachedIterator`), a pooled fetch hands on the outputs
+    (`_PassthroughReader`)."""
 
     transform: _Passthrough
 
