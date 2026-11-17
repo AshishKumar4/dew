@@ -24,7 +24,7 @@ its map tasks."""
 
 CENSUS = "DEW_GATE_CENSUS"
 """The environment variable whose being set runs check 1's arms with YNNPACK's fusions on (no WITHOUT_YNN,
-`reference_error.switched_off`), as CPU users compile them: the census (the plan's `--census`, the land
+`arm_forms.switched_off`), as CPU users compile them: the census (the plan's `--census`, the land
 queue's census run), each red it finds filed and judged Dew's or XLA:CPU's (row 4471;
 docs/design/testing.md, "the YNNPACK switch")."""
 

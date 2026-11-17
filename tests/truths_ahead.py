@@ -8,6 +8,11 @@ terms take, at each shape its draws take (`assert_as_exact`'s stages), for the d
 serializes them under `directory` and runs nothing. Within `compiled_truths(directory, prepare=False, ...)`
 the run computes each draw's truth and terms on its own devices with those executables (`called`), tracing,
 lowering and compiling none of them; the site's verdict is reached as a site computing its own reaches it.
+Its arms (`ARMS`: Dew's, the reference and each further one) are compiled there too, each as its run compiles
+it (`jax.jit`) at each of its draws' own shapes, traced for the run's devices (`CompiledTruths.tracing`), so
+a GPU run traces, lowers and compiles none of a site's programs: each compiled at a run's first call,
+those ran 2,000 of a day's GPU-minutes idle (2026-11-17's census of 226 jobs). A prepare lists them from
+the site's own call (`reference_error.assert_as_exact`), the one definition its run reads.
 A program the store does not hold for a draw's shapes, or one compiled at another `stamp` (the commit and
 JAX), is a red (`MissingTruth`), never one compiled in its place; a terms walk its values steer (a branch
 or loop it reads as it runs, `float64_terms.static`) is held as one, which its run walks on its device.
@@ -48,10 +53,12 @@ reads."""
 
 
 def named(role: str, inputs) -> str:
-    """A program's name in its site's store: its `role` and its inputs' tree, shapes and dtypes, as a trace
-    keys them (`float64_terms.traced`)."""
+    """A program's name in its site's store: its `role` and its inputs' tree, shapes, dtypes and weak types,
+    as a trace keys them (`float64_terms.traced`): a weak Python scalar beside a bfloat16 array keeps it
+    bfloat16, a strong one promotes it."""
     leaves, tree = jax.tree.flatten(inputs)
-    shapes = (str(tree), tuple((tuple(np.shape(leaf)), str(jax.typeof(leaf).dtype)) for leaf in leaves))
+    shapes = (str(tree), tuple((tuple(np.shape(leaf)), str(jax.typeof(leaf).dtype),
+                                jax.typeof(leaf).weak_type) for leaf in leaves))
     return f"{role} {hashlib.sha256(repr(shapes).encode()).hexdigest()[:16]}"
 
 
@@ -81,11 +88,26 @@ class CompiledTruths:
 
         return compile_only_gpus(self.target.generation, 1)[0]
 
+    @contextlib.contextmanager
+    def tracing(self) -> Iterator[None]:
+        """Within the block, a program traces as the store's compile lowers it: for its target's GPUs
+        (`dew.training.ahead.lowering_for`), or this process's devices where it names none. An arm traced in
+        it holds the arrays its compile ahead holds (`reference_error._held_arm`)."""
+        if self.target is None:
+            yield
+            return
+        from dew.training.ahead import lowering_for
+
+        with lowering_for(self.target.generation, self.target.multiprocessors):
+            yield
+
     def compile_site(self, label: str, programs: Mapping[str, tuple[Callable, Sequence]],
-                     held: Mapping[str, dict]) -> None:
+                     held: Mapping[str, dict], *, compiled: Callable | None = None) -> None:
         """The site's `programs` (each a function of its constants and inputs, flat, and their shapes, by
         its name, `named`) compiled for the store's target and written with what each `held`; refused for a
-        label this store compiled already, whose programs a second site of it would replace."""
+        label this store compiled already, whose programs a second site of it would replace. `compiled` makes
+        each program as its run's compile does (`dew.training.ahead.compile_programs`' `compiled`; Dew's
+        compile point where None, a truth's, whose program is its run's)."""
         from dew._cache import uncached
 
         if label in self.begun:
@@ -99,35 +121,41 @@ class CompiledTruths:
         # Compiled here, never loaded from JAX's persistent cache, whose executables serialize without their
         # kernels (`dew.training.ahead.keeping`).
         with uncached():
-            built = self._compiled(programs)
+            built = self._compiled(programs, compiled)
         built.save(site / PROGRAMS)
         (site / HELD).write_bytes(pickle.dumps(dict(held)))
         memory = {name: executable.memory._asdict() for name, executable in built.programs.items()
                   if executable.memory is not None}
         (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory}))
 
-    def _compiled(self, programs: Mapping[str, tuple[Callable, Sequence]]):
-        """`programs` compiled for the store's target (`compile_programs`), or for this process's first
-        device where it names none."""
+    def _compiled(self, programs: Mapping[str, tuple[Callable, Sequence]], compiled: Callable | None):
+        """`programs` compiled for the store's target (`compile_programs`), or for this process's first device
+        where it names none, each made by `compiled` where it is given (`compile_site`), else by Dew's compile
+        point on a target and `jax.jit` here."""
         from dew.training.ahead import AheadPrograms, BuildTarget, Executable, compile_programs
 
         if self.target is not None:
-            return compile_programs(programs, self.target.generation, self.target.multiprocessors)
+            return compile_programs(programs, self.target.generation, self.target.multiprocessors,
+                                    **({} if compiled is None else {"compiled": compiled}))
         devices = jax.devices()[:1]
         placed = jax.sharding.SingleDeviceSharding(devices[0])
+        compile_one = compiled or jax.jit
+
         def built(function, shapes):
-            placed_shapes = (jax.ShapeDtypeStruct(np.shape(shape), shape.dtype, sharding=placed)
+            placed_shapes = (jax.ShapeDtypeStruct(np.shape(shape), shape.dtype, sharding=placed,
+                                                  weak_type=shape.weak_type)
                              for shape in shapes)
-            return Executable.of(jax.jit(function).lower(*placed_shapes).compile())
+            return Executable.of(compile_one(function, out_shardings=placed).lower(*placed_shapes).compile())
 
         return AheadPrograms(BuildTarget.of(devices), {
             name: built(function, shapes) for name, (function, shapes) in programs.items()})
 
     def called(self, label: str, role: str, inputs):
-        """The site's program `role` run on `inputs` (its draw's, widened) and the constants it holds, on
-        this process's devices, its outputs fetched to the host as a site's truths are held, its device's
-        memory left to the arms (a model's float64 gradients a draw, 2.9 GB on the sinks flows); a red
-        (`MissingTruth`) where the store holds none for the site at this stamp or for these shapes."""
+        """The site's program `role` run on `inputs` (its draw's: a truth's widened, an arm's as drawn) and
+        the constants it holds, on this process's devices, its outputs fetched to the host as a site's
+        truths are held, its device's memory left to the next (a model's float64 gradients a draw, 2.9 GB
+        on the sinks flows); a red (`MissingTruth`) where the store holds none for the site at this stamp or
+        for these shapes."""
         programs, held = self._site(label)
         name = named(role, inputs)
         if name not in programs:
