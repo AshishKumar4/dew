@@ -914,23 +914,51 @@ def test_a_weighted_total_rounds_once_and_keeps_excluded_values_out(axis):
     np.testing.assert_array_equal(np.asarray(mass), exact_mass)
 
 
+@pytest.mark.parametrize("name", ["softplus", "silu", "exp", "exp2"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=str)
 @pytest.mark.parametrize("span", [(-88.0, -20.0), (-20.0, -1e-3), (-1e-3, 1e-3), (1e-3, 20.0), (20.0, 88.0)],
                          ids=str)
-def test_softplus_is_as_exact_as_jaxs_across_its_range(dtype, span):
-    """`dew.nn.precision.softplus`, its log1p by its own series (row 7062), and its derivative on par with
-    JAX's softplus from float64 on this backend over each span of its range, large negative to large
-    positive and near zero, its input in fp32 and bf16 (check 1)."""
+def test_dews_own_transcendentals_are_as_exact_as_jaxs_across_their_range(name, dtype, span):
+    """`dew.nn.precision.softplus` (its log1p by its own series), `silu` (`x / (1 + e^-x)`, no logistic) and
+    `accurate_exp` as a TPU takes it (`e^x` and `2^x` by its own sum, traced for an assumed v5e), each past
+    the backend's own (row 7062), and their
+    derivatives on par with JAX's from float64 on this backend over each span of their range, large negative
+    to large positive and near zero, their input in fp32 and bf16 (check 1)."""
+    from contract_support import on_a_tpu
+
     from dew.nn import precision
 
     def draw(seed):
         x = np.random.default_rng(seed).uniform(*span, 4096).astype(np.float32)
         return (jnp.asarray(x, dtype),)
 
-    for name, ours, theirs in (("value", precision.softplus, jax.nn.softplus),
-                               ("slope", jax.vmap(jax.grad(precision.softplus)),
-                                jax.vmap(jax.grad(jax.nn.softplus)))):
-        assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, f"softplus's {name} {span} {dtype}", seeds=8)
+    ours, theirs = {"softplus": (precision.softplus, jax.nn.softplus), "silu": (precision.silu, jax.nn.silu),
+                    "exp": (on_a_tpu(precision.accurate_exp), jnp.exp),
+                    "exp2": (on_a_tpu(functools.partial(precision.accurate_exp, base2=True)), jnp.exp2)}[name]
+    for part, mine, jaxs in (("value", ours, theirs),
+                             ("slope", jax.vmap(jax.grad(ours)), jax.vmap(jax.grad(theirs)))):
+        assert_as_exact(jax.jit(mine), jax.jit(jaxs), draw, f"{name}'s {part} {span} {dtype}", seeds=8)
+
+
+@pytest.mark.tpu(reason="a TPU flushes subnormal floats, which a CPU keeps")
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=str)
+def test_softplus_keeps_its_tail_on_a_tpu(dtype):
+    """Dew's softplus near x = -87 on a TPU, which flushes subnormals: `y = e^x` is a normal float there and
+    half of it is not, so a series whose leading term doubled `y / (2 + y)` was zero where float64's softplus
+    is a normal float (5895 of 65536 fp32 points over [-87.3, -80] on a v5e, Main's tail review); its
+    leading term `y / (1 + y / 2)` is never zero there, and the softplus is on par with JAX's from float64
+    (check 1)."""
+    from dew.nn import precision
+
+    def draw(seed):
+        x = np.random.default_rng(seed).uniform(-87.3, -80.0, 4096).astype(np.float32)
+        return (jnp.asarray(x, dtype),)
+
+    (x,) = draw(0)
+    normal = np.log1p(np.exp(np.asarray(x, np.float64))) >= float(jnp.finfo(dtype).tiny)
+    assert not np.any(np.asarray(jax.jit(precision.softplus)(x))[normal] == 0)
+    assert_as_exact(jax.jit(precision.softplus), jax.jit(jax.nn.softplus), draw, f"softplus's tail {dtype}",
+                    seeds=8)
 
 
 def test_a_routes_declaration_is_the_runs_configured_precision_where_the_call_states_none():

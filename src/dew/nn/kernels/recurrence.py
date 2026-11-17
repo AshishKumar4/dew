@@ -29,11 +29,13 @@ from dew.algebra.scan import Reads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels import launches
 from dew.nn.precision import (
+    accurate_exp,
     at_least_fp32,
     compensated_add,
     l2norm,
     rms_statistics,
     rms_weighted,
+    silu,
     softplus,
     stochastic_bf16,
 )
@@ -220,7 +222,7 @@ def _held(updated, key, value, dtype):
 
 def _gated_decay(gate, log_a, bias):
     """The gates' log decay `-exp(log_a) softplus(gate + bias)`, in the operands' dtype."""
-    return -jnp.exp(log_a) * softplus(gate + bias)
+    return -accurate_exp(log_a) * softplus(gate + bias)
 
 
 def gated(gates: Gates, gate, log_a, bias, beta):
@@ -232,7 +234,7 @@ def gated(gates: Gates, gate, log_a, bias, beta):
     step = softplus(gate + bias)
     if gates.limit is not None:
         step = jnp.clip(step, *gates.limit)
-    return -jnp.exp(log_a) * step, step if gates.write == 'step' else jax.nn.sigmoid(beta)
+    return -accurate_exp(log_a) * step, step if gates.write == 'step' else jax.nn.sigmoid(beta)
 
 
 def gated_rms(out, z, weight, norm: OutputNorm):
@@ -331,7 +333,7 @@ def read(hooks: Hooks, operands, *, optional: tuple[str, ...] = ()) -> dict:
 
 def _activated(pre, conv: Conv):
     """The conv's sums `pre` activated as `conv` says: SiLU, or as they are."""
-    return pre if conv.activation is None else pre * jax.nn.sigmoid(pre)
+    return pre if conv.activation is None else silu(pre)
 
 
 def conv_pieces(conv: Conv, key_heads: int, value_heads: int, key_width: int,
