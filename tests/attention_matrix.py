@@ -174,7 +174,7 @@ def _certified_route(call: tuple[tuple[str, str], ...]):
     if name not in _CERTIFYING:
         _CERTIFYING[name] = concurrent.futures.ProcessPoolExecutor(
             max_workers=1, mp_context=multiprocessing.get_context("spawn"))
-    return _CERTIFYING[name].submit(_routed, call, True).result()
+    return _CERTIFYING[name].submit(functools.partial(_routed, certified=True), call).result()
 
 
 def pin_of(case: dict[str, str], *, certified: bool = False) -> attention_mosaic.BackwardTiles | None:
