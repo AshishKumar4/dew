@@ -165,9 +165,15 @@ def test_a_schema_read_in_context_reads_the_context_after_it_in_the_room_it_leav
     data = decision_rows(examples, 8, objective=objective.data())
     reader = data.train(DataPartition())
     try:
-        next(reader)
+        batch = next(reader)
     finally:
         reader.close()
+    # The window's first row reads the schema and the note's first tokens as its context, its spans where
+    # the schema laid them.
+    kept = len(schema) + room
+    assert np.asarray(batch["context"])[0, :kept].tolist() == list(row.context)
+    assert np.asarray(batch["context_segments"])[0, :kept].tolist() == [1] * kept
+    assert tuple(np.asarray(batch["spans"])[0, 0].tolist()) == laid.questions[0].span
     # The counters a run's data report logs (`data/cut/<corpus>/context`,
     # `data/cut_removed/<corpus>/context`).
     [counts] = data.counts.values()
