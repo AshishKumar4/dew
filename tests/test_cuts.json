@@ -823,7 +823,9 @@
 "tests/test_attention_stability.py::test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[keys an ulp apart, float32]"
 ],
 "tests/test_attention_template.py": [
-"tests/test_attention_template.py::test_a_window_over_the_widest_places_neither_wraps_nor_aliases[half]"
+"tests/test_attention_template.py::test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys[causal-window-none-float32-sliced-at-a-tile-edge]",
+"tests/test_attention_template.py::test_a_window_over_the_widest_places_neither_wraps_nor_aliases[half]",
+"tests/test_attention_template.py::test_key_spans_traced_keep_the_keys_they_keep_eagerly[documents]"
 ],
 "tests/test_attention_triton.py": [
 "tests/test_attention_triton.py::test_a_float32_call_compiles_spill_free_for_an_h100[256 a row]",
@@ -1003,6 +1005,9 @@
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_the_interpreted_mainloop[steep]",
 "tests/test_check2.py::test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16"
 ],
+"tests/test_checkpoint_averaging.py": [
+"tests/test_checkpoint_averaging.py::test_runs_that_agree_average_to_their_own_weights_and_a_runs_average_is_read_where_it_keeps_one[data]"
+],
 "tests/test_chunk_adaptation.py": [
 "tests/test_chunk_adaptation.py::test_a_chain_steps_each_level_as_equation_71_at_its_own_window[1-3-documents]",
 "tests/test_chunk_adaptation.py::test_a_damped_chain_steps_each_level_as_the_literal_loop[documents]",
@@ -1080,7 +1085,8 @@
 "tests/test_config_paths.py::test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran[lm]"
 ],
 "tests/test_contracts_attention.py": [
-"tests/test_contracts_attention.py::test_the_finished_merges_mean_holds_every_order[near the largest]"
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_its_reverse_orders[template-normal]",
+"tests/test_contracts_attention.py::test_the_paged_decode_kernel_holds_every_order[near the largest]"
 ],
 "tests/test_contracts_gemm.py": [
 "tests/test_contracts_gemm.py::test_a_gemm_prologue_holds_every_order[normal]",
@@ -1276,12 +1282,19 @@
 "tests/test_decision_streams.py::test_packed_rows_in_two_streams_decide_each_row_as_the_row_alone[lettered]"
 ],
 "tests/test_decision_task.py": [
+"tests/test_decision_task.py::test_a_laya_release_loaded_and_saved_again_states_the_dtype_its_task_computed_in",
 "tests/test_decision_task.py::test_a_run_continued_from_its_runs_release_averages_with_its_start",
 "tests/test_decision_task.py::test_a_runs_tokenizer_is_held_in_the_run_and_compared_by_its_files",
 "tests/test_decision_task.py::test_a_small_budget_splits_passes_without_moving_a_logit",
+"tests/test_decision_task.py::test_a_task_saves_in_layas_layout_and_reads_back_the_same",
+"tests/test_decision_task.py::test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh",
 "tests/test_decision_task.py::test_abstention_keeps_the_answers_it_serves_within_the_target_error",
-"tests/test_decision_task.py::test_finalists_play_one_round_keep_each_groups_best_and_answer_over_every_option",
-"tests/test_decision_task.py::test_runs_whose_data_hold_other_widths_average_padded_to_the_widest"
+"tests/test_decision_task.py::test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was[state-first]",
+"tests/test_decision_task.py::test_an_objective_from_a_calibrated_task_validates_without_its_temperatures",
+"tests/test_decision_task.py::test_runs_of_other_task_settings_or_a_single_run_do_not_average",
+"tests/test_decision_task.py::test_runs_that_share_a_head_average_as_the_checkpoints_average_them_and_refit_their_temperatures",
+"tests/test_decision_task.py::test_runs_whose_data_hold_other_widths_average_padded_to_the_widest",
+"tests/test_decision_task.py::test_systemone_answers_what_layas_agent_answers"
 ],
 "tests/test_decision_workflow.py": [
 "tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[joint-plain-0.0-examples]",
@@ -1614,7 +1627,7 @@
 "tests/test_end_to_end.py::test_a_repae_step_s_loss_and_terms_are_train_repae_s",
 "tests/test_end_to_end.py::test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them",
 "tests/test_end_to_end.py::test_each_loss_trains_its_own_side",
-"tests/test_end_to_end.py::test_each_network_steps_on_its_own_optimizer_as_repa_e_s_three_do"
+"tests/test_end_to_end.py::test_the_autoencoder_and_discriminator_gradients_are_train_repae_s_in_float64"
 ],
 "tests/test_env_rollout.py": [
 "tests/test_env_rollout.py::test_a_pools_split_scored_by_its_episodes_agrees_and_fails_together",
@@ -2118,9 +2131,6 @@
 "tests/test_kimi_k3.py::test_greedy_generation_and_decode_steps_match_the_reference",
 "tests/test_kimi_k3.py::test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference",
 "tests/test_kimi_k3.py::test_situ_matches_the_released_activation"
-],
-"tests/test_kv_cache.py": [
-"tests/test_kv_cache.py::test_a_quantized_caches_scales_and_codes_are_its_formats_quotients[float8_e4m3fn]"
 ],
 "tests/test_layer_stack.py": [
 "tests/test_layer_stack.py::test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop",
@@ -3395,37 +3405,37 @@
 "tests/test_serving.py": [
 "tests/test_serving.py::test_a_banked_servers_host_tier_reads_back_the_prefix_pages_its_pool_reclaimed",
 "tests/test_serving.py::test_a_decoder_reading_each_tokens_place_or_id_serves_in_the_mixed_step[learned-positions]",
+"tests/test_serving.py::test_a_dropped_server_frees_its_weights_without_a_collection",
+"tests/test_serving.py::test_a_host_tier_keeps_prefix_pages_the_pool_reclaims[device]",
 "tests/test_serving.py::test_a_hybrid_stack_keeps_or_loses_a_prefixs_state_to_the_bit_of_a_sized_sites_server[a-state-from-the-host]",
 "tests/test_serving.py::test_a_hybrid_stack_keeps_or_loses_a_prefixs_state_to_the_bit_of_a_sized_sites_server[evicted]",
 "tests/test_serving.py::test_a_hybrid_stack_keeps_or_loses_a_prefixs_state_to_the_bit_of_a_sized_sites_server[from-one-host-slot]",
 "tests/test_serving.py::test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages[dense-layered]",
-"tests/test_serving.py::test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages[dense-parallel]",
-"tests/test_serving.py::test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages[paged-chunked-parallel]",
+"tests/test_serving.py::test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages[paged-chunked-layered]",
 "tests/test_serving.py::test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages[paged-layered]",
 "tests/test_serving.py::test_a_multimodal_model_serves_over_its_language_models_cache[dense]",
-"tests/test_serving.py::test_a_paged_server_draws_what_each_request_draws_alone[paged]",
+"tests/test_serving.py::test_a_paged_server_serves_layers_that_read_their_keys_places[chunked-prefix]",
 "tests/test_serving.py::test_a_projection_quantized_apart_from_its_group_is_served_unpacked",
-"tests/test_serving.py::test_a_served_length_limit_truncates_a_request_as_a_direct_call_does",
+"tests/test_serving.py::test_a_served_request_is_forced_to_end_at_its_own_budget",
 "tests/test_serving.py::test_a_server_drafts_speculative_blocks_as_a_lone_call_does[greedy]",
 "tests/test_serving.py::test_a_server_drafts_speculative_blocks_as_a_lone_call_does[sampled-four-steps-rbg]",
 "tests/test_serving.py::test_a_server_drafts_speculative_blocks_as_a_lone_call_does[sampled-four-steps]",
-"tests/test_serving.py::test_a_server_draws_at_its_tasks_progress_and_at_each_version_it_loads",
-"tests/test_serving.py::test_a_server_on_a_mesh_draws_what_each_request_draws_alone[data-tensor-chunked-prefix]",
-"tests/test_serving.py::test_a_server_on_an_expert_and_stage_mesh_exchanges_its_experts_and_runs_its_stack_whole",
-"tests/test_serving.py::test_a_server_over_a_banked_store_keeps_its_cache_banked_and_draws_what_the_task_draws[dense]",
+"tests/test_serving.py::test_a_server_on_a_mesh_draws_what_each_request_draws_alone[data-fsdp-tensor-paged-four-steps]",
+"tests/test_serving.py::test_a_server_on_a_mesh_draws_what_each_request_draws_alone[data]",
+"tests/test_serving.py::test_a_server_on_an_expert_mesh_draws_what_one_device_draws[global-1]",
 "tests/test_serving.py::test_a_server_over_a_pool_draws_what_each_request_draws_alone[dense]",
+"tests/test_serving.py::test_a_server_over_a_pool_draws_what_each_request_draws_alone[paged]",
 "tests/test_serving.py::test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter[dense]",
 "tests/test_serving.py::test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter[paged]",
-"tests/test_serving.py::test_a_server_over_split_rows_takes_its_projections_on_each_devices_rows[layers]",
+"tests/test_serving.py::test_a_server_over_loaded_weights_places_them_once",
 "tests/test_serving.py::test_a_server_over_split_rows_takes_its_projections_on_each_devices_rows[scanned]",
 "tests/test_serving.py::test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic[a-parallel-hybrid]",
+"tests/test_serving.py::test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic[several-steps-over-pages]",
 "tests/test_serving.py::test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic[speculative-blocks]",
-"tests/test_serving.py::test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does[float8-over-pages]",
-"tests/test_serving.py::test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does[int8-over-a-shared-prefix]",
-"tests/test_serving.py::test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does[int8]",
-"tests/test_serving.py::test_a_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_mesh_draws[one]",
-"tests/test_serving.py::test_a_text_prompt_through_the_hf_processor_serves_what_the_task_draws",
-"tests/test_serving.py::test_an_offloaded_cache_serves_what_a_resident_one_serves[dense]"
+"tests/test_serving.py::test_a_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_mesh_draws[unmeshed]",
+"tests/test_serving.py::test_a_task_places_loaded_weights_on_the_default_device_as_its_compute_reads_them",
+"tests/test_serving.py::test_a_tree_split_for_training_packs_as_its_whole_tree_and_splits_back_as_it_was",
+"tests/test_serving.py::test_inference_projection_layout_preserves_special_attention_logits[output_gate]"
 ],
 "tests/test_shared_cross_attention.py": [
 "tests/test_shared_cross_attention.py::test_a_decision_run_reads_its_context_through_a_deepseek_backbones_own_attention[deepseek-v4-tiny]",
@@ -3717,6 +3727,10 @@
 "tests/test_wan_source.py": [
 "tests/test_wan_source.py::test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone",
 "tests/test_wan_source.py::test_pipeline_walk_matches_the_source[streamed]"
+],
+"tests/test_wan_vae.py": [
+"tests/test_wan_vae.py::test_a_walk_and_its_gradients_match_the_source[image]",
+"tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",
