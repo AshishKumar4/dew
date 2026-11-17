@@ -948,16 +948,21 @@ def _lowered_rule() -> Callable:
         generation.linear_tangent(forward, backward, _doubled, kind=Protected()))
 
 
-@functools.partial(nested, static_argnames=("reverse",), inline=True)
-def _compensated(values, *, reverse: bool = False, restarts=None) -> tuple[jax.Array, jax.Array]:
-    """`values`' inclusive prefix sums along their first axis (suffix sums where `reverse`), each a float and
-    its rounding error (a compensated scan), each restarting where `restarts` holds (a segmented scan: an
-    element of it the first of its segment's). Each pair joined renormalized (`compensated_add`), the hand
-    math's sum: a pair left unrenormalized held a residual that a product XLA:CPU fused into its sum (a
-    rated decay's `rate * beta`, an FMA) had left wrong, 1.5e-5 off a 16-token prefix (row 1966).
+@functools.partial(nested, static_argnames=("axis", "reverse"), inline=True)
+def compensated(values, *, low=None, axis: int = 0, reverse: bool = False,
+                restarts=None) -> tuple[jax.Array, jax.Array]:
+    """`values`' inclusive prefix sums along `axis` (suffix sums where `reverse`), each a float and its
+    rounding error (a compensated scan), each restarting where `restarts` holds (a segmented scan: an
+    element of it the first of its segment's). `low`, where given, is each value's own low part, the values
+    then double floats themselves (an exact product's pair, `two_product`: Mamba-3's turns). Each pair
+    joined renormalized (`compensated_add`), the hand math's sum: a pair left unrenormalized held a
+    residual that a product XLA:CPU fused into its sum (a rated decay's `rate * beta`, an FMA) had left
+    wrong, 1.5e-5 off a 16-token prefix (row 1966).
     A nested program (`dew.nn.nested`), traced once for its arguments' types within a trace: the associative
     scan otherwise traces its protected additions afresh at every level on every call, each chunk's walked
     sum among them."""
+    low = jnp.zeros_like(values) if low is None else low
+
     def combine(left, right):
         summed = compensated_add(left[:2], right[:2])
         if restarts is None:
@@ -968,8 +973,8 @@ def _compensated(values, *, reverse: bool = False, restarts=None) -> tuple[jax.A
                 left[2] | right[2])
 
     if restarts is None:
-        return lax.associative_scan(combine, (values, jnp.zeros_like(values)), reverse=reverse)
-    high, low, _ = lax.associative_scan(combine, (values, jnp.zeros_like(values), restarts), reverse=reverse)
+        return lax.associative_scan(combine, (values, low), reverse=reverse, axis=axis)
+    high, low, _ = lax.associative_scan(combine, (values, low, restarts), reverse=reverse, axis=axis)
     return high, low
 
 
@@ -1023,7 +1028,7 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     holding -2**127 twice is -inf; one holding -2**70 loses a later -1 to its rounding, its decay 1 in place
     of `exp(-1)`), and each span through one is zero."""
     vanished = exponents <= vanishing(exponents.dtype, base2)
-    high, low = _compensated(jnp.where(vanished, 0.0, exponents), restarts=vanished)
+    high, low = compensated(jnp.where(vanished, 0.0, exponents), restarts=vanished)
     segments = jnp.cumsum(vanished.astype(jnp.int32), axis=0)
     count = exponents.shape[0]
     below = (jnp.arange(count)[:, None] >= jnp.arange(count)[None, :])[:, :, None]
@@ -1100,7 +1105,7 @@ def _earlier(sums) -> jax.Array:
 
 def _scanned(values, *, reverse: bool = False) -> jax.Array:
     """`values`' inclusive prefix sums along their first axis (suffix sums where `reverse`), compensated."""
-    high, low = _compensated(values, reverse=reverse)
+    high, low = compensated(values, reverse=reverse)
     return high + low
 
 
