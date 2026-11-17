@@ -383,7 +383,8 @@ def test_a_step_reading_a_container_that_holds_itself_resumes_exactly_until_it_c
 
 
 GENERATED = """import dataclasses
-from typing import ClassVar
+import typing
+from typing import Annotated, ClassVar
 
 import attrs
 
@@ -589,6 +590,32 @@ def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factor
         resumed_changes(reader(), state)
     (changed,) = resumed_changes(reader("relaxed"), state)
     assert changed.startswith("code.")
+
+
+def test_an_exact_resume_refuses_a_step_whose_annotated_field_changed_its_generic_form(tmp_path, monkeypatch):
+    """A step reaching an attrs field annotated with `typing.Annotated` metadata inside a union
+    (`list[Annotated[int, "tag"]] | None`) compiles and resumes exactly, and the same field annotated
+    `typing.List[...]` in place of `list[...]`, which a converter reading the field's annotation tells
+    apart (`Typed`), refuses an exact resume. The union crashed the step's statement (`vars` of a union),
+    and the two forms were stated alike, an exact resume reading rows the converter wrote otherwise (the base
+    review of 25b3f299c)."""
+    module = tmp_path / f"generated_{uuid4().hex}.py"
+    start = {**GENERATED_AT, "annotation": "list[Annotated[int, 'tag']] | None"}
+    module.write_text(GENERATED.format(**start))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    generated = importlib.import_module(module.stem)
+
+    def reader(resume="exact"):
+        pipeline = Pipeline(ROWS).map(generated.Shifting()).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(), state) == ()
+    edited = "typing.List[Annotated[int, 'tag']] | None"
+    module.write_text(GENERATED.format(**{**start, "annotation": edited}))
+    importlib.reload(generated)
+    with pytest.raises(ValueError):
+        resumed_changes(reader(), state)
 
 
 STATED_IN_A_PROCESS = """import importlib
