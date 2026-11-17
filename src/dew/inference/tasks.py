@@ -89,7 +89,7 @@ if TYPE_CHECKING:
 
     # A run processor's tokenizer is read through its methods alone, so image generation, which builds none,
     # reads no tokenizer library (tests/test_imports.py's optional backends).
-    from dew.data.text import ByteTokenizer, HFTokenizer, Tokenizer
+    from dew.data.text import HFTokenizer, Tokenizer
     from dew.distributed.placement import Layout, MeshSpec
     from dew.objectives.base import Objective
     from dew.quantization import Quantization
@@ -1059,28 +1059,18 @@ def recorded_processor(processor: Processor | None) -> SourceReference | None:
     return processor.source if isinstance(processor, SourceProcessor) else None
 
 
-def saved_tokenizer(name: str, files: Mapping[str, str] | None, run: str) -> ByteTokenizer | HFTokenizer:
-    """The tokenizer a saved run's record names (`name`) and states the files of (`files`, which a record
-    saved before runs held their tokenizers lacks), as every reader of a run builds it: the copy the run in
-    `run` holds where it holds one (`HFTokenizer.held`), its files checked against the record's. A run's
-    task (`_saved_processor`, `dew.decision.Decide.from_run`), the blend of runs that compares them
-    (`dew.decision.Decide.averaged`) and a run's bundle (`dew.interop.Pretrained.from_saved`), which an
-    export writes and a run started from it encodes with."""
-    from dew.data.text import tokenizer_for
-
-    return tokenizer_for(name, files=files, held=run)
-
-
 def _saved_processor(settings: TaskSettings, config: ModelConfig, run: str) -> Processor | None:
     """Build the run's host processor: the checkpoint's own, reloaded from the
-    source it recorded beside `config`'s model, or its run tokenizer (`saved_tokenizer`)."""
+    source it recorded beside `config`'s model, or its run tokenizer (`dew.data.text.tokenizer_for`, the
+    copy the run holds)."""
+    from dew.data.text import tokenizer_for
     from dew.interop.pretrained import load_processor
 
     if settings.processor is not None:
         return load_processor(settings.processor, config.build())
     if settings.tokenizer is None:
         return None
-    return RunProcessor(saved_tokenizer(settings.tokenizer, settings.tokenizer_files, run))
+    return RunProcessor(tokenizer_for(settings.tokenizer, files=settings.tokenizer_files, held=run))
 
 
 def resident(model: nn.Module, variables: Variables) -> Variables:

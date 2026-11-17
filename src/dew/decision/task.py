@@ -284,14 +284,13 @@ def _head_changes(first: Mapping[str, object], other: Mapping[str, object]) -> l
 
 def _tokenizer_held(settings: "DecideSettings", run: str) -> "Tokenizer | str | None":
     """The text tokenizer of the run in `run`, which runs compare by (`_same_tokenizer`): whether its record
-    states its files or was saved before records did (`dew.inference.tasks.saved_tokenizer`); the byte
-    vocabulary, which has no files, by its name."""
-    from dew.data.text import HFTokenizer
-    from dew.inference.tasks import saved_tokenizer
+    states its files or was saved before records did (`dew.data.text.tokenizer_for`, the copy the run
+    holds); the byte vocabulary, which has no files, by its name."""
+    from dew.data.text import HFTokenizer, tokenizer_for
 
     if settings.tokenizer is None:
         return None
-    found = saved_tokenizer(settings.tokenizer, settings.tokenizer_files, run)
+    found = tokenizer_for(settings.tokenizer, files=settings.tokenizer_files, held=run)
     return found if isinstance(found, HFTokenizer) else settings.tokenizer
 
 
@@ -526,7 +525,8 @@ class Decide(SavedRunTask, InItsForm):
                   weights: Weights, dtype: DTypeLike | None) -> Self:
         """The task a run's `record` describes over `backbone` and `variables`, the `weights` they are:
         its head, layout, tokenizer, special tokens and processor as the run recorded them."""
-        from dew.inference.tasks import saved_settings, saved_tokenizer
+        from dew.data.text import tokenizer_for
+        from dew.inference.tasks import saved_settings
         from dew.interop.pretrained import load_processor
 
         settings = saved_settings(record, DecideSettings)
@@ -553,7 +553,7 @@ class Decide(SavedRunTask, InItsForm):
         # here as documents continuing the shared part: the same tokens at the same positions, each
         # question reading the shared part and itself (with siblings, the questions before it), so the
         # same function, each held to its questions' own rows (tests/test_decision_state_once.py).
-        tokenizer = saved_tokenizer(settings.tokenizer, settings.tokenizer_files, directory)
+        tokenizer = tokenizer_for(settings.tokenizer, files=settings.tokenizer_files, held=directory)
         return cls(model, variables, settings.layout, tokenizer, settings.specials,
                    name=str(epath.Path(directory).name), weights=weights, processor=processor, budget=budget,
                    derives_sharing=False)
@@ -1390,8 +1390,12 @@ class Decide(SavedRunTask, InItsForm):
 
         With `whole`, a request that the layout could answer only by cutting its
         state, instructions or options is refused instead, naming the maximum
-        context length, as a benchmark that forbids truncation requires
-        (Decision Index counts such a refusal as unsupported).
+        context length, and one whose context its cross-attention reads only cut
+        (past `context_length`) naming that, as a benchmark that forbids
+        truncation requires (Decision Index counts such a refusal as unsupported).
+        Without it, a longer context keeps its first tokens, and the response
+        states its whole and kept tokens (`usage.context_tokens`,
+        `usage.context_kept`).
         """
         if isinstance(request, Mapping):
             [answered] = self._systemone([request], details=details, strict=strict, whole=whole)
@@ -1775,8 +1779,11 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
             removed = {kind: tokens for kind, (_, tokens) in usage.cut.items()}
             with self.counting:
                 self.counts.dropped(Rejected("cut", cut=removed))
-            cut = ("state" if usage.truncated else "context" if usage.context_cut
-                   else "instructions or options")
+            if usage.context_cut:
+                # A context's room is its cross-attention's, apart from the row's.
+                raise Refused("cut", f"the request's context does not fit the context length, context_length="
+                                     f"{decide.context_length} tokens, without cutting it")
+            cut = "state" if usage.truncated else "instructions or options"
             raise Refused("cut", f"the request does not fit the maximum context length, max_len="
                                  f"{decide.layout.max_len} tokens, without cutting its {cut}")
         with self.counting:
