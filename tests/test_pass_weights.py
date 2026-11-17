@@ -128,10 +128,9 @@ def test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_wei
     (check 1). The two questions' options are named, not described, so the joint row fits in 512 tokens,
     where `test_decision_consistency.NEGATED`'s described nouls and a third question took 959 and the
     test set its CI train's wall (row 7291)."""
-    from dew.decision import Group, JointSchemaHead
-    from dew.decision.layout import SegmentLayout
+    from dew.decision import Group, JointLayout, JointSchemaHead
 
-    layout = SegmentLayout.joint_row(max_len=512)
+    layout = JointLayout(max_len=512)
     asked = {"a": Choice("Billing?", ["y", "n"]), "b": Choice("Other?", ["y", "n"])}
     negated = Example("charged twice", asked, {"a": "y", "b": "n"}, groups=(
         Group("billing", {"a": {"y": "yes", "n": "no"}, "b": {"y": "no", "n": "yes"}}),))
