@@ -31,9 +31,9 @@ or alone, except where the model's products round at boundaries that its
 programs' own roundings cross (a quantized decoder's moving weights, ledger
 2032, and a paged prefill's attention where a device's paged kernel reads the
 pool, docs/concepts/inference.md): there each draw is on par with the model's
-full forward, by check 1, not equal to the lone task's. `submit` returns a future for its `Generation`, `step` runs one
-iteration, `run` steps until queue and rows are empty, and calling the
-server with a batch does both.
+full forward, by check 1, not equal to the lone task's. `submit` returns a
+future for its `Generation`, `step` runs one iteration, `run` steps until
+queue and rows are empty, and calling the server with a batch does both.
 
 Per step the host does the admission bookkeeping and one copy of the drawn
 ids, and reads a step's draws only after dispatching the next, so the device
@@ -622,10 +622,15 @@ slots, each row's cache whole ('whole'), or None, the server's default layout.""
 
 def served_layout(task: TextGeneration, capacity: int, kv_cache: KVCache | PageSize = None) -> KVCache | None:
     """The cache layout `Server.from_task` lays `task`'s rows of `capacity` slots in for its `kv_cache`
-    (`_laid`), None for a model of no layout, whose rows are whole: what a caller deciding by it reads, as
-    an episode cohort serves its turns only over pages (`dew.objectives.rl.RolloutScheduler.episodes`)."""
-    *_, strategy = resolve(*task._controls(None, None, None), task.strategy)
-    return _laid(task.model, kv_cache, capacity, strategy, None)
+    (`_laid`), None for a model of no layout, whose rows are whole; and where it names none, that layout
+    only where a server over it keeps a prefix cache (`_reuses_prefixes`), None where not: what a caller
+    serving the task only where its server shares prompts' pages reads, as an episode cohort does
+    (`dew.objectives.rl.RolloutScheduler.episodes`)."""
+    *_, strategy = resolve(*task.controls(), task.strategy)
+    layout = _laid(task.model, kv_cache, capacity, strategy, None)
+    if kv_cache is None and not _reuses_prefixes(task.model, layout, strategy, None):
+        return None
+    return layout
 
 
 def _served_mesh(task: TextGeneration) -> Mesh | None:
@@ -949,7 +954,7 @@ class Server:
         run's, and `reload` moves it to the version it serves.
         """
         mesh = _served_mesh(task)
-        policy, chain, criteria = task._controls(None, None, None)
+        policy, chain, criteria = task.controls()
         transforms, stopping, strategy = resolve(policy, chain, criteria, task.strategy)
         layout = _laid(task.model, kv_cache, capacity, strategy, prefill_mesh)
         if prefix_cache is None:

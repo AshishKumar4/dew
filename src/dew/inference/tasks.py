@@ -1240,10 +1240,13 @@ class TextGeneration(_NativeTextTask):
         bound.__dict__["_stops"] = self._stops
         return bound
 
-    def _controls(self, sampling: Sampling | None, logits: Transforms | None, stopping: Criteria | None
-                  ) -> tuple[Sampling, Transforms | None, tuple[Stopping, ...]]:
+    def controls(self, sampling: Sampling | None = None, logits: Transforms | None = None,
+                 stopping: Criteria | None = None
+                 ) -> tuple[Sampling, Transforms | None, tuple[Stopping, ...]]:
         """The policy, chain and criteria a call runs, the stop strings compiled
-        into criteria and the EOS and pad ids filled from the task's policy."""
+        into criteria and the EOS and pad ids filled from the task's policy: a call
+        that overrides none of them, the task's own, which a server serves
+        (`dew.inference.serving.Server.from_task`)."""
         policy = self.sampling if sampling is None else with_ids_of(sampling, self.sampling)
         stops = self._stops if policy.stop == self.sampling.stop else self._stop_criteria(policy.stop)
         chain = (self.logits if sampling is None else None) if logits is None else logits
@@ -1317,7 +1320,7 @@ class TextGeneration(_NativeTextTask):
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                           max_length=self.max_length, key=key)
             shaped, trips, capacity = _bucketed(inputs, budget, cache_ceiling(self.model))
-            policy, chain, criteria = self._controls(sampling, logits, stopping)
+            policy, chain, criteria = self.controls(sampling, logits, stopping)
             generated = generate(cache_sized(self.model, capacity), self.placed, shaped, budget,
                                  key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,
                                  stopping=criteria, strategy=self.strategy if strategy is None else strategy,
