@@ -25,8 +25,9 @@ def forget_prefix(forget_logits: jax.Array, segment_ids: jax.Array | None = None
     gates = -softplus(-wide)
     restarts = None if segment_ids is None else jnp.broadcast_to(
         document_starts(segment_ids, jnp.ones(segment_ids.shape, bool))[..., None], gates.shape)
-    high, _ = scan.compensated(gates, axis=1, restarts=restarts)
-    return high.transpose(0, 2, 1)
+    high, low = scan.compensated(gates, axis=1, restarts=restarts)
+    # The pair rounded once: the separable bias reads one value a token.
+    return (high + low).transpose(0, 2, 1)
 
 
 def forgetting_attention(query: jax.Array, key: jax.Array, value: jax.Array, forget_logits: jax.Array, *,
