@@ -158,7 +158,7 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         # Each told the unit it prepares, as the lane names it, under which its programs' memory is filed.
         assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"), name)}
         prepared[group] = {line[0] for line in lines}
-    assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "a test that prepares nothing is skipped"
+    assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "one that prepares nothing is skipped"
     assert not stored, "a prepare records no row"
     assert not (tmp_path / "artifacts" / "progress.jsonl").exists(), "nor any test as passed (review)"
     monkeypatch.delenv("ARMADA_RESUME")
