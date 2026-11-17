@@ -1554,7 +1554,7 @@ class PassPlan:
         rows, decide = self.rows, self.decide
         if not rows or not self.alive:
             return len(rows)
-        whole = decide._shape(rows)
+        whole = self.shape()
         windows = self.placing[self.alive[0]].windows
         below = max((shape.rows for shape in decide.pass_shapes
                      if shape.length == whole.length and shape.rows < whole.rows), default=None)
