@@ -33,7 +33,6 @@ from dew.decision.layout import (
     context_tokens,
     per_question,
     question_fields,
-    reader_of,
     with_context,
 )
 from dew.decision.questions import Choice, Question
@@ -88,8 +87,8 @@ class Encoding(ReadsEarlierLayouts):
 
     @property
     def context_reader(self) -> Tokenizer | ContextReader:
-        """What a row's context is tokenized by (`dew.decision.layout.reader_of`)."""
-        return reader_of(self.tokenizer, self.context_encoder)
+        """What a row's context is tokenized by (`dew.decision.layout.context_tokens`)."""
+        return self.tokenizer if self.context_encoder is None else self.context_encoder
 
     def fewest_tokens(self, row: "FittedRow") -> int:
         """The fewest tokens a draw of this encoding lays `row` out to: a drawn order keeps a row's length,
@@ -415,8 +414,8 @@ class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
 
     @property
     def context_reader(self) -> Tokenizer | ContextReader:
-        """What a row's context is tokenized by (`dew.decision.layout.reader_of`)."""
-        return reader_of(self.tokenizer, self.context_encoder)
+        """What a row's context is tokenized by (`dew.decision.layout.context_tokens`)."""
+        return self.tokenizer if self.context_encoder is None else self.context_encoder
 
     def map(self, element: Batch) -> Batch | Rejected:
         fitted = self._fitted(element)

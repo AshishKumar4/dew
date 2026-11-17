@@ -98,7 +98,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
 
-- Dew requires its JAX build 0.12.0.1.post106 and, on Linux x86_64 and aarch64, its own jaxlib build
+- Dew requires its JAX build 0.12.0.1.post108 and, on Linux x86_64 and aarch64, its own jaxlib build
   0.12.0.1.post103, with its CUDA and PJRT plugins 0.12.0.1.post103 (post96's until now). A GPU compile takes a
   device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
   whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
@@ -114,7 +114,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   integer's exclusive or with 1; and XLA's HLO evaluator left a float32 dot over an empty contraction
   uninitialized, zeros now (row 6942). Pallas Triton lowers an optimization barrier, a one-element slice, boolean
   reductions and hijax primitives (the attention's merge kernel), and which devices a process sees no longer
-  splits a Mosaic GPU lowering's key (row 6717). Elsewhere jaxlib stays the stock 0.12.0.1.
+  splits a Mosaic GPU lowering's key (row 6717). Four faults are fixed with them: a staged `custom_jvp` call's
+  shared output under `vmap` through a `shard_map` was summed, now refused as without one; a declared lowering-cache
+  package holding an unreadable file failed the lowering, which now runs uncached; a named barrier's arrive-and-wait
+  in a warp context could hang its block, now refused as its arrive is; and an interpreted Mosaic GPU kernel's
+  shared memory admitted another execution's device beside the live one's, now one execution at a time. Elsewhere
+  jaxlib stays the stock 0.12.0.1.
 
 - A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
   anything, where its run states no `ns_group`: a step that fits only with them joined one at a time takes

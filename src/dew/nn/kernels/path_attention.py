@@ -18,8 +18,9 @@ import jax
 import jax.numpy as jnp
 from jax.scipy.linalg import solve_triangular
 
+from dew.algebra import scan
 from dew.nn.kernels.deltaformer import causal_masks, masked_softmax
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, compensated_difference
 
 
 def _headed(t, heads: int, work):
@@ -32,10 +33,16 @@ def _headed(t, heads: int, work):
 def _attended(scores, value, gate, scale: float, starts):
     """The output `[B, H, T, Dv]` of `scores` `[B, H, T, T]` (each query against each key, before its scale),
     the gate's log decay `[B, H, T]` (None for none) added as its running sums' difference and scaled with
-    them, a causal softmax within each packed document (`starts`)."""
+    them, a causal softmax within each packed document (`starts`). The running sums are each document's own,
+    compensated (`scan.compensated`, restarting at its first token), and a pair's difference is taken from
+    both halves (`compensated_difference`): a whole row's sum after an earlier document's gates of -2^30
+    rounded every later prefix to -2^30, its documents' differences to 0 (row 7609)."""
     if gate is not None:
-        running = jnp.cumsum(gate, axis=-1)
-        scores = scores + running[..., :, None] - running[..., None, :]
+        restarts = (None if starts is None
+                    else jnp.broadcast_to(jnp.asarray(starts, bool)[:, None], gate.shape))
+        high, low = scan.compensated(gate, axis=-1, restarts=restarts)
+        scores = scores + compensated_difference((high[..., :, None], low[..., :, None]),
+                                                 (high[..., None, :], low[..., None, :]))
     _, causal = causal_masks(scores.shape[-1], starts)
     return jnp.einsum('bhts,bhsd->bhtd', masked_softmax(scores * scale, causal), value)
 

@@ -19,7 +19,10 @@ from dew.data import Hub
 from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig
 
-TRAIN, HELD = Hub("mteb/banking77", revision="18072d2685ea682290f7b8924d94c62acc19c0b2").holdout(0.1)
+
+def banking77():
+    """BANKING77's training split at its pinned commit, a tenth of its rows held out."""
+    return Hub("mteb/banking77", revision="18072d2685ea682290f7b8924d94c62acc19c0b2").holdout(0.1)
 
 
 def asked(rows):
@@ -28,6 +31,10 @@ def asked(rows):
                      instructions="Which banking request is this?").read("memory")
 
 
+def default(train, held) -> DecisionRunConfig:
+    """The recipe's run over a table's `train` and `held` rows, each a `text` and its `label_text`."""
+    return DecisionRunConfig(data=asked(train).shuffle().repeat().batch(32), validation=asked(held).batch(32))
+
+
 if __name__ == "__main__":
-    DecisionRunConfig.cli(default=DecisionRunConfig(data=asked(TRAIN).shuffle().repeat().batch(32),
-                                                    validation=asked(HELD).batch(32))).run()
+    DecisionRunConfig.cli(default=default(*banking77())).run()

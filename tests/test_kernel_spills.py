@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from lane_environment import DETERMINISTIC_OPS
 from generation_support import lowers
 from jax.experimental.layout import Format, Layout
 from kernel_compile import Uncounted
@@ -172,7 +173,8 @@ it lowered by name."""
 
 
 @lowers("sm90")
-def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path):
+@pytest.mark.parametrize("flags", [None, DETERMINISTIC_OPS], ids=["own flags", "deterministic ops"])
+def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, flags):
     """A one-layer decoder of the 4B's gated delta net, its step compiled ahead for a compile-only H100
     (`RECURRENT_AHEAD`), twice over one cache: at its derived tiles its output launch spills (8 bytes at 128
     registers under the cuda12 build's ptxas), and each process lowers the step once. Certification compiles
@@ -182,9 +184,11 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path):
     and the program's compile stepped it down a whole-step relowering a rung, again in every process
     (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm). Each certification's program is named by its
     launch and config (`certified_<op>_l<launch>_c<config>`), so a start's events tell its rungs apart: the
-    cold process lowers each once, two configs of the output launch among them, and the warm one none."""
+    cold process lowers each once, two configs of the output launch among them, and the warm one none,
+    under deterministic ops too, which keep no picks but keep the verdicts (row 7308: every warm start under
+    --xla_gpu_deterministic_ops certified every launch again)."""
     cache = tmp_path / "cache"
-    cold, warm = (fresh(RECURRENT_AHEAD, cache_dir=cache)["lowered"] for _ in range(2))
+    cold, warm = (fresh(RECURRENT_AHEAD, cache_dir=cache, flags=flags)["lowered"] for _ in range(2))
     assert [run.count("jit(step)") for run in (cold, warm)] == [1, 1], (cold, warm)
     certified = [name for name in cold if name.startswith("jit(certified_")]
     assert len(set(certified)) == len(certified), certified

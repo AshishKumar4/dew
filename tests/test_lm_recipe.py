@@ -58,7 +58,7 @@ def test_the_recipes_default_chain_trains_an_epoch_of_another_store(tmp_path):
         tokens, "--set", f"data.source.url={tokens.train}", "--set", f"data.token_windows.seq_len={SEQ}",
         "--set", "data.token_windows.batch=8", "--trainer.epochs", "1", "--trainer.name", "default",
         "--max-new-tokens", "0", model_config='{"emb_features": 16, "num_layers": 1, "num_heads": 2}'),
-        default=LMRunConfig(data=recipe.WINDOWS))
+        default=recipe.default())
     assert int(config.run().step) == 5
 
 

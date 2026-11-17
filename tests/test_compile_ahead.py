@@ -26,6 +26,7 @@ import optax
 import process_support
 import pytest
 from lane_environment import without_flags
+from generation_support import COMPILES_ON_CPU
 from jax.extend import custom_call_targets, xla
 from kernel_compile import gate_generations
 from model_support import TINY_DECODER, memory_limited_to
@@ -1223,6 +1224,7 @@ def test_a_program_holding_a_kernel_this_host_cannot_lower_is_refused_ahead_nami
                                                                                   "attention")
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("generation", [name for name in gate_generations() if capability(name) >= (9, 0)])
 def test_a_compile_only_gpu_assembles_mosaic_gpus_architecture_specific_code(generation):
     """A Mosaic GPU kernel compiled for a compile-only GPU of each generation from Hopper on, in a process

@@ -135,7 +135,7 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                   max_segments: int | None = None, scale: float | None = None,
                   family: mosaic.Family | None = None, interpret: bool = False,
                   inverse=None, kept=None, delta: bool = True,
-                  rounded: bool = False, ranged: bool = False,
+                  rounded: bool = False, apart: int = 0, ranged: bool = False,
                   skip=None,
                   forked: ForkedTable | None = None) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
@@ -164,7 +164,8 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                                   "fp32 call's under the run's fast forms alone")
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
-                   firsts=firsts, rounded=rounded, ranged=ranged, forked=forked, skipped=skip is not None)
+                   firsts=firsts, rounded=rounded, apart=apart, ranged=ranged, forked=forked,
+                   skipped=skip is not None)
     call = run.call
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
     laid_do = call.given.split(run.laid(zero_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))
@@ -374,7 +375,7 @@ def _local_back(q, k, do, hi, lo, taken, call: Call, *, scale: float):
                 functools.partial(block, "keys"), functools.partial(block, "queries"), width // call.block,
                 gate, low, lambda j: stream_tile(slots, "out", given, columns=pl.ds(j * vb, vb)),
                                    value_width // vb,
-                scale, call.held.dtype, issue, issue.summed, emit=stored, laid=laid)
+                scale, call.held.dtype, issue, issue.summed, emit=stored, laid=laid, apart=call.apart)
             return carry, accumulators
 
         return mosaic.Walk(views, step, prologue=None if streamed else lambda: read(None))
@@ -777,17 +778,17 @@ def _query_key_views(call: Call, keyed: tuple, served: tuple, memory: tuple, *, 
 
 
 def _gradient_stored(call: Call, kind: str, block: int, grad, *, weights: Sequence, sums: dict, first,
-                     landing: dict, apart: bool = False) -> None:
+                     landing: dict, split: bool = False) -> None:
     """`algebra.memory_gradients`' emit in `_query_key`: the weights' gradient (`kind` 'dw') in the
     operands' dtype to `weights` (its parts' views) as it is final, as fla's dqkwg writes it; the queries'
     and keys' ('dq', 'dk') to `sums[kind]` summed over the key head's value heads in fp32, stored at the
     first (`first`) and added at the rest (`Family.added`: a TMA reduction, or whole rows through
-    registers), each through its launch's landing tiles. A value split's (`apart`) weights' gradient is its
+    registers), each through its launch's landing tiles. A value split's (`split`) weights' gradient is its
     split's own part of it, fp32, which XLA adds, through its own landing tile."""
     del block
     family = call.family
     if kind == "dw":
-        if apart:
+        if split:
             family.stored([grad], weights, smem=landing["weights"])
             return
         pieces = product.formed(grad.astype(jnp.float32), call.held.parts) if call.held.parts > 1 else (grad,)
@@ -963,7 +964,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
                        held.views(weights_ref[0], row, chunk, weights_at, call.block) if splits == 1 else
                        [weights_ref[0].at[span, pl.ds(split * call.heads * width + weights_at, call.block)]])
             stored = functools.partial(_gradient_stored, call, weights=weights, sums=sums, first=first_head,
-                                       landing=landing, apart=splits > 1)
+                                       landing=landing, split=splits > 1)
 
             issue = Issuer(call)
             ds = stream_tile(slots, "ds", grads) if scores else None
@@ -1158,7 +1159,8 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
                 width // call.block, functools.partial(value_column, "values", held),
                 functools.partial(value_column, "out", given), blocks, gate, low, scale,
                 grads.dtype if accumulated is None else jnp.float32, Issuer(call).summed, laid=laid,
-                column_scale=family.columns_of(beta_ref.at[h, span]) if call.gated_keys else None)
+                column_scale=family.columns_of(beta_ref.at[h, span]) if call.gated_keys else None,
+                apart=call.apart)
             # The pairs' sum before the scores' gradient's store, so an fp32 call's parts form after the
             # pairs are gone.
             decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, column_sums)

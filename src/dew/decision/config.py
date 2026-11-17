@@ -20,8 +20,6 @@ from __future__ import annotations
 
 import dataclasses
 import os
-import types
-import typing
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
 
@@ -55,13 +53,20 @@ from dew.decision.rows import option_width
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.inputs.condition import ConditionEncoder
-from dew.inputs.spec import Condition, TextCondition
+from dew.inputs.spec import TextCondition
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, SharedCrossAttention
-from dew.nn.dit import TextContext
 from dew.nn.protocols import CountedCondition, RematChoosing
 from dew.optim import OptimConfig
-from dew.registry import ModelConfig, class_record, dtype_name, from_record, import_path, record_argument
+from dew.registry import (
+    ModelConfig,
+    class_record,
+    dtype_name,
+    encoders,
+    from_record,
+    import_path,
+    record_argument,
+)
 from dew.state import TrainState
 
 if TYPE_CHECKING:
@@ -98,24 +103,6 @@ def _data_summary(dataset: Loader) -> Mapping[str, object]:
     if declined:
         found["none_of_the_above_declined"] = declined
     return found
-
-
-def encodes_text(kind: type) -> bool:
-    """Whether encoders of `kind` read text into the states context layers read: its class a
-    `ConditionEncoder[str, TextContext]` (`char_table`, `clip_text`, `t5`), not a denoiser's conditioner,
-    which gives a condition of its own, nor an encoder of another input."""
-    declared = [base for klass in kind.__mro__ for base in types.get_original_bases(klass)
-                if typing.get_origin(base) is ConditionEncoder]
-    return any(typing.get_args(base) == (str, TextContext) for base in declared)
-
-
-def _text_encoder(condition: Condition) -> ConditionEncoder:
-    """`condition`'s encoder, refused (ValueError) where it reads no text into the states context layers
-    read (`encodes_text`)."""
-    if not encodes_text(type(condition.encoder)):
-        raise ValueError(f"--context-text.encoder {type(condition.encoder).__name__} encodes no text into "
-                         "the states context layers read; name one that does (char_table, clip_text, t5)")
-    return condition.encoder
 
 
 @dataclasses.dataclass(frozen=True)
@@ -315,14 +302,15 @@ class DecisionRunConfig(DecoderRunConfig):
 
     def _context_derived(self, dtype: str) -> Mapping[str, object]:
         """The objective's context arguments: how its backbone encodes a row's context, or the encoder a
-        run configures (`context_text`, built in the run's compute `dtype` and refused where it encodes no
-        text, `_text_encoder`) and whether its weights train (`context_text_trained`)."""
+        run configures (`context_text`, built in the run's compute `dtype`, one that encodes text as
+        `_refuse_unread_context` holds it) and whether its weights train (`context_text_trained`, which
+        `build_run` reads as well for an encoder its start carries)."""
         if self.context_layers is None:
             return {}
         if self.context_text is None:
             return {"context_encoder": self.context_encoder}
         built = self.context_text.build(dtype=dtype_name(jnp.dtype(dtype)))
-        return {"context_encoder": _text_encoder(built), "context_trained": self.context_text_trained}
+        return {"context_encoder": built.encoder, "context_trained": self.context_text_trained}
 
     def _refuse_unread_context(self) -> None:
         """Refuse each context option a run without context layers would read nothing of: a schema read
@@ -337,14 +325,19 @@ class DecisionRunConfig(DecoderRunConfig):
             raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
         if self.context_text is not None and self.context_layers is None:
             raise ValueError("--context-text encodes the context context layers read; set --context-layers")
-        if self.context_text_trained and self.context_text is None:
-            raise ValueError("--context-text-trained trains a configured context encoder; set --context-text")
         text = self.context_text
         if text is not None and (text.field, text.unconditional) != (TextCondition.field,
                                                                      TextCondition.unconditional):
             raise ValueError("a decision's context encoder reads the row's context field and has no "
                              "unconditional branch; --context-text.field and --context-text.unconditional "
                              "are a diffusion run's")
+        if text is not None:
+            # The states context layers read are a text's (`TextContext`, keyword `textcontext`): an encoder
+            # of another input, or a denoiser's conditioner, is refused by its declarations, before any build.
+            kind = encoders[text.encoder]
+            if not kind.reads_captions or kind.keyword != ConditionEncoder.keyword:
+                raise ValueError(f"--context-text.encoder {text.encoder} encodes no text into the states "
+                                 "context layers read; name one that does (char_table, clip_text, t5)")
         if not self.context_frozen and self.context_layers is None:
             raise ValueError("--no-context-frozen says how context layers hold the backbone; set "
                              "--context-layers")
@@ -353,16 +346,14 @@ class DecisionRunConfig(DecoderRunConfig):
 
     def _context_blocks(self, configured: ConditionEncoder | None) -> CrossAttention | SharedCrossAttention:
         """The context layers the run draws (`context_form`), reading a configured encoder's states at its own
-        width (`ConditionWork.features`), else the backbone's."""
+        width (`ConditionWork.features`), else the backbone's; a shared layer reads them at the backbone's."""
         assert self.context_layers is not None
-        if configured is None:
-            form = SharedCrossAttention if self.context_form == "shared" else CrossAttention
-            return form(self.context_layers, self.context_length)
         if self.context_form == "shared":
-            raise ValueError("--context-form shared reads a context in the layer's own attention, at the "
-                             "backbone's width, which a configured --context-text encoder's states are not")
-        return CrossAttention(self.context_layers, self.context_length,
-                              context_features=_encoded_width(configured))
+            # The layer's own attention reads the context at the backbone's width, a configured encoder's
+            # states among them where they are that wide; the layer refuses any other width.
+            return SharedCrossAttention(self.context_layers, self.context_length)
+        features = None if configured is None else _encoded_width(configured)
+        return CrossAttention(self.context_layers, self.context_length, context_features=features)
 
     def build_run(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
@@ -397,6 +388,13 @@ class DecisionRunConfig(DecoderRunConfig):
             derived["tokenizer"] = start.decision_tokenizer
             start = start.backbone()
         release = isinstance(start, PretrainedDecision)
+        # A configured context encoder trains as the run says, the run's own (`_context_derived`) or the one a
+        # saved run or release it starts from carries (`PretrainedDecision.context`).
+        if isinstance(start, PretrainedDecision) and start.context is not None:
+            derived["context_trained"] = self.context_text_trained
+        elif self.context_text_trained and self.context_text is None:
+            raise ValueError("--context-text-trained trains a configured context encoder, which neither the "
+                             "run (--context-text) nor its start carries")
         # Whether a fresh head's rows lie in blocks, as the loaded checkpoint and the run declare it.
         blocked = not release and reads_blocks(start.config, self.source.overrides())
         # The backbone's own transformations, a release's as a fresh backbone's: its head and layout

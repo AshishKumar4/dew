@@ -164,6 +164,17 @@ def test_the_chunked_form_is_as_exact_as_the_recurrence(packed, rank):
                     seeds=SEEDS[packed, rank], terms=RESET_TERMS)
 
 
+def test_a_rank_whose_chunk_cuts_its_groups_walks_whole_ones():
+    """Three ranks a token over a chunk of 16 op tokens, which no group of three divides: the portable walk
+    takes the largest chunk of whole groups within it (`recurrence_chunk._portable`, 15), never refused for a
+    cut group, its output, final state and gradients on par with the recurrence a token at a time's
+    (check 1)."""
+    dew = jax.jit(with_gradients(functools.partial(chunked, starts=None)))
+    reference = jax.jit(with_gradients(functools.partial(recurrent_mamba3, starts=None)))
+    assert_as_exact(dew, reference, functools.partial(draw, 3), 'mamba3 rank=3', seeds=SEEDS[False, MIMO],
+                    terms=RESET_TERMS)
+
+
 @pytest.mark.parametrize('route', NARROW_ROUTES)
 def test_a_bf16_layers_chunked_form_on_the_template_is_as_exact_as_on_the_portable_math(route):
     """Mamba-3's chunked form on a bf16 layer's operands (`narrow_draw`) on the recurrence template, on each

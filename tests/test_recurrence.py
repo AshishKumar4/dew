@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import kernel_matrix
 import numpy as np
 import pytest
+from generation_support import COMPILES_ON_CPU
 from reference_error import assert_as_exact
 from test_recurrence_chunk import ROUTES, on_route
 
@@ -82,6 +83,8 @@ FORMED = [
     recurrence.Hooks(decay='scalar', reads='before'),
     recurrence.Hooks(decay='vector', delta=False, write_gate=True, own_weight=True),
     recurrence.Hooks(decay='none', delta=False, reads='before'),
+    recurrence.Hooks(decay='scalar', delta=False, write_gate=True, reads='apart'),
+    recurrence.Hooks(decay='vector', delta=False, reads='apart'),
 ]
 """The launch's other prologue values: Mamba2's step gates clipped with the skip, the gated delta rule's
 gates with a clipped step, a scale without the l2 norm and one under it, a rated decay with the
@@ -89,10 +92,13 @@ skip and the norm (`recurrence_chunk.chunk`'s SSD), and the readout's timing and
 (`Hooks.reads`, `Hooks.own_weight`): RWKV6's (a decay a key dimension read before the update, its bonus),
 the delta rule read before its update, a write gate's own write weighed in a readout after it, and a
 readout of the state entering its token alone, undecayed and with no delta rule: its key walk sums one
-term (`step._summed_keys`), which a tuple of one wrapped again failed to trace (audit 2026-11-17)."""
+term (`step._summed_keys`), which a tuple of one wrapped again failed to trace (audit 2026-11-17); and a
+readout apart from its token's own write ('apart', row 7402), a decay a head's under a write gate
+(Mamba-3's) and a key dimension's."""
 
-FORMED_SEEDS = dict(zip(FORMED, (8, 16, 8, 8, 16, 16, 16, 16, 8), strict=True))
-"""The formed sites' seeds, sized independently by `seeds_for` on armada (2026-10-21; the last 2026-11-17)."""
+FORMED_SEEDS = dict(zip(FORMED, (8, 16, 8, 8, 16, 16, 16, 16, 8, 8, 8), strict=True))
+"""The formed sites' seeds, sized independently by `seeds_for` on armada (2026-10-21; the last three
+2026-11-17)."""
 
 BF16_SEEDS = {HOOKS[0]: 8, HOOKS[-1]: 16}
 """The bf16-state sites' seeds, sized by `seeds_for` on armada (2026-10-20), including every output."""
@@ -419,6 +425,7 @@ def test_a_step_reads_its_updated_state(delta, per_key):
     np.testing.assert_array_equal(out, jnp.full((1, width), 2.0 ** 80, jnp.float32))
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("local", [True, False], ids=["per-shard", "partitioned"])
 def test_a_decode_tokens_launch_runs_per_shard_moving_nothing(local):
     """A gated delta rule's decode token (`recurrence.step`, the template's step) over four rows split over
@@ -456,6 +463,7 @@ def test_a_decode_tokens_launch_runs_per_shard_moving_nothing(local):
     assert (failed == []) == local, failed
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize('rows', [1, 128], ids=['one row', '128 rows'])
 @pytest.mark.parametrize('target', ['sm80', 'sm90', 'sm100'])
 def test_a_decode_step_holds_its_registers_at_the_residency_it_plans(target, rows):

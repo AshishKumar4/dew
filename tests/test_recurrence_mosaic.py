@@ -277,7 +277,7 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     wide = hooks.output is not None or (hooks.skip and hooks.delta)
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=wide, bound=hooks.inverse_bound, rounded=rounded,
-                                skip=None if hooks.delta else given.skip)
+                                skip=None if hooks.delta else given.skip, apart=hooks.apart)
 
 
 def refuses_its_gradient(fn, *drawn) -> None:
@@ -356,12 +356,13 @@ def drawn_forward(case: str, dtype: str) -> Callable:
                   COVERED[case, dtype, 'forward'])
 
 
-@pytest.mark.check1_shards(seeds=256, per_task=8)
+@pytest.mark.check1_shards(seeds=256, per_task=4)
 @drawn_forward('one sequence', 'fp32')
 def test_the_mosaic_forward_over_one_fp32_sequence_is_as_exact_as_its_reference():
     """`the_mosaic_forward_is_as_exact_as_its_reference` at an fp32 call over one sequence, under either
-    forms: eight draws a task, an fp32 draw over its routes 42 s at CI's rate (sixteen took 670 s, past a
-    train's bound, train 860's CI)."""
+    forms: four draws a task, an fp32 draw over its three routes (None, sm80, sm100) its two arms interpreted
+    each, 7.5 s a draw and 57 s of compiles a task on an armada probe and 78 s a draw at CI's rate (eight took
+    623 s, past a train's bound, train de27b8e32's CI, row 7459)."""
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=16)
@@ -790,6 +791,26 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
                     seeds=HOOK_SEEDS[hooks, packed])
 
 
+GROUPED = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, reads='apart', ranks=2)
+"""A readout apart from its token's two ranks' writes (Mamba-3 MIMO's, `recurrence.Hooks.ranks`)."""
+
+
+def test_a_readout_apart_from_its_tokens_ranks_is_on_par_with_the_portable_math_interpreted():
+    """The chunked op of a call whose tokens' writes take two op tokens each, its readout apart from them
+    (`GROUPED`), on the template, which keeps the pairs of later tokens alone (`algebra._later_groups`,
+    mamba_ssm's MIMO `i // R > j // R`), output and final memory on par with the portable math's from
+    float64 (check 1; the portable math's read of the state entering a token, less its group's earlier
+    writes, exact in float64, row 7402), one sequence of a value head a key head, under the run's forms."""
+    forms = generation.numerics().forms
+    dew = jax.jit(formed(forms, functools.partial(chunk_on, 'mosaic_gpu', GROUPED)))
+    reference = jax.jit(functools.partial(chunk_on, 'xla', GROUPED))
+
+    def one_sequence(seed):
+        return hooked_draw(GROUPED, packed=False, seed=seed, value_heads=1)
+
+    assert_as_exact(dew, reference, one_sequence, f'{GROUPED} on the template', seeds=32)
+
+
 HOOK_CELLS = [(hooks, packed) for hooks in TAKEN for packed in (False, True)]
 """The mainloop's hook cells, each hook combination over one sequence and packed documents."""
 
@@ -871,6 +892,7 @@ def resource_operands(name: str, dtype, rows: int, length: int) -> list[jax.Shap
                                                     kind=jnp.float32)]
 
 
+@COMPILES_ON_CPU
 @lowers('sm90')
 def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     """The 27B gated delta net's forward launched twice in one program on an H100, at its derived tiles and
@@ -1438,6 +1460,7 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     assert not failed, "\n".join(failed)
 
 
+@COMPILES_ON_CPU
 @lowers('sm100')
 @pytest.mark.parametrize('name', ['qwen3.5-27b-gdn', 'nemotron-h-4b-ssd'])
 def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blackwell(name):
@@ -1739,7 +1762,7 @@ def test_a_launch_past_its_ladders_foot_is_certified_at_a_program_fewer():
             operands).lower(lowering_platforms=('cuda',))
     walked = [each for each in report.certifications() if id(each) not in before and any(
         binary.kernel == 'recurrence_query_key' for _, binary in each.kernels.values())]
-    # A round certifies its rungs together: one after the rung that holds is certified, and not taken.
+    # Rungs are certified one after another: the walk stops at the first that holds.
     held = [each.config.residents.of('recurrence_query_key') for each in walked if not each.refused]
     assert held == [2], walked
 
@@ -1816,7 +1839,8 @@ def test_lightning_attentions_training_step_starts_unspilled_asking_each_rung_on
     # kernel's next rung reads nothing that moved. A rung's kernels that did not move keep their modules.
     spilled = [(each.pulled, module) for each in certified for module, binary in each.kernels.values()
                if binary.refused]
-    # A round certifies its rungs together: one after the rung a kernel holds at is certified, and not taken.
+    # Rungs are certified one after another: the launch's walk stops at the first rung where all its kernels
+    # hold, so a kernel that holds first keeps climbing with the launch.
     held: dict[str, bool] = collections.defaultdict(bool)
     for each in certified:
         for _, binary in each.kernels.values():

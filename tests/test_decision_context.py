@@ -18,7 +18,7 @@ from model_support import flat_tree
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, widened, without_ynn
 
-from dew.batch import FROZEN, thaw, unboxed
+from dew.batch import FROZEN, part, thaw, unboxed
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example
@@ -28,6 +28,7 @@ from dew.decision.layout import SegmentLayout, Specials
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.questions import ChoiceAnswer
+from dew.inputs import CharTable
 from dew.interop import Pretrained
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, crossing
 from dew.nn.multimodal import MultimodalTransformer
@@ -387,11 +388,33 @@ def test_a_decisions_context_is_its_inputs_condition_and_its_check_reads_it():
     assert dict(plain.inputs.conditions) == {}
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class Captionless(CharTable):
+    """A character table that declares it reads no captions (`ConditionEncoder.reads_captions`)."""
+
+    reads_captions = False
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class Conditioning(CharTable):
+    """A character table that declares a denoiser's conditioning keyword (`ConditionEncoder.keyword`)."""
+
+    keyword = "conditioning"
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class Wide(CharTable):
+    """A character table whose states are the tiny Laya backbone's width, 128 features."""
+
+    @classmethod
+    def from_pretrained(cls, checkpoint: str = "char_table", **settings) -> "Wide":
+        return super().from_pretrained(checkpoint, **{"features": 128, **settings})
+
+
 def configured(tokens: int = 12, *, trained: bool = False) -> DecisionObjective:
     """A decision over the tiny Llama whose context is encoded by a configured encoder (`CharTable`, a
     character table of 16 features) in place of the backbone's own, read by fresh cross-attention before
     layer 0 at that width, its windows packing rows as a decision's do."""
-    from dew.inputs import CharTable
 
     table = CharTable.from_pretrained(tokens=tokens, features=16)
     source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
@@ -408,7 +431,6 @@ def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly
     was only ever the backbone's own (6141)."""
     from dew.batch import FROZEN
     from dew.checkpoints import Checkpoints
-    from dew.inputs import CharTable
 
     objective = configured()
     assert isinstance(objective.inputs.conditions["context"].encoder, CharTable)
@@ -490,7 +512,6 @@ def test_a_configured_context_encoders_bundle_carries_it_and_its_trained_weights
     from it read its contexts with the backbone's table (theme 22's head review)."""
     from dew.data.text import HFTokenizer
     from dew.decision.sources import PretrainedDecision
-    from dew.inputs import CharTable
 
     directory = LLAMA.parent / "qwen38-dense-tiny"
     source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
@@ -504,11 +525,20 @@ def test_a_configured_context_encoders_bundle_carries_it_and_its_trained_weights
     trained = {**drawn, "params": {**drawn["params"], "context": jax.tree.map(
         lambda leaf: leaf + 1.0, drawn["params"]["context"])}}
     task = Decide(objective.model, trained, layout, tokenizer, objective.specials, processor=source.processor)
-    again = Decide.released(PretrainedDecision.of(task))
+    bundle = PretrainedDecision.of(task)
+    again = Decide.released(bundle)
     for context in ("a first note", "ten"):
         np.testing.assert_array_equal(
             np.asarray(again("one two three", QUESTION, context=context)["pick"].probabilities),
             np.asarray(task("one two three", QUESTION, context=context)["pick"].probabilities))
+    # A load's transform of the bundle's trees (`map_variables`: a placement, a cast, shapes alone) reaches
+    # the encoder's weights as the backbone's and the head's, which the task declared again reads: they were
+    # left as they were (row 7471).
+    halved = Decide.released(bundle.map_variables(lambda tree: jax.tree.map(lambda leaf: leaf / 2, tree)))
+    for name in ("backbone", "head", "context"):
+        for got, want in zip(jax.tree.leaves(part(halved.variables, name)),
+                             jax.tree.leaves(part(again.variables, name)), strict=True):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want) / 2)
 
 
 def test_a_configured_context_encoder_beside_a_schema_read_in_context_is_refused():
@@ -517,8 +547,6 @@ def test_a_configured_context_encoder_beside_a_schema_read_in_context_is_refused
     objective is refused as it is built, where it tokenized contexts in the encoder's vocabulary for the
     backbone to read (theme 22's head review)."""
     from test_decision_schema_stream import LAYOUT as IN_CONTEXT
-
-    from dew.inputs import CharTable
 
     source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
     blocks = CrossAttention((0,), 64, context_features=16)
@@ -835,11 +863,7 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
     from test_text_encoders import TINY
 
     from dew.batch import FROZEN
-    from dew.decision.config import encodes_text
-    from dew.inputs import CharTable
     from dew.inputs.spec import TextCondition
-    from dew.interop.conditioners import DiffusionConditioner
-    from dew.interop.encoders import CLIPText, HFAudio
     from dew.registry import ModelConfig
 
     text = TextCondition(encoder="clip_text", checkpoint=str(TINY))
@@ -850,9 +874,71 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
     assert jnp.dtype(objective.model.context.encoder.dtype) == jnp.dtype("bfloat16")
     state, _ = trained(run, tmp_path, "clip")
     assert "context" in state.variables[FROZEN] and "context" not in state.variables["params"]
-    for refused in (dataclasses.replace(text, field="caption"), dataclasses.replace(text, unconditional="x")):
+    # A character table is taken; one differing from it in its declarations alone (`reads_captions`,
+    # `keyword`) is refused, as an audio tower and a denoiser's conditioner are.
+    table = TextCondition(encoder="char_table", checkpoint="char_table")
+    assert isinstance(dataclasses.replace(run, context_text=table).prepare().objective.model.context.encoder,
+                      CharTable)
+    for refused in (dataclasses.replace(text, field="caption"), dataclasses.replace(text, unconditional="x"),
+                    dataclasses.replace(table, encoder=f"{__name__}:Captionless"),
+                    dataclasses.replace(table, encoder=f"{__name__}:Conditioning")):
         with pytest.raises(ValueError):
             dataclasses.replace(run, context_text=refused).prepare()
-    assert [encodes_text(kind) for kind in (CharTable, CLIPText, HFAudio, DiffusionConditioner)] == [
-        True, True, False, False]
 
+
+def test_a_run_from_a_saved_run_holds_its_configured_encoders_weights_frozen_or_trained(tmp_path):
+    """A run started from a saved run whose task configured a context encoder (`--pretrained <run>`,
+    `PretrainedDecision.context`) starts from that run's encoder weights, which its training moved from the
+    encoder's checkpoint, and holds them as it says: frozen (`FROZEN`) by default, trained (`params`) under
+    `--context-text-trained`, which such a start takes without `--context-text`; a run whose start carries
+    none refuses it. The started tree is read after a step at a learning rate of zero, which moves no
+    weight. A run from a release could not train its encoder, and the cell that stood for it read a tree's
+    structure alone (train 1003's review, F1)."""
+    from run_kinds import decision, trained
+    from test_text_encoders import TINY
+
+    from dew.config import SourceOptions
+    from dew.inputs.spec import TextCondition
+    from dew.optim import OptimConfig
+
+    text = TextCondition(encoder="clip_text", checkpoint=str(TINY))
+    first = dataclasses.replace(decision(tmp_path, drawn=False), context_layers=(0,), context_length=32,
+                                context_text=text, context_text_trained=True, calibrate=False,
+                                optim=OptimConfig(learning_rate=1e-2))
+    # Two steps: the cross-attention's gate opens from zero on the first, so the second reaches the encoder.
+    state, _ = trained(first, tmp_path, "first", trainer={"steps": 2, "checkpoint_final": True})
+    held = jax.tree.leaves(state.variables["params"]["context"])
+    checkpoint = jax.tree.leaves(text.build(dtype="float32").encoder.params)
+    assert any(np.any(np.asarray(one) != np.asarray(two)) for one, two in zip(held, checkpoint, strict=True))
+    start = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(tmp_path / "runs" / "first"),
+                                source=SourceOptions(step="latest"), calibrate=False,
+                                optim=OptimConfig(learning_rate=0.0))
+    for trains in (False, True):
+        second, _ = trained(dataclasses.replace(start, context_text_trained=trains), tmp_path,
+                            f"second-{trains}")
+        kept, other = ("params", FROZEN) if trains else (FROZEN, "params")
+        for got, want in zip(jax.tree.leaves(second.variables[kept]["context"]), held, strict=True):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+        assert "context" not in second.variables.get(other, {})
+    with pytest.raises(ValueError):
+        dataclasses.replace(decision(tmp_path, drawn=False), context_text_trained=True).prepare()
+
+
+def test_a_shared_cross_attention_reads_a_configured_encoder_of_the_backbones_width(tmp_path):
+    """`--context-form shared` reads a configured encoder's states in the layer's own attention, at the
+    backbone's width: an encoder of that width (`Wide`, 128 features as the tiny Laya backbone) trains a
+    step, and one of another width (char_table's 16) is refused by the layer's own width check. Every
+    configured encoder was refused under the shared form (row 7613)."""
+    from run_kinds import decision, trained
+
+    from dew.inputs.spec import TextCondition
+
+    run = dataclasses.replace(decision(tmp_path, drawn=False), context_layers=(0,), context_length=32,
+                              context_form="shared", calibrate=False,
+                              context_text=TextCondition(encoder=f"{__name__}:Wide", checkpoint="char_table"))
+    state, _ = trained(run, tmp_path, "shared")
+    assert "context" in state.variables[FROZEN]
+    table = TextCondition(encoder="char_table", checkpoint="char_table")
+    narrow = dataclasses.replace(run, context_text=table)
+    with pytest.raises(ValueError):
+        trained(narrow, tmp_path, "narrow")
