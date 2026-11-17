@@ -68,13 +68,15 @@ FORMED = [
     recurrence.Hooks(decay='scalar', delta=False),
     recurrence.Hooks(decay='vector', delta=False, reads='before', own_weight=True),
     recurrence.Hooks(decay='scalar', reads='before', scale=KEY_WIDTH ** -0.5, write_bound=1.0),
+    recurrence.Hooks(decay='vector', delta=False, write_gate=True, own_weight=True),
 ]
 """The prologue's and epilogue's hooks: the gated delta rule's gates and l2 norm, Mamba2's step gates
 clipped with the skip, the gated RMS norm after the l2 norm and after a plain scale, Mamba2's SSD as
 `chunk_ssd` hands it over (a rated decay, the step its write gate), with its gated norm, a rated decay
 under the delta rule and the l2 norm, the norm after the skip, a decay without any write gate, and the
 readout of the memory entering its token (`Hooks.reads`): RWKV6's, a decay a key dimension with its own
-write weighed (`Hooks.own_weight`), and the delta rule's."""
+write weighed (`Hooks.own_weight`), and the delta rule's; and a write gate's own write weighed in a readout
+after it, its own weight added to the query's read of the write, as the decode step adds it."""
 
 PACKED = (False, True)
 
