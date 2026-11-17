@@ -240,8 +240,12 @@ def _follows(operand: tuple[int, ...], shape: tuple[int, ...]) -> bool:
 
 def _elementwise(equation: jcore.JaxprEqn, shape: tuple[int, ...]) -> bool:
     """Whether `equation` computes each entry of a value of `shape` from the same entry of its operands, each
-    following its tiles (`_follows`): a member of a product's prologue or epilogue."""
-    return (entrywise(equation.primitive) and not equation.effects
+    following its tiles (`_follows`): a member of a product's prologue or epilogue. A remat name on such a
+    value (`checkpoint_name`, a gate's projection before its SwiGLU) is one, the value it names handed out
+    of the launch under its name (`fused_gemm._named`, its residual: row 7131), where it ended the region and
+    no named gate's SwiGLU joined its epilogue (row 6102)."""
+    return ((entrywise(equation.primitive) or equation.primitive is jcore.primitives.name_p)
+            and not equation.effects
             and all(_shape(var) == shape for var in equation.outvars)
             and all(_follows(_shape(var), shape) for var in equation.invars))
 
