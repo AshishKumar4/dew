@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import itertools
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -347,6 +348,14 @@ def _walking(scaled: bool = False):
         rule(eq(t).to(x.select(y, z)), anchor(x), local(y), anchor(z)).then(anchor(t)),
         rule(eq(t).to(x.select(y, z)), anchor(x), anchor(y), local(z)).then(anchor(t)),
         rule(eq(t).to(x.select(y, z)), anchor(x), local(y), local(z)).then(anchor(t)),
+        # A clamp, its bounds and operand each walked, local, unwalked or an anchor as a selection's are.
+        rule(eq(t).to(x.clamp(y, z)), eq(walked(x)).to(a)).then(set_(walked(t)).to(a)),
+        rule(eq(t).to(x.clamp(y, z)), eq(walked(y)).to(a)).then(set_(walked(t)).to(a)),
+        rule(eq(t).to(x.clamp(y, z)), eq(walked(z)).to(a)).then(set_(walked(t)).to(a)),
+        rule(eq(t).to(x.clamp(y, z)), local(x), local(y), local(z)).then(local(t)),
+        rule(eq(t).to(x.clamp(y, z)), unwalked(x), unwalked(y), unwalked(z)).then(unwalked(t)),
+        *(rule(eq(t).to(x.clamp(y, z)), *(kind(held) for kind, held in zip(kinds, (x, y, z), strict=True)))
+          .then(anchor(t)) for kinds in itertools.product((local, anchor), repeat=3) if anchor in kinds),
         # Reductions: over other axes the walked axis moves; over the walked axis alone a walked one.
         rule(eq(t).to(x.reduce(name, axes, p)), eq(walked(x)).to(a), reduces(p, a, b)).then(
             set_(walked(t)).to(b)),
@@ -413,9 +422,9 @@ def _walking(scaled: bool = False):
 
 def _shapes():
     """The shapes of the values the derivation's rules make: a carried state its reduction's, a value a step,
-    merge, finish or carried state reads its own, a select its operands', a lifted correction its broadcast's
-    target."""
-    x, y, z = vars_("x y z", Term)
+    merge, finish or carried state reads its own, a select its operands', a clamp its operand's, a lifted
+    correction its broadcast's target."""
+    x, y, z, w = vars_("x y z w", Term)
     side, at = vars_("side at", i64)
     extent = var("extent", Vec[i64])
     given, to = vars_("given to", Vec[i64])
@@ -426,6 +435,7 @@ def _shapes():
         rule(eq(extent).to(shape(x)), eq(y).to(x.merged())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(x)), eq(y).to(x.finished())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(y)), eq(z).to(x.select(y, z))).then(set_(shape(x.select(y, z))).to(extent)),
+        rule(eq(extent).to(shape(y)), eq(w).to(x.clamp(y, z))).then(set_(shape(w)).to(extent)),
         rule(eq(y).to(x.shaped(String("broadcast_in_dim"), lifts(given, to, at)))).then(
             set_(shape(y)).to(to)),
         name="derived shapes")
@@ -494,6 +504,7 @@ def _decoupled(rescaling: bool = False):
             rewrite(read(x.convert(p))).to(read(x).convert(p)),
             rewrite(read(x.shaped(name, p))).to(read(x).shaped(name, p)),
             rewrite(read(x.select(y, z))).to(read(x).select(read(y), read(z))),
+            rewrite(read(x.clamp(y, z))).to(read(x).clamp(read(y), read(z))),
             # A reduction over other axes, or of no walked value, and a product contracting no walked axis.
             rewrite(read(x.reduce(name, axes, p))).to(read(x).reduce(name, axes, p), eq(walked(x)).to(a),
                                                       reduces(p, a, b)),

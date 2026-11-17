@@ -117,6 +117,9 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
     for constructor, operands in ((Term.binary, (0, 2)), (Term.compare, (0, 2)), (Term.select, (0, 1, 2))):
         if (args := get_callable_args(node, constructor)) is not None:
             return Work(operations=made(graph, [args[index] for index in operands], held))
+    if (args := get_callable_args(node, Term.clamp)) is not None:
+        # A maximum and a minimum an element.
+        return Work(operations=2 * made(graph, list(args), held))
     return Work()
 
 
