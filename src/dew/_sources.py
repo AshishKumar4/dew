@@ -316,7 +316,7 @@ def _option(value: bool | enum.Enum) -> bool | str:
     return value.name if isinstance(value, enum.Enum) else value
 
 
-def annotation_text(annotation: Hashable) -> str | tuple[Hashable, ...]:
+def annotation_text(annotation: Hashable) -> str | tuple:
     """An annotation as an identity states it: a string as written, a class by its module and name, a form
     holding `typing.Annotated` metadata by its parts (`_annotated_parts`), any other (a generic alias, a
     union, a typing form) by the text Python gives it, which names what it holds. Metadata is any value, a
@@ -346,7 +346,7 @@ def _arguments(annotation: Hashable) -> tuple[Hashable, ...]:
                  for inner in (argument if isinstance(argument, list) else [argument]))
 
 
-def _annotated_parts(annotation: Hashable) -> tuple[Hashable, ...]:
+def _annotated_parts(annotation: Hashable) -> tuple:
     """A form holding `typing.Annotated` metadata as the values it holds, which an identity states as it
     states any value (`dew._stated`: a module's function by its name, an object by its form): an
     `Annotated` as its annotation's own statement and its metadata, any other form as its origin and its
@@ -357,7 +357,7 @@ def _annotated_parts(annotation: Hashable) -> tuple[Hashable, ...]:
     return ("form", typing.get_origin(annotation), *map(annotation_text, _arguments(annotation)))
 
 
-def _field_value[Value](name: str, value: Value) -> Value | str | dict:
+def _field_value[Value](name: str, value: Value) -> Value | str | tuple | dict:
     """A part of a field as its generator recorded it, as an identity states it: its annotation as text
     (`annotation_text`), its metadata as the mapping it is, a dataclass's field kind (a field, a class or an
     init variable, one of its sentinels) by its name, anything else as it is."""

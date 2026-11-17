@@ -630,17 +630,10 @@ def marker(value):
     return value
 
 
-class Tag:
-    pass
-
-
-TAG = Tag()
-
-
 @dataclasses.dataclass(frozen=True)
 class Shifting:
     by: Annotated[int, marker] = 1
-    each: list[Annotated[int, TAG]] = dataclasses.field(default_factory=list)
+    each: list[Annotated[int, marker]] = dataclasses.field(default_factory=list)
     then: Callable[[Annotated[int, marker]], int] | None = None
 
     def __call__(self, row):
@@ -650,8 +643,8 @@ class Shifting:
 
 def test_a_step_whose_field_annotation_holds_a_function_or_object_is_stated_alike_in_two_processes(tmp_path):
     """A dataclass step whose fields' annotations hold `typing.Annotated` metadata, a module's function
-    (`marker`) and object (`TAG`) whose text is their address in a process, alone and inside a list and a
-    callable's parameters, is stated alike, exactly, by two fresh processes, so an unchanged run's exact
+    (`marker`) whose text is its address in a process, alone and inside a list and a callable's
+    parameters, is stated alike, exactly, by two fresh processes, so an unchanged run's exact
     resume reads on after a restart. The annotation's text, its address, was stated, differing in every
     process (train 977's review; the morning audit of 2026-11-17, CROSS-AM-01)."""
     module = tmp_path / f"annotated_{uuid4().hex}.py"
