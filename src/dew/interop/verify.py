@@ -69,7 +69,7 @@ from dew.nn.kernels.options import owned_program
 from dew.nn.sharding import abstract
 from dew.objectives.base import Variables
 from dew.parity import _scaled_rms
-from dew.registry import from_record, models, record_fields
+from dew.registry import from_record, models, record_fields, to_record
 
 if TYPE_CHECKING:
     import torch
@@ -774,7 +774,8 @@ def _built(model_type: str, convention: str, family: decoder_parts.DecoderFamily
     left unread and its parameter count."""
     record, inert = _translate({**fields, 'model_type': model_type}, convention, family)
     model = models.build("causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"})
-    key = json.dumps(record, sort_keys=True, default=repr)
+    # The model's own record (`to_record`), the one codec of a configuration, as its key.
+    key = json.dumps(to_record(model, type(model)), sort_keys=True)
     if key not in _PARAMETER_COUNTS:
         try:
             template = abstract(lambda: model.init(jax.random.PRNGKey(0), jnp.zeros((1, 2), jnp.int32)))

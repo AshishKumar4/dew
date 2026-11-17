@@ -243,10 +243,10 @@ def test_a_split_convs_bias_holds_its_orders(edge):
 
 @pytest.mark.parametrize("edge", sorted(EDGES))
 def test_a_convs_bias_holds_every_order(edge):
-    """A conv's bias spread over its rows and tokens (`linear.conv_bias`: reverse mode one compensated sum,
-    row 1710): every order runs, finite wherever float64 is a normal float32 and the plain broadcast is."""
-    from dew.nn.linear import conv_bias
-
+    """A conv's bias spread over its rows and tokens (`short_conv.conv_bias`: reverse mode one compensated
+    sum, row 1710): every order runs, finite wherever float64 is a normal float32 and the plain broadcast
+    is."""
+    conv_bias = short_conv.conv_bias
     (bias,) = normal_draw(1710, (8,), scale=EDGES[edge])
     (direction,) = normal_draw(1711, (8,), scale=EDGES[edge])
     (cotangent,) = normal_draw(1712, (2, 5, 8))
