@@ -249,10 +249,9 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
         prologue = formed.stage + cost.Work(device_bytes=formed.side_bytes)
         # XLA's programs as the algebra prices them, beside the arrays they write: the operand formed whole,
         # or its sides alone.
-        forming = xla(algebra_program.priced(formed.whole, target).work + cost.Work(device_bytes=base))
+        forming = _written(algebra_program.priced(formed.whole, target), base, xla)
         if formed.sides is not None:
-            sides = xla(algebra_program.priced(formed.sides, target).work
-                        + cost.Work(device_bytes=formed.side_bytes))
+            sides = _written(algebra_program.priced(formed.sides, target), formed.side_bytes, xla)
     fused_seconds = sides + launched(product + region.chain + prologue + cost.Work(
         device_bytes=operands + region.captured_bytes + region.output_bytes))
     unfused_seconds = forming + launched(product + cost.Work(device_bytes=operands + written))
@@ -260,6 +259,12 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
         unfused_seconds += xla(region.chain + cost.Work(
             device_bytes=written + region.captured_bytes + region.output_bytes, kernels=1.0))
     return fused_seconds, unfused_seconds
+
+
+def _written(program: algebra_cost.Seconds, written: float, xla: algebra_cost.Fused) -> float:
+    """An XLA program's seconds as the algebra prices it (`algebra.program.priced`) with the `written` bytes
+    of the arrays it stores beside its reads, its unreadable terms' seconds (`Seconds.extra`) kept."""
+    return xla(program.work + cost.Work(device_bytes=written)) + program.extra
 
 
 def _chain(consumer, values, acc) -> cost.Work:

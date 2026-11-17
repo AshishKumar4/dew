@@ -312,3 +312,30 @@ def test_a_prologues_sides_are_priced_by_their_arithmetic_as_xla_runs_them():
         assert found.prologue is not None and found.prologue.kernel == "fused", found.prologue
     assert exponential.fused_seconds > summed.fused_seconds, (exponential, summed)
 
+
+def test_an_elementwise_program_is_one_xla_launch_and_a_reductions_one():
+    """`algebra.program.priced` of a program of elementwise work alone (`x * scale`, a producer formed whole
+    before its GEMM) counts one kernel, its outputs' fusion, its fixed latency priced on an H100 (row 7284),
+    as a row sum's program counts its reduction's one: no program XLA runs launches none."""
+    from dew.algebra import program
+
+    x, scale = jnp.zeros((8192, 4096), jnp.bfloat16), jnp.zeros((4096,), jnp.bfloat16)
+    target = generation.gpu_target("sm90")
+    elementwise = program.priced(jax.make_jaxpr(lambda x, scale: x * scale)(x, scale), target)
+    reduced = program.priced(jax.make_jaxpr(lambda x: jnp.sum(x, axis=1))(x), target)
+    assert (elementwise.work.kernels, reduced.work.kernels) == (1.0, 1.0), (elementwise.work, reduced.work)
+
+
+def test_an_xla_programs_price_is_what_its_outputs_read():
+    """`algebra.program.priced` of a program whose output reads a row sum, beside an exponential of the rows
+    no output reads, is the row sum's alone (row 7285: a prologue's side program, the producer read back
+    from its sides, priced its stage's dead exponential)."""
+    from dew.algebra import program
+
+    x = jnp.zeros((8192, 4096), jnp.bfloat16)
+    dead = jax.make_jaxpr(lambda x: (jnp.sum(x, axis=1), jnp.exp(x)))(x)
+    read = dead.replace(jaxpr=dead.jaxpr.replace(outvars=dead.jaxpr.outvars[:1]))
+    alone = jax.make_jaxpr(lambda x: jnp.sum(x, axis=1))(x)
+    target = generation.gpu_target("sm90")
+    assert program.priced(read, target).value == program.priced(alone, target).value
+
