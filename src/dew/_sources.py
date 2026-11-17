@@ -15,6 +15,7 @@ import site
 import sys
 import sysconfig
 import types
+import typing
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, runtime_checkable
@@ -315,19 +316,48 @@ def _option(value: bool | enum.Enum) -> bool | str:
     return value.name if isinstance(value, enum.Enum) else value
 
 
-def annotation_text(annotation: Hashable) -> str:
-    """An annotation as an identity states it: a string as written, a class by its module and name, any other
-    (a generic alias, a union, a typing form) by the text Python gives it, which names what it holds."""
+def annotation_text(annotation: Hashable) -> str | tuple:
+    """An annotation as an identity states it: a string as written, a class by its module and name, a form
+    holding `typing.Annotated` metadata by its parts (`_annotated_parts`), any other (a generic alias, a
+    union, a typing form) by the text Python gives it, which names what it holds. Metadata is any value, a
+    function or an object whose text is its address in this process among them, so its text was stated, and
+    an unchanged step's exact resume refused in every other process (train 977's review, row 7270)."""
     match annotation:
         case str():
             return annotation
         case type() if not isinstance(annotation, types.GenericAlias):
             return f"{annotation.__module__}.{annotation.__qualname__}"
+        case _ if _holds_annotated(annotation):
+            return _annotated_parts(annotation)
         case _:
             return repr(annotation)
 
 
-def _field_value[Value](name: str, value: Value) -> Value | str | dict:
+def _holds_annotated(annotation: Hashable) -> bool:
+    """Whether `annotation` is, or holds among its arguments, a `typing.Annotated` form."""
+    if typing.get_origin(annotation) is typing.Annotated:
+        return True
+    return any(_holds_annotated(argument) for argument in _arguments(annotation))
+
+
+def _arguments(annotation: Hashable) -> tuple[Hashable, ...]:
+    """`annotation`'s arguments (`typing.get_args`), a callable's parameter list's own among them."""
+    return tuple(inner for argument in typing.get_args(annotation)
+                 for inner in (argument if isinstance(argument, list) else [argument]))
+
+
+def _annotated_parts(annotation: Hashable) -> tuple:
+    """A form holding `typing.Annotated` metadata as the values it holds, which an identity states as it
+    states any value (`dew._stated`: a module's function by its name, an object by its form): an
+    `Annotated` as its annotation's own statement and its metadata, any other form as its origin and its
+    arguments' statements (`annotation_text`)."""
+    held = vars(annotation)
+    if typing.get_origin(annotation) is typing.Annotated:
+        return ("annotated", annotation_text(held["__origin__"]), *held["__metadata__"])
+    return ("form", typing.get_origin(annotation), *map(annotation_text, _arguments(annotation)))
+
+
+def _field_value[Value](name: str, value: Value) -> Value | str | tuple | dict:
     """A part of a field as its generator recorded it, as an identity states it: its annotation as text
     (`annotation_text`), its metadata as the mapping it is, a dataclass's field kind (a field, a class or an
     init variable, one of its sentinels) by its name, anything else as it is."""
