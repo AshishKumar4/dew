@@ -525,7 +525,7 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
     truth = truth_fn if truth_fn is not None else reference_fn
     shaped = {}
     for seed in range(staged_units(seeds)):
-        inputs = draw(seed)
+        inputs = _drawn_on_the_host(draw, seed)
         shaped.setdefault(named("truth", widened(inputs)), inputs)
     programs, held = {}, {}
     with (jax.enable_x64(new_val=True), passes(on=False), jax.default_device(store.device()),
@@ -539,6 +539,14 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
     _compile_arms(store, {"dew": (dew_fn, False), "reference": (reference_fn, True),
                           **{f"further {name}": (fn, True) for name, fn in also.items()}},
                   draw, label, seeds=seeds, orders=orders)
+
+
+def _drawn_on_the_host(draw, seed: int):
+    """`draw(seed)` on this process's CPU: a prepare's draws, which shape its programs (cheap setup, as a
+    draw is), where its default device is a compile-only GPU's on which nothing computes
+    (`tests/conftest.py`'s `compiled_ahead`)."""
+    with jax.default_device(jax.local_devices(backend="cpu")[0]):
+        return draw(seed)
 
 
 def armed(label: str) -> str:
@@ -565,11 +573,13 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     and compiled as the gate compiles it (`_arm_compile`): its run calls each draw's executable
     (`_ahead_arm`), tracing, lowering and compiling none. An arm the gate runs as given, or one running Dew's
     own programs (`dew_programs`, a host loop), holds no program."""
-    given = [fn for fn, _ in arms.values() if fn is not None]
-    _refuse_numpy_arms(draw, *given)
+    if store.target is None:
+        # An arm computing in NumPy refused as a run refuses it, by a call on a draw; for a GPU's store the
+        # prepare computes nothing on its host (bible §8), and its trace refuses an arm that cannot trace.
+        _refuse_numpy_arms(draw, *(fn for fn, _ in arms.values() if fn is not None))
     inputs: dict[str, tuple] = {}
     for seed in range(staged_units(seeds)):
-        drawn = draw(seed)
+        drawn = _drawn_on_the_host(draw, seed)
         for ordered in (drawn,) if orders is None else orders(drawn):
             inputs.setdefault(named("arms", ordered), ordered)
     programs: dict = {}

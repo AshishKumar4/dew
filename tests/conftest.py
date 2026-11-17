@@ -165,6 +165,14 @@ def pytest_runtest_makereport(item, call):
     `gate_findings`, a JSON list of each finding's leaf, rule, measure (an infinite one `Infinity`) and
     the phase it failed: what a promotion matches a candidate's failures to its parent's by."""
     outcome = yield
+    # A GPU test that prepared no check-1 site in a part's prepare (`compiled_ahead`) failed before any, on a
+    # device that computes nothing: it has none to prepare, and runs in the part's run, where a site it does
+    # reach is a red (`truths_ahead.MissingTruth`) naming it, never compiled there.
+    if (call.when == "call" and call.excinfo is not None and os.environ.get(tier_wire.PREPARE) == "1"
+            and (store := _sites_store(item)) is not None and not any(store.glob("*/site.json"))):
+        report = outcome.get_result()
+        report.outcome, report.longrepr = "skipped", (str(item.path), item.location[1] or 0,
+                                                      "prepared no check-1 site: it runs in the part's run")
     # A map task's sites of this test, written as its manifest once its call is done, whatever it ended in
     # (`map_judge.manifested`): its judge judges the test from them. Only a test that loaded the map judge
     # reached a site.
@@ -252,15 +260,51 @@ def pytest_runtest_setup(item):
         pytest.skip("runs in the lane's process" if users else "runs in a process that computes as a user's "
                     f"does ({lane_environment.USERS_ARITHMETIC}=1)")
     if os.environ.get(tier_wire.PREPARE) == "1":
-        # A GPU part's prepare, on its node's CPU (tests/model_flows.py): a flow prepares there; every other
-        # test of the part, a GPU's or not, has nothing to prepare and runs in the part's run.
-        if item.get_closest_marker("prepares") is None:
-            pytest.skip("a GPU tier's prepare runs the flows that prepare alone")
+        # A GPU part's prepare, on its node's CPU (tests/model_flows.py): a flow prepares there, and every
+        # other test of the part's files compiles its check-1 sites' programs (`compiled_ahead`), however it
+        # is marked: the part's run runs each of them on its GPU. One that prepares none runs in the run.
         return
     for backend, device in (("gpu", "a cuda device"), ("tpu", "a tpu")):
         marker = item.get_closest_marker(backend)
         if marker and jax.default_backend() != backend:
             pytest.skip(marker.kwargs.get("reason", f"runs on {device}"))
+
+
+def _sites_store(item) -> Path | None:
+    """A GPU test's directory of its tier part's store of programs compiled ahead (`compiled_ahead`), by its
+    node id; None for a flow's (which opens its own), a test no GPU runs, or outside a part with a store."""
+    if item.get_closest_marker("prepares") is not None or tier_wire.TRUTHS not in os.environ:
+        return None
+    digest = hashlib.sha256(item.nodeid.encode()).hexdigest()[:24]
+    return Path(os.environ[tier_wire.TRUTHS]) / "sites" / digest
+
+
+@pytest.fixture(autouse=True)
+def compiled_ahead(request):
+    """A GPU test's check-1 sites on its tier part's store of programs compiled ahead (tests/truths_ahead.py,
+    its own directory of the part's, `DEW_TIER_TRUTHS`), but a flow's, which opens its own
+    (tests/model_flows.py): its prepare, on the node's CPU, compiles each site's truths and arms for the
+    node's GPU with that GPU's compile-only device this process's default, on which nothing computes, so a
+    test computing more than its draws before its sites fails at once, naming itself (bible §8: no dense
+    math on a node's CPU); its run reads them, tracing, lowering and compiling none. Outside a part with a
+    store, nothing."""
+    import model_flows
+    from truths_ahead import compiled_truths
+
+    store = _sites_store(request.node)
+    if store is None:
+        yield
+        return
+    if not model_flows.preparing():
+        with compiled_truths(store, prepare=False, stamp=model_flows.stamp()):
+            yield
+        return
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    target = model_flows.node_target()
+    with (compiled_truths(store, prepare=True, stamp=model_flows.stamp(), target=target),
+          jax.default_device(compile_only_gpus(target.generation, 1)[0])):
+        yield
 
 
 @pytest.fixture(autouse=True)
