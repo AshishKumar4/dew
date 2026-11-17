@@ -20,7 +20,6 @@ from dew.data.text import Tokenizer
 from dew.decision.data import Example, GroupedExamples, grouped_by
 from dew.decision.head import Head
 from dew.decision.inputs import compacted, labelled_rows, question_owners
-from dew.inputs.condition import ConditionEncoder
 from dew.decision.layout import (
     OPTIONS,
     QUESTION_FIELDS,
@@ -36,6 +35,7 @@ from dew.decision.layout import (
     with_context,
 )
 from dew.decision.questions import Choice, Question
+from dew.inputs.condition import ConditionEncoder
 
 NONE_OF_THE_ABOVE = "none of the above"
 
