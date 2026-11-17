@@ -22,9 +22,12 @@ def flowers():
 
 
 def default(train, held) -> JepaRunConfig:
-    """The recipe's run over `train`'s and `held`'s images, `held`'s labels scoring the probes."""
-    return JepaRunConfig(data=train.shuffle(seed=0).repeat().pipe(presets.images, 224, batch=64),
-                         validation=held.pipe(presets.images, 224, batch=64))
+    """The recipe's run over `train`'s and `held`'s images, `held`'s labels scoring the probes: a curated
+    corpus, whose every image decodes, one that does not stopping the run (`rejects=False`), so the run
+    counts its passes ahead, as its epochs need."""
+    return JepaRunConfig(
+        data=train.shuffle(seed=0).repeat().pipe(presets.images, 224, batch=64, rejects=False),
+        validation=held.pipe(presets.images, 224, batch=64, rejects=False))
 
 
 if __name__ == "__main__":

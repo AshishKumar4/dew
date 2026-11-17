@@ -10,10 +10,11 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from run_kinds import QWEN_TINY, TINY_LAYA
+from objective_data import IMAGES
+from run_kinds import QWEN_TINY, TINY_LAYA, pictures
 from tool_support import REPO_ROOT, load
 
-from dew.data import Memory
+from dew.data import TFDS, Memory
 from dew.data.text import export_tokens
 
 
@@ -79,6 +80,39 @@ def decision(args: list[str], root: Path) -> Callable[[], object]:
     return config.run
 
 
+IMAGE_MODEL = {"--model.patch-size": "2", "--model.emb-features": "16", "--model.num-layers": "1",
+               "--model.num-heads": "2"}
+
+
+def diffusion(args: list[str], root: Path) -> Callable[[], object]:
+    from dew.config.diffusion import DiffusionRunConfig
+
+    recipe = load("train", "recipes/diffusion")
+    sized = scaled(args, {"data.images.size": "8", "data.images.batch": "8", "--trainer.epochs": "1",
+                          **IMAGE_MODEL})
+    config = DiffusionRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs"),
+                                     "--set", "validation.images.size=8",
+                                     "--set", "validation.images.batch=8",
+                                     # Its default scores read a CLIP model from the Hub.
+                                     "--val-metrics", "[]",
+                                     "--text.encoder", "char_table", "--text.checkpoint", "char_table"],
+                                    default=recipe.default(*pictures()))
+    return config.run
+
+
+def jepa(args: list[str], root: Path) -> Callable[[], object]:
+    from dew.config.jepa import JepaRunConfig
+
+    recipe = load("train", "recipes/jepa")
+    sized = scaled(args, {"data.images.size": "16", "data.images.batch": "8", "--trainer.epochs": "1",
+                          "--probe-classes": "2", **IMAGE_MODEL})
+    images = TFDS("dew_images", path=str(IMAGES), split="train")
+    config = JepaRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs"),
+                                "--set", "validation.images.size=16", "--set", "validation.images.batch=8"],
+                               default=recipe.default(*images.holdout(split="test")))
+    return config.run
+
+
 def lm(args: list[str], root: Path) -> Callable[[], object]:
     from dew.config.lm import LMRunConfig
 
@@ -117,10 +151,12 @@ def mixture(args: list[str], root: Path) -> Callable[[], object]:
     return lambda: recipe.main(tyro.cli(recipe.Args, args=scaled(args, {"--show": "8"})))
 
 
-TINY = {"decision/train": decision, "lm/train": lm, "lm/rigel": rigel, "lm/mixture": mixture}
+TINY = {"decision/train": decision, "diffusion/train": diffusion, "jepa/train": jepa, "lm/train": lm,
+        "lm/rigel": rigel, "lm/mixture": mixture}
 """How each recipe's documented commands run here: their documented flags at a tiny size, over local data."""
 
-RUN = (("decision/train", 1), ("lm/train", 0), ("lm/rigel", 1), ("lm/mixture", 0))
+RUN = (("decision/train", 0), ("decision/train", 1), ("diffusion/train", 0), ("jepa/train", 0),
+       ("lm/train", 0), ("lm/rigel", 1), ("lm/mixture", 0))
 """The documented commands this file runs, each by its recipe and its place among the recipe's commands: those
 that run as documented; a fix that makes another run adds it."""
 
