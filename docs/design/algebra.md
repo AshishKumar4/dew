@@ -1124,6 +1124,13 @@ class Scan:                          # a recurrence
                                      # exponent `scan.RESET_DECAY` for its own (the state entering it
                                      # decays to exactly 0 in fp32), the replaced exponent given no gradient
     ranges: Mapping[str, float | tuple[float, float]] = {}   # bounds, "state" and "overlap" among them
+    reads: Literal["after", "before", "apart"] = "after"   # the state after the token, entering it (RWKV-6),
+                                     # or after its decay less its group's writes (Mamba-3's ranks)
+    group: int = 1                   # the tokens a readout "apart" reads none of the writes of
+    turn: str | None = None          # an operand neither reads, [..., A]: each token turns the state's first
+                                     # A key pairs by e^{-i turn} before its decay (Mamba-3's rotating
+                                     # basis); the chunk forms read each token in its chunk's frame, a
+                                     # turn's cotangent the replay's, of the pairs crossing it (row 7419)
 
 class Derived(NamedTuple):           # dew.algebra.forms
     init: Callable                   # shapes -> the empty state
