@@ -146,7 +146,7 @@ class Celled(Protocol):
     """A case an op with declared cells reads (`Op.declared`): its `cell`, the scope a receipt measures
     (a template's instruction family, `generation.family`, None outside every family; a standalone
     kernel's device generation, `generation.device_generation`) and the kind of call it is, the object
-    its op states it by (a GEMM's `grouped_matmul.Kind`, a norm's rows' dtype, a recurrence's product)."""
+    its op states it by (a GEMM's `grouped_cells.Kind`, a norm's rows' dtype, a recurrence's product)."""
 
     @property
     def cell(self) -> tuple[str | None, Hashable]: ...
