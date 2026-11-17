@@ -13,6 +13,7 @@ path (tools/armada/child_groups.py), as importing `dew` sets the process's XLA f
 
 import _thread
 import contextlib
+import functools
 import os
 import select
 import signal
@@ -166,20 +167,19 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
         process, begun = starting.abandon()
         if process is not None:
             done = _Done()
-            _thread.start_new_thread(_run, (_undo_and_signal, process, done))
+            _thread.start_new_thread(_run, (functools.partial(_undo_and_signal, process, done),))
             done.wait()
         elif begun:
             starting.done.wait()
         raise
 
 
-def _run[**Arguments](function: Callable[Arguments, None], *args: Arguments.args,
-                      **kwargs: Arguments.kwargs) -> None:
-    """`function(*args, **kwargs)` on a thread `_thread` started, under the trace and profile hooks a `threading`
-    thread takes (`threading.settrace`, `threading.setprofile`)."""
+def _run(work: Callable[[], None]) -> None:
+    """`work()` on a thread `_thread` started, under the trace and profile hooks a `threading` thread takes
+    (`threading.settrace`, `threading.setprofile`)."""
     sys.settrace(threading.gettrace())
     sys.setprofile(threading.getprofile())
-    function(*args, **kwargs)
+    work()
 
 
 class _Done:
