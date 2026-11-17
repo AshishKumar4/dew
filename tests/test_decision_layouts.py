@@ -77,8 +77,8 @@ def test_each_row_holds_its_questions_at_their_spans_and_its_state_as_far_as_it_
     its instructions and each option's its marker (`marker_text`, one token) or under labels its line,
     which spells its label and its option, as far as a declared budget keeps them (`head_max_len`,
     `option_tokens`), the options in the order of their slots; the state's tokens it keeps are no more than
-    it holds, a cut counted (`state_cut`), none where it fits whole, and a joint row's no more than its cap
-    (`max_state_tokens`)."""
+    it holds, a cut counted where any copy kept less (`state_cut`, `state_characters_cut`), none where it
+    fits whole, and a joint row's no more than its cap (`max_state_tokens`)."""
     layout = LAYOUTS[name]
     for (state_name, state), questions in itertools.product(STATES.items(), QUESTIONS.values()):
         rows = layout.rows(TOKENIZER, SPECIALS, state, questions)
@@ -87,7 +87,9 @@ def test_each_row_holds_its_questions_at_their_spans_and_its_state_as_far_as_it_
             if layout.refusal(row) is not None:
                 continue
             assert len(row.tokens) <= layout.max_len
-            assert row.state_kept <= row.state_tokens and row.state_cut == row.state_tokens - row.state_kept
+            assert row.state_kept <= row.state_tokens
+            # A cut is counted, its tokens or a row encoded whole its characters, where a copy kept less.
+            assert (row.state_kept < row.state_tokens) == bool(row.state_cut or row.state_characters_cut)
             if layout.joint and layout.max_state_tokens is not None:
                 assert row.state_kept <= layout.max_state_tokens
             if state_name == "short" and layout.max_len >= 512:
