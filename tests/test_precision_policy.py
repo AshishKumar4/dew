@@ -914,22 +914,24 @@ def test_a_weighted_total_rounds_once_and_keeps_excluded_values_out(axis):
     np.testing.assert_array_equal(np.asarray(mass), exact_mass)
 
 
-@pytest.mark.parametrize("name", ["softplus", "silu"])
+@pytest.mark.parametrize("name", ["softplus", "silu", "exp", "exp2"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=str)
 @pytest.mark.parametrize("span", [(-88.0, -20.0), (-20.0, -1e-3), (-1e-3, 1e-3), (1e-3, 20.0), (20.0, 88.0)],
                          ids=str)
 def test_dews_own_transcendentals_are_as_exact_as_jaxs_across_their_range(name, dtype, span):
-    """`dew.nn.precision.softplus` (its log1p by its own series) and `silu` (`x / (1 + e^-x)`, no logistic),
-    each past the backend's own (row 7062), and their derivatives on par with JAX's from float64 on this
-    backend over each span of their range, large negative to large positive and near zero, their input in
-    fp32 and bf16 (check 1)."""
+    """`dew.nn.precision.softplus` (its log1p by its own series), `silu` (`x / (1 + e^-x)`, no logistic) and
+    `accurate_exp` (`e^x` and `2^x` by its own sum), each past the backend's own (row 7062), and their
+    derivatives on par with JAX's from float64 on this backend over each span of their range, large negative
+    to large positive and near zero, their input in fp32 and bf16 (check 1)."""
     from dew.nn import precision
 
     def draw(seed):
         x = np.random.default_rng(seed).uniform(*span, 4096).astype(np.float32)
         return (jnp.asarray(x, dtype),)
 
-    ours, theirs = getattr(precision, name), getattr(jax.nn, name)
+    ours, theirs = {"softplus": (precision.softplus, jax.nn.softplus), "silu": (precision.silu, jax.nn.silu),
+                    "exp": (precision.accurate_exp, jnp.exp),
+                    "exp2": (functools.partial(precision.accurate_exp, base2=True), jnp.exp2)}[name]
     for part, mine, jaxs in (("value", ours, theirs),
                              ("slope", jax.vmap(jax.grad(ours)), jax.vmap(jax.grad(theirs)))):
         assert_as_exact(jax.jit(mine), jax.jit(jaxs), draw, f"{name}'s {part} {span} {dtype}", seeds=8)
