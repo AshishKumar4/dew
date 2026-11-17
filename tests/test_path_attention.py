@@ -3,6 +3,7 @@ its output and gradients on par with its definition a lag at a time from float64
 documents (check 1)."""
 
 import functools
+import itertools
 
 import jax
 import jax.numpy as jnp
@@ -71,7 +72,7 @@ def _alone(fn):
             bounds = (*documents, LENGTH)
             operands = (query, key, value, w, beta, gate)
             rows.append(jnp.concatenate([fn(*(t[row:row + 1, a:b] for t in operands))
-                                         for a, b in zip(bounds, bounds[1:])], axis=1))
+                                         for a, b in itertools.pairwise(bounds)], axis=1))
         return jnp.concatenate(rows, axis=0)
 
     return separate
