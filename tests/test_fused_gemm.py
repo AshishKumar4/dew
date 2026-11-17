@@ -13,7 +13,7 @@ from reference_error import assert_as_exact
 from test_algebra import traces_cheaper
 
 from dew import algebra
-from dew.nn.kernels import fused_gemm, generation, selection
+from dew.nn.kernels import fused_gemm, gemm, generation, selection
 
 
 @INTERPRETS
@@ -292,4 +292,29 @@ def test_a_normed_projection_takes_the_template_where_a_receipt_timed_it(hidden,
         jax.jit(algebra.rewritten(normed, kernels=True)).trace(x, scale, w)
     found = {(route.choice, route.kernel) for route in routes}
     assert (("grouped_matmul", "mosaic") in found) == (gpu in taken), found
+
+
+def test_a_scattered_products_named_output_is_read_back_in_its_rows_order():
+    """A scattered grouped product (`gemm`'s `scatter`, rows [1, 0]) of bf16 rows [[1], [2]] by [[1]], its
+    epilogue `(y * y, y)` of its accumulator rounded to bf16, its second output named (`named`, a remat
+    residual, row 7131), interpreted as an H100's: its rows' gradient under a unit cotangent of the squares
+    is 2y in the rows' own order, [[2], [4]], the forward's saved output read back where its rows landed
+    (the morning audit's P0: [[4], [2]])."""
+    lhs = jnp.asarray([[1.0], [2.0]], jnp.bfloat16)
+    rhs = jnp.asarray([[[1.0]]], jnp.bfloat16)
+    sizes, scatter = jnp.asarray([2], jnp.int32), jnp.asarray([1, 0], jnp.int32)
+
+    def squares(lhs):
+        def epilogue(acc):  # the accumulator read through its rounding alone, which the second output is
+            rounded = acc.astype(jnp.bfloat16)
+            return rounded * rounded, rounded
+
+        out, _ = gemm.gemm(lhs, rhs, sizes, scatter=scatter, epilogue=epilogue,
+                           out_dtype=jnp.bfloat16, out_dtypes=(jnp.bfloat16, jnp.bfloat16),
+                           named=(None, "gate"), interpret_on_cpu=True)
+        return jnp.sum(out.astype(jnp.float32))
+
+    with generation.assumed("sm90"):
+        gradient = jax.grad(squares)(lhs)
+    np.testing.assert_array_equal(np.asarray(gradient, np.float32), [[2.0], [4.0]])
 
