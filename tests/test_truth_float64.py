@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from arm_arithmetic import float64_held, stored_as
 from check1_judge import STAGES_LOG
+from contract_support import assert_contract
 from reference_error import NarrowTruth, as_given, assert_as_exact, over_windows, windows
 
 from dew.parity import FEWEST_SEEDS, GateFailure
@@ -307,3 +308,15 @@ def test_a_tpus_truth_is_float64s_past_float32s_range():
     seeds)."""
     assert_as_exact(jax.jit(hypotenuse), jax.jit(hypotenuse), far, "a hypotenuse past float32's squares",
                     seeds=FEWEST_SEEDS, truth_fn=squared_out)
+
+
+@pytest.mark.tpu(reason="a TPU emulates float64 within float32's range; its truths compute on its host")
+def test_a_tpus_derivative_contract_holds_where_float64_is_past_float32s_squares():
+    """A derivative contract's float64 run (`contract_support.assert_contract`) on a TPU is IEEE float64's,
+    on its host: a hypotenuse squared as written overflows in float32 at every order where its float64 run
+    is a normal float32, and the contract fails it; emulated on the TPU its float64 squares overflowed
+    too, so the contract read no position and passed it (row 7226)."""
+    x, y = far(0)
+    with pytest.raises(AssertionError):
+        assert_contract(squared_out, (x, y), (np.ones_like(x), np.ones_like(y)), np.ones_like(x),
+                        "a hypotenuse squared as written")
