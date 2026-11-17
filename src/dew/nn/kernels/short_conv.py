@@ -108,7 +108,8 @@ def conv_bias(bias: jax.Array, leading: tuple[int, ...]) -> jax.Array:
     return _spread_bias((*leading, bias.shape[0]))(bias)
 
 
-@functools.cache
+# Bounded: a server's calls vary their rows, each shape a wrapper of its own.
+@functools.lru_cache(maxsize=256)
 def _spread_bias(shape: tuple[int, ...]) -> Callable:
     """A conv's bias spread over the rows and tokens of `shape` `[B, S, C]`, differentiated at every order
     (`generation.linear_tangent`): reverse mode sums its tokens' cotangents in one compensated reduction
