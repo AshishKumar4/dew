@@ -189,8 +189,8 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
     under a third of its record though its cut fits; a file whose cut fits and whose total holds keeps its
     entries byte for byte, as does one whose heaviest group is a test past the budget alone, which no cut
     shortens, though its time moves; a file with a red group keeps its own but for what its rows timed past
-    them, which raises them (`raised`); a file the checkout no longer has loses them; the newest Python's times
-    move nothing."""
+    them, which raises them (`raised`); a file the checkout no longer has loses them; the newest Python's
+    times move nothing."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
     record, rows = {}, []
 
