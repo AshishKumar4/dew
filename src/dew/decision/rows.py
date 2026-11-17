@@ -27,6 +27,7 @@ from dew.decision.layout import (
     Encoded,
     Layout,
     QuestionField,
+    ReadsEarlierLayouts,
     Specials,
     context_tokens,
     per_question,
@@ -39,7 +40,7 @@ NONE_OF_THE_ABOVE = "none of the above"
 
 
 @dataclass(frozen=True)
-class Encoding:
+class Encoding(ReadsEarlierLayouts):
     """How a labelled example becomes the row a step packs and trains on.
 
     A row is its own tokens, at most `max_len`, one slot per question it lays
@@ -356,7 +357,7 @@ def _declined(rows: Iterable[FittedRow]) -> dict[str, int]:
 
 
 @dataclass(frozen=True)
-class Fit(pygrain.MapTransform):
+class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
     layout: Layout
     tokenizer: Tokenizer
     specials: Specials
@@ -688,7 +689,7 @@ class EvaluateRows(pygrain.MapTransform):
 
 
 @dataclass(frozen=True)
-class ConfigureLayout:
+class ConfigureLayout(ReadsEarlierLayouts):
     layout: Layout
     tokenizer: Tokenizer
     specials: Specials

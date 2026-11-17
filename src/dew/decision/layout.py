@@ -29,7 +29,7 @@ import numpy as np
 from typing_extensions import get_protocol_members
 
 from dew import _records
-from dew._records import EARLIER_DESCRIPTIONS, EARLIER_LAYOUTS, JSON
+from dew._records import EARLIER_LAYOUTS, JSON
 from dew.data.text import HFTokenizer, Offsets, Tokenizer
 from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
@@ -2271,8 +2271,8 @@ def earlier_described(value: JSON) -> JSON:
     describe by a class it was before (`dew._records.EARLIER_LAYOUTS`, in a description's dotted spelling)
     described as the `SegmentLayout` it is now: the description of its form's layout by default, its own
     fields over it. A configuration is JSON in a string (`dew.data.plan.StepIdentity`), read and written
-    back as the plan writes one, so a position saved before the classes became one resumes exactly.
-    Registered as this module is imported (`dew._records.EARLIER_DESCRIPTIONS`)."""
+    back as the plan writes one, so a position saved before the classes became one resumes exactly. A data
+    plan holding a step that lays out decision rows applies it (`ReadsEarlierLayouts`)."""
     from dew.data.plan import structured
 
     forms = {named.replace(":", "."): fields for named, fields in EARLIER_LAYOUTS.items()}
@@ -2299,7 +2299,13 @@ def earlier_described(value: JSON) -> JSON:
     return described(value)
 
 
-EARLIER_DESCRIPTIONS.append(earlier_described)
+class ReadsEarlierLayouts:
+    """A data step that lays out decision rows, whose descriptions an earlier Dew saved may name a layout by
+    a class it was before: a data plan holding it reads them as they are now (`earlier_described`,
+    `dew.data.plan.ReadsEarlier`)."""
+
+    def earlier_described(self, saved: JSON) -> JSON:
+        return earlier_described(saved)
 
 
 def per_question(layout: Layout | None) -> TypeGuard[SegmentLayout]:
