@@ -144,7 +144,7 @@ def chunk_on(kernel: str, hooks, *args, **kwargs):
 """A row of one sequence, and of packed documents."""
 
 SEEDS = dict(zip(((hooks, packed) for hooks in HOOKS + FORMED for packed in PACKED), (
-    8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 64, 64, 16, 16, 16, 16, 8, 8, 64, 64, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 64, 64, 16, 16, 16, 16, 8, 8, 64, 64, 8, 8, 8, 8, 8, 8,
     64, 64, 128, 128, 16, 8, 16, 16, 64, 64, 32, 32, 32, 32, 8, 8, 16, 16, 16, 16, 16, 16), strict=True))
 """Each site's declared seeds (hooks in `HOOKS` then `FORMED` order, one sequence then packed), sized
 independently by `seeds_for` on armada (2026-10-21), on the draw with a memory entering and a
