@@ -120,7 +120,7 @@ def mixture(args: list[str], root: Path) -> Callable[[], object]:
 TINY = {"decision/train": decision, "lm/train": lm, "lm/rigel": rigel, "lm/mixture": mixture}
 """How each recipe's documented commands run here: their documented flags at a tiny size, over local data."""
 
-RUN = (("decision/train", 1), ("lm/train", 0), ("lm/rigel", 1), ("lm/mixture", 0))
+RUN = (("decision/train", 1), ("lm/train", 0), ("lm/rigel", 0), ("lm/rigel", 1), ("lm/mixture", 0))
 """The documented commands this file runs, each by its recipe and its place among the recipe's commands: those
 that run as documented; a fix that makes another run adds it."""
 
