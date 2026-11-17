@@ -134,7 +134,7 @@ def test_every_process_gathers_the_split_asked_after_each_miss():
 
 
 def test_every_process_keeps_or_drops_the_narrow_copies_together():
-    """Whether the ladder keeps the narrow copies (`FitSearch.copies_freed`) is every process's verdict
+    """Whether the ladder keeps the narrow copies (`FitSearch.freed`) is every process's verdict
     gathered: a process whose step without them fell less short, beside one whose fell no less short,
     keeps them as that one does, so no two processes lower different steps and enter different compiles'
     collectives; and where every process's drop freed bytes, every one keeps them dropped."""
@@ -148,11 +148,11 @@ def test_every_process_keeps_or_drops_the_narrow_copies_together():
         return SimpleNamespace(misses=misses, gather=lambda held: [held, others])
 
     # This process's drop helped (40 short, where 50 with them); another's did not: both keep the copies.
-    assert FitSearch.copies_freed(search(40, others=True), "with", "without") is False
+    assert FitSearch.freed(search(40, others=True), "with", "without") is False
     # Neither process's drop left it no less short: both keep them dropped.
-    assert FitSearch.copies_freed(search(40, others=False), "with", "without") is True
+    assert FitSearch.freed(search(40, others=False), "with", "without") is True
     # This process's drop did not help: it keeps them, whatever another's did.
-    assert FitSearch.copies_freed(search(60, others=False), "with", "without") is False
+    assert FitSearch.freed(search(60, others=False), "with", "without") is False
 
 
 def test_a_miss_computes_the_split_its_temporaries_leave_room_at():
@@ -1672,6 +1672,41 @@ def test_a_fits_start_traces_its_loss_once_for_its_fit_check_and_its_plan(monkey
         trainer.fit(data, steps=1)
     traced = [program for program in compiles.programs if program.kind == "traced" and program.name == "loss"]
     assert len(traced) == 1, [program.where for program in traced]
+
+
+def muon_lm(**opts) -> Trainer:
+    """A four-layer LM trained by Muon over one microbatch a step of two rows: its layers' matrices of one
+    shape are stacks its Newton-Schulz joins where `opts` states no group, wide enough beside the rows'
+    activations that the update's iteration holds the step's peak."""
+    model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=4, num_heads=2, mlp_features=256,
+                              max_seq_len=SEQ)
+    config = OptimConfig(optimizer="muon", learning_rate=1e-2, optimizer_opts=opts)
+    return one_device(Trainer(LMObjective(model, seq_len=SEQ), config, key=jax.random.key(0), split=1))
+
+
+def fitted_once(trainer: Trainer) -> None:
+    """`trainer` fit one step of two of BATCH's rows, its plan made as a fit makes it."""
+    trainer.fit(Pipeline(Memory({"text": np.asarray(BATCH["text"][:2])})).repeat().batch(2), steps=1)
+
+
+def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_recomputing(monkeypatch):
+    """A Muon step whose joined Newton-Schulz stacks' copies leave it short of the devices' room, and which
+    fits with them parted, its split fixed: its plan parts them, joining one at a time (`ns_group` 1, the
+    climb's release after the narrow copies, `FitSearch.searched`), and recomputes nothing more, where it
+    climbed the remat rungs (row 5889: the joined copies held 11.3 GB of a 4B step's peak for 82 ms a step).
+    A run that states its group keeps it, the release asked of no step of it."""
+    joined = needs(monkeypatch, trainer := muon_lm(), lambda: fitted_once(trainer))
+    parted = needs(monkeypatch, trainer := muon_lm(ns_group=1), lambda: fitted_once(trainer))
+    assert parted < joined, (parted, joined)
+    free(monkeypatch, (parted + joined) // 2)
+    planned = muon_lm()
+    fitted_once(planned)
+    assert planned.plan["ns_group"] == 1, planned.plan
+    assert planned.plan["remat"] == trainer.plan["remat"], planned.plan
+    stated = muon_lm(ns_group=2)
+    free(monkeypatch, LIMIT)
+    fitted_once(stated)
+    assert stated.plan["ns_group"] is None
 
 
 def lowered_and_compiled(run: Callable[[], object]) -> tuple[int, int]:

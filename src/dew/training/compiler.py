@@ -17,7 +17,7 @@ from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
-from dew._records import JSON, boolean, json_value, listed, record
+from dew._records import JSON, boolean, integer, json_value, listed, record
 from dew.batch import CLOSES_WINDOW, Batch
 from dew.distributed.batches import batch_layout, batch_shardings, batch_signature
 from dew.distributed.placement import Validation
@@ -219,6 +219,8 @@ class StepCompiler[L, E]:
         # The ladder's rungs past the objective's head and remat that a step fit at (no narrow copies, XLA's
         # defaults) stay for later compiles; a resumed run starts at its checkpoint's rung (`climb_to`).
         self._narrow, self._xla_defaults = True, False
+        # The Newton-Schulz stacks the step joins at a time where the run states none (`ns_group`).
+        self._ns_group: int | None = None
         self._resumed_rung: JSON = None
         # The rung each newly met shape starts from, as the first compile found the objective: its modules,
         # head tile, XLA option choice and record (`at_base_rung`).
@@ -248,6 +250,13 @@ class StepCompiler[L, E]:
         return self._narrow
 
     @property
+    def ns_group(self) -> int | None:
+        """The Newton-Schulz stacks of one shape the step joins at a time where its run states none, at the
+        rung it stands at (`dew.newton_schulz.released`): None joins them all. Every trace of the step reads
+        it (`StepSettings.ns_group`, `Trainer._settings`)."""
+        return self._ns_group
+
+    @property
     def stated_links(self) -> Mapping[str, Link]:
         """The links the run states by axis, measuring none of them (`links`)."""
         return self._stated_links
@@ -257,7 +266,7 @@ class StepCompiler[L, E]:
         modules' remat (`recompute_record`) and whether the step keeps XLA's default options
         (`dew.training.planning.FitSearch.ladder`). A checkpoint records it, since each decides the program
         a step runs."""
-        return rung_record(self.objective, self._xla_defaults, narrow=self._narrow)
+        return rung_record(self.objective, self._xla_defaults, narrow=self._narrow, ns_group=self._ns_group)
 
     def checkpoint_rung(self) -> JSON:
         """The rung a checkpoint records: the run's own, which every newly met
@@ -300,6 +309,7 @@ class StepCompiler[L, E]:
             self.objective.substitute(list(modules))
             self.objective.restore_head(tile, fused=bool(rung['head_fused']))
             self._xla_defaults, self._narrow = defaults, bool(rung['narrow'])
+            self._ns_group = None if rung['ns_group'] is None else integer(rung['ns_group'], "rung ns_group")
             # The base modules at the pass count the step being compiled runs, whatever they were taken at.
             self.phase_passes.restored(self.objective)
         recorded = self._plan_of(batch)
@@ -324,6 +334,10 @@ class StepCompiler[L, E]:
             fields.get("xla_defaults", False), "rung xla_defaults"
         )
         self._narrow = self._narrow and boolean(fields.get("narrow", True), "rung narrow")
+        # A group the record states is a release its run made: kept, as the ladder never joins them again.
+        group = fields.get("ns_group")
+        if group is not None:
+            self._ns_group = integer(group, "rung ns_group")
         self._resumed_rung = self.rung()
 
 
@@ -614,8 +628,11 @@ class StepCompiler[L, E]:
         candidates = splits(stepping.shape.rows, batch, mesh, settings.microbatches, stepping.shape.split)
         stepping = self.loss_shaped(stepping, schedule)
 
-        def lower(split: int, narrow: bool) -> Candidate:
-            return candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow)
+        def lower(split: int, narrow: bool, ns_group: int | None) -> Candidate:
+            # Its Newton-Schulz stacks joined as the rung asked releases them (`StepSettings.ns_group`).
+            grouped = dataclasses.replace(stepping, settings=dataclasses.replace(stepping.settings,
+                                                                                 ns_group=ns_group))
+            return candidate_for(grouped, state, batch, schedule, placement, replicated, split, narrow)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -637,7 +654,8 @@ class StepCompiler[L, E]:
         search = FitSearch(
             lower, lambda candidate: step_options(
                 self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
-            self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
+            self.objective, mesh, self._xla_defaults, self._narrow, self._ns_group,
+            None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self.ahead,
             provisional=provisional, unplaced=unplaced)
         planned, probes = search.admitted(
@@ -652,10 +670,11 @@ class StepCompiler[L, E]:
         self.ahead = search.ahead
         planned.at.put(self.objective)
         self._xla_defaults, self._narrow = planned.at.xla_defaults, planned.at.narrow
+        self._ns_group = planned.at.ns_group
         if runs := pgle_runs():
             trials = Trials(state, batch, owned=False) if trials is None else trials
             run = self.runner(stepping, planned, mesh)
-            relower = functools.partial(lower, planned.split, planned.at.narrow)
+            relower = functools.partial(lower, planned.split, planned.at.narrow, planned.at.ns_group)
             asked = search.compiled_key(planned.candidate.lowered, planned.options)
             planned = planned.guided(trials.profiled(run, planned, mesh, runs), runs, mesh, relower)
             # The guided executable in the unguided one's place, as JAX's jit keeps its program's under

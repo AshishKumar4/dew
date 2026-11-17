@@ -856,8 +856,8 @@ def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_
     # program (row 3506).
     objective = fine_tune(deviceless, split=None).objective
     search = FitSearch(lower=None, options=lambda candidate: compiler_options(*objective.towers()) or None,
-                       objective=objective, mesh=deviceless, xla_defaults=False, narrow=False, base=None,
-                       resumed=None)
+                       objective=objective, mesh=deviceless, xla_defaults=False, narrow=False, ns_group=None,
+                       base=None, resumed=None)
     assert search.options(None) == search.required == (compiler_options(*objective.towers()) or None)
     # Its compile's stop past the devices' limit is no option of its program's: the ladder asks no rung of
     # XLA's defaults beside each place, the same program (train 993's F3), and does where its options differ.
@@ -865,7 +865,8 @@ def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_
 
     def twins(chosen) -> list:
         search.chosen = chosen
-        return [rung for rungs in search.ladder(start, narrow=False) for rung in rungs if rung.xla_defaults]
+        ladder = search.ladder(start, narrow=False, ns_group=None)
+        return [rung for rungs in ladder for rung in rungs if rung.xla_defaults]
 
     assert not twins({**(search.required or {}), LIMIT_EXIT: 2**30})
     assert twins({**(search.required or {}), "xla_gpu_enable_triton_gemm": True, LIMIT_EXIT: 2**30})
