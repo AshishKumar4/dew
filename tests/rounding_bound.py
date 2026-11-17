@@ -31,7 +31,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import on_float64_device, on_float64_host, rounds_nothing, unrewritten
-from float64_terms import SUMS, _static, _target, evaluated_on, walked
+from float64_terms import SUMS, _target, evaluated_on, static, walked
 from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
@@ -168,7 +168,7 @@ def rounding_scale(fn, *args, seed: int = 0):
         leaves = [jnp.asarray(_widened(leaf)) for leaf in moved]
         consts = [_widened(value) for value in on_float64_host(closed.consts)]
         keys = _keys(seed)
-        if _static(closed.jaxpr):
+        if static(closed.jaxpr):
             signature = (jax.tree.structure(args), tuple((np.shape(leaf), jnp.result_type(leaf),
                                                           getattr(jax.typeof(leaf), "weak_type", False))
                                                          for leaf in jax.tree.leaves(args)),
