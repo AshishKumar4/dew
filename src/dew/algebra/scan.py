@@ -186,7 +186,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         affine, (exponent, *values) = parts(chunk, window)
         decays = _decays(exponent, affine.base2)
         natural = _walked(exponent, affine.base2)
-        tokens, entering = _read_entering(declaration, chunk, dict(zip(TOKENS, values, strict=True)))
+        read = declaration if window is None else _unreset(declaration)
+        tokens, entering = _read_entering(read, chunk, dict(zip(TOKENS, values, strict=True)))
         extents = linear_scan.Extents(tokens["B"].shape[0], shape[0], shape[1], exponent.shape[-1],
                                       affine.values_read)
         corrected = affine.correction is not None
@@ -226,8 +227,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         if walked is None:
             return _replayed(declaration, names, affine_of(chunk), chunk, h)
         # A walk's hooks take its documents' memories up where a reset would have zeroed them.
-        unreset = dataclasses.replace(declaration, reset=None)
-        return _replayed(unreset, names, affine_of(chunk), chunk, h, walked)
+        return _replayed(_unreset(declaration), names, affine_of(chunk), chunk, h, walked)
 
     return Derived(init, _stepped, merge, finish, mapped,
                    {"rounding": "compensated prefix", "walked": declaration.walked},
@@ -236,17 +236,18 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
 def _segment_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, window=None):
     """A chunk's token parts (`_token_parts`), or where `window` is given (`(origin, through)`) a document's
-    segment of it (`_windowed`), refused for a token that reads the state entering it, which a window's
-    memory enters mid-chunk, after the window's first token reads it."""
+    segment of it (`_windowed`, `_unreset`'s): every token before its origin the identity, so a token
+    reading the state entering it (`Scan.reads`) at the origin reads the memory the window enters with."""
     if window is None:
         return _token_parts(declaration, names, affine, chunk)
-    if declaration.reads == "before":
-        raise Refused("a window's memory enters mid-chunk, which a token reading the state entering it "
-                      "reads before the window's first token: no windowed form")
-    # A window holds no reset (its segment ends before the next document's first token): its origin
-    # takes its own exponent, the memory entering it decayed as a row's entering state is.
-    unreset = dataclasses.replace(declaration, reset=None)
-    return _windowed(_token_parts(unreset, names, affine, chunk), window)
+    return _windowed(_token_parts(_unreset(declaration), names, affine, chunk), window)
+
+
+def _unreset(declaration: Scan) -> Scan:
+    """`declaration` with no reset, as a window takes it: its segment ends before the next document's first
+    token, and its origin takes its own exponent and reads the memory entering it, decayed and read as a
+    row's entering state is, not zero."""
+    return dataclasses.replace(declaration, reset=None)
 
 
 def _replay_backward(replay: Callable, names: Sequence[str], chunk, state, d_state, d_outputs, walked=None):
