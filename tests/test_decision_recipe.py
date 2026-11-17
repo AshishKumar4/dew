@@ -1028,3 +1028,28 @@ def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():
     state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), mesh=config.trainer.mesh,
                     layout=config.trainer.layout).place()[0]
     assert {id(leaf) for leaf in jax.tree.leaves(state.variables[FROZEN])} == {id(leaf) for leaf in base}
+
+
+def test_every_head_that_reads_the_base_resumes_a_decision_run_held_as_shapes_to_its_end(tmp_path):
+    """Each head a decision run draws by reading its base (the joint schema head its vocabulary table, the
+    letter readout its output rows, tied and untied) trains a run to half its steps (`Pause`) and resumes
+    it to its end, through `RunConfig.run`. A resume holds its base as shapes, and the draw its optimizer
+    groups read (`Objective.fresh_trained`, `abstract`) handed a head's start the structs themselves, so
+    the joint schema run stopped before its first resumed step (a head's start took `.T` of a
+    `jax.ShapeDtypeStruct`)."""
+    from run_kinds import decision
+
+    from dew.decision.config import JointShape, Letters
+    from dew.training import Pause
+
+    for name, head in (("joint", JointShape(width=16, routing_layers=1, layers=1, heads=2, feedforward=32)),
+                       ("letters", Letters(count=4)), ("untied", Letters(count=4, untied=True))):
+        run = dataclasses.replace(decision(tmp_path, drawn=False), head=head, calibrate=False)
+        trainer = dataclasses.replace(run.trainer, name=name, checkpoint_dir=str(tmp_path / "runs"), steps=4,
+                                      checkpoint_every=1, eval_every=None, log_every=1, multi_host=False,
+                                      compilation_cache_dir=None, stop=Pause(0.5))
+        paused = dataclasses.replace(run, trainer=trainer).run()
+        resumed = dataclasses.replace(run, trainer=dataclasses.replace(trainer, stop=None,
+                                                                       resume="require")).run()
+        assert (int(paused.step), int(resumed.step)) == (2, 4), name
+
