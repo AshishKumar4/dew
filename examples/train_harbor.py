@@ -276,6 +276,8 @@ def smoke_setup(config: Config, source) -> tuple[SmokeGateway, Path, tuple[Path,
         TextGeneration(source.model, source.variables, source.processor, sampling=sampling),
         slots=config.prompts * config.groups,
         capacity=config.width,
+        # A group's samples repeat their prompt: its pages are prefilled once.
+        kv_cache="shared",
     )
     fake = SmokeGateway(
         NativeRolloutServer(engine), HFTokenizer(str(FIXTURES / "diffusion-gemma-workflow"))
