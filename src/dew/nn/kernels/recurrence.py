@@ -19,13 +19,13 @@ stage every row of it shares, the decay's prefix within each chunk (`cumulated`)
 
 import dataclasses
 import functools
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from dew._hashing import fmix32
-from dew.algebra.scan import Reads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels import launches
 from dew.nn.precision import (
@@ -43,6 +43,10 @@ from dew.nn.precision import (
 from ..sharding import explicit_spec, grouped_heads, manual_map
 from . import chunked_launch, short_conv
 from .generation import linear_tangent
+
+Readout = Literal["after", "before", "apart"]
+"""What a token's readout reads (`Hooks.reads`): the state after its update, the state entering it, or the
+state after its update less its own write (`'apart'`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -102,8 +106,11 @@ class Hooks:
     one); a skip `D v`, and the epilogue; and `write_bound`, the largest write gate
     a layer declares of l2-normalized keys (its config's: 1 for a sigmoid's, 2 for twice a sigmoid's, the
     negative-eigenvalue delta rule's), which bounds the delta rule's chunk inverse (`inverse_bound`). The
-    readout reads the state after the token's update (`reads` 'after'), or the state entering it ('before',
-    RWKV6's, `o = q^T S`); `own_weight` adds the token's own write to it weighted a key dimension, `o += ((q
+    readout reads the state after the token's update (`reads` 'after'), the state entering it ('before',
+    RWKV6's, `o = q^T S`), or the state after the update less the token's own write ('apart', `o = (g
+    q)^T S`, mamba_ssm's Mamba-3, whose own write its caller weighs apart: its intra-chunk scores strictly
+    lower, the diagonal `gamma q . k` added apart "to prevent non-causal numerical leakage",
+    `mamba3_siso_fwd.py`); `own_weight` adds the token's own write to it weighted a key dimension, `o += ((q
     * own * beta k) . 1) v` (`own` `[Hv, Dk]`, RWKV6's bonus `u` read before the update), each alone a form
     of any recurrence. The chunked op (`recurrence_chunk.chunk`) takes the same form."""
     conv: Conv | None = None
@@ -117,7 +124,7 @@ class Hooks:
     skip: bool = False
     output: OutputNorm | None = None
     write_bound: float | None = None
-    reads: Reads = 'after'
+    reads: Readout = 'after'
     own_weight: bool = False
 
     @property
@@ -142,9 +149,9 @@ class Hooks:
         return self.delta or self.write_gate or self.gates is not None or self.rated
 
     def __post_init__(self):
-        if self.reads not in ('after', 'before'):
-            raise ValueError(f"a readout reads the state 'after' its token's update or 'before' it, not "
-                             f"{self.reads!r}")
+        if self.reads not in ('after', 'before', 'apart'):
+            raise ValueError(f"a readout reads the state 'after' its token's update, 'before' it or 'apart' "
+                             f"from its own write, not {self.reads!r}")
         if self.own_weight and self.delta:
             raise ValueError("a readout weighs a token's own write without the delta rule: the delta rule's "
                              "write is its corrected value, which reads the state its readout does not")
@@ -176,7 +183,7 @@ def salted_bf16(state, key, value):
     return stochastic_bf16(state, fmix32(bits ^ salt))
 
 
-def update(state, query, key, value, decay, write, *, delta: bool, reads: Reads = 'after', own=None):
+def update(state, query, key, value, decay, write, *, delta: bool, reads: Readout = 'after', own=None):
     """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` its decay per key dimension `[...,
     Dk]` or a head's `[..., 1]` (`exp(g)`) and `write` the write gate `[..., 1]`, a head's one: its output
     `[..., Dv]` and the updated state `S' = g S + (beta k) c^T`, `c = v - (g k)^T S` the delta rule's
@@ -197,7 +204,8 @@ def update(state, query, key, value, decay, write, *, delta: bool, reads: Reads 
     largest at its prefix (4.4e38) where float64's sum was 3.0e38 (the decode step's contract near the
     largest, 128-wide heads).
     Read `reads` 'before', the output is the state entering the token's, `q^T S`, the decay and the write
-    after it; `own` `[..., Dk]`, where given, adds the token's own write to the output weighed a key
+    after it; 'apart', the state after the update less the token's own write, `(g q)^T S`; `own` `[...,
+    Dk]`, where given, adds the token's own write to the output weighed a key
     dimension, `(q * own)^T ((beta k) c^T)`, RWKV6's bonus (`Hooks.own_weight`), beside the query's whole
     read of it where it reads the state after the update, as the chunked form adds it."""
     def read(x, rows):
@@ -205,7 +213,7 @@ def update(state, query, key, value, decay, write, *, delta: bool, reads: Reads 
 
     corrected = value - read(key * decay, state) if delta else value
     outer = jnp.swapaxes(corrected[..., :, None] * (key * write)[..., None, :], -1, -2)
-    reading = query * decay if reads == 'after' else query
+    reading = query if reads == 'before' else query * decay
     out = read(reading, state)
     # Read after the update, the token's write is the query's; its own weight, where given, adds to it.
     if reads == 'after':

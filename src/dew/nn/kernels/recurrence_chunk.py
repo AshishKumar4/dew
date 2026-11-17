@@ -42,7 +42,14 @@ from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed_at
 from dew.nn.inputs import cu_seqlens
 from dew.nn.nested import nested
-from dew.nn.precision import asks_default_precision, at_least_fp32, exact_products, l2norm, rounds_products
+from dew.nn.precision import (
+    accurate_exp,
+    asks_default_precision,
+    at_least_fp32,
+    exact_products,
+    l2norm,
+    rounds_products,
+)
 from dew.nn.residuals import Residual
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, shard_shapes, varying_like
 
@@ -200,6 +207,10 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         firsts = forked.firsts
         max_segments = firsts.shape[1]
     readout = hooks.reads == 'after' and not hooks.own_weight
+    # A readout apart from its token's own write (Mamba-3's) the template forms under a decay a head without
+    # the delta rule (`mainloop.Call.apart`); the portable math as the decayed query's read of the state
+    # entering the token, `(g q)^T S`, exactly the state after the update less the token's write.
+    apart = hooks.reads == 'apart' and not hooks.own_weight
     if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None and readout:
         # Each of its routes adds the skip, the port in its kernels.
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, firsts, chunk_size,
@@ -225,7 +236,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                scale=scale, wide=fused_wide, bound=hooks.inverse_bound,
                                product=product, forked=forked, delta=hooks.delta,
                                decayed=hooks.decay != 'none', skip=None if hooks.delta else skip,
-                               rounded=rounded, firsts=firsts, readout=readout)
+                               rounded=rounded, firsts=firsts, readout=readout, apart=apart)
 
         def run(kernel, query, key, value, g, beta, skip, state, starts, firsts, *walked):
             # Every kernel walks the packed rows, each document from its own memory, its values read once
@@ -241,15 +252,21 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                 out, final = template_rule(query, key, own, g, beta, state, starts, firsts,
                                            skip if fused else None, forked=carried,
                                            max_segments=max_segments, scale=scale, delta=hooks.delta,
-                                           wide=fused_wide, bound=hooks.inverse_bound, rounded=rounded)
+                                           wide=fused_wide, bound=hooks.inverse_bound, rounded=rounded,
+                                           apart=apart)
             elif kernel == 'fla':
                 out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
                                       max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
             else:
                 size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
+                reads = hooks.reads
+                if reads == 'apart':
+                    decay = accurate_exp(jnp.asarray(g, work))
+                    decay = decay if g.ndim == query.ndim else decay[..., None]
+                    query, reads = query.astype(work) * decay, 'before'
                 out, final = xla_mainloop(Tiles(size), query, key, wide, g, beta, state, starts, firsts,
                                           scale=scale, delta=hooks.delta, dtype=work,
-                                          bound=hooks.inverse_bound, forked=carried, reads=hooks.reads,
+                                          bound=hooks.inverse_bound, forked=carried, reads=reads,
                                           own=given['own'] if hooks.own_weight else None)
             out = out.astype(work)
             return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
@@ -276,7 +293,8 @@ class PortCase:
     its decay is a key dimension's
     (`per_key`), whether its documents enter earlier documents' finals (`forked`, `Chunk.loads`), and
     whether its readout reads the state after its token's update alone (`readout`: `Hooks.reads` 'after'
-    and no `Hooks.own_weight`)."""
+    and no `Hooks.own_weight`) or after it less its own write (`apart`: 'apart', which the template forms
+    and no port's kernels do)."""
 
     varying: bool
     dtype: np.dtype
@@ -291,6 +309,7 @@ class PortCase:
     per_key: bool = False
     forked: bool = False
     readout: bool = True
+    apart: bool = False
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -449,7 +468,8 @@ class Templated(Protocol):
     """A case the recurrence template's requirements read (`TEMPLATE_SUPPORTS`): the template's
     implementations bound to the call (`call`), the instruction family of the device it runs on (`family`,
     None off a GPU), the product it is selected for (`product`), the operands' `dtype`, and whether the
-    readout reads the state after its token's update alone (`readout`)."""
+    readout reads the state after its token's update alone (`readout`) or after it less its own write
+    (`apart`)."""
 
     @property
     def call(self) -> base.Call | None: ...
@@ -465,6 +485,9 @@ class Templated(Protocol):
 
     @property
     def readout(self) -> bool: ...
+
+    @property
+    def apart(self) -> bool: ...
 
 
 TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
@@ -487,7 +510,8 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
                 "an fp32 product), which the template's whole products (its accurate parts, or a 16-bit "
                 "operand's own) do not compute; it rounds an fp32 product at the default alone, under the "
                 "run's fast forms (`fast_rounding`)", row=INHERENT, kind='handoff'),
-    Requirement('readout', lambda case: case.readout, READOUT_HANDOFF, row='ledger 6128', kind='handoff'),
+    Requirement('readout', lambda case: case.readout or case.apart, READOUT_HANDOFF, row='ledger 6128',
+                kind='handoff'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
 call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Template.eligible`: dtypes,
@@ -959,7 +983,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                 scale: float | None = None, wide: bool = False,
                 bound: float | None = None, product: str = 'forward', report: bool = True, delta: bool = True,
                 decayed: bool = True, forked: Forked | None = None, skip=None, rounded: bool | None = None,
-                firsts=None, readout: bool = True) -> str:
+                firsts=None, readout: bool = True, apart: bool = False) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
     ('forward', 'training'), of the form `delta` and `decayed` state and the chunk inverse's `bound` its form
     proves (`recurrence.Hooks.inverse_bound`; `PortCase`), the template's
@@ -970,17 +994,18 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     reported as its route, or not where not `report` (`selected`). A kernel a call names
     (`generation.chosen`) insists on it (`selection.KernelRefused`: the port named over varying operands),
     but for a form the rule's kernels do not run, which the portable math takes; `readout` whether the
-    call's readout reads the state after its token's update alone (`PortCase.readout`)."""
+    call's readout reads the state after its token's update alone (`PortCase.readout`) or after it less its
+    own write (`apart`, which its call to the template carries)."""
     call = template_call(query, key, value, g, beta, state, starts, firsts, skip, forked,
                          max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound,
                          rounded=(chunk_rounding(delta, jnp.result_type(query, key, value))
-                                  if rounded is None else rounded))
+                                  if rounded is None else rounded), apart=apart)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1],
                     heads=(key.shape[-2], value.shape[-2], value.shape[-1]), call=call, family=family,
                     product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4,
-                    forked=forked is not None, readout=readout)
+                    forked=forked is not None, readout=readout, apart=apart)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
 
@@ -1485,6 +1510,7 @@ class ScanCase:
     product: str = 'forward'
     forked: bool = False
     readout: bool = True
+    apart: bool = False
 
     @property
     def cell(self) -> tuple[str | None, str]:

@@ -469,8 +469,16 @@ def scores_of(products, decays, scales):
     return jnp.where(_lags(products.shape) >= 0, products * decays * scales[None, :], 0.0)
 
 
-TILES = {"pairs": pairs_of, "scores": scores_of}
-"""The recurrence's tile declarations (`derived_tile`): its system's pairs and its readout's scores."""
+def scores_apart_of(products, decays, scales):
+    """`scores_of` strictly lower `tril(products decays scales_t, -1)` `[C, C]`: the scores of a readout of
+    the state after its token's update less the token's own write (`recurrence.Hooks.reads` 'apart'), whose
+    caller weighs the diagonal itself."""
+    return jnp.where(_lags(products.shape) > 0, products * decays * scales[None, :], 0.0)
+
+
+TILES = {"pairs": pairs_of, "scores": scores_of, "scores apart": scores_apart_of}
+"""The recurrence's tile declarations (`derived_tile`): its system's pairs and its readout's scores, with
+or without the token's own pair."""
 
 
 @functools.cache
@@ -592,22 +600,24 @@ def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
 
 
 def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issue: Issue, *,
-                 laid: tuple | None = None, column_scale=None):
+                 laid: tuple | None = None, column_scale=None, diagonal: bool = True):
     """A chunk's own pairs' scores `[C, C]` under a decay a head, `tril((q k^T) exp2(g_s - g_t))`, the key
     column blocks `queries(c)` and `keys(c)` summed into fp32 ('scores'), in `dtype` for `chunk_output`'s
     'local', which every value block of the chunk takes. `laid` is the prefix's halves `(gate, low)` as a
     column's vectors where a mainloop's layouts keep them apart from a row's (`system`'s). The pairs' decays
     come before the products, their exponents' working tiles done before the products' sum is live.
     `column_scale` `[C]`, where given, scales each key token's column before the scores are rounded (the
-    write gate on the keys' side, mamba_ssm's `CB exp(dA_i - dA_j) dt_j`, `_chunk_scan_fwd`)."""
+    write gate on the keys' side, mamba_ssm's `CB exp(dA_i - dA_j) dt_j`, `_chunk_scan_fwd`). Without the
+    `diagonal` (a readout apart from its token's own write, `recurrence.Hooks.reads` 'apart') strictly
+    lower (`scores_apart_of`)."""
     decay = decayed(gate, low, *((gate, low) if laid is None else laid))
     scores = jnp.zeros((gate.shape[0], gate.shape[0]), jnp.float32)
     for c in range(columns):
         scores += issue("scores", queries(c), keys(c).T)
     scales = jnp.ones((gate.shape[0],), jnp.float32) if column_scale is None else column_scale
     # The tile's algebra over its products and decays its declaration's derived forms (`scores_of`).
-    return derived_tile("scores").mapped({"products": scores, "decays": decay, "scales": scales}).astype(
-        dtype)
+    tile = derived_tile("scores" if diagonal else "scores apart")
+    return tile.mapped({"products": scores, "decays": decay, "scales": scales}).astype(dtype)
 
 
 def chunk_output(queries: Load, entered: Load, columns: int, gate, low, scores, value, scale: float,
@@ -820,18 +830,19 @@ def key_decayed_output(gated: Load, entered: Load, columns: int, scores, value,
 
 def local_gradient(keys: TileLoad, queries: TileLoad, columns: int, gate, low, out_grads: TileLoad,
                    blocks: int, scale: float, dtype, issue: Issue, summed: Callable[[list], jax.Array], *,
-                   emit: Callable[[int, jax.Array], None], laid: tuple | None = None) -> None:
+                   emit: Callable[[int, jax.Array], None], laid: tuple | None = None,
+                   diagonal: bool = True) -> None:
     """The corrected values' gradient from the chunk's own output, each value block `j`'s `[C, BV]` fp32 to
     `emit(j, dv)`: `A^T do` for `chunk_output`'s scores `A[t, s] = scale (q_t . k_s) exp2(g_t - g_s)`
     (`s <= t`), its transpose taken as `k q^T` ('local_t', the key blocks' sum in one accumulator,
     `summed`) and cast to the gradient's `dtype` once for every block's product with `out_grads(j)`
-    ('local_dv'); `laid` as `chunk_output`'s. The pairs' decays come before the products, as
-    `chunk_scores`'."""
+    ('local_dv'); `laid` as `chunk_output`'s, `diagonal` as `chunk_scores`' (`s < t` without it). The pairs'
+    decays come before the products, as `chunk_scores`'."""
     column_gate, column_low = (gate, low) if laid is None else laid
     decay = decayed(-gate, -low, -column_gate, -column_low)
     product = summed([("local_t", keys(c), queries(c).T) for c in range(columns)]) * decay
     lag = _lags(product.shape)
-    scores = jnp.where(lag <= 0, product * scale, 0.0).astype(dtype)
+    scores = jnp.where((lag <= 0) if diagonal else (lag < 0), product * scale, 0.0).astype(dtype)
     for j in range(blocks):
         emit(j, issue("local_dv", scores, out_grads(j)))
 
@@ -1083,7 +1094,8 @@ def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array
 
 def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad, out_grads: TileLoad,
                     blocks: int, gate, low, scale: float, dtype, summed: Callable[[list], jax.Array], *,
-                    laid: tuple | None = None, column_scale=None) -> tuple[jax.Array, jax.Array]:
+                    laid: tuple | None = None, column_scale=None,
+                    diagonal: bool = True) -> tuple[jax.Array, jax.Array]:
     """A chunk and value head's scores' gradient under a decay a head, `ds = do v^T` over the value blocks
     `j` gated by its pairs' decays, causal and scaled, in `dtype` (which `memory_gradients`' `dq += ds k`
     and `dk += ds^T q` take), and the decay's pair terms `ds (q k^T)` (strictly lower, fp32,
@@ -1096,14 +1108,16 @@ def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: Til
     where first it needs 224 registers, an H100's at Qwen3.5-27B's widths the same 192 either way
     (scores-order and scores-first at e43d62899). `column_scale` `[C]`, where given, scales each value
     token's column in fp32 after the products: the write gate on the keys' side (`chunk_scores`'), mamba_ssm's
-    `dCB = (dout x^T) dt` (`_chunk_scan_bwd_dcb`)."""
+    `dCB = (dout x^T) dt` (`_chunk_scan_bwd_dcb`). Without the `diagonal` strictly lower, as
+    `chunk_scores`' (the pairs' terms are, either way: a token's own pair takes no decay)."""
     scores = summed([Blocks("local_t", queries, lambda c: keys(c).T, columns)])
     ds = summed([Blocks("values_ds", out_grads, lambda j: values(j).T, blocks)])
     if column_scale is not None:
         ds = ds * column_scale[None, :]
     column_gate, column_low = (gate, low) if laid is None else laid
     lag = _lags(ds.shape)
-    ds = jnp.where(lag >= 0, ds * decayed(gate, low, column_gate, column_low), 0.0) * scale
+    ds = jnp.where((lag >= 0) if diagonal else (lag > 0), ds * decayed(gate, low, column_gate, column_low),
+                   0.0) * scale
     return ds.astype(dtype), jnp.where(lag > 0, ds * scores, 0.0)
 
 

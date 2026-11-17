@@ -113,7 +113,8 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
             max_segments: int | None = None,
             scale: float | None = None, delta: bool = True, wide: bool = False,
             family: mosaic.Family | None = None, interpret: bool = False,
-            rounded: bool = False, ranged: bool = False, skip=None, forked: ForkedTable | None = None):
+            rounded: bool = False, apart: bool = False, ranged: bool = False, skip=None,
+            forked: ForkedTable | None = None):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
     `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g`, a head's `[B, T, HV]` (the gated delta
     rule) or a key dimension's `[B, T, HV, Dk]` (Kimi delta attention), the write gate `beta` `[B, T, HV]` and
@@ -141,7 +142,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, keeps=False,
-                                 rounded=rounded, ranged=ranged, skip=skip, forked=forked)
+                                 rounded=rounded, apart=apart, ranged=ranged, skip=skip, forked=forked)
     return out, final
 
 
@@ -163,7 +164,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  scale: float | None = None, delta: bool = True, wide: bool = False,
                  family: mosaic.Family | None = None, interpret: bool = False,
                  keeps: bool = True,
-                 rounded: bool = False, ranged: bool = False,
+                 rounded: bool = False, apart: bool = False, ranged: bool = False,
                  skip=None, forked: ForkedTable | None = None) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
     (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
@@ -176,7 +177,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                        keeps=keeps)
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
-                   rounded=rounded, ranged=ranged, scans=scans, forked=forked,
+                   rounded=rounded, apart=apart, ranged=ranged, scans=scans, forked=forked,
                    out_dtype=jnp.float32 if wide else None, skipped=skip is not None)
     call, tiles, out_dtype = run.call, run.tiles, run.landed
     # The skip in the launch that holds the values as given (`Call.gated_keys`); where they hold them gated,
@@ -286,7 +287,8 @@ def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool,
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
              firsts=None,
              inverse=None, kept=None, keeps: bool = True,
-             rounded: bool = False, ranged: bool = False, scans: bool = False, forked=None,
+             rounded: bool = False, apart: bool = False, ranged: bool = False, scans: bool = False,
+             forked=None,
              out_dtype=None, skipped: bool = False) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
@@ -334,9 +336,12 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     # rounded put the output 1.7 times and the final memory up to 540 times the portable math's distance from
     # float64).
     held = given if delta or rounded else Operand(rows, product.EXACT_PARTS, jnp.dtype(jnp.float32))
+    if apart and (delta or per_key):
+        raise NotImplementedError("the mainloop reads a token's state apart from its own write under a decay "
+                                  "a head without the delta rule alone: the portable math takes the rest")
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
-                interpret, generation.gpu_target(), tiles.chunk, ranged=ranged, producers=tiles.producers,
-                residents=tiles.residents)
+                interpret, generation.gpu_target(), tiles.chunk, ranged=ranged, apart=apart,
+                producers=tiles.producers, residents=tiles.residents)
     table = None if forked is None else tabled(forked, width, columns)
     # A skip reads the values a launch holds as given (`Call.gated_keys`); else it is added after them.
     landed = jnp.dtype(jnp.float32 if skipped and not call.gated_keys else out_dtype or dtype)
