@@ -68,7 +68,7 @@ def joint() -> dict[str, object]:
                 (16384, 220), (("release", None), ("schema first", schema_first)), (None, 24))}
 
 
-ADDED_SINCE = frozenset({"context_cut"})
+ADDED_SINCE = frozenset({"context_cut", "context_given"})
 """The fields an encoded row gained since main's renderers wrote the digests (`decision_layout_plans.json`),
 each at its default on every row a layout writes, which `with_context` alone sets."""
 

@@ -85,6 +85,10 @@ class CharTable(ConditionEncoder[str, TextContext]):
     def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
         return char_codes(texts, self.tokens, self.vocab)
 
+    def token_counts(self, texts: Sequence[str]) -> np.ndarray:
+        # A start token and one a character, before `tokens` cuts them.
+        return np.asarray([1 + len(text) for text in texts], np.int64)
+
     def conditioning_flops(self, tokens) -> ConditionWork:
         lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
         return ConditionWork(0.0, lengths, np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64),
