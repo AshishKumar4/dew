@@ -9,8 +9,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from armada_support import LANE_TEST, cached, fetcher, gpu_driver, gpu_lane_at, interpreter, loaded
 import tier_wire
+from armada_support import LANE_TEST, cached, fetcher, gpu_driver, gpu_lane_at, interpreter, loaded
 from tool_support import load
 
 
