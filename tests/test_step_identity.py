@@ -603,14 +603,40 @@ print(json.dumps([identity.exact, identity.config, list(identity.held), list(ide
 """
 
 
-def test_a_generated_classs_step_is_stated_alike_in_processes_of_different_string_hashing(tmp_path):
-    """The step of `GENERATED`, which reaches hashable attrs classes, is stated alike, exactly, by two fresh
-    processes of different string hashing, so a position one saves resumes exactly in the other. attrs
-    writes a hashable class's `__hash__` with this process's salted string hash, and the generated
-    methods' code was stated, differing in every process: an exact resume of an unchanged pipeline was
-    refused (train 974's review)."""
-    module = tmp_path / f"generated_{uuid4().hex}.py"
-    module.write_text(GENERATED.format(**GENERATED_AT))
+ANNOTATED = """import dataclasses
+from typing import Annotated, Callable
+
+
+def marker(value):
+    return value
+
+
+@dataclasses.dataclass(frozen=True)
+class Shifting:
+    by: Annotated[int, marker] = 1
+    each: list[Annotated[int, marker]] = dataclasses.field(default_factory=list)
+    then: Callable[[Annotated[int, marker]], int] | None = None
+
+    def __call__(self, row):
+        return {{"x": row["x"] + self.by}}
+"""
+
+
+
+@pytest.mark.parametrize("source", ["generated", "annotated"])
+def test_a_steps_dataclass_or_attrs_class_is_stated_alike_in_two_processes(tmp_path, source):
+    """A step reaching generated or annotated classes is stated alike, exactly, by two fresh processes of
+    different string hashing, so a position one saves resumes exactly in the other, as an unchanged run's
+    exact resume after a restart reads on.
+
+    `generated` (`GENERATED`) reaches hashable attrs classes, whose `__hash__` attrs writes with the
+    process's salted string hash: the generated methods' code was stated, differing in every process
+    (train 974's review). `annotated` (`ANNOTATED`) is a dataclass whose fields' annotations hold
+    `typing.Annotated` metadata, a module's function whose text is its address in a process, alone and
+    inside a list and a callable's parameters: the annotation's text was stated (train 977's review; the
+    morning audit of 2026-11-17, CROSS-AM-01)."""
+    module = tmp_path / f"{source}_{uuid4().hex}.py"
+    module.write_text(GENERATED.format(**GENERATED_AT) if source == "generated" else ANNOTATED.format())
     stated = []
     for seed in ("1", "2"):
         done = subprocess.run([sys.executable, "-c", STATED_IN_A_PROCESS, str(tmp_path), module.stem],

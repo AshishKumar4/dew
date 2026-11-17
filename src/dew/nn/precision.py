@@ -522,17 +522,20 @@ def softplus_series(x) -> jax.Array:
     exponential `y` in (0, 1], the `log1p` by its series in `s = y / (2 + y)`, at most a third, `2 (s + s^3 /
     3 + s^5 / 5 + ...)` to its working dtype's rounding (`_series_terms`): a backend's own `log1p` is no part
     of it, a v5e's 1.4e-4 from float64 (its `log` alike), which held a Mamba-2 layer's output at 2.9e-5 from
-    float64 where this holds it at 1.4e-6 (row 7062). Formed in at least float32 and rounded once to `x`'s
-    dtype; its derivative the logistic, as JAX's."""
+    float64 where this holds it at 1.4e-6 (row 7062). Its leading term `2 s` formed as `y / (1 + y / 2)`,
+    normal wherever `y` is, the series in `s^2` alone: `s` itself, half of `y` near fp32's least normal
+    (`x` near -87), is subnormal, which a target flushing them (a TPU's, a GPU's) made zero, and the softplus
+    with it, where `y` is the answer; `s^2` underflowing leaves the series its first term, one. Formed in at
+    least float32 and rounded once to `x`'s dtype; its derivative the logistic, as JAX's."""
     given = jnp.asarray(x)
     x = given.astype(at_least_fp32(given.dtype))
     y = accurate_exp(-jnp.abs(x))
-    s = y / (2.0 + y)
-    square = s * s
-    series = jnp.zeros_like(s)
+    leading = y / (1.0 + 0.5 * y)
+    square = 0.25 * (leading * leading)
+    series = jnp.zeros_like(y)
     for odd in range(_series_terms(x.dtype), 0, -2):
         series = series * square + 1.0 / odd
-    return (jnp.maximum(x, 0) + 2.0 * s * series).astype(given.dtype)
+    return (jnp.maximum(x, 0) + leading * series).astype(given.dtype)
 
 
 def _series_terms(dtype) -> int:

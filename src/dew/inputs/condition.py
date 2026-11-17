@@ -106,6 +106,12 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
         """Return the keyword fields that `from_pretrained` rebuilds this encoder from, its checkpoint
         among them: the record a run keeps (`dew.registry.Recorded`)."""
 
+    def token_counts(self, texts: Sequence[Raw]) -> np.ndarray:
+        """How many tokens each of `texts` is before `tokenize` cuts it to the encoder's width, which a
+        reader that keeps a text's first tokens reports as a cut (`dew.decision.layout.with_context`): the
+        tokens `tokenize` keeps, for an encoder that cuts none; one that cuts states its own."""
+        return np.sum(np.asarray(self.tokenize(texts)["attention_mask"]) != 0, axis=-1)
+
     def dependencies(self) -> Mapping[str, object]:
         """What `tokenize` makes of raw data depends on: the encoder and the fields it is
         rebuilt from, which hold its context length and its checkpoint's revision."""
@@ -123,9 +129,6 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
         weights (`from_pretrained`).
         """
         encoder, fields = component(ConditionEncoder, record)
-        if issubclass(encoder, BackboneEncoder):
-            # It holds no weights of its own: the model's own pass is its tower.
-            return encoder(**fields)
         checkpoint = fields.get("checkpoint")
         if not isinstance(checkpoint, str):
             raise ValueError(f"the {record['class']} record names no checkpoint to rebuild from")

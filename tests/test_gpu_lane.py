@@ -1,6 +1,7 @@
 """CI's GPU lane (tools/armada/ci.py `gpu-lane`): each test file in a process of its own, admitted on the
 GPU memory its runs measured, and tools/armada/gpu_holds.py, what a lane needs to run a file."""
 
+import hashlib
 import itertools
 import json
 import os
@@ -125,7 +126,8 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
         "    with open(f'{kind}.log', 'a') as log:\n"
         "        log.write(' '.join([name, os.environ.get('JAX_PLATFORMS', '-'),\n"
-        "                            os.environ.get('DEW_TIER_TRUTHS', '-')]) + chr(10))\n"
+        "                            os.environ.get('DEW_TIER_TRUTHS', '-'),\n"
+        "                            os.environ.get('DEW_TIER_UNIT', '-')]) + chr(10))\n"
         + "".join(f"{'@pytest.mark.prepares' + chr(10) if index % 2 else ''}"
                   f"def test_{index}():\n    said('test_{index}')\n" for index in range(6)))
     (tmp_path / "tests/test_plain.py").write_text(LANE_TEST)
@@ -151,7 +153,8 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         assert [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]] == [
             (f"3.12:{name}", 0)]
         lines = said("prepared")
-        assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"))}
+        # Each told the unit it prepares, as the lane names it, under which its programs' memory is filed.
+        assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"), name)}
         prepared[group] = {line[0] for line in lines}
     assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "nothing to prepare starts no process"
     assert not stored, "a prepare records no row"
@@ -163,45 +166,6 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
                            deadline=600.0) == 0
         assert {line[0] for line in said("ran")} & marked == prepared[group], group
     assert stored, "its run's rows are recorded as any lane's"
-
-
-def test_a_lanes_files_ask_beside_their_reports_and_a_follow_up_hands_each_the_asks_and_reuses_no_row(
-        ci, tmp_path, monkeypatch, cache_worker):
-    """Each file a GPU lane runs writes its sites' asks for their later units (check 1's LATER) beside its
-    report, where its receipt carries them; a follow-up lane given those asks (`asked`, check 1's ASKED) hands
-    them to each file's process, and its run reuses no row the test cache holds: a follow-up judges what the
-    run it follows left undecided, never a green earned before (Main,
-    2026-11-14; train 859's review: one channel, the LATER asks)."""
-    url, stored, _ = cache_worker
-    gpu_lane_at(tmp_path, monkeypatch, url, 0)
-    interpreter(tmp_path, "3.12")
-    fetcher(tmp_path)
-    wire = load("check1_wire", "tests")
-    (tmp_path / "tests/test_flows.py").write_text(
-        "import json, os\n"
-        "def test_flow():\n"
-        "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
-        f"    with open(f'{{kind}}.log', 'a') as log:\n"
-        f"        log.write(str(os.environ.get('{wire.ASKED}')) + chr(10))\n"
-        f"    if kind == 'ran':\n"
-        f"        with open(os.environ['{wire.LATER}'], 'a') as asks:\n"
-        "            asks.write(json.dumps({'site': 'sinks: train', 'from': 64, 'to': 256}) + chr(10))\n")
-    out = tmp_path / "verdict.json"
-    assert ci.gpu_lane("3.12", ["tests/test_flows.py"], out, cache="on", processes=1, deadline=600.0) == 0
-    assert (tmp_path / "ran.log").read_text().split() == ["None"]
-    asks = ci.later_asks(out.with_name(f"{out.name}.0"))
-    assert asks.parent == out.parent and json.loads(asks.read_text()) == {"site": "sinks: train", "from": 64,
-                                                                            "to": 256}
-    # Its rows recorded, so a lane with the cache on would reuse them; a follow-up runs its files again, its
-    # asks handed to each, and its own asks start from none.
-    assert stored
-    asked = tmp_path / "asked.jsonl"
-    asked.write_text(asks.read_text())
-    assert ci.gpu_lane("3.12", ["tests/test_flows.py"], out, cache="on", processes=1, deadline=600.0,
-                       asked=asked) == 0
-    assert (tmp_path / "ran.log").read_text().split() == ["None", str(asked)]
-    assert len(asks.read_text().splitlines()) == 1
-    assert ci.asked_environment(None) == {} and ci.asked_environment(asked) == {wire.ASKED: str(asked)}
 
 
 def test_a_file_that_does_not_collect_is_its_own_red_row_and_the_lanes_other_files_run(
@@ -691,6 +655,70 @@ def test_a_tier_cut_group_is_admitted_on_the_most_its_file_held_and_no_need_is_c
     assert ci.gpu_lane("3.12", ["tests/test_long.py#1/2"], out, cache="off", processes=1, deadline=600.0) == 0
     assert float(lane_runs(tmp_path, "test_long")[-1][0]) == 0.5
 
+
+def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare_filed(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A lane unit whose prepare filed its programs' memory (`NEEDS`, under the tier's store, its prepare told
+    which unit it is by DEW_TIER_UNIT) is given no less than the least pool at which Dew's admission
+    (dew.training.memory `needed`) takes the most demanding of them, beside what its runs measured: a part's
+    float64 truths, which no run of it held, are admitted before they run (2026-11-17: two flows' 1.71 GiB
+    terms walk beside 1.1 GiB of arms ran out of a 2.84 GiB share). One past the lane's share is not run
+    below it: its row is red, naming its need and the GPU (Main, 2026-11-17)."""
+    url, stored, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    (tmp_path / "tests/test_flow.py").write_text(LANE_TEST)
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    # Dew's admission standing in, in the lane's environment as the real one runs: a program's least pool its
+    # resident and beside bytes and twice its temporaries, as a stranding allocator's.
+    monkeypatch.setattr(ci.gpu_measures, "NEEDED", "import json, sys\n"
+                        "units = json.load(sys.stdin)\n"
+                        "print(json.dumps({name: max(p['resident'] + p['beside'] + 2 * p['temporaries'] "
+                        "for p in programs) for name, programs in units.items()}))\n")
+    truths = tmp_path / "truths"
+    monkeypatch.setenv("DEW_TIER_TRUTHS", str(truths))
+    gib, total = 2 ** 30, 81920 * 2 ** 20
+
+    def measured() -> None:
+        # Its measured 2 GiB, as each run here records its own (with no GPU, none) over it.
+        for inputs in (None, ci.lane_inputs("3.12")):
+            at = "/" + ci.record_key("3.12", "3.12:tests/test_flow.py", ci.device_class(), inputs)
+            stored[at] = json.dumps({"key": None, "depends": ["tests/test_flow.py"], "row": {}, "reads": [],
+                                     "peak": 2 * gib, "shares": 0, "pools": 0}).encode()
+
+    def filed(*programs: tuple[int, int, int]) -> None:
+        name = "tests/test_flow.py"
+        (truths / "needs").mkdir(parents=True, exist_ok=True)
+        listed = [{"resident": r, "beside": b, "temporaries": m} for r, b, m in programs]
+        (truths / "needs" / f"{hashlib.sha256(name.encode()).hexdigest()[:16]}.json").write_text(
+            json.dumps({"unit": name, "programs": listed}))
+
+    def lane() -> tuple[float, dict]:
+        measured()
+        out = tmp_path / "verdict.json"
+        assert ci.gpu_lane("3.12", ["tests/test_flow.py"], out, cache="off", processes=1, deadline=600.0) == 0
+        [row] = json.loads(out.read_text())["rows"]
+        return float(lane_runs(tmp_path, "test_flow")[-1][0]) * total, row
+
+    # Its measured 2 GiB alone: 3.5 GiB, its peak and headroom.
+    share, row = lane()
+    assert (share, row["output"]) == (2 * gib * 1.25 + gib, "")
+    # Its arms, and its float64 walk beside them, whose stranded temporaries need 7 GiB: given those.
+    filed((gib, gib // 2, gib // 4), (gib, gib, int(2.5 * gib)))
+    share, row = lane()
+    assert (share, row["output"], row["exitCode"]) == (7 * gib, "", 0)
+    # Its children each take a share's fraction: what it holds is of its raised share, 7 GiB twice over.
+    assert ci.gpu_needs({"depends": [], "peak": 2 * gib, "shares": 1, "pools": 0}, 40 * gib, 7 * gib) == (
+        7 * gib, 14 * gib)
+    # Programs past the lane's 40 GiB: none runs, each red as its file, its row naming its need and the GPU,
+    # and saying a lane of the whole GPU holds it only where that lane's 60 GiB (JAX's 75%) does.
+    for need, temporaries, whole in ((50, 24, True), (70, 34, False), (98, 48, False)):
+        filed((gib, gib, temporaries * gib))
+        runs = len(lane_runs(tmp_path, "test_flow"))
+        _, row = lane()
+        assert len(lane_runs(tmp_path, "test_flow")) == runs and row["exitCode"] == 1
+        assert row["kind"] == "whole" and f"{need:.2f} GiB" in row["output"]
+        assert ci.device_class() in row["output"] and ("holds it" in row["output"]) == whole
 
 def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measured_class_held_it(
         ci, tmp_path, monkeypatch, cache_worker, capsys):

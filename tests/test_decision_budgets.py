@@ -213,7 +213,7 @@ def test_a_context_no_cross_attention_reads_counts_as_a_cut_of_it():
     example = Example("short", {"q": Choice("Pick", ["a", "b"])}, {"q": "a"}, context="the account history")
     layout = SegmentLayout.state_first_row(max_len=128, labels=BYTE_LABELS)
     fitted = Fit(layout, BYTES, BYTE_SPECIALS, DecisionHead(64)).map({"example": example})
-    unread = len(context_tokens(BYTES, "the account history"))
+    _, unread = context_tokens(BYTES, "the account history")
     assert unread > 0 and fitted["_dew_cut"]["context"] == (1, unread)
 
 

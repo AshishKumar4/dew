@@ -416,7 +416,7 @@ class Trainer(Generic[Loss, Effects]):
                             self.device_mesh, self.accumulation,
                             self.step, self.dynamic_scale, self.diloco, self.tune_kernels, self.inspection,
                             self.microbatches, self.record, self.lower_for, self.state_mesh,
-                            self.skip_nonfinite)
+                            self.skip_nonfinite, self._compiler.ns_group)
 
     # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
@@ -1751,8 +1751,10 @@ class Trainer(Generic[Loss, Effects]):
         accumulation its window pools. The narrow copies are left out: the plan's first rung drops
         them where the step does not fit with them (`dew.training.planning.FitSearch`)."""
         micro = microbatch_shapes(split_fields(batch)[0], split)
+        # Its loss's trace the plan's candidates read again (`StepCompiler.loss_shaped`).
         with self._traced_on(self.device_mesh) as schedule:
-            _, _, whole, _ = prepared_for(self._stepping(), state, micro, schedule, split, narrow=False)
+            stepping = self._compiler.loss_shaped(self._stepping(), schedule)
+            _, _, whole, _ = prepared_for(stepping, state, micro, schedule, split, narrow=False)
         return self._validated(whole)[1]
 
     def _fitting(self, state: TrainState, batch: Batch) -> Validation:

@@ -19,6 +19,7 @@ from flax import linen as nn
 from dew import _records
 from dew.batch import Variables, part, thaw
 from dew.data.text import HFTokenizer
+from dew.inputs.spec import Condition
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained
 from dew.interop.releases import ReleasePlan, writable
@@ -96,6 +97,11 @@ class PretrainedDecision(Pretrained):
     named_encoder: str | None = None
     """The encoder the release it was read from names for its readers (Laya's `encoder`), which a release
     of it names again (`dew.decision.laya.head_files`); None where it named none or was not read from one."""
+    context: Condition | None = None
+    """A run's task's configured context encoder (`DecisionModel.context`), bound to the task's trained
+    weights, which a run started from the bundle reads its context with as the task did; None for the
+    backbone's own (`context_encoder`). Its backbone reads a context through cross-attention, which no
+    release format writes."""
 
     def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
         return dataclasses.replace(self, variables=transform(self.variables),
@@ -151,7 +157,8 @@ class PretrainedDecision(Pretrained):
                 "numerics": task.precision}
         return cls(**held, head=head, head_variables=thaw(part(task.variables, "head")), layout=task.layout,
                    specials=task.specials, calibration=task.calibration, decision_tokenizer=task.tokenizer,
-                   context_encoder=task.model.context_encoder, named_encoder=task.named_encoder)
+                   context_encoder=task.model.context_encoder, named_encoder=task.named_encoder,
+                   context=_trained_context(task))
 
     @classmethod
     def from_components(cls, backbone: Pretrained, head: Head, head_variables: Variables,
@@ -174,6 +181,17 @@ class PretrainedDecision(Pretrained):
                    named_encoder=named_encoder)
 
 
+
+
+def _trained_context(task: Decide) -> Condition | None:
+    """`task`'s configured context condition (`DecisionModel.context`) bound to its trained weights
+    (`Condition.bound` over its record and the task's `context` module), which a bundle carries."""
+    from dew.registry import to_record
+
+    if task.model.context is None:
+        return None
+    held = _records.record(to_record(task.model.context, Condition), "context condition")
+    return Condition.bound(held, params=part(task.variables, "context")["params"])
 
 
 class DecisionSource(SourceKind):

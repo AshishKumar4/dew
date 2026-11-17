@@ -220,6 +220,9 @@ def _pulled(call: "_Call", operands, cotangent, live, saved: tuple = ()) -> tupl
      applied) = operands
     # Gathered rows are read where they lie (row 1376), their cotangent summed back into the tokens.
     cotangent, read = _scattered_cotangent(cotangent, scatter, epilogue=epilogue, first=first)
+    # The named outputs the forward kept (`gemm`'s `named`, an epilogue's) were stored where their rows
+    # landed: read back in the product's row order, as the epilogue's derivative reads its cotangent.
+    saved = tuple(saved if scatter is None else (value[scatter] for value in saved))
     # The operands a reverse pass differentiates, by their place among the operands' leaves: a frozen
     # matrix's kernel gradient, or an operand no reverse pass reaches, is never formed.
     wanted = set(live)

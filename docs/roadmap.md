@@ -8,18 +8,10 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- A launch's call and its gradient's product shared one digest. [6780]
-- Dew's jaxlib 0.12.0.1.post99 crashed CPU processes by SIGFPE. [6829]
 - finished_merged's mean is 0 where its slices' masses total past fp32's largest. [6904]
 - finished_merged's derivative along its denominators is NaN where (o - out) / W passes fp32 though its product with the tangent does not. [6905]
-- Mosaic GPU converts an integer to a boolean by truncating it to its low bit, where lax (and XLA) convert by comparing with zero. [6941]
 - The flash fallback's packed documents on a TPU give wrong results. [6981]
-- Splash's float32 forward at width 256 does not compile on a v5e. [6992]
-- The attention template's Mosaic TPU forward does not compile for a v5e training step at width 64, full, float16. [6993]
-- Paged decode on a v5e does not compile. [6994]
 - Splash's training step on a v5e is not finite in its value gradient. [7226]
-- Splash in float16 does not compile on a v5e. [7227]
-- JAX's paged decode at width 64 does not lower on a v5e. [7228]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -36,6 +28,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - finished_merged's derivative as to a slice of zero total is 0 where the merge formula's is (o - out) e^(m - M) / W. [7124]
 - The kernel gate reads no resource report of a fp32 decode's plain-forward kernels. [7263]
 - The row-indexed hooked attention backward compile nodes (test_attention_mosaic_compile spill-free, sm80/sm86/sm89 accurate, row-indexed hook) take 209-295 s…. [7360]
+- No test exercises the TPU paged decode (jax's pallas tpu paged_attention via kv_cache) on a v5e. [7385]
+- Tests/test_mamba3.py::test_the_chunked_form_is_as_exact_as_the_recurrence passes vacuously on main. [7401]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -62,7 +56,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
 - For the owner's choice: pay for the range now, pay less after a kernel route, or restate it. [6655]
 - On main today, both arms: the chunked op's backward forms the local scores' gradient do v^T before the key's product, so a cotangent of 2^110 through values of…. [6656]
-- XLA:GPU's Triton nested-GEMM fusion of a residual add into a dot inside a while body rounds worse than the separate add cuBLAS's program keeps. [6759]
 
 ## Models and interop
 
@@ -72,7 +65,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
 - Stacks, scans and looped models. [1568]
-- One token layout, and every layout and placement trains and serves. [1710, 1903]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
 
 ## Training and parallelism
@@ -96,12 +88,12 @@ This page is generated from the maintainers' findings ledger as each change land
 - Training and serving efficiency. [3330, 1880, 5292]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
+- Mamba-1 and Mamba-2 refuse a decode step under a mesh sequence axis above one (nn/mixers/mamba.py and mamba2.py: LayoutRefused 'runs whole training sequences;…. [7400]
 
 ## Algebra
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Bit-level synthesis in dew.algebra. [3733]
-- Py `_holds_regions`: 'any other holder of a program (a manual mesh's, a native kernel's) is an opaque leaf'), so a projection mapped per shard…. [6578]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
@@ -109,9 +101,11 @@ This page is generated from the maintainers' findings ledger as each change land
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 - Released checkpoints judged on GPUs. [1703]
 - Reference comparisons held by derived bounds. [1719, 2094]
+- One token layout, and every layout and placement trains and serves. [1903]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - Saved runs carried across. [2791, 2792]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
+- Py `_holds_regions`: 'any other holder of a program (a manual mesh's, a native kernel's) is an opaque leaf'), so a projection mapped per shard…. [6578]
 
 ## Tutorials and docs
 

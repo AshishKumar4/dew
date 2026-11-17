@@ -14,7 +14,7 @@ from test_algebra import traces_cheaper
 
 import dew
 from dew import algebra
-from dew.nn.kernels import fused_gemm, generation, selection
+from dew.nn.kernels import fused_gemm, gemm, generation, selection
 
 
 @INTERPRETS
@@ -406,16 +406,18 @@ def test_a_named_gate_projection_is_its_launchs_residual_and_its_backward_recomp
 @pytest.mark.parametrize(("hidden", "width", "rows", "taken"),
                          [(1024, 4096 + 512 + 512, 12288, ("sm80", "sm90")),
                           (1024, 2 * 3584, 12288, ("sm80", "sm90")),
-                          (1024, 2048, 12288, ()), (2560, 9216, 24576, ("sm90",))],
-                         ids=["q/k/v", "gate/up", "unmeasured", "4B gate/up"])
+                          (1024, 2048, 12288, ()), (2560, 9216, 24576, ("sm90",)),
+                          (2560, 2 * 9216, 4096, ("sm90",)), (4096, 2 * 14336, 12288, ("sm90",))],
+                         ids=["q/k/v", "gate/up", "unmeasured", "4B up", "4B gate/up", "8B gate/up"])
 def test_a_normed_projection_takes_the_template_where_a_receipt_timed_it(hidden, width, rows, taken, gpu):
     """An RMS norm feeding a bf16 projection of 4 x 3072 rows of 1024 on an A100 or an H100 (its program
     through the algebra's pass, which recognizes the norm as the product's prologue): at the widths M-EM-65
     timed (Qwen3.5-0.8B's joined q/k/v and gate/up, `grouped_matmul.NORMED_08B`) the product's launch is the
     template's and the norm its prologue, as the receipt measured faster than the norm kernel then XLA's
-    dot; a formed projection at a matrix another receipt timed (the 4B's, M-EM-36 on wgmma) its cell's, as
-    the projection unnormed (train 977 F1); at a width none timed, XLA's dot as every dense cell's of their
-    families (DENSE1)."""
+    dot, and on an H100 at the 4B's and the 8B's normed widths M-EM-67 timed (`NORMED_4B_8B`: an A100's lost
+    there); a formed projection at a matrix another receipt timed (the 4B's up, M-EM-36 on wgmma) its
+    cell's, as the projection unnormed (train 977 F1); at a width none timed, XLA's dot as every dense
+    cell's of their families (DENSE1)."""
     from dew import algebra
 
     def normed(x, scale, w):
@@ -431,3 +433,29 @@ def test_a_normed_projection_takes_the_template_where_a_receipt_timed_it(hidden,
         jax.jit(algebra.rewritten(normed, kernels=True)).trace(x, scale, w)
     found = {(route.choice, route.kernel) for route in routes}
     assert (("grouped_matmul", "mosaic") in found) == (gpu in taken), found
+
+
+def test_a_scattered_products_named_output_is_read_back_in_its_rows_order():
+    """A scattered grouped product (`gemm`'s `scatter`, rows [1, 0]) of bf16 rows [[1], [2]] by [[1]], its
+    epilogue `(y * y, y)` of its accumulator rounded to bf16, its second output named (`named`, a remat
+    residual, row 7131), interpreted as an H100's: its rows' gradient under a unit cotangent of the squares
+    is 2y in the rows' own order, [[2], [4]], the forward's saved output read back where its rows landed
+    (the morning audit's P0: [[4], [2]])."""
+    lhs = jnp.asarray([[1.0], [2.0]], jnp.bfloat16)
+    rhs = jnp.asarray([[[1.0]]], jnp.bfloat16)
+    sizes, scatter = jnp.asarray([2], jnp.int32), jnp.asarray([1, 0], jnp.int32)
+
+    def squares(lhs):
+        def epilogue(acc):  # the accumulator read through its rounding alone, which the second output is
+            rounded = acc.astype(jnp.bfloat16)
+            return rounded * rounded, rounded
+
+        out, _ = gemm.gemm(lhs, rhs, sizes, scatter=scatter, epilogue=epilogue,
+                           out_dtype=jnp.bfloat16, out_dtypes=(jnp.bfloat16, jnp.bfloat16),
+                           named=(None, "gate"), interpret_on_cpu=True)
+        return jnp.sum(out.astype(jnp.float32))
+
+    with generation.assumed("sm90"):
+        gradient = jax.grad(squares)(lhs)
+    np.testing.assert_array_equal(np.asarray(gradient, np.float32), [[2.0], [4.0]])
+
