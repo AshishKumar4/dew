@@ -27,7 +27,7 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.engram import Engram, PLELayer
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.inputs import MixerCall
-from dew.nn.memory import Gate, InContextMemory, LinearMemory, Objective
+from dew.nn.memory import Gate, InContextMemory, LinearMemory, MLPMemory, Objective
 from dew.nn.mixers import AttentionMixer
 from dew.nn.mixers.memory import InContextMemoryMixer
 from dew.objectives.lm.objective import LMObjective
@@ -74,13 +74,24 @@ MLA = {"q_lora_rank": 8, "kv_lora_rank": 8, "qk_nope_head_dim": 8, "qk_rope_head
 hold it."""
 
 
-def hybrid_model(mixer: str, attention: dict | None = None) -> CausalTransformer:
+UNFOLDED = {"memory": InContextMemory(network=MLPMemory(hidden=(16,)), heads=2, head_features=8, chunk=4,
+                                     normalize=True, learning_rate=Gate(scale=0.1), momentum=Gate(),
+                                     retention=Gate(bias=-2.0))}
+"""Titans' deep memory, an in-context memory off the shared recurrence, which computes a call over forks by
+unfolding each document's chain into a row of its own (`InContextMemory._unfolded`): each document as its
+own row computes it, at its row's documents' times the layer's work, so its decoder's rows are laid whole
+where they are packed (`prefix_sharing_refusal`)."""
+
+
+def hybrid_model(mixer: str, attention: dict | None = None, *, unfolded: bool = False) -> CausalTransformer:
     """A hybrid stack at toy size: a recurrent `mixer`, whose memory and conv tail are each row's own
-    state, then full attention, the standard layer's or the `attention` mixer's."""
+    state (`RECURRENT`'s, or with `unfolded` the memory `UNFOLDED` holds), then full attention, the standard
+    layer's or the `attention` mixer's."""
+    fields = {"memory": UNFOLDED[mixer]} if unfolded else RECURRENT[mixer]
     return CausalTransformer(
         vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8, mlp_features=32,
         max_seq_len=WIDTH, dtype="float32", layer_types=("linear_attention", "full_attention"),
-        kinds={"linear_attention": {"mixer": {"class": mixer, "fields": RECURRENT[mixer]}},
+        kinds={"linear_attention": {"mixer": {"class": mixer, "fields": fields}},
                **({} if attention is None else {"full_attention": {"mixer": attention}})})
 
 
@@ -106,10 +117,16 @@ MODELS = {
     "mixture": lambda: attention_model(mixture=Mixture(experts=4, top_k=2, expert_features=16)),
     "looped": lambda: attention_model(loop=Loop(2, exit_gate=True)),
     "engram": engram_model,
+    "unfolded memory hybrid": lambda: hybrid_model("memory", unfolded=True),
 }
 """The decoders whose every layer reads forks: attention, windowed attention, each recurrent mixer beside
 attention, a latent attention beside Kimi's delta attention, a routed feed-forward, a looped stack whose
-every pass reads the forks, and engram's n-gram lookups, each token's n-grams its chain's."""
+every pass reads the forks, engram's n-gram lookups, each token's n-grams its chain's, and a memory that
+unfolds them (`UNFOLDED`), whose rows are laid whole where they are packed (`UNSHARED`)."""
+
+UNSHARED = frozenset({"unfolded memory hybrid"})
+"""The decoders of `MODELS` whose rows an objective lays whole (`prefix_sharing_refusal`), each computing a
+call over forks all the same."""
 
 
 @pytest.mark.parametrize("kind", sorted(MODELS))
@@ -118,10 +135,12 @@ def test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole(kind):
     next-token losses, and the gradient of their weighted sum in every parameter, what the rows laid out
     alone give (check 1, over drawn weights, float64 truth): each document over its ancestors, each token
     scored from its predecessor, a document's first from its parent's last (`Forks.predecessors`), and the
-    gradient of a shared token summed over the rows that read it."""
+    gradient of a shared token summed over the rows that read it. A decoder whose rows an objective lays
+    whole (`UNSHARED`) computes them so all the same."""
     model = MODELS[kind]()
     objective = LMObjective(model, WIDTH - 1)
-    assert objective.shares_prefixes(train=True)
+    assert model.fork_refusal(train=True) is None
+    assert objective.shares_prefixes(train=True) is (kind not in UNSHARED)
     shared = ForkedRows.pack(ROWS, WIDTH)
     whole = ForkedRows.pack(ROWS, WIDTH, share=False, documents=1)
     assert shared.coordinates.forks is not None and whole.coordinates.forks is None
@@ -192,13 +211,15 @@ def test_rows_whose_shared_prefix_needs_more_documents_than_a_window_holds_are_l
             assert list(tokens[np.asarray(forks.index[number, :len(row)])]) == row
 
 
-def test_a_memory_whose_products_a_wrapper_makes_nonlinear_lays_its_rows_whole():
-    """An in-context memory on its shared recurrence reads forks (`RECURRENT`'s), but a wrapper whose
-    products are not linear takes its heads off the recurrence (`InContextMemory._route`), the one path
-    of it that reads them (`dew.registry.Wrapper.keeps_products_linear`, `MixerBase.wrapped_fork_refusal`):
-    a quantized training's decoder lays its rows whole (`shares_prefixes`) and its call over forks is
-    refused, as a served quantization's decoder and a parallel layer's memory branch are; an adapter
-    reads them but in training under its dropout, as the decoder unwrapped runs them."""
+def test_a_memory_whose_products_a_wrapper_makes_nonlinear_computes_forks_but_lays_its_rows_whole():
+    """An in-context memory on its shared recurrence reads forks at one row's work (`RECURRENT`'s), but a
+    wrapper whose products are not linear takes its heads off the recurrence (`InContextMemory._route`),
+    where the memory computes a call over forks by unfolding each document's chain into a row of its own,
+    at its documents' times the work (`dew.registry.Wrapper.keeps_products_linear`,
+    `MixerBase.fork_sharing_refusal`): a quantized training's decoder computes such a call (`fork_refusal`
+    None) but its objective lays its rows whole (`prefix_sharing_refusal`, `shares_prefixes`), as a
+    served quantization's decoder and a parallel layer's memory branch do; an adapter's rows share their
+    prefixes but in training under its dropout."""
     pytest.importorskip("qwix")
     from dew.lora import LoRA
     from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
@@ -210,21 +231,22 @@ def test_a_memory_whose_products_a_wrapper_makes_nonlinear_lays_its_rows_whole()
     quantizing = Quantization(patterns=(r"(.*/)?head_\d+/.*",))
     quantized = quantizing.apply(model)
     assert LMObjective(model, WIDTH - 1).shares_prefixes(train=True)
+    assert quantized.fork_refusal() is None
     assert not LMObjective(quantized, WIDTH - 1).shares_prefixes()
-    model.apply(params, forks.tokens, coordinates=forks.coordinates)
-    with pytest.raises(ValueError):
-        quantized.apply(quantized.init(jax.random.key(0), ones), forks.tokens, coordinates=forks.coordinates)
+    logits = quantized.apply(quantized.init(jax.random.key(0), ones), forks.tokens,
+                             coordinates=forks.coordinates)
+    assert bool(jnp.all(jnp.isfinite(jnp.asarray(logits))))
     served, _ = quantize_for_serving(model, params, quantizing, ones)
-    assert served.fork_refusal() is not None
+    assert served.fork_refusal() is None and served.prefix_sharing_refusal() is not None
     memory = InContextMemoryMixer(RECURRENT["memory"]["memory"])
     parallel = hybrid_model("memory").clone(kinds={"linear_attention": LayerKind(mixer=ParallelMixer(
         branches=(ParallelBranch("memory", memory), ParallelBranch("attention", AttentionMixer()))))})
-    assert parallel.fork_refusal() is None
-    assert quantizing.apply(parallel).fork_refusal() is not None
-    for dropout, refused in ((0.0, False), (0.1, True)):
+    assert parallel.prefix_sharing_refusal() is None
+    assert quantizing.apply(parallel).prefix_sharing_refusal() is not None
+    for dropout, unshared in ((0.0, False), (0.1, True)):
         adapted = LoRA(rank=2, modules=("o_proj",), dropout=dropout).apply(model, params, key=0).model
-        assert adapted.fork_refusal() is None
-        assert (adapted.fork_refusal(train=True) is not None) == refused, dropout
+        assert adapted.prefix_sharing_refusal() is None
+        assert (adapted.prefix_sharing_refusal(train=True) is not None) == unshared, dropout
 
 
 def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
@@ -352,17 +374,35 @@ def tree_coordinates(tree: tuple[int, ...], rows: int, base: int, valid=None):
     return dataclasses.replace(laid, forks=forks)
 
 
-@pytest.mark.parametrize("model", [*sorted(RECURRENT), "kimi linear"])
+@pytest.mark.parametrize("model", [*sorted(RECURRENT), "kimi linear", "unfolded memory"])
 @pytest.mark.parametrize("tree", [TREE, (-1,), (-1, 0, 1)], ids=["branching", "one-token", "chain"])
 def test_a_tree_call_reads_each_token_as_its_path_decoded_alone(tree, model):
     """A hybrid's cached call over a tree (a document a token, each continuing its parent's, the root's the
     row's cache): each token's logits are on par with its root-to-token path decoded as a plain cached call
     from the same cache, from the float64 run's (check 1), its conv over its ancestors and past the root the
     cache's history (`forked_conv`), its recurrence from its parent's state (`forked_scan`), its attention
-    over the cache and its ancestors (`fork_runs`); a one-token tree and a chain too."""
+    over the cache and its ancestors (`fork_runs`), a memory off its recurrence each path unfolded from
+    the cache's weights (`InContextMemory._unfolded`); a one-token tree and a chain too."""
     built = (hybrid_model("kimi_delta_attention", {"class": "mla", "fields": MLA}) if model == "kimi linear"
+             else hybrid_model("memory", unfolded=True) if model == "unfolded memory"
              else hybrid_model(model))
     assert_reads_paths(built, tree, f"{model} tree")
+
+
+@pytest.mark.parametrize("tree", [TREE, (-1, 0, 1)], ids=["branching", "chain"])
+def test_a_tree_call_rounds_a_quantized_memory_as_each_path_decoded_alone(tree):
+    """A memory off its recurrence whose inner gradients a quantization rounds stochastically from the
+    row's key in the cache folded with each token's place (`ROUNDING_KEYS`): a cached call over a tree
+    unfolds each token's path (`InContextMemory._unfolded`), rounding at each token's place along it
+    (`Forks.positions`), on par with the path decoded as a plain cached call, from the same quantized
+    computation in float64 (check 1), on a stack of the memory alone."""
+    pytest.importorskip("qwix")
+    from dew.quantization import Quantization
+
+    spec = Quantization(patterns=(r"(.*/)?head_\d+/.*",), bwd_qtype="int8", bwd_stochastic_rounding="uniform")
+    stack = hybrid_model("memory", unfolded=True).clone(num_layers=1, layer_types=("linear_attention",))
+    assert_reads_paths(spec.apply(stack), tree, f"quantized memory tree {len(tree)}",
+                       wide=spec.apply(stack.clone(dtype=jnp.float64)))
 
 
 @pytest.mark.parametrize("tree", [TREE, (-1, 0, 1)], ids=["branching", "chain"])
@@ -424,12 +464,13 @@ def test_a_tree_after_a_packed_prompt_reads_its_last_document_alone():
 
 
 def assert_reads_paths(model: CausalTransformer, tree: tuple[int, ...], label: str, *,
-                       valid: jax.Array | None = None) -> None:
+                       valid: jax.Array | None = None, wide: CausalTransformer | None = None) -> None:
     """`model`'s cached call over `tree` past a cached prompt (`tree_coordinates`), on par with each token's
     root-to-token path decoded as a plain cached call from the same cache, from the float64 run's (check 1),
     over drawn weights and ids; the tokens each row holds `valid` (`[2, S]`, every one where None), each
-    path's held alike, for a stack with no attention, whose keys a tree's runs name whether held or not."""
-    wide = float64_twin(model)
+    path's held alike, for a stack with no attention, whose keys a tree's runs name whether held or not;
+    `wide` the float64 decoder whose paths are the truth, `model`'s twin where None."""
+    wide = float64_twin(model) if wide is None else wide
     rows = 2
     initialized = jax.jit(model.init)
 

@@ -1268,8 +1268,8 @@ class Wrapper(Protocol):
     def keeps_products_linear(self, train: bool) -> bool:
         """Whether every product the wrapper holds stays the linear map of its input by its kernel in a call,
         a training one where `train`: an adapter's where it drops nothing there, a quantization's never.
-        A layer that reads forks along a linear path alone (an in-context memory's recurrence) reads none
-        under a wrapper that does not (`MixerBase.wrapped_fork_refusal`)."""
+        A layer that reads forks along a linear path at no more work than one row (an in-context memory's
+        recurrence) unfolds them under a wrapper that does not (`MixerBase.fork_sharing_refusal`)."""
         ...
 
 
