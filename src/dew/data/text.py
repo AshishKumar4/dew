@@ -435,13 +435,13 @@ class HFTokenizer:
         return [*ids, ending] if eos and ending is not None and ids else ids
 
     def save_pretrained(self, directory) -> None:
-        """Write this tokenizer's own files into an export directory.
-
-        The tokenizer writes tokenizer.json, tokenizer_config.json and its
-        vocabulary itself, so the export copies no files by hand and the
-        result loads in anything that reads the HF layout.
-        """
-        self.tokenizer.save_pretrained(str(directory))
+        """Write this tokenizer's own files into an export directory, byte for byte as it holds them (its
+        pinned files, `pinned`), each checked against its hash (`copy_checked`): a release holds the files
+        its run read, so its tokenizer is its run's by their hashes, and a run continued from it averages
+        with its start. transformers' `save_pretrained` rewrote them, tokenizer.json among them, so a
+        release differed from its own run by hash."""
+        pinned = self.pinned
+        copy_checked(epath.Path(pinned.directory), epath.Path(directory), pinned.files)
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self.name!r})"
@@ -964,6 +964,16 @@ def cached_tokenizer(source: epath.Path, files: Mapping[str, str], *, named: str
         with staged(local) as building:
             copy_checked(source, epath.Path(building), files)
     return str(local)
+
+
+def canonical_files(tokenizer: HFTokenizer) -> dict[str, str]:
+    """The hashes of `tokenizer`'s files as this host's transformers writes them (`save_pretrained` of the
+    tokenizer it loads), each path in its directory: one canonical form, which two copies of one tokenizer
+    share whatever bytes each holds, a copy transformers wrote again among them."""
+    with tempfile.TemporaryDirectory(prefix="dew-canonical-") as written:
+        tokenizer.tokenizer.save_pretrained(written)
+        return {str(path.relative_to(written)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in sorted(Path(written).rglob("*")) if path.is_file()}
 
 
 def copy_checked(source: epath.Path, target: epath.Path, files: Mapping[str, str]) -> None:

@@ -982,6 +982,35 @@ def test_runs_whose_data_hold_other_widths_average_padded_to_the_widest(decide, 
     assert average.options == budgets[0].options
 
 
+@pytest.mark.parametrize("written", ["copied", "rewritten"])
+def test_a_run_continued_from_its_runs_release_averages_with_its_start(decide, tmp_path, written):
+    """A run exported as a release (`Decide.save_pretrained`), a run continued from that release and the
+    run it started from average as one task's (`Decide.averaged`). The release holds its run's tokenizer
+    files byte for byte (`HFTokenizer.save_pretrained`, `copied`); one exported before releases copied
+    them, its files written again by transformers (`rewritten`, its tokenizer.json among them, so its
+    hashes differ from its run's), is read as its run's tokenizer by both written again
+    (`canonical_files`). An export rewrote the files, and averaging refused a continued run its own start
+    (row 7387)."""
+    import hashlib
+
+    from transformers import AutoTokenizer
+
+    start = trained_runs(decide, tmp_path, 1, name="start")[0]
+    release = tmp_path / "release"
+    Decide.from_run(start).save_pretrained(release)
+    folder = next(release.rglob("tokenizer.json")).parent
+    held = Decide.from_run(start).tokenizer.pinned
+    files = {path: hashlib.sha256((folder / path).read_bytes()).hexdigest() for path in held.files}
+    assert files == dict(held.files)
+    if written == "rewritten":
+        AutoTokenizer.from_pretrained(str(folder)).save_pretrained(str(folder))
+        rewrote = {path: hashlib.sha256((folder / path).read_bytes()).hexdigest() for path in held.files}
+        assert rewrote != files
+    continued = trained_runs(Decide.from_pretrained(str(release), attention_impl="xla"), tmp_path, 1,
+                             name="continued")[0]
+    assert Decide.averaged([start, continued]).weights.averaged
+
+
 def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_path):
     """Runs average where their recorded task settings are one task's: a run whose head trained under
     dropout averages with one that trained none, as dropout says how a head trains and not what it
