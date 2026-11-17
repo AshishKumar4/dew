@@ -231,26 +231,28 @@ def _split(x, trailing: int, *, blocks: int, half: int):
     return jnp.reshape(x, (*lead, blocks, 2, half, *x.shape[x.ndim - trailing:]))
 
 
-def _halves(query, key, value, d_out, log, beta, ids, *, scale: float, group: int) -> jax.Array:
+def _halves(query, key, value, d_out, log, beta, ids, teams, *, scale: float, group: int) -> jax.Array:
     """The crossing sums of a chunk's own pairs `[..., C, A]`: each token `t`'s `sum_{u < t <= s} dA_su (J
     q_s) . k_u`, `dA_su = scale beta_u exp(G_s - G_u) (do_s . v_u)` over pairs of one document (`ids`) and of
-    later groups (`s // group > u // group`, a readout apart from its group's writes), by halves: a block's
+    later groups (`teams`, each token's group, a readout apart from its group's writes), by halves: a block's
     later half's pairs with its earlier half's cross each token of either half they lie between, as a suffix
     over the later half of `(J q_s) . sum_u dA_su k_u` and a prefix over the earlier half of `(J sum_s dA_su
     q_s) . k_u`; each half's own pairs are the next level's. Every term summed crosses its token: no term
-    cancels another. `query` and `key` `[..., C, 2 A]`, `value` and `d_out` `[..., C, V]`, `log` the log
-    decays' prefix `G` and `beta` `[..., C]`, `ids` `[..., C]` broadcast against them."""
+    cancels another. A level whose blocks each lie in one group (its size dividing `group`, groups whole a
+    chunk) holds no pair a readout apart keeps, nor does any level below it: the levels stop there (a
+    rank-four call's two smallest, each three small products a chunk). `query` and `key` `[..., C, 2 A]`,
+    `value` and `d_out` `[..., C, V]`, `log` the log decays' prefix `G` and `beta` `[..., C]`, `ids` and
+    `teams` `[..., C]` broadcast against them."""
     length = query.shape[-2]
-    positions = jnp.arange(length)
     total = jnp.zeros((*query.shape[:-1], query.shape[-1] // 2), jnp.float32)
     size = length
-    while size > 1:
+    while size > 1 and (group % size or length % group):
         half = size // 2
         split = functools.partial(_split, blocks=length // size, half=half)
         q, k, v, do = (split(x, 1) for x in (query, key, value, d_out))
-        G, b, doc = (split(x, 0) for x in (log, beta, jnp.broadcast_to(ids, log.shape)))
-        place = split(positions, 0)
-        kept = ((place[..., 1, :, None] // group > place[..., 0, None, :] // group)
+        G, b, doc, team = (split(x, 0) for x in (log, beta, *(jnp.broadcast_to(t, log.shape)
+                                                             for t in (ids, teams))))
+        kept = ((team[..., 1, :, None] > team[..., 0, None, :])
                 & (doc[..., 1, :, None] == doc[..., 0, None, :]))
         lag = jnp.where(kept, G[..., 1, :, None] - G[..., 0, None, :], -jnp.inf)
         pairs = jnp.einsum('...iv,...jv->...ij', do[..., 1, :, :], v[..., 0, :, :]) * jnp.exp(lag)
@@ -282,12 +284,12 @@ def turn_gradient(query, key, value, d_out, g, beta, state, d_final, starts, *, 
     turned = 2 * pairs
     rows = (query, key, value, d_out, g, beta)
     if documents is None:
-        walked = _packed(*rows, state, d_final, starts, scale=scale, turned=turned)
+        walked = _packed(*rows, state, d_final, starts, scale=scale, turned=turned, group=group)
     else:
         walked = _laid_documents(*rows, state, d_final, documents, entry, scale=scale, turned=turned,
-                                 held=held)
-    (q, k, v, do, log, b, ids, readers, writers, memories, leaving, passes), unlaid = walked
-    own = _halves(q, k, v, do, log, b, ids, scale=scale, group=group)
+                                 held=held, group=group)
+    (q, k, v, do, log, b, ids, teams, readers, writers, memories, leaving, passes), unlaid = walked
+    own = _halves(q, k, v, do, log, b, ids, teams, scale=scale, group=group)
     entered = _suffix(_crossed(readers, jnp.einsum('bhnkv,bhncv->bhnck', memories, do)), axis=-2)
     terms = -_crossed(writers, jnp.einsum('bhnkv,bhncv->bhnck', leaving, v))
     left = jnp.cumsum(terms, axis=-2) - terms
@@ -317,7 +319,8 @@ def _sides(q, k, log, b, reads, writes, scale: float):
     return readers, writers
 
 
-def _packed(query, key, value, d_out, g, beta, state, d_final, starts, *, scale: float, turned: int):
+def _packed(query, key, value, d_out, g, beta, state, d_final, starts, *, scale: float, turned: int,
+            group: int):
     """`turn_gradient`'s chunks of a call of packed documents, each from a zero memory but a row's first
     (`state`): its tokens in `CHUNK`-token chunks (padded), each token's document's id (`starts`' count
     through it), and the memories entering each chunk and their cotangents leaving it, walked over a row's
@@ -338,6 +341,8 @@ def _packed(query, key, value, d_out, g, beta, state, d_final, starts, *, scale:
     log = _segmented(laid(jnp.asarray(g, jnp.float32)), laid(begins)[:, None])
     b = laid(jnp.asarray(beta, jnp.float32))
     ids = laid(jnp.cumsum(begins.astype(jnp.int32), axis=1), mode='edge')[:, None]
+    # Each token's group: a row's tokens' ranks in turn from its first, each document beginning a token.
+    teams = laid(jnp.broadcast_to(jnp.arange(length) // group, (batch, length)), mode='edge')[:, None]
     before = jnp.concatenate([jnp.zeros_like(ids[..., :1, -1]), ids[..., :-1, -1]], axis=-1)
     readers, writers = _sides(q, k, log, b, ids == before[..., None], ids == ids[..., -1:], scale)
     passes = (ids[..., -1] == before)[..., None, None] * jnp.exp(log[..., -1])[..., None, None]
@@ -361,7 +366,7 @@ def _packed(query, key, value, d_out, g, beta, state, d_final, starts, *, scale:
         total = jnp.reshape(jnp.moveaxis(total, 1, 3), (batch, chunks * CHUNK, heads, total.shape[-1]))
         return total[:, :length]
 
-    return (q, k, v, do, log, b, ids, readers, writers, memories, leaving, passes), unlaid
+    return (q, k, v, do, log, b, ids, teams, readers, writers, memories, leaving, passes), unlaid
 
 
 def _document_of(firsts, length: int):
@@ -380,7 +385,7 @@ def _segmented(values, restarts):
 
 
 def _laid_documents(query, key, value, d_out, g, beta, given, d_final, documents, entry, *, scale: float,
-                    turned: int, held: int):
+                    turned: int, held: int, group: int):
     """`turn_gradient`'s chunks of a forked call: each document laid from a chunk's edge (padded to whole
     chunks, as the template and the portable math lay it), the memories entering each chunk walked through
     the call's table (a document's first chunk enters its `loads` slot's memory and its entry write, its last
@@ -449,7 +454,9 @@ def _laid_documents(query, key, value, d_out, g, beta, given, d_final, documents
         return jax.vmap(lambda row, at: row[at])(total, position)
 
     ids = jnp.broadcast_to(head[:, None, :, None], (batch, 1, chunks, CHUNK))
-    return (q, k, v, do, log, b, ids, readers, writers, memories, leaving, passes), unlaid
+    # Each token's group, counted from its document's first token (a chunk's edge).
+    teams = _chunked(within // group, chunks)[:, None]
+    return (q, k, v, do, log, b, ids, teams, readers, writers, memories, leaving, passes), unlaid
 
 
 def _slot(at, slots: int):
