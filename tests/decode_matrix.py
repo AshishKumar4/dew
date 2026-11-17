@@ -205,10 +205,11 @@ def a_decode_step_is_on_par(case: tuple[str, ...]) -> None:
 
 def per_shard(choice: str, kernel: str) -> dict:
     """`kernel`'s per-shard cells (`sharded.Shard`, tests/test_per_shard.py): its first case on `choice`'s
-    layout (`CASES`), an H100's where it has one, none where it has none, as a decode step through its choice's route at `kernel`,
-    over its heads a two-device tensor axis splits as the attention layer maps them (the query's, the
-    cache's and a sink's a head), under the default logical axis rules: the output, and a dense step's
-    gradients, on par with one device's from the reference path in float64, as the case's generation."""
+    layout (`CASES`), an H100's where it has one, none where it has none, as a decode step through its
+    choice's route at `kernel`, over its heads a two-device tensor axis splits as the attention layer maps
+    them (the query's, the cache's and a sink's a head), under the default logical axis rules: the output, and
+    a dense step's gradients, on par with one device's from the reference path in float64, as the case's
+    generation."""
     from flax import linen as nn
     from jax.sharding import PartitionSpec
     from sharded import Shard
