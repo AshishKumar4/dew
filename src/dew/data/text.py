@@ -443,8 +443,8 @@ class HFTokenizer:
         The tokenizer writes tokenizer.json, tokenizer_config.json and its vocabulary itself, as it holds
         them (a run's processor may have set its special tokens and template), so the export copies no files
         by hand and the result loads in anything that reads the HF layout. Its files' hashes are not its
-        run's: runs compare tokenizers through one canonical form where the hashes differ
-        (`canonical_files`)."""
+        run's: Dew compares tokenizers through one canonical form where the hashes differ
+        (`same_tokenizer`)."""
         self.tokenizer.save_pretrained(str(directory))
 
     def __repr__(self):
@@ -892,12 +892,11 @@ def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "t
     step = Tokenize(tokenizer, field, eos)
     documents = dataset.map(step)
     vocabulary = step.vocabulary
-    # The tokenizer's identity as it resolved for this export (a hub name's commit and every file's digest,
-    # a directory's files' digests), which stores read together state alike (`tokenizer_contract`): a name
-    # alone is two tokenizers once its files change.
+    # The tokenizer's identity as it resolved for this export (`tokenizer_revision`), which stores read
+    # together state alike (`tokenizer_contract`): a name alone is two tokenizers once its files change.
     metadata = {"token_store": True, "tokenizer": tokenizer, "vocab_size": vocabulary.vocab_size,
                 "dtype": "int32", "eos_id": vocabulary.eos_id if eos else None,
-                "tokenizer_revision": vocabulary.dependencies()}
+                "tokenizer_revision": tokenizer_revision(vocabulary)}
     return export(iterate(documents, read=read, provision=provision), url,
                   format="array_record", rows_per_shard=rows_per_shard, metadata=metadata,
                   length_field="text")
@@ -978,6 +977,28 @@ def canonical_files(tokenizer: HFTokenizer) -> dict[str, str]:
         tokenizer.tokenizer.save_pretrained(written)
         return {str(path.relative_to(written)): hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in sorted(Path(written).rglob("*")) if path.is_file()}
+
+
+def tokenizer_revision(vocabulary: ByteTokenizer | HFTokenizer) -> Mapping[str, object]:
+    """The identity a store records of the tokenizer its rows were encoded with (its `tokenizer_revision`):
+    its resolution (`dependencies`: a hub name's commit and each file's hash, a directory's files' hashes)
+    and, a Hugging Face tokenizer's, its files' canonical form's hashes (`canonical`, `canonical_files`),
+    by which `same_tokenizer` knows copies of one tokenizer whose bytes differ."""
+    match vocabulary:
+        case HFTokenizer():
+            return {**vocabulary.dependencies(), "canonical": canonical_files(vocabulary)}
+        case _:
+            return vocabulary.dependencies()
+
+
+def same_tokenizer(one: Mapping[str, object], other: Mapping[str, object]) -> bool:
+    """Whether two Hugging Face tokenizers' identities (`tokenizer_revision`, each stating its files'
+    hashes) name one tokenizer, Dew's one rule of it, for runs and stores alike: their files' hashes alike,
+    else their canonical forms alike where both state one. An export always writes a run's tokenizer
+    through transformers (`HFTokenizer.save_pretrained`), which writes its tokenizer.json anew, so every
+    release's hashes differ from its run's though it is one tokenizer; transformers writes both alike
+    again. A store recorded before stores stated a canonical form compares by its hashes alone."""
+    return one["files"] == other["files"] or ("canonical" in one and one["canonical"] == other.get("canonical"))
 
 
 def confined_files(files: Mapping[str, str]) -> dict[str, str]:

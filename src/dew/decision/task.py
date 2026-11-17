@@ -296,16 +296,14 @@ def _tokenizer_held(settings: "DecideSettings", run: str) -> "Tokenizer | str | 
 
 
 def _same_tokenizer(one: "Tokenizer | str | None", other: "Tokenizer | str | None") -> bool:
-    """Whether two runs read one tokenizer: their files' hashes alike (`PinnedTokenizer.files`), else their
-    files each written again by this host's transformers alike (`dew.data.text.canonical_files`), which a
-    release exported before releases copied their run's files (`HFTokenizer.save_pretrained`) is read by:
-    transformers rewrote its tokenizer.json, so its hashes differ from its run's though it is one
-    tokenizer, which a run continued from it averages with its start by. A byte vocabulary by its name."""
-    from dew.data.text import HFTokenizer, canonical_files
+    """Whether two runs read one tokenizer, by Dew's one rule of it (`dew.data.text.same_tokenizer`): a run
+    continued from a release reads the release's tokenizer, which an export wrote through transformers,
+    and averages with its start by it. A byte vocabulary by its name."""
+    from dew.data.text import HFTokenizer, same_tokenizer, tokenizer_revision
 
     match one, other:
         case HFTokenizer(), HFTokenizer():
-            return one.pinned.files == other.pinned.files or canonical_files(one) == canonical_files(other)
+            return same_tokenizer(tokenizer_revision(one), tokenizer_revision(other))
         case _:
             return one == other
 
@@ -666,7 +664,7 @@ class Decide(SavedRunTask, InItsForm):
         settings = [saved_settings(saved, DecideSettings) for saved in recorded]
         # A setting its data derives (its padding, `metadata["derived"]`) may differ between the runs, and
         # their heads by how they run or train alone (`_head_changes`).
-        # Their tokenizers by what they are, their files' hashes, wherever each found it (`_tokenizer_held`).
+        # Their tokenizers by what they are (`_same_tokenizer`), wherever each found it (`_tokenizer_held`).
         tokenizers = [_tokenizer_held(own, run.directory) for own, run in zip(settings, pinned, strict=True)]
         for directory, own, held in zip(runs, settings, tokenizers, strict=True):
             differing = [entry.name for entry in fields(DecideSettings)

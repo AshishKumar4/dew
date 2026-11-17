@@ -26,6 +26,7 @@ from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self, TypeGuard, runtime_checkable
 
 from dew._records import JSON, integer, json_value
+from dew.data.text import same_tokenizer
 
 if TYPE_CHECKING:
     import grain.python as pygrain
@@ -48,28 +49,31 @@ TOKENIZER_CONTRACT = ("tokenizer", "vocab_size", "eos_id", "tokenizer_revision")
 together, and every store a concatenation joins, must state alike where they state them:
 `tokenizer_revision` the identity its tokenizer resolved to as it was written (a hub name's commit and
 each file's digest, `dew.data.text.export_tokens`), which a store written before it stated one leaves out.
-A tokenizer is what its files are, as a run's is (`dew.data.text.PinnedTokenizer.files`): stores that state
-its files compare by them alone, one tokenizer under two names or at two places alike."""
+A tokenizer is what its files are, as a run's is (`dew.data.text.same_tokenizer`): stores that state its
+files compare by them alone, one tokenizer under two names, at two places, or written again by
+transformers (a release's) alike."""
 
 
-def tokenizer_files(metadata: Mapping[str, object]) -> JSON:
-    """The files' hashes a store's tokenizer resolved to (`tokenizer_revision`'s `files`), or None where it
-    states none."""
-    revision = metadata.get("tokenizer_revision")
-    return json_value(revision.get("files"), "tokenizer files") if isinstance(revision, Mapping) else None
+def stated_revision(metadata: Mapping[str, object]) -> Mapping[str, object] | None:
+    """A store's tokenizer identity (`tokenizer_revision`) where it states its files' hashes, or None."""
+    match metadata.get("tokenizer_revision"):
+        case {"files": _} as revision:
+            return revision
+        case _:
+            return None
 
 
 def tokenizer_contract(stated: Iterable[tuple[str, Mapping[str, object]]]) -> dict[str, JSON]:
     """The tokenizer contract (`TOKENIZER_CONTRACT`) of stores read together, each `(name,
     metadata)`: every fact any of them states, as the first states it, which every other that states it
-    states alike; a tokenizer by its files where both state them (`tokenizer_files`), its name and
-    revision then no part of it. Raises ValueError naming the store whose fact differs from the first's."""
+    states alike; a tokenizer by its files where both state them (`stated_revision`, `same_tokenizer`),
+    its name and revision then no part of it. Raises ValueError naming the store whose fact differs from the first's."""
     declared: dict[str, JSON] = {}
-    first: JSON = None
+    first: Mapping[str, object] | None = None
     for name, metadata in stated:
-        files = tokenizer_files(metadata)
-        by_files = files is not None and first is not None
-        if by_files and files != first:
+        revision = stated_revision(metadata)
+        by_files = revision is not None and first is not None
+        if by_files and not same_tokenizer(revision, first):
             raise ValueError(f"{name}'s tokenizer files differ from the first store's; stores read together "
                              "must share the tokenizer contract, whose ids they hold")
         for key in TOKENIZER_CONTRACT:
@@ -81,7 +85,7 @@ def tokenizer_contract(stated: Iterable[tuple[str, Mapping[str, object]]]) -> di
                 raise ValueError(f"{name} has {key}={value!r}, expected {declared[key]!r}; stores read "
                                  "together must share the tokenizer contract, whose ids they hold")
             declared.setdefault(key, value)
-        first = files if first is None else first
+        first = revision if first is None else first
     return declared
 
 
