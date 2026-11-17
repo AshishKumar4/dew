@@ -29989,7 +29989,6 @@
 "tests/test_plan.py::test_a_split_plan_does_not_compile_or_time_an_optional_faster_sibling": 4.348,
 "tests/test_plan.py::test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits[decoder-cpu]": 61.828,
 "tests/test_plan.py::test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits[decoder-h100]": 53.194,
-"tests/test_plan.py::test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits[delta-scanned-cpu]": 503.854,
 "tests/test_plan.py::test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits[delta-scanned-h100]": 199.576,
 "tests/test_plan.py::test_a_step_compiled_ahead_is_profiled_on_a_trial_under_autopgle[two-microbatches]": 9.085,
 "tests/test_plan.py::test_a_step_compiled_ahead_is_profiled_on_a_trial_under_autopgle[whole-batch]": 10.925,
