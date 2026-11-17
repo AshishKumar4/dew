@@ -18,7 +18,7 @@ import logging
 import os
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import IO, TYPE_CHECKING
 
 import jax
@@ -26,6 +26,7 @@ import numpy as np
 
 from dew import _records
 from dew._cache import hub_answer, hub_commit, hub_storage, recorded_hub_answer
+from dew._files import inside
 from dew.interop import pickles
 from dew.interop.codecs import CT_PARTS
 from dew.interop.safetensors_io import (
@@ -83,8 +84,7 @@ class SourceReference:
     (`pretrained.load_processor`, `dew.registry.trusts_source`)."""
 
     def __post_init__(self):
-        folder = Path(self.subfolder or "")
-        if folder.is_absolute() or ".." in folder.parts:
+        if self.subfolder and not inside(self.subfolder):
             raise ValueError("subfolder must stay inside the resolved source")
 
     @classmethod
@@ -270,7 +270,7 @@ def code_modules(code: SourceCode) -> dict[str, Path]:
 
     def located(file: str) -> Path:
         # A module named by a config or an import is a path inside the source, as a subfolder is.
-        if PurePosixPath(file).is_absolute() or {"", ".", ".."} & set(PurePosixPath(file).parts):
+        if not file or not inside(file) or file.endswith("/"):
             raise ValueError(f"{file!r} is no module inside the source: its code may not name a path "
                              "outside it")
         if local:

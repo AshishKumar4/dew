@@ -61,6 +61,7 @@ from types import MappingProxyType
 from typing import Protocol
 
 from dew._cleanup import exit_code, groups_ended, process_group, signal_group
+from dew._files import inside
 from dew._records import JSON, finite
 from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import Draw, InfrastructureError
@@ -294,8 +295,7 @@ class Program:
         if not self.command or any(not isinstance(part, str) or not part for part in self.command):
             raise ValueError("a program command is a nonempty argv tuple")
         for name in self.files:
-            path = Path(name)
-            if path.is_absolute() or ".." in path.parts or not path.parts:
+            if not name or not inside(name) or name.endswith("/"):
                 raise ValueError(f"program file {name!r} must be a relative path inside the job directory")
         object.__setattr__(self, "files", MappingProxyType(dict(self.files)))
 
