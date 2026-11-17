@@ -50,11 +50,21 @@ def assert_split_as_whole(module, variables, row: str, seeds: int, site: str, *,
     if segments is not None:
         fields["segments"] = jnp.asarray(np.broadcast_to(segments, (SPLIT_BATCH, 32)), jnp.int32)
     call = MixerCall(AttentionMetadata(coordinates=coordinates(**fields)))
+    split, draw = assert_as_on_one_device(module, variables, call, (SPLIT_BATCH, 32, width), seeds, site,
+                                          shards=shards)
+    assert not np.any(np.asarray(split(*draw(0))[0])[:, ~valid])
 
+
+def assert_as_on_one_device(module, variables, call: MixerCall, shape: tuple[int, int, int], seeds: int,
+                            site: str, *, shards: int = 4):
+    """Under a sequence axis of `shards`, `module` with `variables` called with `call` over hidden states of
+    `shape` `[B, S, width]` computes as on one device: its output and its input's and parameters' gradients
+    check 1's against the same call on one device, from float64, over `seeds` draws. Returns the call on the
+    axis, `(hidden, cotangent) -> (output, parameters' gradient, hidden's gradient)`, and the draw of a
+    seed's `(hidden, cotangent)`."""
     def draw(seed):
         rng = np.random.default_rng([0x5E9, seed])
-        return (rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32),
-                rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32))
+        return (rng.standard_normal(shape).astype(np.float32), rng.standard_normal(shape).astype(np.float32))
 
     def pulled(model):
         """The layer's output and its pullback of a cotangent, `model` over `params`, compiled once for
@@ -79,4 +89,37 @@ def assert_split_as_whole(module, variables, row: str, seeds: int, site: str, *,
 
     assert_as_exact(split, lambda hidden, cotangent: whole(variables, hidden, cotangent), draw, site,
                     seeds=seeds, truth_fn=truth)
-    assert not np.any(np.asarray(split(*draw(0))[0])[:, ~valid])
+    return split, draw
+
+
+def assert_decodes_as_whole(module, variables, seeds: int, site: str, *, width: int, shards: int = 4,
+                            prefill: int = 5, length: int = 8):
+    """Under a sequence axis of `shards`, `module` with `variables` decodes as it decodes on one device: a
+    prefill of `prefill` tokens through its cache, then one token a step to `length`, the call run whole with
+    its state replicated over the axis (`linear.sequence_split`). Every step's output is check 1's against
+    the same decode on one device, from float64, over `seeds` draws of hidden states `width` wide."""
+    from model_support import decode_through
+
+    def draw(seed):
+        rng = np.random.default_rng([0xDEC, seed])
+        return (rng.standard_normal((2, length, width)).astype(np.float32),)
+
+    def decoded(model, params):
+        return jax.jit(lambda hidden: decode_through(model, params, hidden, prefill)[0])
+
+    whole = decoded(module, variables)
+    mesh = MeshSpec(sequence=shards).build(jax.devices()[:shards])
+
+    @as_given
+    def split(hidden):
+        with jax.set_mesh(mesh):
+            return whole(hidden)
+
+    @as_given
+    def truth(hidden):
+        with jax.enable_x64(new_val=True):
+            params, wide_hidden = widened((variables, hidden))
+            return decoded(module.clone(dtype=jnp.float64), params)(wide_hidden)
+
+    assert_as_exact(split, lambda hidden: whole(hidden), draw, site, seeds=seeds, truth_fn=truth)
+

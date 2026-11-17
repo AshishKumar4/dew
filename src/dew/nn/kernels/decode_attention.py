@@ -51,7 +51,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn.decode_geometry import grouped_query
 from dew.nn.kernels import launches
-from dew.nn.precision import precision_names
+from dew.nn.precision import FP32_PRODUCTS, precision_names
 
 from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
@@ -127,7 +127,7 @@ def run_products(case: "AttentionCase") -> bool:
     if not names:
         return True
     if jnp.dtype(case.dtype) == jnp.dtype(jnp.float32):
-        return names <= {"HIGHEST", "F32_F32_F32"}
+        return names <= FP32_PRODUCTS
     return not any(name.endswith(("_BF16", "_F16")) for name in names)
 
 

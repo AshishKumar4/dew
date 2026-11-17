@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import types
+import typing
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
 
 import jax
+import jax.numpy as jnp
 
 from dew._records import ADDED, integer, number, record
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
@@ -52,16 +55,67 @@ from dew.decision.rows import option_width
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.inputs.condition import ConditionEncoder
-from dew.inputs.spec import TextCondition
+from dew.inputs.spec import Condition, TextCondition
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, SharedCrossAttention
+from dew.nn.dit import TextContext
 from dew.nn.protocols import CountedCondition, RematChoosing
 from dew.optim import OptimConfig
-from dew.registry import ModelConfig, class_record, from_record, import_path, record_argument
+from dew.registry import ModelConfig, class_record, dtype_name, from_record, import_path, record_argument
 from dew.state import TrainState
 
 if TYPE_CHECKING:
     from dew.checkpoints import Checkpoints
+    from dew.data.dataset import Loader
+
+
+def _data_summary(dataset: Loader) -> Mapping[str, object]:
+    """What a decision run's data left out or cut, as its data counters count them: the rows each layout
+    refused by reason, the rows and tokens each cut removed, and the draws of "none of the above" declined."""
+    found: dict[str, object] = {}
+    # The rows each layout refused, by reason, and the rows and tokens each cut removed, of the
+    # rows it delivered and the tokens of those it refused, as the run's data counters count them
+    # (`Layout.refusal`, `Encoded.cuts`, `Rejected.cut`).
+    for reason in ("unfit", "options_alike"):
+        refused = {name: counter.refused.get(reason, 0) for name, counter in dataset.counts.items()}
+        refused["held out"] = sum(counter.refused.get(reason, 0)
+                                  for counter in dataset.validation_counts.values())
+        if any(refused.values()):
+            found[reason] = refused
+    cut = {name: {kind: {"examples": counter.cut_examples[kind], "rows": counter.cut_rows[kind],
+                         "removed": counter.cut_removed[kind], "refused": counter.refused_cut[kind],
+                         "unit": cut_unit(kind)}
+                  for kind in {**counter.cut_rows, **counter.refused_cut}}
+           for name, counter in {**dataset.counts, **{f"{name} (held out)": counter for name, counter
+                                                       in dataset.validation_counts.items()}}.items()
+           if counter.cut_rows or counter.refused_cut}
+    if cut:
+        found["cut"] = cut
+    # The rows whose "none of the above" a training read declines where it draws it, by why their
+    # layout refuses it (`FittedRow.declined`); each such read trains on the row as it was admitted.
+    declined = {name: dict(counter.declined) for name, counter in dataset.counts.items()
+                if counter.declined}
+    if declined:
+        found["none_of_the_above_declined"] = declined
+    return found
+
+
+def encodes_text(kind: type) -> bool:
+    """Whether encoders of `kind` read text into the states context layers read: its class a
+    `ConditionEncoder[str, TextContext]` (`char_table`, `clip_text`, `t5`), not a denoiser's conditioner,
+    which gives a condition of its own, nor an encoder of another input."""
+    declared = [base for klass in kind.__mro__ for base in types.get_original_bases(klass)
+                if typing.get_origin(base) is ConditionEncoder]
+    return any(typing.get_args(base) == (str, TextContext) for base in declared)
+
+
+def _text_encoder(condition: Condition) -> ConditionEncoder:
+    """`condition`'s encoder, refused (ValueError) where it reads no text into the states context layers
+    read (`encodes_text`)."""
+    if not encodes_text(type(condition.encoder)):
+        raise ValueError(f"--context-text.encoder {type(condition.encoder).__name__} encodes no text into "
+                         "the states context layers read; name one that does (char_table, clip_text, t5)")
+    return condition.encoder
 
 
 @dataclasses.dataclass(frozen=True)
@@ -215,10 +269,14 @@ class DecisionRunConfig(DecoderRunConfig):
     (`DecisionModel.context_encoder`): the backbone's token table, or the
     backbone's own pass over it. With `context_layers` alone."""
     context_text: TextCondition | None = dataclasses.field(default=None, metadata={ADDED: True})
-    """A configured encoder of the context in place of the backbone's own (`DecisionModel.context`): any
-    registered condition encoder and its checkpoint, as a diffusion run's text condition names one, its
-    tokenization the context's, each row's context encoded alone, its states read by the cross-attention at
-    its own width. With `context_layers` alone."""
+    """A configured encoder of the context in place of the backbone's own (`DecisionModel.context`): a
+    registered encoder of text into states (`char_table`, `clip_text`, `t5`) and its checkpoint, as a
+    diffusion run's text condition names one, computing in the run's dtype, its tokenization the
+    context's, each row's context encoded alone, its states read by the cross-attention at its own width,
+    its weights frozen unless `context_text_trained`. With `context_layers` alone."""
+    context_text_trained: bool = dataclasses.field(default=False, metadata={ADDED: True})
+    """Whether a configured context encoder's weights train with the run, else held frozen and run
+    forward alone, as a diffusion run's text encoders are."""
     context_form: Literal["idefics", "shared"] = "idefics"
     """The block each context layer runs: IDEFICS's gated block, an attention and a
     feed-forward of its own drawn beside the layer (`CrossAttention`), or the
@@ -255,6 +313,17 @@ class DecisionRunConfig(DecoderRunConfig):
         revision = SourceReference(self.pretrained, self.revision, self.subfolder).pinned().revision
         return run if revision == self.revision else dataclasses.replace(run, revision=revision)
 
+    def _context_derived(self, dtype: str) -> Mapping[str, object]:
+        """The objective's context arguments: how its backbone encodes a row's context, or the encoder a
+        run configures (`context_text`, built in the run's compute `dtype` and refused where it encodes no
+        text, `_text_encoder`) and whether its weights train (`context_text_trained`)."""
+        if self.context_layers is None:
+            return {}
+        if self.context_text is None:
+            return {"context_encoder": self.context_encoder}
+        built = self.context_text.build(dtype=dtype_name(jnp.dtype(dtype)))
+        return {"context_encoder": _text_encoder(built), "context_trained": self.context_text_trained}
+
     def _refuse_unread_context(self) -> None:
         """Refuse each context option a run without context layers would read nothing of: a schema read
         as the row's context, its encoder, its frozen backbone and its block's form."""
@@ -268,6 +337,14 @@ class DecisionRunConfig(DecoderRunConfig):
             raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
         if self.context_text is not None and self.context_layers is None:
             raise ValueError("--context-text encodes the context context layers read; set --context-layers")
+        if self.context_text_trained and self.context_text is None:
+            raise ValueError("--context-text-trained trains a configured context encoder; set --context-text")
+        text = self.context_text
+        if text is not None and (text.field, text.unconditional) != (TextCondition.field,
+                                                                     TextCondition.unconditional):
+            raise ValueError("a decision's context encoder reads the row's context field and has no "
+                             "unconditional branch; --context-text.field and --context-text.unconditional "
+                             "are a diffusion run's")
         if not self.context_frozen and self.context_layers is None:
             raise ValueError("--no-context-frozen says how context layers hold the backbone; set "
                              "--context-layers")
@@ -306,10 +383,7 @@ class DecisionRunConfig(DecoderRunConfig):
         attention_impl = self.source_attention()
         budgets = self._row_fields()
         self._refuse_unread_context()
-        derived: dict[str, object] = {}
-        configured = None if self.context_text is None else self.context_text.build().encoder
-        if self.context_layers is not None:
-            derived["context_encoder"] = self.context_encoder if configured is None else configured
+        derived: dict[str, object] = dict(self._context_derived(dtype))
         from dew.decision.slot_source import reads_blocks
         from dew.decision.sources import PretrainedDecision
 
@@ -335,6 +409,8 @@ class DecisionRunConfig(DecoderRunConfig):
         start = self.looped(start)
         if self.context_layers is not None:
             # Drawn from a key of their own, apart from the adapter's and the head's.
+            encoder = derived["context_encoder"]
+            configured = encoder if isinstance(encoder, ConditionEncoder) else None
             start = start.with_cross_attention(self._context_blocks(configured), key=jax.random.fold_in(
                 jax.random.key(self.trainer.key), 1), frozen=self.context_frozen)
         start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
@@ -362,30 +438,7 @@ class DecisionRunConfig(DecoderRunConfig):
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
         dataset, held = self.compiled(objective.data(), self.chain(), self.validation)
         summary["records"] = dataset.records
-        # The rows each layout refused, by reason, and the rows and tokens each cut removed, of the
-        # rows it delivered and the tokens of those it refused, as the run's data counters count them
-        # (`Layout.refusal`, `Encoded.cuts`, `Rejected.cut`).
-        for reason in ("unfit", "options_alike"):
-            refused = {name: counter.refused.get(reason, 0) for name, counter in dataset.counts.items()}
-            refused["held out"] = sum(counter.refused.get(reason, 0)
-                                      for counter in dataset.validation_counts.values())
-            if any(refused.values()):
-                summary[reason] = refused
-        cut = {name: {kind: {"examples": counter.cut_examples[kind], "rows": counter.cut_rows[kind],
-                             "removed": counter.cut_removed[kind], "refused": counter.refused_cut[kind],
-                             "unit": cut_unit(kind)}
-                      for kind in {**counter.cut_rows, **counter.refused_cut}}
-               for name, counter in {**dataset.counts, **{f"{name} (held out)": counter for name, counter
-                                                           in dataset.validation_counts.items()}}.items()
-               if counter.cut_rows or counter.refused_cut}
-        if cut:
-            summary["cut"] = cut
-        # The rows whose "none of the above" a training read declines where it draws it, by why their
-        # layout refuses it (`FittedRow.declined`); each such read trains on the row as it was admitted.
-        declined = {name: dict(counter.declined) for name, counter in dataset.counts.items()
-                    if counter.declined}
-        if declined:
-            summary["none_of_the_above_declined"] = declined
+        summary.update(_data_summary(dataset))
 
         def calibrate(state: TrainState, directory: str) -> None:
             """Fit the task's temperatures on the held-out rows; process zero saves them into the run."""
