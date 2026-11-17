@@ -77,6 +77,28 @@ def test_images_train_a_denoiser_with_device_augmentation_and_validate_unaugment
     assert logged.artifacts, "the validation batches were sampled from"
 
 
+def test_an_undecodable_image_is_skipped_counted_and_read_by_its_epochs_pass():
+    """Eleven photographs and one file that does not decode, trained for two epochs: the image is dropped
+    and counted (`data/rejected/`), the run trains through it, and a pass is the source's twelve records,
+    the skipped one read among them, so the run's two epochs consume 24 records. A pass counted in the
+    examples a decode keeps knew no count ahead, so an image recipe's epochs were refused (row 7627)."""
+    from test_example_counts import counted, read_whole
+
+    records = [*jpegs(11), {"image": b"not an image", "label": 0}]
+    chain = Memory(records).shuffle(0).repeat().pipe(presets.images, 16, batch=4)
+    loader = compile(chain, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1), epochs=2)
+    assert loader.pass_examples == 12
+    assert read_whole(loader, "image")[1] == 24
+    assert counted(loader, "data/rejected/") == [2]
+    objective = DiffusionObjective(SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
+                                             mlp_ratio=1),
+                                   Flow(), InputSpec(Field("image", (16, 16, 3))), solver=Euler(), steps=2)
+    tracker = RecordingTracker()
+    state = Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker).fit(chain, epochs=2, log_every=1)
+    finite(tracker, "train/loss")
+    assert int(state.consumed) == 24
+
+
 def test_images_apply_a_user_random_step_on_the_host_right_after_resize():
     pixels = np.arange(24 * 32 * 3, dtype=np.uint8).reshape(24, 32, 3)
     source = Memory([{"image": pixels, "label": index} for index in range(8)])
