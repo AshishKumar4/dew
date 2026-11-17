@@ -2013,14 +2013,13 @@ def lane_units(python: str, tests: list[str], within: float | None = None) -> di
 
 PREPARES = "prepares"
 """The mark of a GPU test whose part's prepare runs it first, on the node's CPU (`gpu_prepared`)."""
-PREPARING = {"DEW_TIER_PREPARE": "1", "JAX_PLATFORMS": "cpu"}
-"""What a lane's prepare runs its files under: the word tests/conftest.py reads to skip every test but those
-marked `PREPARES`, each of which then prepares rather than runs (tests/model_flows.py), on the CPU alone."""
 
 
 def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, deadline: float) -> int:
     """A GPU lane's prepare, on its node's CPU before its files' GPU run (`gpu_lane`) and with no GPU drawn:
-    each of `tests` that holds a test marked `PREPARES` run once in a process of its own under `PREPARING`,
+    each of `tests` that holds a test marked `PREPARES` run once in a process of its own on the CPU alone,
+    under the prepare's word (tests/tier_wire.py's PREPARE, which tests/conftest.py reads to skip every test
+    but those marked `PREPARES`, each of which then prepares rather than runs) and its unit's name (UNIT),
     at most `processes` at once, as its run will select and cut it (a group `<file>#G/N` holds in its prepare
     the tests it holds in its run: the same selection, the same weights, DEW_SPLIT_DURATIONS), so each such
     test computes what its run reads and must not compute while it holds the GPU, its float64 truths and
@@ -2059,8 +2058,9 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
                 "output": "not prepared: its lane's prepare had no time left for it"}]}))
             return 0
         return tested(python, [file], group, verdict, mine, "off", session.GRACE, "",
-                      {**PREPARING, "OMP_NUM_THREADS": threads, **(VARIANTS[variant][1] if variant else {}),
-                       gpu_measures.UNIT: name}, recorded=False, variant=variant)
+                      {"JAX_PLATFORMS": "cpu", gpu_measures.wire().PREPARE: "1", "OMP_NUM_THREADS": threads,
+                       **(VARIANTS[variant][1] if variant else {}), gpu_measures.wire().UNIT: name},
+                      recorded=False, variant=variant)
 
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
         for done in [pool.submit(prepared, name, verdict) for name, verdict in verdicts.items()]:

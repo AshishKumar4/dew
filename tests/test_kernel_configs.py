@@ -841,8 +841,8 @@ def test_a_refused_gathering_producer_offers_its_whole_ladder_and_its_refused_ti
     """The B200's gathered input gradient's derived tile, its producer at its ladder's top
     (`producers.started`), refused as a compile finding its kernel spilling refuses it
     (`report.refuse_launch`): its rungs (`_Mosaic.rungs`) are offered whole, each a lower producer above the
-    least, though no compile refused any of them, so certification asks them a round at a time
-    (`tuning.KernelOp._climbed`); the refused tile is no pin or stored pick (`pinnable`)."""
+    least, though no compile refused any of them, so certification asks them in turn, the first that holds
+    taken (`tuning.KernelOp._climbed`); the refused tile is no pin or stored pick (`pinnable`)."""
     launch, arguments = _gathered_on_a_b200("input gradient, its rows gathered")
     with report.refusals(), generation.assumed("sm100"):
         tile = launch.derived(arguments, generation.gpu_target())

@@ -40,15 +40,21 @@ OPERANDS = {"x": ("time", "width"), "dt": ("time",), "B": ("time", "state"), "C"
 DECLARED = scan.Scan(update, readout, OPERANDS, walked="time", state=((STATE, WIDTH), jnp.float32))
 
 
-def tokenwise(x, dt, B, C, reads: str = "after"):
+def tokenwise(x, dt, B, C, reads: str = "after", group: int = 1):
     """The recurrence token by token (`lax.scan`), its outputs and final state, each token reading the state
-    after it or entering it (`reads`, `Scan.reads`: RWKV-6's, before its decay and its write)."""
-    def one(h, token):
+    after it or entering it (`reads`, `Scan.reads`: RWKV-6's, before its decay and its write), or after its
+    decay apart from every write of its `group` (Mamba-3's ranks: the state its group entered, decayed by
+    each of the group's tokens up to it)."""
+    def one(carry, token):
+        h, held, index = carry
         x_t, dt_t, B_t, C_t = token
         after = update(h, x_t, dt_t, B_t, C_t, RATE, SKIP)
-        return after, readout(h if reads == "before" else after, x_t, dt_t, B_t, C_t, RATE, SKIP)
+        held = jnp.exp(dt_t * RATE) * jnp.where(index % group == 0, h, held)
+        read = {"before": h, "after": after, "apart": held}[reads]
+        return (after, held, index + 1), readout(read, x_t, dt_t, B_t, C_t, RATE, SKIP)
 
-    final, outputs = jax.lax.scan(one, jnp.zeros((STATE, WIDTH), x.dtype), (x, dt, B, C))
+    zero = jnp.zeros((STATE, WIDTH), x.dtype)
+    (final, _, _), outputs = jax.lax.scan(one, (zero, zero, 0), (x, dt, B, C))
     return outputs, final
 
 
@@ -72,11 +78,19 @@ def deep_draw(seed):
     return x, jnp.asarray(np.random.default_rng(seed + 1).uniform(1, 2, TOKENS), jnp.float32), B, C
 
 
-def vanishing_draw(seed):
-    """`draw`'s inputs, every eighth token's step so long its decay vanishes in float32 (`e^-1400`), with no
-    reset: the state it reads entering it is whole, the one it leaves its own write alone."""
-    x, dt, B, C = draw(seed)
-    return x, dt.at[3::8].set(2e3), B, C
+def stepped_at(tokens: slice, step: float, doc: str):
+    """`draw`'s inputs with the steps of `tokens` set to `step`, a draw `doc` states."""
+    def drawn(seed):
+        x, dt, B, C = draw(seed)
+        return x, dt.at[tokens].set(step), B, C
+
+    drawn.__doc__ = doc
+    return drawn
+
+
+vanishing_draw = stepped_at(slice(3, None, 8), 2e3, """`draw`'s inputs, every eighth token's step so long its
+decay vanishes in float32 (`e^-1400`), with no reset: the state it reads entering it is whole, the one it
+leaves its own write alone.""")
 
 
 def operands(x, dt, B, C) -> dict:
@@ -101,26 +115,66 @@ def walk(forms, values, chunks: range, state, axes: dict = OPERANDS):
     return outputs, state
 
 
-READING_DRAWS = [("after", draw), ("before", draw), ("before", vanishing_draw)]
-"""The SSD's walks each token reading the state after it or entering it (`Scan.reads`, RWKV-6's), over
-`draw`'s inputs, and reading before over `vanishing_draw`'s, a decay vanishing at a token with no reset."""
+ranked_draw = stepped_at(slice(1, None, 2), 0.0, """`draw`'s inputs as Mamba-3's ranks of two: each token's
+two ranks consecutive, its step (its decay) on its first rank alone, the second's zero, so the second reads
+the state its token's first decayed.""")
 
 
-@pytest.mark.parametrize(("reads", "draw_fn"), READING_DRAWS, ids=["after", "before", "before-vanishing"])
-def test_the_derived_chunks_compute_the_token_scan(reads, draw_fn):
-    """The derived chunk outputs and step over every chunk in order, each token reading the state after it or
-    entering it (`Scan.reads`): on par with the token-by-token scan reading alike, outputs and final state,
-    against the float64 truth (check 1); a decay vanishing at a token erases nothing that token reads."""
-    forms = scan.derive_scan(dataclasses.replace(DECLARED, reads=reads), saturation=SATURATION)
-
+def ssd_walked(forms):
+    """`forms`' chunk outputs and steps over every chunk in order from a zero state, finished: a function of
+    the SSD's inputs."""
     def derived(x, dt, B, C):
         values = operands(x, dt, B, C)
         outputs, state = walk(forms, values, range(TOKENS // CHUNK), forms.init({}))
         return jnp.concatenate(outputs), forms.finish(state, values)
 
-    label = f"ssd chunks{READING[reads]}{', vanishing decays' if draw_fn is vanishing_draw else ''}"
-    scanned = functools.partial(tokenwise, reads=reads)
+    return derived
+
+
+READING_DRAWS = [("after", 1, draw), ("before", 1, draw), ("before", 1, vanishing_draw), ("apart", 1, draw),
+                 ("apart", 2, ranked_draw), ("apart", 4, draw), ("apart", 2, vanishing_draw)]
+"""The SSD's walks each token reading the state after it or entering it (`Scan.reads`, RWKV-6's), over
+`draw`'s inputs, and reading before over `vanishing_draw`'s, a decay vanishing at a token with no reset; and
+each reading after its decay apart from its group's writes, a group of one, Mamba-3's ranks of two, four
+tokens, and two over vanishing decays."""
+
+
+@pytest.mark.parametrize(("reads", "group", "draw_fn"), READING_DRAWS,
+                         ids=["after", "before", "before-vanishing", "apart", "apart-ranks", "apart-4",
+                              "apart-vanishing"])
+def test_the_derived_chunks_compute_the_token_scan(reads, group, draw_fn):
+    """The derived chunk outputs and step over every chunk in order, each token reading the state after it or
+    entering it, or after its decay apart from every write of its group (`Scan.reads`, `Scan.group`): on par
+    with the token-by-token scan reading alike, outputs and final state, against the float64 truth (check 1);
+    a decay vanishing at a token erases nothing that token reads."""
+    forms = scan.derive_scan(dataclasses.replace(DECLARED, reads=reads, group=group), saturation=SATURATION)
+    derived = ssd_walked(forms)
+    label = (f"ssd chunks{READING[reads]}{f' a group of {group}' if reads == 'apart' else ''}"
+             f"{', ranks' if draw_fn is ranked_draw else ''}"
+             f"{', vanishing decays' if draw_fn is vanishing_draw else ''}")
+    scanned = functools.partial(tokenwise, reads=reads, group=group)
     assert_as_exact(jax.jit(derived), jax.jit(scanned), draw_fn, label, seeds=16)
+
+
+@pytest.mark.parametrize("target", ["sm86", "v5e"])
+def test_an_apart_readouts_replay_and_token_loop_read_apart_from_its_group(target):
+    """A readout apart from its group's writes (Mamba-3's ranks of two) replayed token by token
+    (`Derived.replay`, which the walk's derivative reads) and its chunk derived where the token loop is
+    extracted (a v5e's step latency unstated) or the dual form (an A10's): each on par with the token scan,
+    outputs and state (check 1)."""
+    declared = dataclasses.replace(DECLARED, reads="apart", group=2)
+    # The target held through each check, where the forms are prepared and traced.
+    with program.passes(target=target):
+        forms = scan.derive_scan(declared, saturation=SATURATION)
+        derived = ssd_walked(forms)
+
+        def replayed(x, dt, B, C):
+            return forms.replay(operands(x, dt, B, C), jnp.zeros((STATE, WIDTH), x.dtype))
+
+        scanned = functools.partial(tokenwise, reads="apart", group=2)
+        for form, name in ((derived, "derived"), (replayed, "replayed")):
+            assert_as_exact(jax.jit(form), jax.jit(scanned), ranked_draw,
+                            f"ssd apart ranks, {name} on {target}", seeds=16)
 
 
 def test_two_walks_merged_give_the_final_state():
@@ -776,14 +830,16 @@ def cotangents_of(seed, outputs_shape, state_shape):
             jnp.asarray(rng.standard_normal(state_shape), jnp.float32))
 
 
-@pytest.mark.parametrize(("reads", "draw_fn"), [("after", draw), ("after", deep_draw), *READING_DRAWS[1:]],
-                         ids=["after", "after-deep", "before", "before-vanishing"])
-def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient(reads, draw_fn):
+@pytest.mark.parametrize(("reads", "group", "draw_fn"),
+                         [("after", 1, draw), ("after", 1, deep_draw), *READING_DRAWS[1:]],
+                         ids=["after", "after-deep", "before", "before-vanishing", "apart", "apart-ranks",
+                              "apart-4", "apart-vanishing"])
+def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient(reads, group, draw_fn):
     """Mamba-2's chunk adjoint (`backward`), walked back over the chunks, each token reading the state after
-    it or entering it (`Scan.reads`): each token operand's gradient on par with the token-by-token scan's
-    reading alike against the float64 truth (check 1), its steps' too where a chunk's decays reach e^-45 or
-    vanish at a token."""
-    forms = scan.derive_scan(dataclasses.replace(DECLARED, reads=reads), saturation=SATURATION)
+    it or entering it, or after its decay apart from its group's writes (`Scan.reads`): each token operand's
+    gradient on par with the token-by-token scan's reading alike against the float64 truth (check 1), its
+    steps' too where a chunk's decays reach e^-45 or vanish at a token."""
+    forms = scan.derive_scan(dataclasses.replace(DECLARED, reads=reads, group=group), saturation=SATURATION)
     names = ("x", "dt", "B", "C")
 
     def chunked(values, index):
@@ -799,7 +855,7 @@ def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient(reads, draw_fn):
         return tuple(grads[name] for name in names)
 
     def as_tokens(x, dt, B, C, d_out, d_final):
-        scanned = functools.partial(tokenwise, reads=reads)
+        scanned = functools.partial(tokenwise, reads=reads, group=group)
         grads = gradient_of(scanned, names)({"x": x, "dt": dt, "B": B, "C": C}, (d_out, d_final))
         return tuple(grads[name] for name in names)
 
@@ -864,7 +920,8 @@ constants. A decay in base 2, and exponents in float16, whose partials' sum of s
 largest."""
 
 
-READING = {"after": "", "before": ", reading the state entering each token"}
+READING = {"after": "", "before": ", reading the state entering each token",
+           "apart": ", reading apart from its group's writes"}
 """A reset site's label's suffix for where its tokens read the state (`Scan.reads`)."""
 
 
@@ -1040,3 +1097,26 @@ def test_a_derived_chunk_computes_what_its_token_update_states(update, dtype):
         # Every value here is exact (counts, doublings of one rounded 1.9e100), so the two agree exactly.
         np.testing.assert_array_equal(np.asarray(final), np.asarray(declared_final))
         np.testing.assert_array_equal(np.asarray(outputs), np.asarray(declared_outputs))
+
+
+def test_a_segmented_compensated_scan_of_double_floats_along_an_axis_holds_each_segments_exact_sum():
+    """`scan.compensated` over double floats (`low` each value's low part) along a later axis, restarting
+    at each segment's first: each prefix's pair is its segment's exact sum, the high half that sum rounded
+    once. Whole numbers with low parts in multiples of 2^-30 keep every pair's arithmetic exact, so the
+    pairs equal float64's sums, where a plain fp32 sum drops every low part. Each value a double float as an
+    exact product leaves it, its low part within half its high part's ulp (none beside a zero)."""
+    rng = np.random.default_rng(7432)
+    shape = (2, 64, 3)
+    high = rng.integers(-8, 9, shape).astype(np.float32)
+    low = np.where(high == 0, 0.0, rng.integers(-16, 17, shape) * 2.0 ** -30).astype(np.float32)
+    restarts = rng.random(shape[:2]) < 0.1
+    restarts[:, 0] = True
+    restarts = np.broadcast_to(restarts[:, :, None], shape)
+    summed_high, summed_low = jax.jit(functools.partial(scan.compensated, axis=1))(
+        high, low=low, restarts=restarts)
+    exact = np.zeros(shape)
+    for t in range(shape[1]):
+        before = 0.0 if t == 0 else exact[:, t - 1]
+        exact[:, t] = np.where(restarts[:, t], 0.0, before) + high[:, t].astype(np.float64) + low[:, t]
+    np.testing.assert_array_equal(np.float64(summed_high) + np.float64(summed_low), exact)
+    np.testing.assert_array_equal(np.asarray(summed_high), exact.astype(np.float32))

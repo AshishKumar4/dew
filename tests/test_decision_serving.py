@@ -397,9 +397,11 @@ def test_a_tasks_scorings_hold_one_plan(decide):
 def test_a_scoring_pass_looks_at_every_waiting_request(decide):
     """A pass takes rows from every waiting request while its plan takes them, not from a bounded few: a
     hundred short requests one pass's windows hold are answered in one step, where a pass of 64 requests
-    at most left the rest to a second, its windows part empty (ledger 2514)."""
+    at most left the rest to a second, its windows part empty (ledger 2514). Its windows at one count a
+    length, the most, so no pass leaves rows to a smaller count's (`PassPlan.taken`)."""
     from dew.decision import Question
 
+    decide = replace(decide, budget=replace(decide.budget, counts=("most",)))
     single = {**REQUEST, "questions": dict(list(REQUEST["questions"].items())[:1])}
     questions = {name: Question.from_wire(wire) for name, wire in single["questions"].items()}
     plan = decide.planned()
@@ -464,3 +466,36 @@ def test_a_scoring_server_reports_the_share_of_each_pass_shapes_tokens_its_rows_
     assert 0 < metrics["served/real_token_share"] < 1
     assert {name for name in metrics if name.endswith("/passes")} == {
         f"served/passes/{shape.rows}x{shape.length}/passes" for shape in shapes}
+
+
+def test_a_pass_that_overruns_a_window_count_runs_the_rest_in_a_pass_of_its_own(decide):
+    """A server's pass whose rows fill every window of a declared count (`Decide.pass_shapes`: 1, 8, 64 and
+    the most, a length's) and take one past it runs the rows in that count's windows and leaves the rest
+    to a pass of its own shape (`PassPlan.taken`), computing fewer tokens than the next count's whole pass:
+    a server's last pass of 512 requests held 29% of its 32 windows' tokens, a fifth of every pass's tokens
+    padding (row 3330). Every request is answered as it is alone in every field a batch cannot move."""
+    import itertools
+
+    from test_decision_batches import CASES, discrete
+
+    laid, _ = decide.scoring()
+    plan, bodies = decide.planned(), []
+    # Requests until their rows fill a declared count's windows and take one past them.
+    for body in itertools.islice(itertools.cycle(CASES.values()), 4096):
+        assert all(plan.add(row.encoded) for row in laid.admit(body).rows)
+        bodies.append(body)
+        whole = plan.shape()
+        counts = {shape.rows for shape in decide.pass_shapes if shape.length == whole.length}
+        if max(plan.windows()) in counts - {1} and max(plan.windows()) + 1 < whole.rows:
+            break
+    task, variables = decide.scoring()
+    server = ScoringServer.from_task(task, variables)
+    futures = [server.submit(body) for body in bodies]
+    server.run()
+    shapes = task.passes.shapes
+    computed = sum(passes.windows * shape.length for shape, passes in shapes.items())
+    assert sum(passes.passes for passes in shapes.values()) == 2 and computed < whole.rows * whole.length
+    lone = {id(body): discrete(json.loads(json.dumps(decide.systemone(body)))) for body in CASES.values()}
+    assert all(discrete(future.result()) == lone[id(body)]
+               for body, future in zip(bodies, futures, strict=True))
+

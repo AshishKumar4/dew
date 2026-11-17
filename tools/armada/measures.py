@@ -3,7 +3,8 @@ its recorded peak, and of the records its runs left, the one that held the most;
 Dew's admission of the programs its prepare filed."""
 
 import concurrent.futures
-import hashlib
+import functools
+import importlib.util
 import json
 import math
 import os
@@ -57,35 +58,43 @@ def largest(keys: Iterable[str], read: Callable[[str], dict | None],
     return most
 
 
-UNIT = "DEW_TIER_UNIT"
-"""The lane unit a prepare's process prepares (`gpu_prepared`): its file, or `<file>#G/N`, as the lane names
-it, so its flows file their programs' memory under it (`prepared_needs`)."""
-NEEDS = "needs"
-"""Under the tier's store (DEW_TIER_TRUTHS), each prepared unit's programs' memory, in bytes:
-`<sha256(unit)[:16]>.json`, holding `{"unit": UNIT, "programs": [{"resident", "beside", "temporaries"}, ...]}`
-(tests/model_flows.py)."""
+@functools.cache
+def wire():
+    """The tier's prepare-to-lane contract (tests/tier_wire.py, its one owner), loaded by its path when a lane
+    first needs it: a harness checkout with no tests/ (a page generator's scratch copy) imports ci.py all the
+    same (review)."""
+    spec = importlib.util.spec_from_file_location("tier_wire", Path(__file__).resolve().parents[2] / "tests"
+                                                  / "tier_wire.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 NEEDED = """import json, sys
 import jax
+from dew._devices import allocator_limit
 from dew.training.memory import needed
 device = jax.local_devices()[0]
 units = json.load(sys.stdin)
-print(json.dumps({name: max(needed(device, p["resident"], p["beside"], p["temporaries"]) for p in programs)
-                  for name, programs in units.items()}))
+print(json.dumps({name: allocator_limit(max(needed(device, p["resident"], p["beside"], p["temporaries"])
+                                            for p in programs)) for name, programs in units.items()}))
 """
-"""Each unit's least pool, by Dew's own admission (dew.training.memory `needed`, the inverse of `admitted`) of
-the most demanding of its programs on this GPU, its allocator's stranding counted: one accounting, the one the
-planner trusts (Main, 2026-11-17)."""
+"""Each unit's least pool, in the pool's bytes the lane's budget counts, by Dew's own admission
+(dew.training.memory `needed`, the inverse of `admitted`) of the most demanding of its programs on this
+GPU, its allocator's stranding counted: one accounting, the one the planner trusts (Main, 2026-11-17).
+`needed` is the GPU's memory whose pool admits it, and the pool its share of that (`allocator_limit`)
+(train 997's review: read as pool bytes, every need was its share's inverse larger)."""
 
 
 def prepared_programs(names: Iterable[str]) -> dict[str, list[dict]]:
-    """The programs' memory each of `names` filed at its prepare (`NEEDS`), by unit; none where the tier's
-    store names none, or the unit filed nothing."""
-    store = os.environ.get("DEW_TIER_TRUTHS")
+    """The programs' memory each of `names` filed at its prepare (`wire`'s `needs_file`), by unit; none
+    where the tier's store names none, or the unit filed nothing."""
+    store = os.environ.get(wire().TRUTHS)
     if not store:
         return {}
     found = {}
     for name in names:
-        path = Path(store) / NEEDS / f"{hashlib.sha256(name.encode()).hexdigest()[:16]}.json"
+        path = wire().needs_file(Path(store), name)
         if path.is_file() and (filed := json.loads(path.read_text()))["unit"] == name and filed["programs"]:
             found[name] = filed["programs"]
     return found

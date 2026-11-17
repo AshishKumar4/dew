@@ -73,6 +73,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5361]
 - XLA:CPU edges. [1591]
+- Training and serving efficiency. [1880, 5292]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
@@ -85,7 +86,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## RL and serving
 
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
-- Training and serving efficiency. [3330, 1880, 5292]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
 - A served rollout's or episode cohort's server pages its cache wherever pages serve the policy as it draws (serving.served_layout, theme 15), at every prompt…. [7420]
