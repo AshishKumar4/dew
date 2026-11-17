@@ -24,6 +24,7 @@ from dew.data import Files, Memory
 from dew.data.compile import compile, fitted
 from dew.data.dataset import Closeable, DataPartition, Loader, Loading
 from dew.data.pipeline import ObjectiveData, Pipeline
+from dew.decision.layout import SegmentLayout
 from dew.distributed.batches import batch_signature
 from dew.objectives import Aux, Objective
 from dew.optim import Cosine, Linear, OneCycle, OptimConfig
@@ -915,9 +916,9 @@ def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_row
     objective step a memory read would run over the store first."""
     from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
 
-    from dew.decision import DecisionObjective, Example, Noul, StateFirstLayout, decisions
+    from dew.decision import DecisionObjective, Example, Noul, decisions
 
-    layout = StateFirstLayout(max_len=128)
+    layout = SegmentLayout.state_first_row(max_len=128)
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=128), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout)
     asked = {"first": Noul("Is it on?"), "second": Noul("Is it off?")}

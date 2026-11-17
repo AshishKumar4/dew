@@ -35,7 +35,8 @@ from tool_support import load as load_tool
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader, replayed
-from dew.decision import Choice, DecisionModel, DecisionObjective, Example, JointLayout, JointSchemaHead
+from dew.decision import Choice, DecisionModel, DecisionObjective, Example, JointSchemaHead
+from dew.decision.layout import SegmentLayout
 from dew.inference import TextGeneration
 from dew.inference.serving import Server
 from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
@@ -737,7 +738,7 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path, 
     599a23f5d, row 5200)."""
     loaded = load(max_seq_len=1024)
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
-    objective = DecisionObjective(loaded, layout=JointLayout(max_len=1024), head=head)
+    objective = DecisionObjective(loaded, layout=SegmentLayout.joint_row(max_len=1024), head=head)
     data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(str(tmp_path)))
     initial = trainer.initial_state()

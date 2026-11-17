@@ -24,19 +24,18 @@ from dew.decision import (
     Framing,
     Group,
     GroupedExamples,
-    JointLayout,
     JointSchemaHead,
     Noul,
     Schema,
-    StateFirstLayout,
 )
 from dew.decision.laya import LAYA_BUDGETS
+from dew.decision.layout import SegmentLayout
 from dew.decision.rows import Encoding, Fit, QuestionRows, _encoded_unit, _window_groups
 from dew.decision.task import laid_out, whole_blocks_of
 from dew.nn import categorical
 from dew.objectives.base import Ratio, Step, Weighted
 
-LAYOUT = JointLayout(max_len=1024)
+LAYOUT = SegmentLayout.joint_row(max_len=1024)
 
 
 NEGATED = Example("the customer was charged twice",
@@ -208,7 +207,8 @@ PARAPHRASED = GroupedExamples(
 member unlabelled; and an ungrouped question beside one of them."""
 
 
-@pytest.mark.parametrize("layout", [JointLayout(max_len=4096), StateFirstLayout(max_len=512)],
+@pytest.mark.parametrize("layout", [SegmentLayout.joint_row(max_len=4096),
+                                    SegmentLayout.state_first_row(max_len=512)],
                          ids=["joint", "state-first"])
 def test_examples_grouped_across_rows_train_in_one_window_and_agree_as_one_group(layout):
     """Questions grouped across examples (`GroupedExamples`) train as one unit: under a joint layout and
@@ -262,7 +262,7 @@ def test_a_unit_no_window_holds_trains_its_examples_apart_and_one_without_a_labe
     row of its own that fits alone, none dropped for its group, and with no labelled question it is
     rejected as unlabelled; an example's own groups under a layout of a question a row are such a unit,
     where the run once refused them."""
-    layout = StateFirstLayout(max_len=512)
+    layout = SegmentLayout.state_first_row(max_len=512)
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=512), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout, consistency=0.5)
     fit = Fit(layout, TOKENIZER, SPECIALS, objective.model.head, context_length=None, grouped=True,
@@ -284,7 +284,7 @@ def test_a_unit_no_window_holds_trains_its_examples_apart_and_one_without_a_labe
 def test_grouped_examples_without_a_consistency_term_are_their_examples_rows():
     """With no consistency term the groups are not read: grouped examples pack as their examples do
     alone, the same windows to the token, so no unit ties their rows into one document."""
-    layout = StateFirstLayout(max_len=512)
+    layout = SegmentLayout.state_first_row(max_len=512)
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=512), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout)
     def first(records):
@@ -329,7 +329,7 @@ def test_grouped_examples_read_from_their_own_rows_fields(asked):
     from dew.data.compile import compile
     from dew.decision import decisions
 
-    layout = StateFirstLayout(max_len=512)
+    layout = SegmentLayout.state_first_row(max_len=512)
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=512), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout, consistency=0.5)
     noul = ({"type": "noul", "instructions": "Is this about billing?"} if asked == "wire"
@@ -351,7 +351,7 @@ def test_a_unit_is_budgeted_for_the_options_its_training_adds():
     the above" added beside each answered choice (`none_of_the_above`), two rows that fit a window as
     they are no longer do, and the unit trains its two examples apart, a row each, rather than packed
     past the window or dropped."""
-    layout = StateFirstLayout(max_len=256)
+    layout = SegmentLayout.state_first_row(max_len=256)
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=256), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout, consistency=0.5)
     pair = GroupedExamples(tuple(Example("x" * 100, {"q": Choice("x", ["a", "b"])}, {"q": "a"})
@@ -370,7 +370,7 @@ def test_a_unit_is_budgeted_for_the_options_its_training_adds():
 
 def _trimmed_pair() -> tuple[GroupedExamples, int]:
     """Two rows of a question each whose options share the row's budget, so that adding one cuts them
-    all harder (`QuestionLayout`) and the row with the option added is shorter than the row with it in
+    all harder (`SegmentLayout`) and the row with the option added is shorter than the row with it in
     place of the right one; and the encoding's options."""
     options = ["a" * 60, "b" * 60, "c" * 60, "d", "e"]
     pair = GroupedExamples(tuple(Example("", {"q": Choice("x", options)}, {"q": options[0]})
@@ -389,13 +389,14 @@ def _joint_pair() -> tuple[GroupedExamples, int]:
     return pair, 3
 
 
-def _joint_layout(window: int) -> JointLayout:
-    return JointLayout(max_len=window, framing=Framing(system="", prefill="", template=False),
+def _joint_layout(window: int) -> SegmentLayout:
+    return SegmentLayout.joint_row(max_len=window, framing=Framing(system="", prefill="", template=False),
                        segments=(Schema(),))
 
 
 UNITS = {
-    "trimmed": (_trimmed_pair, lambda window: StateFirstLayout(max_len=window, **LAYA_BUDGETS), 1.0,
+    "trimmed": (_trimmed_pair, lambda window: SegmentLayout.state_first_row(max_len=window, **LAYA_BUDGETS),
+                1.0,
                 range(256, 424, 8), None),
     "joint": (_joint_pair, _joint_layout, 0.5, range(896, 1248, 16),
               JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)),

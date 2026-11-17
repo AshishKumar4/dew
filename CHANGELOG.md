@@ -19,6 +19,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   JAX's persistent compilation cache with the rung records, which key a compile by the same lowered
   program, options and target.
 
+- A decision layout is one class, `dew.decision.SegmentLayout`, whose `form` names the row it writes:
+  `SegmentLayout.marker_row(...)` (Laya's, formerly `MarkerLayout(...)`), `state_first_row(...)` (formerly
+  `StateFirstLayout(...)`) and `joint_row(...)` (formerly `JointLayout(...)`), each laying out the rows its class
+  did, byte for byte. A saved run, step declaration or release that names one of the earlier classes reads as
+  the segment layout it is now; code that builds or checks for the earlier classes moves to the constructors
+  and to `layout.joint` and `dew.decision.layout.per_question`.
 - A process holds the step executables its plans compiled (`dew.nn.kernels.options.hold`), by the program,
   its options and its devices: a later trainer of the same step plans on the earlier's executable, where
   each new trainer read it back from the persistent compilation cache (4.4 s of a small model's 11.9 s

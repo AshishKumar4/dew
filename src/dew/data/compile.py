@@ -148,7 +148,16 @@ from dew.data.pipeline import (
     with_children,
     with_stores,
 )
-from dew.data.plan import DataResume, Plan, StepIdentity, described, fingerprint, identified, structured
+from dew.data.plan import (
+    DataResume,
+    Plan,
+    StepIdentity,
+    described,
+    earlier_readers,
+    fingerprint,
+    identified,
+    structured,
+)
 from dew.data.readers import GRAIN, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
     Read,
@@ -1139,6 +1148,7 @@ def _compiled(
         rules=build.rules(train),
         volatile=any(_volatile(stage) for stage in (*_steps(original), *(
             stage for source in sources for stage in _written(source, ())))),
+        earlier=earlier_readers((*_steps(original), *host)),
     )
     tuned = build.tuned(train, batches=batches)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
