@@ -29,7 +29,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
         prologue=None, prologue_operands: tuple = (), prologue_axes: tuple = (), epilogue=None,
         epilogue_operands: tuple = (), epilogue_axes: tuple = (), exact_sums: bool = False) -> tuple:
     """`lhs` times `rhs` in each of `out_dtypes` (the epilogue's outputs, or the accumulator rounded), a
-    `tile` (`grouped_matmul.Tile`) an output tile and its depth step; `exact_sums` adds each step's product
+    `tile` (`grouped_launch.Tile`) an output tile and its depth step; `exact_sums` adds each step's product
     into the fp32 sum by an IEEE add (`_summed`)."""
     (rows, depth), width = lhs.shape, rhs.shape[0] if transpose_rhs else rhs.shape[1]
     block_m, block_n, block_k = tile.block_m, tile.block_n, tile.block_k
@@ -98,7 +98,7 @@ def _gmm_kernel(live_ref, lhs_ref, rhs_ref, *refs, depth: int, block_k: int, tra
 def tgmm(lhs: jax.Array, rhs: jax.Array, *, tile, out_dtype, interpret: bool, prologue=None,
          prologue_operands: tuple = (), prologue_axes: tuple = (), exact_sums: bool = False) -> jax.Array:
     """`prologue(lhs)` transposed times `rhs`: `[depth, width]` in `out_dtype`, a `tile` a `block_k` x
-    `block_n` output tile summed over the rows `block_m` at a time (`grouped_matmul.Tgmm`'s tiles)."""
+    `block_n` output tile summed over the rows `block_m` at a time (`grouped_triton.Tgmm`'s tiles)."""
     (rows, depth), width = lhs.shape, rhs.shape[1]
     block_m, block_n, block_k = tile.block_m, tile.block_n, tile.block_k
     # Padded as `gmm`'s: the depth and width dropped from the gradient, the rows it sums zeroed again

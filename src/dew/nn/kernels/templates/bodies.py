@@ -17,7 +17,7 @@ from dew.nn.kernels import generation, launches
 
 def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
     """A launch's interpreter: `interpret`'s own parameters where it gives them (a read past an operand
-    poisoned, `grouped_matmul.INTERPRETED`), the default where it is True, none where False."""
+    poisoned, `grouped_launch.INTERPRETED`), the default where it is True, none where False."""
     if isinstance(interpret, plgpu.InterpretGPUParams):
         return interpret
     return plgpu.InterpretGPUParams() if interpret else None

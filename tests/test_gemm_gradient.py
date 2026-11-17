@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from generation_support import INTERPRETS
 
-from dew.nn.kernels import generation, grouped_matmul
+from dew.nn.kernels import generation, grouped_launch, grouped_matmul
 from dew.nn.kernels.templates import mosaic_sm90
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
@@ -50,7 +50,7 @@ def test_a_dense_kernel_gradient_reads_its_stages_as_loaded(name, rows, depth, o
     expected = np.asarray(x, np.float32).T @ np.asarray(dy, np.float32)
     with generation.assumed(GENERATION_OF[tiles.family]):
         got = mosaic_gpu.tgmm(x, dy, jnp.asarray([rows], jnp.int32), tiles=tiles, out_dtype=out_dtype,
-                              multiprocessors=8, interpret=grouped_matmul.INTERPRETED, dense=True,
+                              multiprocessors=8, interpret=grouped_launch.INTERPRETED, dense=True,
                               exact_sums=bool(jnp.dtype(out_dtype) == jnp.float32))
     np.testing.assert_array_equal(np.asarray(got[0], np.float32), expected)
 
@@ -81,7 +81,7 @@ def test_an_exact_kernel_gradients_depth_split_sums_its_partials_once(generation
             def dew(splits, group_sizes=group_sizes, dense=dense, tile=tile):
                 return mosaic_gpu.tgmm(x, dy, group_sizes, tiles=dataclasses.replace(tile, splits=splits),
                                        out_dtype=jnp.float32, multiprocessors=8,
-                                       interpret=grouped_matmul.INTERPRETED, dense=dense, exact_sums=True)
+                                       interpret=grouped_launch.INTERPRETED, dense=dense, exact_sums=True)
 
             whole = np.asarray(dew(1))
             for splits in (2, 3):
@@ -107,7 +107,7 @@ def test_a_split_kernel_gradient_reads_each_groups_side_operand_at_its_own_group
     def dew(splits):
         return mosaic_gpu.tgmm(x, dy, jnp.asarray([128, 128], jnp.int32),
                                tiles=dataclasses.replace(tiles, splits=splits), out_dtype=jnp.float32,
-                               multiprocessors=8, interpret=grouped_matmul.INTERPRETED, prologue=scaled,
+                               multiprocessors=8, interpret=grouped_launch.INTERPRETED, prologue=scaled,
                                prologue_operands=(scales,), prologue_axes=(("groups", "depth"),),
                                exact_sums=True)
 

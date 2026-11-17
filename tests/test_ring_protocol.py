@@ -15,7 +15,7 @@ import pytest
 import ring_protocol
 from ring_protocol import Event, Violation, explore, programs
 
-from dew.nn.kernels.templates import mosaic_sm90
+from dew.nn.kernels.templates import mosaic_sm90, rings
 
 BLOCK = (64, 64)
 
@@ -49,12 +49,14 @@ SEGMENT_CASES = [
 
 @functools.cache
 def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: bool,
-           streams: tuple = ("a",), pingpong: bool = False, empty_active: bool = False, joined: bool = False):
+           streams: tuple = ("a",), pingpong: bool = False, empty_active: bool = False, joined: bool = False,
+           among: bool = False):
     """The ring family's persistent walk at the configuration over a ring of each of `streams`, each step
     reading its slot of each, its two consumers taking alternate tiles whole where `pingpong` (each slot
     released by its tile's owner alone), a tile of no steps active where `empty_active` (its turn taken, its
-    walk none), its streams one barrier pair between them where `joined` (`rings.joined`): each warpgroup's
-    program and the barriers' arrivals (`ring_protocol.programs`)."""
+    walk none), its streams one barrier pair between them where `joined` (`rings.joined`), each step's
+    source chosen between two arrays by its tile where `among` (`rings.Among`): each warpgroup's program and
+    the barriers' arrivals (`ring_protocol.programs`)."""
     family = mosaic_sm90.WGMMA
     starts = [sum(tiles[:index]) for index in range(len(tiles))]
     names = streams  # the streams' names, not their allocations' keys (a joined pair's one)
@@ -69,7 +71,8 @@ def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: 
             def schedule(index):
                 tile = index[0]
                 steps = at(tile, tiles)
-                views = {name: (x_gmem, lambda step: (at(tile, starts) + step, 0)) for name in names}
+                source = rings.Among(tile % 2, (x_gmem, x_gmem)) if among else x_gmem
+                views = {name: (source, lambda step: (at(tile, starts) + step, 0)) for name in names}
                 return (steps > 0) | empty_active, steps, views, tile
 
             def issue(wg, tile, walk, *, active):
@@ -105,6 +108,20 @@ def test_the_ring_familys_walk_holds_every_property_in_every_interleaving(case):
     loads' landings explored, each property held (`ring_protocol.explore`)."""
     threads, arrivals = walked(**case)
     assert any(event.kind == "load" for event in threads[-1]), "the producer loads nothing"
+    assert explore(threads, arrivals) > 0
+
+
+@pytest.mark.parametrize("case", TWO_RING_CASES, ids=[
+    f"stages{c['stages']}-consumers{c['consumers']}-tiles{c['tiles']}-inflight{c['in_flight']}"
+    f"-{'unrolled' if c['unrolled'] else 'stepped'}" for c in TWO_RING_CASES])
+def test_a_ring_loading_its_steps_among_sources_holds_every_property_in_every_interleaving(case):
+    """Two rings whose every step's source is chosen at run time between two arrays by its tile
+    (`rings.Among`, matrices side by side, row 6794): one copy a step, its arrivals as any view's, every
+    interleaving explored and each property held, the producer's loads as many as a ring of one source's."""
+    threads, arrivals = walked(**case, among=True)
+    plain, _ = walked(**case)
+    loads = sum(event.kind == "load" for event in threads[-1])
+    assert loads == sum(event.kind == "load" for event in plain[-1]) == len(STREAMS) * sum(case["tiles"])
     assert explore(threads, arrivals) > 0
 
 

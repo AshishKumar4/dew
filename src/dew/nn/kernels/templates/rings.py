@@ -6,6 +6,7 @@ of (`passed`), and a step's slots of them (`Slots`, `WholeSlots`; `Beside` its o
 them). The families and walks that compose them are `mosaic`'s."""
 
 import dataclasses
+import functools
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
@@ -46,6 +47,17 @@ class Rows:
 
 
 @dataclasses.dataclass(frozen=True)
+class Among:
+    """A step's source chosen at run time among several arrays' views (`which`, traced, the index of the one
+    a tile reads: a launch's column tile among matrices side by side, `mosaic_gpu.Beside`): `viewed` takes
+    each source's tile at the step's indices, and a ring's load copies the chosen one's alone (`Ring.copied`),
+    one copy a step as any other view's."""
+
+    which: Any
+    sources: tuple
+
+
+@dataclasses.dataclass(frozen=True)
 class Paired:
     """A step's block indices in a pair's view, which the two CTAs of a pair (`Family.pairs_product`) load
     between them: `indices` in the pair's blocks, its block the slot's twice along `along` (`viewed`), each
@@ -70,8 +82,10 @@ def viewed(view: tuple, block: tuple, step):
     `Rows`, each run's view at its table's entry; where it gives `Paired`, the pair's block (`block` twice
     along its axis) as a `Split`, each CTA's half its own; where `ref` is `Pieces` of refs (an fp32 operand's
     bf16 parts, each its own array's), each one's tile at the indices, its share of the block's rows, in
-    order."""
+    order; where `ref` is `Among` refs, each one's tile at the indices, a load copying the chosen one's."""
     ref, index_map = view
+    if isinstance(ref, Among):
+        return Among(ref.which, tuple(viewed((each, index_map), block, step) for each in ref.sources))
     indices = index_map(step)
     if isinstance(ref, Pieces):
         share = (block[0] // len(ref), *block[1:])
@@ -301,6 +315,11 @@ class Ring:
         slot's rows, one arrival each at the slot's load barrier, which takes as many (`ring`'s `copies`, a
         joined pair's every member's, `joined`)."""
         slot = opaque(turn.slot)
+        if isinstance(view, Among):
+            # The chosen source's copy alone, one arrival as any view's.
+            for index, source in enumerate(view.sources):
+                pl.when(view.which == index)(functools.partial(self.copied, turn, source))
+            return
         if not isinstance(view, Pieces):
             plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot],
                                     collective_axes=self.multicast)
