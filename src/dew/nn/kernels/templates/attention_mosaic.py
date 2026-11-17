@@ -1460,8 +1460,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         own (FlashAttention 4's), at the largest step of queries that holds; else the two launches, dQ queries
         first and dK/dV keys first, each at the largest walked tile that holds, dK's and dV's columns in the
         fewest shares that hold (at width 256 the one launch's resident keys and values and its query streams
-        pass a B200's block, row 4839's arithmetic). None where the device has none or none holds. A B200's
-        A/B pins it (M-ET-74); `derived` offers it once its receipt moves the route."""
+        pass a B200's block, row 4839's arithmetic). None where the device has none or none holds. `derived`
+        offers it first (M-ET-74's receipt, row 6918)."""
         query, key = ba.arguments["query"], ba.arguments["key"]
         found = {family.name: family for family in walked_layouts(target.generation, query.dtype)}
         keys, queries = found.get(placed.KEYS.name), found.get(placed.QUERIES.name)
@@ -1504,10 +1504,15 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         row 3171's toy one alone the slower, 1 x 1024 over three short documents and a window of 256,
         1.38 times: 20 us a step); otherwise (deterministic mode, `deterministic_ops_requested`; the
         accurate form, a hook with parameters, a width no fused launch holds) two launches, the dQ launch
-        then the keys-first dK/dV one, in a fixed order."""
+        then the keys-first dK/dV one, in a fixed order. On a device whose walks are placed on a role
+        (tcgen05's, `walked_layouts`), the walked config first where it takes the call (`walked`: on an
+        emulated B200 0.18, 0.15 and 0.42 of the mma.sync two launches' time at Qwen3-8B's 2 x 4096 and
+        1 x 16384 and Qwen3-4B's width 256, M-ET-74, row 6918)."""
         family = self._family(ba, target)
         if family is None:
             return None
+        if (walked := self.walked(ba, target)) is not None:
+            return walked
         query, key = ba.arguments["query"], ba.arguments["key"]
 
         def fits(config: BackwardTiles) -> bool:

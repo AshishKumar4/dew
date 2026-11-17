@@ -272,6 +272,29 @@ def test_the_walked_backward_at_width_256_holds_check_1_interpreted(call):
                  pins=(None, tiles), target=generation.gpu_target("sm100"))
 
 
+@pytest.mark.parametrize("name", ["sm100", "sm90"])
+def test_a_tcgen05_devices_backward_derives_its_walked_launches(name):
+    """Qwen3-8B's heads (32 query heads over 8, width 128, 2 x 4096 causal bf16) derive their backward on a
+    B200 as the walked placements take it (`MosaicBackward.derived` is `walked`'s config, its dK/dV keys
+    first on tcgen05: M-ET-74's 0.18 of the mma.sync two launches' time, row 6918), where an H100, whose
+    walks place on no role, derives its own and has no walked config."""
+    tokens, heads, kv_heads, width = 4096, 32, 8, 128
+    spans = template.spans(tokens, tokens, 2, causal=True)
+    query = jax.ShapeDtypeStruct((2, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, tokens, kv_heads, width), jnp.bfloat16)
+    with generation.assumed(name):
+        residuals = jax.eval_shape(lambda q, k, v: attention_mosaic.forward(
+            q, k, v, spans, residuals=template.Kept.SPLIT), query, key, key)[1:]
+        op, args = attention_mosaic._backward_call(query, key, key, spans, None, query, tuple(residuals),
+                                                   scale=None, natural=attention_mosaic.NATURAL)
+        ba, target = op.bind(*args, interpret=False), generation.gpu_target()
+        walked, derived = op.walked(ba, target), op.derived(ba, target)
+    if name == "sm100":
+        assert walked is not None and derived == walked and derived.dkv_family == "tcgen05.keys", derived
+    else:
+        assert walked is None and derived is not None, (walked, derived)
+
+
 @pytest.mark.parametrize("form", ["two launches", "fused", "walked dq"])
 def test_the_walked_backward_states_each_product_its_issuers_walk(form):
     """A bf16 call's backward over 256 queries and keys, every pair reached, with its dK/dV keys first on a
