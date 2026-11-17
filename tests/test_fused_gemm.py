@@ -261,3 +261,56 @@ def test_a_fused_prologue_never_reads_the_depths_padding(generation_name):
     with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
         got = jax.jit(functools.partial(fused_gemm.fused, region))(x, w, s)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(program(x, w, s)))
+
+
+@pytest.mark.parametrize("row_value", [lambda x: jnp.prod(x, axis=1, keepdims=True),
+                                       lambda x: jnp.argmax(x, axis=1, keepdims=True).astype(x.dtype)],
+                         ids=["product", "argmax"])
+def test_a_producer_whose_row_value_is_any_reduction_fuses_through_the_public_entry(row_value):
+    """A producer scaling each row by a value XLA computes whole beside the prologue (its elements' product,
+    the index of its largest) is priced and fused through `fused_gemm.fused` (a CPU's interpretation): XLA's
+    pass for the row value priced by its bytes, the stage the kernel runs by the kernels' counter, where a
+    product's and an index's reductions were refused unpriced (base reviews of 045f07e31 and df983f703,
+    F1); the region's values the program's as written (check 1)."""
+    def region(x, w):
+        return fused_gemm.product(x * row_value(x), w, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    def program(x, w):
+        return jnp.dot(x * row_value(x), w)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(1.0 + rng.standard_normal((64, 128)) / 64, jnp.float32),
+                jnp.asarray(rng.standard_normal((128, 64)) / 8, jnp.float32))
+
+    fused = functools.partial(fused_gemm.fused, region)
+    with generation.assumed("sm90"):
+        found = fused_gemm.analysis(region, *draw(0))
+        assert found.prologue is not None, found
+        assert_as_exact(jax.jit(fused), jax.jit(program), draw, "a product reduction's producer, fused",
+                        seeds=8)
+
+
+@pytest.mark.parametrize("chosen", [{}, {"gemm_prologue": "xla", "grouped_matmul": "xla"}],
+                         ids=["selected", "named xla"])
+def test_a_producer_stage_no_kernel_prices_is_refused_and_formed_by_xla(chosen):
+    """A producer whose stage holds an operation the kernels' counter prices none of (a `stack`'s layout
+    beside the rows) on an H100: its prologue refused as unpriced, never raised (base review of dc7063c94,
+    F1), the operand formed by XLA before the product, selected so or named so, and the region's value the
+    program's."""
+    keys = jax.random.split(jax.random.key(3), 3)
+    x = jax.random.randint(keys[0], (64, 128), -3, 4).astype(jnp.float32)
+    b = jax.random.randint(keys[1], (128,), -3, 4).astype(jnp.float32)
+    w = jax.random.randint(keys[2], (128, 64), -3, 4).astype(jnp.float32)
+
+    def region(x, b, w):
+        # A stack, then its first row: a concatenation's layout and a slice beside the rows.
+        return fused_gemm.product(x + jnp.stack([b, b], axis=0)[:1], w, out_dtype=jnp.float32,
+                                  interpret_on_cpu=True)
+
+    with generation.assumed("sm90"), generation.chosen(**chosen):
+        found = fused_gemm.analysis(region, x, b, w)
+        got = fused_gemm.fused(region, x, b, w)
+    assert found.prologue is not None and found.prologue.kernel == "xla", found
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(jnp.dot(x + b[None], w, precision="highest")))
+

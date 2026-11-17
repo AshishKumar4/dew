@@ -117,8 +117,13 @@ and an fcmp), an erf XLA's own rational polynomial (xla/codegen/intrinsic/erf.cc
 expm1 CUDA's expm1f, whose fp32 SASS issues FMAs alone, no MUFU (sm80, probe FS-LIBM2: ten FFMAs and three
 FADDs, where an expf issues a MUFU.EX2)."""
 
-_REDUCTIONS = frozenset({lax.reduce_max_p, lax.reduce_min_p, lax.reduce_sum_p})
-"""Reductions, one operation an input element."""
+_REDUCTIONS = frozenset({lax.reduce_max_p, lax.reduce_min_p, lax.reduce_sum_p, lax.reduce_prod_p,
+                         lax.reduce_and_p, lax.reduce_or_p, lax.reduce_xor_p})
+"""Reductions of one operation an input element: an extreme, a sum or a product, and the bitwise and, or and
+xor (a mask's all, any and parity), so a producer's row value of any of them is priced (a fused region's
+prologue sides, `fused_gemm._split`). An extreme's index (argmax, argmin) carries its index beside each
+step's value, a compare and two selects as lowered: no rule here, its count its lowering's when a kernel
+reaches one."""
 
 APPROXIMATED = frozenset({lax.exp_p, lax.exp2_p, lax.log_p, lax.log2_p, lax.log1p_p, lax.tanh_p,
                           lax.logistic_p, lax.sin_p, lax.cos_p, lax.sqrt_p, lax.rsqrt_p, lax.pow_p})
