@@ -1410,7 +1410,7 @@ def test_a_hooked_sm80_backward_takes_fewer_rows_where_its_hook_reads_no_querys_
                 ba = op.keyed(ba)
                 assert isinstance(ba.op.score_mod, str)
             derived[name] = ba.op.derived(ba, target)
-    role = attention_mosaic.bundle_of(derived["row-indexed"], jnp.bfloat16).role_rows
+        role = attention_mosaic.bundle_of(derived["row-indexed"], jnp.bfloat16).role_rows
     assert min(derived["bucketed"].block_q, derived["bucketed"].block_k) < role, derived
     assert min(derived["row-indexed"].block_q, derived["row-indexed"].block_k) >= role, derived
 
