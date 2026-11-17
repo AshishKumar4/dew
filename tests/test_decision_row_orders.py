@@ -1,4 +1,4 @@
-"""A question layout's one writer in each order its own row takes (`QuestionLayout.order`): the state first,
+"""A question layout's one writer in each order its own row takes (`SegmentLayout.order`): the state first,
 the question first, and the state, the question and the state again, each part as the built-in row writes
 it, and the row split into blocks, or kept one, as `split` says. Rows are read under GPT-2's tokenizer,
 each part's tokens its own piece's."""
@@ -17,13 +17,11 @@ from dew.decision.layout import (
     Framing,
     Instructions,
     Labels,
-    MarkerLayout,
     OptionLines,
-    QuestionLayout,
+    SegmentLayout,
     Special,
     Specials,
     State,
-    StateFirstLayout,
     Text,
     default_layout,
 )
@@ -43,7 +41,7 @@ def piece(text: str) -> list[int]:
     return list(GPT2.encode(text, add_special_tokens=False))
 
 
-def question_pieces(layout: QuestionLayout) -> tuple[list[int], list[int], list[int]]:
+def question_pieces(layout: SegmentLayout) -> tuple[list[int], list[int], list[int]]:
     """The built-in row's question as its pieces: the header and instructions, the lettered option lines,
     and the answer cue."""
     head = piece(f"choice question: {QUESTION.instructions}")
@@ -57,7 +55,7 @@ def test_each_order_writes_the_built_in_rows_parts_in_that_order(order):
     """Each order's row is the begin token, the built-in question's header, lettered lines and cue, and the
     state, a separator after each part but the last, in its order; the state the request's whole, as the
     built-in row writes it."""
-    layout = StateFirstLayout(labels=LABELS, order=order)
+    layout = SegmentLayout.state_first_row(labels=LABELS, order=order)
     [row] = layout.rows(GPT2, SPECIALS, "my card is lost", {"q": QUESTION})
     head, lines, cue = question_pieces(layout)
     begin, separator, state = [SPECIALS.begin], [SPECIALS.separator], piece("my card is lost")
@@ -78,11 +76,12 @@ def test_a_run_of_either_layout_writes_the_other_layouts_own_row_in_its_order():
     under labels alike."""
     for labels in (None, LABELS):
         for state in ("my card is lost", CONVERSATION):
-            question_first = StateFirstLayout(labels=labels, order="question_first", max_len=96)
-            state_first = MarkerLayout(labels=labels, order="state_first", max_len=96)
+            question_first = SegmentLayout.state_first_row(labels=labels, order="question_first", max_len=96)
+            state_first = SegmentLayout.marker_row(labels=labels, order="state_first", max_len=96)
             assert (question_first.rows(GPT2, SPECIALS, state, {"q": QUESTION})
-                    == MarkerLayout(labels=labels, max_len=96).rows(GPT2, SPECIALS, state, {"q": QUESTION}))
-            own = StateFirstLayout(labels=labels, max_len=96)
+                    == SegmentLayout.marker_row(labels=labels, max_len=96).rows(GPT2, SPECIALS, state,
+                                                                                {"q": QUESTION}))
+            own = SegmentLayout.state_first_row(labels=labels, max_len=96)
             assert (state_first.rows(GPT2, SPECIALS, state, {"q": QUESTION})
                     == own.rows(GPT2, SPECIALS, state, {"q": QUESTION}))
 
@@ -91,7 +90,7 @@ def test_a_re_read_row_keeps_a_conversations_end_in_each_copy_of_its_share():
     """A re-read row too long for its window cuts each copy of a conversation to its share of the room the
     rest leaves (`share_tokens`), each keeping the conversation's end, the row filling its window; a
     record state keeps its start in each."""
-    layout = StateFirstLayout(labels=LABELS, order="re_read", max_len=120)
+    layout = SegmentLayout.state_first_row(labels=LABELS, order="re_read", max_len=120)
     head, lines, cue = question_pieces(layout)
     begin, separator = [SPECIALS.begin], [SPECIALS.separator]
     for state, end in ((CONVERSATION, True), ({"customer": "A", "history": list(range(80))}, False)):
@@ -118,8 +117,9 @@ def test_each_order_trims_the_question_as_its_budgets_declare(order):
     long = Choice("Which of the teams below handles a customer who reports that their card was lost or "
                   "stolen while they were travelling abroad last week?",
                   dict(zip(QUESTION.options, QUESTION.descriptions, strict=True)))
-    [own] = StateFirstLayout(**budgets).rows(GPT2, SPECIALS, "my card is lost", {"q": long})
-    [row] = StateFirstLayout(**budgets, order=order).rows(GPT2, SPECIALS, "my card is lost", {"q": long})
+    [own] = SegmentLayout.state_first_row(**budgets).rows(GPT2, SPECIALS, "my card is lost", {"q": long})
+    [row] = SegmentLayout.state_first_row(**budgets, order=order).rows(GPT2, SPECIALS, "my card is lost",
+                                                                       {"q": long})
     assert own.options_cut > 0 and own.instructions_cut > 0
     assert row.cuts == own.cuts
 
@@ -135,14 +135,16 @@ def test_a_row_in_blocks_splits_where_its_split_says():
     at its state's, the question one block and the state the other; and `whole` keeps the row one block
     its backbone reads both ways, its tokens those of the row read in order."""
     state = "my card is lost"
-    plain = StateFirstLayout(labels=LABELS).rows(GPT2, SPECIALS, state, {"q": QUESTION})[0]
-    [whole] = StateFirstLayout(labels=LABELS, blocks=True, split="whole").rows(GPT2, SPECIALS, state,
+    plain = SegmentLayout.state_first_row(labels=LABELS).rows(GPT2, SPECIALS, state, {"q": QUESTION})[0]
+    [whole] = SegmentLayout.state_first_row(labels=LABELS, blocks=True, split="whole").rows(GPT2, SPECIALS,
+                                                                                            state,
                                                                               {"q": QUESTION})
     assert whole.tokens == plain.tokens and whole.blocks == (0,) * len(plain.tokens)
-    [split] = StateFirstLayout(labels=LABELS, blocks=True).rows(GPT2, SPECIALS, state, {"q": QUESTION})
+    [split] = SegmentLayout.state_first_row(labels=LABELS, blocks=True).rows(GPT2, SPECIALS, state,
+                                                                             {"q": QUESTION})
     start = split.questions[0].span[0]
     assert split.blocks == (0,) * start + (1,) * (len(split.tokens) - start)
-    layout = StateFirstLayout(labels=LABELS, blocks=True, split="part", order="question_first")
+    layout = SegmentLayout.state_first_row(labels=LABELS, blocks=True, split="part", order="question_first")
     [part] = layout.rows(GPT2, SPECIALS, state, {"q": QUESTION})
     head, lines, _ = question_pieces(layout)
     question = 1 + len(head) + 1 + len(lines) + 1
@@ -154,27 +156,27 @@ def test_a_layout_refuses_a_split_of_rows_read_in_order_and_an_order_beside_its_
     """A split says where a row in blocks splits, so a layout whose rows are read in order states none;
     and an order writes the layout's own row, which segments of a row's own replace."""
     with pytest.raises(ValueError):
-        StateFirstLayout(labels=LABELS, split="whole")
+        SegmentLayout.state_first_row(labels=LABELS, split="whole")
     segments = (Instructions({"choice": "{}"}), OptionLines(), State(), AnswerCue())
     with pytest.raises(ValueError):
-        StateFirstLayout(labels=LABELS, segments=segments, order="re_read")
+        SegmentLayout.state_first_row(labels=LABELS, segments=segments, order="re_read")
 
 
 def test_a_layout_of_an_order_reloads_its_order_and_an_earlier_record_its_own():
     """A layout's order and split are recorded, so it reloads them; an earlier run's record, which states
     neither, reloads to the layout's own row."""
-    layout = StateFirstLayout(labels=LABELS, order="re_read", blocks=True, split="whole")
-    recorded = json.loads(json.dumps(to_record(layout, StateFirstLayout)))
-    assert from_record(StateFirstLayout, recorded, dtypes=False) == layout
+    layout = SegmentLayout.state_first_row(labels=LABELS, order="re_read", blocks=True, split="whole")
+    recorded = json.loads(json.dumps(to_record(layout, SegmentLayout)))
+    assert from_record(SegmentLayout, recorded, dtypes=False) == layout
     earlier = {key: value for key, value in recorded.items() if key not in ("order", "split", "blocks")}
-    assert from_record(StateFirstLayout, earlier, dtypes=False) == StateFirstLayout(labels=LABELS)
+    assert from_record(SegmentLayout, earlier, dtypes=False) == SegmentLayout.state_first_row(labels=LABELS)
 
 
 def test_a_state_of_json_null_is_written_as_any_state_is():
     """A request whose state is JSON null writes it as `null`, as any state renders, in every order, by
     rows and by its tokens alike."""
     for order in ("state_first", "question_first", "re_read"):
-        layout = StateFirstLayout(labels=LABELS, order=order)
+        layout = SegmentLayout.state_first_row(labels=LABELS, order=order)
         [row] = layout.rows(GPT2, SPECIALS, None, {"q": QUESTION})
         assert list(layout.state(GPT2, SPECIALS, None)) == piece("null")
         assert row.state_tokens == len(piece("null"))
@@ -185,7 +187,7 @@ def test_a_state_of_json_null_is_written_as_any_state_is():
 def test_a_row_of_its_states_tokens_is_the_row_of_its_state(order):
     """A row written from the state's tokens alone (`encode`) is the row its state writes, a
     conversation's end kept in every copy under a window that cuts them."""
-    layout = StateFirstLayout(labels=LABELS, order=order, max_len=120)
+    layout = SegmentLayout.state_first_row(labels=LABELS, order=order, max_len=120)
     [row] = layout.rows(GPT2, SPECIALS, CONVERSATION, {"q": QUESTION})
     assert row.state_cut > 0
     tokens = layout.state(GPT2, SPECIALS, CONVERSATION)
@@ -195,7 +197,8 @@ def test_a_row_of_its_states_tokens_is_the_row_of_its_state(order):
 def test_a_row_of_no_state_counts_the_state_it_leaves_out_from_its_tokens_too():
     """A row whose segments write no state leaves all of it out, counted as cut, whether the row is
     written from the state or from its tokens alone."""
-    layout = StateFirstLayout(labels=LABELS, segments=(Instructions({"choice": "{}"}), OptionLines(),
+    layout = SegmentLayout.state_first_row(labels=LABELS, segments=(Instructions({"choice": "{}"}),
+                                                                    OptionLines(),
                                                        AnswerCue()))
     [row] = layout.rows(GPT2, SPECIALS, "my card is lost", {"q": QUESTION})
     assert row.state_tokens == row.state_cut == len(piece("my card is lost")) and row.state_kept == 0
@@ -213,7 +216,7 @@ def test_a_cut_that_leaves_options_their_labels_alone_finds_them_alike_by_the_te
     question = {"q": Choice("Which?", ["alpha", "beta"])}
 
     def row(option_tokens: int):
-        layout = StateFirstLayout(labels=labels, segments=segments, option_tokens=option_tokens)
+        layout = SegmentLayout.state_first_row(labels=labels, segments=segments, option_tokens=option_tokens)
         [encoded] = layout.rows(ByteTokenizer(), bytes_specials, "x", question)
         return layout, encoded
 
@@ -230,26 +233,27 @@ def test_a_framed_row_keeps_its_special_tokens_between_the_halves_of_its_turn():
     token the tokenizer has none of writes nothing, as without it."""
     segments = (Special("begin"), Instructions({"choice": "{}"}), Special("separator"), OptionLines(),
                 Text("\n"), State(render="state"), AnswerCue())
-    plain = StateFirstLayout(labels=LABELS, segments=segments, unit="whole")
+    plain = SegmentLayout.state_first_row(labels=LABELS, segments=segments, unit="whole")
     [own] = plain.rows(GPT2, SPECIALS, "my card is lost", {"q": QUESTION})
     verbatim = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
     for framing in (Framing(template=False), Framing(chat_template=verbatim)):
-        framed = StateFirstLayout(labels=LABELS, segments=segments, unit="whole", framing=framing)
+        framed = SegmentLayout.state_first_row(labels=LABELS, segments=segments, unit="whole",
+                                               framing=framing)
         [row] = framed.rows(GPT2, SPECIALS, "my card is lost", {"q": QUESTION})
         before = framing.system + ("\n\n" if not framing.template else "")
         assert row.tokens.count(SPECIALS.separator) == own.tokens.count(SPECIALS.separator) == 2
         assert list(row.tokens[:len(piece(before)) + 1]) == [*piece(before), SPECIALS.begin]
     # A template that trims the newline before the begin token writes the row it writes without it.
     trimming = "{% for message in messages %}{{ message['content'] | trim }}{% endfor %}"
-    leading = StateFirstLayout(labels=LABELS, segments=(Text("\n"), *segments), unit="whole",
+    leading = SegmentLayout.state_first_row(labels=LABELS, segments=(Text("\n"), *segments), unit="whole",
                                framing=Framing(chat_template=trimming))
-    held = StateFirstLayout(labels=LABELS, segments=segments, unit="whole",
+    held = SegmentLayout.state_first_row(labels=LABELS, segments=segments, unit="whole",
                             framing=Framing(chat_template=verbatim))
     assert (leading.rows(GPT2, SPECIALS, "my card is lost", {"q": QUESTION})
             == held.rows(GPT2, SPECIALS, "my card is lost", {"q": QUESTION}))
     unbegun = dataclasses.replace(SPECIALS, begin=None)
     templated = Framing(chat_template=verbatim)
-    rows = [StateFirstLayout(labels=LABELS, segments=written, unit="whole", framing=templated)
+    rows = [SegmentLayout.state_first_row(labels=LABELS, segments=written, unit="whole", framing=templated)
             .rows(GPT2, unbegun, "my card", {"q": QUESTION}) for written in (segments, segments[1:])]
     assert rows[0] == rows[1]
 
@@ -258,7 +262,8 @@ def lettered_row(lines: OptionLines, question, option_tokens: int | None):
     """The byte-encoded row of `question` about "x" whose options `lines` writes under the labels A and
     B, cut to `option_tokens`."""
     segments = (Instructions({"choice": "{}"}), lines, State(), AnswerCue())
-    layout = StateFirstLayout(labels=Labels(names=("A", "B"), variants=("{}",)), segments=segments,
+    layout = SegmentLayout.state_first_row(labels=Labels(names=("A", "B"), variants=("{}",)),
+                                           segments=segments,
                               option_tokens=option_tokens)
     bytes_specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
     [encoded] = layout.rows(ByteTokenizer(), bytes_specials, "x", question)
@@ -301,7 +306,7 @@ def test_a_requests_questions_share_one_encoding_of_its_state():
             return super().encode(text, add_special_tokens=add_special_tokens)
 
     bytes_specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
-    layout = StateFirstLayout()
+    layout = SegmentLayout.state_first_row()
     questions = {name: Choice(f"Which {name}?", ["a", "b"]) for name in ("first", "second", "third")}
     rows = layout.rows(Counting(), bytes_specials, state, questions)
     assert encoded.count(state) == 1
@@ -328,7 +333,7 @@ def test_a_label_that_merges_with_the_text_before_it_leaves_options_found_alike_
         assert line[:len(own)] != own
 
     def row(option_tokens: int):
-        layout = StateFirstLayout(labels=labels, segments=segments, option_tokens=option_tokens)
+        layout = SegmentLayout.state_first_row(labels=labels, segments=segments, option_tokens=option_tokens)
         [encoded] = layout.rows(bpe, Specials.of(bpe), "x", question)
         return encoded
 
@@ -344,20 +349,20 @@ def test_a_fresh_heads_row_writes_a_choices_option_as_its_text():
                       {"option_0": "Paris", "option_1": "London", "Rome": None})
     names = LABELS.names_for(3)
 
-    def written(layout: QuestionLayout) -> str:
+    def written(layout: SegmentLayout) -> str:
         [row] = layout.rows(GPT2, SPECIALS, "a question about cities", {"q": question})
         return GPT2.decode(list(row.tokens))
 
     fresh = dataclasses.replace(default_layout(causal=True, one_question=True), labels=LABELS)
-    released = StateFirstLayout(labels=LABELS)
+    released = SegmentLayout.state_first_row(labels=LABELS)
     def lines(texts) -> str:
         return "\n".join(f"{name}. {text}" for name, text in zip(names, texts, strict=True))
 
     assert lines(("Paris", "London", "Rome")) in written(fresh) and "option_0" not in written(fresh)
     assert lines(("option_0: Paris", "option_1: London", "Rome")) in written(released)
-    recorded = json.loads(json.dumps(to_record(fresh, StateFirstLayout)))
-    assert from_record(StateFirstLayout, recorded, dtypes=False) == fresh
+    recorded = json.loads(json.dumps(to_record(fresh, SegmentLayout)))
+    assert from_record(SegmentLayout, recorded, dtypes=False) == fresh
     earlier = {key: value for key, value in recorded.items() if key != "option_text"}
     named = dataclasses.replace(fresh, option_text="named")
-    assert from_record(StateFirstLayout, earlier, dtypes=False) == named
+    assert from_record(SegmentLayout, earlier, dtypes=False) == named
 

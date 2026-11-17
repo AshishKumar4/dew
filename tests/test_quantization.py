@@ -2068,14 +2068,18 @@ def assert_step_moves_by_the_hosts_gradient():
         return flat(held["params"]) - flat(jax.device_get(state.variables["params"]))
 
     def gradient(dtype):
+        program = LMObjective(spec.apply(tiny(dtype=dtype)), seq_len=length, ema_decay=None)
+
+        # One compiled program of the host's for every seed, where each seed's gradient ran op by op.
+        @jax.jit
+        def differentiated(variables, text):
+            step = Step(jnp.asarray(0), jax.random.key(0), None, training=True)
+            return jax.grad(parameter_loss(program, variables, {"text": text}, step))(variables["params"])
+
         @as_given
         def on_the_host(held, text):
-            program = LMObjective(spec.apply(tiny(dtype=dtype)), seq_len=length, ema_decay=None)
             with jax.default_device(cpu):
-                step = Step(jnp.asarray(0), jax.random.key(0), None, training=True)
-                variables = placed(held, dtype)
-                loss = parameter_loss(program, variables, {"text": jnp.asarray(text)}, step)
-                return flat(jax.grad(loss)(variables["params"]))
+                return flat(differentiated(placed(held, dtype), jnp.asarray(text)))
         return on_the_host
 
     assert_as_exact(moved, gradient(jnp.float32), draw, "an int8 training step's gradient", seeds=HOST_SEEDS,

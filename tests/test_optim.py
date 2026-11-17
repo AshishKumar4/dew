@@ -826,6 +826,123 @@ def test_a_clip_rescales_the_weights_only_after_the_updates_it_takes_part_in():
         params, state = moved, after
 
 
+def clip_state(state):
+    """The one QK-Clip state an optimizer's `state` holds."""
+    from dew.optim import QKClipState
+
+    [held] = [node for node in jax.tree.leaves(state, is_leaf=lambda node: isinstance(node, QKClipState))
+              if isinstance(node, QKClipState)]
+    return held
+
+
+def windowed(solver, params, grads, calls, scales=None):
+    """The optimizer's state after `calls` calls (the attention logit maxima of each, rows of heads), each
+    as a step's commit makes it (`dew.training.transaction.optimizer_update`), each call's gradients
+    `grads` scaled by its `scales` entry where given."""
+    from dew.training.transaction import optimizer_update
+
+    state = solver.init(params)
+    for values, scale in zip(calls, scales or [1.0] * len(calls), strict=True):
+        stats = qk_stats(layers=len(params), rows=len(values), values=values)
+        scaled = jax.tree.map(lambda grad, scale=scale: scale * grad, grads)
+        _, state = optimizer_update(solver, scaled, state, params, qk=stats)
+    return state
+
+
+FIRES, QUIET = [[200.0, 50.0, 10.0, 5.0]] + [[10.0] * 4] * 2, [[10.0] * 4] * 3
+"""A call whose largest logit fires the clip at tau 100 (its first head's), and one that fires none."""
+
+
+HOLDING = {"multisteps": lambda inner: optax.MultiSteps(inner, every_k_schedule=2).gradient_transformation(),
+           "apply_every": lambda inner: optax.chain(inner, optax.apply_every(2))}
+"""The wrappers that hold an update back over a window of two calls: one that runs its inner update, the
+clip's, at the window's last call alone, and one that runs it every call and zeroes all updates but the
+window's last."""
+
+
+@pytest.mark.parametrize("partitioned", [False, True], ids=["whole", "partitioned"])
+@pytest.mark.parametrize("holding", sorted(HOLDING))
+def test_a_held_windows_clip_pools_its_own_leaves_maxima_and_empties_where_it_applies(holding, partitioned):
+    """Under a wrapper that holds the update back over a window of two calls (`HOLDING`), whose first call
+    fires the clip and whose second does not, the window's rescales are the clip's alone over the leaves
+    it clips at both calls' largest logits, bit for bit, and its pool is empty once the window applies: a
+    clip over the whole tree, or in one group of an `optax.partition` (as each `muonclip` param group's),
+    whose state holds its group's leaves alone (train 978's F1: the fold read every query and key leaf of
+    the tree and raised KeyError)."""
+    params, grads = qk_tree(layers=2)
+    clip = optax.chain(optax.sgd(LR), scale_by_qk_clip(100.0))
+    group = {"layers_0": params["layers_0"]} if partitioned else params
+    inner = optax.partition({"clipped": clip, "plain": optax.sgd(LR)},
+                            {name: "clipped" if name in group else "plain" for name in params}) \
+        if partitioned else clip
+    state = windowed(HOLDING[holding](inner), params, grads, [FIRES, QUIET])
+    alone = scale_by_qk_clip(100.0)
+    stats = qk_stats(layers=2, rows=6, values=FIRES + QUIET)
+    expected = alone.update(grads, alone.init(group), group, qk_stats=stats)[1].rescales
+    assert any(np.any(np.asarray(factors) != 1) for factors in expected.values()), "the first call fires"
+    held = clip_state(state)
+    assert held.rescales.keys() == expected.keys()
+    for key, factors in held.rescales.items():
+        np.testing.assert_array_equal(factors, expected[key])
+    assert held.pooled.keys() == expected.keys()
+    assert all(np.all(np.asarray(pooled) == 0) for pooled in held.pooled.values())
+
+
+def test_a_microstep_multisteps_skips_clips_nothing():
+    """Under `optax.MultiSteps` whose `should_skip_update_fn` rejects a microstep, that microstep's logits
+    clip nothing: a window whose skipped microstep fires and whose taken ones do not leaves every rescale
+    one, the pool as it was before the skipped call (`held_updates.input_taken`), where main kept its maxima
+    and clipped the window by logits it never trained on (train 978's F2)."""
+    params, grads = qk_tree()
+    # The first call's gradients large, which the skip rejects (as `optax.skip_large_updates` does).
+    solver = optax.MultiSteps(scale_by_qk_clip(100.0), every_k_schedule=2,
+                              should_skip_update_fn=lambda updates, gradient_step, params: (
+                                  optax.tree.norm(updates) > 1.0, ())).gradient_transformation()
+    state = windowed(solver, params, grads, [FIRES, QUIET, QUIET], scales=[1e4, 1.0, 1.0])
+    clip = clip_state(state)
+    assert int(clip.steps) == 1
+    assert all(np.all(np.asarray(factors) == 1) for factors in clip.rescales.values())
+
+
+def test_a_clip_under_apply_every_leaves_the_weights_on_a_call_whose_update_it_zeroes():
+    """Under `optax.apply_every`, which runs the clip on every call and zeroes the updates of all but a
+    window's last, a call whose update it zeroes leaves the weights bit for bit where they were, though the
+    clip fired on it: a post-step effect acts where the update applied (`stepped`), where main rescaled the
+    weights on that call (row 7262)."""
+    params, grads = qk_tree()
+    solver = optax.chain(optax.sgd(LR), scale_by_qk_clip(100.0), optax.apply_every(2))
+    initial = solver.init(params)
+    updates, after = solver.update(grads, initial, params, qk_stats=qk_stats(values=[[200.0] * 4] * 3))
+    assert largest_difference(stepped(params, updates, initial, after, post_step_order(solver, params)),
+                              params) == 0.0
+
+
+def test_a_clip_under_apply_every_takes_every_calls_largest_logits_where_its_update_applies():
+    """Under `optax.apply_every` a window of two calls whose first fires and whose last does not moves the
+    weights on its second by the window's update and the clip's rescale at both calls' largest logits, as
+    the clip alone moves them over the summed update at those maxima, bit for bit: each call's maxima pooled
+    in the clip's state and emptied where the update applies (`dew.optim.pooled_update`, called by the
+    step's commit, row 7262)."""
+    from dew.training.transaction import optimizer_update
+
+    params, grads = qk_tree()
+    fires, quiet = FIRES, QUIET
+    solver = optax.chain(optax.sgd(LR), scale_by_qk_clip(100.0), optax.apply_every(2))
+    order = post_step_order(solver, params)
+    state, moved = solver.init(params), params
+    for values in (fires, quiet):
+        updates, after = optimizer_update(solver, grads, state, moved, qk=qk_stats(values=values))
+        moved, state = stepped(moved, updates, state, after, order), after
+    alone = optax.chain(optax.sgd(LR), scale_by_qk_clip(100.0))
+    initial = alone.init(params)
+    doubled = jax.tree.map(lambda grad: 2 * grad, grads)
+    expected_updates, expected_state = alone.update(doubled, initial, params,
+                                                    qk_stats=qk_stats(rows=6, values=fires + quiet))
+    expected = stepped(params, expected_updates, initial, expected_state, post_step_order(alone, params))
+    assert largest_difference(moved, expected) == 0.0
+    assert all(np.all(np.asarray(pooled) == 0) for pooled in clip_state(state).pooled.values())
+
+
 def test_a_bounded_clipped_group_clamps_after_the_clip():
     """A bounded group's clamp is its weights' last word: under MuonClip, which rescales the stepped
     kernels, the clamp acts on the rescaled weights (`stepped`, in the chain's order), so every stored

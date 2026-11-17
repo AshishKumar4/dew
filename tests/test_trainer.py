@@ -172,17 +172,18 @@ def test_a_run_records_where_its_optimizers_split_sent_each_parameter():
 
 
 def test_a_runs_start_reports_each_phase_it_took_once():
-    """A run's start reports the seconds each phase took (the data's preparation, the step's compile, the
-    evaluations' warming) once, beside its first logged step's scalars, none after; and a fresh start that
-    took the lowering begun beside its step's compile says so (`startup/start_overlapped`): its algebra
-    passed once, not again only to match the begun compile (train 914's F1, row 6847)."""
+    """A run's start reports each phase's seconds (data, state's start, first read, fit check, compile,
+    placement, evaluations' warming) and the rest to its first step (`startup/other_seconds`) once, beside
+    its first logged step's scalars; a fresh start that took the lowering begun beside its compile says so
+    (`startup/start_overlapped`): its algebra passed once (row 6847)."""
     tracker = RecordingTracker()
     trainer = make_trainer(objective=Features(), tracker=tracker)
     trainer.fit(dataset(val=val_batches(3)), steps=3, log_every=1, eval_every=2)
     reported = [{name: value for name, value in scalars.items() if name.startswith("startup/")}
                 for _, scalars in tracker.scalars]
     [first] = [phases for phases in reported if phases]
-    seconds = {"startup/data_seconds", "startup/compile_seconds", "startup/warm_seconds"}
+    seconds = {f"startup/{name}_seconds"
+               for name in ("data", "start", "read", "check", "compile", "place", "warm", "other")}
     assert set(first) == seconds | {"startup/start_overlapped"} and first["startup/start_overlapped"] == 1
     assert all(first[name] >= 0 for name in seconds) and reported[0] == first
     # A run that logs no step reports its start with its outcome, once.

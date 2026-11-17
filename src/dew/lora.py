@@ -1204,6 +1204,11 @@ class AdapterRecord:
         if not set(self.layouts) <= set(self.targets):
             raise ValueError("adapter layouts must be keyed by the adapter's own modules")
 
+    def keeps_products_linear(self, train: bool) -> bool:
+        """Where its branch drops nothing: outside training, or with no dropout
+        (`dew.registry.Wrapper.keeps_products_linear`); the branch's own product is linear."""
+        return not (train and self.dropout > 0)
+
     def apply(self, model: nn.Module) -> nn.Module:
         """`model` adapted as this record says, which is how a recorded run's
         model is rebuilt (`ModelConfig.build`); the checkpoint supplies the factors."""

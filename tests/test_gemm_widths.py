@@ -120,12 +120,13 @@ def unaligned_widths_run_on_the_template(depth: int, width: int, *, interpret: b
         "dense forward": (lambda: gemm.gemm(x, w[0], None, **options),
                           np.asarray(x, np.float32) @ np.asarray(w[0], np.float32)),
     }
-    with generation.chosen(grouped_matmul="mosaic"):
-        for name, (call, expected) in calls.items():
-            with generation.routes() as routes:
-                got = np.asarray(jax.jit(call)(), np.float32)
-            assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}, name
-            np.testing.assert_array_equal(got, expected, err_msg=name)
+    # Every product one program, traced and compiled once (bible §8), each one's launch the template's.
+    with generation.chosen(grouped_matmul="mosaic"), generation.routes() as routes:
+        got = jax.jit(lambda: tuple(call() for call, _ in calls.values()))()
+    launched = [route.kernel for route in routes if route.choice == "grouped_matmul"]
+    assert len(launched) >= len(calls) and set(launched) == {"mosaic"}, launched
+    for (name, (_, expected)), value in zip(calls.items(), got, strict=True):
+        np.testing.assert_array_equal(np.asarray(value, np.float32), expected, err_msg=name)
 
 
 def test_a_dense_products_partial_depth_lowers_with_its_matrix_prefetched():

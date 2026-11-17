@@ -49,7 +49,7 @@ from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.mixers.mamba2 import MambaRMSNormGated
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import at_least_fp32, float32_dot_general
+from dew.nn.precision import at_least_fp32, float32_dot_general, softplus
 from dew.nn.residuals import Residual
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import sequence_shards
@@ -534,7 +534,7 @@ class Mamba3(nn.Module):
             ranked = t.reshape(batch, length, self.mimo_rank, self.n_groups, self.state_size)
             normed = _per_head(norm(ranked).astype(wide), self.num_heads)
             keys.append(_biased(normed, jnp.swapaxes(bias, 0, 1)).astype(projected.dtype))
-        step = nn.softplus(_biased(dt.astype(wide), self.dt_bias))
+        step = softplus(_biased(dt.astype(wide), self.dt_bias))
         decay = jnp.minimum(-_heavy_tail(A.astype(wide)), -self.A_floor)
         rates = (jnp.tanh(angles.astype(wide)) * jnp.pi)[:, :, None]
         x, z = (t.reshape(batch, length, 1, self.num_heads, self.head_dim) for t in (x, z))
