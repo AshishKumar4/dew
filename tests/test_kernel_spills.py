@@ -22,7 +22,7 @@ from lane_environment import DETERMINISTIC_OPS
 from generation_support import lowers
 from jax.experimental.layout import Format, Layout
 from kernel_compile import Uncounted
-from process_support import fresh
+from process_support import fresh, keeping_picks
 
 from dew.inputs import Field, InputSpec
 from dew.nn.attention import scaled_dot_product_attention
@@ -173,8 +173,8 @@ it lowered by name."""
 
 
 @lowers("sm90")
-@pytest.mark.parametrize("flags", [None, DETERMINISTIC_OPS], ids=["own flags", "deterministic ops"])
-def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, flags):
+@pytest.mark.parametrize("deterministic", [False, True], ids=["keeping picks", "deterministic ops"])
+def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, deterministic):
     """A one-layer decoder of the 4B's gated delta net, its step compiled ahead for a compile-only H100
     (`RECURRENT_AHEAD`), twice over one cache: at its derived tiles its output launch spills (8 bytes at 128
     registers under the cuda12 build's ptxas), and each process lowers the step once. Certification compiles
@@ -188,6 +188,8 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, flags):
     under deterministic ops too, which keep no picks but keep the verdicts (row 7308: every warm start under
     --xla_gpu_deterministic_ops certified every launch again)."""
     cache = tmp_path / "cache"
+    # The lane's own flags each time, without deterministic ops and with them, whatever the lane's are.
+    flags = f"{keeping_picks()} {DETERMINISTIC_OPS}" if deterministic else keeping_picks()
     cold, warm = (fresh(RECURRENT_AHEAD, cache_dir=cache, flags=flags)["lowered"] for _ in range(2))
     assert [run.count("jit(step)") for run in (cold, warm)] == [1, 1], (cold, warm)
     certified = [name for name in cold if name.startswith("jit(certified_")]
