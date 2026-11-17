@@ -11,13 +11,14 @@ import jax
 import numpy as np
 import pytest
 from process_support import run_pool
-from run_kinds import SEQ, decision, diffusion, lm, trained
+from run_kinds import SEQ, decision, diffusion, lm, pictures, read, trained
 from saved_run_kinds import over, windows
 from token_support import write_token_corpus
 
 from dew.batch import FROZEN
 from dew.config import ObjectiveConfig, SourceOptions
 from dew.config.diffusion import DEFAULT_MODEL_CONFIG, DiffusionRunConfig
+from dew.data import images as image_steps, presets
 from dew.decision.config import DecisionRunConfig
 from dew.inference import TextToImage
 from dew.inference.tasks import SavedRun
@@ -542,8 +543,9 @@ def test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task(tmp_
     starts from the weights the run's own task restores (`TextToImage.from_run`), bit for bit, and samples
     by that task's policy where it states none. It trains a step, and its record names the run it started
     from and the step it read; an adapter over it trains its factors over the run's frozen weights. The
-    source is at the run's own size, another refused, and a language model's loader refuses a diffusion
-    run, which has no release. A run that trained an adapter starts another with its base frozen
+    source binds at the run's own size and at another, from which a run over larger pictures trains (ledger
+    2792, where another size was refused), and a language model's loader refuses a diffusion run, which has
+    no release. A run that trained an adapter starts another with its base frozen
     (`test_a_diffusion_run_starts_from_an_adapted_run_with_its_base_frozen`; the two took 135 s as one
     test, ledger 3899)."""
     first = diffusion(tmp_path, drawn=False)
@@ -568,10 +570,75 @@ def test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task(tmp_
 
     sized = load_diffusion_source(str(source), dtype="float32", size=task.inputs.sample.shape[:-1])
     assert sized.inputs.sample == task.inputs.sample
-    with pytest.raises(ValueError):
-        load_diffusion_source(str(source), dtype="float32", size=(8, 8))
+    larger = load_diffusion_source(str(source), dtype="float32", size=(8, 8))
+    assert larger.inputs.sample == dataclasses.replace(task.inputs.sample, shape=(8, 8, 3))
+    train, held = pictures()
+
+    def at_eight(rows):
+        return read(rows.pipe(presets.images, 8, batch=8, caption=image_steps.caption(), augment=False))
+
+    state, _ = trained(dataclasses.replace(run, data=at_eight(train), validation=at_eight(held)), tmp_path,
+                       "larger")
+    assert int(state.step) == 1
     with pytest.raises(ValueError):
         released_run(source)
+
+
+PUBLISHED = {"xl": ("tiny_diffusers", "xl"), "flux": ("flux_source", "pipeline")}
+"""Each published pipeline a run trains from (its fixture's archive and folder): SDXL's, whose time ids
+state its size, and Flux's, whose grid's tokens set its resolution shift."""
+
+
+@pytest.mark.parametrize("pipeline", sorted(PUBLISHED))
+def test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_does(pipeline, tmp_path):
+    """A run trained a step from a published pipeline and saved binds at another size as the pipeline binds
+    there (ledger 2792, where another size was refused): its sample, an XL composition's size conditioning,
+    its grid's tokens and a resolution shift at that size are the pipeline's own there, each moved from
+    its own size's."""
+    from diffusion_stubs import batch_for
+    from diffusion_support import images_of, saved_after_one_step
+    from interop_support import extract_fixture
+
+    from dew.config import TrainerConfig
+    from dew.diffusion.schedules.flow import FlowMatchingScheduler
+    from dew.interop.conditioners import DiffusionConditioner
+    from dew.interop.pretrained import PretrainedPipeline
+    from dew.interop.saved_sources import RunPipeline
+
+    archive, folder = PUBLISHED[pipeline]
+    directory = extract_fixture(Path(__file__).parent / "fixtures" / f"{archive}.tar.xz", tmp_path / archive)
+    directory = directory / folder
+    own = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    height, width = own.inputs.sample.shape[-3:-1]
+    config = DiffusionRunConfig(
+        pretrained=str(directory), data=images_of("tfds://oxford_flowers102", height), val_metrics=(),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
+        objective=ObjectiveConfig("diffusion", {"steps": 2, "ema_decay": None}))
+    saved_after_one_step(config, lambda task: batch_for(task, 4), tmp_path / "run", 1e-2)
+    size = (2 * height, height + width)
+    saved = load_diffusion_source(str(tmp_path / "run"), dtype="float32", size=size)
+    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=size)
+    assert isinstance(saved, RunPipeline) and saved.grid is not None
+    assert isinstance(published, PretrainedPipeline) and isinstance(own, PretrainedPipeline)
+    assert saved.inputs.sample == published.inputs.sample != own.inputs.sample
+
+    def time_ids(source) -> dict:
+        return {keyword: condition.encoder.time_id_values for keyword, condition in
+                source.inputs.conditions.items() if isinstance(condition.encoder, DiffusionConditioner)}
+
+    assert time_ids(saved) == time_ids(published)
+    if pipeline == "xl":
+        assert time_ids(saved) and time_ids(saved) != time_ids(own)
+    assert ((saved.grid.tokens, saved.grid.origin, dict(saved.grid.config)) ==
+            (published.task.grid.tokens, published.task.grid.origin, dict(published.task.grid.config)))
+    assert saved.grid.tokens != own.task.grid.tokens
+    if pipeline == "flux":
+        def shift(source) -> float:
+            schedule = source.process.schedule
+            assert isinstance(schedule, FlowMatchingScheduler)
+            return schedule.shift
+
+        assert shift(saved) == shift(published) != shift(own)
 
 
 @pytest.mark.mesh(devices=8)
