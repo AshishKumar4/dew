@@ -63,8 +63,10 @@ class Encoding(ReadsEarlierLayouts):
     fitted the example with (`Fit`), which the row lays out again.
 
     With a `context_length`, a row also carries its example's context as
-    `context`, the tokens of its text (`render`), a context longer than
-    `context_length` refused (`Fit`), and none for an example without one.
+    `context`, the tokens of its text (`render`, or a configured context
+    encoder's, `context_encoder`), a context longer than its room cut to its
+    first tokens and counted (`with_context`), and none for an example without
+    one.
     """
 
     layout: Layout
@@ -385,9 +387,8 @@ class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
     head: Head
     context_length: int | None = None
     """The most context tokens the backbone's cross-attention reads, or None where it reads none: an
-    example whose context is longer refuses the run (ValueError) where the data reads it, which the
-    data plan's compile meets before training for data read into memory and a streamed or indexed
-    read meets at that record, so no example is silently cut or dropped."""
+    example whose context is longer keeps its first tokens, the cut counted with its cuts
+    (`with_context`, `data/cut/<corpus>/context`), so none is cut silently."""
     grouped: bool = False
     """Whether the objective reads consistency groups, whose members may stand in rows of their own: an
     example's questions under a layout of a question a row, or grouped examples' (`GroupedExamples`),
