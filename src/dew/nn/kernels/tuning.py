@@ -1279,17 +1279,18 @@ def _verdicts_path(device_kind: str) -> str:
     """The store of the certification verdicts of GPUs of `device_kind`, beside their picks
     (`kernel_picks_path`): verdicts alone, each by what decides its compile (`report._verdict_key`), where
     the picks are measured timings. A model's own (row 6717: an H100 and a GH200, which assemble alike,
-    share none until the ptxas each runs is known, row 7309)."""
+    share none until the ptxas each runs is known, row 7309). Read and written under deterministic ops too,
+    which keep no picks (`dew._cache.keeps_picks`): a verdict is what the assembler said of a compile, the
+    same in every process alike in what its key states, the run's XLA flags among them (row 7308: the cuda
+    lane's warm start certified every launch again)."""
     return _cache.kernel_picks_path(f"certified {device_kind}")
 
 
 def stored_verdict(device_kind: str, key: str) -> Rebuilt | None:
     """Certification's verdict of the launch `key` names on GPUs of `device_kind` (`report.certified`), an
     accepted config's or a refused one's, as stored (`_verdicts_path`) and rebuilt (`decoded`), read once a
-    process; none where the process keeps no picks, none is stored, or this checkout cannot rebuild it
-    (`Unreadable`: it certifies again)."""
-    if not _cache.keeps_picks():
-        return None
+    process; none where none is stored, or this checkout cannot rebuild it (`Unreadable`: it certifies
+    again)."""
     with _LOADING:
         if device_kind not in _VERDICTS:
             _VERDICTS[device_kind] = {entry["certified"]: entry["verdict"]
@@ -1306,9 +1307,7 @@ def stored_verdict(device_kind: str, key: str) -> Rebuilt | None:
 
 def store_verdict(device_kind: str, key: str, verdict: dict[str, tuple[str, report.Binary]]) -> None:
     """`verdict` stored for the launch `key` names on GPUs of `device_kind` (`_verdicts_path`), as the picks
-    are (`encoded`), one writer at a time, the file replaced whole, where the process keeps picks."""
-    if not _cache.keeps_picks():
-        return
+    are (`encoded`), one writer at a time, the file replaced whole."""
     written = encoded(verdict)
     path = _verdicts_path(device_kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)
