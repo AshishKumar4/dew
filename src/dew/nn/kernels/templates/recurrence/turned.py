@@ -247,7 +247,8 @@ def _halves(query, key, value, d_out, log, beta, ids, teams, *, scale: float, gr
     cancels another. A chunk is a power of two of whole groups (`turn_gradient`'s), and a level whose
     blocks are one group each holds no pair a readout apart keeps: the levels stop there (a rank-four call's
     two smallest, each three small products a chunk). `query` and `key` `[..., C, 2 A]`,
-    `value` and `d_out` `[..., C, V]`, `log` the log decays' prefix `G` and `beta` `[..., C]`, `ids` and
+    `value` and `d_out` `[..., C, V]`, `log` the log decays' prefix `G` as a double float (`_between`) and
+    `beta` `[..., C]`, `ids` and
     `teams` `[..., C]` broadcast against them."""
     length = query.shape[-2]
     total = jnp.zeros((*query.shape[:-1], query.shape[-1] // 2), query.dtype)
@@ -256,12 +257,13 @@ def _halves(query, key, value, d_out, log, beta, ids, teams, *, scale: float, gr
         half = size // 2
         split = functools.partial(_split, blocks=length // size, half=half)
         q, k, v, do = (split(x, 1) for x in (query, key, value, d_out))
-        G, b, doc, team = (split(x, 0) for x in (log, beta, *(jnp.broadcast_to(t, log.shape)
-                                                             for t in (ids, teams))))
+        G = tuple(split(part, 0) for part in log)
+        b, doc, team = (split(x, 0) for x in (beta, *(jnp.broadcast_to(t, beta.shape) for t in (ids, teams))))
         kept = ((team[..., 1, :, None] > team[..., 0, None, :])
                 & (doc[..., 1, :, None] == doc[..., 0, None, :]))
-        lag = jnp.where(kept, G[..., 1, :, None] - G[..., 0, None, :], -jnp.inf)
-        pairs = jnp.einsum('...iv,...jv->...ij', do[..., 1, :, :], v[..., 0, :, :]) * jnp.exp(lag)
+        lag = _between(tuple(part[..., 1, :, None] for part in G), tuple(part[..., 0, None, :] for part in G))
+        pairs = (jnp.einsum('...iv,...jv->...ij', do[..., 1, :, :], v[..., 0, :, :])
+                 * jnp.exp(jnp.where(kept, lag, -jnp.inf)))
         pairs = pairs * (scale * b[..., 0, None, :])
         later = _suffix(_crossed(q[..., 1, :, :], jnp.einsum('...ij,...jk->...ik', pairs, k[..., 0, :, :])),
                         axis=-2)
@@ -319,11 +321,19 @@ def _walk(step, carry, *xs, reverse: bool = False):
     return jax.tree.map(lambda y: jnp.moveaxis(y, 0, 2), ys)
 
 
+def _between(later, earlier) -> jax.Array:
+    """A pair's log decay `G_later - G_earlier` of two double-float prefixes `(high, low)`, the highs'
+    difference first (exact where they are near) then the lows': a prefix rounded once to fp32 put a pair's
+    decay `eps |G|` off, where the chunk's `|G|` is many times the pair's own (the crossing form's turn
+    gradient 2.5 to 5.3 times the recurrence's error from float64, its arithmetic in float64 0.5 times)."""
+    return (later[0] - earlier[0]) + (later[1] - earlier[1])
+
+
 def _sides(q, k, log, b, reads, writes, scale: float):
     """A chunk's readers of the memory entering it, `q_s scale exp(G_s)`, and writers into the memory
     leaving it, `k_u beta_u exp(G_end - G_u)`, of the chunk's document alone (`reads`, `writes`)."""
-    readers = q * (scale * jnp.exp(log) * reads)[..., None]
-    writers = k * (b * jnp.exp(log[..., -1:] - log) * writes)[..., None]
+    readers = q * (scale * jnp.exp(log[0] + log[1]) * reads)[..., None]
+    writers = k * (b * jnp.exp(_between(tuple(part[..., -1:] for part in log), log)) * writes)[..., None]
     return readers, writers
 
 
@@ -347,14 +357,16 @@ def _packed(query, key, value, d_out, g, beta, state, d_final, starts, *, scale:
     # Each chunk's log decays' prefix restarts at each document's first token: summed across a chunk's
     # documents, a pair of a later one took its decays as a difference of the earlier ones' (PaTH's row
     # 7609: a first document's -2^30 rounded the next one's to nothing).
-    log = _segmented(laid(jnp.asarray(g, work)), laid(begins)[:, None])
+    g = laid(jnp.asarray(g, work))
+    log = scan.compensated(g, axis=-1, restarts=jnp.broadcast_to(laid(begins)[:, None], g.shape))
     b = laid(jnp.asarray(beta, work))
     ids = laid(jnp.cumsum(begins.astype(jnp.int32), axis=1), mode='edge')[:, None]
     # Each token's group: a row's tokens' ranks in turn from its first, each document beginning a token.
     teams = laid(jnp.broadcast_to(jnp.arange(length) // group, (batch, length)), mode='edge')[:, None]
     before = jnp.concatenate([jnp.zeros_like(ids[..., :1, -1]), ids[..., :-1, -1]], axis=-1)
     readers, writers = _sides(q, k, log, b, ids == before[..., None], ids == ids[..., -1:], scale)
-    passes = (ids[..., -1] == before)[..., None, None] * jnp.exp(log[..., -1])[..., None, None]
+    whole = jnp.exp(log[0][..., -1] + log[1][..., -1])
+    passes = ((ids[..., -1] == before) * whole)[..., None, None]
     written = jnp.einsum('bhnck,bhncv->bhnkv', writers, v)
     read = jnp.einsum('bhnck,bhncv->bhnkv', readers, do)
     entering = (jnp.zeros((batch, heads, turned, v.shape[-1]), work) if state is None
@@ -381,16 +393,6 @@ def _packed(query, key, value, d_out, g, beta, state, d_final, starts, *, scale:
 def _document_of(firsts, length: int):
     """Each token's document `[B, T]`: the count of `firsts` `[B, D]` at or before it, less one."""
     return jnp.sum(jnp.arange(length)[None, :, None] >= firsts[:, None, :], axis=-1) - 1
-
-
-def _segmented(values, restarts):
-    """`values`' inclusive prefix sums along their last axis, restarting at each of `restarts`
-    (broadcast)."""
-    def combine(left, right):
-        return jnp.where(right[1], right[0], left[0] + right[0]), left[1] | right[1]
-
-    restarts = jnp.broadcast_to(restarts, values.shape)
-    return jax.lax.associative_scan(combine, (values, restarts), axis=-1)[0]
 
 
 def _laid_documents(query, key, value, d_out, g, beta, given, d_final, documents, entry, *, scale: float,
@@ -424,7 +426,7 @@ def _laid_documents(query, key, value, d_out, g, beta, given, d_final, documents
 
     q, k = (laid(jnp.asarray(x, work)[..., :turned]) for x in (query, key))
     v, do = (laid(jnp.asarray(x, work)) for x in (value, d_out))
-    log = jnp.cumsum(laid(jnp.asarray(g, work)), axis=-1)
+    log = scan.compensated(laid(jnp.asarray(g, work)), axis=-1)
     b = laid(jnp.asarray(beta, work))
     on = _chunked(real, chunks, chunk)[:, None]
     readers, writers = _sides(q, k, log, b, on, on, scale)
@@ -433,7 +435,7 @@ def _laid_documents(query, key, value, d_out, g, beta, given, d_final, documents
     first = alive & (jnp.arange(chunks)[None] * chunk == _taken(offsets, head))
     last = alive & ((jnp.arange(chunks)[None] + 1) * chunk == _taken(offsets + spans, head))
     final = last & (head == _document_of(firsts, length)[:, -1:])
-    passes = (alive[:, None] * jnp.exp(log[..., -1]))[..., None, None]
+    passes = (alive[:, None] * jnp.exp(log[0][..., -1] + log[1][..., -1]))[..., None, None]
     written = jnp.einsum('bhnck,bhncv->bhnkv', writers, v)
     read = jnp.einsum('bhnck,bhncv->bhnkv', readers, do)
     shape = (batch, heads, turned, v.shape[-1])
