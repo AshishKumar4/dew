@@ -30,9 +30,9 @@ def file_of(case: ET.Element) -> str:
 
 
 def of(case: ET.Element, name: str) -> bool:
-    """Whether JUnit `case` is of what a run named `name`: its file, or a test node in it (`file::test`, a class's
-    `file::Class`), each of its parametrized cases among them (2026-11-17: a tier given node ids read every one of
-    them as never run, its cases matched against their file's name)."""
+    """Whether JUnit `case` is of what a run named `name`: its file, or a test node in it (`file::test`, a
+    class's `file::Class`), each of its parametrized cases among them (2026-11-17: a tier given node ids read
+    every one of them as never run, its cases matched against their file's name)."""
     if "::" not in name:
         return file_of(case) == name
     node = node_of(case)
