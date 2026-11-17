@@ -214,7 +214,10 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # forms' three parts, whose solve no sm90 thread holds, past the fast ones the selector gave it).
         epilogue = hooks.output is not None or dtype != jnp.result_type(query, key, value)
         wide_out = hooks.skip or epilogue
-        rounded = chunk_rounding(hooks.delta, jnp.result_type(query, key, value), released=simple_gla(hooks))
+        # fla's simple GLA rounds at its release's placements, its write gated on the values
+        # (`mainloop.Call.values_gated`).
+        values_gated = simple_gla(hooks)
+        rounded = chunk_rounding(hooks.delta, jnp.result_type(query, key, value), released=values_gated)
         skip = given['skip'] if hooks.skip else None
         # Without the delta rule the template takes the skip, its output wide where an epilogue or the
         # caller reads it so (`chunk_forward.forward`).
@@ -225,7 +228,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                scale=scale, wide=fused_wide, bound=hooks.inverse_bound,
                                product=product, forked=forked, delta=hooks.delta,
                                decayed=hooks.decay != 'none', skip=None if hooks.delta else skip,
-                               rounded=rounded, firsts=firsts, readout=readout)
+                               rounded=rounded, values_gated=values_gated, firsts=firsts, readout=readout)
 
         def run(kernel, query, key, value, g, beta, skip, state, starts, firsts, *walked):
             # Every kernel walks the packed rows, each document from its own memory, its values read once
@@ -241,7 +244,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                 out, final = template_rule(query, key, own, g, beta, state, starts, firsts,
                                            skip if fused else None, forked=carried,
                                            max_segments=max_segments, scale=scale, delta=hooks.delta,
-                                           wide=fused_wide, bound=hooks.inverse_bound, rounded=rounded)
+                                           wide=fused_wide, bound=hooks.inverse_bound, rounded=rounded,
+                                           values_gated=values_gated)
             elif kernel == 'fla':
                 out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
                                       max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
@@ -959,22 +963,23 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                 scale: float | None = None, wide: bool = False,
                 bound: float | None = None, product: str = 'forward', report: bool = True, delta: bool = True,
                 decayed: bool = True, forked: Forked | None = None, skip=None, rounded: bool | None = None,
-                firsts=None, readout: bool = True) -> str:
+                values_gated: bool = False, firsts=None, readout: bool = True) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
     ('forward', 'training'), of the form `delta` and `decayed` state and the chunk inverse's `bound` its form
     proves (`recurrence.Hooks.inverse_bound`; `PortCase`), the template's
     implementations bound to it, its `skip` among them where it takes one (`chunk`: a form without the delta
     rule's), on the target (`generation`'s, an assumed one's within `assumed`), at the call's numbers
     `rounded` (`chunk_rounding`'s where None, read here; a call passes its own, read once at it, so a
-    selection made later, a remat's pullback's under its caller's precision, reads the call's):
-    reported as its route, or not where not `report` (`selected`). A kernel a call names
+    selection made later, a remat's pullback's under its caller's precision, reads the call's), its write
+    gated on the values where `values_gated` (fla's simple GLA, `mainloop.Call.values_gated`): reported as its
+    route, or not where not `report` (`selected`). A kernel a call names
     (`generation.chosen`) insists on it (`selection.KernelRefused`: the port named over varying operands),
     but for a form the rule's kernels do not run, which the portable math takes; `readout` whether the
     call's readout reads the state after its token's update alone (`PortCase.readout`)."""
     call = template_call(query, key, value, g, beta, state, starts, firsts, skip, forked,
                          max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound,
                          rounded=(chunk_rounding(delta, jnp.result_type(query, key, value))
-                                  if rounded is None else rounded))
+                                  if rounded is None else rounded), values_gated=values_gated)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1],

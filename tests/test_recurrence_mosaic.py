@@ -1264,11 +1264,12 @@ def _form(name: str, dtype) -> dict:
     """A resource case's call form beside its operands under the run's fast forms (`rounded`, `fast_rounding`,
     an fp32 call's operands in two parts), as its route gives it: a rated scan's without the delta rule and
     wide, as Mamba-2's mixer reads its output (`chunk`'s fp32 `dtype`); lightning attention's at its
-    release's rounding as `chunk` takes it (`chunk_rounding`'s `released`)."""
+    release's rounding as `chunk` takes it (`chunk_rounding`'s `released`), its write gated on the values."""
     if name in WHOLE:
         return {'delta': False}
     if name in RELEASED:
-        return {'delta': False, 'rounded': chunk_rounding(delta=False, dtype=dtype, released=True)}
+        return {'delta': False, 'rounded': chunk_rounding(delta=False, dtype=dtype, released=True),
+                'values_gated': True}
     return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
 
 
