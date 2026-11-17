@@ -395,6 +395,18 @@ def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
     return frozenset(_name(one) for one in written if one is not None)
 
 
+FP32_PRODUCTS = frozenset({"HIGHEST", "F32_F32_F32"})
+"""The precision names that declare fp32 operands' products in IEEE fp32 (`precision_names`): `highest` and
+the F32_F32_F32 preset, which `jax_default_matmul_precision` spells 'highest', 'float32' or the preset's
+name."""
+
+
+def declares_fp32_products(precision: jax.lax.PrecisionLike) -> bool:
+    """Whether `precision` (a run's `jax_default_matmul_precision`, `Numerics.matmul`) declares fp32
+    operands' products in IEEE fp32 (`FP32_PRODUCTS`), however it is spelled."""
+    return bool(precision_names(precision) & FP32_PRODUCTS)
+
+
 def _name(precision: str | jax.lax.Precision | jax.lax.DotAlgorithmPreset | jax.lax.DotAlgorithm) -> str:
     """The name of one precision `precision_names` takes, a string read as JAX reads one."""
     if isinstance(precision, jax.lax.DotAlgorithm):

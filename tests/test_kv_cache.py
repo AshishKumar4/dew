@@ -24,6 +24,7 @@ from dew.nn.kv_cache import (
     KVCache,
     KVSpec,
     KVStore,
+    TPU_PAGED_SUPPORTS,
     _gather_pages,
     _gathered_attention,
     gpu_paged,
@@ -292,6 +293,18 @@ def test_a_quantized_caches_scales_and_codes_are_its_formats_quotients(quantized
     rounded = (np.clip(np.rint(quotients), -127, 127).astype(np.int8) if quantized == "int8"
                else quotients.astype(jnp.float8_e4m3fn))
     np.testing.assert_array_equal(np.asarray(codes).view(np.uint8), np.asarray(rounded).view(np.uint8))
+
+
+@pytest.mark.parametrize("declared", ["highest", "float32", "F32_F32_F32", "bfloat16"])
+def test_a_v5e_refuses_the_tpu_paged_decode_wherever_a_run_declares_fp32_products(declared):
+    """The TPU paged decode's requirement that the MXU take a run's fp32 products (`fp32_by_bf16_precise`)
+    reads the run's declaration as `precision.declares_fp32_products` names it: on a v5e, refused under
+    'highest', 'float32' and the F32_F32_F32 preset alike, served under bf16 products; the same names
+    `decode_attention.run_products` reads (where the preset was admitted and 'highest' refused)."""
+    (requirement,) = [each for each in TPU_PAGED_SUPPORTS if each.code == "fp32_by_bf16_precise"]
+    with generation.assumed("v5e"), jax.default_matmul_precision(declared):
+        refusal = requirement.analysis(None)
+    assert (refusal is None) == (declared == "bfloat16"), (declared, refusal)
 
 
 def test_a_pool_too_small_for_every_row_is_refused_where_no_server_assigns_pages():
