@@ -21,7 +21,7 @@ from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding
 
 from dew import communicators
-from dew._devices import device_memory, gpu_free_bytes, xla_flag
+from dew._devices import device_memory, fresh_pool, gpu_free_bytes, xla_flag
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
@@ -394,6 +394,28 @@ def _admitted(devices: Sequence, memory: Sequence[Mapping[str, int]], beside: in
         needed = temporaries * stranding(device, held)
         margins.append(min(block(held, free) - needed, available(held, free) - beside - needed))
     return min(margins)
+
+
+def needed(device, resident: int, beside: int, temporaries: int) -> int:
+    """The least bytes a GPU like `device` must hold for `admitted` to admit a step of `temporaries`, with
+    `resident` bytes in use and `beside` more placed: its allocator a fresh pool at its limit, as a GPU not
+    attached states it (`dew._devices.fresh_pool`), read through the one admission (`_admitted`) that
+    leaves zero or more bytes to spare there and none one byte fewer: the inverse of `admitted`, which a
+    pool of GPUs is sized by."""
+
+    def headroom(memory: int) -> int:
+        spare = _admitted([device], [fresh_pool(memory, resident)], beside, temporaries)
+        assert spare is not None
+        return spare
+
+    # The headroom grows with the memory: double to a size that admits, then halve to its least.
+    low, high = 0, max(1, resident + beside + temporaries)
+    while headroom(high) < 0:
+        low, high = high + 1, 2 * high
+    while low < high:
+        middle = (low + high) // 2
+        low, high = (low, middle) if headroom(middle) >= 0 else (middle + 1, high)
+    return low
 
 
 def stated(memory: Sequence[Mapping[str, int]]) -> bool:
