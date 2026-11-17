@@ -148,6 +148,14 @@ class Hooks:
         return bound if bound is not None and bound <= 2.0 else None
 
     @property
+    def apart(self) -> int:
+        """The op tokens of a group whose writes a readout apart from them leaves out (`ranks`) that the
+        template forms (`mainloop.Call.apart`: a decay a head or none, no delta rule, no own weight), zero
+        where it reads the whole state or the portable math alone forms it."""
+        formed = self.reads == 'apart' and not self.own_weight and self.decay != 'vector' and not self.delta
+        return self.ranks if formed else 0
+
+    @property
     def gated_write(self) -> bool:
         """Whether the step reads a write gate `beta`."""
         return self.delta or self.write_gate or self.gates is not None or self.rated
@@ -156,9 +164,11 @@ class Hooks:
         if self.reads not in ('after', 'before', 'apart'):
             raise ValueError(f"a readout reads the state 'after' its token's update, 'before' it or 'apart' "
                              f"from its own write, not {self.reads!r}")
-        if self.ranks < 1 or (self.ranks > 1 and self.reads != 'apart'):
+        if self.ranks < 1 or (self.ranks > 1 and (self.reads != 'apart' or self.delta)):
             raise ValueError(f"a token's ranks are one or more, more only where its readout reads apart from "
-                             f"their writes, not {self.ranks} reading {self.reads!r}")
+                             f"their writes without the delta rule (whose writes are corrected values a "
+                             f"group's read would take), not {self.ranks} reading {self.reads!r} with "
+                             f"delta={self.delta}")
         if self.own_weight and self.delta:
             raise ValueError("a readout weighs a token's own write without the delta rule: the delta rule's "
                              "write is its corrected value, which reads the state its readout does not")
@@ -498,6 +508,9 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     """`(output [rows, Hv, Dv], history' or None, state')` of a decode token, in XLA: each piece of
     arithmetic in at least fp32 (float64 operands in float64), the state held as it came (bf16
     rounded by `round_to_bf16`), the output in `dtype` (the value's or the token's without it)."""
+    if hooks.ranks > 1:
+        raise NotImplementedError(f"a decode token of {hooks.ranks} ranks: a token's step takes one op "
+                                  "token, its ranks the caller's (Mamba-3's `step_mamba3`)")
     given = read(hooks, operands)
     state = given['state']
     operand = given['token' if hooks.conv is not None else 'value'].dtype
@@ -549,6 +562,9 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     `step_reference` (`generation.linear_tangent`), the launch having no derivative of its own: a token
     traced for `jax.jvp`, however a jit, a scan or a remat staged it, takes the reference's tangent and
     the launch's value (row 2395)."""
+    if hooks.ranks > 1:
+        raise NotImplementedError(f"a decode token of {hooks.ranks} ranks: a token's step takes one op "
+                                  "token, its ranks the caller's (Mamba-3's `step_mamba3`)")
     def portable(operands):
         return step_reference(hooks, operands, dtype=dtype)
 

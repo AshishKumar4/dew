@@ -473,24 +473,36 @@ TILES = {"pairs": pairs_of, "scores": scores_of}
 """The recurrence's tile declarations (`derived_tile`): its system's pairs and its readout's scores."""
 
 
-def _later_groups(shape, group: int) -> jax.Array:
-    """Whether each row of a tile `[R, C]` is in a later group of `group` consecutive tokens than its column:
-    the pairs a readout apart from its token's own writes keeps (`recurrence.Hooks.reads` 'apart', a token's
-    ranks `group` tokens, mamba_ssm's Mamba-3 MIMO `i // R > j // R`, `mamba3_mimo_fwd.py`; strictly lower
-    at one)."""
-    rows, cols = _grid(shape)
-    return rows // group > cols // group
+def _later_groups(shape, group: int, *, columns_later: bool = False) -> jax.Array:
+    """Whether each row of a tile `[R, C]` is in a later group of `group` consecutive tokens than its column
+    (its column in a later one than its row where `columns_later`, the transposed tile's, formed as it is,
+    no tile transposed): the pairs a readout apart from its token's own writes keeps
+    (`recurrence.Hooks.reads` 'apart', a token's ranks `group` tokens, mamba_ssm's Mamba-3 MIMO `i // R > j
+    // R`, `mamba3_mimo_fwd.py`; strictly lower at one). `group` a power of two (the template's, dividing
+    its role's rows, `template.Mosaic.eligible`): each index's group its bits past the group's, shifted, no
+    division."""
+    shift = group.bit_length() - 1
+    if group != 1 << shift:
+        raise ValueError(f"a group of {group} tokens is no power of two")
+    rows, cols = (index >> shift for index in _grid(shape))
+    return cols > rows if columns_later else rows > cols
 
 
 @functools.cache
-def derived_tile(name: str):
+def derived_tile(name: str, apart: int = 0):
     """The derived forms of the tile declaration `name` (`TILES`, the fast class), the template's: a mainloop
     forms the products and its compensated prefix's decays (representations it keeps) and takes the tile's
-    algebra over them from these forms, the hand forms' own arithmetic in their order (FS-DERIVED-ID1/2)."""
+    algebra over them from these forms, the hand forms' own arithmetic in their order (FS-DERIVED-ID1/2). A
+    readout `apart` from its group's writes (`chunk_scores`') keeps the pairs of later groups alone, its mask
+    the declaration's own, one select of the tile."""
     from dew.algebra import SATURATION, derive
     axes = {"products": ("rows", "columns"), "decays": ("rows", "columns"),
             "scales": ("rows",) if name == "pairs" else ("columns",)}
-    return derive.derive(derive.Reduction(TILES[name], axes, walked="columns", exponent="e"), accurate=False,
+    declared = TILES[name]
+    if apart:
+        def declared(products, decays, scales):
+            return jnp.where(_later_groups(products.shape, apart), products * decays * scales[None, :], 0.0)
+    return derive.derive(derive.Reduction(declared, axes, walked="columns", exponent="e"), accurate=False,
                          saturation=SATURATION)
 
 
@@ -617,8 +629,8 @@ def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issu
         scores += issue("scores", queries(c), keys(c).T)
     scales = jnp.ones((gate.shape[0],), jnp.float32) if column_scale is None else column_scale
     # The tile's algebra over its products and decays its declaration's derived forms (`scores_of`).
-    scores = derived_tile("scores").mapped({"products": scores, "decays": decay, "scales": scales})
-    return (jnp.where(_later_groups(scores.shape, apart), scores, 0.0) if apart else scores).astype(dtype)
+    tile = derived_tile("scores", apart)
+    return tile.mapped({"products": scores, "decays": decay, "scales": scales}).astype(dtype)
 
 
 def chunk_output(queries: Load, entered: Load, columns: int, gate, low, scores, value, scale: float,
@@ -843,7 +855,7 @@ def local_gradient(keys: TileLoad, queries: TileLoad, columns: int, gate, low, o
     decay = decayed(-gate, -low, -column_gate, -column_low)
     product = summed([("local_t", keys(c), queries(c).T) for c in range(columns)]) * decay
     lag = _lags(product.shape)
-    kept = _later_groups(product.shape, apart).T if apart else lag <= 0
+    kept = _later_groups(product.shape, apart, columns_later=True) if apart else lag <= 0
     scores = jnp.where(kept, product * scale, 0.0).astype(dtype)
     for j in range(blocks):
         emit(j, issue("local_dv", scores, out_grads(j)))

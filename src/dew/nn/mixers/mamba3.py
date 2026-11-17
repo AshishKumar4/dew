@@ -167,11 +167,16 @@ def _ranked(t):
 def _rank_terms(own, x, gamma):
     """What a token's own writes add to each of its ranks' outputs past the chunked op's (`chunk_mamba3`, its
     readout apart from them, `MAMBA3`): every rank `u` of the token at `gamma`, as the recurrence reads them,
-    on `own`, the token's queries and keys unturned `(C, B)` `[B, S, R, H, N]` in the working dtype (one
-    angle a token: its ranks' overlaps are its turned ones', mamba_ssm's `qk_dot` on `q_pre . k_pre`). `x`
-    `[B, S, R, H, P]`, `gamma` `[B, S, H]`."""
-    overlap = jnp.einsum('bsrhn,bsuhn->bshru', *own) * gamma[..., None, None]
-    return jnp.einsum('bshru,bsuhp->bsrhp', overlap, x)
+    on `own`, the token's queries and keys unturned `(C, B)` `[B, S, R, G, N]` (one angle a token: its ranks'
+    overlaps are its turned ones', mamba_ssm's `qk_dot` on `q_pre . k_pre`), a group's overlaps formed once
+    for its heads in fp32 and the operands read in their own dtype. `x` `[B, S, R, H, P]` and `gamma` `[B, S,
+    H]` in the working dtype."""
+    batch, length, rank, heads, width = x.shape
+    groups = own[0].shape[-2]
+    overlap = jnp.einsum('bsrgn,bsugn->bsgru', *own, preferred_element_type=x.dtype)
+    weighed = (x * gamma[:, :, None, :, None]).reshape(batch, length, rank, groups, heads // groups, width)
+    out = jnp.einsum('bsgru,bsugjp->bsrgjp', overlap, weighed)
+    return out.reshape(x.shape)
 
 
 def _trapezoid(delta, real, resets):
@@ -279,8 +284,7 @@ def _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, state, star
                              log_decay=_ranked(decay), beta=_ranked(gate), state=state,
                              starts=None if begins is None else _ranked(begins), **table),
                        **({} if chunk_size is None else {'chunk_size': chunk_size}), dtype=work)
-    own = tuple(_per_head(jnp.asarray(t, work), heads) for t in (C, B))
-    out = out.reshape(x.shape) + _rank_terms(own, jnp.asarray(x, work), lam * dt)
+    out = out.reshape(x.shape) + _rank_terms((C, B), jnp.asarray(x, work), lam * dt)
     return out, final, keys
 
 

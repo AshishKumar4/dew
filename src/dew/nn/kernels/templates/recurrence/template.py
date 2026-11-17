@@ -429,7 +429,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
                         arguments.get("rounded", False), arguments.get("wide", False),
                         ranged(dtype, delta, arguments.get("bound")),
                         None if skip is None else jax.ShapeDtypeStruct(skip.shape, skip.dtype), forked=table,
-                        training_forward=bool(fast), apart=arguments.get("apart", False))
+                        training_forward=bool(fast), apart=arguments.get("apart", 0))
 
     GENERATES: ClassVar[bool] = True
 
@@ -1022,7 +1022,13 @@ class Mosaic(base.Template[mainloop.Tiles]):
             return False
         taken = (arguments["g"].ndim == 3
                  or mainloop.per_key_refusal(dtype, rounded=arguments.get("rounded", False)) is None)
-        if not (taken and bundle(target, dtype) is not None and target.tensor_rate("16bit") is not None):
+        family = bundle(target, dtype)
+        if not (taken and family is not None and target.tensor_rate("16bit") is not None):
+            return False
+        # A readout apart from a group of tokens' writes (`mainloop.Call.apart`) the template forms where
+        # every chunk it derives holds whole groups: its chunks are its role's rows times a power of two
+        # (`chunk_of`), so where the group divides the role's rows (a rank of three refused, train 1000's F1).
+        if family.role_rows % max(arguments.get("apart", 0), 1):
             return False
         # A training call's launch, selected as reverse mode runs it (`recurrence_chunk._per_product`), holds
         # where its certification takes a config (`holds`), as the call's own certification then reads it

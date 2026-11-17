@@ -277,8 +277,7 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     wide = hooks.output is not None or (hooks.skip and hooks.delta)
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=wide, bound=hooks.inverse_bound, rounded=rounded,
-                                skip=None if hooks.delta else given.skip,
-                                apart=hooks.reads == 'apart' and hooks.decay != 'vector')
+                                skip=None if hooks.delta else given.skip, apart=hooks.apart)
 
 
 def refuses_its_gradient(fn, *drawn) -> None:
