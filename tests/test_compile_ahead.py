@@ -13,6 +13,7 @@ import itertools
 import json
 import logging
 import os
+import pickle
 import shutil
 import subprocess
 import sys
@@ -171,6 +172,19 @@ if ended.wait(0.5):
 raise SystemExit(1)
 """
 """A run that begins its start's compile beside its planning and is refused before it takes the start."""
+
+
+def test_a_filed_executable_states_the_memory_its_compile_analysed():
+    """A program compiled ahead (`Executable.of`), filed and read back, states the memory XLA analysed for it
+    where it compiled (`compiled_memory`: its arguments', temporaries', outputs' and live peak), so a run's
+    need is read before any device loads it (the GPU tier's workers sized by their parts' programs)."""
+    from dew.telemetry.instrumentation import compiled_memory
+    from dew.training.ahead import Executable, filed
+
+    compiled = jax.jit(lambda values: jnp.cumsum(jnp.sin(values) @ values.T, axis=0)).lower(
+        jax.ShapeDtypeStruct((64, 32), jnp.float32)).compile()
+    read = pickle.loads(filed(Executable.of(compiled)))
+    assert read.memory == compiled_memory(compiled) is not None
 
 
 def test_a_run_refused_before_its_start_is_taken_exits_once_its_compile_ends():
