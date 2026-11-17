@@ -31,6 +31,7 @@ from dew.objectives.rl import EnvironmentSource, EpisodeStatus, GRPOObjective, O
 from dew.objectives.rl.scheduler import Asynchronous, RolloutScheduler
 from dew.objectives.rl.sessions import Status, pack
 from dew.sampling import Sampling
+from dew.sampling.strategies import Beam
 from dew.training import Layout, Trainer
 
 VOCAB = 13
@@ -439,10 +440,10 @@ def test_a_served_rollouts_server_shares_its_prompts_pages_by_default():
 
 
 def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
-    """An episode scheduler over a `TextGeneration` policy drawing one row a prompt, whose model pages,
-    serves its cohort's turns over a paged cache (`paged_layout`, `EpisodeCollector.kv_cache`), so each
-    turn prefills only what follows its row's history where every turn prefilled it again (row 5374); a
-    policy drawing several rows a prompt is drawn whole, as a served cohort refuses it."""
+    """An episode scheduler over a `TextGeneration` policy drawing one row a prompt by sampling, whose model
+    pages, serves its cohort's turns over a paged cache (`served_layout`, `EpisodeCollector.kv_cache`), so
+    each turn prefills only what follows its row's history where every turn prefilled it again (row 5374);
+    a policy drawing several rows a prompt, or searching beams, is drawn whole."""
     from model_support import serving_task
 
     from dew.objectives.rl import EpisodeCollector
@@ -462,6 +463,8 @@ def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
     paged = layout(task)
     assert paged is not None and paged.page_size == 64
     assert layout(dataclasses.replace(task, n=2)) is None
+    # A policy searching beams, which a server over pages does not draw, is drawn whole.
+    assert layout(dataclasses.replace(task, strategy=Beam(width=2))) is None
 
 
 def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):
