@@ -31,8 +31,6 @@ from dew.data.dataset import DataPartition, Reader
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import Pack, Refused, Rejected, cut_counts, cut_unit
 from dew.data.text import Tokenizer
-from dew.inputs.condition import ConditionEncoder
-from dew.inputs.spec import Condition
 from dew.decision.calibration import (
     BUCKET_MINIMUM,
     TYPE_MINIMUM,
@@ -80,6 +78,8 @@ from dew.inference.tasks import (
     shape_bucket,
     traced_in_its_form,
 )
+from dew.inputs.condition import ConditionEncoder
+from dew.inputs.spec import Condition
 from dew.interop.processors import Processor
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.sources import SourceReference
