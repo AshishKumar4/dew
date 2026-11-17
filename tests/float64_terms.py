@@ -13,7 +13,7 @@ from typing import Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import float64_host, on_float64_host, unrewritten
+from arm_arithmetic import on_float64_device, on_float64_host, unrewritten
 from jax.extend.core import primitives
 from jax.interpreters import partial_eval as pe
 
@@ -150,7 +150,7 @@ def _termed(fn, args, *, power: int):
     leaves, consts = on_float64_host((jax.tree.leaves(args), closed.consts))
     token = POWER.set(power)
     try:
-        with evaluated_on(leaves):
+        with on_float64_device(), evaluated_on(leaves):
             if _static(closed.jaxpr):
                 values, energies = _compiled(closed.jaxpr)(consts, leaves)
             else:
@@ -207,14 +207,11 @@ def evaluated_on(leaves):
     `rounding_bound.rounding_scale`): the device it runs on, as jit would run them, the first committed
     array's, else JAX's default device (its `jax_default_device`, else its first), so a branch its
     platform picks is that device's (`_platform`) and every compiled evaluation is keyed by it
-    (`_target`); on a process whose float64 computes on its host (`arm_arithmetic.float64_host`), the
-    host's."""
+    (`_target`): a float64 evaluation's within `arm_arithmetic.on_float64_device`, its host's on a TPU's
+    process."""
     committed = next((leaf for leaf in leaves if isinstance(leaf, jax.Array) and leaf.committed), None)
     default = jax.config.jax_default_device
-    host = float64_host()
-    if host is not None:
-        device = host
-    elif committed is not None:
+    if committed is not None:
         device = min(committed.devices(), key=lambda device: device.id)
     elif default is None or isinstance(default, str):
         device = jax.devices(default)[0]
@@ -222,10 +219,7 @@ def evaluated_on(leaves):
         device = default
     token = PLACED.set(device)
     try:
-        # A process whose float64 computes on its host (`float64_host`, a TPU's) evaluates there, every
-        # value it makes placed there.
-        with contextlib.nullcontext() if host is None else jax.default_device(host):
-            yield device
+        yield device
     finally:
         PLACED.reset(token)
 

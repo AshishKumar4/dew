@@ -22,6 +22,14 @@ def float64_host() -> jax.Device | None:
     return jax.devices("cpu")[0] if jax.default_backend() == "tpu" else None
 
 
+def on_float64_device():
+    """The scope a float64 truth, its terms or its evaluation computes in: on `float64_host` where one is
+    named (a TPU's process), every array it makes placed there; else where its values lie. Check 2's
+    certification of native kernels (`certified`) runs on the lane's own device, outside it."""
+    host = float64_host()
+    return contextlib.nullcontext() if host is None else jax.default_device(host)
+
+
 def on_float64_host(tree):
     """`tree`'s arrays put on `float64_host` where one is named (a truth's inputs and the constants its
     program holds, so it computes there whatever device made them), as they are elsewhere."""
@@ -39,8 +47,9 @@ def widened(tree):
     """`tree` in float64, its complex leaves in complex128 and its integer leaves as they are: the inputs
     of a float64 truth. A leaf an accelerator holds is widened where it lies, so its truth runs on that
     device's FP64 units with no host round trip (a decode step's keys and values, a hundred megabytes a
-    draw to the host and back); any other is a host array. On a process whose float64 computes on its host
-    (`float64_host`, a TPU's), every leaf is put there, widened."""
+    draw to the host and back); any other is a host array, as is every leaf on a process whose float64
+    computes on its host (`float64_host`, a TPU's): a truth computes there (`on_float64_device`, `Truth`),
+    and one run as given reads host values (a torch truth's `torch.from_numpy`)."""
     def wide(leaf):
         to = (np.complex128 if jnp.issubdtype(leaf.dtype, jnp.complexfloating)
               else np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype)
@@ -50,7 +59,7 @@ def widened(tree):
                 return leaf.astype(to)
         return np.asarray(leaf, to)
 
-    return on_float64_host(jax.tree.map(wide, tree))
+    return jax.tree.map(wide, tree)
 
 
 EXACT = frozenset({jax.lax.neg_p, jax.lax.abs_p, jax.lax.max_p, jax.lax.min_p, jax.lax.select_n_p,

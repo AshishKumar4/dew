@@ -7,7 +7,7 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import FORMATTED, on_float64_host, rounds_nothing
+from arm_arithmetic import FORMATTED, on_float64_device, on_float64_host, rounds_nothing
 from float64_terms import evaluated_on, lowered, walked
 from jax.extend.core import primitives
 from reference_error import _floating, as_given, equations
@@ -72,7 +72,7 @@ def float64_replay(fn, *, compiled: bool = False):
         native = [value if jax.dtypes.issubdtype(aval.dtype, jax.dtypes.extended)
                   else np.asarray(value).astype(aval.dtype)
                   for value, aval in zip(jax.tree.leaves(arguments), graph.in_avals, strict=True)]
-        with jax.enable_x64(new_val=True), evaluated_on(native):
+        with jax.enable_x64(new_val=True), on_float64_device(), evaluated_on(native):
             if compiled and not program:
                 program.append(jax.jit(lambda *given: _walked(graph, given)))
                 traced[signature] = (graph, shapes, *program)
