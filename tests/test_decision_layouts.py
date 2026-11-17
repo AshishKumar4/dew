@@ -1,8 +1,8 @@
 """What every segment layout's row holds (decision-inputs.md §1), over the three forms
-(`SegmentLayout.marker_row`, `state_first_row`, `joint_row`) and a grid of their configurations, states and questions: each question's
-span its instructions, each option's span its marker or its line, the state cut to what the row leaves and
-counted, the question's declared budgets kept, and a position main saved under a layout class resuming
-exactly under the segment layout it is now."""
+(`SegmentLayout.marker_row`, `state_first_row`, `joint_row`) and a grid of their configurations, states
+and questions: each question's span its instructions, each option's span its marker or its line, the state
+cut to what the row leaves and counted, the question's declared budgets kept, and a position main saved
+under a layout class resuming exactly under the segment layout it is now."""
 
 import itertools
 import json
