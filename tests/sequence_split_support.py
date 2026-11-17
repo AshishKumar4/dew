@@ -50,11 +50,21 @@ def assert_split_as_whole(module, variables, row: str, seeds: int, site: str, *,
     if segments is not None:
         fields["segments"] = jnp.asarray(np.broadcast_to(segments, (SPLIT_BATCH, 32)), jnp.int32)
     call = MixerCall(AttentionMetadata(coordinates=coordinates(**fields)))
+    split, draw = assert_as_on_one_device(module, variables, call, (SPLIT_BATCH, 32, width), seeds, site,
+                                          shards=shards)
+    assert not np.any(np.asarray(split(*draw(0))[0])[:, ~valid])
 
+
+def assert_as_on_one_device(module, variables, call: MixerCall, shape: tuple[int, int, int], seeds: int,
+                            site: str, *, shards: int = 4):
+    """Under a sequence axis of `shards`, `module` with `variables` called with `call` over hidden states of
+    `shape` `[B, S, width]` computes as on one device: its output and its input's and parameters' gradients
+    check 1's against the same call on one device, from float64, over `seeds` draws. Returns the call on the
+    axis, `(hidden, cotangent) -> (output, parameters' gradient, hidden's gradient)`, and the draw of a
+    seed's `(hidden, cotangent)`."""
     def draw(seed):
         rng = np.random.default_rng([0x5E9, seed])
-        return (rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32),
-                rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32))
+        return (rng.standard_normal(shape).astype(np.float32), rng.standard_normal(shape).astype(np.float32))
 
     def pulled(model):
         """The layer's output and its pullback of a cotangent, `model` over `params`, compiled once for
@@ -79,7 +89,7 @@ def assert_split_as_whole(module, variables, row: str, seeds: int, site: str, *,
 
     assert_as_exact(split, lambda hidden, cotangent: whole(variables, hidden, cotangent), draw, site,
                     seeds=seeds, truth_fn=truth)
-    assert not np.any(np.asarray(split(*draw(0))[0])[:, ~valid])
+    return split, draw
 
 
 def assert_decodes_as_whole(module, variables, seeds: int, site: str, *, width: int, shards: int = 4,

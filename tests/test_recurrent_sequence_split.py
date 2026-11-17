@@ -8,7 +8,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import as_given, assert_as_exact, widened
-from sequence_split_support import SPLIT_BATCH, SPLIT_ROWS, assert_decodes_as_whole, assert_split_as_whole
+from sequence_split_support import (
+    SPLIT_BATCH,
+    SPLIT_ROWS,
+    assert_as_on_one_device,
+    assert_decodes_as_whole,
+    assert_split_as_whole,
+)
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
@@ -78,39 +84,13 @@ LIGHTNING = LightningAttention(emb_features=WIDTH, num_heads=2, head_dim=8, slop
 """MiniMax's lightning layer at a small geometry, the second of a stack of four."""
 
 
-def assert_as_on_one_device(module, call: MixerCall, shape: tuple[int, int], seeds: int, site: str):
-    """Under a sequence axis of 4, `module` called with `call` over hidden states of `shape` `[B, S]` and
-    `WIDTH` wide computes as on one device: its output and every gradient check 1's against the same call
-    on one device, from float64."""
+def on_one_device(module, call: MixerCall, shape: tuple[int, int], seeds: int, site: str):
+    """`module`, initialized here, called with `call` over hidden states of `shape` `[B, S]` and `WIDTH`
+    wide on a sequence axis of 4 as on one device (`assert_as_on_one_device`)."""
     depth = None if call.depth is None else jnp.ones((1, shape[1]), jnp.int32)
     variables = jax.tree.map(np.asarray, module.init(jax.random.key(7), jnp.zeros((1, shape[1], WIDTH)),
                                                      MixerCall(depth=depth)))
-
-    def draw(seed):
-        rng = np.random.default_rng([0x7400, seed])
-        return tuple(rng.standard_normal((*shape, WIDTH)).astype(np.float32) for _ in range(2))
-
-    def pulled(model):
-        def run(params, hidden, cotangent):
-            out, pull = jax.vjp(lambda params, hidden: model.apply(params, hidden, call), params, hidden)
-            return out, *pull(cotangent)
-        return jax.jit(run)
-
-    whole, wide = pulled(module), pulled(module.clone(dtype=jnp.float64))
-    mesh = MeshSpec(sequence=4).build(jax.devices()[:4])
-
-    @as_given
-    def split(hidden, cotangent):
-        with jax.set_mesh(mesh):
-            return whole(variables, hidden, cotangent)
-
-    @as_given
-    def truth(hidden, cotangent):
-        with jax.enable_x64(new_val=True):
-            return wide(*widened((variables, hidden, cotangent)))
-
-    assert_as_exact(split, lambda hidden, cotangent: whole(variables, hidden, cotangent), draw, site,
-                    seeds=seeds, truth_fn=truth)
+    assert_as_on_one_device(module, variables, call, (*shape, WIDTH), seeds, site)
 
 
 @pytest.mark.mesh
@@ -127,7 +107,7 @@ def test_a_lightning_layer_split_over_the_sequence_runs_its_rows_as_whole_ones(r
                          segments=None if segments is None else jnp.asarray(
                              np.broadcast_to(segments, (SPLIT_BATCH, 32)), jnp.int32))
     call = MixerCall(AttentionMetadata(coordinates=tokens), depth=jnp.ones((SPLIT_BATCH, 32), jnp.int32))
-    assert_as_on_one_device(LIGHTNING, call, (SPLIT_BATCH, 32), SEEDS[row],
+    on_one_device(LIGHTNING, call, (SPLIT_BATCH, 32), SEEDS[row],
                             f"lightning split over the sequence, {row}")
 
 
@@ -143,7 +123,7 @@ FORK_SEEDS = 32
 def test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device(name):
     """Under a sequence axis of 4, a call over forks runs whole, each document continuing its parent's state
     across the axis (`linear.sequence_split`, row 7400), where `held_scan`'s forked path refused the axis
-    (`assert_as_on_one_device`)."""
+    (`on_one_device`)."""
     from dew.data.forked_rows import ForkedRows
     from dew.nn.inputs import AttentionMetadata
 
@@ -152,7 +132,7 @@ def test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device(na
     batch, length = forks.tokens.shape
     depth = jnp.ones((batch, length), jnp.int32) if name == "lightning" else None
     call = MixerCall(AttentionMetadata(coordinates=forks.coordinates), depth=depth)
-    assert_as_on_one_device(module, call, (batch, length), FORK_SEEDS,
+    on_one_device(module, call, (batch, length), FORK_SEEDS,
                             f"{name} over forks under a sequence axis")
 
 
