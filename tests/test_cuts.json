@@ -913,9 +913,6 @@
 "tests/test_block_sft.py::test_official_sft_loss_and_every_parameter_gradient",
 "tests/test_block_sft.py::test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target"
 ],
-"tests/test_block_visibility.py": [
-"tests/test_block_visibility.py::test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names"
-],
 "tests/test_cache_opening.py": [
 "tests/test_cache_opening.py::test_each_familys_cache_opens_as_its_decode_opens_and_writes_it[causal_transformer]"
 ],
@@ -1067,6 +1064,9 @@
 "tests/test_config_paths.py::test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran[diffusion]",
 "tests/test_config_paths.py::test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran[jepa]",
 "tests/test_config_paths.py::test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran[lm]"
+],
+"tests/test_contracts_attention.py": [
+"tests/test_contracts_attention.py::test_the_finished_merges_mean_holds_every_order[near the largest]"
 ],
 "tests/test_contracts_gemm.py": [
 "tests/test_contracts_gemm.py::test_a_gemm_prologue_holds_every_order[normal]",
@@ -1233,7 +1233,7 @@
 "tests/test_decision_recipe.py::test_a_decision_runs_rows_its_head_or_source_cannot_hold_are_refused",
 "tests/test_decision_recipe.py::test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh",
 "tests/test_decision_recipe.py::test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads",
-"tests/test_decision_recipe.py::test_a_mixture_saved_in_grains_schedule_resumes_as_it_was_built_not_by_its_changed_default"
+"tests/test_decision_recipe.py::test_every_head_that_reads_the_base_resumes_a_decision_run_held_as_shapes_to_its_end"
 ],
 "tests/test_decision_serving.py": [
 "tests/test_decision_serving.py::test_a_request_jev_would_refuse_gets_a_422_with_its_reason[{\"questions\": {\"department\": {\"type\": \"choice\", \"instructions\": \"Which department should handle this?\", \"criteria\": {\"billing\": \"invoices, refunds and charges\", \"technical\": \"bugs and outages\", \"sales\": \"pricing and upgrades\"}}, \"urgency\": {\"type\": \"score\", \"instructions\": \"How urgent is this?\", \"criteria\": [\"not urgent\", \"soon\", \"today\", \"blocking\"]}, \"churn\": {\"type\": \"noul\", \"instructions\": \"Does the customer threaten to leave?\"}}}]",
@@ -1434,8 +1434,8 @@
 "tests/test_deepseek_v41.py::test_a_paged_window_cache_decodes_what_the_compact_cache_decodes[int8]",
 "tests/test_deepseek_v41.py::test_a_prefilled_decode_cache_holds_no_payload_twice",
 "tests/test_deepseek_v41.py::test_a_quantization_aware_step_is_never_wrong",
-"tests/test_deepseek_v41.py::test_a_quantized_bundle_loaded_text_only_is_its_quantized_text_checkpoint",
-"tests/test_deepseek_v41.py::test_an_uncached_draft_reads_a_padded_context_at_its_real_positions",
+"tests/test_deepseek_v41.py::test_a_quantized_window_cache_decodes_what_dequantizing_in_the_own_basis_computes[int8]",
+"tests/test_deepseek_v41.py::test_a_sequence_shorter_than_its_candidate_sources_rate_computes_and_trains",
 "tests/test_deepseek_v41.py::test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens[coordinates]",
 "tests/test_deepseek_v41.py::test_consecutive_reindex_layers_publish_their_selections_under_scan_layers",
 "tests/test_deepseek_v41.py::test_left_padding_changes_no_row",
@@ -1564,9 +1564,6 @@
 "tests/test_dory.py::test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop_count[1]",
 "tests/test_dory.py::test_the_release_qualification_holds_dew_to_a_reference_kept_as_row_distances"
 ],
-"tests/test_dpo.py": [
-"tests/test_dpo.py::test_packed_pairs_train_as_each_pair_a_row[attention-shared]"
-],
 "tests/test_dreamer.py": [
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_a_step_without_its_state_owes_only_the_steps_after_it",
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[prefilled]",
@@ -1582,7 +1579,7 @@
 "tests/test_dreamer.py::test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole[transformer]",
 "tests/test_dreamer.py::test_dreamer_filled_batches_train_real_windows_alone[gru]",
 "tests/test_dreamer.py::test_dreamer_filled_batches_train_real_windows_alone[transformer]",
-"tests/test_dreamer.py::test_dreamer_split_step_preserves_draws_percentiles_and_mid_window_resume"
+"tests/test_dreamer.py::test_each_replayed_step_draws_its_posterior_from_its_own_key"
 ],
 "tests/test_dsa_kpool.py": [
 "tests/test_dsa_kpool.py::test_decode_cache_preserves_the_expanded_projection_storage_dtype"
@@ -1709,9 +1706,6 @@
 "tests/test_fresh_rate.py::test_a_shared_form_run_draws_its_layers_gates_alone_in_its_fresh_group",
 "tests/test_fresh_rate.py::test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one",
 "tests/test_fresh_rate.py::test_under_muon_a_fresh_groups_rate_reaches_its_vector_and_its_matrix"
-],
-"tests/test_gated_mlp.py": [
-"tests/test_gated_mlp.py::test_the_fused_mlp_holds_check_1_with_its_gradients[swiglu-1.5-sm90]"
 ],
 "tests/test_gemm_gather.py": [
 "tests/test_gemm_gather.py::test_a_gathered_kernel_gradient_lowers_for_cuda"
@@ -2279,8 +2273,8 @@
 "tests/test_mixed_step.py::test_a_mixed_call_through_one_template_work_list_is_on_par_interpreted[True-dense-window]"
 ],
 "tests/test_mixers.py": [
-"tests/test_mixers.py::test_a_decoder_of_no_compute_dtype_over_bfloat16_weights_decodes[mla-True]",
-"tests/test_mixers.py::test_a_packed_row_computes_what_its_documents_compute_alone[block_sparse_attention]",
+"tests/test_mixers.py::test_a_decoder_of_no_compute_dtype_over_bfloat16_weights_decodes[parallel-False]",
+"tests/test_mixers.py::test_a_layer_runs_no_mask_its_mixer_does_not_read[pairwise_mask]",
 "tests/test_mixers.py::test_a_packed_row_computes_what_its_documents_compute_alone[kpool_sparse_attention]",
 "tests/test_mixers.py::test_a_packed_row_computes_what_its_documents_compute_alone[lightning_attention]",
 "tests/test_mixers.py::test_a_packed_row_computes_what_its_documents_compute_alone[mamba]",
@@ -2455,7 +2449,7 @@
 "tests/test_mtp.py::test_the_term_adds_the_weighted_mean_depth_cross_entropy[plain_trunk]"
 ],
 "tests/test_multimodal_model.py": [
-"tests/test_multimodal_model.py::test_a_drawn_site_is_on_par_with_its_reference[llama4]",
+"tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[gemma3-gradient]",
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[llama4-gradient]",
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[llama4-inputs]",
 "tests/test_multimodal_model.py::test_a_float64_gemma4_audio_tower_computes_in_float64_throughout",
@@ -3091,6 +3085,9 @@
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[mimo-v2-sliding-tiny-native]",
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[mimo-v2-tiny-saved]"
 ],
+"tests/test_rl_expert_balance.py": [
+"tests/test_rl_expert_balance.py::test_a_policy_runs_balance_flag_builds_a_policy_that_balances_its_routers[dpo]"
+],
 "tests/test_router_statistics.py": [
 "tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains",
 "tests/test_router_statistics.py::test_all_padding_has_no_router_support_or_bias_effect[mtp-attention_mask-False]",
@@ -3150,6 +3147,7 @@
 "tests/test_samplers.py::test_solver_matches_diffusers_latents_and_gradient[deis.3_short]"
 ],
 "tests/test_saved_models.py": [
+"tests/test_saved_models.py::test_a_dreamer_run_exports_its_world_model_and_agent_whole",
 "tests/test_saved_models.py::test_a_jepa_run_exports_and_loads_as_its_encoder"
 ],
 "tests/test_saved_runs.py": [
