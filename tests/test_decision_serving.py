@@ -464,3 +464,51 @@ def test_a_scoring_server_reports_the_share_of_each_pass_shapes_tokens_its_rows_
     assert 0 < metrics["served/real_token_share"] < 1
     assert {name for name in metrics if name.endswith("/passes")} == {
         f"served/passes/{shape.rows}x{shape.length}/passes" for shape in shapes}
+
+
+def test_a_pass_that_overruns_a_window_count_runs_the_rest_in_a_pass_of_its_own(decide):
+    """A server's pass whose rows take one window past a declared count (`Decide.pass_shapes`: 1, 8, 64 and
+    the most, a length's) runs the rows in that count's windows and leaves the rest to a pass of its own
+    shape (`PassPlan.taken`), so it computes fewer tokens than the next count's whole pass would: a
+    server's last pass of 512 requests held 29% of its 32 windows' tokens, a fifth of every pass's tokens
+    padding (row 3330). Every request is answered as a server of it alone answers it, to its responses'
+    rounding."""
+    import itertools
+
+    from test_decision_batches import CASES
+
+    laid, _ = decide.scoring()
+    plan, bodies = decide.planned(), []
+    # Requests until their rows take one window past a declared count of their length.
+    for body in itertools.islice(itertools.cycle(CASES.values()), 4096):
+        assert all(plan.add(row.encoded) for row in laid.admit(body).rows)
+        bodies.append(body)
+        whole = plan.shape()
+        counts = {shape.rows for shape in decide.pass_shapes if shape.length == whole.length}
+        if max(plan.windows()) in counts - {1} and max(plan.windows()) + 1 < whole.rows:
+            break
+    task, variables = decide.scoring()
+    server = ScoringServer.from_task(task, variables)
+    futures = [server.submit(body) for body in bodies]
+    server.run()
+    computed = sum(passes.windows * shape.length for shape, passes in task.passes.shapes.items())
+    assert sum(passes.passes for passes in task.passes.shapes.values()) > 1
+    assert computed < whole.rows * whole.length
+
+    def close(served, alone) -> bool:
+        match served, alone:
+            case dict(), dict():
+                return served.keys() == alone.keys() and all(close(served[key], alone[key]) for key in served)
+            case float(), float():
+                return abs(served - alone) <= 2e-3
+            case _:
+                return served == alone
+
+    lone = {}
+    for body in CASES.values():
+        alone = ScoringServer.from_task(*decide.scoring())
+        answered = alone.submit(body)
+        alone.run()
+        lone[id(body)] = answered.result()["answers"]
+    assert all(close(future.result()["answers"], lone[id(body)])
+               for body, future in zip(bodies, futures, strict=True))

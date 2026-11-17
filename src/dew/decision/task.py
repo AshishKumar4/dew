@@ -1550,6 +1550,9 @@ class PassPlan:
             return whole.rows * whole.length, everything
         windows = self.placing[self.alive[0]].windows
         least, kept = whole.rows * whole.length, everything
+        if max(windows) + 1 == whole.rows:
+            # Every window of its count holds a row: a split runs as many windows or more.
+            return least, kept
         for shape in decide.pass_shapes:
             if shape.length != whole.length or shape.rows > max(windows):
                 continue
