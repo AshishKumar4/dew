@@ -333,12 +333,6 @@ class ContextReader:
     def dependencies(self) -> Mapping[str, object]:
         return self.encoder.dependencies()
 
-    def __eq__(self, other: "ContextReader | None") -> bool:
-        return isinstance(other, ContextReader) and self.dependencies() == other.dependencies()
-
-    def __hash__(self) -> int:
-        return hash(json.dumps(self.dependencies(), sort_keys=True, default=str))
-
 
 def context_tokens(reader: "Tokenizer | ContextReader", context: JSON | None) -> tuple[np.ndarray, int]:
     """A context's tokens as a row reads them, and how many it is whole: its text's (`render`) by the
