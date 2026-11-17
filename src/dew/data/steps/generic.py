@@ -85,7 +85,7 @@ class Coordinated(grain.MapTransform):
         object.__setattr__(self, "_laid_out", True)
 
     @classmethod
-    def laid(cls, fields: tuple[str, ...], max_segments: int | None, laid_out: bool) -> "Coordinated":
+    def laid(cls, fields: tuple[str, ...], max_segments: int | None, laid_out: bool) -> Coordinated:
         """The step over `fields`' windows, which the read lays out where `laid_out`, else states their
         bound alone, its objective laying them out itself (`dew.data.pipeline.LaysOutWindows`)."""
         made = cls(fields, max_segments)
