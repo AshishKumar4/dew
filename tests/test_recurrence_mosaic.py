@@ -2265,15 +2265,15 @@ def _dealt(units: list, tasks: int, task: int) -> list:
     return [each for name in names for each in parts[int(name)]]
 
 
-IDENTITY_TASKS = {'sm90': 50, 'sm100': 45, 'sm80': 17, 'sm86': 17, 'sm89': 17, 'sm120': 5}
-"""The tasks a target's identity units are dealt among (`_dealt`), a function of the code alone, so a task's
-units are its id's at one revision whatever a run's timings (row 7254: a count from the durations record moved
-each id's units, sm100's 44 to 52, where a cached task and a rerun one could cover different units). Sized as
-the kernels the target's units lower (`_identity_units`' last field, summed: sm90 1237, sm100 1103, sm80 409,
-sm120 112 at 4c2215bfa49, identity_groups_probe) at about 2.4 s a kernel (sm90's recorded 2953 s over its
-1237) against 60 s an item, half the group target; a target absent from it takes the largest. Kernels a
-target's units lower that move this far past it move its items' seconds, which the CI plan's past-the-target
-check reports: resize it then."""
+IDENTITY_TASKS = {'sm90': 50, 'sm100': 52, 'sm80': 3, 'sm86': 2, 'sm89': 2, 'sm120': 1}
+"""The tasks a target's identity units are dealt among (`_dealt`), only the shards the work is split into: every
+unit is dealt to some task whatever the count, and the count is a function of the code alone, so a task's units
+are its id's at one revision whatever a run's timings (row 7254: a count from the durations record moved each
+id's units, sm100's 44 to 52, where a cached task and a rerun one could cover different units). Sized as the
+target's identity seconds in the record main's CI folded at 91be41158 (sm90 2953 s, sm100 3094, sm80 129, sm86
+90, sm89 80, sm120 35) over 60 s a task, half the group target; a target absent from it takes the largest.
+The units a target lowers that move far from these move its tasks' seconds, which the CI plan's past-the-
+target check reports: resize it then from the record."""
 
 
 def identity_tasks(target: str) -> int:
