@@ -22,11 +22,6 @@ it does not on (`map_judge.ask_later`): the plan marks a check-1 site's second-s
 armada runs only where the judge's first judgement asks for them, and the judge then judges again over all
 its map tasks."""
 
-ASKED = "DEW_CHECK1_ASKED"
-"""A GPU lane's file of the asks (LATER's lines) of the run a follow-up follows, its sites each once at its
-widest `to` (dew-ops' follow-up; ci.py gpu-lane --asked): its prepare draws each asked site's every stage, and
-its run judges the flows holding an asked site over every stage."""
-
 CENSUS = "DEW_GATE_CENSUS"
 """The environment variable whose being set runs check 1's arms with YNNPACK's fusions on (no WITHOUT_YNN,
 `reference_error.switched_off`), as CPU users compile them: the census (the plan's `--census`, the land

@@ -24,6 +24,7 @@ from dew.decision.layout import (
     OPTIONS,
     QUESTION_FIELDS,
     Bounds,
+    ContextReader,
     Encoded,
     Layout,
     QuestionField,
@@ -62,8 +63,10 @@ class Encoding(ReadsEarlierLayouts):
     fitted the example with (`Fit`), which the row lays out again.
 
     With a `context_length`, a row also carries its example's context as
-    `context`, the tokens of its text (`render`), a context longer than
-    `context_length` refused (`Fit`), and none for an example without one.
+    `context`, the tokens of its text (`render`, or a configured context
+    encoder's, `context_encoder`), a context longer than its room cut to its
+    first tokens and counted (`with_context`), and none for an example without
+    one.
     """
 
     layout: Layout
@@ -78,6 +81,14 @@ class Encoding(ReadsEarlierLayouts):
     consistency term's rows; every row then carries them, an example of none with none in each."""
     none_of_the_above_options: int = field(default=0, repr=False, metadata={ADDED: True})
     """The fewest options a choice holds to draw a "none of the above" (`draws_none`); 0, every choice."""
+    context_encoder: ContextReader | None = field(default=None, repr=False, metadata={ADDED: True})
+    """The encoder a run configures for its context (`DecisionModel.context`), whose tokenization a row's
+    context is read by (`context_reader`); None, the decision's tokenizer."""
+
+    @property
+    def context_reader(self) -> Tokenizer | ContextReader:
+        """What a row's context is tokenized by (`dew.decision.layout.context_tokens`)."""
+        return self.tokenizer if self.context_encoder is None else self.context_encoder
 
     def fewest_tokens(self, row: "FittedRow") -> int:
         """The fewest tokens a draw of this encoding lays `row` out to: a drawn order keeps a row's length,
@@ -93,7 +104,7 @@ class Encoding(ReadsEarlierLayouts):
 
         def laid(drop: bool, names: Collection[str] | None = None, held: "FittedRow" = row) -> int:
             return _with_none(self.layout, self.tokenizer, self.specials, held, fewest, drop, names,
-                              self.context_length)[0]
+                              self.context_length, self.context_reader)[0]
 
         if len(row.names) == 1:
             return min(row.length, laid(drop=False), laid(drop=True))
@@ -124,8 +135,8 @@ class Encoding(ReadsEarlierLayouts):
         """`rows` with the context their backbone reads (`with_context`): the example's own, after a schema
         read as the row's context where the row reads one there; none where the backbone reads none, which
         leaves the example's context unread."""
-        return with_context(rows, self.tokenizer, None if self.context_length is None else example.context,
-                            self.context_length)
+        context = None if self.context_length is None else example.context
+        return with_context(rows, self.context_reader, context, self.context_length)
 
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None,
                  tokens: np.ndarray | None = None, group_of: "GroupOf | None" = None,
@@ -376,9 +387,8 @@ class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
     head: Head
     context_length: int | None = None
     """The most context tokens the backbone's cross-attention reads, or None where it reads none: an
-    example whose context is longer refuses the run (ValueError) where the data reads it, which the
-    data plan's compile meets before training for data read into memory and a streamed or indexed
-    read meets at that record, so no example is silently cut or dropped."""
+    example whose context is longer keeps its first tokens, the cut counted with its cuts
+    (`with_context`, `data/cut/<corpus>/context`), so none is cut silently."""
     grouped: bool = False
     """Whether the objective reads consistency groups, whose members may stand in rows of their own: an
     example's questions under a layout of a question a row, or grouped examples' (`GroupedExamples`),
@@ -397,7 +407,15 @@ class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
     (`options_alike` in its cut record), where training leaves it out (`Layout.refusal`)."""
     none_of_the_above_options: int = field(default=0, repr=False, metadata={ADDED: True})
     """The fewest options a choice holds to draw a "none of the above" (`Encoding`, `draws_none`)."""
+    context_encoder: ContextReader | None = field(default=None, repr=False, metadata={ADDED: True})
+    """The encoder a run configures for its context, whose tokenization a row's context is read by
+    (`Encoding.context_encoder`); None, the decision's tokenizer."""
     rejects = True
+
+    @property
+    def context_reader(self) -> Tokenizer | ContextReader:
+        """What a row's context is tokenized by (`dew.decision.layout.context_tokens`)."""
+        return self.tokenizer if self.context_encoder is None else self.context_encoder
 
     def map(self, element: Batch) -> Batch | Rejected:
         fitted = self._fitted(element)
@@ -466,9 +484,10 @@ class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
         unread: dict[str, int] = {}
         if self.context_length is not None:
             # Its context as its encoding lays it out, a context cut to its room counted with its cuts.
-            laid = with_context(laid, self.tokenizer, example.context, self.context_length)
+            laid = with_context(laid, self.context_reader, example.context, self.context_length)
         contexts = [len(row.context or ()) for row in laid]
-        lost = 0 if self.context_length is not None else len(context_tokens(self.tokenizer, example.context))
+        _, whole = context_tokens(self.context_reader, example.context)
+        lost = 0 if self.context_length is not None else whole
         if lost:
             # A backbone that reads no context leaves the example's unread, counted as a cut of it.
             unread["context"] = lost
@@ -506,7 +525,7 @@ class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
             return refused
         if self.context_length is not None:
             # Its context as the encoding lays it out, a schema the option lengthens cutting more of it.
-            laid = with_context(laid, self.tokenizer, example.context, self.context_length)
+            laid = with_context(laid, self.context_reader, example.context, self.context_length)
         return drawn_refusal(self.layout, laid[0], self.context_length, row.cuts)
 
     def _apart(self, grouped: GroupedExamples) -> Batch | Rejected:
@@ -550,7 +569,8 @@ class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
             return row.length, row.context
         sizes = [(row.length, row.context),
                  *(_with_none(self.layout, self.tokenizer, self.specials, row, self.none_of_the_above_options,
-                              drop, context_length=self.context_length) for drop in (False, True))]
+                              drop, context_length=self.context_length, reader=self.context_reader)
+                   for drop in (False, True))]
         return max(tokens for tokens, _ in sizes), max(context for _, context in sizes)
 
     def _unit(self, grouped: GroupedExamples) -> Batch | Rejected:
@@ -593,13 +613,14 @@ class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
 
 def _with_none(layout: Layout, tokenizer: Tokenizer, specials: Specials, row: FittedRow, fewest: int,
                drop: bool, names: Collection[str] | None = None,
-               context_length: int | None = None) -> tuple[int, int]:
+               context_length: int | None = None, reader: Tokenizer | ContextReader | None = None,
+               ) -> tuple[int, int]:
     """The tokens and context tokens `row` lays out to with a "none of the above" (`Encoding`) beside each
     of its answered choices' options that draws one (`draws_none`, `fewest`), or in place of its right
     option where `drop`: each such question of `names` where given, of the row's every one otherwise. A
     schema read as the row's context lengthens as its row does, the example's context after it in the room
-    the schema leaves under `context_length` (`with_context`); an example's context alone does not
-    change."""
+    the schema leaves under `context_length` (`with_context`, read by `reader`, the decision's tokenizer
+    where None); an example's context alone does not change."""
     example = row.example
     labels = example.labels()
     asked = {name: (_none_of_the_above(question, labels[name], drop=drop)[0]
@@ -609,7 +630,7 @@ def _with_none(layout: Layout, tokenizer: Tokenizer, specials: Specials, row: Fi
     laid = layout.rows(tokenizer, specials, example.state, asked, tokens=row.tokens.tolist(),
                        request=example.questions)
     if context_length is not None and all(len(each.context or ()) <= context_length for each in laid):
-        laid = with_context(laid, tokenizer, example.context, context_length)
+        laid = with_context(laid, tokenizer if reader is None else reader, example.context, context_length)
     schemas = sum(len(each.context or ()) for each in laid if each.spans_in_context)
     return sum(len(each.tokens) for each in laid), schemas or row.context
 
@@ -723,6 +744,8 @@ class ConfigureLayout(ReadsEarlierLayouts):
     grouped: bool = False
     none_of_the_above_options: int = field(default=0, repr=False, metadata={ADDED: True})
     """The fewest options a choice holds to draw a "none of the above" (`Encoding`)."""
+    context_encoder: ContextReader | None = field(default=None, repr=False, metadata={ADDED: True})
+    """The encoder a run configures for its context (`Encoding.context_encoder`)."""
 
     def __call__(self, metadata: Mapping[str, object]) -> LayoutRows | EvaluateRows:
         width = option_width(record(metadata["slots"], "decision slots"), self.none_of_the_above,
@@ -731,7 +754,8 @@ class ConfigureLayout(ReadsEarlierLayouts):
             raise ValueError("decision source slot maxima must be positive")
         encoding = Encoding(self.layout, self.tokenizer, self.specials, width, self.shuffle,
                             self.none_of_the_above, self.context_length, self.grouped,
-                            none_of_the_above_options=self.none_of_the_above_options)
+                            none_of_the_above_options=self.none_of_the_above_options,
+                            context_encoder=self.context_encoder)
         return LayoutRows(encoding) if self.train else EvaluateRows(encoding)
 
 

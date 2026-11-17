@@ -321,6 +321,13 @@ def device_memory(device, arguments: int = 0) -> Mapping[str, int]:
     memory = COMPILE_ONLY_MEMORY.get(device)
     if memory is None:
         return (device.memory_stats() or {}) if device in jax.local_devices() else {}
+    return fresh_pool(memory, arguments)
+
+
+def fresh_pool(memory: int, arguments: int = 0) -> dict[str, int]:
+    """What XLA's BFC pool states on a GPU of `memory` bytes, fresh at its allocator's limit
+    (`allocator_limit`) with `arguments` resident: the one stated memory of a GPU not attached
+    (`device_memory`, `dew.training.memory.needed`)."""
     limit = allocator_limit(memory)
     return {"bytes_limit": limit, "bytes_in_use": arguments, "pool_bytes": limit,
             "largest_free_block_bytes": limit - arguments}

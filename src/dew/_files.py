@@ -31,6 +31,18 @@ def is_uri(path: str) -> bool:
     return "://" in path
 
 
+def inside(path: str) -> bool:
+    """Whether `path` names a place within the directory it is read against: relative, in forward slashes,
+    no part `.`, `..` or empty (a trailing slash, a directory's own name, aside) and no drive. The one test
+    of it every reader of outside input applies (a saved run's tokenizer files, `dew.data.text.
+    confined_files`; a DDUF archive's entries; a source's subfolder; a sandboxed program's files), so a
+    path one admits none refuses."""
+    parts = path.split("/")
+    if parts[-1:] == [""] and len(parts) > 1:
+        parts = parts[:-1]
+    return not ("\\" in path or ":" in parts[0] or any(part in ("", ".", "..") for part in parts))
+
+
 def stat_identity(path: str | os.PathLike) -> tuple[str, int, int]:
     """A file's resolved path, size and modification time in ns, which a
     conversion cache keys it by in place of a hash of its bytes.
