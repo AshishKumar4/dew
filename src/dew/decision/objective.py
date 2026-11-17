@@ -19,7 +19,7 @@ from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
 from dew.decision.head import DecisionHead, Head
 from dew.decision.inputs import OPTION_TILE, DecisionInputs
-from dew.decision.layout import Bounds, Layout, QuestionLayout, Specials, default_layout
+from dew.decision.layout import Bounds, Layout, Specials, default_layout, per_question
 from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Score
 from dew.decision.rows import (
@@ -106,8 +106,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     `LMObjective` accepts one), or a whole `Decide` task, such as Laya's released
     checkpoint, which brings its head and layout with it. Unless `layout` says
     otherwise, a head that reads several questions a row reads them in one
-    row (`JointLayout`), and one that reads one question a row reads Laya's
-    `MarkerLayout` over a bidirectional backbone and the `StateFirstLayout`
+    row (`SegmentLayout.joint_row`), and one that reads one question a row reads Laya's
+    `SegmentLayout.marker_row` over a bidirectional backbone and the `SegmentLayout.state_first_row`
     over a causal one (`default_layout`). `tokenizer` and `specials` default
     to the loaded model's.
 
@@ -249,9 +249,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     def _context_lengths(self, batch: Batch) -> np.ndarray | None:
         """Each window row's context length where the backbone reads the context in a pass of its own,
-        as it reads a schema in context (`spans_in_context`) or encodes every context
-        (`DecisionModel.context_encoder`); None where it reads none."""
-        passes = self.spans_in_context or self.model.context_encoder == "backbone"
+        as the stream its context is says (`DecisionModel.own_pass`: a schema in context always, a context
+        where its stream's encoder is the backbone's pass); None where it reads none."""
+        passes = self.model.own_pass(self.spans_in_context)
         if not passes or "context_lengths" not in batch:
             return None
         return self._row_contexts(batch)
@@ -397,7 +397,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         if head is None:
             width, dtype = DecisionModel.head_size(module)
             head = DecisionHead(width, dtype=dtype)
-        if isinstance(layout, QuestionLayout) and layout.labels is not None:
+        if per_question(layout) and layout.labels is not None:
             # A head that reads labels and was drawn with none reads the layout's, by this tokenizer, the
             # one its rows are laid out by, which names them where the layout names none.
             head, labels = head.labelled(layout.labels, tokenizer)
@@ -407,14 +407,14 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             if not isinstance(module, TokenModel):
                 raise ValueError(
                     f"a {type(module).__name__} does not say whether it reads its tokens in "
-                    "order; pass layout= (StateFirstLayout if it does, MarkerLayout if not)"
+                    "order; pass layout= (SegmentLayout.state_first_row if it does, marker_row if not)"
                 )
             layout = default_layout(module.causal, head.one_question)
         # The layout as stated, and as a request's questions train over one copy of its state where the
         # backbone and head read each question as its own row (`shared_for`), in a training step's form:
         # the two a run reads its rows by, by its data plan's version (`layout`).
         self.stated = layout
-        self._shared = (shared_for(layout, module, head, train=True) if isinstance(layout, QuestionLayout)
+        self._shared = (shared_for(layout, module, head, train=True) if per_question(layout)
                         else layout)
         self.tokenizer = tokenizer
         self.specials = specials or Specials.of(tokenizer)
@@ -646,7 +646,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         if weights is None:
             return None
         weights.of_model(self.model.backbone)
-        encoded = self.spans_in_context or self.model.context_encoder == "backbone"
+        encoded = self.model.own_pass(self.spans_in_context)
         if self.context_length is not None and encoded:
             raise ValueError("pass_weights scores each pass's exit as the backbone run that many times "
                              "would, and a row whose context the backbone encodes in its own passes reads "
@@ -861,6 +861,10 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         self.options = option_width(record(widths["slots"], "decision slots"), self.none_of_the_above,
                                     self.none_of_the_above_options)
 
+    def run_tokenizer(self) -> Tokenizer:
+        """The tokenizer the decision rows are laid out with, which a checkpoint holds in the run."""
+        return self.tokenizer
+
     def task_settings(self) -> DecideSettings:
         """What a saved run rebuilds its task from beside the backbone.
 
@@ -869,7 +873,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         reloads that source's processor files and derives its media geometry
         from the source config; the decision record owns neither format.
         """
-        from dew.inference.tasks import recorded_tokenizer
+        from dew.inference.tasks import recorded_files, recorded_tokenizer
 
         return DecideSettings(
             self.model.head.record(),
@@ -879,7 +883,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             None if self.image_processor is None or self.image_processor.directory is None
             else self.image_processor.source,
             self.model.context_encoder,
-            self.options)
+            self.options,
+            recorded_files(RunProcessor(self.tokenizer)))
 
     def recorded_model(self) -> nn.Module:
         """The backbone; the head is a task setting of its own."""

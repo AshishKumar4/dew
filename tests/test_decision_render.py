@@ -1,8 +1,8 @@
 """One renderer of decision rows (`dew.decision.renderer`, docs/design/decision-render.md): a row's
 chunks encoded piece by piece or whole, each mark's tokens the ones that overlap its characters, a
 token across two marks both's; and a published slot release's prompt as a layout value
-(`QuestionLayout(segments=...)`), its rows the release's own text and ids (qev/prompt.py at OneJev
-81ce62f, rendered as its engine renders them), its options' spans the lines its runtime pools, its
+(`SegmentLayout.state_first_row(segments=...)`), its rows the release's own text and ids (qev/prompt.py at
+OneJev 81ce62f, rendered as its engine renders them), its options' spans the lines its runtime pools, its
 answer at its last token, and its state cut only where its segments say."""
 
 import dataclasses
@@ -15,7 +15,7 @@ import pytest
 from dew._records import JSON
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import Choice, Noul, Question, Score
-from dew.decision.layout import LETTERS, AnswerCue, Framing, Labels, QuestionLayout, Specials, State, Text
+from dew.decision.layout import LETTERS, AnswerCue, Framing, Labels, SegmentLayout, Specials, State, Text
 from dew.decision.renderer import Chunk, render
 from dew.decision.slot_source import SLOT_LABELS, SLOT_SYSTEM, SlotSource
 
@@ -166,7 +166,8 @@ def test_more_options_than_letters_ask_for_one_label_their_structures_indented(q
     the layout's own label; a structured description and a structured state are indented JSON."""
     labels = Labels(variants=("{}",), names=(*LETTERS, "a", "b", "c", "d"))
     layout = release()
-    many = QuestionLayout(max_len=layout.max_len, labels=labels, unit="whole", framing=layout.framing,
+    many = SegmentLayout.state_first_row(max_len=layout.max_len, labels=labels, unit="whole",
+                                         framing=layout.framing,
                           segments=layout.segments)
     queues = Choice("Which queue?", {f"queue{index:02d}": ({"team": index} if index == 0 else None)
                                      for index in range(30)})
@@ -209,7 +210,8 @@ def test_the_two_units_agree_where_the_vocabulary_never_merges():
     """Over bytes, which never merge, a row encoded whole is the row encoded piece by piece: tokens,
     spans and answer."""
     whole = release(max_len=1024)
-    pieces = QuestionLayout(max_len=1024, labels=whole.labels, segments=whole.segments, unit="pieces",
+    pieces = SegmentLayout.state_first_row(max_len=1024, labels=whole.labels, segments=whole.segments,
+                                           unit="pieces",
                             framing=whole.framing)
     one, other = (layout.rows(ByteTokenizer(), SPECIALS, STATE, {"team": TEAM})[0]
                   for layout in (whole, pieces))
@@ -230,11 +232,12 @@ def test_a_token_across_two_marks_belongs_to_both():
     assert apart.marks == {"one": (0, 1), "two": (1, 2)}
 
 
-def cutting(keep: Literal["start", "end"], unit: Literal["pieces", "whole"], room: int) -> QuestionLayout:
+def cutting(keep: Literal["start", "end"], unit: Literal["pieces", "whole"], room: int) -> SegmentLayout:
     layout = release()
     segments = tuple(State(render="state", keep=keep) if isinstance(segment, State) else segment
                      for segment in layout.segments or ())
-    return QuestionLayout(max_len=room, labels=layout.labels, unit=unit, framing=layout.framing,
+    return SegmentLayout.state_first_row(max_len=room, labels=layout.labels, unit=unit,
+                                         framing=layout.framing,
                           segments=segments)
 
 
@@ -276,7 +279,7 @@ def test_a_framing_carries_its_marks_through_a_trimming_template_and_refuses_one
     trimming = ("{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content | trim }}"
                 "<|im_end|>\n{% endfor %}<|im_start|>assistant\n")
     layout = release()
-    spaced = QuestionLayout(max_len=layout.max_len, labels=layout.labels, unit="whole",
+    spaced = SegmentLayout.state_first_row(max_len=layout.max_len, labels=layout.labels, unit="whole",
                             framing=Framing(system=SLOT_SYSTEM, prefill="", thinking=None,
                                             chat_template=trimming),
                             segments=(Text("  "), *(layout.segments or ())))
@@ -287,7 +290,7 @@ def test_a_framing_carries_its_marks_through_a_trimming_template_and_refuses_one
     assert list(laid.options) == [overlapping(qwen, prompt, line) for line in lines_of(prompt, 3)]
     question_first = tuple(segment for segment in layout.segments or ()
                            if not isinstance(segment, (State, Text)))
-    trailing = QuestionLayout(max_len=layout.max_len, labels=layout.labels, unit="whole",
+    trailing = SegmentLayout.state_first_row(max_len=layout.max_len, labels=layout.labels, unit="whole",
                               framing=spaced.framing,
                               segments=(question_first[0], Text("\n\nOptions:\n"), question_first[1],
                                         Text("\n\n"), question_first[2], Text("\n"), State(render="state")))
@@ -297,7 +300,7 @@ def test_a_framing_carries_its_marks_through_a_trimming_template_and_refuses_one
     assert list(blank.questions[0].options) == [overlapping(qwen, shown, line) for line in lines_of(shown, 3)]
     verbatim = trimming.replace("message.content | trim", "message.content")
     options_last = tuple(segment for segment in layout.segments or () if not isinstance(segment, AnswerCue))
-    padded = QuestionLayout(max_len=layout.max_len, labels=layout.labels, unit="whole",
+    padded = SegmentLayout.state_first_row(max_len=layout.max_len, labels=layout.labels, unit="whole",
                             framing=Framing(system=SLOT_SYSTEM, prefill="", thinking=None,
                                             chat_template=verbatim),
                             segments=(Text("   "), *options_last[:-1]))
@@ -308,7 +311,8 @@ def test_a_framing_carries_its_marks_through_a_trimming_template_and_refuses_one
     assert row.questions[0].options[-1] == expected
     rewriting = trimming.replace("message.content | trim", "message.content | upper")
     with pytest.raises(ValueError):
-        QuestionLayout(max_len=layout.max_len, labels=layout.labels, unit="whole", segments=layout.segments,
+        SegmentLayout.state_first_row(max_len=layout.max_len, labels=layout.labels, unit="whole",
+                                      segments=layout.segments,
                        framing=Framing(system=SLOT_SYSTEM, prefill="", thinking=None,
                                        chat_template=rewriting)).rows(qwen, SPECIALS, STATE, {"team": TEAM})
 
@@ -329,7 +333,7 @@ def test_every_piece_is_encoded_an_empty_one_too():
     from dew.decision.layout import context_tokens
 
     assert render([Chunk(""), Chunk(ids=()), Chunk("a")], Marked(), "pieces").tokens == (7, 7, 97)
-    assert list(context_tokens(Marked(), "", 8)) == [7]
+    assert list(context_tokens(Marked(), "")) == [7]
 
 
 def test_the_renderer_is_its_own_module_beside_the_value_renderer():
@@ -359,7 +363,7 @@ def test_a_whole_row_over_a_vocabulary_without_offsets_is_refused():
 
 def test_a_whole_copy_over_its_cap_lays_out_whole():
     """A copy kept whole is never cut, its cap aside: a row it fits lays it out whole (row 1616)."""
-    layout = QuestionLayout(max_len=1 << 12, labels=Labels(variants=("{}",)), unit="whole",
+    layout = SegmentLayout.state_first_row(max_len=1 << 12, labels=Labels(variants=("{}",)), unit="whole",
                             segments=(Text("S:"), State(render="state", keep="all", max_tokens=1),
                                       Text("\n"), *(release().segments or ())[-5:]))
     [row] = layout.rows(ByteTokenizer(), SPECIALS, "whole", {"team": TEAM})
@@ -378,7 +382,8 @@ def test_a_question_row_holds_the_state_twice_each_copy_its_own_render_and_budge
                 State(render="compact", keep="end", max_tokens=9), Text("</tail>\n\n"),
                 *(segment for segment in layout.segments or () if not isinstance(segment, (State, Text))))
     segments = (*segments[:5], segments[5], Text("\n\nOptions:\n"), segments[6], Text("\n\n"), segments[7])
-    twice = QuestionLayout(max_len=1 << 16, labels=layout.labels, unit=unit, framing=layout.framing,
+    twice = SegmentLayout.state_first_row(max_len=1 << 16, labels=layout.labels, unit=unit,
+                                          framing=layout.framing,
                            segments=segments)
     [row] = twice.rows(qwen, SPECIALS, state, {"team": TEAM})
     text = qwen.decode(list(row.tokens))
@@ -394,7 +399,7 @@ def test_a_question_row_holds_the_state_twice_each_copy_its_own_render_and_budge
 def test_a_capped_copy_keeps_whole_characters_within_its_cap(keep):
     """Encoded whole, a copy cut inside a character of several tokens keeps the character whole or not
     at all, its own encoding within its cap: a cap of one byte keeps no two-byte character."""
-    layout = QuestionLayout(max_len=1 << 12, labels=Labels(variants=("{}",)), unit="whole",
+    layout = SegmentLayout.state_first_row(max_len=1 << 12, labels=Labels(variants=("{}",)), unit="whole",
                             segments=(Text("S:"), State(render="state", keep=keep, max_tokens=1),
                                       Text("\n"), *(release().segments or ())[-5:]))
     [row] = layout.rows(ByteTokenizer(), SPECIALS, "éé", {"team": TEAM})
@@ -407,7 +412,8 @@ def test_a_cut_takes_the_longest_state_a_merge_lets_fit():
     token merges with the text before it, keeping it costs the row no token, and the cut keeps it."""
     laya = HFTokenizer(str(LAYA), local_files_only=True)
     segments = (Text("n"), State(render="state"), Text("\n"), *(release().segments or ())[-5:])
-    empty = QuestionLayout(max_len=1 << 12, labels=Labels(variants=("{}",)), unit="whole", segments=segments)
+    empty = SegmentLayout.state_first_row(max_len=1 << 12, labels=Labels(variants=("{}",)), unit="whole",
+                                          segments=segments)
     [bare] = empty.rows(laya, SPECIALS, "", {"team": TEAM})
     tight = dataclasses.replace(empty, max_len=len(bare.tokens))
     [row] = tight.rows(laya, SPECIALS, "ta", {"team": TEAM})

@@ -17,6 +17,7 @@ import dataclasses
 import functools
 import hashlib
 import json
+import re
 import tempfile
 import threading
 import unicodedata
@@ -26,8 +27,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_chec
 
 import grain.python as grain
 import numpy as np
+from etils import epath
 
-from dew._files import published
+from dew._files import staged
 from dew.data.pipeline import TOKEN_FIELDS, Rejected
 from dew.data.tokens import chunk_table
 
@@ -69,6 +71,16 @@ class PinnedTokenizer:
     snapshot: Mapping[str, object]
     directory: str
 
+    @property
+    def files(self) -> Mapping[str, str]:
+        """Each file's hash, by its path in the directory: what the tokenizer is, wherever it stands, so two
+        copies at different paths or under different names are one tokenizer, and a vocabulary changed in
+        any file is another."""
+        files = self.snapshot["files"]
+        if not isinstance(files, Mapping):
+            raise TypeError(f"a pinned tokenizer's files are a mapping, not {files!r}")
+        return {str(path): str(digest) for path, digest in files.items()}
+
     def transformers(self, *, cls: str | None = None) -> PreTrainedTokenizerBase:
         """The transformers tokenizer of these files, whose chat template
         renders conversations, as transformers' class `cls` where a reader
@@ -76,8 +88,14 @@ class PinnedTokenizer:
         where it is, so the load reaches no hub, and it is the one load every
         reader of these files shares (`load_tokenizer`): keyed by their hashes,
         so a directory whose files changed since a load loads again."""
-        files = json.dumps(self.snapshot["files"], sort_keys=True).encode()
-        return load_tokenizer(self.directory, contents=hashlib.sha256(files).hexdigest(), cls=cls)
+        return load_tokenizer(self.directory, contents=files_digest(self.files), cls=cls)
+
+
+def files_digest(files: Mapping[str, str]) -> str:
+    """One digest of a tokenizer's files by their hashes (`PinnedTokenizer.files`): what names the files
+    wherever Dew keeps a copy, in a run (`held_place`) or in this host's cache (`cached_tokenizer`), and
+    the load every reader of them shares (`PinnedTokenizer.transformers`)."""
+    return hashlib.sha256(json.dumps(dict(files), sort_keys=True).encode()).hexdigest()[:24]
 
 
 def pin_tokenizer(name: str, *, local_files_only: bool = False) -> PinnedTokenizer:
@@ -85,6 +103,25 @@ def pin_tokenizer(name: str, *, local_files_only: bool = False) -> PinnedTokeniz
     if name == "byte":
         raise ValueError("'byte' names Dew's byte vocabulary (ByteTokenizer), which has no tokenizer files")
     return PinnedTokenizer(*pin_files(name, _TOKENIZER_FILES, local_files_only=local_files_only))
+
+
+HUB_SNAPSHOT = re.compile(
+    r"(?:^|[/\\])models--(?P<repo>[^/\\]+)[/\\]snapshots[/\\](?P<commit>[0-9a-f]{40})[/\\]?$")
+"""A Hugging Face hub cache's snapshot directory, `.../models--<org>--<name>/snapshots/<commit>`: where a
+loaded checkpoint's tokenizer names itself (`name_or_path`) on the host that read it."""
+
+
+def snapshot_here(name: str) -> str:
+    """A tokenizer an earlier run recorded by the hub cache's snapshot directory of the host that read it
+    (`HUB_SNAPSHOT`), named as the pinned resolver finds it on any host: its repo at its commit
+    (`repo@commit`, `pin_files`), which this host's hub cache holds or the hub hands down; any other name,
+    or a directory this host holds, as it is. A run Dew saves now holds its tokenizer's files in itself
+    (`dew.inference.tasks.hold_tokenizer`); this reads the runs saved before
+    (`dew.inference.tasks.earlier_shapes`)."""
+    found = HUB_SNAPSHOT.search(name)
+    if found is None or Path(name).is_dir():
+        return name
+    return f"{found['repo'].replace('--', '/', 1)}@{found['commit']}"
 
 
 def pin_files(name: str, patterns: Sequence[str], *,
@@ -302,14 +339,32 @@ class HFTokenizer:
     the hub until a caller uses the tokenizer.
     """
 
-    def __init__(self, name: str, *, local_files_only: bool = False):
+    def __init__(self, name: str, *, local_files_only: bool = False, files: Mapping[str, str] | None = None,
+                 held: str | None = None):
         self.name = name
         self.local_files_only = local_files_only
+        # The file hashes a record holds of the tokenizer it names, which its files must hash to here.
+        self.files = files
+        # The run that holds a copy of it by those hashes (`held_place`), read in place of its name.
+        self.held = held
 
     @functools.cached_property
     def pinned(self) -> PinnedTokenizer:
-        """The name resolved once to immutable files (`pin_tokenizer`)."""
-        return pin_tokenizer(self.name, local_files_only=self.local_files_only)
+        """The name resolved once to immutable files (`pin_tokenizer`), refused where they are not the
+        files a record holds (`files`): a tokenizer is what its files are, wherever they stand."""
+        source = self.name
+        if self.files is not None and self.held is not None:
+            place = held_place(self.held, self.files)
+            if (place / HELD_FILES).exists():
+                # The copy its run holds, as a directory of this host's (a run on a bucket among them).
+                source = cached_tokenizer(place, self.files)
+        pinned = pin_tokenizer(source, local_files_only=self.local_files_only)
+        if self.files is not None and pinned.files != self.files:
+            differing = sorted(path for path in {*pinned.files, *self.files}
+                               if pinned.files.get(path) != self.files.get(path))
+            raise ValueError(f"the tokenizer at {self.name} ({pinned.directory}) is not the one the run "
+                             f"recorded: its files differ in {differing}")
+        return pinned
 
     def dependencies(self) -> Mapping[str, object]:
         return self.pinned.snapshot
@@ -406,26 +461,17 @@ def tokenizer_name(tokenizer: str | SavedTokenizer) -> str:
     files' hash, which every worker reads and every run hashes alike."""
     if isinstance(tokenizer, str):
         return tokenizer
-    import shutil
-    import tempfile
-
-    from dew._builds import dew_cache_dir
-
-    root = Path(dew_cache_dir(), "tokenizers")
-    root.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(dir=root))
-    try:
-        tokenizer.save_pretrained(str(staging))
-        digest = hashlib.sha256()
-        for path in sorted(path for path in staging.rglob("*") if path.is_file()):
-            digest.update(str(path.relative_to(staging)).encode() + b"\0" + path.read_bytes())
-        directory = root / digest.hexdigest()
-        # Another process saving the same tokenizer writes the same files; whichever renames second
-        # finds the directory there.
-        published(staging, directory)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-    return str(directory)
+    with tempfile.TemporaryDirectory() as saved:
+        tokenizer.save_pretrained(saved)
+        # Every file it saved, by its hash, under the name the steps that read it have always carried in
+        # their identities: one digest of each file's path and bytes in order (train 985's review).
+        paths = sorted(path for path in Path(saved).rglob("*") if path.is_file())
+        files = {str(path.relative_to(saved)): hashlib.sha256(path.read_bytes()).hexdigest()
+                 for path in paths}
+        named = hashlib.sha256()
+        for path in paths:
+            named.update(str(path.relative_to(saved)).encode() + b"\0" + path.read_bytes())
+        return cached_tokenizer(epath.Path(saved), files, named=named.hexdigest())
 
 
 def tokenize(tokenizer: str | SavedTokenizer = "byte", *, field: str = "text",
@@ -887,15 +933,64 @@ def train_tokenizer(dataset: Dataset, base: str, path: str, *, vocab_size: int, 
     return path
 
 
-def tokenizer_for(name: str, *, local_files_only: bool = False) -> ByteTokenizer | HFTokenizer:
+HELD_TOKENIZERS = "tokenizer"
+"""Where a run keeps the tokenizers its records name, in the run's own directory, each under its files'
+digest (`held_place`)."""
+
+HELD_FILES = "files.json"
+"""The file a held tokenizer's directory names its files and their hashes in, written last: a directory that
+holds it holds them whole (`hold_tokenizer`)."""
+
+
+def held_place(run: str, files: Mapping[str, str]) -> epath.Path:
+    """Where the run in `run` holds the tokenizer whose files hash to `files`: `run/tokenizer/<their
+    digest>` (`files_digest`), the place its record names by what the tokenizer is, never by a path a
+    record states."""
+    return epath.Path(run) / HELD_TOKENIZERS / files_digest(files)
+
+
+def cached_tokenizer(source: epath.Path, files: Mapping[str, str], *, named: str | None = None) -> str:
+    """The tokenizer whose `files` stand in `source` (a run's held copy, a local directory or a bucket's,
+    or a tokenizer object's saved files) as a directory of this host's cache (`dew._builds.dew_cache_dir`)
+    under their digest (`files_digest`), or `named`, a tokenizer object's (`tokenizer_name`), written once,
+    whole (`dew._files.staged`), each file checked (`copy_checked`): the one writer of Dew's cache of
+    tokenizers."""
+    from dew._builds import dew_cache_dir
+
+    local = Path(dew_cache_dir()) / "tokenizers" / (named or files_digest(files))
+    if not local.is_dir():
+        # Another process caching the same files writes the same bytes; whichever publishes second finds
+        # the directory there.
+        with staged(local) as building:
+            copy_checked(source, epath.Path(building), files)
+    return str(local)
+
+
+def copy_checked(source: epath.Path, target: epath.Path, files: Mapping[str, str]) -> None:
+    """Each of a tokenizer's `files` copied from the directory `source` into `target`, each read and checked
+    against its hash before it is written: a file missing, or whose bytes differ, is refused, naming it.
+    The one copier of a tokenizer's files, into a run (`dew.inference.tasks.hold_tokenizer`) and into this
+    host's cache (`cached_tokenizer`)."""
+    for path, digest in files.items():
+        contents = (source / path).read_bytes()
+        if hashlib.sha256(contents).hexdigest() != digest:
+            raise ValueError(f"the tokenizer at {source} differs from its record in {path}")
+        (target / path).parent.mkdir(parents=True, exist_ok=True)
+        (target / path).write_bytes(contents)
+
+
+def tokenizer_for(name: str, *, local_files_only: bool = False, files: Mapping[str, str] | None = None,
+                  held: str | None = None) -> ByteTokenizer | HFTokenizer:
     """Builds the tokenizer `name` asks for.
 
     `byte` is dew's own utf-8 vocabulary; any other name is the HF tokenizer
     of that repo or local directory. Resolving names here alone keeps a
     training run and an export of what it trained reading one name one way.
     An export passes `local_files_only`, since writing a checkpoint out is no
-    reason to reach the hub.
+    reason to reach the hub. A record's `files`, the file hashes it holds, are what the files found must
+    hash to (`HFTokenizer.files`), read from the copy the run in `held` holds where it holds one
+    (`HFTokenizer.held`).
     """
     if name == "byte":
         return ByteTokenizer()
-    return HFTokenizer(name, local_files_only=local_files_only)
+    return HFTokenizer(name, local_files_only=local_files_only, files=files, held=held)

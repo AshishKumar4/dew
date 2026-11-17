@@ -3,6 +3,7 @@
 import base64
 import io
 import json
+import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from dew.decision import (
 )
 from dew.decision.calibration import softmax
 from dew.decision.laya import LAYA_OPTION_LAYOUTS, LAYA_REQUIRED
+from dew.decision.layout import SegmentLayout
 from dew.decision.metrics import Answered
 from dew.decision.task import Finalists, Knockout, decoded_images, trained_tree
 
@@ -789,12 +791,12 @@ def test_a_released_checkpoint_states_the_layout_its_task_was_trained_with(decid
     chat) exports and reads back with the layout it was trained with, which the release states beside
     Laya's own files (`dew.config.Release`): Laya's config keeps the window and budgets it states, and a
     release with no such record reads as Laya's file alone does (row 4310)."""
-    from dew.decision.layout import Framing, MarkerLayout
+    from dew.decision.layout import Framing, SegmentLayout
 
     framed = Framing(system="Answer from the state.", prefill="", thinking=False)
     for number, chosen in enumerate(({"order": "state_first"}, {"order": "re_read"}, {"blocks": True},
                                      {"framing": framed, "order": "question_first"})):
-        # The layout as the task reads it, a row a question for Laya's head (`QuestionLayout.shared_for`).
+        # The layout as the task reads it, a row a question for Laya's head (`SegmentLayout.shared_for`).
         layout = replace(decide, layout=replace(decide.layout, **chosen)).layout
         replace(decide, layout=layout).save_pretrained(tmp_path / str(number))
         again = Decide.from_pretrained(tmp_path / str(number), attention_impl="xla")
@@ -804,7 +806,7 @@ def test_a_released_checkpoint_states_the_layout_its_task_was_trained_with(decid
         # Laya's readers refuse a layout they would lay out otherwise (row 4599).
         assert stated["option_layout"] not in LAYA_OPTION_LAYOUTS
     (tmp_path / "0" / "dew_release.json").unlink()
-    assert Decide.from_pretrained(tmp_path / "0", attention_impl="xla").layout == MarkerLayout(
+    assert Decide.from_pretrained(tmp_path / "0", attention_impl="xla").layout == SegmentLayout.marker_row(
         max_len=decide.layout.max_len, head_max_len=decide.layout.head_max_len,
         option_tokens=decide.layout.option_tokens, parallel=decide.layout.parallel)
 
@@ -1010,11 +1012,10 @@ def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decid
     run's own directory, which holds other weights, refuses it."""
     import dataclasses
 
-    from dew.decision import StateFirstLayout
     from dew.inference.loading import pipeline
 
     if kind == "state-first":
-        decide = replace(decide, layout=StateFirstLayout(max_len=decide.layout.max_len,
+        decide = replace(decide, layout=SegmentLayout.state_first_row(max_len=decide.layout.max_len,
                                                          head_max_len=decide.layout.head_max_len))
     runs = trained_runs(decide, tmp_path, 2)
     held_out = answered() * 10
@@ -1100,3 +1101,96 @@ def test_a_batch_of_requests_takes_no_one_requests_request_images_or_context(dec
     # One request's context goes in `context`; a batch's `contexts` it would read none of (row 4658).
     with pytest.raises(ValueError):
         decide(request["state"], asked, contexts=["a context"])
+
+
+COMMIT = "0" * 39 + "1"
+"""The commit a test hub cache holds its tokenizer snapshot at."""
+
+
+def hub_snapshot_of(tokenizer_directory: str, cache: Path, repo: str = "org--tiny") -> Path:
+    """A copy of a tokenizer's files as a Hugging Face hub cache holds a snapshot of `repo` (`org--name`):
+    `cache/models--<repo>/snapshots/<COMMIT>`."""
+    from shutil import copytree
+
+    snapshot = cache / f"models--{repo}" / "snapshots" / COMMIT
+    copytree(tokenizer_directory, snapshot)
+    return snapshot
+
+
+def saved_before_runs_held_tokenizers(run: str) -> None:
+    """The run's checkpoints as a run saved before runs held their tokenizers wrote them: each step's
+    declaration names its tokenizer and states no hashes of its files, and the run holds no copy."""
+
+    def unstated(value):
+        match value:
+            case dict():
+                return {key: unstated(entry) for key, entry in value.items() if key != "tokenizer_files"}
+            case list():
+                return [unstated(entry) for entry in value]
+            case _:
+                return value
+
+    for written in Path(run).glob("*/_CHECKPOINT_METADATA"):
+        written.write_text(json.dumps(unstated(json.loads(written.read_text()))))
+    shutil.rmtree(Path(run) / "tokenizer")
+
+
+def test_a_runs_tokenizer_is_held_in_the_run_and_compared_by_its_files(decide, tmp_path, monkeypatch):
+    """A decision run holds its tokenizer's files in the run itself, found by their hashes: served with the
+    place it read them from gone and this host's cache fresh, it loads them from the run and answers as it
+    did, whether it read them from a hub cache snapshot or from a path relative to where it trained
+    (`tokenizer/bpe32k`, a name the run's own folder of tokenizers shares); a run started from it holds its
+    own, and answers as it did with the first run gone. Two runs whose one tokenizer stood at different
+    places blend, and so do a run saved before runs held their tokenizers and one saved since; a run whose
+    vocabulary changed in a file does not. A run recorded its training host's directory, which a start or a
+    serve elsewhere handed the hub as a repo id and failed on, and blends of one tokenizer at two paths, or
+    of a run that states its tokenizer's files with one that does not, were refused."""
+    from dew.data.text import HFTokenizer, tokenizer_for
+
+    def fresh_cache(name: str) -> None:
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "caches" / name))
+
+    assert isinstance(decide.tokenizer, HFTokenizer)
+    files = decide.tokenizer.pinned.directory
+    first = tmp_path / "first-host"
+    snapshot = hub_snapshot_of(files, first)
+    runs = trained_runs(replace(decide, tokenizer=tokenizer_for(str(snapshot))), tmp_path, 2)
+    request = CASES["quickstart"]
+    expected = Decide.from_run(runs[0]).systemone(request)
+    # Another host: the training host's cache is gone, and so is this host's copy of the run's.
+    (first / "models--org--tiny").rename(tmp_path / "moved")
+    fresh_cache("served")
+    served = Decide.from_run(runs[0])
+    assert served.systemone(request) == expected
+    started = trained_runs(served, tmp_path, 1, name="started")
+    answered = Decide.from_run(started[0]).systemone(request)
+    # The run it started from gone: the started run reads its own copy.
+    held = Path(runs[0]).rename(tmp_path / "first-run")
+    fresh_cache("started")
+    assert Decide.from_run(started[0]).systemone(request) == answered
+    held.rename(runs[0])
+    # A tokenizer read from a path relative to where the run trained, whose folder a run's held copies share.
+    monkeypatch.chdir(tmp_path)
+    shutil.copytree(files, tmp_path / "tokenizer" / "bpe32k")
+    relative = trained_runs(replace(decide, tokenizer=tokenizer_for("tokenizer/bpe32k")), tmp_path, 1,
+                            name="relative")
+    trained = Decide.from_run(relative[0]).systemone(request)
+    monkeypatch.chdir(tmp_path / "caches")
+    fresh_cache("relative")
+    assert Decide.from_run(relative[0]).systemone(request) == trained
+    # A run saved before runs held their tokenizers, which states no hashes, blends with one that does: each
+    # is compared by the files it reads.
+    earlier = trained_runs(replace(decide, tokenizer=tokenizer_for(files)), tmp_path, 1, name="earlier")
+    saved_before_runs_held_tokenizers(earlier[0])
+    assert len(Decide.averaged([runs[0], *earlier]).weights.averaged) == 2
+    # One tokenizer at other places blends; one whose vocabulary changed does not.
+    assert len(Decide.averaged([*runs, *started, *relative]).weights.averaged) == 4
+    changed = hub_snapshot_of(files, tmp_path / "second-host", repo="org--changed")
+    # Two of its pieces swap their ids: the same pieces, another vocabulary.
+    stated = json.loads((changed / "tokenizer.json").read_text())
+    vocabulary = stated["model"]["vocab"]
+    vocabulary["!"], vocabulary["[MASK]"] = vocabulary["[MASK]"], vocabulary["!"]
+    (changed / "tokenizer.json").write_text(json.dumps(stated))
+    other = trained_runs(replace(decide, tokenizer=tokenizer_for(str(changed))), tmp_path, 1, name="changed")
+    with pytest.raises(ValueError):
+        Decide.averaged([runs[0], *other])

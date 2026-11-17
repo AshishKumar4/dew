@@ -1130,13 +1130,20 @@ class PositionCapacity(Protocol):
 
 
 @runtime_checkable
-class Bounded(Protocol):
-    """A model that declares its vocabulary and cache capacity, which the host
-    checks read to refuse an id outside the vocabulary or a request that would
-    overflow the cache; a model that declares neither is checked for neither."""
+class StatesVocabulary(Protocol):
+    """A model that declares its vocabulary, the rows of the table its token ids index, which the host
+    checks read to refuse an id outside it (`dew.nn.blocks.token_table`), whether or not it declares a
+    cache's capacity (`Bounded`)."""
 
     @property
     def vocab_size(self) -> int: ...
+
+
+@runtime_checkable
+class Bounded(StatesVocabulary, Protocol):
+    """A model that declares its vocabulary and cache capacity, which the host
+    checks read to refuse an id outside the vocabulary or a request that would
+    overflow the cache; a model that declares neither is checked for neither."""
 
     @property
     def max_seq_len(self) -> int | None: ...
@@ -1216,12 +1223,17 @@ class Generating(Protocol):
 class ForkedCalls(Protocol):
     """A decoder that says, after examining the layers it builds, why a call over forks
     (`dew.batch.Forks`: documents that continue another, a shared prefix computed once) would not compute
-    each document as its own row of its ancestors and itself does, or None; with `train`, as a training
-    step runs it, its dropout drawing at random. A caller that packs rows over their shared prefixes
-    (`dew.data.forked_rows.ForkedRows`) lays them whole where it says why; a model that does not state it
-    is laid whole too."""
+    each document as its own row of its ancestors and itself does, or None (`fork_refusal`; with `train`,
+    as a training step runs it, its dropout drawing at random), such a call refused; and why rows that
+    begin alike should not be packed over their shared prefixes (`prefix_sharing_refusal`): that reason,
+    or a layer that computes a call over forks at more work than the rows laid whole (an in-context memory
+    off its shared recurrence). A caller that packs rows over their shared prefixes
+    (`dew.data.forked_rows.ForkedRows`) lays them whole where the second says why; a model that does not
+    state it is laid whole too."""
 
     def fork_refusal(self, train: bool = False) -> str | None: ...
+
+    def prefix_sharing_refusal(self, train: bool = False) -> str | None: ...
 
 
 @runtime_checkable

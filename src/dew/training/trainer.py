@@ -15,6 +15,8 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import gc
+import hashlib
 import logging
 import os
 import sys
@@ -219,25 +221,62 @@ _DEFAULT_MESH = MeshSpec()
 _DEFAULT_LAYOUT = Layout()
 
 
-def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | None]) -> None:
-    """Refuse to save a `state` whose checked trees (`transaction.checked`: the parameters, optimizer state
-    and averages, and under DiLoCo each replica's inner copy of them, which the next meeting averages into
-    the outer model) hold a non-finite value, on any tier: no checkpoint is written and none rotated out,
-    and the run stops, naming the step and the first such leaf, so the checkpoint a resume finds is the
-    last finite one (`latest`, read only to say so). Read wherever the leaves are placed
-    (`transaction.finite_flags`), the same on every process (training.md, checkpoints and resume)."""
+def first_non_finite(state: TrainState) -> str | None:
+    """The first leaf of `state`'s checked trees (`transaction.checked`: the parameters, every optimizer
+    leaf and the averages, and under DiLoCo each replica's inner copy of them) holding a value that is not
+    finite, by its path; None where none does. Read wherever the leaves are placed, one compiled check a
+    placement (`transaction.finite_flags`), the same on every process."""
     trees = {**checked(state), **({} if state.inner is None else
                                   {f"inner.{name}": tree for name, tree in checked(state.inner).items()})}
     leaves = [(f"{name}{jax.tree_util.keystr(path)}", leaf) for name, tree in trees.items()
               for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
               if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)]
     finite = finite_flags([leaf for _, leaf in leaves])
-    first = next((path for (path, _), held in zip(leaves, finite, strict=True) if not held), None)
+    return next((path for (path, _), held in zip(leaves, finite, strict=True) if not held), None)
+
+
+def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | None]) -> None:
+    """Refuse to save a `state` holding a value that is not finite (`first_non_finite`), on any tier: no
+    checkpoint is written and none rotated out, and the run stops, naming the step and the first such leaf,
+    so the checkpoint a resume finds is the last finite one (`latest`, read only to say so) (training.md,
+    checkpoints and resume)."""
+    first = first_non_finite(state)
     if first is not None:
         kept = latest()
         said = "no checkpoint" if kept is None else f"the latest checkpoint, step {kept}"
         raise RuntimeError(f"step {step}'s state holds a non-finite value at {first}, so no checkpoint of it "
                            f"is written and {said} is the one a resume finds")
+
+
+def _closer(stream: Iterator[Batch]) -> Callable[[], None] | None:
+    """`stream`'s close, where it states one."""
+    return stream.close if isinstance(stream, Closeable) else None
+
+
+def _closed(stream: Iterator[Batch]) -> None:
+    """Close `stream`, where it states a close."""
+    if (close := _closer(stream)) is not None:
+        close()
+
+
+def signature_digest(signature: Hashable) -> str:
+    """The digest of a step's batch signature (`batch_signature`, keyed by its phase's passes), which names
+    the step compiled for it in a run's records (`StepCompiled.signature`, `ProfileTraced.signature`),
+    computed once a compile."""
+    return hashlib.sha256(repr(signature).encode()).hexdigest()[:16]
+
+
+
+def _custom_step_refusal(step, record: bool, inspection) -> None:
+    """Refuse what a custom step cannot serve (ValueError): records of its Steps, or an inspection of an
+    update it commits."""
+    if record and step is not None:
+        raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
+                         "build them with Step(record=True)")
+    if inspection is not None and step is not None:
+        raise ValueError("a custom step commits no update an inspection reads (Trainer(inspection=...)); "
+                         "summarize its arrays in the step's own report")
+
 
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
@@ -271,6 +310,7 @@ class Trainer(Generic[Loss, Effects]):
         diloco: DiLoCo | None = None,
         phase_passes: Sequence[int] | None = None,
         data_resume: DataResume = "relaxed",
+        skip_nonfinite: bool = False,
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -284,14 +324,16 @@ class Trainer(Generic[Loss, Effects]):
         (`Objective.optimizer`), made from it. `step` replaces the built-in transaction. A custom step then
         owns the clocks, the scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
         attempted-step counter; it passes a model that reads the run's progress it (`PassesProgress`).
-        `rollout` runs once per batch read, before the step and outside replay. `layout` and `mesh` say where
-        the state lives: `mesh` a `MeshSpec` or a native `jax.sharding.Mesh` of any axes, which `layout`'s
-        rules name (`Layout.data_axes` its rows'). `microbatches` is how many a pipelined step feeds through
-        the mesh's stage axis, a multiple of its size; None feeds one a stage. `lower_for`, a CUDA generation,
-        lowers the first step for it in place of compiling it (`dew.training._lowering.Lowered`); `ahead`, a
-        step compiled ahead (`dew.training.ahead`), runs as the first step where it is that program, and
-        one compiled without its GPU kind's tuned choices (`AheadOfTime.tuned`) is not run: the run compiles
-        its step as without it, said once (`AheadOfTime.runnable`).
+        `rollout` runs once per batch read, before the step and outside replay. `skip_nonfinite` skips a step
+        not finite, which a run otherwise takes and stops at (training.md, a step that is not finite).
+        `layout` and `mesh` say where the state lives: `mesh` a `MeshSpec` or a native `jax.sharding.Mesh` of
+        any axes, which `layout`'s rules name (`Layout.data_axes` its rows'). `microbatches` is how many a
+        pipelined step feeds through the mesh's stage axis, a multiple of its size; None feeds one a stage.
+        `lower_for`, a CUDA generation, lowers the first step for it in place of compiling it
+        (`dew.training._lowering.Lowered`); `ahead`, a step compiled ahead (`dew.training.ahead`), runs as
+        the first step where it is that program, and one compiled without its GPU kind's tuned choices
+        (`AheadOfTime.tuned`) is not run: the run compiles its step as without it, said once
+        (`AheadOfTime.runnable`).
         `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its derived
         config. It measures each of Dew's own launches that declares variants to time (`KernelOp`: the
         kernel templates, `attention_impl="template"`, the norms, SwiGLU and decode attention); tokamax's
@@ -308,10 +350,10 @@ class Trainer(Generic[Loss, Effects]):
         layout = objective.placement(layout)  # as its models place their trees (a tier-3 plan, ledger 2777)
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
-        built = isinstance(optimizer, optax.GradientTransformation)
         # A config's groups take what the objective draws fresh, as a run's do (`OptimConfig.claiming`).
         self._config, self._optimizer = ((None, declaring(objective.optimizer(optimizer), self._boxed_axes))
-                                         if built else (optimizer.claiming(*objective.fresh_trained()), None))
+                                         if isinstance(optimizer, optax.GradientTransformation) else
+                                         (optimizer.claiming(*objective.fresh_trained()), None))
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
@@ -321,18 +363,14 @@ class Trainer(Generic[Loss, Effects]):
         self.split = split
         # How a resume treats its data (`DataResume`): relaxed starts it again where its plan differs.
         self.data_resume: DataResume = data_resume
+        self.skip_nonfinite = skip_nonfinite
         self._microbatches, self._loss_scale = microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         # A loss scale stated by a flag alone is a value a step's trace can be kept by (`_step_key`).
         self._scaled = dynamic_scale if isinstance(dynamic_scale, bool) else None
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
-        if record and step is not None:
-            raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
-                             "build them with Step(record=True)")
-        if inspection is not None and step is not None:
-            raise ValueError("a custom step commits no update an inspection reads (Trainer(inspection=...)); "
-                             "summarize its arrays in the step's own report")
+        _custom_step_refusal(step, record, inspection)
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
@@ -377,7 +415,8 @@ class Trainer(Generic[Loss, Effects]):
         return StepSettings(self.objective if objective is None else objective, self._optimizer, self.layout,
                             self.device_mesh, self.accumulation,
                             self.step, self.dynamic_scale, self.diloco, self.tune_kernels, self.inspection,
-                            self.microbatches, self.record, self.lower_for, self.state_mesh)
+                            self.microbatches, self.record, self.lower_for, self.state_mesh,
+                            self.skip_nonfinite)
 
     # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
@@ -430,15 +469,15 @@ class Trainer(Generic[Loss, Effects]):
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
             updates=jnp.zeros((), jnp.int32),
-            # A state of its own, the given scale's leaves copied: the step donates the state.
-            scale=None if self._loss_scale is None else jax.tree.map(
-                lambda leaf: jnp.array(leaf, copy=True), self._loss_scale),
+            # A state of its own, the given scale's leaves copied by the transfer, compiling no program: the
+            # step donates the state.
+            scale=None if self._loss_scale is None else jax.tree.map(transferred_copy, self._loss_scale),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
             variables=params,
             opt_state=opt_state,
-            # The average starts equal to the parameters but as its own buffers: the step donates
-            # the state, and a buffer can be donated once.
-            ema=None if ema is None else jax.tree.map(jnp.copy, select(params, ema.select)),
+            # The average starts equal to the parameters but as its own buffers, copied by the transfer: the
+            # step donates the state, and a buffer can be donated once.
+            ema=None if ema is None else jax.tree.map(transferred_copy, select(params, ema.select)),
             key=run_key,
             consumed=None if self._shape.examples is None else jnp.zeros((), jnp.int32),
             deferred=waiting(opt_state))
@@ -527,9 +566,8 @@ class Trainer(Generic[Loss, Effects]):
         if settings is UNKEYED:
             return None
         return (type(objective), stated, settings, self._shape.updates, self._shape.examples,
-                self._microbatches,
-                self.accumulation, self.split, self._scaled, self.lower_for, compiler.narrow,
-                self.record)
+                self._microbatches, self.accumulation, self.split, self._scaled, self.lower_for,
+                compiler.narrow, self.record, self.skip_nonfinite)
 
     def _stepping(self, objective: Objective[Loss, Effects] | None = None,
                   compiler: StepCompiler | None = None) -> Stepping[Loss, Effects]:
@@ -665,6 +703,10 @@ class Trainer(Generic[Loss, Effects]):
                                                          dataclasses.replace(shardings, variables=placement)))
         _log.info("the state holds %.2f GiB on its fullest device between steps",
                   max(self.validation.device_bytes.values()) / 2 ** 30)
+        if self.validation.by_shape:
+            # A parameter whose module declares no axes keeps the shape heuristic (training.md, the layout).
+            _log.info("the layout placed %d parameters by their shape, their modules declaring no axes: %s",
+                      len(self.validation.by_shape), ", ".join(self.validation.by_shape))
         return shardings, self.validation
 
     def _validation(self, placed: TrainState) -> Validation:
@@ -995,7 +1037,8 @@ class Trainer(Generic[Loss, Effects]):
             return Transaction(objective, self.optimizer, split * self.accumulation, shapes, copies,
                                split=split, record=self.record, resting=resting,
                                examples=self._shape.examples,
-                               inspection=self.inspection if sampled else None, placed=placed).step()
+                               inspection=self.inspection if sampled else None, placed=placed,
+                               skip=self.skip_nonfinite).step()
         # A custom step need not run the objective's loss, which passes a model the run's progress.
         refuse_unpassed_progress(objective, passes=isinstance(self.step, PassesProgress))
         custom = self.step(objective, self.optimizer)
@@ -1300,17 +1343,15 @@ class Trainer(Generic[Loss, Effects]):
                        tracer: Profiler | None, profile: ProfileWindow | None,
                        checkpoints: Checkpoints | None,
                        initial: TrainState | None = None, resume: Resume = "auto") -> TrainState:
-        """Place the state, dispatch the numerical steps and finish their loop
-        before resource cleanup. Returns the final state, the placed one for a
-        run already complete, its last checkpoint written, so nothing ran.
+        """Place the state, dispatch the numerical steps and finish their loop before resource cleanup.
+        Returns the final state, the placed one for a run already complete, its last checkpoint written.
 
-        The loop is the state's one holder: each step donates the state it is
-        handed, and a reference kept past that, as fit's own once was, holds
-        an array whose buffers the step consumed."""
-        current, position, placed, abstract, fresh = self._starting(run, plan.dataset, initial, resume)
+        The loop is the state's one holder: each step donates the state it is handed, and a reference
+        kept past that, as fit's own once was, holds an array whose buffers the step consumed."""
+        with run.startup.phase("start", "tracing the state's start"):
+            current, position, placed, abstract, fresh = self._starting(run, plan.dataset, initial, resume)
         run.last_checkpoint = time.perf_counter()
-        interval = Interval.resumed(run.stop_control, last_saved=(
-            current if checkpoints is not None and checkpoints.latest is not None else None))
+        interval = self._interval(run, current, checkpoints, abstract)
         state, shardings, complete = self._opened(plan, run, interval, current, position, placed, abstract,
                                                   resumed=initial is None and interval.last_saved is not None,
                                                   fresh=fresh)
@@ -1402,7 +1443,7 @@ class Trainer(Generic[Loss, Effects]):
                 batch = device = None
                 if run.first_step is None:
                     loss.block_until_ready()
-                    run.first_step = time.perf_counter() - run.started
+                    run.first_step = run.startup.first_step(run.started)
             # The step row is complete once its scope exits; the window's last step closes it before the work
             # after it, whose evaluations, saves and cooldowns run outside it (`FitRun.outside_window`).
             if run.tracing and profile is not None:
@@ -1416,6 +1457,18 @@ class Trainer(Generic[Loss, Effects]):
             if stopped:
                 break
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
+
+    def _interval(self, run: FitRun, current: int, checkpoints: Checkpoints | None,
+                  abstract: TrainState) -> Interval:
+        """The fit's first interval, its clocks read off the run's control (`Interval.resumed`): a run that
+        drops a step not finite whole, a scaled one as its scale backs off or one whose optimizer holds
+        updates back (`holds_back`, its groups' inner one under DiLoCo), stops at no single such step."""
+        from dew.held_updates import holds_back
+
+        held = abstract.opt_state if abstract.inner is None else abstract.inner.opt_state
+        return Interval.resumed(run.stop_control, last_saved=(
+            current if checkpoints is not None and checkpoints.latest is not None else None),
+            skips_nonfinite=self.skip_nonfinite or self.dynamic_scale or holds_back(held))
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
@@ -1441,7 +1494,10 @@ class Trainer(Generic[Loss, Effects]):
         # its peers may never finish (`LogWriter.raise_failure`).
         unread = functools.partial(self._read_taken, run, agree=False)
         exported = waited_export(profile, profiler)
+        primed, run.primed = run.primed, None
+        unopened = None if primed is None else _closer(primed[1])
         cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
+                    ("Primed stream", unopened),
                     ("Profiler", stop_trace), ("Profile export", exported),
                     ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
                     ("Display", self._display.close))
@@ -1460,7 +1516,7 @@ class Trainer(Generic[Loss, Effects]):
     def _starting(self, run: FitRun, dataset: Loader, initial: TrainState | None, resume: Resume
                   ) -> tuple[int, bytes | None,
                              Callable[[Compiling | None], tuple[TrainState, Placement[TrainState]]],
-                             TrainState | None, Start | None]:
+                             TrainState, Start | None]:
         """Where `fit` starts, before it places anything: the step, the data position a resume reads
         alone (`Checkpoints.position`), so the data opens where the run left it, the placement still
         to make (handed the start's compile where one began, `attempting`), the state's shapes it checks
@@ -1469,7 +1525,7 @@ class Trainer(Generic[Loss, Effects]):
         `resume="require"` refuses, and under "never" into a directory that holds no run either. An
         objective that names its input field alone declares it first (`_declare_input`)."""
         checkpoints = self.checkpoints
-        self._declare_input(lambda: first_batch(dataset, self._stream_partition()))
+        self._declare_input(lambda: self._primed_first(run, dataset))
         if resume == "require" and (checkpoints is None or initial is not None):
             raise ValueError("resume='require' continues the checkpointer's latest checkpoint, which a "
                              "trainer with no checkpointer, or a run given its state=, starts without")
@@ -1517,6 +1573,25 @@ class Trainer(Generic[Loss, Effects]):
         beginning where updates do (`window`, `Ramp.stages`)."""
         return DataPartition.of(self.device_mesh, window=self.accumulation)
 
+    def _primed_first(self, run: FitRun, dataset: Loader) -> Batch:
+        """The first batch of this process's share of `dataset`'s training stream, its stream kept open with
+        its position after it (`FitRun.primed`), which a fresh start's prefetcher hands on as its first
+        batch (`_opened`), so the run reads it once (training.md, the batch contract; row 6663); a share
+        that reads none of its own reads its pool's (`first_batch`)."""
+        partition = self._stream_partition()
+        stream = dataset.train(partition)
+        try:
+            batch = next(iter(stream), None)
+            position = stream.get_state() if isinstance(stream, Checkpointable) else None
+        except BaseException:
+            _closed(stream)
+            raise
+        if batch is None:
+            _closed(stream)
+            return first_batch(dataset, partition)
+        run.primed = (partition, stream, batch, position)
+        return batch
+
     def _declare_input(self, first: Callable[[], Batch]) -> None:
         """Declare the objective's input where it names its field alone (`Objective.named_inputs`), at the
         per-example shape its model reads (`Field.of`) of the run's first batch, `first`'s, placed as the
@@ -1533,7 +1608,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _opened(self, plan: FitPlan, run: FitRun, interval: Interval, current: int, position,
                 placed: Callable[[Compiling | None], tuple[TrainState, Placement[TrainState]]],
-                abstract: TrainState | None, *, resumed: bool, fresh: Start | None = None,
+                abstract: TrainState, *, resumed: bool, fresh: Start | None = None,
                 ) -> tuple[TrainState, Placement[TrainState], bool]:
         """Start `fit` at step `current`: refuse a run already past its steps, a checkpoint cadence
         with no checkpointer or a resume its stream cannot continue; open the training stream on its
@@ -1546,8 +1621,6 @@ class Trainer(Generic[Loss, Effects]):
         checkpoint at its last step having been written, so there is nothing to do."""
         mesh, checkpoints, steps = self.device_mesh, self.checkpoints, plan.steps
         begun: Compiling | None = None
-        # Whether the run's cooldown branches were checked before its state was placed.
-        branched = False
         if steps is not None and current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
         bound = self._shape.examples
@@ -1563,6 +1636,9 @@ class Trainer(Generic[Loss, Effects]):
             "cooldown record", lambda: checkpoints.cooldown(current) if jax.process_index() == 0 else None)
         run.cooling = broadcast_from_process_zero(kept)
         pending = run.cooling is not None
+        # Refused before the stream opens and the start's program begins to compile: what branches read is
+        # the optimizer state's structure.
+        check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(rated(abstract)))
         complete = (plan.ended(current, interval.real_tokens, interval.consumed) and checkpoints is not None
                     and checkpoints.latest is not None and not pending)
         # The step the run reads from, as the pre-read's empty-stream check reads it, and the FLOP
@@ -1571,7 +1647,8 @@ class Trainer(Generic[Loss, Effects]):
         self._refusal = None
         if not complete and (pending or not plan.ended(current, interval.real_tokens, interval.consumed)):
             partition = self._stream_partition()
-            run.source = plan.dataset.train(partition)
+            opened, ahead = self._source_opened(plan, run, partition, position)
+            run.source = opened
             run.unworked = isinstance(run.source, ReadsInProcess) and run.source.in_process
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None and run.restarted is None else None)
@@ -1588,36 +1665,32 @@ class Trainer(Generic[Loss, Effects]):
                                                   for stage, after in pairwise(stages))))
 
             run.partition = partition
-            run.train = self._prefetched(plan, run, run.source, position)
+            run.train = self._prefetched(plan, run, opened, position, ahead)
             run.source = None  # Lifetime transferred to the prefetch worker.
-            if abstract is not None and self.rollout is None:
+            if self.rollout is None:
                 # Read on the host before the state is placed, and agreed: a process whose read failed
                 # stops its peers before any of them places one. The prefetcher places it at the first step.
-                first = waited_read(run, interval, agree=True, peek=True)
+                with run.startup.phase("read", "reading the first batch"):
+                    first = waited_read(run, interval, agree=True, peek=True)
                 if first is not None:
                     placed_first = placed_abstract(mesh, first)
                     # A process whose reader changed a field or a shape is refused by every process, as
                     # a compile refuses it, before the state it would check is traced from that batch.
                     agreed_same("training batch layout", lambda: batch_layout(split_fields(placed_first)[0]))
-                    self._fitting(abstract, placed_first)
-                    # Refused before the start's program begins to compile, as every refusal that needs
-                    # nothing the planning beside it finds: its state's structure states what branches read.
-                    check_branches(bool(plan.branches) or pending, plan.suites,
-                                   settable=settable_rates(rated(abstract)))
-                    branched = True
+                    with run.startup.phase("check", "checking the state fits"):
+                        self._fitting(abstract, placed_first)
                     if fresh is not None:
                         begun = self._compiled_fresh(run, fresh, first, placed_first)
             elif position is not None:
                 # Its first batch read, so its worker has restored the stream or started it again
                 # (`_prefetched`), which the run reports as it starts (`DataRestarted`).
                 waited_read(run, interval, agree=True, peek=True)
-        state, shardings = placed(begun)
+        with run.startup.phase("place", "placing the state"):
+            state, shardings = placed(begun)
         if begun is not None:
             run.startup.overlapped = begun.taken.is_set()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
-        if not branched:
-            check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(rated(state)))
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
@@ -1656,10 +1729,10 @@ class Trainer(Generic[Loss, Effects]):
         program begun beside it in a thread of its own (`start_compiling`), the key lowered unplaced as the
         start compiled ahead takes it: both once the whole state is checked, so a refused run compiles
         neither. None where the step is not compiled here (one compiled ahead, a host-master's, a profile
-        guided run's), the start then compiling as it is placed. The one refusal that can come while the
-        start's program compiles is its step's planning's (`PlanRefused`, a compile that fails), which runs
-        beside it, the overlap the start is begun for; the process's exit then waits for the start's compile
-        to end (`options.compiling`)."""
+        guided run's), the start then compiling as it is placed. What can stop the run while the start's
+        program compiles is its step's planning, which runs beside it, the overlap the start is begun for (a
+        refusal of it, `PlanRefused` or `LayoutRefused`, a compile that fails, an interrupt); the process's
+        exit then waits, saying so, for the start's compile to end (`options.compiling`)."""
         if self._compiler.ahead is not None or self.host_master or pgle_runs():
             return None
         key = shapes_of(fresh.key)
@@ -1694,10 +1767,27 @@ class Trainer(Generic[Loss, Effects]):
                 refusals.append(refused)
         raise refusals[-1]
 
-    def _prefetched(self, plan: FitPlan, run: FitRun, source: Iterator[Batch],
-                    position: bytes | None) -> DevicePrefetchIterator:
+    @staticmethod
+    def _source_opened(plan: FitPlan, run: FitRun, partition: DataPartition, position: bytes | None
+                       ) -> tuple[Iterator[Batch], tuple[Batch, object] | None]:
+        """The training stream of `partition`'s share the run reads, and the first batch it read already
+        with the stream's position after it (`FitRun.primed`, the start's read for its input's shape), where
+        the run reads its stream from its beginning: that stream, handed on; else a stream opened now, the
+        primed one closed."""
+        primed, run.primed = run.primed, None
+        # Handed on only where the stream reads from its beginning: a resume, or a relaxed one starting a
+        # stage again (`FitRun.restarted`, which `_prefetched` moves a staged stream to), reads elsewhere.
+        if primed is not None and primed[0] == partition and position is None and run.restarted is None:
+            return primed[1], (primed[2], primed[3])
+        if primed is not None:
+            _closed(primed[1])
+        return plan.dataset.train(partition), None
+
+    def _prefetched(self, plan: FitPlan, run: FitRun, source: Iterator[Batch], position: bytes | None,
+                    primed: tuple[Batch, object] | None = None) -> DevicePrefetchIterator:
         """`source`'s batches placed ahead of the step by the prefetch worker, which restores it to
-        `position` first, once a pool's processes agree their streams read the same records."""
+        `position` first, once a pool's processes agree their streams read the same records; a batch the
+        start read already (`primed`, with the position after it) is its first."""
         assert run.partition is not None
         if position is None and run.restarted is not None and isinstance(
                 source, StepPhases | RampedStream | PhasedStream):
@@ -1740,7 +1830,7 @@ class Trainer(Generic[Loss, Effects]):
             run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), run.marked,
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))
         return DevicePrefetchIterator(source, self.device_mesh, self._shape.prefetch, source_state=position,
-                                      reads=run.reads, prepare=prepare, restore=restore)
+                                      reads=run.reads, prepare=prepare, restore=restore, primed=primed)
 
     @staticmethod
     def _restarting(run: FitRun, differs: tuple[str, ...]) -> None:
@@ -2105,8 +2195,15 @@ class Trainer(Generic[Loss, Effects]):
         checkpoints its state in a pool (`_rollout_admitted`), and a pipeline's batch, whose placement could
         take minutes or run out of memory before the error. Every other mesh's batch is checked with its
         stream (`check_stream`), a ramp's at each of its stages. The checkpoints learn why no record rebuilds
-        a run of this trainer on the data it was `stated` (`Checkpoints.python_run`)."""
+        a run of this trainer on the data it was `stated` (`Checkpoints.python_run`), and its checkpoints'
+        declaration is built (`_artifact`), resolving the tokenizer whose files it states and the checkpoints
+        hold (`Checkpoints.save`), held to be the objective's run tokenizer (`declared_tokenizer`): a host
+        that cannot resolve it, or an objective whose run tokenizer is not the one its record states, refuses
+        before step 0, not at the first checkpoint (train 972's and 978's reviews)."""
         if self.checkpoints is not None:
+            from dew.inference.tasks import declared_tokenizer
+
+            declared_tokenizer(self._artifact(), self.objective.run_tokenizer())
             given = {"a rollout (rollout=)": _rollout_admitted(self.rollout),
                      "a custom step (step=)": self.step, "a tracker (tracker=)": self.tracker,
                      "recording each step's draws (record=True)": self.record or None}
@@ -2194,11 +2291,21 @@ class Trainer(Generic[Loss, Effects]):
             with region("compile"), run.held():
                 compiled[signature] = (self.compile(state, batch, trials), self.step_flops)
             seconds = time.perf_counter() - began
+            # Python's collector walks its whole heap at a full collection, which CPython 3.12 runs once the
+            # objects made since the last outnumber a quarter of those it kept: a compile makes millions
+            # (its traces, its lowered programs' Python side), so the first full collection after it walked
+            # them all inside the loop, 0.75 to 0.9 s at a step of the 4B (row 6739). Collected
+            # here, where the step is compiled, each later one waits for the run to make a quarter as many.
+            gc.collect()
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
+            run.signatures[signature] = signature_digest(signature)
             self._report(StepCompiled(seconds, recompute_record(self.objective), links, self.memory,
-                                      self.plan), int(trials.state.step) if reported is None else reported)
+                                      self.plan, run.signatures[signature]),
+                         int(trials.state.step) if reported is None else reported)
             self._unproven = True
+        # The step compiled for this batch's signature, which a profile window that stops after it names.
+        run.signature = run.signatures.get(signature)
         return (*compiled[signature], trials.state)
 
     def _saved_checkpoint(
@@ -2228,8 +2335,10 @@ class Trainer(Generic[Loss, Effects]):
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         envelope = self._checkpoint_envelope(state, position, interval, run, weights_only=weights_only)
+        # The run holds the tokenizer its declaration states the files of (`Checkpoints.save`).
         write = functools.partial(checkpoints.save, step, metrics=metadata, ranking=ranking,
-                                  weights_only=weights_only, **envelope)
+                                  weights_only=weights_only, tokenizer=self.objective.run_tokenizer(),
+                                  **envelope)
         with run.outside_window(), run.held():
             self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step, resumable=not weights_only)
@@ -2332,7 +2441,8 @@ class Trainer(Generic[Loss, Effects]):
                 if jax.process_index() == 0:
                     wall = time.perf_counter() - run.started
                     # A run that logged no step reports its start here (`Startup.scalars`).
-                    scalars = {**goodput(wall, run.first_step, run.other), **run.startup.scalars()}
+                    scalars = {**goodput(wall, run.first_step, run.other),
+                               **run.startup.scalars()}
                     self._display.summary(run.current, wall, scalars,
                                           None if run.loss is None else float(jax.device_get(run.loss)))
                     if self.tracker is not None:

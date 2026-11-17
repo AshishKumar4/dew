@@ -26,7 +26,7 @@ from dew.data.dataset import Loader, rows_of, take_batch
 from dew.data.text import ByteTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.inputs import DecisionInputs
-from dew.decision.layout import Specials, StateFirstLayout
+from dew.decision.layout import SegmentLayout, Specials
 from dew.decision.objective import DecisionObjective
 from dew.diffusion import presets
 from dew.distributed.batches import DevicePrefetchIterator
@@ -473,7 +473,7 @@ def test_decision_objective_supplies_the_layout_geometry_to_the_head():
     objective = DecisionObjective(model, head=head, tokenizer=ByteTokenizer(),
                                   specials=Specials(begin=None, separator=10, marker=0,
                                                     marker_text="\x00", pad=255),
-                                  layout=StateFirstLayout(max_len=16))
+                                  layout=SegmentLayout.state_first_row(max_len=16))
     batch = {**packed_windows(), "questions": np.array([[True, False], [True, True]]),
              "options": np.array([[[True, True, False], [False, False, False]],
                                   [[True, True, True], [True, True, True]]])}
@@ -513,7 +513,7 @@ def test_adapted_decision_backbone_counts_training_work_without_claiming_an_lm_h
     objective = DecisionObjective(adapter, head=head, tokenizer=ByteTokenizer(),
                                   specials=Specials(begin=None, separator=10, marker=0,
                                                     marker_text="\x00", pad=255),
-                                  layout=StateFirstLayout(max_len=8))
+                                  layout=SegmentLayout.state_first_row(max_len=8))
     batch = {**packed_windows(questions=1), "questions": np.ones((2, 1), bool),
              "options": np.ones((2, 1, 2), bool)}
     frozen = 4 * 8 * 8 * np.sum(LENGTHS)

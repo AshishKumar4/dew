@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     from flax.training.dynamic_scale import DynamicScale
 
     from dew.data.dataset import DataPartition
+    from dew.data.text import Tokenizer
     from dew.state import Accumulation, TrainState
 
 # One field of the train state as a checkpoint holds it: a scalar array, a
@@ -712,6 +713,44 @@ def _occupancy_unsaved(template, metadata):
     if stored is None or "fill" in stored:
         return template
     return template.with_window(dataclasses.replace(template.window, fill=None))
+
+
+def _clip_pooled_unsaved(template, metadata):
+    """A restore's `template`, a train state's, whose QK-Clip states hold their held microsteps' pooled
+    maxima (`dew.optim.QKClipState.pooled`), where the checkpoint was saved before the state held them:
+    each such leaf made as no microstep held back (zero), which every such checkpoint's run held none of
+    (its trainer refused a clip under a held update), so the restore keeps it as made. The one translation
+    of that form at the restore boundary (CONTRIBUTING), deleted at 1.0. Any other template as it is."""
+    from dew.optim import QKClipState, clips_qk
+    from dew.state import TrainState
+
+    if not isinstance(template, TrainState) or not clips_qk(template.opt_state):
+        return template
+    if not _clip_states_unpooled(metadata.get("opt_state")):
+        return template
+
+    def made(leaf):
+        held = jnp.zeros(leaf.shape, leaf.dtype)
+        return held if leaf.sharding is None else jax.device_put(held, leaf.sharding)
+
+    def unpooled(state):
+        if not isinstance(state, QKClipState):
+            return state
+        return state._replace(pooled={key: made(leaf) for key, leaf in state.pooled.items()})
+
+    return dataclasses.replace(template, opt_state=jax.tree.map(
+        unpooled, template.opt_state, is_leaf=lambda node: isinstance(node, QKClipState)))
+
+
+def _clip_states_unpooled(tree) -> bool:
+    """Whether a checkpoint's optimizer-state metadata `tree` holds a QK-Clip state of the form before its
+    pooled maxima: its steps and rescales with no `pooled` beside them, as Orbax names a NamedTuple's
+    fields."""
+    if isinstance(tree, Mapping):
+        if {"steps", "rescales"} <= tree.keys() and "pooled" not in tree:
+            return True
+        return any(_clip_states_unpooled(value) for value in tree.values())
+    return isinstance(tree, list | tuple) and any(_clip_states_unpooled(value) for value in tree)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1322,6 +1361,14 @@ class Checkpoints:
             return f"{holder} (a replica)"
         return self.local_path
 
+    def _hold(self, artifact: JSON, tokenizer: Tokenizer | None) -> None:
+        """The run holding `tokenizer`, where given, as `artifact`, a step's inference declaration, states
+        it (`dew.inference.tasks.hold_tokenizer`)."""
+        if tokenizer is not None:
+            from dew.inference.tasks import hold_tokenizer
+
+            hold_tokenizer(artifact, self.directory, tokenizer)
+
     def save(
         self,
         step: int,
@@ -1338,9 +1385,12 @@ class Checkpoints:
         artifact: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
         rollout: Mapping[str, object] | None = None,
+        tokenizer: Tokenizer | None = None,
     ) -> None:
         """Write `state` under `step`, asynchronously, a train state with its rollout's tree of arrays where
-        it holds one (`rollout`), which `rollout_state` reads back.
+        it holds one (`rollout`), which `rollout_state` reads back, and the run holding `tokenizer`, where
+        given, the one the step's inference declaration (`artifact`) states the files of, before the step is
+        written (`dew.inference.tasks.hold_tokenizer`): a committed step's tokenizer is in its run.
 
         `state` is a run's `TrainState`, or a mapping of arrays in its place
         for a state that is not a training run's, such as a simulation's,
@@ -1378,9 +1428,11 @@ class Checkpoints:
         mapping = isinstance(state, Mapping)
         if not mapping:
             self._identify_run()
+            # A run's trainer hands its objective's tokenizer (`Trainer`); a direct save holds none.
+            self._hold(artifact, tokenizer)
         if mapping:
             if (saved is not None or share is not None or weights_only or rung is not None
-                    or artifact is not None or rollout is not None):
+                    or artifact is not None or rollout is not None or tokenizer is not None):
                 raise ValueError("a mapping is saved as it is: it takes no data position, share, "
                                  "weights-only split, rung, artifact or rollout, which a train state's save "
                                  "records")
@@ -2068,7 +2120,7 @@ class Checkpoints:
         stored = metadata.keys()
         _check_template(template, metadata, stored, mapping=mapping)
         placed = template
-        template = _occupancy_unsaved(template, metadata)
+        template = _clip_pooled_unsaved(_occupancy_unsaved(template, metadata), metadata)
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None
         if template is None:

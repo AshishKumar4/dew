@@ -26,7 +26,7 @@ import itertools
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Annotated, Literal, NamedTuple
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -49,7 +49,7 @@ from dew._schedule_pieces import (
     ramp,
 )
 from dew.gauss_newton import gauss_newton, solved_directions
-from dew.held_updates import holds_state, refuse_untold, update_applied
+from dew.held_updates import holds_state, input_taken, refuse_untold, update_applied
 from dew.laprop import laprop
 from dew.mesh import LogicalAxes
 from dew.newton_schulz import (
@@ -75,9 +75,11 @@ from dew.registry import Aliases, JsonDict, from_record, record_argument, schedu
 HEAD_AXES = frozenset({'heads', 'head_dim', 'kv'})
 
 # An expert dimension stacks whole matrices, one per expert, so it is a batch
-# axis. It names neither side, and optax orthogonalizes each expert on its
-# own (optax/contrib/_muon.py:56-74).
-BATCH_AXES = frozenset({'exp'})
+# axis, as a block-diagonal kernel's group dimension is ('groups', DeepSeek
+# V4's grouped output projection). Each names neither side, and optax
+# orthogonalizes each expert or group on its own (optax/contrib/_muon.py:56-74).
+# No rule shards 'groups', so a group stack stays whole on every device.
+BATCH_AXES = frozenset({'exp', 'groups'})
 
 # A parameter that maps into or out of a discrete index is a lookup, so AdamW
 # keeps the embeddings, the head and the router
@@ -232,9 +234,18 @@ def _placement(path: jax.tree_util.KeyPath, param,
         sides = _matrix_sides(named)
         if sides is not None:
             return _shifted(optax.contrib.MuonDimensionNumbers(*sides), stacked), "muon"
+        # Its stacking axes set aside (`BATCH_AXES`: a group stack), two dimensions declared on one side
+        # (('groups', 'attention', None), DeepSeek V4's grouped output projection) are each stacked
+        # matrix as its two dimensions make it, as an undeclared one is: contracted into the output side.
+        matrix = [dimension for dimension, name in enumerate(named) if name not in BATCH_AXES]
+        if len(matrix) == 2 and len(matrix) < len(named):
+            return _shifted(optax.contrib.MuonDimensionNumbers((matrix[0],), (matrix[1],)), stacked), "muon"
     if rank == 3 and param.shape[stacked + 1] == 1:
         return None, "adamw: a per-channel filter, [channels, 1, taps], a vector a channel"
-    if named is not None:
+    # A matrix whose declaration names one side (`('embed', None)`, a projection the rules shard on one
+    # side and leave whole on the other) is the matrix its rank makes it, as an undeclared one is: two
+    # dimensions are one contracted side and one output side whatever the declaration names.
+    if named is not None and rank > 2:
         raise ValueError(
             f"{jax.tree_util.keystr(path)} is declared {named}, which is not one contracted side and one "
             "output side, so Muon cannot tell what its matrix is. An axis that stacks matrices rather "
@@ -560,10 +571,106 @@ def _qk_normed(params) -> set[tuple[str, ...]]:
     return layers
 
 
-def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tree_util.KeyPath,
-               param: jax.Array) -> jax.Array:
+@dataclasses.dataclass(frozen=True)
+class _ClipLayer:
+    """What one query or key leaf's clip reads of its layer's sown collection (`_ClipLayer.of`): its
+    projection's name, its heads' largest logits (`s_max`), the leaf's width and dtype at float32 or wider,
+    and the latent no-positional width or the key-head count and head width its layer sowed."""
+
+    names: tuple[str, ...]
+    projection: str
+    s_max: jax.Array
+    last: int
+    wide: Any
+    nope: jax.Array | None
+    kv_heads: jax.Array | None
+    head_dim: jax.Array | None
+
+    @property
+    def heads(self) -> int:
+        return self.s_max.shape[0]
+
+    @staticmethod
+    def of(qk_stats, normed: set[tuple[str, ...]], path: jax.tree_util.KeyPath, param) -> _ClipLayer:
+        names = _dict_names(path)
+        if names[:-2] in normed:
+            raise ValueError(
+                f"QK-Clip reaches {'.'.join(names)}, whose layer norms its queries and keys: the "
+                "norm divides the kernels' scale back out of the logits, so the clip cannot bound "
+                "them. Train this model with 'muon', or build it with qk_norm=False")
+        node = qk_stats
+        for name in names[:-2]:
+            node = node.get(name) if isinstance(node, Mapping) else None
+            if node is None:
+                break
+        logged = _sown(node, 'max_logits')
+        if logged is None:
+            raise ValueError(
+                f"QK-Clip reaches {'.'.join(names)} but its layer sowed no max "
+                f"logits; the model has to sow them under the {QK!r} collection "
+                "for the clip to know what fires")
+        # Float32 or wider, the leaf's: a float32 or bf16 run's clip is float32 as ever, and a float64
+        # read of it computes it in float64.
+        wide = at_least_fp32(param.dtype)
+        logged = jnp.asarray(logged)
+        s_max = jnp.max(logged.astype(jnp.promote_types(wide, at_least_fp32(logged.dtype))), axis=0)
+        heads = s_max.shape[0]
+        last = param.shape[-1]
+        if last % heads:
+            raise ValueError(
+                f"QK-Clip cannot split {'.'.join(names)} of width {last} into "
+                f"{heads} heads")
+        return _ClipLayer(names, names[-2], s_max, last, wide, _sown(node, 'qk_nope'),
+                          _sown(node, 'kv_heads'), _sown(node, 'head_dim'))
+
+    @property
+    def per_head(self) -> bool:
+        """Whether the leaf rescales per head: a latent query or key projection (MaxText's clip), where
+        every other rescales per query group (Megatron Core's)."""
+        return self.projection == 'kv_b_proj' or (self.projection in ('q_proj', 'q_b_proj')
+                                                  and self.nope is not None)
+
+    @property
+    def guard(self) -> float:
+        """The rescale's guard (`_clip_scale`): MaxText's where the layer sowed a latent width, else none."""
+        return 1e-6 if self.nope is not None else 0.0
+
+    def grouped(self) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Each query head's group, h // (heads / kv_heads), the grouping the kernels repeat the keys over,
+        with the key-head count and head width the layer sowed; `kv_heads` stays a traced value, so only
+        the shapes are static. Refused where the layer sowed neither."""
+        if self.kv_heads is None or self.head_dim is None:
+            raise ValueError(
+                f"QK-Clip reaches {'.'.join(self.names)} with no key-head count or head width "
+                "sowed; a query or key projection needs its layer's 'kv_heads' and 'head_dim'")
+        return jnp.arange(self.heads) // (self.heads // self.kv_heads), self.kv_heads, self.head_dim
+
+    def latent(self) -> jax.Array:
+        """The no-positional width a latent projection's layer sowed (`per_head`'s)."""
+        if self.nope is None:
+            raise ValueError(
+                f"QK-Clip reaches {'.'.join(self.names)} with no nope width sowed; "
+                "a latent key projection needs its layer's 'qk_nope'")
+        return self.nope
+
+
+def _leaf_maxima(layer: _ClipLayer) -> jax.Array:
+    """The logit maxima a query or key leaf's rescale reads, one a column of its last axis: its head's
+    largest where the leaf rescales per head or is a grouped query projection, its key head's group's
+    largest for a grouped key projection. The rescale falls as its maximum rises (`_clip_scale`, each gamma
+    of it, a group's least scale), so the rescale of the largest of several steps' maxima is the least of
+    their rescales, bit for bit: the maxima of the microsteps an update held back pool by their largest
+    (`pooled_update`)."""
+    if layer.per_head or layer.projection in ('q_proj', 'q_b_proj'):
+        return _columns(layer.s_max, layer.heads, layer.last, layer.s_max.dtype)
+    groups, kv_heads, _ = layer.grouped()
+    grouped = jax.ops.segment_max(layer.s_max, groups, num_segments=layer.heads)
+    return grouped[jnp.arange(layer.last) // (layer.last // kv_heads)]
+
+
+def _leaf_rescale(layer: _ClipLayer, maxima: jax.Array, tau) -> jax.Array:
     """QK-Clip's post-step rescale of one query or key leaf (`_rescales` picks them), a factor a
-    column of its last axis (`_columns`).
+    column of its last axis (`_columns`), from the logit `maxima` its columns read (`_leaf_maxima`).
 
     The clip acts on the weights after the step, `gamma * (W + update)`, and the step applies it
     there (`stepped`): an update that would land on it, `(gamma - 1) * W + gamma * update`, rounds at
@@ -589,73 +696,34 @@ def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tre
     logit, and the paper rescales the query and key weights alone. Latent
     attention rescales per head instead, the rope slice of its query by the
     full gamma."""
-    names = _dict_names(path)
-    if names[:-2] in normed:
-        raise ValueError(
-            f"QK-Clip reaches {'.'.join(names)}, whose layer norms its queries and keys: the "
-            "norm divides the kernels' scale back out of the logits, so the clip cannot bound "
-            "them. Train this model with 'muon', or build it with qk_norm=False")
-    node = qk_stats
-    for name in names[:-2]:
-        node = node.get(name) if isinstance(node, Mapping) else None
-        if node is None:
-            break
-    logged = _sown(node, 'max_logits')
-    if logged is None:
-        raise ValueError(
-            f"QK-Clip reaches {'.'.join(names)} but its layer sowed no max "
-            f"logits; the model has to sow them under the {QK!r} collection "
-            "for the clip to know what fires")
-    # Float32 or wider, the leaf's: a float32 or bf16 run's clip is float32 as ever, and a float64
-    # read of it computes it in float64.
-    wide = at_least_fp32(param.dtype)
-    logged = jnp.asarray(logged)
-    s_max = jnp.max(logged.astype(jnp.promote_types(wide, at_least_fp32(logged.dtype))), axis=0)
-    heads = s_max.shape[0]
-    last = param.shape[-1]
-    if last % heads:
-        raise ValueError(
-            f"QK-Clip cannot split {'.'.join(names)} of width {last} into "
-            f"{heads} heads")
-    proj = names[-2]
-    nope = _sown(node, 'qk_nope')
-    # Latent attention is MaxText's clip, with its guard; grouped attention is Megatron Core's, without.
-    scale = _clip_scale(s_max, tau, 1e-6 if nope is not None else 0.0)
-    if proj in ('q_proj', 'q_b_proj') and nope is not None:
-        return _columns(_mla_query_gamma(scale, nope, last // heads), heads, last, wide)
-    if proj == 'kv_b_proj':
-        if nope is None:
-            raise ValueError(
-                f"QK-Clip reaches {'.'.join(names)} with no nope width sowed; "
-                "a latent key projection needs its layer's 'qk_nope'")
-        return _columns(_mla_key_gamma(scale, nope, last // heads), heads, last, wide)
-    kv_heads, head_dim = _sown(node, 'kv_heads'), _sown(node, 'head_dim')
-    if kv_heads is None or head_dim is None:
-        raise ValueError(
-            f"QK-Clip reaches {'.'.join(names)} with no key-head count or head width "
-            "sowed; a query or key projection needs its layer's 'kv_heads' and 'head_dim'")
-    # Query head h is in group h // (heads / kv_heads), the grouping the
-    # kernels repeat the keys over, and group g's rescale lands at index g.
-    # `kv_heads` stays a traced value, so only the shapes are static.
-    groups = jnp.arange(heads) // (heads // kv_heads)
-    grouped = jax.ops.segment_min(scale, groups, num_segments=heads)
-    if proj in ('q_proj', 'q_b_proj'):
-        query = jnp.arange(last // heads)[None, :] < head_dim
-        gamma = jnp.where(query, jnp.sqrt(grouped[groups])[:, None], jnp.ones((), scale.dtype))
+    heads, last, wide = layer.heads, layer.last, layer.wide
+    if layer.per_head:
+        scale = _clip_scale(maxima.reshape(heads, -1)[:, 0], tau, layer.guard)
+        gamma = (_mla_key_gamma if layer.projection == 'kv_b_proj' else _mla_query_gamma)(
+            scale, layer.latent(), last // heads)
         return _columns(gamma, heads, last, wide)
-    columns = jnp.arange(last) // (last // kv_heads)
-    return jnp.sqrt(grouped[columns]).astype(wide)
+    if layer.projection in ('q_proj', 'q_b_proj'):
+        groups, _, head_dim = layer.grouped()
+        largest = jax.ops.segment_max(maxima.reshape(heads, -1)[:, 0], groups, num_segments=heads)
+        grouped = _clip_scale(largest, tau, layer.guard)
+        query = jnp.arange(last // heads)[None, :] < head_dim
+        gamma = jnp.where(query, jnp.sqrt(grouped[groups])[:, None], jnp.ones((), grouped.dtype))
+        return _columns(gamma, heads, last, wide)
+    return jnp.sqrt(_clip_scale(maxima, tau, layer.guard)).astype(wide)
 
 
 class QKClipState(NamedTuple):
-    """The rescale QK-Clip leaves for the stepped weights (`stepped`): the updates the clip has taken
-    part in, `steps`, and each query and key leaf's factor a column of its last axis by its path,
-    every factor one before the first update or where no maxima were sown, so the state keeps one
-    structure. A stage-local run's leaf holds one entry a stored layer, by the layer's path
-    (`layers_of`), as an unstacked tree holds it."""
+    """The rescale QK-Clip leaves for the stepped weights (`stepped`): the updates the clip has taken part in,
+    `steps`, and each query and key leaf's factor a column of its last axis by its path, every factor one
+    before the first update or where no maxima were sown, so the state keeps one structure; and the logit
+    maxima its columns read (`_leaf_maxima`) of the microsteps an update held back so far (`pooled`,
+    `pooled_update`; zero where none was), which the update that applies them takes with its own. A
+    stage-local run's leaf holds one entry a stored layer, by the layer's path (`layers_of`), as an unstacked
+    tree holds it."""
 
     steps: jax.Array
     rescales: Mapping[str, jax.Array]
+    pooled: Mapping[str, jax.Array]
 
 
 class BoundsState(NamedTuple):
@@ -687,38 +755,100 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
     sowed, which a run asks its objective for when its optimizer's state
     holds this transform's (`clips_qk`) and forwards from the loss's `Aux`,
     refusing a step whose objective returns none. Called without them, as a
-    loop of plain optax calls may, the transform steps aside."""
+    loop of plain optax calls may, the transform steps aside.
+
+    Inside a wrapper that holds its update back over several calls (`optax.MultiSteps`, which runs the
+    clip at the window's last alone; `optax.apply_every`, which runs it every call and zeroes all updates
+    but the window's last), the trainer's commit pools each call's maxima in the clip's state
+    (`pooled_update`), so the update is clipped by the largest logits of every microstep it trained on."""
     if tau <= 0:
         raise ValueError(f"the clip threshold bounds positive logits, got {tau}")
 
     def init_fn(params) -> QKClipState:
-        return QKClipState(jnp.zeros([], jnp.int32), _rescales(params, None, tau))
+        return QKClipState(jnp.zeros([], jnp.int32), _rescales(params, None, tau, None),
+                           _unpooled(params))
 
     def update_fn(updates, state, params=None, qk_stats=None, **extra_args):
         del extra_args
         if params is None:
             return updates, state
         return updates, state._replace(steps=optax.safe_increment(state.steps),
-                                       rescales=_rescales(params, qk_stats, tau))
+                                       rescales=_rescales(params, qk_stats, tau, state.pooled))
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
-def _rescales(params, qk_stats, tau: float) -> dict[str, jax.Array]:
-    """Each query and key leaf's factor a column by its path (`_clip_leaf`), every factor one where no
-    maxima were sown, so the state has one structure from its first step to its last."""
-    normed = _qk_normed(params) if qk_stats is not None else set()
-    held = {}
+def pooled_update(update: Callable[[optax.OptState], tuple], opt_state, params, qk_stats) -> tuple:
+    """`update(opt_state)`, a call of an optimizer that may hold its update back over several calls, with
+    this call's attention logit maxima (`qk_stats`, over `params`) pooled in every QK-Clip state it holds,
+    however the optimizer composes the clip: before it, each leaf the state holds (a clip a partition
+    masks holds its group's alone) pools the largest of its maxima and this call's (`_leaf_maxima`), which
+    the clip's update takes with its own; after it, the pool is emptied where the call applied an update
+    (`held_updates.update_applied`), and is as it was before the call where the wrapper skipped its input
+    (`held_updates.input_taken`: a microstep `optax.MultiSteps` rejects trains nothing, so its logits clip
+    nothing). The one thing a step's commit calls for the clip: the update that applies is clipped by the
+    maxima of every microstep it trained on, whether the wrapper runs the clip at the window's last call
+    alone (`optax.MultiSteps`) or every call (`optax.apply_every`)."""
+    def is_clip(node) -> bool:
+        return isinstance(node, QKClipState)
+
+    def fold(state):
+        if not is_clip(state):
+            return state
+        normed = _qk_normed(params)
+        maxima = {key: jnp.maximum(state.pooled[key],
+                                   _leaf_maxima(_ClipLayer.of(qk_stats, normed, layer, param))
+                                   ).astype(state.pooled[key].dtype)
+                  for key, layer, param in _clipped(params) if key in state.pooled}
+        return state._replace(pooled=maxima)
+
+    updates, after = update(jax.tree.map(fold, opt_state, is_leaf=is_clip))
+    applied, taken = update_applied(opt_state, after), input_taken(opt_state, after)
+
+    def settled(before, state):
+        if not is_clip(state):
+            return state
+        return state._replace(pooled={
+            key: jnp.where(applied, jnp.zeros_like(held), jnp.where(taken, held, before.pooled[key]))
+            for key, held in state.pooled.items()})
+
+    return updates, jax.tree.map(settled, opt_state, after, is_leaf=is_clip)
+
+
+def _clipped(params):
+    """Each query and key leaf the clip rescales (`QK_PROJECTIONS`), by its key in the clip's state, its
+    path and the leaf: a stage-local run's leaf once a stored layer, each clipped by its own layer's
+    maxima (`layers_of`)."""
     for path, param in jax.tree_util.tree_leaves_with_path(params):
         names = _dict_names(path)
         if len(names) < 2 or names[-1] not in ('kernel', 'bias') or names[-2] not in QK_PROJECTIONS:
             continue
-        # A stage-local run's leaf is its stored layers', each clipped by its own layer's maxima.
         for layer in layers_of(path)[0]:
-            held[jax.tree_util.keystr(layer)] = (
-                jnp.ones(param.shape[-1], at_least_fp32(param.dtype)) if qk_stats is None
-                else _clip_leaf(qk_stats, tau, normed, layer, param))
+            yield jax.tree_util.keystr(layer), layer, param
+
+
+def _rescales(params, qk_stats, tau, pooled) -> dict[str, jax.Array]:
+    """Each query and key leaf's factor a column by its key (`_leaf_rescale`), from the logit maxima its
+    columns read, this call's and the `pooled` ones of the calls its update held back (`pooled_update`); every
+    factor one where no maxima were sown, so the state has one structure from its first step to its
+    last."""
+    if qk_stats is None:
+        return {key: jnp.ones(param.shape[-1], at_least_fp32(param.dtype))
+                for key, _, param in _clipped(params)}
+    normed = _qk_normed(params)
+    held = {}
+    for key, layer, param in _clipped(params):
+        clip = _ClipLayer.of(qk_stats, normed, layer, param)
+        held[key] = _leaf_rescale(clip, jnp.maximum(pooled[key], _leaf_maxima(clip)), tau)
     return held
+
+
+def _unpooled(params) -> dict[str, jax.Array]:
+    """No maxima pooled yet (`QKClipState.pooled`): zero a column of each query and key leaf, which clips
+    nothing, as no maximum at or below zero does (`_clip_scale`), so a logit's largest taken with it rescales
+    as itself, bit for bit, and the state stays finite, as every checkpointed state must."""
+    return {key: jnp.zeros(param.shape[-1], at_least_fp32(param.dtype))
+            for key, _, param in _clipped(params)}
 
 
 POST_STEP = (QKClipState, BoundsState)
@@ -744,10 +874,13 @@ def stepped(params, updates, before, after, order: Sequence[tuple]):
     state from `before` to `after`, in the chain's `order` (`post_step_order`): QK-Clip's rescale
     (`QKClipState`), one rounding of `gamma * (W + update)`, and a bounded group's clamp (`BoundsState`),
     exact. The weights a step stores, and the only way to form them (the trainer's transaction,
-    `power_profiles`' averages). An effect whose transform the update did not run, a group a mask left out
-    or an update a wrapper deferred or rejected (`optax.MultiSteps`, `optax.apply_if_finite`), whose state
-    comes back as it was, leaves the weights as the update moved them."""
+    `power_profiles`' averages). An effect acts where its transform ran and the call applied an update
+    (`held_updates.update_applied`): a group a mask left out, an update a wrapper deferred or rejected
+    (`optax.MultiSteps`, `optax.apply_if_finite`, whose state comes back as it was), or a call whose update
+    a wrapper zeroes while its transforms run (`optax.apply_every`, row 7262) leaves the weights as the
+    update moved them."""
     moved = optax.apply_updates(params, updates)
+    applied = update_applied(before, after)
     # Either state may hold a named chain sorted by name: effects pair by their paths, in the chain's order.
     previous, current = dict(_post_step_effects(before)), dict(_post_step_effects(after))
     pairs = [(previous[path], current[path]) for path in order]
@@ -761,7 +894,7 @@ def stepped(params, updates, before, after, order: Sequence[tuple]):
         layers, stacked = layers_of(path)
         entries[jax.tree_util.keystr(path)] = ([jax.tree_util.keystr(layer) for layer in layers], stacked)
     for previous, current in pairs:
-        taken = current.steps != previous.steps
+        taken = (current.steps != previous.steps) & applied
         acted = current.rescales if isinstance(current, QKClipState) else current.bounds
         lacking = acted.keys() - {entry for layers, _ in entries.values() for entry in layers}
         if lacking:
@@ -1062,10 +1195,12 @@ def scale_by_trust_ratio(min_norm: float = 0.0, trust_coefficient: float = 1.0,
         def scaled(path, update, param):
             stacked = layers_of(path)[1]
             param_norm, update_norm = (layer_norms(leaf, stacked, min_norm) for leaf in (param, update))
-            ratio = trust_coefficient * param_norm / (update_norm + eps)
+            # The update over its own norm, then the parameters' norm: the ratio's product with no quotient of
+            # two norms formed first, which passes float32 where a backend keeps an update's subnormal
+            # squares (a norm near 1e-22 beside one near 1e19).
+            scaled = update / (update_norm + eps) * (trust_coefficient * param_norm)
             # A layer whose parameters or update are zero would never move: it keeps its update.
-            return update * jnp.where((param_norm == 0.0) | (update_norm == 0.0),
-                                      jnp.array(1.0, param.dtype), ratio)
+            return jnp.where((param_norm == 0.0) | (update_norm == 0.0), update, scaled)
         return jax.tree_util.tree_map_with_path(scaled, updates, params), state
 
     return optax.GradientTransformation(optax.init_empty_state, update_fn)

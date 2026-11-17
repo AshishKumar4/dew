@@ -23,7 +23,7 @@ from dew.decision import Choice, Decide, Example, Noul
 from dew.decision.config import DecisionRunConfig, Letters
 from dew.decision.data import GroupedExamples, decisions
 from dew.decision.head import DecisionHead
-from dew.decision.layout import Labels, MarkerLayout, Specials, StateFirstLayout
+from dew.decision.layout import Labels, SegmentLayout, Specials
 from dew.decision.rows import Fit, _none_of_the_above
 
 LAYA = {"head_max_len": 192, "option_tokens": 48}
@@ -70,7 +70,8 @@ def test_a_fresh_lettered_row_holds_every_option_of_a_large_question_whole(token
     others, nothing of the question is counted cut, and the state takes what the question leaves of
     max_len, its cut counted."""
     labels = Labels().spelled(tokenizer, count)
-    layout = (StateFirstLayout if first == "state" else MarkerLayout)(max_len=2048, labels=labels)
+    layout = (SegmentLayout.state_first_row if first == "state" else SegmentLayout.marker_row)(max_len=2048,
+                                                                                               labels=labels)
     question = intents(count)
     [row] = layout.rows(tokenizer, Specials.of(tokenizer), STATE, {"intent": question})
     names = labels.names_for(count)
@@ -85,7 +86,7 @@ def test_a_fresh_lettered_row_holds_every_option_of_a_large_question_whole(token
 def test_a_fresh_marker_row_holds_every_option_of_a_large_question_whole(tokenizer, count):
     """A fresh marker layout, a bidirectional backbone's, holds every option of a question of 77 or 151
     intents whole, each its own text before its marker, and nothing of the question is counted cut."""
-    layout = MarkerLayout(max_len=2048)
+    layout = SegmentLayout.marker_row(max_len=2048)
     question = intents(count)
     [row] = layout.rows(tokenizer, Specials.of(tokenizer), STATE, {"intent": question})
     markers = [start for start, _ in row.questions[0].options]
@@ -100,8 +101,8 @@ def test_a_fresh_marker_row_holds_every_option_of_a_large_question_whole(tokeniz
 def test_a_question_that_alone_passes_max_len_is_refused_as_unfit_never_cut(tokenizer):
     """A question of 151 intents in a row of 256 tokens is laid out whole and refused as unfit, by
     training and a server alike (`Layout.refusal`), never cut to fit."""
-    lettered = StateFirstLayout(max_len=256, labels=Labels().spelled(tokenizer, 151))
-    for layout in (lettered, MarkerLayout(max_len=256)):
+    lettered = SegmentLayout.state_first_row(max_len=256, labels=Labels().spelled(tokenizer, 151))
+    for layout in (lettered, SegmentLayout.marker_row(max_len=256)):
         [row] = layout.rows(tokenizer, Specials.of(tokenizer), "short", {"intent": intents(151)})
         assert layout.refusal(row) == "unfit" and not row.trimmed and len(row.questions[0].options) == 151
 
@@ -112,14 +113,14 @@ def test_a_declared_budget_counts_each_cut_and_refuses_a_cut_that_leaves_options
     read alike. A question of three long options under the same budgets keeps them apart, cut to 48
     tokens each and counted, and is laid out."""
     labels = Labels().spelled(tokenizer, 151)
-    declared = StateFirstLayout(max_len=2048, labels=labels, **LAYA)
+    declared = SegmentLayout.state_first_row(max_len=2048, labels=labels, **LAYA)
     [cut] = declared.rows(tokenizer, Specials.of(tokenizer), "short", {"intent": intents(151)})
     assert cut.options_cut > 0 and cut.options_alike and declared.refusal(cut) == "options_alike"
     long = Choice("Which team handles it?", {
         team: f"{team} handles " + " and ".join(f"{team} matter number {index}" for index in range(30))
         for team in ("billing", "technical", "sales")})
     [kept] = declared.rows(tokenizer, Specials.of(tokenizer), "short", {"team": long})
-    whole = StateFirstLayout(max_len=8192, labels=labels)
+    whole = SegmentLayout.state_first_row(max_len=8192, labels=labels)
     whole_lines = whole.rows(tokenizer, Specials.of(tokenizer), "short", {"team": long})[0]
     assert kept.options_cut == sum(end - start for start, end in whole_lines.questions[0].options) - sum(
         end - start for start, end in kept.questions[0].options) > 0
@@ -134,7 +135,7 @@ def test_fit_counts_each_cut_by_kind_and_none_where_the_question_is_whole():
     questions = {"q": Choice("Choose the banking intent", {
         f"intent_{index}": f"the full meaning of banking intent {index}" for index in range(77)})}
     example = Example("the state", questions, {"q": "intent_0"})
-    fresh = StateFirstLayout(max_len=6144, labels=BYTE_LABELS)
+    fresh = SegmentLayout.state_first_row(max_len=6144, labels=BYTE_LABELS)
     whole = Fit(fresh, BYTES, BYTE_SPECIALS, DecisionHead(64)).map({"example": example})
     assert whole["_dew_cut"] == {}
     declared = dataclasses.replace(fresh, head_max_len=4096, option_tokens=24)
@@ -165,7 +166,7 @@ def test_a_refused_row_keeps_the_cut_that_refused_it_beside_its_records_earlier_
     from dew.data.compile import compile
     from dew.data.pipeline import ObjectiveData
 
-    layout = StateFirstLayout(max_len=512, labels=BYTE_LABELS, option_tokens=8)
+    layout = SegmentLayout.state_first_row(max_len=512, labels=BYTE_LABELS, option_tokens=8)
     [apart] = layout.rows(BYTES, BYTE_SPECIALS, APART.state, APART.questions)
     [alike] = layout.rows(BYTES, BYTE_SPECIALS, ALIKE.state, ALIKE.questions)
     assert layout.refusal(apart) is None and layout.refusal(alike) == "options_alike"
@@ -210,9 +211,9 @@ def test_a_context_no_cross_attention_reads_counts_as_a_cut_of_it():
     from dew.decision.layout import context_tokens
 
     example = Example("short", {"q": Choice("Pick", ["a", "b"])}, {"q": "a"}, context="the account history")
-    layout = StateFirstLayout(max_len=128, labels=BYTE_LABELS)
+    layout = SegmentLayout.state_first_row(max_len=128, labels=BYTE_LABELS)
     fitted = Fit(layout, BYTES, BYTE_SPECIALS, DecisionHead(64)).map({"example": example})
-    unread = len(context_tokens(BYTES, "the account history", None))
+    unread = len(context_tokens(BYTES, "the account history"))
     assert unread > 0 and fitted["_dew_cut"]["context"] == (1, unread)
 
 
@@ -251,7 +252,7 @@ def test_a_choice_of_fewer_options_than_its_floor_draws_no_none_of_the_above():
     two = Choice("Is it on?", ["yes", "no"])
     three = Choice("Which colour?", ["red", "green", "blue"])
     example = Example("the lamp", {"two": two, "three": three}, {"two": "yes", "three": "red"})
-    layout = MarkerLayout(max_len=256)
+    layout = SegmentLayout.marker_row(max_len=256)
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
                                  max_seq_len=256, attention_impl="xla")
 
@@ -289,7 +290,7 @@ def test_a_yes_or_no_draws_no_none_of_the_above_by_default_and_a_recorded_run_ke
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
                                  max_seq_len=256, attention_impl="xla")
     objective = DecisionObjective(backbone, tokenizer=BYTES, specials=BYTE_SPECIALS,
-                                  layout=MarkerLayout(max_len=256), none_of_the_above=1.0)
+                                  layout=SegmentLayout.marker_row(max_len=256), none_of_the_above=1.0)
     fit, expand, configured = objective.data().train
     assert isinstance(expand, QuestionRows)
     read = configured.factory({"slots": {"options": 3, "questions": 1}})
@@ -331,8 +332,8 @@ def test_a_none_of_the_above_draw_never_leaves_a_row_unfit():
     # The question with the option added takes 95 tokens with no state, with it in place of "abca" 89: the
     # window holds the latter with its state whole, which no draw may cut further than Fit admitted it.
     replaced, _ = _none_of_the_above(question, 0, drop=True)
-    [whole] = MarkerLayout(max_len=256).rows(BYTES, BYTE_SPECIALS, example.state, {"q": replaced})
-    layout = MarkerLayout(max_len=len(whole.tokens))
+    [whole] = SegmentLayout.marker_row(max_len=256).rows(BYTES, BYTE_SPECIALS, example.state, {"q": replaced})
+    layout = SegmentLayout.marker_row(max_len=len(whole.tokens))
     [admitted] = layout.rows(BYTES, BYTE_SPECIALS, example.state, example.questions)
     added, _ = _none_of_the_above(question, 0, drop=False)
     [augmented] = layout.rows(BYTES, BYTE_SPECIALS, example.state, {"q": added})
@@ -342,7 +343,8 @@ def test_a_none_of_the_above_draw_never_leaves_a_row_unfit():
     assert any(np.array_equal(row["tokens"], admitted.tokens) for row in rows)
     assert any(not np.array_equal(row["tokens"], admitted.tokens) for row in rows)
     fit = Fit(layout, BYTES, BYTE_SPECIALS, DecisionHead(64), none_of_the_above=1.0)
-    roomy = Fit(MarkerLayout(max_len=128), BYTES, BYTE_SPECIALS, DecisionHead(64), none_of_the_above=1.0)
+    roomy = Fit(SegmentLayout.marker_row(max_len=128), BYTES, BYTE_SPECIALS, DecisionHead(64),
+                none_of_the_above=1.0)
     for fitting, declined in ((fit, {"unfit": 1}), (roomy, {})):
         loader = compile(Memory([{"example": example}]).batch(1), read="memory",
                          objective=ObjectiveData(train=(fitting,)))
@@ -355,7 +357,7 @@ def test_a_none_of_the_above_draw_never_leaves_the_options_alike():
     question out as Fit admitted it: every read's options are distinct, where the same augmentation laid
     out alone leaves them alike; a draw whose options stay apart stands (the control)."""
     question = Choice("Which?", ["abca", "abcb", "abcc"])
-    layout = MarkerLayout(max_len=128, head_max_len=34)
+    layout = SegmentLayout.marker_row(max_len=128, head_max_len=34)
     example = Example("short", {"q": question}, {"q": "abca"})
     [admitted] = layout.rows(BYTES, BYTE_SPECIALS, example.state, example.questions)
     assert layout.refusal(admitted) is None
@@ -377,9 +379,10 @@ def test_a_none_of_the_above_draw_never_cuts_the_state_further_than_its_count_sa
     right = "the first option, whose line is longer than any none of the above with its description"
     question = Choice("Which?", [right, "the second option", "the third one"])
     example = Example("the account was charged twice on the same day, " * 4, {"q": question}, {"q": right})
-    [whole] = MarkerLayout(max_len=1024).rows(BYTES, BYTE_SPECIALS, example.state, example.questions)
+    [whole] = SegmentLayout.marker_row(max_len=1024).rows(BYTES, BYTE_SPECIALS, example.state,
+                                                          example.questions)
     assert not whole.cuts
-    layout = MarkerLayout(max_len=len(whole.tokens))
+    layout = SegmentLayout.marker_row(max_len=len(whole.tokens))
     [admitted] = layout.rows(BYTES, BYTE_SPECIALS, example.state, example.questions)
     added, _ = _none_of_the_above(question, 0, drop=False)
     [augmented] = layout.rows(BYTES, BYTE_SPECIALS, example.state, {"q": added})
@@ -400,7 +403,7 @@ def test_a_grouped_example_counts_the_members_it_leaves_out():
     small = Example("short", {"q": Choice("Pick", ["a", "b"])}, {"q": "a"})
     large = Example("short", {"q": Choice("Pick", [f"option {index}" for index in range(60)])},
                     {"q": "option 0"})
-    layout = StateFirstLayout(max_len=128, labels=BYTE_LABELS)
+    layout = SegmentLayout.state_first_row(max_len=128, labels=BYTE_LABELS)
     grouped = {"example": GroupedExamples((small, large))}
     fitted = Fit(layout, BYTES, BYTE_SPECIALS, DecisionHead(64)).map(grouped)
     assert len(fitted["decision_rows"]) == 1 and fitted["_dew_rejected"] == {"unfit": 1}

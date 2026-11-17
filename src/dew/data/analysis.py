@@ -760,20 +760,6 @@ def _volatile(stage: Stage) -> bool:
     return ran is not None and isinstance(ran.step, Volatile) and ran.step.volatile
 
 
-def member_length(pipeline: Pipeline, analyzed: _Lowering) -> int | None:
-    """The records a mix's member `pipeline` reads before it ends, where they are its source's, one for one
-    (`dew.data.mixing.mix_end`): none of its stages drops, makes, bounds or repeats records, it caches none
-    and its source is indexed, a missing record held in memory not counted; None otherwise, a member that
-    reads only as a stream or of no length known ahead, which ends its mix at its first failed pull."""
-    source = pipeline.source
-    if (isinstance(source, Combined) or analyzed.cache is not None or analyzed.unending
-            or not source.supports("indexed")
-            or any(_drops(stage) or isinstance(stage, (Slice, Limit, Repeat, Native))
-                   for stage in pipeline.stages)):
-        return None
-    records = source.records("indexed")
-    return sum(record is not None for record in records) if _in_memory(source) else len(records)
-
 def _drops(stage: Stage) -> bool:
     """Whether a stage can drop or make rows, so the rows after it are not
     the rows before it, one for one."""
@@ -1171,11 +1157,12 @@ def _checked(
                 raise ValueError(f"cache prefix in {name} must hold deterministic record steps and views of "
                                  f"the inputs: {refused}")
             declared = [_identity(step).name for step in prefix
-                        if isinstance(step, (Map, FlatMap)) and step.pool is not None]
+                        if isinstance(step, (Map, FlatMap)) and step.pool == "processes"]
             if declared:
-                raise ValueError(f"cache prefix in {name} holds {declared} on pools of their own, and a "
+                raise ValueError(f"cache prefix in {name} holds {declared} on processes of their own, and a "
                                  "cache fills in its reading process, writing each input as its steps make "
-                                 "it; declare the pool after the cache, or no pool")
+                                 "it; declare the pool after the cache, or run them on threads "
+                                 "(pool='threads')")
         laid = laid or (read == "memory" and cuts((stage,)) and examples_bound((*ran, *prefix)) is not None)
         if (isinstance(stage, Shuffle) and stage.window is None and stage.streamed is None and not indexed
                 and not promotion and not laid):
@@ -1209,20 +1196,48 @@ def _checked(
     return per_share
 
 
-def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) -> None:
-    missing = _unsupported(pipelines, read)
+def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool,
+                  ending: Sequence[Pipeline] = ()) -> None:
+    """Refuse a read the sources under `pipelines` cannot take, provisioning each where `provision` asks;
+    and of a streamed read of `ending` (the reads that end, no training read's), the indexed read whose
+    length each member of an unseeded mix needs (`_measured_members`), which ends the mix at its members'
+    share-spans (data.md §3)."""
+    missing: list[tuple[Source, Read]] = [(source, read) for source in _unsupported(pipelines, read)]
+    if read == "streamed":
+        measured = [source for pipeline in ending for source in _measured_members(pipeline)]
+        indexed: Read = "indexed"
+        missing.extend((source, indexed) for source in measured if not source.supports(indexed))
     if provision:
-        for source in missing:
-            preparer = provisioner(source, read)
+        for source, needed in missing:
+            preparer = provisioner(source, needed)
             if preparer is not None:
                 preparer.provision()
     refused: dict[str, list[str]] = {}
-    for source in missing:
-        if not source.supports(read):
-            refused.setdefault(_refusal(source, read, provision=provision), []).append(source.describe())
+    for source, needed in missing:
+        if not source.supports(needed):
+            why = _refusal(source, needed, provision=provision)
+            if needed != read:
+                why = f"an unseeded mix's end needs its length, from an indexed read: {why}"
+            refused.setdefault(why, []).append(source.describe())
     if refused:
         raise ValueError(f"read={read!r} is unavailable: "
                          + "; ".join(f"{', '.join(names)}: {why}" for why, names in refused.items()))
+
+
+def _measured_members(pipeline: Pipeline) -> list[Source]:
+    """The sources of `pipeline`'s unseeded mixes (by records) whose lengths their end needs: each member
+    read once, one record a record (no repeat, nothing dropped or made), its source's own length its
+    length. A member of unknown length (one a step changes) ends its mix at its first failed pull."""
+    found: list[Source] = []
+    source = pipeline.source
+    if isinstance(source, Combined):
+        for child in source.pipelines:
+            found += _measured_members(child)
+    if isinstance(source, Mixture) and source.seed is None and source.tokens is None:
+        found += [child.source for child in source.pipelines
+                  if not isinstance(child.source, Combined)
+                  and not any(isinstance(stage, Repeat) or _drops(stage) for stage in child.stages)]
+    return found
 
 
 def _refusal(source: Source, read: Read, *, provision: bool) -> str:

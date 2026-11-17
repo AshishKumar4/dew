@@ -307,6 +307,21 @@ def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
     assert cheaper_spliced(_shared_products, *operands_)
 
 
+def test_a_program_the_pass_rewrites_is_traced_once_at_the_compile_point():
+    """The compile point (`options.program`) lowers a program the pass rewrites from the rewritten program
+    itself, never traced again (row 6977: its replay was a whole second trace of every rewritten step), and
+    what it runs is that program's: two sums the pass joins, as the rewritten function computes them."""
+    from dew.telemetry.compiles import Compiles
+
+    operands = rows(3, (64, 128), (64, 128), (64, 128))
+    compiled = options.program(two_sums)
+    with Compiles("two_sums") as heard:
+        traced = compiled.trace(*operands)
+    assert [found.kind for found in heard.programs].count("traced") == 1
+    np.testing.assert_array_equal(traced.lower().compile()(*operands),
+                                  jax.jit(algebra.rewritten(two_sums))(*operands))
+
+
 def test_two_sums_join_into_one_where_the_model_prices_it_cheaper():
     """Two sums of bounded values (`sum(tanh(x)) + sum(tanh(y))`): the model reads each operand once either
     way and counts one reduction's operations and one addition fewer joined, so the pass splices a form it
@@ -318,6 +333,88 @@ def test_two_sums_join_into_one_where_the_model_prices_it_cheaper():
     assert cheaper_spliced(two, *rows(3, *shapes))
     assert_as_exact(jax.jit(algebra.rewritten(two)), jax.jit(two), lambda seed: rows(seed, *shapes),
                     "two sums", seeds=16)
+
+
+def _clamped_products(x, a, b, lower, upper, operand=jnp.tanh):
+    """A clamped value (of `operand(x)`) read by two products of bounded values, which the pass joins into
+    one product of their sum."""
+    clamped = jax.lax.clamp(lower, operand(x), upper)
+    return jnp.sum(clamped * jnp.tanh(a), axis=-1) + jnp.sum(clamped * jnp.tanh(b), axis=-1)
+
+
+CLAMP_EDGES = np.asarray([np.inf, -np.inf, 0.0, -0.0, 0.3, 1.0, -2.0, 5.0, 2.0 ** -140], np.float32)
+"""A clamp's operands at its edges: both infinities, signed zeros (a bound at 0's), values between, on and
+past bounds of 0 and 1, and a subnormal; a NaN beside them in one row of their program (`_clamp_edges`)."""
+
+
+def _clamp_edges() -> jax.Array:
+    """`CLAMP_EDGES` over a 64 by 128 program, a NaN in its first row alone, so every other row's sums are
+    finite and the first's carries the NaN through."""
+    edges = np.resize(CLAMP_EDGES, (64, 128))
+    edges[0, 0] = np.nan
+    return jnp.asarray(edges)
+
+
+def _clamp_draw(seed: int) -> tuple[jax.Array, ...]:
+    """A clamp's finite edges and bounds (0, 1, and +-0.5) beside drawn values, over a 64 by 128 program, and
+    the two products' operands."""
+    rng = np.random.default_rng(seed)
+    finite = CLAMP_EDGES[np.isfinite(CLAMP_EDGES)]
+    x = rng.choice(np.concatenate([finite, [0.5, -0.5], rng.standard_normal(16)]), (64, 128))
+    return (jnp.asarray(x, jnp.float32), *rows(seed, (64, 128), (64, 128)))
+
+
+@pytest.mark.parametrize("bounds", ["scalar", "crossed", "array", "of an unbounded operand"])
+def test_a_rewritten_clamps_derivative_is_zero_at_its_bounds_and_its_program_on_par(bounds):
+    """A clamp is an operation of its own (`Term.clamp`), emitted as itself: the pass joins two products a
+    clamped value is read by, scalar, crossed (lower above upper) and array bounds, and of an operand nothing
+    bounds (a clamp is bounded by its bounds alone, an infinity clamped to one). Its derivative is zero
+    exactly wherever the written program's is, at a bound and past one, and a NaN where it is one, over the
+    clamp's edges (a maximum and a minimum would halve it at a bound: 0.76 where it is 0, row 7286's
+    finding); the rewritten program and its gradient are on par with the written ones (check 1)."""
+    x = _clamp_edges()
+    a, b = rows(5, x.shape, x.shape)
+    def scalars(*values):
+        return lambda a, b: tuple(jnp.asarray(value, a.dtype) for value in values)
+
+    # The bounds in the operands' dtype (a clamp's are its operand's), check 1's truth's float64 among them.
+    bounded = {"scalar": scalars(0, 1), "crossed": scalars(1, 0),
+               # Bounds of their own values, bounded (a clamp's magnitude is its bounds'), x's shape.
+               "array": lambda a, b: (-0.5 * jnp.abs(jnp.tanh(b)), jnp.abs(jnp.tanh(a))),
+               "of an unbounded operand": scalars(-0.5, 0.5)}[bounds]
+    operand = (lambda x: x) if bounds == "of an unbounded operand" else jnp.tanh
+
+    def clamped(x, a, b):
+        return _clamped_products(x, a, b, *bounded(a, b), operand=operand)
+
+    def gradient(form):
+        return jax.grad(lambda x, a, b: jnp.sum(form(x, a, b)))
+
+    assert cheaper_spliced(clamped, x, a, b)
+    rewritten = algebra.rewritten(clamped)
+    found, wanted = (np.asarray(jax.jit(gradient(form))(x, a, b)) for form in (rewritten, clamped))
+    held = wanted == 0
+    np.testing.assert_array_equal(found[held], wanted[held])
+    np.testing.assert_array_equal(np.isnan(found), np.isnan(wanted))
+    for arm, reference in ((rewritten, clamped), (gradient(rewritten), gradient(clamped))):
+        assert_as_exact(jax.jit(arm), jax.jit(reference), _clamp_draw, f"a clamp's products, {bounds}",
+                        seeds=16)
+
+
+def test_a_clamp_is_priced_as_a_maximum_and_a_minimum_of_its_operand_read_once():
+    """A clamped value's price (`cost.work`) is its operand's and two operations an element, a maximum's and
+    a minimum's, its operand read once: as an operation the language did not speak, a clamp was a leaf of its
+    own, its output read again and none of its arithmetic counted (row 7286)."""
+    def priced(fn):
+        region = terms.region(jax.make_jaxpr(fn)(jnp.ones((64, 128), jnp.float32)))
+        graph, bundle, _ = program.graphed(region)
+        _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                                 cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
+        return price.work
+
+    plain = priced(jnp.tanh)
+    clamped = priced(lambda x: jax.lax.clamp(np.float32(-0.5), jnp.tanh(x), np.float32(0.5)))
+    assert (clamped.operations - plain.operations, clamped.device_bytes) == (2 * 64 * 128, plain.device_bytes)
 
 
 def test_products_with_a_shared_operand_join_into_one():
@@ -683,6 +780,25 @@ def test_an_fp8_product_is_priced_in_the_tensor_mode_its_gpu_runs_it_in(generati
 
     # Exact: each mode's price is the same FLOPs over the same facts, its rate a power of two apart.
     assert seconds(jnp.float8_e4m3fn) == seconds(jnp.bfloat16) / speedup
+
+
+@pytest.mark.parametrize("target_name", ["v5e", "v6e"])
+def test_an_fp32_product_on_a_tpu_is_its_matrix_units_bf16_passes(target_name):
+    """An fp32 product priced for a TPU is its matrix units' bfloat16 passes (`jax.lax.Precision`'s: one at
+    the default precision, three at HIGH, six at HIGHEST), a bf16 product's work that many times, all of it
+    work the TPU's rates price (row 7201: counted as CUDA-core operations, which a TPU states no rate of,
+    every product of a scan's chunk forms priced at nothing)."""
+    tpu = generation.TARGETS[target_name]
+
+    def work(dtype, precision):
+        with program.passes(target=target_name):
+            made = cost.product_work(1024, 1024, 1024, dtype=dtype, precision=precision)
+        assert not any(kernel_cost.units(made, kernel_cost.rates(tpu, device=True))[1])
+        return made.flops
+
+    bf16 = work(jnp.bfloat16, None)
+    assert [work(jnp.float32, precision) for precision in ("default", "high", "highest")] == [
+        bf16, 3 * bf16, 6 * bf16]
 
 
 def test_xlas_schedule_prices_each_kernel_its_parts_fixed_latency():

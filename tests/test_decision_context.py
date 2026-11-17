@@ -24,7 +24,7 @@ from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example
 from dew.decision.images import Images
 from dew.decision.inputs import DecisionInputs
-from dew.decision.layout import Specials
+from dew.decision.layout import SegmentLayout, Specials
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.questions import ChoiceAnswer
@@ -455,12 +455,11 @@ def test_a_request_with_images_reads_its_context_beside_them():
     from PIL import Image
 
     from dew.data.text import HFTokenizer
-    from dew.decision import JointLayout
 
     directory = LLAMA.parent / "qwen38-dense-tiny"
     source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
     tokenizer = HFTokenizer(str(directory), local_files_only=True)
-    layout = JointLayout(max_len=1024)
+    layout = SegmentLayout.joint_row(max_len=1024)
     objective = DecisionObjective(source.with_cross_attention(CrossAttention((0,), 32), key=0),
                                   tokenizer=tokenizer, layout=layout)
     variables = objective.init(jax.random.key(0))
@@ -496,13 +495,12 @@ def test_a_context_reading_tasks_bundle_carries_its_cross_attention_and_refuses_
     its release, which no family writes, is refused as it is written (row 4776's review: the bundle was
     refused as it was made, and a run from such a run's native release could not start)."""
     from dew.data.text import HFTokenizer
-    from dew.decision import JointLayout
     from dew.decision.sources import PretrainedDecision
 
     directory = LLAMA.parent / "qwen38-dense-tiny"
     source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
     tokenizer = HFTokenizer(str(directory), local_files_only=True)
-    layout = JointLayout(max_len=1024)
+    layout = SegmentLayout.joint_row(max_len=1024)
     objective = DecisionObjective(source.with_cross_attention(CrossAttention((0,), 32), key=0),
                                   tokenizer=tokenizer, layout=layout, context_encoder="backbone")
     task = Decide(objective.model, opened(objective.init(jax.random.key(0))), layout, tokenizer,
@@ -556,29 +554,35 @@ def test_a_backbone_encoded_context_is_the_backbones_own_pass_over_it():
     assert DecisionObjective(tasks[1]).model.context_encoder == "backbone"
 
 
-def test_a_context_its_cross_attention_cannot_hold_is_refused_never_cut():
-    """A context of more tokens than the cross-attention reads is refused, by a task and over the wire
-    (ValueError, which a server turns into the request's own refusal), and refuses a run's data where
-    its fitting reads the record; one of exactly that many is read whole."""
+def test_a_context_past_its_cross_attentions_room_is_cut_and_its_caller_told():
+    """A context of more tokens than the cross-attention reads keeps its first ones, as a context beside a
+    schema does (one policy, `with_context`): a task answers from them, a served answer states the
+    request's context tokens and those it read, whatever rows its questions take, and a run's data counts
+    the cut (`data/cut/.../context`). It was refused, and refused a run's data inside its fitting (train
+    985's review, F5); a served answer of three question rows summed their cuts, reporting 12 kept where
+    every row read 16, and one that forbids cuts answered from a cut context (train 986's review)."""
     from dew.decision.rows import Fit
 
     objective = conditioned(16, (0,))
     task = Decide(objective.model, objective.init(jax.random.key(0)), objective.layout, objective.tokenizer,
                   objective.specials)
-    exact, over = "x" * 16, "x" * 17
-    [row] = task._encoded("one two", QUESTION, context=exact)
-    assert row.context is not None and len(row.context) == 16
+    exact, over = "x" * 16, "x" * 17 + "y"
+    [whole] = task._encoded("one two", QUESTION, context=exact)
+    [cut] = task._encoded("one two", QUESTION, context=over)
+    assert whole.context == cut.context and cut.cuts == {"context": 2}
+    assert task("one two", QUESTION, context=over)["pick"].probabilities.tolist() == task(
+        "one two", QUESTION, context=exact)["pick"].probabilities.tolist()
+    wire = {name: {"type": "choice", "instructions": "Which one?", "criteria": ["a", "b", "c"]}
+            for name in ("pick", "other", "third")}
+    served = task.systemone({"state": "one two", "questions": wire, "context": over})
+    assert (served["usage"]["context_tokens"], served["usage"]["context_kept"]) == (18, 16)
+    # A caller that forbids every cut is refused one of its context, as one of its state.
     with pytest.raises(ValueError):
-        task("one two", QUESTION, context=over)
-    wire = {"pick": {"type": "choice", "instructions": "Which one?", "criteria": ["a", "b", "c"]}}
-    [refused] = task.systemone([{"state": "one two", "questions": wire, "context": over}])
-    assert isinstance(refused, ValueError)
+        task.systemone({"state": "one two", "questions": wire, "context": over}, whole=True)
     fit = Fit(objective.layout, objective.tokenizer, objective.specials, objective.model.head,
               objective.context_length)
-    assert not isinstance(fit.map({"example": Example("one two", QUESTION, {"pick": "a"}, context=exact)}),
-                          type(None))
-    with pytest.raises(ValueError):
-        fit.map({"example": Example("one two", QUESTION, {"pick": "a"}, context=over)})
+    fitted = fit.map({"example": Example("one two", QUESTION, {"pick": "a"}, context=over)})
+    assert isinstance(fitted, dict) and fitted["_dew_cut"] == {"context": (1, 2)}
 
 
 def test_a_backbone_without_cross_attention_refuses_a_requests_context():

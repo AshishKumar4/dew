@@ -66,6 +66,45 @@ unchanged, and starts the data again where it differs, naming what differs (`Pla
 any difference, and a source or step it cannot check."""
 
 
+@runtime_checkable
+class ReadsEarlier(Protocol):
+    """A step whose class reads the descriptions an earlier Dew saved of steps like it as it describes them
+    now (`dew.decision.layout.ReadsEarlierLayouts`: a decision layout by a class it was before, row 6140),
+    which a plan holding the step applies to a saved plan it compares (`Plan.earlier`)."""
+
+    def earlier_described(self, saved: JSON) -> JSON: ...
+
+
+def earlier_readers(steps: Sequence[object]) -> tuple[Callable[[JSON], JSON], ...]:
+    """The readers of earlier descriptions the live `steps` hold (`ReadsEarlier`): a stage's own, its step's
+    and a configured step's factory's, each class's once."""
+    from dew.data.pipeline import Configured, FlatMap, Map, RandomMap
+
+    # Each reader once, however many steps' classes share it.
+    held: dict[Callable[..., JSON], Callable[[JSON], JSON]] = {}
+    for stage in steps:
+        match stage:
+            case Map(step=inner) | RandomMap(step=inner) | FlatMap(step=inner) | Configured(factory=inner):
+                candidates = (stage, inner)
+            case _:
+                candidates = (stage,)
+        for candidate in candidates:
+            if isinstance(candidate, ReadsEarlier):
+                held.setdefault(type(candidate).earlier_described, candidate.earlier_described)
+    return tuple(held.values())
+
+
+def _read_saved(saved: Mapping[str, object],
+                earlier: Sequence[Callable[[JSON], JSON]] = ()) -> Mapping[str, object]:
+    """A saved data plan in the shapes Dew describes now: its classes by the paths they have now
+    (`moved_paths`, row 5996), and descriptions of classes the live steps' classes read as they are now
+    (`earlier`, `ReadsEarlier`, row 6140)."""
+    read = record(moved_paths(json_value(saved, "saved data plan")), "saved data plan")
+    for reader in earlier:
+        read = record(reader(json_value(read, "saved data plan")), "saved data plan")
+    return read
+
+
 class PlanOrderChanged(PlanChanged):
     """A saved data position's plan whose order is not the chain's now: each path of the order `changed`
     (`selection_seed`, `phases[1].selection_seed`), its saved value and its value now (None where one holds
@@ -925,6 +964,9 @@ class Plan:
     """The rules deciding which rows come next that its read reads by, by name, each its owner's value
     (`dew.data.lowering._Build.rules`, and `grain` for a per-share read's Grain-owned state,
     `dew.data.readers.GRAIN`), compared by name where a position resumes (`check`)."""
+    earlier: tuple[Callable[[JSON], JSON], ...] = dataclasses.field(default=(), compare=False, repr=False)
+    """The readers of earlier descriptions its live steps hold (`earlier_readers`), which a saved plan it
+    compares is read by (`_read_saved`); no part of what the plan records."""
 
     def record(self) -> dict[str, JSON]:
         """The plan as a position holds it, its order's stages held by their steps' places in its manifest
@@ -1014,7 +1056,7 @@ class Plan:
                   ) -> tuple[str, ...]:
         """`check` of all but the version and the rules, the changed environment and members returned; the
         saved plan's classes by the paths they have now (`moved_paths`, row 5996)."""
-        saved = record(moved_paths(json_value(saved, "saved data plan")), "saved data plan")
+        saved = _read_saved(saved, self.earlier)
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "relaxed":
             raise PlanChanged(
                 ("exact",),

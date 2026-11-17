@@ -242,19 +242,19 @@ def test_a_16_bit_products_stated_dot_algorithm_reaches_xla():
         np.asarray(jax.jit(xla_own, static_argnums=(2, 3))(xb, wb, preset.BF16_BF16_F32, jnp.float32)))
 
 
-def test_a_kept_calls_identity_states_the_installed_cutlass_wheel(tmp_path, monkeypatch):
-    """A call's identity (`dew.training.identity.facts`, what a kept program is handed by) states which
-    generations' kernels the installed dew-cutlass holds, as CUTLASS's eligibility reads them
-    (`generation.cutlass_built`): a process that installs the wheel, or another build of it, after a
-    program was kept is not handed that program, its route to CUTLASS untraced (audit P9). Two builds, one
-    holding Hopper's kernels and one Ampere's, stand in for the wheel ahead of any installed one."""
-    from dew.training import identity
-
-    fact = "dew.nn.kernels.generation.cutlass_built"
-    before = identity.facts()[fact]
+def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path, monkeypatch):
+    """Which generations' kernels the installed dew-cutlass holds is read where CUTLASS's eligibility asks
+    (`generation.cutlass_built`), from the build installed then: a process that installs the wheel, or
+    another build of it, routes as that build allows (audit P9), and the program its trace lowers states
+    the route it took. Two builds, one holding Hopper's kernels and one Ampere's, stand in for the wheel
+    ahead of any installed one."""
     path = list(sys.path)
+    # The process's own dew_cutlass, or none, back in sys.modules after the test: each stand-in build is
+    # imported in its place, never left there (a stand-in left stated no TARGETS, and every later test of
+    # the process that counted a program's kernel calls failed, train 991's red).
+    monkeypatch.setitem(sys.modules, "dew_cutlass", sys.modules.get("dew_cutlass"))
 
-    def installed(minimum: tuple[int, int], built: str):
+    def installed(minimum: tuple[int, int], built: str) -> dict:
         # Each build its own directory ahead of the installed packages, so no build's bytecode stands in
         # for another's.
         wheel = tmp_path / built
@@ -262,17 +262,16 @@ def test_a_kept_calls_identity_states_the_installed_cutlass_wheel(tmp_path, monk
         dispatch = f"return {built!r} if (major, minor) >= {minimum} else None"
         (wheel / "dew_cutlass.py").write_text(f"def architecture(major, minor):\n    {dispatch}\n")
         monkeypatch.setattr(sys, "path", [str(wheel), *path])
-        monkeypatch.delitem(sys.modules, "dew_cutlass", raising=False)
+        del sys.modules["dew_cutlass"]
         importlib.invalidate_caches()
-        return identity.facts()[fact]
+        return generation.cutlass_built()
 
     hopper = installed((9, 0), "sm90")
-    built = generation.cutlass_built()
-    assert built["sm90"] == "sm90" and built["sm80"] is None
+    assert hopper["sm90"] == "sm90" and hopper["sm80"] is None
     assert grouped_matmul.cutlass_built_for("sm90") == "sm90"
     assert grouped_matmul.cutlass_built_for("sm80") is None
-    assert hopper != before
-    assert installed((8, 0), "sm80") != hopper
+    ampere = installed((8, 0), "sm80")
+    assert ampere["sm80"] == "sm80" and grouped_matmul.cutlass_built_for("sm80") == "sm80"
 
 
 def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
@@ -516,7 +515,9 @@ def test_a_paired_products_input_gradient_adds_its_parts_on_the_launch_its_plain
         with generation.assumed(generation_name):
             assert gemm._keeps_launch(cotangents[1], second, sizes, gemm._added, (prior,), (jnp.bfloat16,),
                                       (jnp.bfloat16,), options), generation_name
-        with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
+        # Interpreted on the host's CPU, whatever GPU it has (row 7130).
+        with (generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"),
+              jax.default_device(jax.devices("cpu")[0])):
             [d_tokens] = jax.vjp(paired, tokens)[1](cotangents)
         np.testing.assert_array_equal(np.asarray(d_tokens), np.asarray(wide.astype(jnp.bfloat16)),
                                       err_msg=generation_name)
@@ -990,6 +991,7 @@ def test_the_tuners_group_sizes_route_every_row(groups):
     assert sizes.sum() == 300 and (sizes >= 0).all() and (groups == 1 or sizes[0] == 0), sizes
 
 
+@pytest.mark.mesh(devices=8)
 def test_a_ragged_products_portable_route_places_its_output_on_an_explicit_mesh():
     """XLA's ragged products on a CPU (`gemm.gemm` and its reverse pass, `gemm.gemm_t`, the portable route a
     fused producer's analysis replays) of rows an Explicit data axis splits, as a device step's are
@@ -1074,7 +1076,10 @@ def test_a_gathered_projections_reverse_pass_reads_its_rows_where_they_lie(scatt
     stacked = (3,) if layered else ()
     matrices = jnp.asarray(rng.integers(-3, 4, size=(2, *stacked, 3, 128, 128)), jnp.bfloat16)
     layer = jnp.asarray(2, jnp.int32) if layered else None
-    with generation.assumed(name), generation.chosen(grouped_matmul="mosaic"):
+    # Interpreted on the host's CPU, whatever GPU it has: a B200's kernels compiled for a GH200 abort its
+    # process (row 7130).
+    with (generation.assumed(name), generation.chosen(grouped_matmul="mosaic"),
+          jax.default_device(jax.devices("cpu")[0])):
         a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, scattered=scattered,
                                                               interpret_on_cpu=True, layer=layer)
 

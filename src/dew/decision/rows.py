@@ -7,7 +7,7 @@ import dataclasses
 import hashlib
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TypeGuard
+from typing import ClassVar, TypeGuard
 
 import grain.python as pygrain
 import numpy as np
@@ -27,9 +27,10 @@ from dew.decision.layout import (
     Encoded,
     Layout,
     QuestionField,
-    QuestionLayout,
+    ReadsEarlierLayouts,
     Specials,
     context_tokens,
+    per_question,
     question_fields,
     with_context,
 )
@@ -39,7 +40,7 @@ NONE_OF_THE_ABOVE = "none of the above"
 
 
 @dataclass(frozen=True)
-class Encoding:
+class Encoding(ReadsEarlierLayouts):
     """How a labelled example becomes the row a step packs and trains on.
 
     A row is its own tokens, at most `max_len`, one slot per question it lays
@@ -91,7 +92,8 @@ class Encoding:
         fewest = self.none_of_the_above_options
 
         def laid(drop: bool, names: Collection[str] | None = None, held: "FittedRow" = row) -> int:
-            return _with_none(self.layout, self.tokenizer, self.specials, held, fewest, drop, names)[0]
+            return _with_none(self.layout, self.tokenizer, self.specials, held, fewest, drop, names,
+                              self.context_length)[0]
 
         if len(row.names) == 1:
             return min(row.length, laid(drop=False), laid(drop=True))
@@ -117,6 +119,13 @@ class Encoding:
         )
         return self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders,
                                 tokens=None if tokens is None else tokens.tolist(), request=example.questions)
+
+    def _contexted(self, example: Example, rows: Sequence[Encoded]) -> list[Encoded]:
+        """`rows` with the context their backbone reads (`with_context`): the example's own, after a schema
+        read as the row's context where the row reads one there; none where the backbone reads none, which
+        leaves the example's context unread."""
+        return with_context(rows, self.tokenizer, None if self.context_length is None else example.context,
+                            self.context_length)
 
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None,
                  tokens: np.ndarray | None = None, group_of: "GroupOf | None" = None,
@@ -153,6 +162,10 @@ class Encoding:
             if gold is not None:
                 golds[name] = gold
         rows = self._rows(example, asked, rng, tokens)
+        # A drawn row the layout refuses (a schema past the context, `Layout.refusal`) has no context to
+        # resolve; one it admits is read with its context, whose cut it may deepen (`drawn_refusal`).
+        rows = rows if dropped and any(self.layout.refusal(row, self.context_length) is not None
+                                       for row in rows) else self._contexted(example, rows)
         if dropped and (len(rows) != 1 or any(drawn_refusal(self.layout, row, self.context_length, admitted)
                                               is not None for row in rows)):
             # The added option made a row no run trains on (`Layout.refusal`: unfit, or options a
@@ -161,14 +174,11 @@ class Encoding:
             asked = {name: example.questions[name] for name in names}
             golds = {name: example.distribution(name) for name in names if name in labels}
             dropped = {}
-            rows = self._rows(example, asked, rng, tokens)
+            rows = self._contexted(example, self._rows(example, asked, rng, tokens))
         if len(rows) != 1:
             # A row over one state that its options' drawn order splits, their lines read as other tokens
-            # (`QuestionLayout.shared_state`), is laid out in their own order, as Fit admitted it.
-            rows = self._rows(example, asked, None, tokens)
-        # A run over a backbone that reads no context leaves an example's own context unread.
-        rows = with_context(rows, self.tokenizer, None if self.context_length is None else example.context,
-                            self.context_length)
+            # (`SegmentLayout.shared_state`), is laid out in their own order, as Fit admitted it.
+            rows = self._contexted(example, self._rows(example, asked, None, tokens))
         if len(rows) != 1:
             raise ValueError(f"an encoding lays out one row, and the layout gave {len(rows)}")
         encoded = rows[0]
@@ -331,16 +341,19 @@ class FittedRow:
 
 def drawn_refusal(layout: Layout, row: Encoded, context_length: int | None,
                   admitted: Mapping[str, int] | None) -> str | None:
-    """Why a training read declines the "none of the above" it drew for `row`: the layout refuses the row
-    (`Layout.refusal`), or the option's line cuts more of the state than the row was `admitted` with
-    (`state_cut`), which its data report counted (`FittedRow.cuts`); None where the row stands as drawn.
-    The option's own line under a declared question budget is the budget's (`options_alike` where it
-    leaves two alike)."""
+    """Why a training read declines the "none of the above" it drew for `row`, its context resolved
+    (`with_context`): the layout refuses the row (`Layout.refusal`), or the option's line cuts more of the
+    state (`state_cut`) or, lengthening a schema read as the row's context, more of the context after it
+    (`context_cut`) than the row was `admitted` with, which its data report counted (`FittedRow.cuts`);
+    None where the row stands as drawn. The option's own line under a declared question budget is the
+    budget's (`options_alike` where it leaves two alike)."""
     refused = layout.refusal(row, context_length)
     if refused is not None or admitted is None:
         return refused
-    deeper = any(row.cuts.get(kind, 0) > admitted.get(kind, 0) for kind in ("state", "state_characters"))
-    return "state_cut" if deeper else None
+    for kinds, reason in ((("state", "state_characters"), "state_cut"), (("context",), "context_cut")):
+        if any(row.cuts.get(kind, 0) > admitted.get(kind, 0) for kind in kinds):
+            return reason
+    return None
 
 
 def _cuts(rows: Iterable[FittedRow]) -> dict[str, tuple[int, int]]:
@@ -356,7 +369,7 @@ def _declined(rows: Iterable[FittedRow]) -> dict[str, int]:
 
 
 @dataclass(frozen=True)
-class Fit(pygrain.MapTransform):
+class Fit(pygrain.MapTransform, ReadsEarlierLayouts):
     layout: Layout
     tokenizer: Tokenizer
     specials: Specials
@@ -451,12 +464,12 @@ class Fit(pygrain.MapTransform):
             removed = sum((collections.Counter(row.cuts) for row in laid), collections.Counter())
             return Rejected(refused, cut=removed)
         unread: dict[str, int] = {}
-        contexts = [0] * len(laid)
         if self.context_length is not None:
-            contexts = [len(row.context or ()) for row in with_context(laid, self.tokenizer, example.context,
-                                                                       self.context_length)]
-        elif example.context is not None and (lost := len(context_tokens(self.tokenizer, example.context,
-                                                                           None))):
+            # Its context as its encoding lays it out, a context cut to its room counted with its cuts.
+            laid = with_context(laid, self.tokenizer, example.context, self.context_length)
+        contexts = [len(row.context or ()) for row in laid]
+        lost = 0 if self.context_length is not None else len(context_tokens(self.tokenizer, example.context))
+        if lost:
             # A backbone that reads no context leaves the example's unread, counted as a cut of it.
             unread["context"] = lost
         self.head.validate_rows(laid)
@@ -486,8 +499,14 @@ class Fit(pygrain.MapTransform):
         laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state,
                                 request=example.questions)
         if len(laid) != 1:
-            # A row over one state its added options leave no room in (`QuestionLayout.shared_state`).
+            # A row over one state its added options leave no room in (`SegmentLayout.shared_state`).
             return "unfit"
+        refused = self.layout.refusal(laid[0], self.context_length)
+        if refused is not None:
+            return refused
+        if self.context_length is not None:
+            # Its context as the encoding lays it out, a schema the option lengthens cutting more of it.
+            laid = with_context(laid, self.tokenizer, example.context, self.context_length)
         return drawn_refusal(self.layout, laid[0], self.context_length, row.cuts)
 
     def _apart(self, grouped: GroupedExamples) -> Batch | Rejected:
@@ -522,7 +541,7 @@ class Fit(pygrain.MapTransform):
         "none of the above" (`Encoding`), and the most context tokens it reads: the longest of the row as
         it is, with the option added beside every answered choice's options, and with it in place of
         each one's right option. A row of a question each is these three exactly, since its layout may
-        trim its options together (`QuestionLayout`), so that adding one can shorten the row; a row of
+        trim its options together (`SegmentLayout`), so that adding one can shorten the row; a row of
         several questions lays them out untrimmed, where adding the option beside every one is the
         longest: it lengthens each question by the option or leaves it as it is (`_none_of_the_above`),
         and the state takes the room the rest leaves. A schema read as the row's context lengthens as
@@ -531,7 +550,7 @@ class Fit(pygrain.MapTransform):
             return row.length, row.context
         sizes = [(row.length, row.context),
                  *(_with_none(self.layout, self.tokenizer, self.specials, row, self.none_of_the_above_options,
-                              drop) for drop in (False, True))]
+                              drop, context_length=self.context_length) for drop in (False, True))]
         return max(tokens for tokens, _ in sizes), max(context for _, context in sizes)
 
     def _unit(self, grouped: GroupedExamples) -> Batch | Rejected:
@@ -573,11 +592,14 @@ class Fit(pygrain.MapTransform):
 
 
 def _with_none(layout: Layout, tokenizer: Tokenizer, specials: Specials, row: FittedRow, fewest: int,
-               drop: bool, names: Collection[str] | None = None) -> tuple[int, int]:
+               drop: bool, names: Collection[str] | None = None,
+               context_length: int | None = None) -> tuple[int, int]:
     """The tokens and context tokens `row` lays out to with a "none of the above" (`Encoding`) beside each
     of its answered choices' options that draws one (`draws_none`, `fewest`), or in place of its right
     option where `drop`: each such question of `names` where given, of the row's every one otherwise. A
-    schema read as the row's context lengthens as its row does; an example's context does not change."""
+    schema read as the row's context lengthens as its row does, the example's context after it in the room
+    the schema leaves under `context_length` (`with_context`); an example's context alone does not
+    change."""
     example = row.example
     labels = example.labels()
     asked = {name: (_none_of_the_above(question, labels[name], drop=drop)[0]
@@ -586,6 +608,8 @@ def _with_none(layout: Layout, tokenizer: Tokenizer, specials: Specials, row: Fi
              for name in row.names for question in (example.questions[name],)}
     laid = layout.rows(tokenizer, specials, example.state, asked, tokens=row.tokens.tolist(),
                        request=example.questions)
+    if context_length is not None and all(len(each.context or ()) <= context_length for each in laid):
+        laid = with_context(laid, tokenizer, example.context, context_length)
     schemas = sum(len(each.context or ()) for each in laid if each.spans_in_context)
     return sum(len(each.tokens) for each in laid), schemas or row.context
 
@@ -656,7 +680,7 @@ def _fitted(element: Batch) -> FittedRow:
 
 
 @dataclass(frozen=True)
-class LayoutRows(pygrain.RandomMapTransform):
+class LayoutRows(pygrain.RandomMapTransform, ReadsEarlierLayouts):
     encoding: Encoding
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
@@ -677,7 +701,7 @@ class LayoutRows(pygrain.RandomMapTransform):
 
 
 @dataclass(frozen=True)
-class EvaluateRows(pygrain.MapTransform):
+class EvaluateRows(pygrain.MapTransform, ReadsEarlierLayouts):
     encoding: Encoding
 
     def map(self, element: Batch) -> Batch:
@@ -688,7 +712,7 @@ class EvaluateRows(pygrain.MapTransform):
 
 
 @dataclass(frozen=True)
-class ConfigureLayout:
+class ConfigureLayout(ReadsEarlierLayouts):
     layout: Layout
     tokenizer: Tokenizer
     specials: Specials
@@ -737,7 +761,7 @@ def _along(layout: Layout, grouped: bool = False, trained: bool = True) -> tuple
     """The fields along the questions of `layout`'s rows (`QUESTION_FIELDS`), with a training row's gold
     (`TRAINING_FIELDS`) where they are `trained`: its readout's where its options stand under labels,
     and their consistency groups' where they carry them (`grouped`)."""
-    labelled = isinstance(layout, QuestionLayout) and layout.labels is not None
+    labelled = per_question(layout) and layout.labels is not None
     carried = ("always", *(("trained",) if trained else ()), *(("labelled",) if labelled else ()),
                *(("grouped",) if grouped else ()))
     declared = (*QUESTION_FIELDS, *TRAINING_FIELDS)
@@ -761,16 +785,16 @@ def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, g
     `context_segments`): a window holds rows while both its streams do. A
     `trained` row carries its gold along its questions; a scored one
     (`model_row`) carries the model's fields alone."""
-    parallel = isinstance(layout, QuestionLayout) and layout.parallel
+    parallel = per_question(layout) and layout.parallel
     # A row of questions over one state lays each at its own row's positions, each question's own part a
-    # document continuing the shared part (`QuestionLayout.shares`, `Encoded.forked`).
-    forked = isinstance(layout, QuestionLayout) and layout.shares
+    # document continuing the shared part (`SegmentLayout.shares`, `Encoded.forked`).
+    forked = per_question(layout) and layout.shares
     # With siblings, each question's document continuing the one before it (`Encoded.forked_parents`).
-    chained = forked and isinstance(layout, QuestionLayout) and layout.siblings
+    chained = forked and per_question(layout) and layout.siblings
     # Rows in streams over one state lay each question at its own row's positions too
-    # (`QuestionLayout.streamed`).
-    positioned = parallel or forked or (isinstance(layout, QuestionLayout) and layout.streamed)
-    blocked = isinstance(layout, QuestionLayout) and layout.blocks
+    # (`SegmentLayout.streamed`).
+    positioned = parallel or forked or (per_question(layout) and layout.streamed)
+    blocked = per_question(layout) and layout.blocks
     streamed = layout.attention is not None
     along = tuple((name, bounds.questions) for name in _along(layout, grouped, trained))
     if context_window is not None:
@@ -867,9 +891,9 @@ def _row_starts(along: np.ndarray, owners: np.ndarray) -> np.ndarray:
 
 def forked_documents(layout: Layout, bounds: Bounds) -> int | None:
     """The most documents a window of `layout`'s rows holds where they ask questions over one state
-    (`QuestionLayout.shares`): a shared part a row and an own part a question, within `bounds`; None for
+    (`SegmentLayout.shares`): a shared part a row and an own part a question, within `bounds`; None for
     rows of one document."""
-    if not (isinstance(layout, QuestionLayout) and layout.shares):
+    if not (per_question(layout) and layout.shares):
         return None
     return bounds.segments + bounds.questions
 
@@ -884,6 +908,7 @@ class PackedRows(pygrain.MapTransform):
     slots (`compacted`). Every window is `max_length` tokens, which a token
     budget divides into rows."""
 
+    lays_out_windows: ClassVar[bool] = True
     max_length: int
     option_slots: int | None = None
     spans_in_context: bool = False

@@ -19,7 +19,7 @@ from dew.nn.kernels import options
 from dew.nn.kernels.templates import report
 from dew.objectives.rl import GRPOObjective, RolloutScheduler
 from dew.sampling.text import Sampling
-from dew.training import Layout, Trainer, identity
+from dew.training import Layout, Trainer
 from dew.training.evaluation import Evaluation
 
 
@@ -36,7 +36,7 @@ def compiled_in(passed, run) -> tuple[list[str], int]:
     the pass, so a path records at least a pass a program."""
     names: list[str] = []
     before = len(passed())
-    with options.keeping(lambda program, *heard: names.append(identity.called(program))):
+    with options.keeping(lambda program, *heard: names.append(program.called)):
         run()
     return names, len(passed()) - before
 

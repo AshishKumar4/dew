@@ -227,3 +227,70 @@ def test_a_linen_models_fields_are_written_against_the_annotations_its_own_modul
 
     records = argument_records(models["edm2_unet"], {"model_channels": 32, "channel_mult": [1, 2]})
     assert tuple(models.build("edm2_unet", **records).channel_mult) == (1, 2)
+
+
+USER_MODELS = '''
+import dew
+from flax import linen as nn
+
+
+@dew.register("users_dense")
+class UsersDense(nn.Module):
+    features: int = 4
+
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(self.features)(x)
+'''
+"""A user's module of models, one registered by its decorator (`dew.register`) as the module is imported."""
+
+
+def _ran(directory, script: str) -> str:
+    """`script` run in a fresh Python beside the user's modules in `directory`, its printed last line."""
+    import subprocess
+    import sys
+
+    paths = os.pathsep.join([str(directory), *filter(None, [os.environ.get("PYTHONPATH")])])
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, cwd=directory,
+                         env={**os.environ, "PYTHONPATH": paths, "JAX_PLATFORMS": "cpu"})
+    assert run.returncode == 0, run.stderr[-2000:]
+    return run.stdout.strip().splitlines()[-1]
+
+
+def test_a_users_decorated_model_builds_by_its_alias_from_a_config(tmp_path):
+    """A user's model class named by `@dew.register(name)` as its module is imported builds by that alias
+    from a config's record, as Dew's own models do (`ModelConfig`), and the record names it by its import
+    path, which a process that never imported the user's module rebuilds (the owner, 2026-11-16: "if
+    decorators could also be a supported way, I would like it"; row 6151), once it trusts the user's package
+    (`import_trusted`), as a record of any class outside Dew."""
+    (tmp_path / "users_models.py").write_text(USER_MODELS)
+    record = json.loads(_ran(tmp_path, """
+import json
+import users_models
+from dew.registry import ModelConfig, to_record
+config = ModelConfig.from_dict({"name": "users_dense", "fields": {"features": 3}})
+model = config.build()
+assert type(model) is users_models.UsersDense and model.features == 3, model
+print(json.dumps(to_record(config, ModelConfig)))
+"""))
+    assert record["name"] == "users_models:UsersDense", record
+    rebuilt = _ran(tmp_path, f"""
+import json
+import sys
+from dew.registry import ModelConfig, import_trusted
+assert "users_models" not in sys.modules
+record = json.loads({json.dumps(json.dumps(record))})
+import_trusted(record, ("users_models",))
+model = ModelConfig.from_dict(record).build()
+print(type(model).__module__, type(model).__name__, model.features)
+""")
+    assert rebuilt.split() == ["users_models", "UsersDense", "3"]
+    # A run that trusts the user's package (`dew train run.json --trust users_models`, which reads no record
+    # yet) builds the alias its run.json names: trusting the package imports it, its decorators with it.
+    aliased = _ran(tmp_path, """
+from dew.registry import ModelConfig, import_trusted
+import_trusted(None, ("users_models",))
+model = ModelConfig.from_dict({"name": "users_dense", "fields": {"features": 5}}).build()
+print(type(model).__name__, model.features)
+""")
+    assert aliased.split() == ["UsersDense", "5"]

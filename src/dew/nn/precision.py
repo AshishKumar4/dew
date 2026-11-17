@@ -430,6 +430,49 @@ def rounds_products() -> bool:
     return numerics().forms == "fast" and asks_default_precision(None, configured=True)
 
 
+def softplus_series(x) -> jax.Array:
+    """`jax.nn.softplus(x)`'s value, `log(1 + exp(x))`, as its larger part plus `log1p` of the smaller's
+    exponential `y` in (0, 1], the `log1p` by its series in `s = y / (2 + y)`, at most a third, `2 (s + s^3 /
+    3 + s^5 / 5 + ...)` to its working dtype's rounding (`_series_terms`): a backend's own `log1p` is no part
+    of it, a v5e's 1.4e-4 from float64 (its `log` alike), which held a Mamba-2 layer's output at 2.9e-5 from
+    float64 where this holds it at 1.4e-6 (row 7062). Formed in at least float32 and rounded once to `x`'s
+    dtype; its derivative the logistic, as JAX's."""
+    given = jnp.asarray(x)
+    x = given.astype(at_least_fp32(given.dtype))
+    y = jnp.exp(-jnp.abs(x))
+    s = y / (2.0 + y)
+    square = s * s
+    series = jnp.zeros_like(s)
+    for odd in range(_series_terms(x.dtype), 0, -2):
+        series = series * square + 1.0 / odd
+    return (jnp.maximum(x, 0) + 2.0 * s * series).astype(given.dtype)
+
+
+def _series_terms(dtype) -> int:
+    """The last odd power `softplus`'s series keeps in `dtype`: past it the next term relative to the
+    first, `s^(n + 1) / (n + 2)` at `s`'s most, a third, is under `dtype`'s rounding (15 terms to s^29 in
+    float64, 7 to s^13 in float32)."""
+    rounding, last = float(jnp.finfo(dtype).eps), 1
+    while (1 / 3) ** (last + 1) / (last + 2) >= rounding:
+        last += 2
+    return last
+
+
+def _softplus_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
+    """`softplus`'s value and tangent: its derivative the logistic, as JAX's softplus's, in at least float32
+    and rounded once to its input's dtype."""
+    (x,), (tangent,) = primals, tangents
+    work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
+    return softplus(x), (jax.nn.sigmoid(work) * tangent.astype(work.dtype)).astype(tangent.dtype)
+
+
+softplus = contracted("test_softplus_holds_every_order")(
+    declared_tangent(Protected(), softplus_series, _softplus_jvp))
+"""Dew's one softplus (`softplus_series`, its derivative the logistic), which every softplus of `src/dew`
+calls (tools/lint_slop.py's SLOP030); a kernel's body, which differentiates nothing, calls
+`softplus_series`."""
+
+
 def iteration_dtype() -> jnp.dtype:
     """The dtype an optimizer's matrix iteration (Muon's and M3's Newton-Schulz, `dew.newton_schulz`)
     multiplies in under the run's numerics: in its fast forms, bfloat16 for any 16-bit compute dtype (the
@@ -948,15 +991,19 @@ class RecipeRefused(ValueError):
     (`refuse_recipe`)."""
 
 
-def refuse_recipe(owner: str) -> None:
-    """Refuse a projection the run's low-precision recipe takes by its role (`recipe_role`) whose product
-    `owner` holds instead (a quantizer's product class, a wrapper's interception, an adapter's fused
-    product), which would train it unquantized, silently: the recipe and a product wrapper compose nowhere
-    yet."""
+def refuse_recipe(owner: str, depth: int, width: int) -> None:
+    """Refuse a `depth` x `width` projection the run's low-precision recipe takes (`recipe_refusal`, the one
+    decision: its role the recipe's, its widths whole blocks of the recipe's) whose product `owner` holds
+    instead (a quantizer's product class, a wrapper's interception, an adapter's fused product), which would
+    train it unquantized, silently: the recipe and a product wrapper compose nowhere yet. A projection the
+    recipe leaves (a role it keeps, widths of no whole blocks) runs under the wrapper as without a recipe."""
+    from dew.nn.kernels.projections import recipe_refusal
+
     held = recipe_role()
-    if held is not None and held[1] in held[0].roles:
-        raise RecipeRefused(f"the run's {held[0].recipe} recipe takes this {held[1]} projection, whose "
-                            f"product {owner} holds: train it in the recipe or under the wrapper, not both")
+    if held is not None and recipe_refusal(depth, width) is None:
+        raise RecipeRefused(f"the run's {held[0].recipe} recipe takes this {depth} x {width} {held[1]} "
+                            f"projection, whose product {owner} holds: train it in the recipe or under the "
+                            "wrapper, not both")
 
 
 @dataclasses.dataclass(frozen=True)

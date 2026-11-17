@@ -118,7 +118,7 @@ def whole() -> Iterator[None]:
     one device does, while the mesh, its expert axis among it, stays in context for the layers that read
     it (an expert exchange). A server decodes a run trained on such a mesh under it (`dew.inference.Server`),
     one token a step leaving no microbatches to pipeline and no sequence to split. A JAX user context
-    (`dew._cache.WHOLE`): what a trace reads through it is part of its call's identity."""
+    (`dew._cache.WHOLE`): what a trace reads through it is part of JAX's trace context."""
     with _cache.WHOLE(new_value=True):
         yield
 
@@ -247,9 +247,12 @@ def layer_norms(leaf: jax.Array, stacked: int, floor: float = 0.0) -> jax.Array:
     """Each stored layer's norm of `leaf`, a leaf whose first `stacked` dimensions stack its layers
     (`layers_of`), over the layer's own values and kept against its layers' axes, at least `floor`: the whole
     leaf's where it stacks none, as an optimizer rule reads one layer. The values flattened to one axis, as
-    `optax.safe_norm` takes one axis or two."""
+    `optax.safe_norm` takes one axis or two, each scaled by its largest magnitude first, so a layer whose
+    values are finite has a finite norm though their squares would pass float32 (a parameter of 1e20)."""
     flat = leaf.reshape((*leaf.shape[:stacked], -1))
-    held = optax.safe_norm(flat, floor, axis=-1, keepdims=True)
+    largest = jnp.max(jnp.abs(flat), axis=-1, keepdims=True)
+    scale = jnp.where(largest > 0, largest, jnp.ones_like(largest))
+    held = jnp.maximum(optax.safe_norm(flat / scale, 0.0, axis=-1, keepdims=True) * scale, floor)
     return held.reshape((*leaf.shape[:stacked], *(1,) * (leaf.ndim - stacked)))
 
 
@@ -342,7 +345,7 @@ def placing(layout: ParameterLayout | None) -> Iterator[None]:
     projection stays with the partitioner (a reference arm traced inside a step opts out so). The trainer's
     step and its evaluations trace under their layout (`Trainer._traced_on`, `Evaluator.scoring`), a server
     and a scoring server under `FORWARD`; a program cached by what it traced under keys on it
-    (`trace_context`), and a call's identity states it (`dew._cache.PLACING`, a JAX user context)."""
+    (`trace_context`), as JAX's trace context does (`dew._cache.PLACING`, a JAX user context)."""
     with _cache.PLACING(new_value=layout):
         yield
 

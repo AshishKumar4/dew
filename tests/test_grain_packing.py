@@ -371,3 +371,23 @@ def test_a_record_whose_packed_fields_differ_in_length_is_refused(read, policy):
     with pytest.raises(ValueError):
         windows(records((1, 4)))
 
+
+
+def _unpositioned(window: dict) -> dict:
+    """A packed window without its positions, as a step after the pack that dropped them hands it on."""
+    return {name: value for name, value in window.items() if name != "text_positions"}
+
+
+def test_a_packed_window_whose_positions_a_later_step_dropped_is_refused():
+    """A packed read lays each window's documents out by their segment ids and positions (`Coordinated`); a
+    window a later step left without its positions is refused, naming them, where the read dropped its
+    segment ids and handed on a bound alone, the window read as one document (train 890's review, row
+    6631)."""
+    documents = Memory([{"text": np.arange(start, start + 3, dtype=np.int32)} for start in (10, 20, 30)])
+    chain = Pipeline(documents).pack(8, bins=3).map(_unpositioned).batch(1)
+    stream = compile(chain, read="memory", loading=Loading(workers=0, threads=1)).train(DataPartition())
+    try:
+        with pytest.raises(ValueError):
+            next(stream)
+    finally:
+        stream.close()

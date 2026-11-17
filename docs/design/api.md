@@ -1,6 +1,6 @@
 # The API: one registry, one objective, one trainer
 
-This page records the original API design and how it was built. The statistics-first C01/C02 cutover replaced its scalar-loss, MultiSteps, mutable-router and checkpoint-field examples. Its registry decorators and name records were later replaced by import paths and static aliases (`dew.registry`). For contracts you can run, read the [current core API](../reference/core-api.md) and the [objective guide](../concepts/objectives.md).
+This page records the original API design and how it was built. The statistics-first C01/C02 cutover replaced its scalar-loss, MultiSteps, mutable-router and checkpoint-field examples. Its registry decorators and name records were later replaced by import paths and static aliases (`dew.registry`), and a user's class joins a kind's aliases by a decorator again (§3.1, the owner, 2026-11-16). For contracts you can run, read the [current core API](../reference/core-api.md) and the [objective guide](../concepts/objectives.md).
 
 Design record, 2026-09-03. The code blocks are design sketches, not runnable code. The examples describe the revisions they cite.
 
@@ -9,7 +9,7 @@ Design record, 2026-09-03. The code blocks are design sketches, not runnable cod
 | # | Decision | Where |
 | --- | --- | --- |
 | 1 | `Trainer` and `Objective` stay the two nouns. No `TrainProgram`, `Execution`, `Runner` layer. | 3.3, 3.4 |
-| 2 | Everything extensible has one `Registry`: a decorator, a `Mapping` and an attribute view. `models["simple_dit"]`, `models.SimpleDiT` and the class are the same object. | 3.1 |
+| 2 | Everything extensible has one alias table a kind (`dew.registry.Aliases`): Dew's own classes its static entries, a user's added by a decorator (`@dew.register("my_model")`). `models["simple_dit"]` and the class are the same object; a record names a class by its import path. | 3.1 |
 | 3 | Values cross `jit`, objects author them, protocols grant effects. A `flax.struct.dataclass` for state, a frozen dataclass for configuration, a `Protocol` for anything with two implementations. | 2 |
 | 4 | Randomness is a `key` argument. `RandomMarkovState` goes. Step keys are `fold_in(run_key, step)`. | 3.2 |
 | 5 | Effects live in capabilities handed to the trainer (`Tracker`, `Checkpoints`). Constructing anything opens nothing. | 3.4 |
@@ -53,34 +53,48 @@ Every surface below follows all six rules, and a reviewer can check a new module
 
 ## 3. The surfaces
 
-### 3.1 `Registry`
+### 3.1 `Aliases`
 
 ```python
 # dew/registry.py
-class Registry(Mapping[str, T]):
-    """Names for one kind of thing. Decorator, mapping and attribute view in one."""
-    def __init__(self, kind: str): ...
-    def __call__(self, name: str, /) -> Callable[[T], T]:      # @models("simple_dit")
-    def __getitem__(self, name: str) -> T                       # models["simple_dit"]
-    def __getattr__(self, attr: str) -> T                       # models.SimpleDiT
+class Aliases(Mapping[str, T]):
+    """One kind's short names, each an import path: Dew's own a static table, imported when read."""
+    def __init__(self, kind: str, paths: Mapping[str, str], base: str | None = None): ...
+    def register(self, name: str, /) -> Callable[[T], T]       # @models.register("my_model"), at import
+    def __getitem__(self, name: str) -> T                       # models["simple_dit"], or an import path
     def __iter__(self), __len__(self)
-    def build(self, name: str, /, **fields) -> Any              # unknown field raises
+    def build(self, name: str, record=..., /, **fields) -> Any  # unknown field raises
+    def from_record(self, record) -> Any                        # {"class": ..., "fields": {...}}
     @property
     def union(self) -> type                                     # Union[...] of members, for tyro
 
-models     = Registry[type[nn.Module]]("model")
-presets    = Registry[type[Preset]]("preset")
-samplers   = Registry[type[Solver]]("sampler")
-encoders   = Registry[type[ConditionEncoder]]("encoder")
-metrics    = Registry[Callable[..., Metric]]("metric")
-objectives = Registry[type[Objective]]("objective")
+models   = Aliases[type[nn.Module], nn.Module]("model", {"simple_dit": "dew.nn.backbones.dit:SimpleDiT", ...},
+                                               base="flax.linen:Module")
+register = models.register                                     # dew.register
 ```
 
 ```python
-@models("simple_dit")
-class SimpleDiT(nn.Module):
-    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"   # replaces use_hilbert, use_zigzag and "+hilbert"
+@dew.register("my_model")
+class MyModel(nn.Module):
+    features: int = 4
+
+ModelConfig.from_dict({"name": "my_model", "fields": {"features": 8}}).build()   # MyModel(features=8)
 ```
+
+Each kind (`models`, `mixers`, `objectives`, ...) has one table. Dew's own classes are its static entries,
+each mapped to its import path and imported only when it is read, so `import dew.registry` imports no feature
+package. A user's class joins the same table under a name of its own through the table's decorator as its
+module is imported, `@dew.register("my_model")` for a model and `@mixers.register("my_mixer")` for any other
+kind, and then builds by that name from a config, a record or the command line as Dew's own do, the command
+line once it trusts the module's package (`--trust users_models`, which imports it, `import_trusted`) (the owner,
+2026-11-16: "I want really good DX. if decorators could also be a supported way, I would like it."). The
+decorator refuses a name another class holds and a class not of the kind. It is one table with two ways
+in, not a second registry. A record names every class by its import path, a user's registered one too, so a
+saved record rebuilds in a process that has not imported the user's module once it trusts the module's
+package (`import_trusted`, a run's `--trust`), as any class outside Dew
+(tests/test_registry_records.py::test_a_users_decorated_model_builds_by_its_alias_from_a_config); only a
+run's own record names its run class by its alias in `runs`. A class is read by its alias or its path: the
+attribute view (`models.SimpleDiT`) of the original design was not built.
 
 `build` validates against `dataclasses.fields`, which the fix in `7adad81` already does for `build_model`. `canonicalize_architecture` and `ARCHITECTURE_SUFFIX_FLAGS` (`registry.py:43-86`) go; `SimpleDiT.scan_order` is already a property (`nn/backbones/dit.py:33-37`) and becomes the field.
 
@@ -292,7 +306,9 @@ decoder with the tokenizer, saves as that text checkpoint, and names no Hub orig
 loads the wrapper. A family that reads its media bundle as one decoder (DeepSeek-V4.1) loads as its
 text checkpoint, the bundle's config without its vision_config and its decoder's tensors without those
 that serve the media alone (the routers' image-span bias). A decoder or a fallback source is text
-already and loads as it is. A diffusion pipeline and a quantized wrapper are refused. A checkpoint that holds none of the prediction depths its config names loads as its trunk;
+already and loads as it is. A diffusion pipeline is refused. A quantized wrapper loads as its quantized
+text checkpoint, its quantization's module selection renamed with its tensors and the towers' dropped (the
+owner, 2026-11-16: "why refuse? no point in unnecessarily refusing stuff!"). A checkpoint that holds none of the prediction depths its config names loads as its trunk;
 one holding some of them must hold all. `prediction_depths` chooses how many the load builds: None
 the ones the checkpoint holds, 0 none, `n` the first `n`; a DSpark drafter, whose stages draft as
 one with its heads on the last, is kept whole or at 0 not at all. The load reads the source as the checkpoint of those depths alone, its config's counts cut
@@ -339,8 +355,9 @@ which rows one pass holds (`fits`), runs a pass over the weights the server hand
 reads a request's answer off its rows' outputs (`answer`). The server runs one pass a step over the
 waiting rows oldest first, so a request whose rows outrun a pass carries the rest to the next turn.
 `ScoringServer.from_task` compiles every program its passes run before the first; with `programs=`,
-a file an earlier process of the task kept them in (`dew.training.ahead.keeping`), it loads each in
-place of tracing and compiling it, and refuses a file kept under another target, code or settings
+a file an earlier process of the task kept them in (`dew.training.ahead.keeping`), it traces and
+lowers each and loads the kept executable of the program it lowers to in place of compiling it; a
+program the file holds none of, or a file kept for another target, compiles
 ([training.md §6](training.md#6-compilation)).
 It binds each request to the (task, weights) pair that admitted it, so a reload swaps both at once
 for what is submitted after. `Decide.scoring()` gives a decision task as such a task, and

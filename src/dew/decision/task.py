@@ -50,8 +50,9 @@ from dew.decision.layout import (
     Encoded,
     Laid,
     Layout,
-    QuestionLayout,
     Specials,
+    context_tokens,
+    per_question,
     render,
     with_context,
 )
@@ -224,15 +225,33 @@ class Usage:
     state_tokens: int
     state_kept: int
     cut: Mapping[str, tuple[int, int]] = field(default_factory=dict)
+    context_tokens: int = 0
+    """The tokens of the request's own context, whole (`context_tokens`)."""
+    context_kept: int = 0
+    """Its first tokens, those every row read: the whole less the most any row cut (`Encoded.context_cut`),
+    each row cutting the one context alike (`contexted`)."""
 
     @property
     def truncated(self) -> bool:
         return self.state_kept < self.state_tokens
 
     @property
+    def context_cut(self) -> bool:
+        """Whether its rows read less than the request's context."""
+        return self.context_kept < self.context_tokens
+
+    @property
     def trimmed(self) -> bool:
         """Whether a row's declared budgets cut a question's instructions or options."""
         return "instructions" in self.cut or "options" in self.cut
+
+
+def contexted(usage: Usage, rows: Sequence[Encoded], given: int) -> Usage:
+    """`usage` with the request's context of `given` tokens and those its rows read: every row reads the one
+    context, each cutting it alike where it cuts it, so the most any row cut is the context's cut, which a
+    sum over rows (`cut_counts`) would count once a row (train 986's review)."""
+    return replace(usage, context_tokens=given,
+                   context_kept=given - max((row.context_cut for row in rows), default=0))
 
 
 def usage_of(rows: Sequence[Encoded]) -> Usage:
@@ -255,12 +274,25 @@ def _head_changes(first: Mapping[str, object], other: Mapping[str, object]) -> l
     return [f"head.{name}" for name in registry.computing_differences(
         registry.imported(str(first["class"])), *stated, kept=(_records.NUMBERS,))]
 
+def _tokenizer_held(settings: "DecideSettings", run: str) -> Mapping[str, str] | str | None:
+    """What the text tokenizer of the run in `run` is, which runs compare by: the hashes of the files it
+    reads (`PinnedTokenizer.files`), whether its record states them or was saved before records did
+    (`dew.inference.tasks.saved_tokenizer`); the byte vocabulary, which has no files, by its name."""
+    from dew.data.text import HFTokenizer
+    from dew.inference.tasks import saved_tokenizer
+
+    if settings.tokenizer is None:
+        return None
+    found = saved_tokenizer(settings.tokenizer, settings.tokenizer_files, run)
+    return found.pinned.files if isinstance(found, HFTokenizer) else settings.tokenizer
+
+
 @dataclass(frozen=True)
 class DecideSettings:
     """What a decision run records beside its backbone, and its task is built with
     (`Decide.from_run`): the head's record (`Head.record`), the layout (by import path, its
-    segments with it), the special tokens, the text tokenizer's name, and an image processor's
-    source, or None."""
+    segments with it), the special tokens, where the text tokenizer is found (its name, a hub snapshot as
+    its repo and commit) and what it is (its files' hashes), and an image processor's source, or None."""
 
     head: Mapping[str, object]
     """The head's class record (`Head.record`), which `Head.from_record` builds over the backbone it reads,
@@ -279,6 +311,10 @@ class DecideSettings:
     which a pass of its task pads each question to (`Budget.options`); None where the run recorded
     none, as before it did. A pass's question slots are its windows' (`Decide.pass_shapes`), so the
     run records no count of questions (an earlier run's `questions` is read past, `saved_settings`)."""
+    tokenizer_files: Mapping[str, str] | None = field(default=None, metadata={_records.ADDED: True})
+    """What the text tokenizer is: each of its files' hash (`dew.inference.tasks.recorded_files`), which a
+    load holds the files it finds to and runs compare by; None where a run recorded none, as runs before
+    it did."""
 
 
 CALIBRATIONS = "calibrations"
@@ -375,18 +411,18 @@ class Decide(SavedRunTask, InItsForm):
     which a release of it names again; None for a task read from none."""
     derives_sharing: bool = field(default=True, repr=False, compare=False)
     """Whether the task states how a request's questions share a state where its layout states none
-    (`QuestionLayout.shared_for`), as a task built in code does; one read from a release or a run lays its
+    (`SegmentLayout.shared_for`), as a task built in code does; one read from a release or a run lays its
     rows out as they were declared (`released`, `_recorded`), a layout that states none a question a row."""
 
     sharing: tuple[int | None, int | None] | None = field(default=None, repr=False, compare=False)
-    """The sharing (`QuestionLayout.shared_state`) the layout the task was given states, and the sharing the
+    """The sharing (`SegmentLayout.shared_state`) the layout the task was given states, and the sharing the
     task states for it (`layout`), carried by a task that replaces its layout but not its sharing
     (`dataclasses.replace`); None until the task reads its layout."""
 
     def __post_init__(self) -> None:
         # A request's questions are scored over one copy of its state where the backbone and head read each
-        # question as its own row (`QuestionLayout.shared_for`).
-        if isinstance(self.layout, QuestionLayout) and self.derives_sharing:
+        # question as its own row (`SegmentLayout.shared_for`).
+        if per_question(self.layout) and self.derives_sharing:
             from dew.decision.shared_state import shared_for
 
             given = self.layout.shared_state
@@ -403,7 +439,7 @@ class Decide(SavedRunTask, InItsForm):
         """The layout as the task was given it, its sharing as stated (`sharing`): what a run trained from
         the task lays its rows out by under a data plan before they shared a state
         (`DecisionObjective.stated`)."""
-        if not isinstance(self.layout, QuestionLayout) or self.sharing is None:
+        if not per_question(self.layout) or self.sharing is None:
             return self.layout
         return replace(self.layout, shared_state=self.sharing[0])
 
@@ -463,8 +499,7 @@ class Decide(SavedRunTask, InItsForm):
                   weights: Weights, dtype: DTypeLike | None) -> Self:
         """The task a run's `record` describes over `backbone` and `variables`, the `weights` they are:
         its head, layout, tokenizer, special tokens and processor as the run recorded them."""
-        from dew.data.text import tokenizer_for
-        from dew.inference.tasks import saved_settings
+        from dew.inference.tasks import saved_settings, saved_tokenizer
         from dew.interop.pretrained import load_processor
 
         settings = saved_settings(record, DecideSettings)
@@ -482,11 +517,12 @@ class Decide(SavedRunTask, InItsForm):
         # Its rows laid out as the run recorded them: a layout that states no sharing, from a run saved
         # before rows shared a state (data plan version 12), a question a row as it trained. One
         # that states its sharing, saved under such a plan, trained its rows in streams
-        # (`QuestionLayout.streamed`, which the plan's version states and no record holds) and is laid
+        # (`SegmentLayout.streamed`, which the plan's version states and no record holds) and is laid
         # here as documents continuing the shared part: the same tokens at the same positions, each
         # question reading the shared part and itself (with siblings, the questions before it), so the
         # same function, each held to its questions' own rows (tests/test_decision_state_once.py).
-        return cls(model, variables, settings.layout, tokenizer_for(settings.tokenizer), settings.specials,
+        tokenizer = saved_tokenizer(settings.tokenizer, settings.tokenizer_files, directory)
+        return cls(model, variables, settings.layout, tokenizer, settings.specials,
                    name=str(epath.Path(directory).name), weights=weights, processor=processor, budget=budget,
                    derives_sharing=False)
 
@@ -599,11 +635,15 @@ class Decide(SavedRunTask, InItsForm):
         settings = [saved_settings(saved, DecideSettings) for saved in recorded]
         # A setting its data derives (its padding, `metadata["derived"]`) may differ between the runs, and
         # their heads by how they run or train alone (`_head_changes`).
-        for directory, own in zip(runs, settings, strict=True):
+        # Their tokenizers by what they are, their files' hashes, wherever each found it (`_tokenizer_held`).
+        tokenizers = [_tokenizer_held(own, run.directory) for own, run in zip(settings, pinned, strict=True)]
+        for directory, own, held in zip(runs, settings, tokenizers, strict=True):
             differing = [entry.name for entry in fields(DecideSettings)
-                         if entry.metadata.get("derived") != "data" and entry.name != "head"
+                         if entry.metadata.get("derived") != "data"
+                         and entry.name not in ("head", "tokenizer", "tokenizer_files")
                          and getattr(own, entry.name) != getattr(settings[0], entry.name)]
             differing += _head_changes(settings[0].head, own.head)
+            differing += ["tokenizer"] if held != tokenizers[0] else []
             if differing:
                 raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
                                  f"{', '.join(differing)}, so their weights are not one task's to average")
@@ -723,7 +763,8 @@ class Decide(SavedRunTask, InItsForm):
                 # The releases of saved runs its paths lie within mapped to the runs they hold, as a
                 # trainer's checkpoint carries them (`with_release_sources`).
                 record = with_release_sources(DecisionObjective(self).inference_record())
-            checkpoints.save(self.weights.step, state, artifact=record, weights_only=True)
+            checkpoints.save(self.weights.step, state, artifact=record, weights_only=True,
+                             tokenizer=self.tokenizer)
             checkpoints.wait()
 
     @overload
@@ -1373,6 +1414,9 @@ class Decide(SavedRunTask, InItsForm):
         """A Jev response body of a request's answers and usage."""
         gated = self.calibration.abstention is not None
         reported: dict[str, JSON] = {"input_tokens": usage.input_tokens, "output_tokens": 0}
+        if usage.context_tokens:
+            # Every caller whose context its rows cut is told so in its own answer, details or not.
+            reported.update(context_tokens=usage.context_tokens, context_kept=usage.context_kept)
         if details:
             reported.update(state_tokens=usage.state_tokens, state_kept=usage.state_kept,
                             truncated=usage.truncated,
@@ -1522,6 +1566,8 @@ class _Admitted:
 
     questions: dict[str, Question]
     rows: tuple[Encoded, ...]
+    admitted: Usage | None = None
+    """What admission read of the body's context (`contexted`), which its answer states."""
 
 
 @dataclass(frozen=True)
@@ -1656,23 +1702,27 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
             with self.counting:
                 self.counts.dropped(Rejected(refused.reason))
             raise
-        usage = usage_of([row.encoded for row in rows])
-        if self.whole and (usage.truncated or usage.trimmed):
+        usage = contexted(usage_of([row.encoded for row in rows]), [row.encoded for row in rows],
+                          len(context_tokens(decide.tokenizer, context)))
+        if self.whole and (usage.truncated or usage.trimmed or usage.context_cut):
             # Counted as a run counts a row it refused: its reason and the tokens its cut removed.
             removed = {kind: tokens for kind, (_, tokens) in usage.cut.items()}
             with self.counting:
                 self.counts.dropped(Rejected("cut", cut=removed))
-            cut = "state" if usage.truncated else "instructions or options"
+            cut = ("state" if usage.truncated else "context" if usage.context_cut
+                   else "instructions or options")
             raise Refused("cut", f"the request does not fit the maximum context length, max_len="
                                  f"{decide.layout.max_len} tokens, without cutting its {cut}")
         with self.counting:
             self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
-        return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
+        return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows), usage))
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
-        return self.decide._wire_response(payload.questions,
-                                          *self.decide._replied(payload.questions, payload.rows, outputs),
-                                          details=self.details)
+        answers, usage = self.decide._replied(payload.questions, payload.rows, outputs)
+        if payload.admitted is not None:
+            usage = replace(usage, context_tokens=payload.admitted.context_tokens,
+                            context_kept=payload.admitted.context_kept)
+        return self.decide._wire_response(payload.questions, answers, usage, details=self.details)
 
 
 def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -> Variables:
@@ -1758,7 +1808,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
     holding at most the rows its read declares (`tokens_bound`, `SegmentBound`: the most a window
     of the read holds, which it measured), else `max_segments` (the objective's bound), the questions'
     spans in each row's context where
-    `spans_in_context` (`JointLayout.spans_in_context`), each row's block the whole row where
+    `spans_in_context` (`SegmentLayout.spans_in_context`), each row's block the whole row where
     `whole_blocks` (`whole_blocks_of`), its rows read in their streams as their layout's `attention`
     says (`Layout.attention`), its documents' chains at most `fork_depth` long and each row's read
     together where `joint_forks` (`dew.decision.shared_state.fork_depth`, `Forks.joint`)."""
@@ -1787,8 +1837,8 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
 
 
 def whole_blocks_of(layout: Layout) -> bool:
-    """Whether `layout`'s rows are each one block of the whole row (`QuestionLayout.split` 'whole')."""
-    return isinstance(layout, QuestionLayout) and layout.blocks and layout.split == "whole"
+    """Whether `layout`'s rows are each one block of the whole row (`SegmentLayout.split` 'whole')."""
+    return per_question(layout) and layout.blocks and layout.split == "whole"
 
 
 def _near_equal(options: Sequence[str], group: int) -> list[list[str]]:

@@ -219,3 +219,77 @@ def test_a_fused_prologue_never_reads_the_depths_padding(generation_name):
     with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
         got = jax.jit(functools.partial(fused_gemm.fused, region))(x, w, s)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(program(x, w, s)))
+
+
+def _products(jaxpr) -> int:
+    """How many products `jaxpr` and the jaxprs it holds compute: dots and kernel launches."""
+    products = {"dot_general", "ragged_dot_general", "pallas_call"}
+    return sum(eqn.primitive.name in products for eqn in jaxpr.eqns) + sum(
+        _products(inner) for eqn in jaxpr.eqns for inner in jax.extend.core.jaxprs_in_params(eqn.params))
+
+
+def test_a_named_gate_projection_is_its_launchs_residual_and_its_backward_recomputes_no_product():
+    """A SwiGLU on a gate projection the program names `gate_proj` (`checkpoint_name`), fused through
+    `fused_gemm.fused` on an H100 (a CPU's interpretation): under a remat policy saving that name, the
+    launch's output under it is the derivative's residual (`gemm`'s `named`), so the reverse pass reads
+    the gate from it and computes one product fewer than the same region unnamed, whose backward recomputes
+    the gate's accumulator (row 7131); its gradients are the unnamed region's, bitwise (the epilogue reads
+    its accumulator through its rounding to bf16 alone, the residual that rounding)."""
+    keys = jax.random.split(jax.random.key(11), 3)
+    x = jax.random.randint(keys[0], (64, 128), -3, 4).astype(jnp.bfloat16)
+    wg = jax.random.randint(keys[1], (128, 64), -3, 4).astype(jnp.bfloat16)
+    up = jax.random.randint(keys[2], (64, 64), -3, 4).astype(jnp.bfloat16)
+
+    def region(name):
+        def swiglu(x, wg, up):
+            gate = fused_gemm.product(x, wg, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+            gate = jax.ad_checkpoint.checkpoint_name(gate, name) if name else gate
+            return (jax.nn.silu(gate.astype(jnp.float32)) * up.astype(jnp.float32)).astype(jnp.bfloat16)
+        return functools.partial(fused_gemm.fused, swiglu)
+
+    policy = jax.checkpoint_policies.save_only_these_names("gate_proj")
+
+    def gradient(name):
+        def loss(x, wg, up):
+            return jnp.sum(region(name)(x, wg, up).astype(jnp.float32))
+        return jax.grad(jax.checkpoint(loss, policy=policy), argnums=(0, 1))
+
+    with generation.assumed("sm90"):
+        named, unnamed = (_products(jax.make_jaxpr(gradient(name))(x, wg, up).jaxpr)
+                          for name in ("gate_proj", None))
+        got, expected = (gradient(name)(x, wg, up) for name in ("gate_proj", None))
+    assert named < unnamed, (named, unnamed)
+    for g, e in zip(got, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(g, np.float32), np.asarray(e, np.float32))
+
+
+@pytest.mark.parametrize("gpu", ["sm80", "sm90"])
+@pytest.mark.parametrize(("hidden", "width", "rows", "taken"),
+                         [(1024, 4096 + 512 + 512, 12288, ("sm80", "sm90")),
+                          (1024, 2 * 3584, 12288, ("sm80", "sm90")),
+                          (1024, 2048, 12288, ()), (2560, 9216, 24576, ("sm90",))],
+                         ids=["q/k/v", "gate/up", "unmeasured", "4B gate/up"])
+def test_a_normed_projection_takes_the_template_where_a_receipt_timed_it(hidden, width, rows, taken, gpu):
+    """An RMS norm feeding a bf16 projection of 4 x 3072 rows of 1024 on an A100 or an H100 (its program
+    through the algebra's pass, which recognizes the norm as the product's prologue): at the widths M-EM-65
+    timed (Qwen3.5-0.8B's joined q/k/v and gate/up, `grouped_matmul.NORMED_08B`) the product's launch is the
+    template's and the norm its prologue, as the receipt measured faster than the norm kernel then XLA's
+    dot; a formed projection at a matrix another receipt timed (the 4B's, M-EM-36 on wgmma) its cell's, as
+    the projection unnormed (train 977 F1); at a width none timed, XLA's dot as every dense cell's of their
+    families (DENSE1)."""
+    from dew import algebra
+
+    def normed(x, scale, w):
+        wide = x.astype(jnp.float32)
+        inverse = jax.lax.rsqrt(jnp.mean(wide * wide, axis=-1, keepdims=True) + 1e-6)
+        return jnp.dot((wide * inverse * scale).astype(x.dtype), w,
+                       preferred_element_type=jnp.float32).astype(x.dtype)
+
+    x = jax.ShapeDtypeStruct((rows, hidden), jnp.bfloat16)
+    scale = jax.ShapeDtypeStruct((hidden,), jnp.float32)
+    w = jax.ShapeDtypeStruct((hidden, width), jnp.bfloat16)
+    with generation.assumed(gpu), generation.routes() as routes:
+        jax.jit(algebra.rewritten(normed, kernels=True)).trace(x, scale, w)
+    found = {(route.choice, route.kernel) for route in routes}
+    assert (("grouped_matmul", "mosaic") in found) == (gpu in taken), found
+

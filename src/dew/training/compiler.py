@@ -427,11 +427,13 @@ class StepCompiler[L, E]:
         return planned, compiled
 
     def _plan(self, stepping: Stepping, state: TrainState, batch: Batch, trials: Trials | None,
-              frontier: bool = False, *, unplaced: int | None = None
+              frontier: bool = False, *, unplaced: int | None = None, provisional: bool = False
               ) -> tuple[Planned, Compiled, Callable[[], None]]:
         """`plan`, over a state whose devices hold `unplaced` bytes a device holds of it none of yet where
         given (`FitSearch.unplaced`), and the record of its rung, which the caller keeps once it takes the
-        plan (`keep_rung`)."""
+        plan (`keep_rung`); a plan before its state is placed, or one `provisional` (a later phase's off the
+        loop), holds each executable it compiles for the plan made on the devices as they stand
+        (`FitSearch.provisional`)."""
         settings = stepping.settings
         mesh = settings.device_mesh
         links = self.links(mesh)
@@ -439,7 +441,8 @@ class StepCompiler[L, E]:
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with stepping.traced_on(mesh, links) as schedule, held_objects():
             planned, flops, plan, validation, keep = self._planned(stepping, state, batch, mesh, schedule,
-                                                                   resumed, trials, frontier, unplaced)
+                                                                   resumed, trials, frontier, unplaced,
+                                                                   provisional or unplaced is not None)
             split, candidate = planned.split, planned.candidate
             self._shape_rungs[batch_layout(batch)] = self.rung()
             memory = memory_record(planned.executable, local_devices(mesh), candidate.held, fits=True)
@@ -516,7 +519,7 @@ class StepCompiler[L, E]:
 
     def _planned(self, stepping: Stepping, state: TrainState, batch: Batch,
                  mesh: Mesh, schedule: Schedule, resumed: JSON, trials: Trials | None,
-                 frontier: bool, unplaced: int | None
+                 frontier: bool, unplaced: int | None, provisional: bool
                  ) -> tuple[Planned, StepFlops | None, JSON, Validation, Callable[[], None]]:
         """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the first that
         fits, guided under AutoPGLE (`Planned.guided`), with `plan` its record and the objective at its rung,
@@ -567,7 +570,7 @@ class StepCompiler[L, E]:
                 self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self.ahead,
-            unplaced=unplaced)
+            provisional=provisional, unplaced=unplaced)
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         # The rungs above the plan are read for their memory alone, no device ever running them: offline
@@ -626,7 +629,8 @@ class StepCompiler[L, E]:
                                                         window=settings.accumulation, shape_only=True)
             placement = stepping.shardings(prepared)
             transaction = Transaction(self.objective, settings.optimizer, settings.accumulation, shapes,
-                                      record=settings.record, examples=stepping.shape.examples)
+                                      record=settings.record, examples=stepping.shape.examples,
+                                      skip=settings.skip_nonfinite)
             body = transaction.step(realize=execution.realize, host=True,
                                     frozen=tuple(path for path, _, _ in frozen_trees(state.variables, sites)))
 

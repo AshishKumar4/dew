@@ -33,8 +33,9 @@ from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, FROZEN, Batch, Variables, dicts, leaves_by_path, merge
 from dew.data.dataset import rows_of
 from dew.gauss_newton import solves_equations
-from dew.held_updates import holds_back, holds_state, input_taken, refuse_untold, update_applied
+from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
 from dew.nn import in_backward
+from dew.nn.finite import all_finite, leaf_finite, zeroed_unless
 from dew.nn.inspection import (
     PROBES,
     Watched,
@@ -62,7 +63,7 @@ from dew.objectives.base import (
     with_projected,
 )
 from dew.objectives.routing import refuse_fixed_routers
-from dew.optim import clips_qk, post_step_order, stepped
+from dew.optim import clips_qk, pooled_update, post_step_order, stepped
 from dew.optim_schedules import injected_edited
 from dew.state import Accumulation, ReplicaState, TokenCount, TrainState, apart, occupancy, together
 from dew.training.distributed import microbatch
@@ -122,6 +123,15 @@ class Committed:
     own: Ratio | jax.Array | float | None = None
     """The microbatch's own loss statistics, which a step read in several pools into its batch's loss
     (`dew.training.planning.whole_step`) and lets go; None past the step."""
+    unfinite_layer: jax.Array | None = None
+    """The first layer the attempt's backward walk met whose gradient was not finite (`Applied`), -1 for
+    none; None in a step that updates no layer in its backward, and past the step."""
+    finite: jax.Array | None = None
+    """Whether an attempt with no loss scale was finite, its gradient and forward as well as its loss, which
+    the step reports (`outcome`) and a run's streak of steps that are not reads (`dew.training.interval`): a
+    finite loss over a gradient that is not trains nothing. None under a loss scale, whose overflow its
+    scale backs off from, the step reporting its loss's finiteness, and past the step, whose own finiteness
+    the whole of its parts states (`whole_step`)."""
 
 
 def _chosen(take, taken, kept):
@@ -175,14 +185,15 @@ def _only_when(due, taken, kept, operand):
     return jax.lax.cond(due, lambda current: jax.lax.optimization_barrier(taken(current)), kept, operand)
 
 
-def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux, committed: jax.Array | None,
+def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux, committed: Committed | None,
             batch: Batch, stepped: jax.typing.ArrayLike, consumed: jax.Array, *, split: int) -> tuple:
     """What a compiled step returns (`Trainer.compile`) of the transaction it ran from `current` on
     `batch`, wherever it ran: the advanced state, its step counting `stepped` and its clock the source
     examples its microbatch `consumed` (`TrainState.consumed`, where the run keeps one), the loss, the
-    metrics with the batch's counts, and whether the loss is finite, the microbatch accepted and the
-    window committed. A metric stated as a statistic (`Aux.pooled`) is its value where the step is read
-    whole (`split` 1), and its statistic where it is one of `split` microbatches, which the step's whole
+    metrics with the batch's counts, and whether the attempt was finite (`Committed.finite`, its loss's
+    where it states none), the microbatch accepted and the window committed. A metric stated as a statistic
+    (`Aux.pooled`) is its value where the step is read whole (`split` 1), and its statistic where it is one
+    of `split` microbatches, which the step's whole
     pools (`dew.training.planning.whole_step`)."""
     pooled = aux.pooled if split > 1 else {name: value.mean()[0] for name, value in aux.pooled.items()}
     metrics = {**aux.metrics, **pooled, **step_counts(batch)}
@@ -190,8 +201,10 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
         assert "evaluated" in aux.record, "a recording transaction stacks its evaluations (`recorded`)"
         metrics |= recorded_metrics(aux.record)
     clock = None if current.consumed is None else (current.consumed + consumed).astype(current.consumed.dtype)
+    finite = jnp.isfinite(loss) if committed is None or committed.finite is None else committed.finite
     return (dataclasses.replace(advanced, step=current.step + stepped, consumed=clock), loss, metrics,
-            jnp.isfinite(loss), advanced.microstep > current.microstep, committed)
+            finite, advanced.microstep > current.microstep, dataclasses.replace(committed, finite=None)
+            if committed is not None else None)
 
 
 def probed_loss(objective: Objective, variables: Variables, batch: Batch, step: Step):
@@ -270,20 +283,23 @@ def optimizer_update(optimizer: optax.GradientTransformation, gradient, opt_stat
     (`dew.gauss_newton`). An update its type declares to take none, a plain transformation wrapping the
     clip, is handed the logits' maxima where its state holds a QK-Clip, which reads the step's own and
     would otherwise step unclipped (row 6552); never the statistics, so a solver in it refuses
-    (`dew.gauss_newton`) rather than solve one step's system for the window's update. A QK-Clip inside an
-    accumulating wrapper (`optax.MultiSteps`) is refused as the step traces: the wrapper hands its inner
-    update one step's maxima at the window's end, where the window's update trained on every step's; the
-    trainer's own accumulation (`Trainer(accumulation=k)`) pools them."""
-    if clips_qk(opt_state) and holds_state(opt_state, optax.MultiStepsState):
-        raise ValueError("a QK-Clip inside optax.MultiSteps would be handed its window's last step's "
-                         "attention logit maxima alone, not every step's its update trained on: accumulate "
-                         "with the trainer (`Trainer(accumulation=k)`), which pools them")
+    (`dew.gauss_newton`) rather than solve one step's system for the window's update. Where the optimizer
+    holds its update back over several calls (`optax.MultiSteps`, which runs its inner update at the
+    window's last call alone, or `optax.apply_every`), each call's maxima are pooled in its QK-Clip's state
+    (`dew.optim.pooled_update`), so the update that applies is clipped by every microstep's, as the
+    trainer's own accumulation pools them."""
     clocked = {} if progress is None else {"progress": progress}
-    if isinstance(optimizer, optax.GradientTransformationExtraArgs):
-        solved = {"statistics": statistics} if solves_equations(opt_state) else {}
-        return optimizer.update(gradient, opt_state, params, qk_stats=qk, **solved, **clocked)
-    clipped = {"qk_stats": qk} if clips_qk(opt_state) else {}
-    return optimizer.update(gradient, opt_state, params, **clipped)
+
+    def update(state) -> tuple:
+        if isinstance(optimizer, optax.GradientTransformationExtraArgs):
+            solved = {"statistics": statistics} if solves_equations(state) else {}
+            return optimizer.update(gradient, state, params, qk_stats=qk, **solved, **clocked)
+        clipped = {"qk_stats": qk} if clips_qk(state) else {}
+        return optimizer.update(gradient, state, params, **clipped)
+
+    if qk is not None and clips_qk(opt_state) and holds_back(opt_state):
+        return pooled_update(update, opt_state, params, qk)
+    return update(opt_state)
 
 
 def leaf_local(optimizer: optax.GradientTransformation, gradients, state, *, progressed: bool) -> bool:
@@ -449,6 +465,10 @@ class Applied:
     moments: tuple[Variables, ...]
     sumsq: jax.Array
     nonfinite: jax.Array
+    unfinite_layer: jax.Array
+    """The first layer the backward's walk met whose gradient was not finite (the runs' layers numbered in
+    the model's order, the walk taking them from the top), -1 for none: the layers above it moved, it and
+    those below took a zero gradient (`dew.nn.in_backward.gated`), which a run's log names."""
 
     def onto(self, state: TrainState) -> TrainState:
         """`state` with the runs' new parameters and moments in place of theirs."""
@@ -457,6 +477,40 @@ class Applied:
                                  lambda index, copy: merge(copy, self.moments[index]))
         return dataclasses.replace(state, variables={**state.variables, "params": merge(params, self.params)},
                                    opt_state=opt_state)
+
+
+def _collections_kept(finite: jax.Array, numerical: TrainState, state: TrainState,
+                      written: Variables | None) -> TrainState:
+    """`numerical` with the forward's collections it wrote back (`written`, a batch norm's statistics) as
+    `state` held them where the step, with no loss scale, is not `finite`, by its attempt or its update
+    (training.md, a step that is not finite)."""
+    if written is None:
+        return numerical
+    kept = {name: _chosen(finite, numerical.variables[name], state.variables[name])
+            for name in dicts(written)}
+    return dataclasses.replace(numerical, variables={**numerical.variables, **kept})
+
+
+def _unfinite_layer(runs: Sequence[tuple[jax.Array, int]]) -> jax.Array:
+    """The model layer that tops the first scanned slot the backward's walk met a gradient not finite in,
+    of `runs`' per-slot counts in the model's order (their stage and slot axes, one stage), each slot of a
+    run that many layers (`_period`: one, or a repeated period's): the layer itself for a run of layers, the
+    top of the period for a periodic one, whose positions share one count; numbered across the runs. -1 for
+    none."""
+    first, offset = jnp.asarray(-1, jnp.int32), 0
+    for counts, period in runs:
+        counts = counts.reshape(-1)
+        tops = jnp.arange(counts.size, dtype=jnp.int32) * period + period - 1 + offset
+        first = jnp.maximum(first, jnp.max(jnp.where(counts > 0, tops, -1)))
+        offset += counts.size * period
+    return first
+
+
+def _period(run: Mapping) -> int:
+    """The layers each scanned slot of `run` (its tree in the state) holds: a repeated period's positions
+    (`layers_0`, `layers_1`, ...), one each, or one for a run of single layers."""
+    keys = [str(key) for key in run]
+    return len(keys) if keys and all(key.startswith("layers_") for key in keys) else 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -528,29 +582,19 @@ def _numerical(opt_state: optax.OptState) -> optax.OptState:
     return injected_edited(opt_state, lambda _, node: node._replace(hyperparams={}))
 
 
-def _finite(leaf: jax.Array) -> jax.Array:
-    """Whether `leaf` is finite throughout."""
-    return jnp.isfinite(leaf).all()
-
-
-def _all_finite(tree) -> jax.Array:
-    """Whether every leaf of `tree` is finite (`_finite`), within a traced program."""
-    finite = jnp.asarray(a=True)
-    for leaf in jax.tree.leaves(tree):
-        finite = finite & _finite(leaf)
-    return finite
-
 
 def _finite_each(leaves: list[jax.Array]) -> list[jax.Array]:
     """Whether each of `leaves` is finite throughout, one program over them."""
-    return [_finite(leaf) for leaf in leaves]
+    return [leaf_finite(leaf) for leaf in leaves]
 
 
 def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
-    """Whether each of `leaves`, arrays placed anywhere, is finite throughout (`_finite`), read outside a
+    """Whether each of `leaves`, arrays placed anywhere, is finite throughout (`leaf_finite`), read outside a
     step: one program for each placement the leaves share (their devices and memory kind), as no one
-    program spans two meshes (a CPU-owned run's host companion and its accelerator); a leaf in host memory
-    (a layout's pinned-host field) brought to its devices' memory one leaf at a time (`fetched`)."""
+    program spans two meshes (a CPU-owned run's host companion and its accelerator), which hands back one
+    flag for them all and, only where it is false, each leaf's; a leaf in host memory (a layout's
+    pinned-host field) brought to its devices' memory one leaf at a time (`fetched`). A flag a leaf, read
+    each check, took 0.19 s a check of the 4B's 1,493 leaves on a GH200 (UB-6861-FIT2)."""
     groups: dict[tuple, list[int]] = {}
     for index, leaf in enumerate(leaves):
         sharding = leaf.sharding
@@ -560,9 +604,12 @@ def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
         if memory not in (None, "device"):
             for index in members:
                 leaf = leaves[index]
-                flags[index] = bool(program(_finite)(fetched(leaf, leaf.sharding)))
+                flags[index] = bool(program(leaf_finite)(fetched(leaf, leaf.sharding)))
             continue
-        read = jax.device_get(program(_finite_each)([leaves[index] for index in members]))
+        held = [leaves[index] for index in members]
+        if bool(program(all_finite)(held)):
+            continue
+        read = jax.device_get(program(_finite_each)(held))
         for index, finite in zip(members, read, strict=True):
             flags[index] = bool(finite)
     return flags
@@ -777,7 +824,8 @@ class Transaction:
     """
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
                  record: bool = False, resting: Mapping[str, object] | None = None,
-                 inspection: Inspection | None = None, examples: int | None = None, placed=None):
+                 inspection: Inspection | None = None, examples: int | None = None, placed=None,
+                 skip: bool = False):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -804,6 +852,10 @@ class Transaction:
         """
         self.resting = dict(resting or {})
         self.placed = placed
+        # Whether a step with no loss scale whose loss or gradient is not finite is skipped (the run's
+        # opt-in, `Trainer(skip_nonfinite=True)`): else it is taken as it is formed and the run stops at its
+        # next log, naming it (training.md, a step that is not finite).
+        self.skip = skip
         self.record = record
         # What a sampled step summarizes at its commit (`Committed.inspected`); None in every other step.
         self.inspection = inspection
@@ -893,7 +945,12 @@ class Transaction:
         due = (fill + 1) == self.size
         if closing is not None:
             due = due | closing
-        local_finite = _all_finite((loss, stats, gradient, aux.variables, aux.effects))
+        # A step with no loss scale reads its gradient's finiteness by its commit's norm (`commit`), its
+        # pooled gradient carrying every microbatch's; one taken whether finite or not (`skip` off) reads
+        # its loss alone, a scalar, the rest of a skipped one's small trees too.
+        unscaled = state.scale is None and not holds_back(state.opt_state)
+        everything = (loss, stats, aux.variables, aux.effects, *(() if unscaled else (gradient,)))
+        local_finite = all_finite(loss) if unscaled and not self.skip else all_finite(everything)
         local_ok = jnp.asarray(a=True) if state.scale is None else local_finite
         qk = compact_qk(aux.qk_stats)
         effects = tuple(jax.tree.leaves(aux.effects))
@@ -1024,7 +1081,23 @@ class Transaction:
                              "a run bounded in examples that no plan counts ahead keeps")
         return jnp.asarray(current.consumed, jnp.float32) / self.bound
 
-    def commit(self, current, gradient, effects, qk, statistics, applied: Applied | None = None):
+    def _refuse_unheld(self, current) -> None:
+        """Refuse, as the step is traced and before any runs, a commit whose clocks could not count the
+        updates its optimizer applies (`update_applied`): one whose state does not say which it holds back,
+        a held update whose post-step effects no update would apply, and a held one with no tokens
+        waiting for it."""
+        refuse_untold(current.opt_state)
+        if holds_back(current.opt_state) and self.aux_shape.effects is not None:
+            raise ValueError("an objective with post-step effects (Aux.effects) under an optimizer that "
+                             "holds updates back, whose held calls' effects no update applies; accumulate "
+                             "gradients with Trainer(accumulation=k)")
+        if holds_back(current.opt_state) and current.deferred is None:
+            raise ValueError("the state holds no tokens waiting for the update its optimizer holds back "
+                             "(TrainState.deferred): build it with Trainer.initial_state, or restore it "
+                             "through the trainer, which gives one written before them none waiting")
+
+    def commit(self, current, gradient, effects, qk, statistics, applied: Applied | None = None,
+               attempted: jax.Array | None = None):
         """Apply the pooled native gradient and return its finiteness and global norm. An optimizer that
         reads more than the gradient is handed the update's pooled loss `statistics` (a Gauss-Newton
         update's system, `dew.gauss_newton`) and attention logit maxima (`qk`).
@@ -1035,53 +1108,72 @@ class Transaction:
         Admission is decided by finish_attempt after checking the updated
         parameters and optimizer state as well.
         """
-        # The clocks count the updates the optimizer applies (`update_applied`), which an optimizer that holds
-        # some back says by its state; one whose state does not, or a held update whose post-step
-        # effects no update would apply, is refused as the step is traced, before any runs.
-        refuse_untold(current.opt_state)
-        if holds_back(current.opt_state) and self.aux_shape.effects is not None:
-            raise ValueError("an objective with post-step effects (Aux.effects) under an optimizer that "
-                             "holds updates back, whose held calls' effects no update applies; accumulate "
-                             "gradients with Trainer(accumulation=k)")
-        if holds_back(current.opt_state) and current.deferred is None:
-            raise ValueError("the state holds no tokens waiting for the update its optimizer holds back "
-                             "(TrainState.deferred): build it with Trainer.initial_state, or restore it "
-                             "through the trainer, which gives one written before them none waiting")
+        self._refuse_unheld(current)
         # The gradient where the parameters are placed (`placed`): left where the backward made it, a
         # stage-local leaf's update came out split over the tensor axis its pipeline's read took, and the
         # commit gathered every parameter and moment back each step (row 3697).
         gradient = gradient if self.placed is None else placed_as(gradient, self.placed)
         native = jax.tree.map(_descending, gradient, current.variables["params"])
-        native_finite = _all_finite(native)
+        # The gradient's global norm, which the run logs and a clip reads, and its finiteness by it: a value
+        # not finite anywhere makes the norm so, with no pass of its own (the owner, 2026-11-16).
         norm = optax.global_norm(native)
         norm = norm.astype(at_least_fp32(norm.dtype))
+        native_finite = jnp.isfinite(norm)
         if applied is not None:
             # The runs that updated in their backward hold no gradient here (zeros where theirs would be):
             # their norm and finiteness come from the backward that read them (`Applied`).
-            native_finite = native_finite & (applied.nonfinite == 0)
             norm = jnp.sqrt(jnp.square(norm) + applied.sumsq.astype(norm.dtype))
+            # The whole gradient's norm finite, as the rest's is read, besides each run's own count.
+            native_finite = native_finite & (applied.nonfinite == 0) & jnp.isfinite(norm)
+        # With no loss scale, a run that skips steps not finite (`skip`, its opt-in) gates one where it is
+        # computed: its gradient, the forward's statistics and its update read as zero, so its parameters,
+        # update count and EMA stay as they were and its optimizer takes one step of zero gradient, holding
+        # no old state beside the new (training.md, a step that is not finite). One that does not takes the
+        # step as it is formed. A scaled step's rejection keeps the optimizer, chosen below, as a scale's
+        # back-off must, and so does one whose optimizer holds updates back (`holds_back`,
+        # `optax.MultiSteps`): a zero input would join its window and close it, where the step's rejection
+        # keeps the inputs it holds.
+        gated = self.skip and current.scale is None and not holds_back(current.opt_state)
+        if gated:
+            native_finite = native_finite & all_finite((qk, statistics, effects))
+            # The attempt's own finiteness (its loss, its collections, its microbatch), as its acceptance
+            # reads it (`finish_attempt`): one gate for every write.
+            native_finite = native_finite if attempted is None else native_finite & attempted
+            native, qk, statistics, effects = (zeroed_unless(native_finite, value)
+                                               for value in (native, qk, statistics, effects))
 
         def apply(current):
             # The update applies to the parameters the model's constraint projects
             # (`Objective.projected`), and the step stores them projected again.
             stored = self.objective.projected(current.variables["params"], updated=False)
-            update, opt_state = optimizer_update(
-                self.optimizer, native, current.opt_state, stored, qk=qk, statistics=statistics,
-                progress=None if self.bound is None else self.progress(current))
+            progress = None if self.bound is None else self.progress(current)
+            update, opt_state = optimizer_update(self.optimizer, native, current.opt_state, stored, qk=qk,
+                                                 statistics=statistics, progress=progress)
+            update = zeroed_unless(native_finite, update) if gated else update
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
-            # rescale, a bounded group's clamp) acts on them (`stepped`).
-            params = {**current.variables, "params": stepped(stored, update, current.opt_state, opt_state,
-                                                             post_step_order(self.optimizer, stored))}
+            # rescale, a bounded group's clamp) acts on them (`stepped`): on a gated step's only where it is
+            # taken, as the effect's count steps with the zero gradient's step of a rejected one.
+            order = post_step_order(self.optimizer, stored)
+            moved = stepped(stored, update, current.opt_state, opt_state, order)
+            if gated and order:
+                moved = _chosen(native_finite, moved, stored)
+            params = {**current.variables, "params": moved}
             if applied is not None:
                 # The runs that updated in their backward take what their backward wrote, and the update's
                 # own of them, read by nothing, is never computed.
                 moved = applied.onto(dataclasses.replace(current, variables=params, opt_state=opt_state))
                 params, opt_state = moved.variables, moved.opt_state
             params = {**params, "params": self.objective.projected(params["params"], updated=True)}
-            done = update_applied(current.opt_state, opt_state)
+            done = update_applied(current.opt_state, opt_state) & (native_finite | (not gated))
             if self.aux_shape.effects is not None:
-                params = write_back(params, self.objective.apply_effects(
+                written = write_back(params, self.objective.apply_effects(
                     params, self.effects_tree.unflatten(effects)))
+                # A gated step's forward writes back nothing where it is rejected, for whatever reason: its
+                # collections (batch statistics) stay, and so does whatever its effects would move (a
+                # router's balancing biases), its parameters among them.
+                params = written if not gated else {
+                    **written, **{name: _chosen(native_finite, value, params[name])
+                                  for name, value in written.items()}}
             averaged = current.ema
             if self.objective.ema is not None:
                 if averaged is None:
@@ -1097,7 +1189,9 @@ class Transaction:
                                        updates=updates), inspected
 
         if current.scale is None:
-            return *apply(current), native_finite, norm
+            committed, inspected = apply(current)
+            return committed, inspected, native_finite, norm
+
         if self.size == 1:
             applied, inspected = apply(current)
             return _chosen(native_finite, applied, current), inspected, native_finite, norm
@@ -1158,6 +1252,17 @@ class Transaction:
         return dataclasses.replace(window, gradient=candidate.gradient, batch_statistics=held_stats,
                                    statistics_stamp=stamp)
 
+    def _finiteness(self, scale, holding: bool, pending, aux, gradient) -> tuple[bool, bool, jax.Array]:
+        """Whether the step is gated where it is not finite (no loss scale, `skip`, in its commit), whether
+        it is taken as it is formed (no loss scale, not `skip`), and its attempt's finiteness: one taken as
+        formed reads its loss alone, its gradient by its commit's norm; one gated its small trees too; a
+        scaled one, or one an optimizer holds back, its gradient besides."""
+        unscaled = scale is None and not holding
+        gated, taken_as_formed = unscaled and self.skip, unscaled and not self.skip
+        trees = (pending.effects, pending.qk, aux.variables, *(() if unscaled else (gradient,)))
+        read = (pending.loss,) if taken_as_formed else (pending.loss, *trees)
+        return gated, taken_as_formed, pending.local_finite & all_finite(read)
+
     def finish_attempt(self, state, batch, aux, pending, gradient, attempt, tokens, probed=None):
         """Commit the window when it is due, then advance the state's clocks.
 
@@ -1168,14 +1273,11 @@ class Transaction:
         (`dropped_window`), its parameters, optimizer state and EMA untouched,
         and the scaler moved.
 
-        A window of one microbatch commits on every step it can, so its
-        commit is computed and kept by elementwise selects. A longer window
-        commits under `lax.cond`, which skips the optimizer on the
-        microbatches that do not close it. A GPU conditional whose branch
-        holds a collective, as fsdp's gradient norm is, reads its predicate
-        on the host: the host then queues the next step only once the device
-        has reached this one's commit, and the device idles through every
-        step's host work (15.9 ms a 32.5 ms DiT step on four RTX 3090s).
+        A window of one microbatch commits on every step it can, by elementwise selects; a longer window
+        under `lax.cond`, which skips the optimizer on the microbatches that do not close it. A GPU
+        conditional whose branch holds a collective (fsdp's gradient norm) reads its predicate on the host,
+        which then idles the device through every step's host work (15.9 ms a 32.5 ms DiT step on four
+        RTX 3090s).
 
         A window that is not due retains this microbatch's batch, read
         snapshots and `attempt` in its slot, so a later replay can reproduce
@@ -1184,15 +1286,24 @@ class Transaction:
         """
         scale, previous = state.scale, state.accumulation
         effects, qk, loss = pending.effects, pending.qk, pending.loss
-        finite = pending.local_finite & _all_finite((loss, gradient, effects, qk, aux.variables))
-        accepted = jnp.asarray(a=True) if scale is None else finite
+        holding = holds_back(state.opt_state)
+        gated, taken_as_formed, finite = self._finiteness(scale, holding, pending, aux, gradient)
+        # A step with no loss scale is gated in its commit (`commit`), but one whose optimizer holds updates
+        # back is rejected whole, its optimizer state kept, as a scaled step's is.
+        accepted = jnp.asarray(a=True) if scale is None and not holding else finite
         numerical = dataclasses.replace(state, variables=write_back(state.variables, aux.variables),
                                         microstep=state.microstep + 1)
         # Runs that updated in their backward wrote it only where the step commits (`in_backward.gated`).
         numerical = numerical if pending.applied is None else pending.applied.onto(numerical)
 
+        # What the commit's own finiteness (its pooled gradient, effects and logit maxima) leaves out: the
+        # attempt's loss and its collections. A microbatch's own gradient (`local_finite`) is in the pooled
+        # one; read here, its reduction would hold the window's step back (a tenth more of a split step's
+        # need in test_plan's tight start).
+        attempted = all_finite((loss, aux.variables)) if gated else None
+
         def commit(current):
-            return self.commit(current, gradient, effects, qk, pending.pooled, pending.applied)
+            return self.commit(current, gradient, effects, qk, pending.pooled, pending.applied, attempted)
 
         def recopied(current):
             # A window of several microbatches reads one set of copies
@@ -1223,8 +1334,14 @@ class Transaction:
             numerical = dataclasses.replace(numerical, accumulation=previous)
         inspected = {**inspected, **self.watched_summaries(aux, probed)}
         finite = finite & native_finite
-        if scale is not None:
-            accepted = finite & _all_finite(checked(numerical))
+        if gated:
+            numerical = _collections_kept(finite, numerical, state, aux.variables)
+        if scale is not None or holding:
+            # A step taken whole or not at all reads what it formed: its whole new state finite. For an
+            # optimizer that holds updates back (`optax.MultiSteps`), that is its inner optimizer's state over
+            # the window's gathered gradient, which a sum of finite gradients can carry past what its
+            # moments hold.
+            accepted = finite & all_finite(checked(numerical))
         if previous is not None:
             numerical = dataclasses.replace(
                 numerical, accumulation=self._retained_window(state, batch, pending, attempt, read))
@@ -1242,12 +1359,16 @@ class Transaction:
         # An update the optimizer holds back commits nothing yet: its tokens wait in the state
         # (`TrainState.deferred`) for the update that applies them (`update_applied`).
         # An input the optimizer skipped trains no update, so its tokens wait for none (`input_taken`).
-        done = update_applied(state.opt_state, advanced.opt_state)
+        # A gated step (no loss scale, skipped where not finite) committed nothing: no update, no tokens
+        # (`commit`); one taken as formed committed its update whatever it held.
+        done = update_applied(state.opt_state, advanced.opt_state) & (finite | (scale is not None)
+                                                                      | taken_as_formed)
         counted = due & accepted & done
         if state.deferred is not None:
             taken = input_taken(state.opt_state, advanced.opt_state)
             held = TokenCount.add(state.deferred, jnp.where(taken, held, 0).astype(jnp.uint32))
-            waiting = jnp.where(due & accepted & ~done, held, jnp.where(counted, 0, state.deferred))
+            trained = finite | (scale is not None) | taken_as_formed
+            waiting = jnp.where(due & accepted & trained & ~done, held, jnp.where(counted, 0, state.deferred))
             advanced = dataclasses.replace(advanced, deferred=waiting.astype(jnp.uint32))
         if self.split == 1:
             # A step that commits no update, a window still filling or one its optimizer holds back
@@ -1259,7 +1380,9 @@ class Transaction:
         return advanced, loss, aux, Committed(
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
             jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted),
-            own=pending.own if self.split > 1 else None)
+            own=pending.own if self.split > 1 else None,
+            finite=(accepted if holding else finite) if scale is None else None,
+            unfinite_layer=None if pending.applied is None else pending.applied.unfinite_layer)
 
     def planned(self, state: TrainState) -> _Planned | None:
         """The plan by which the runs a one-stage scanned state holds stacked update in their backward
@@ -1306,15 +1429,17 @@ class Transaction:
             before = _with_copies(_placeholders_at(state.opt_state, params, where), params,
                                   lambda index, _: copies[index])
             descent = layer(jax.tree.map(_descending, gradient, weights))
+
             moved, after = optimizer_update(self.optimizer, descent, before, held, progress=progress)
+            stepped_held = stepped(held, moved, before, after, post_step_order(self.optimizer, held))
             # Each copy's new value where the update leaves it in the state it read, which the update keeps
             # laid out as it was: a group with no parameter in this run holds placeholders alone there.
             laid = _laid_as(held)
             slots = [slot for copy in copies
                      for slot, node in enumerate(jax.tree.leaves(before, is_leaf=laid)) if node is copy]
             stepped_copies = [jax.tree.leaves(after, is_leaf=laid)[slot] for slot in slots]
-            return (unlayer(stepped(held, moved, before, after, post_step_order(self.optimizer, held))),
-                    {name: unlayer(copy) for name, copy in zip(names, stepped_copies, strict=True)})
+            return unlayer(stepped_held), {name: unlayer(copy) for name, copy in zip(names, stepped_copies,
+                                                                                   strict=True)}
 
         norms = {}
         for path in runs:
@@ -1359,7 +1484,9 @@ class Transaction:
             sumsq=sum((jnp.sum(in_backward.norms_of(_at(norms, path))["sumsq"]) for path in handled),
                       jnp.zeros((), jnp.float32)),
             nonfinite=sum((jnp.sum(in_backward.norms_of(_at(norms, path))["nonfinite"]) for path in handled),
-                          jnp.zeros((), jnp.float32)))
+                          jnp.zeros((), jnp.float32)),
+            unfinite_layer=_unfinite_layer([(in_backward.norms_of(_at(norms, path))["nonfinite"],
+                                             _period(_at(gradient, path))) for path in handled]))
         zeros = functools.reduce(merge, [_nested(path, jax.tree.map(jnp.zeros_like, _at(gradient, path)))
                                          for path in handled], {})
         return merge(gradient, zeros), applied
@@ -1382,8 +1509,15 @@ class Transaction:
         and what its runs that updated in their backward left (`split_planned`), whose backward reads
         whether the step commits (`dew.nn.in_backward.gated`), known once its forward is."""
         if planned is not None:
-            _, active = self.objective.reduce_loss(realized.stats)
-            with in_backward.gated(active):
+            loss, active = self.objective.reduce_loss(realized.stats)
+            # A run that updates in its backward holds no loss scale (`consumed_where_made`), so where it
+            # skips steps not finite (`skip`) each is gated layer by layer as the walk reaches it: by the
+            # loss's, the forward's statistics' and collections' finiteness, as the commit and the attempt
+            # read them, and each layer's own gradient's (`in_backward.gated`); else the walk updates each
+            # layer as it is formed.
+            finite = (jnp.isfinite(loss) & all_finite((realized.stats, realized.aux.variables))
+                      if self.skip else None)
+            with in_backward.gated(active, finite):
                 gradient, applied = self.split_planned(planned, realized.pullback(cotangent), masters)
             return gradient, None, applied
         if realized.probed is None or not whole:
