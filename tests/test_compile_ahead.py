@@ -1082,7 +1082,6 @@ asks it, in a process of its own (`process_support.fresh`): its directory is its
 saved step's generation and every kernel its routes took."""
 
 
-@COMPILES_ON_CPU
 def test_a_gated_delta_steps_mosaic_kernels_compile_ahead_for_the_gpu_it_targets(tmp_path):
     """A bf16 gated-delta decoder's run compiled ahead for a compile-only A100 by its command
     (`--trainer.compile-ahead.generation sm80`, rows 3916, 3977) saves a step for sm80 whose gated delta
