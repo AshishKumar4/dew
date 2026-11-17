@@ -309,7 +309,8 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
     `ns_precision`'s dot algorithm (`ns_operands`), run whole on one device, the matrices spread across the
     devices (`orthogonalized`), the stacks of one shape joined `ns_group` at a time, all where None
     (`spread_stacks`): the fewer joined, the more products and the less their copies hold, which a run states
-    (`OptimConfig`'s `ns_group`) and no plan sets yet (row 5889). Each parameter's matrix is its dimension
+    (`OptimConfig`'s `ns_group`), else its plan, all joined unless the step fits only one at a time
+    (`dew.newton_schulz.released`, row 5889). Each parameter's matrix is its dimension
     numbers' (`muon_weight_dimension_numbers`), or each of its heads' where `per_head` names it
     (`head_widths`)."""
     coefficients = _coefficients(ns_coeffs, ns_steps)

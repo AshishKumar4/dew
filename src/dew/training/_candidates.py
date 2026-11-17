@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
+from dew import newton_schulz
 from dew.batch import CLOSES_WINDOW, Batch
 from dew.data.dataset import Stage
 from dew.data.pipeline import DeviceStep
@@ -98,6 +99,9 @@ class StepSettings[LossT, EffectsT]:
     record: bool
     lower_for: str | None
     state_mesh: Mesh
+    ns_group: int | None = None
+    """The stacks of one shape the step's Newton-Schulz joins at a time where the run states none, its plan's
+    (`dew.newton_schulz.released`, `FitSearch`'s release): None joins them all."""
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -183,7 +187,8 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
     # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (
-        stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow, mesh,
+        stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow,
+        stepping.settings.ns_group, mesh,
         platforms, stepping.shape.rows,
         stepping.shape.split, stepping.shape.prefetch, stepping.shape.examples, held_context())
     if key is not None:
@@ -259,14 +264,17 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
         lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
         *apart(prepared), given, part))
     tuned = settings.tune_kernels and platforms is None
-    if tuned:
-        lowered, kernels = tuning.tune(lower, measure=True), lower.report()
-    else:
-        # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
-        made, found = routed(lambda: jitted.trace(*apart(prepared), given, part))
-        lowered = made.lower(lowering_platforms=platforms)
-        kernels = kernel_report(found, lowered)
-    candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, kernels)
+    # Whether its updates join stacks a plan's release would part (`newton_schulz.joining`), off its trace.
+    with newton_schulz.joining() as joined:
+        if tuned:
+            lowered, kernels = tuning.tune(lower, measure=True), lower.report()
+        else:
+            # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
+            made, found = routed(lambda: jitted.trace(*apart(prepared), given, part))
+            lowered = made.lower(lowering_platforms=platforms)
+            kernels = kernel_report(found, lowered)
+    candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, kernels,
+                          joins=bool(joined))
     return dataclasses.replace(candidate, sampled=_sampled(stepping, candidate, batch, placement, replicated,
                                                            split, platforms))
 
@@ -325,6 +333,10 @@ def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, c
     moving, frozen = apart(shardings)
 
     def step(current, held, batch, part):
+        with newton_schulz.released(settings.ns_group):
+            return stepped(current, held, batch, part)
+
+    def stepped(current, held, batch, part):
         # The body sees every field on the device; the out shardings
         # return the host-resident ones to pinned host memory.
         current = together(current, held)

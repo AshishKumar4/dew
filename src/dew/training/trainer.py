@@ -377,7 +377,8 @@ class Trainer(Generic[Loss, Effects]):
         return StepSettings(self.objective if objective is None else objective, self._optimizer, self.layout,
                             self.device_mesh, self.accumulation,
                             self.step, self.dynamic_scale, self.diloco, self.tune_kernels, self.inspection,
-                            self.microbatches, self.record, self.lower_for, self.state_mesh)
+                            self.microbatches, self.record, self.lower_for, self.state_mesh,
+                            self._compiler.ns_group)
 
     # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------

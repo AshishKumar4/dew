@@ -98,6 +98,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   float32 dot over an empty contraction uninitialized, zeros now (row 6942). Elsewhere jaxlib stays the
   stock 0.12.0.1.
 
+- A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
+  anything, where its run states no `ns_group`: a step that fits only with them joined one at a time takes
+  that (`FitSearch.searched`, its rung's `ns_group`; 11.3 GB of a 4B step's peak for 82 ms a step), kept
+  only where it brought the step nearer to fitting, as the narrow copies' drop is; a run that states its
+  group keeps it. Its rung records it, which a resumed run compiles at.
+
 - A fit searches its step's plan once: the search made before the state is placed keeps the plan it finds
   even where candidates missed on the way, and the run's first compile takes it, its executable compiled
   once, where a second search from the ladder's foot over the placed state lowered every candidate again
