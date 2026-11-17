@@ -73,8 +73,7 @@ ROWS = SegmentLayout.state_first_row(max_len=256, head_max_len=64, option_tokens
 LABELS = Labels(variants=("{}",))
 """Labels a byte vocabulary spells as one token each: the bare letter."""
 ARMS = {
-    # A window of 1024 tokens packs two of the examples' joint rows (962 real tokens, IG-JOINTWIN).
-    "joint": (SegmentLayout.joint_row(max_len=1024), qwen35,
+    "joint": (SegmentLayout.joint_row(max_len=1536), qwen35,
              lambda: JointSchemaHead(64, width=32, routing_layers=1, layers=1, heads=2, feedforward=64)),
     "marker": (ROWS, qwen35, lambda: DecisionHead(64, layers=1)),
     # The parallel arm's decoder on the attention template, which reads the layout's key runs as its spans
@@ -91,10 +90,8 @@ both over Qwen3.5; parallel options, whose key runs Gated DeltaNet refuses, over
 options under labels read at each row's answer cue by the backbone's own logits, over Qwen3.5."""
 
 
-def objective_for(arm: str, layout: SegmentLayout | None = None) -> DecisionObjective:
-    """`arm`'s objective (`ARMS`), over `layout` where given, its own otherwise."""
-    own, backbone, head = ARMS[arm]
-    layout = own if layout is None else layout
+def objective_for(arm: str) -> DecisionObjective:
+    layout, backbone, head = ARMS[arm]
     return DecisionObjective(backbone(layout.max_len), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
                              head=head(), loss=LogLoss(), shuffle_options=False)
 
@@ -449,12 +446,10 @@ attention key biases (ledger 1548). Twice the rows a draw took the same counts o
 SF-packing-scale2-sizing), each draw twice the work."""
 
 
-PACKING_WINDOWS = {"marker": 1, "joint": 1}
+PACKING_WINDOWS = {"marker": 1}
 """The packed windows a draw holds where an arm's site takes fewer than two: the marker arm's one window
 packs several rows, and its draw at two windows took 0.50 s on armada against 0.31 at one, where the
-256 draws two windows took on an A100 brought it past the suite's 240 s a test (ledger 1851); the joint
-arm's one window of 1024 tokens packs two rows, where two of 1536 took the GPU flow's cell 403 s of a
-GH200's 526 (DC-GPU-MODELS-SPLIT-2-sm90)."""
+256 draws two windows took on an A100 brought it past the suite's 240 s a test (ledger 1851)."""
 
 
 def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 2) -> None:
@@ -775,8 +770,7 @@ def test_a_packed_decision_run_main_saved_resumes_exactly():
     import dataclasses
     from pathlib import Path
 
-    # The joint layout main saved its read under, its windows of 1536 tokens.
-    objective = objective_for("joint", SegmentLayout.joint_row(max_len=1536))
+    objective = objective_for("joint")
     data = decision_rows(EXAMPLES * 4, None, objective=objective.data(), tokens=2 * objective.layout.max_len)
     saved = (Path(__file__).with_name("fixtures") / "positions" / "main-ecb9577e7"
              / "decision_packed.position").read_bytes()
