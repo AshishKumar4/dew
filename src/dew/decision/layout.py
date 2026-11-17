@@ -40,7 +40,6 @@ from dew.decision.renderer import (
     Unit,
     render as rendered_chunks,
     stream_point,
-    streamed_chunks,
 )
 
 if TYPE_CHECKING:
@@ -938,23 +937,7 @@ class SegmentLayout(Layout):
         # A question written to the row's context (`Instructions.stream`, `Schema.stream`) is its own
         # chunks, which the row's cross-attention reads, its spans the context's.
         context: list[Chunk | State] = []
-        copies = [_kept_by(segment, conversation) for segment in segments if isinstance(segment, State)]
-        # A copy rendered as the layout renders its state reads the request's precomputed tokens where it
-        # gives them, under pieces; any other renders the state's text (`written_state`).
-        reads = [tokens is not None and unit == "pieces" and copy.render == self._state_render
-                 and copy.values == Values() and copy.turns is None for copy in copies]
-        if isinstance(state, _Unread) and not all(reads):
-            raise ValueError("a row of its state's tokens alone holds copies of it rendered as the layout "
-                             "renders its state, encoded piece by piece")
-        state_texts = ["" if read or isinstance(state, _Unread) else written_state(state, copy, specials)
-                       for copy, read in zip(copies, reads, strict=True)]
-
-        def longest() -> int:
-            # The tokens of the state's longest copy before any cut, which an `Again` asks (`Again.over`).
-            return max((len(tokens) if read and tokens is not None
-                        else len(encoder.encode(text, add_special_tokens=False)) if text else 0
-                        for text, read in zip(state_texts, reads, strict=True)), default=0)
-
+        copies, reads, state_texts, longest = self._copies(encoder, specials, state, tokens, conversation)
         head_at, cue_at, line_at, labelled = self._chunked(chunks, context, asked, specials,
                                                            opening if not question_first else (),
                                                            request=request, size=longest, encoder=encoder,
@@ -1034,6 +1017,29 @@ class SegmentLayout(Layout):
         boundary = (laid.points["suffix"] if split == "part" else rows[0].span[0] if split == "question"
                     else len(row_tokens))
         return _blocked(encoded, boundary)
+
+    def _copies(self, encoder: Tokenizer, specials: Specials, state: JSON | _Unread,
+                tokens: Sequence[int] | None, conversation: bool
+                ) -> "tuple[list[State], list[bool], list[str], Callable[[], int]]":
+        """The row's copies of its state (`State` segments, as a conversation keeps them), whether each
+        reads the request's precomputed `tokens`, each other's text, and the tokens of the longest before
+        any cut, which an `Again` asks (`Again.over`). A copy rendered as the layout renders its state
+        reads `tokens` where given, under pieces; any other renders the state's text (`written_state`)."""
+        copies = [_kept_by(segment, conversation) for segment in self.written if isinstance(segment, State)]
+        reads = [tokens is not None and self._unit == "pieces" and copy.render == self._state_render
+                 and copy.values == Values() and copy.turns is None for copy in copies]
+        if isinstance(state, _Unread) and not all(reads):
+            raise ValueError("a row of its state's tokens alone holds copies of it rendered as the layout "
+                             "renders its state, encoded piece by piece")
+        texts = ["" if read or isinstance(state, _Unread) else written_state(state, copy, specials)
+                 for copy, read in zip(copies, reads, strict=True)]
+
+        def longest() -> int:
+            return max((len(tokens) if read and tokens is not None
+                        else len(encoder.encode(text, add_special_tokens=False)) if text else 0
+                        for text, read in zip(texts, reads, strict=True)), default=0)
+
+        return copies, reads, texts, longest
 
     def _slots_of(self, question: Question, order: Sequence[int] | None) -> list[int]:
         """The option each of `question`'s slots shows: the order a request gives, else the row's own: a
@@ -2158,7 +2164,7 @@ class _Asked:
 
     @staticmethod
     def of(layout: SegmentLayout, name: str, question: Question, slots: Mapping[str, Sequence[int]],
-           specials: Specials) -> _Asked:
+           specials: Specials) -> "_Asked":
         shown = tuple(slots[name])
         labels = layout.labels
         return _Asked(name, question, tuple(zip(question.options, question.descriptions, strict=True)), shown,
