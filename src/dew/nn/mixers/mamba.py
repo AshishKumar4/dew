@@ -253,11 +253,11 @@ class Mamba(nn.Module):
             # (`sequence_conv`); the step, B and C come token by token outside; each shard scans from
             # zero, then from the state the earlier ones leave it (`_sequence_scan`), as Mamba-2's does.
             convolved = over_sequence(functools.partial(_sequence_conv, dtype=wide), shards,
-                                      (mixed.astype(wide), tokens.segments, valid), ((taps, bias),))
+                                      (mixed.astype(wide), tokens.segments, valid), (taps, bias))
             xs, step, B, C = self._projected(convolved, valid)
             out = over_sequence(functools.partial(_sequence_scan, chunk_size=self.chunk_size), shards,
                                 (xs, step, B, C, tokens.starts),
-                                ((-jnp.exp(jnp.asarray(self.A_log, wide)), jnp.asarray(self.D, wide)),))
+                                (-jnp.exp(jnp.asarray(self.A_log, wide)), jnp.asarray(self.D, wide)))
             # The scan's output as `held_scan` names it, a mixer's 'context' and a recurrence's 'scan'.
             out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
         else:
