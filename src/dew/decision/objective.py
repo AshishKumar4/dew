@@ -20,7 +20,7 @@ from dew.decision.calibration import Temperatures
 from dew.decision.head import DecisionHead, Head
 from dew.decision.inputs import OPTION_TILE, DecisionInputs
 from dew.decision.layout import Bounds, Layout, Specials, default_layout, per_question
-from dew.decision.model import BackboneContext, DecisionModel, encoded_width
+from dew.decision.model import BackboneContext, DecisionModel, encoded_tokens
 from dew.decision.questions import KINDS, Score
 from dew.decision.rows import (
     ConfigureLayout,
@@ -281,7 +281,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             raise MissingFlopsCount(f"{type(condition.encoder).__name__} has no conditioning_flops(tokens)")
         lengths = self._row_contexts(batch)
         lengths = lengths[lengths > 0]
-        width = encoded_width(condition.encoder)
+        width = encoded_tokens(condition.encoder)
         mask = (np.arange(width)[None, :] < lengths[:, None]).astype(np.int32)
         tokens = {"input_ids": np.zeros_like(mask), "attention_mask": mask}
         return float(condition.encoder.conditioning_flops(tokens).flops)

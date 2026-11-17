@@ -1163,10 +1163,11 @@ class Decide(SavedRunTask, InItsForm):
     @traced_in_its_form
     def _forward(self, variables: Variables, inputs: DecisionInputs, *,
                  media: ModelInputs | None = None) -> jax.Array:
-        """`model.logits`, compiled with the XLA options its backbone and head take where they run
-        (`program`)."""
+        """`model.logits`, compiled with the XLA options the modules it runs take (`program`): its
+        backbone and head and a configured context encoder, which reads every quantized tower the model
+        holds; listing the backbone and head alone left an int8 encoder out of the int8 GEMM guard."""
         model = self.model
-        logits = program(type(model).logits, model.backbone, model.head, static_argnums=(0,))
+        logits = program(type(model).logits, model, static_argnums=(0,))
         return logits(model, variables, inputs, media=media)
 
     def tournament(self, state: JSON, questions: Mapping[str, Question], *,
