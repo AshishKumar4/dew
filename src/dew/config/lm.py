@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Annotated, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -52,13 +52,15 @@ class ServedRollout:
     rollout at most `max_lag` updates behind the trainer, and the weights pushed every `sync_every`
     updates. A `max_lag` above 0 trains on stale rollouts, which the objective's behavior importance
     weights (`--objective.behavior-importance`). With `page_size` the server pages its cache and shares
-    prompt pages, so a group's samples of one prompt prefill it once; None keeps each row's cache whole."""
+    prompt pages, so a group's samples of one prompt prefill it once; 'whole' keeps each row's cache whole;
+    None pages it wherever pages serve the policy as it draws (`RolloutScheduler.serve`: the model's own
+    layout's page size, else 64), rows whole where not."""
 
     slots: int = 8
     ahead: int = 1
     max_lag: int = 1
     sync_every: int = 1
-    page_size: int | None = None
+    page_size: int | Literal["whole"] | None = None
 
 
 @dataclasses.dataclass(frozen=True)

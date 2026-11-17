@@ -8,10 +8,20 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import as_given, assert_as_exact, widened
-from sequence_split_support import SPLIT_BATCH, SPLIT_ROWS, assert_split_as_whole
+from sequence_split_support import (
+    SPLIT_BATCH,
+    SPLIT_ROWS,
+    assert_as_on_one_device,
+    assert_decodes_as_whole,
+    assert_split_as_whole,
+)
 
+from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.linear import GatedDeltaNet, held_conv1d, over_sequence, sequence_conv, sequence_halo
+from dew.nn.mixers.lightning import LightningAttention
+from dew.nn.mixers.mamba import Mamba
+from dew.nn.mixers.mamba2 import Mamba2
 from dew.training import MeshSpec
 
 WIDTH = 32
@@ -42,6 +52,88 @@ def test_a_delta_rule_split_over_the_sequence_runs_its_rows_as_whole_ones(name, 
     variables = jax.tree.map(lambda leaf: np.asarray(leaf), module.init(jax.random.key(7), hidden))
     assert_split_as_whole(module, variables, row, SEEDS[row], f"{name} split over the sequence, {row}",
                           width=WIDTH)
+
+
+DECODE_MIXERS = {
+    **MIXERS,
+    "mamba": Mamba(emb_features=WIDTH, intermediate_size=16, state_size=4, time_step_rank=2, chunk_size=4),
+    "mamba2": Mamba2(emb_features=WIDTH, num_heads=4, head_dim=8, state_size=8, n_groups=1, chunk_size=4,
+                     dtype=jnp.float32),
+}
+"""The recurrent mixers that split a training call over the sequence (`linear.sequence_split`)."""
+
+DECODE_SEEDS = 32
+"""Each mixer's declared draws for its decode under the axis."""
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", sorted(DECODE_MIXERS))
+def test_a_recurrent_mixer_decodes_under_a_sequence_axis_as_on_one_device(name):
+    """Under a sequence axis of 4, a decode call runs whole, its state replicated over the axis: one token a
+    row holds no sequence to split (`linear.sequence_split`, row 7400). A prefill and the steps after it
+    decode as on one device (`assert_decodes_as_whole`), where the mixer refused the call."""
+    module = DECODE_MIXERS[name]
+    hidden = jnp.zeros((1, 8, WIDTH), jnp.float32)
+    variables = jax.tree.map(np.asarray, module.init(jax.random.key(7), hidden))
+    assert_decodes_as_whole(module, variables, DECODE_SEEDS, f"{name} decoded under a sequence axis",
+                            width=WIDTH)
+
+
+LIGHTNING = LightningAttention(emb_features=WIDTH, num_heads=2, head_dim=8, slopes=(0.5, 0.25), layers=4,
+                               chunk_size=4)
+"""MiniMax's lightning layer at a small geometry, the second of a stack of four."""
+
+
+def on_one_device(module, call: MixerCall, shape: tuple[int, int], seeds: int, site: str):
+    """`module`, initialized here, called with `call` over hidden states of `shape` `[B, S]` and `WIDTH`
+    wide on a sequence axis of 4 as on one device (`assert_as_on_one_device`)."""
+    depth = None if call.depth is None else jnp.ones((1, shape[1]), jnp.int32)
+    variables = jax.tree.map(np.asarray, module.init(jax.random.key(7), jnp.zeros((1, shape[1], WIDTH)),
+                                                     MixerCall(depth=depth)))
+    assert_as_on_one_device(module, variables, call, (*shape, WIDTH), seeds, site)
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("row", sorted(SEEDS))
+def test_a_lightning_layer_split_over_the_sequence_runs_its_rows_as_whole_ones(row):
+    """Under a sequence axis of 4, a lightning layer runs each row of `SEEDS`' as on one device, each shard
+    from the memory the earlier ones leave it (`lightning._sequence_memory`, row 7400), where it refused the
+    axis: real tokens, packed documents, right padding and an interior shard of padding."""
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata
+
+    valid, segments = SPLIT_ROWS[row]
+    tokens = coordinates(valid=jnp.asarray(np.broadcast_to(valid, (SPLIT_BATCH, 32))),
+                         segments=None if segments is None else jnp.asarray(
+                             np.broadcast_to(segments, (SPLIT_BATCH, 32)), jnp.int32))
+    call = MixerCall(AttentionMetadata(coordinates=tokens), depth=jnp.ones((SPLIT_BATCH, 32), jnp.int32))
+    on_one_device(LIGHTNING, call, (SPLIT_BATCH, 32), SEEDS[row],
+                            f"lightning split over the sequence, {row}")
+
+
+FORK_ROWS = [[3, 4, 5, 6, 7, 8, 9, 10, 11], [3, 4, 5, 6, 7, 8, 9, 12], [20, 21, 22, 23, 24]]
+"""Two rows over one prompt of seven tokens, and a row of its own."""
+
+FORK_SEEDS = 32
+"""Each mixer's declared draws over forks under the axis."""
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", [*sorted(DECODE_MIXERS), "lightning"])
+def test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device(name):
+    """Under a sequence axis of 4, a call over forks runs whole, each document continuing its parent's state
+    across the axis (`linear.sequence_split`, row 7400), where `held_scan`'s forked path refused the axis
+    (`on_one_device`)."""
+    from dew.data.forked_rows import ForkedRows
+    from dew.nn.inputs import AttentionMetadata
+
+    module = LIGHTNING if name == "lightning" else DECODE_MIXERS[name]
+    forks = ForkedRows.pack(FORK_ROWS, 24)
+    batch, length = forks.tokens.shape
+    depth = jnp.ones((batch, length), jnp.int32) if name == "lightning" else None
+    call = MixerCall(AttentionMetadata(coordinates=forks.coordinates), depth=depth)
+    on_one_device(module, call, (batch, length), FORK_SEEDS,
+                            f"{name} over forks under a sequence axis")
 
 
 CONV_SEEDS = 96
