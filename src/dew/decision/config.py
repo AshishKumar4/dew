@@ -26,8 +26,6 @@ from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
 import jax
 
 from dew._records import ADDED, integer, number, record
-from dew.inputs.condition import ConditionEncoder
-from dew.inputs.spec import TextCondition
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.pipeline import Dataset, cut_unit
 from dew.decision.data import SCHEDULE_MIXTURE, made_by
@@ -53,6 +51,8 @@ from dew.decision.renderer import Unit
 from dew.decision.rows import option_width
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
+from dew.inputs.condition import ConditionEncoder
+from dew.inputs.spec import TextCondition
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, SharedCrossAttention
 from dew.nn.protocols import CountedCondition, RematChoosing

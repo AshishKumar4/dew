@@ -333,7 +333,7 @@ class ContextReader:
     def dependencies(self) -> Mapping[str, object]:
         return self.encoder.dependencies()
 
-    def __eq__(self, other: object) -> bool:
+    def __eq__(self, other: ContextReader | None) -> bool:
         return isinstance(other, ContextReader) and self.dependencies() == other.dependencies()
 
     def __hash__(self) -> int:

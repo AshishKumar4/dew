@@ -470,7 +470,7 @@ def test_a_clip_context_encoder_trains_serves_and_counts_each_rows_context_alone
     alone = sum(tower.conditioning_flops(tower.tokenize([""]) | {
         "attention_mask": (np.arange(77)[None, :] < np.sum(row == document)).astype(np.int32)}).flops
         for row in owners for document in set(row.tolist()) - {0})
-    assert alone > 0 and objective._encoder_flops(batch) == pytest.approx(alone)
+    assert alone > 0 and objective._encoder_flops(batch) == alone
     state = Trainer(objective, optax.adam(1e-3), key=0).fit(data, steps=1, log_every=1)
     task = objective.pipeline(state)
     assert set(task("one two three", QUESTION, context="a first note")) == {"pick"}
