@@ -54,10 +54,11 @@ from dew.decision.layout import (
     Layout,
     Specials,
     per_question,
+    reader_of,
     render,
     with_context,
 )
-from dew.decision.model import DecisionModel
+from dew.decision.model import DecisionModel, context_weights
 from dew.decision.questions import (
     KINDS,
     Answer,
@@ -520,10 +521,8 @@ class Decide(SavedRunTask, InItsForm):
         head = Head.from_record(settings.head, width)
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
-        from dew.batch import part
-
         context = None if settings.context is None else Condition.bound(
-            settings.context, params=part(variables, "context")["params"])
+            settings.context, params=context_weights(variables))
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
                               settings.context_encoder, context)
         if settings.tokenizer is None:
@@ -1037,9 +1036,8 @@ class Decide(SavedRunTask, InItsForm):
 
     @property
     def context_reader(self) -> "Tokenizer | ContextReader":
-        """What a request's context is tokenized by (`dew.decision.layout.context_tokens`): the model's
-        configured context encoder (`DecisionModel.context`), else its tokenizer."""
-        return self.tokenizer if self.model.context is None else ContextReader(self.model.context.encoder)
+        """What a request's context is tokenized by (`dew.decision.layout.reader_of`)."""
+        return reader_of(self.tokenizer, self.model.context_reader)
 
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None,
