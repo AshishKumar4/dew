@@ -26,6 +26,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
 
 import jax
+import jax.numpy as jnp
 
 from dew._records import ADDED, integer, number, record
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
@@ -60,7 +61,7 @@ from dew.nn.cross_attention import ContextEncoder, CrossAttention, SharedCrossAt
 from dew.nn.dit import TextContext
 from dew.nn.protocols import CountedCondition, RematChoosing
 from dew.optim import OptimConfig
-from dew.registry import ModelConfig, class_record, from_record, import_path, record_argument
+from dew.registry import ModelConfig, class_record, dtype_name, from_record, import_path, record_argument
 from dew.state import TrainState
 
 if TYPE_CHECKING:
@@ -281,6 +282,17 @@ class DecisionRunConfig(DecoderRunConfig):
         revision = SourceReference(self.pretrained, self.revision, self.subfolder).pinned().revision
         return run if revision == self.revision else dataclasses.replace(run, revision=revision)
 
+    def _context_derived(self, dtype: str) -> dict[str, object]:
+        """The objective's context arguments: how its backbone encodes a row's context, or the encoder a
+        run configures (`context_text`, built in the run's compute `dtype` and refused where it encodes no
+        text, `_text_encoder`) and whether its weights train (`context_text_trained`)."""
+        if self.context_layers is None:
+            return {}
+        if self.context_text is None:
+            return {"context_encoder": self.context_encoder}
+        built = self.context_text.build(dtype=dtype_name(jnp.dtype(dtype)))
+        return {"context_encoder": _text_encoder(built), "context_trained": self.context_text_trained}
+
     def _refuse_unread_context(self) -> None:
         """Refuse each context option a run without context layers would read nothing of: a schema read
         as the row's context, its encoder, its frozen backbone and its block's form."""
@@ -340,13 +352,7 @@ class DecisionRunConfig(DecoderRunConfig):
         attention_impl = self.source_attention()
         budgets = self._row_fields()
         self._refuse_unread_context()
-        derived: dict[str, object] = {}
-        text = self.context_text
-        configured = None if text is None else _text_encoder(text.build(dtype=dtype))
-        if self.context_layers is not None:
-            derived["context_encoder"] = self.context_encoder if configured is None else configured
-        if configured is not None:
-            derived["context_trained"] = self.context_text_trained
+        derived: dict[str, object] = self._context_derived(dtype)
         from dew.decision.slot_source import reads_blocks
         from dew.decision.sources import PretrainedDecision
 

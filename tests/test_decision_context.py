@@ -406,6 +406,7 @@ def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly
     the encoder's work; a run trains, saves, and its task loads the encoder from the run's record and
     weights and answers as the trained task does, to the bit; a resume reads on exactly. A run's context
     was only ever the backbone's own (6141)."""
+    from dew.batch import FROZEN
     from dew.checkpoints import Checkpoints
     from dew.inputs import CharTable
 
@@ -437,7 +438,8 @@ def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly
     resumed = again.fit(dataclasses.replace(data, resume="exact"), steps=3, log_every=1, checkpoint_every=1)
     # Every weight, the encoder's among them, and the optimizer's state as a run of three steps leaves them.
     whole = Trainer(configured(), optax.adam(1e-3), key=0).fit(data, steps=3, log_every=1)
-    assert "context" in resumed.variables["params"]
+    # The encoder's weights held frozen, as a configured encoder's are unless trained (`context_trained`).
+    assert "context" in resumed.variables[FROZEN]
     for got, want in zip(jax.tree.leaves((resumed.variables, resumed.opt_state)),
                          jax.tree.leaves((whole.variables, whole.opt_state)), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
@@ -811,7 +813,9 @@ def test_a_configured_context_encoder_is_frozen_unless_trained_and_counted_as_it
         data = decision_rows(examples(), 8, objective=objective.data())
         batch = next(iter(data.train(DataPartition())))
         drawn = objective.model.context.encoder.params
-        state = Trainer(objective, optax.adam(1e-1), key=0).fit(data, steps=1, log_every=1)
+        # Two steps: the cross-attention's gate opens from zero on the first, so the second reaches the
+        # encoder.
+        state = Trainer(objective, optax.adam(1e-1), key=0).fit(data, steps=2, log_every=1)
         held = state.variables["params" if trained else FROZEN]["context"]
         moved = [bool(np.any(np.asarray(after) != np.asarray(before)))
                  for after, before in zip(jax.tree.leaves(held), jax.tree.leaves(drawn), strict=True)]

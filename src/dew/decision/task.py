@@ -521,8 +521,6 @@ class Decide(SavedRunTask, InItsForm):
         head = Head.from_record(settings.head, width)
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
-        from dew.batch import part
-
         context = None if settings.context is None else Condition.bound(
             settings.context, params=context_weights(variables))
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
