@@ -154,10 +154,10 @@ class ImageSettings:
     # dewml/hybrid-dit-176m's published record predates the fields below.
     end_to_end: JSON = None
     grid: JSON = None
-    grid_process: bool = False
+    grid_process: bool = field(default=False, metadata={"derived": "preset"})
     """Whether `process` is the grid's own training process at the grid's tokens
-    (`DiffusionObjective.grid_process`), which a run over another size takes at its tokens; a record
-    before it states none, its process kept as it trained."""
+    (`DiffusionObjective.grid_process`: a run over a published pipeline naming no preset), which a run over
+    another size takes at its tokens; a record before it states none, its process kept as it trained."""
 
     def __post_init__(self) -> None:
         from dew._records import integer
