@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from lane_environment import DETERMINISTIC_OPS
 from generation_support import lowers
 from jax.experimental.layout import Format, Layout
 from kernel_compile import Uncounted
@@ -189,7 +190,8 @@ text."""
 
 @pytest.mark.parametrize("target", [pytest.param("sm90", marks=lowers("sm90")),
                                     pytest.param("sm100", marks=lowers("sm100"))])
-def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target):
+@pytest.mark.parametrize("flags", [None, DETERMINISTIC_OPS], ids=["own flags", "deterministic ops"])
+def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target, flags):
     """A one-layer decoder of the 4B's gated delta net, its step compiled ahead for a compile-only H100 and a
     compile-only B200 (`RECURRENT_AHEAD`), twice over one cache: each process lowers the step once, the cold
     one certifies each launch's configs once each (whatever its walk takes: a config refused steps the
@@ -202,9 +204,11 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target):
     lowered afresh once in the cold process: the step's kernels certification lowered are the lowerings it
     made (a launch's trace held, `tuning.lowered_once`, bound into the step as certification traced it,
     under the step's own mesh), where the step lowered its kernels again, each a cache miss, 34 of a 4B's 36
-    kernels on a B200 the ones certification had made (FS-CERTSPLIT4: 27 s of its lowering)."""
+    kernels on a B200 the ones certification had made (FS-CERTSPLIT4: 27 s of its lowering). Under
+    deterministic ops too, which keep no picks but keep the verdicts (row 7308: every warm start under
+    --xla_gpu_deterministic_ops certified every launch again)."""
     cache = tmp_path / "cache"
-    runs = [fresh(RECURRENT_AHEAD, target, cache_dir=cache) for _ in range(2)]
+    runs = [fresh(RECURRENT_AHEAD, target, cache_dir=cache, flags=flags) for _ in range(2)]
     cold, warm = (run["events"] for run in runs)
     modules = runs[0]["modules"]
     assert len(set(modules)) == len(modules), collections.Counter(modules).most_common(3)
