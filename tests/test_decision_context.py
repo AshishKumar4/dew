@@ -825,7 +825,7 @@ def test_a_configured_context_encoder_is_frozen_unless_trained_and_counted_as_it
         assert "context" not in state.variables.get(FROZEN if trained else "params", {})
 
 
-def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(tmp_path):
+def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(tmp_path, monkeypatch):
     """A decision run's `--context-text` builds its encoder in the run's compute dtype, as a diffusion run's
     text condition is, a pretrained tower (`clip_text`) among them, and trains a step with it frozen; an
     encoder that reads no text into the states context layers read (an audio tower, a denoiser's
@@ -835,11 +835,7 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
     from test_text_encoders import TINY
 
     from dew.batch import FROZEN
-    from dew.decision.config import encodes_text
-    from dew.inputs import CharTable
     from dew.inputs.spec import TextCondition
-    from dew.interop.conditioners import DiffusionConditioner
-    from dew.interop.encoders import CLIPText, HFAudio
     from dew.registry import ModelConfig
 
     text = TextCondition(encoder="clip_text", checkpoint=str(TINY))
@@ -850,9 +846,28 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
     assert jnp.dtype(objective.model.context.encoder.dtype) == jnp.dtype("bfloat16")
     state, _ = trained(run, tmp_path, "clip")
     assert "context" in state.variables[FROZEN] and "context" not in state.variables["params"]
-    for refused in (dataclasses.replace(text, field="caption"), dataclasses.replace(text, unconditional="x")):
+    # Refused by the encoder's own declarations (`reads_captions`, `keyword`) before any tower is built.
+    monkeypatch.setattr(TextCondition, "build", lambda *_, **__: pytest.fail("a refused encoder was built"))
+    for refused in (dataclasses.replace(text, field="caption"), dataclasses.replace(text, unconditional="x"),
+                    TextCondition(encoder="hf_audio", checkpoint=str(TINY)),
+                    TextCondition(encoder="diffusion_text", checkpoint=str(TINY))):
         with pytest.raises(ValueError):
             dataclasses.replace(run, context_text=refused).prepare()
-    assert [encodes_text(kind) for kind in (CharTable, CLIPText, HFAudio, DiffusionConditioner)] == [
-        True, True, False, False]
+
+
+def test_a_configured_encoder_a_tree_holds_is_frozen_or_trained_as_the_run_says():
+    """A configured context encoder's weights a tree already holds (a release's, `Decide.released`, under
+    `params`) are completed as the run holds them: frozen (`FROZEN`) by default, trained where
+    `context_trained`, as an encoder drawn afresh is. A release's encoder trained whatever the run said
+    (train 998's review, F1)."""
+    from dew.batch import FROZEN
+
+    for trained in (False, True):
+        objective = configured(trained=trained)
+        released = {"params": {"context": objective.model.context.encoder.params}}
+        completed = objective.complete_variables(jax.random.key(0), released)
+        held, other = ("params", FROZEN) if trained else (FROZEN, "params")
+        drawn = released["params"]["context"]
+        assert jax.tree.structure(completed[held]["context"]) == jax.tree.structure(drawn)
+        assert "context" not in completed.get(other, {})
 

@@ -8,7 +8,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 
-from dew.batch import COORDINATES_FIELD, FROZEN, Variables, part, prefix_sum, thaw
+from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
 from dew.decision.head import Head, answer_states
 from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import HOWS, ContextReader
@@ -58,14 +58,6 @@ class BackboneContext(BackboneEncoder[Sequence[int]]):
         return {"encoder": self.encoder}
 
 
-def context_weights(variables: Variables) -> Variables:
-    """A configured context encoder's weights (`DecisionModel.context`) out of a decision's tree, trained
-    (`params`) or held frozen (`FROZEN`) as its objective holds them (`DecisionObjective.context_trained`):
-    the one reader of them, the model's, a task's and a bundle's."""
-    held = part(variables, "context")
-    return {**held.get(FROZEN, {}), **held.get("params", {})}
-
-
 @dataclass(frozen=True)
 class DecisionModel(HeadedModel):
     """Any backbone with final states, read by a decision head (`HeadedModel`).
@@ -90,7 +82,7 @@ class DecisionModel(HeadedModel):
     @functools.cached_property
     def context_reader(self) -> "ContextReader | None":
         """The tokenization a row's context is read by where a run configures its encoder (`context`):
-        built once, the one every reader of the context takes (`dew.decision.layout.reader_of`); None,
+        built once, the one every reader of the context takes (`dew.decision.layout.context_tokens`); None,
         the decision's tokenizer."""
         return None if self.context is None else ContextReader(self.context.encoder)
 
@@ -126,7 +118,7 @@ class DecisionModel(HeadedModel):
                 return encode_conditions((("context", backbone),), {}, {"context": tokens},
                                          path="DecisionModel", backbone=live)["context"]
             case encoder:
-                weights = {"context": context_weights(variables)}
+                weights = {"context": thaw(part(variables, "context"))["params"]}
 
                 def encoded(tokens: jax.Array, lengths: jax.Array) -> jax.Array:
                     mask = (jnp.arange(tokens.shape[1])[None, :] < lengths[:, None]).astype(jnp.int32)
