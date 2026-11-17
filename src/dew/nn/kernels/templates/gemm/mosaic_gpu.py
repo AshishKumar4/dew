@@ -390,8 +390,8 @@ def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, pr
     2-SM MMA) runs every tile on its pair."""
     multicast = consumers > 1 and rows >= block_m
     cluster = layout.cluster if layout.pairs_product or multicast else 1
-    band = resources.band(multiprocessors * programs, block_m, block_n, width // block_n,
-                          -(-rows // (block_m * cluster)) if grouped else None, cluster=cluster)
+    band = resources.band(multiprocessors * programs, block_m, block_n, width // block_n, grouped=grouped,
+                          cluster=cluster)
     return Tiles(block_m, block_n, step, 2, band, warpgroups=consumers, cluster=cluster, family=layout.name,
                  programs=programs)
 

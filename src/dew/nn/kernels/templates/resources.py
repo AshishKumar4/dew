@@ -376,28 +376,27 @@ def held_rows(family: "Family", consumers: int, columns: int) -> int:
     return share // family.role_rows * family.role_rows * consumers
 
 
-def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
-         group_row_tiles: int | None = None, *, cluster: int = 1) -> int:
+def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int, *, grouped: bool = False,
+         cluster: int = 1) -> int:
     """The planar snake's column tiles a band for a wave of one program a multiprocessor sharing its
-    blocks in the L2 (`grid_block_n`): the power of two, at most `column_tiles`, nearest below the band
-    that reads each operand fewest times from the device, or a grouped walk's every column tile where
-    the band reaches them. The rows' and the columns' blocks balanced
-    (a wave as near a square of output tiles as their sides allow: √(programs · rows / columns)) or,
-    where the rows split into groups of `group_row_tiles` row tiles each, wider while a wave still spans
-    each group's row tiles whole (programs over a group's row tiles), whose columns' blocks it then
-    reads once a group. A grouped walk's band that reaches every column tile takes them all, whatever
-    their count: a power of two below it would leave a last band that walks every row tile again (row
-    4053: the H100 grouped forward's three or six column tiles in bands of two or four read its tokens
-    twice, 1.39x CUTLASS's bytes, M-NS-3). A dense walk's stays a power of two: its snake's division by
-    another count took the registers a 128 x 256 kernel gradient had left (ptxas 240 and 44 bytes
-    spilled at a band of three, NS4053-1), which the register model does not see. A cluster of
-    `cluster` multiprocessors is one program, its tile `cluster` row tiles (`group_row_tiles` counts a
-    group's clusters' tiles)."""
+    blocks in the L2 (`grid_block_n`). A grouped walk's every column tile: each row tile's columns walked
+    by one wave reads each block of a group's rows from the device once, as a ragged group's rows are read
+    by no other group's tiles, where a narrower band walks every row tile again a band (Mixtral's down on a
+    GH200, M-EM-68: its device reads 9.70, 8.45, 7.49, 7.40 and 6.73 GB at bands 1, 2, 4, 8 and every
+    column tile, 16; its forward 1.037x CUTLASS's at the band of 8 a wave's balance gave, 0.997x at every
+    column tile; row 4053's H100 forward's three or six column tiles read its tokens twice in bands of
+    two or four, 1.39x CUTLASS's bytes, M-NS-3). A dense walk's the power of two, at most `column_tiles`,
+    nearest below the band that reads each operand fewest times, the rows' and the columns' blocks
+    balanced (a wave as near a square of output tiles as their sides allow: √(programs · rows / columns));
+    a power of two, as its snake's division by another count took the registers a 128 x 256 kernel
+    gradient had left (ptxas 240 and 44 bytes spilled at a band of three, NS4053-1), which the register
+    model does not see. A cluster of `cluster` multiprocessors is one program, its tile `cluster` row
+    tiles."""
+    if grouped:
+        return column_tiles
     programs, rows = multiprocessors // cluster, block_m * cluster
-    balanced = math.sqrt(programs * rows / block_n)
-    spanning = programs / group_row_tiles if group_row_tiles else 0.0
-    wide = max(1, min(int(max(balanced, spanning)), column_tiles))
-    return column_tiles if group_row_tiles and wide == column_tiles else 1 << (wide.bit_length() - 1)
+    wide = max(1, min(int(math.sqrt(programs * rows / block_n)), column_tiles))
+    return 1 << (wide.bit_length() - 1)
 
 
 RAISES_HONORED = True
