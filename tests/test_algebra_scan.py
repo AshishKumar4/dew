@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact
 
-from dew.algebra import SATURATION, scan
+from dew.algebra import SATURATION, program, scan
 from dew.nn.kernels import generation
 from dew.nn.precision import float32_matmul
 
@@ -403,6 +403,44 @@ def test_two_delta_rule_walks_merged_through_an_issuer_give_the_final_state(upda
     assert_as_exact(jax.jit(merged), jax.jit(lambda *xs: gated_tokenwise(update_fn)(*xs)[1]), draw_fn,
                     f"{update_fn.__name__} merged through an issuer", seeds=16)
     assert {"transfer_compose", "transfer_apply"} <= roles, roles
+
+
+def long_draw(seed):
+    """`draw`'s inputs over two of its draws: 256 tokens, one chunk of them."""
+    return tuple(jnp.concatenate(pair) for pair in zip(draw(2 * seed), draw(2 * seed + 1), strict=True))
+
+
+@pytest.mark.parametrize("target", ["sm86", "v5e"])
+def test_a_long_chunks_token_loop_is_split_by_its_construction(target):
+    """Mamba-2's chunk of 256 tokens derived priced for a target whose step latency is unstated (an A10, a
+    v5e), so the token loop's steps are priced by no time and it is extracted: its split is the loop's own,
+    never its 256 steps unrolled into the split's e-graph (row 7201: 6,917 equations, 20 minutes, then
+    egglog's extraction past Python's stack), its outputs and final state on par with the token scan
+    (check 1)."""
+    with program.passes(target=target):
+        forms = scan.derive_scan(DECLARED, saturation=SATURATION)
+
+        def derived(x, dt, B, C):
+            values = operands(x, dt, B, C)
+            prepared = forms.prepare(values)
+            state = forms.init({})
+            return forms.mapped(prepared, state), forms.finish(forms.step(state, prepared), values)
+
+        assert_as_exact(jax.jit(derived), jax.jit(tokenwise), long_draw, f"ssd's 256 tokens on {target}",
+                        seeds=8)
+
+
+def test_a_token_loop_carries_its_state_in_its_operands_wider_type():
+    """A float32 state walked over float64 operands (x64's) by a token loop (a v5e's, `_looped_split`): its
+    outputs and the state it leaves are float64, the token scan's types, its carry widened once."""
+    with jax.enable_x64(new_val=True), program.passes(target="v5e"):
+        forms = scan.derive_scan(DECLARED, saturation=SATURATION)
+        wide = tuple(value.astype(jnp.float64) for value in long_draw(0))
+        values = operands(*wide)
+        prepared = forms.prepare(values)
+        outputs, (_, state) = forms.mapped(prepared, forms.init({})), forms.step(forms.init({}), prepared)
+        expected = tokenwise(*wide)
+    assert (outputs.dtype, state.dtype) == (expected[0].dtype, expected[1].dtype) == (jnp.float64,) * 2
 
 
 @pytest.mark.parametrize("target", ["sm86", "sm90"])

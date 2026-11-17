@@ -133,13 +133,16 @@ def _shown(log: float) -> str:
 
 
 def _scaled_rms(rows, xp=np):
-    """Each row's root mean square of finite values, the row scaled by its largest first, so no square
-    overflows (row 1628): zero for a row of zeros. In numpy, or in `xp` (jax.numpy, inside check 1's
-    programs, `_computed_here`)."""
-    rows = xp.abs(xp.asarray(rows, xp.float64))
+    """Each row's root mean square of its magnitudes (`_laid`), the row scaled by its largest first, so no
+    square overflows (row 1628): zero for a row of zeros, NaN for a row holding an infinity or a NaN,
+    selected, never computed. In numpy, or in `xp` (jax.numpy, inside check 1's programs,
+    `_computed_here`)."""
+    rows = xp.asarray(xp.abs(rows), xp.float64)
     largest = xp.max(rows, axis=1, keepdims=True) if rows.shape[1] else xp.zeros((len(rows), 1))
-    scale = xp.where(largest > 0, largest, 1.0)
-    return scale[:, 0] * xp.sqrt(xp.mean(xp.square(rows / scale), axis=1))
+    finite = xp.isfinite(largest)
+    scale = xp.where(finite & (largest > 0), largest, 1.0)
+    rms = scale[:, 0] * xp.sqrt(xp.mean(xp.square(xp.where(finite, rows, 0.0) / scale), axis=1))
+    return xp.where(finite[:, 0], rms, xp.nan)
 
 
 def log_errors(errors) -> np.ndarray:
@@ -664,11 +667,11 @@ def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
     zero. No other row's size enters: a small row beside large ones has its
     own. A value of rank one or less is one row, which `distance` already
     judges, and has none here."""
-    truth = np.asarray(truth, np.float64)
+    truth = np.asarray(truth, _wide(truth))
     if truth.ndim < 2:
         return np.zeros(0), np.zeros(0)
-    held = None if terms is None else np.asarray(terms, np.float64)
-    return _row_sizes(truth, held)[1], _rows_rms(np.asarray(value, np.float64) - truth, truth.shape[-1])
+    held = None if terms is None else np.asarray(terms, _wide(terms))
+    return _row_sizes(truth, held)[1], _rows_rms(np.asarray(value, _wide(value)) - truth, truth.shape[-1])
 
 
 def _rows_rms(values, width: int) -> np.ndarray:
@@ -687,11 +690,11 @@ def _row_sizes(truth, terms=None, *, xp=np) -> tuple:
     and check 1's own (`_truth_rows`), in NumPy or in `xp`, as `_computed_here` computes a draw's
     statistics (on its GPUs where it has one, an array a GPU holds where it is, else in NumPy)."""
     rows = truth.reshape(-1, truth.shape[-1])
-    own, leaf = _scaled_rms(rows, xp), xp.sqrt(xp.mean(xp.square(truth)))
+    own, leaf = _scaled_rms(rows, xp), xp.sqrt(xp.mean(xp.square(xp.abs(truth))))
     if terms is None:
         return own, xp.where(own > RESOLUTION * leaf, own, 0.0)
     sized = xp.maximum(own, _scaled_rms(terms.reshape(rows.shape), xp))
-    leaf = xp.maximum(leaf, xp.sqrt(xp.mean(xp.square(terms))))
+    leaf = xp.maximum(leaf, xp.sqrt(xp.mean(xp.square(xp.abs(terms)))))
     return own, xp.where(sized > RESOLUTION * leaf, sized, 0.0)
 
 
@@ -834,12 +837,19 @@ def _width(leaf) -> int:
     return np.shape(leaf)[-1] if np.ndim(leaf) >= 1 else 0
 
 
+def _wide(leaf) -> type[np.float64] | type[np.complex128]:
+    """The format the gate reads `leaf` in: float64, complex128 for a complex leaf. The gate reads a value's
+    magnitude and an error's (`_scaled_rms`), so an error in a complex value's imaginary part is the gate's
+    as one in its real part is."""
+    return np.complex128 if np.iscomplexobj(leaf) else np.float64
+
+
 def _laid(leaf, xp):
-    """`leaf` in float64, in C order: its sums run alike whatever layout it came in (numpy's follow
-    memory order; a compiled program's leaves are C-ordered)."""
+    """`leaf` in the gate's format (`_wide`), in C order: its sums run alike whatever layout it came in
+    (numpy's follow memory order; a compiled program's leaves are C-ordered)."""
     # Its own shape kept: numpy lays a scalar out as one value of rank one, which has a row a scalar has not.
-    return (np.ascontiguousarray(leaf, np.float64).reshape(np.shape(leaf)) if xp is np
-            else jnp.asarray(leaf, jnp.float64))
+    return (np.ascontiguousarray(leaf, _wide(leaf)).reshape(np.shape(leaf)) if xp is np
+            else jnp.asarray(leaf, _wide(leaf)))
 
 
 def _truth_rows(truths, terms, *, xp):
@@ -880,18 +890,19 @@ def log_mean_square(errors, xp=np):
     finite = xp.isfinite(largest) & (largest > 0)
     held = xp.where(finite, largest, 1.0)
     # Each case's logs of its own operands alone: a zero's -inf selected, never computed (NumPy warns of it).
-    scaled = 2 * xp.log(held) + xp.log(xp.where(finite, xp.mean(xp.square(errors / held)), 1.0))
+    scaled = 2 * xp.log(held) + xp.log(xp.where(finite, xp.mean(xp.square(xp.abs(errors) / held)), 1.0))
     unscaled = 2 * xp.log(xp.where(largest == 0, 1.0, largest))
     return xp.where(finite, scaled, xp.where(largest == 0, -xp.inf, unscaled))
 
 
 def _largest_share(rows, xp=np):
     """Each row's largest element's share of the row's squared error, the row scaled by its largest first so
-    no square overflows: one for a row one element holds alone, zero for a row of zeros. In numpy, or in
-    `xp` (jax.numpy, inside check 1's programs)."""
-    rows = xp.abs(xp.asarray(rows, xp.float64))
+    no square overflows: one for a row one element holds alone, zero for a row of zeros or one holding an
+    infinity or a NaN. In numpy, or in `xp` (jax.numpy, inside check 1's programs)."""
+    rows = xp.asarray(xp.abs(rows), xp.float64)
     largest = xp.max(rows, axis=1, keepdims=True) if rows.shape[1] else xp.zeros((len(rows), 1))
-    scaled = xp.square(rows / xp.where(largest > 0, largest, 1.0))
+    finite = xp.isfinite(largest)
+    scaled = xp.square(xp.where(finite, rows, 0.0) / xp.where(finite & (largest > 0), largest, 1.0))
     total = xp.sum(scaled, axis=1)
     return xp.where(total > 0, 1.0 / xp.where(total > 0, total, 1.0), 0.0)
 
@@ -1137,10 +1148,10 @@ def _shares(found: list[list], count: int) -> np.ndarray:
 def example_mse(arm, truth) -> np.ndarray | None:
     """An arm's mean squared error from its float64 `truth` on each of a leaf's independent examples, its
     first axis (`judge`'s `examples`); None for a leaf of no axis."""
-    truth = np.asarray(truth, np.float64)
+    truth = np.asarray(truth, _wide(truth))
     if truth.ndim == 0:
         return None
-    return np.mean(np.square(np.asarray(arm, np.float64) - truth), axis=tuple(range(1, truth.ndim)))
+    return np.mean(np.square(np.abs(np.asarray(arm, _wide(arm)) - truth)), axis=tuple(range(1, truth.ndim)))
 
 
 def example_worst(arm, truth) -> np.ndarray | None:
@@ -1148,15 +1159,15 @@ def example_worst(arm, truth) -> np.ndarray | None:
     float64 `truth` over the row's size, the rows those of the leaf's last axis, sized by their truth's RMS,
     rows under RESOLUTION of their example's size left out. None for a leaf under rank two (no rows), or
     one with an example of no sized row."""
-    truth = np.asarray(truth, np.float64)
+    truth = np.asarray(truth, _wide(truth))
     if truth.ndim < 2:
         return None
     rows = truth.reshape(truth.shape[0], -1, truth.shape[-1])
     sizes = np.stack([_scaled_rms(example) for example in rows])
-    sized = sizes > RESOLUTION * np.sqrt(np.mean(np.square(rows), axis=(1, 2)))[:, None]
+    sized = sizes > RESOLUTION * np.sqrt(np.mean(np.square(np.abs(rows)), axis=(1, 2)))[:, None]
     if not sized.any(axis=1).all():
         return None
-    errors = (np.asarray(arm, np.float64) - truth).reshape(rows.shape)
+    errors = (np.asarray(arm, _wide(arm)) - truth).reshape(rows.shape)
     logs = log_over(np.stack([_scaled_rms(example) for example in errors]), np.where(sized, sizes, 1.0))
     return np.max(np.where(sized, logs, LOG_ZERO), axis=1)
 
@@ -1587,7 +1598,8 @@ class Weighed:
                 # A leaf of no float (an index, a count) is judged as it is.
                 weighed.append(leaf)
                 continue
-            value, true, scale = (np.asarray(part, np.float64) for part in (leaf, true, scale))
+            value, true, scale = (np.asarray(leaf, _wide(leaf)), np.asarray(true, _wide(true)),
+                                  np.asarray(scale, np.float64))
             unweighable = ~np.isfinite(scale)
             if unweighable.any():
                 at = tuple(int(index) for index in np.argwhere(unweighable)[0])
@@ -1619,7 +1631,7 @@ def heavy_masks(runs) -> list:
     totals = None
     for ran, true in runs:
         structure = jax.tree.structure(true)
-        squares = [np.square(np.asarray(arm, np.float64) - np.asarray(truth, np.float64))
+        squares = [np.square(np.abs(np.asarray(arm, _wide(arm)) - np.asarray(truth, _wide(truth))))
                    if float_leaf(truth) and np.ndim(truth) and np.shape(truth)[-1] > 1 else None
                    for arm, truth in zip(structure.flatten_up_to(ran), structure.flatten_up_to(true),
                                          strict=True)]

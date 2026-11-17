@@ -334,6 +334,14 @@ def supported(family: str, combination: tuple[tuple[str, str], ...]) -> bool:
     return importlib.import_module(CELLS[family][0]).supported(dict(combination))
 
 
+def served(family: str, combination: tuple[tuple[str, str], ...]) -> bool:
+    """Whether `family`'s route serves `combination` as a run takes it (a declared cell's check): its cell
+    module's `served` where its launches' forms are certification's (`attention_matrix.served`), else the
+    route's own analyses (`supported`)."""
+    module = importlib.import_module(CELLS[family][0])
+    return module.served(dict(combination)) if hasattr(module, "served") else supported(family, combination)
+
+
 def supported_pairs(family: str) -> set[tuple[tuple[str, str], tuple[str, str]]]:
     """Every pair of axis values (each an axis and its value) that some combination the route serves holds.
     A combination whose pairs are all held already adds none whatever its route does, so it is not asked

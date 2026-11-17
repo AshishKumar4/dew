@@ -105,6 +105,14 @@ def held_together(rings: dict) -> list[dict]:
     return groups
 
 
+def stepped_in(rings: dict, turn_of: Callable, view_of: Callable) -> None:
+    """A step's loads into `rings` (`turn_of(key, ring)` its turn, `view_of(key, ring)` its source), a barrier
+    pair at a time (`held_together`, `_loaded`): the one loader a producer's and a loading consumer's walks
+    (`fed.Feed`) take."""
+    for group in held_together(rings):
+        _loaded(group, turn_of, view_of)
+
+
 def _loaded(group: dict, turn_of: Callable, view_of: Callable) -> None:
     """A group's step loaded (`held_together`): a ring holding its own pair by its own load (`Ring.load`, a
     gathered ring's its own copies), a joined pair's slot freed once and each member copied into it."""
@@ -135,9 +143,8 @@ def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
 
     @pl.loop(0, jnp.where(active, steps, 0))
     def _(step):
-        for group in held_together(rings):
-            _loaded(group, lambda name, ring: ring.turn(counter + step),
-                    lambda name, ring: ring.viewed(views[name], step))
+        stepped_in(rings, lambda name, ring: ring.turn(counter + step),
+                   lambda name, ring: ring.viewed(views[name], step))
 
 
 def loaded_once(rings: dict, views: dict) -> None:
@@ -153,8 +160,7 @@ def streamed(rings: tuple, views, lo, hi) -> None:
     @pl.loop(lo, hi)
     def _(index):
         given = dict(zip(_keyed(rings), views(index), strict=True))
-        for group in held_together(_keyed(rings)):
-            _loaded(group, lambda key, ring: ring.turn(index - lo), lambda key, ring: given[key])
+        stepped_in(_keyed(rings), lambda key, ring: ring.turn(index - lo), lambda key, ring: given[key])
 
     drain(rings, hi - lo)
 
@@ -264,8 +270,7 @@ class Ring:
     def multicast(self) -> tuple | None:
         """The cluster axes the ring's loads are multicast along: its release barrier's, a cluster's (`ring`);
         None where the ring is its program's own."""
-        dtype = self.consumed.dtype
-        return dtype.collective_axes if isinstance(dtype, plgpu_core.ClusterBarrierType) else None
+        return collective_axes(self.consumed)
 
     def turn(self, counter) -> Turn:
         """Step `counter`'s turn (traced, or a Python int)."""
@@ -446,13 +451,14 @@ def opened_joined(key: str, scoped: dict) -> dict[str, "JoinedRing"]:
     """A joined pair's rings (`joined`) by stream name, from its key and its allocations scoped."""
     names = key.split(JOINED)
     return {name.rstrip(MULTICAST): JoinedRing(scoped['smem'][name.rstrip(MULTICAST)], scoped['full'],
-                                               scoped['consumed'], axes=_axes(scoped['consumed'])
+                                               scoped['consumed'], axes=collective_axes(scoped['consumed'])
                                                if name.endswith(MULTICAST) else None)
             for name in names}
 
 
-def _axes(consumed) -> tuple | None:
-    """A cluster barrier's collective axes, None for a program's own."""
+def collective_axes(consumed) -> tuple | None:
+    """The cluster axes a release barrier's arrivals reach (a `ring`'s multicast one's), None for a
+    program's own: a ring's multicast (`Ring.multicast`, a joined member's, `opened_joined`)."""
     dtype = consumed.dtype
     return dtype.collective_axes if isinstance(dtype, plgpu_core.ClusterBarrierType) else None
 

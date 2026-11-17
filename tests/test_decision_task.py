@@ -32,6 +32,7 @@ from dew.decision import (
 )
 from dew.decision.calibration import softmax
 from dew.decision.laya import LAYA_OPTION_LAYOUTS, LAYA_REQUIRED
+from dew.decision.layout import SegmentLayout
 from dew.decision.metrics import Answered
 from dew.decision.task import Finalists, Knockout, decoded_images, trained_tree
 
@@ -790,12 +791,12 @@ def test_a_released_checkpoint_states_the_layout_its_task_was_trained_with(decid
     chat) exports and reads back with the layout it was trained with, which the release states beside
     Laya's own files (`dew.config.Release`): Laya's config keeps the window and budgets it states, and a
     release with no such record reads as Laya's file alone does (row 4310)."""
-    from dew.decision.layout import Framing, MarkerLayout
+    from dew.decision.layout import Framing, SegmentLayout
 
     framed = Framing(system="Answer from the state.", prefill="", thinking=False)
     for number, chosen in enumerate(({"order": "state_first"}, {"order": "re_read"}, {"blocks": True},
                                      {"framing": framed, "order": "question_first"})):
-        # The layout as the task reads it, a row a question for Laya's head (`QuestionLayout.shared_for`).
+        # The layout as the task reads it, a row a question for Laya's head (`SegmentLayout.shared_for`).
         layout = replace(decide, layout=replace(decide.layout, **chosen)).layout
         replace(decide, layout=layout).save_pretrained(tmp_path / str(number))
         again = Decide.from_pretrained(tmp_path / str(number), attention_impl="xla")
@@ -805,7 +806,7 @@ def test_a_released_checkpoint_states_the_layout_its_task_was_trained_with(decid
         # Laya's readers refuse a layout they would lay out otherwise (row 4599).
         assert stated["option_layout"] not in LAYA_OPTION_LAYOUTS
     (tmp_path / "0" / "dew_release.json").unlink()
-    assert Decide.from_pretrained(tmp_path / "0", attention_impl="xla").layout == MarkerLayout(
+    assert Decide.from_pretrained(tmp_path / "0", attention_impl="xla").layout == SegmentLayout.marker_row(
         max_len=decide.layout.max_len, head_max_len=decide.layout.head_max_len,
         option_tokens=decide.layout.option_tokens, parallel=decide.layout.parallel)
 
@@ -1011,11 +1012,10 @@ def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decid
     run's own directory, which holds other weights, refuses it."""
     import dataclasses
 
-    from dew.decision import StateFirstLayout
     from dew.inference.loading import pipeline
 
     if kind == "state-first":
-        decide = replace(decide, layout=StateFirstLayout(max_len=decide.layout.max_len,
+        decide = replace(decide, layout=SegmentLayout.state_first_row(max_len=decide.layout.max_len,
                                                          head_max_len=decide.layout.head_max_len))
     runs = trained_runs(decide, tmp_path, 2)
     held_out = answered() * 10

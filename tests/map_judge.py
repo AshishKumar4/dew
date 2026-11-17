@@ -45,6 +45,12 @@ def commit() -> str:
                           text=True, check=True).stdout.strip()
 
 
+def marked_seeds(request) -> int:
+    """The seeds a sharded site declares: its test's `check1_shards` mark's, which CI's plan reads, the one
+    count its check draws (pytest's `request`)."""
+    return request.node.get_closest_marker("check1_shards").kwargs["seeds"]
+
+
 def drawing() -> bool:
     """Whether this process is a map task (DRAWS): it records a site's units and judges nothing, so a site
     that draws alone (`reference_error`'s deferred checks) leaves its judgement to the judge; a site whose

@@ -992,6 +992,45 @@ def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(tar
     assert all(record["shared"] > 0 for record in found), found
 
 
+@pytest.mark.parametrize("target", ["sm80", "sm90", "sm100"])
+def test_tritons_compiler_rounds_a_product_and_a_sum_apart(target):
+    """A Pallas Triton kernel's product and the sum it feeds, alone (`a * b + c`) and inside a compensated
+    sum's TwoSum (`s = p + c`, `t = s - p`, `e = (p - (s - t)) + (c - t)`, as the online softmax's merge
+    recovers its error), compiled by XLA's CUDA backend for a compile-only device on this CPU: its machine
+    code multiplies and adds apart (FMUL and FADD, no FFMA), each rounding on its own. A contraction of the
+    two into one fused multiply-add, which ptxas forms wherever the PTX allows it, would leave the error
+    term the product's rounding error instead of the sum's, and the merge's recovery wrong."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as plt
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.templates import report
+
+    def alone(a_ref, b_ref, c_ref, s_ref, e_ref):
+        s_ref[...] = a_ref[...] * b_ref[...] + c_ref[...]
+        e_ref[...] = c_ref[...]
+
+    def two_sum(a_ref, b_ref, c_ref, s_ref, e_ref):
+        product, c = a_ref[...] * b_ref[...], c_ref[...]
+        total = product + c
+        back = total - product
+        s_ref[...] = total
+        e_ref[...] = (product - (total - back)) + (c - back)
+
+    vector = jax.ShapeDtypeStruct((256,), jnp.float32)
+    for kernel in (alone, two_sum):
+        def call(a, b, c, kernel=kernel):
+            return pl.pallas_call(kernel, out_shape=(vector, vector),
+                                  compiler_params=plt.CompilerParams(num_warps=4, num_stages=1))(a, b, c)
+
+        with generation.assumed(target):
+            executable = lowered_for(call, (vector, vector, vector), target).compile()
+        [(_, elf, _)] = report.custom_kernels(executable)
+        listing = report.sass_listing(elf)
+        assert listing is not None, "no disassembler installed: the ci extra installs nvdisasm"
+        assert "FMUL" in listing and "FADD" in listing and "FFMA" not in listing, (kernel.__name__, listing)
+
+
 @pytest.mark.parametrize("target", ["sm80", "sm90"])
 def test_a_calls_runs_lower_and_compile_on_tritons_compiler(target):
     """A call's runs (`test_attention_template.RUN_CASES`' decision row's), fp32, its forward with residuals

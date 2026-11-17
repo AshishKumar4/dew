@@ -88,7 +88,7 @@ class Head(nn.Module):
     questions at the host boundary (`validate_rows`)."""
     reads_apart: ClassVar[bool] = True
     """Whether the head reads each question from the backbone's states at its own spans alone, so that the
-    questions of a row over one state (`QuestionLayout.shared_state`) stay apart; a head whose own layers
+    questions of a row over one state (`SegmentLayout.shared_state`) stay apart; a head whose own layers
     attend across its row's questions refuses such a row (`validate_rows`)."""
     width_field: ClassVar[str] = "features"
     """The field holding the width of the states the head reads."""
@@ -123,8 +123,8 @@ class Head(nn.Module):
     def validate_rows(self, rows: Sequence[Encoded]) -> None:
         """Refuse encoded host rows that ask more questions than this head reads."""
         if self.one_question and any(len(row.questions) > 1 for row in rows):
-            raise ValueError("this head reads one question a row; lay the rows out with a "
-                             "QuestionLayout or use a joint head")
+            raise ValueError("this head reads one question a row; lay the rows out a question a row "
+                             "(SegmentLayout.marker_row or state_first_row) or use a joint head")
         if not self.reads_apart and any(over_one_state_row(row) for row in rows):
             raise ValueError("this head's own layers attend across a row's questions, which a row over one "
                              "state keeps apart; read it with a head that reads each question's own states")
@@ -159,7 +159,7 @@ class DecisionHead(Head):
     each marker. The blocks are Dew's `DecoderBlock`. Laya's action head is left
     out, because its own model card reports that it carries no signal.
 
-    It reads one question per row (`QuestionLayout`), the first token of each
+    It reads one question per row (`SegmentLayout`), the first token of each
     option slot being its marker, and a window's rows apart from each other.
     """
 
@@ -218,7 +218,7 @@ class DecisionHead(Head):
         if inputs.spans_in_context:
             raise TypeError("Laya's head scores each option at its marker in the row, so it reads no "
                             "schema read as the row's context; use a JointSchemaHead")
-        # Every token takes its row's question type: a QuestionLayout row asks one question.
+        # Every token takes its row's question type: a row a question asks one question.
         owned = inputs.question_segments[:, None, :] == inputs.segments[:, :, None]
         kinds = jnp.sum(jnp.where(owned, inputs.kinds[:, None, :], 0), axis=-1)
         # A padding token's state enters none of the head's blocks, whose attention multiplies its
@@ -354,7 +354,7 @@ class JointSchemaHead(Head):
     cosine of field and option, and a residual MLP over the pair). The three
     scales are learned in log space and held to 100 at most.
 
-    It reads every question of a row (`JointLayout`), and the backbone's output
+    It reads every question of a row (`SegmentLayout.joint_row`), and the backbone's output
     table. In a window of packed rows each question and option reads its own
     row alone, and the row's last token is its own. Each option is computed on
     its own but for its weight in its question's summary, so where the inputs
@@ -715,7 +715,7 @@ def _refuse_other_labels(rows: Sequence[Encoded], labels: tuple[tuple[int, ...],
         for laid in row.questions:
             if laid.label_ids is None:
                 raise ValueError(f"question {laid.name!r} stands under no labels, which a readout reads; lay "
-                                 "its rows out with labels (QuestionLayout.labels)")
+                                 "its rows out with labels (SegmentLayout.labels)")
             if tuple(laid.label_ids) != labels[:len(laid.label_ids)] or len(laid.label_ids) > len(labels):
                 raise ValueError(f"question {laid.name!r} stands under {len(laid.label_ids)} labels other "
                                  f"than the readout's first, of {len(labels)}; lay the rows out under the "
