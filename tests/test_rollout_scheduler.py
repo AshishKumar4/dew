@@ -455,7 +455,7 @@ def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
         """The cache layout the scheduler's collector serves its cohort's turns over."""
         acquisition = RolloutScheduler.episodes(
             policy, Harness(), lambda episode: 0.0, objective=objective, max_prompt_tokens=8,
-            max_new_tokens=4, max_turns=2, sampling=Sampling()).acquisition
+            max_new_tokens=4, max_turns=2, sampling=Sampling(eos_token_ids=(3,))).acquisition
         assert isinstance(acquisition, Synchronous) and isinstance(acquisition.collector, EpisodeCollector)
         return acquisition.collector.kv_cache
 
