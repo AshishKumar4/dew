@@ -197,7 +197,7 @@ Branch coverage of src/dew over the scenario suite (the files ci.py SCENARIO_SUI
 | src/dew/nn/kernels/templates/gemm/pricing.py | 99 | 68 | 14 | 0 | 27.4% |
 | src/dew/interop/families/llama4.py | 82 | 55 | 16 | 0 | 27.6% |
 | src/dew/interop/autoencoders/dc_ae.py | 67 | 43 | 20 | 0 | 27.6% |
-| src/dew/interop/isolated.py | 50 | 35 | 8 | 1 | 27.6% |
+| src/dew/_isolated.py | 50 | 35 | 8 | 1 | 27.6% |
 | src/dew/nn/engram.py | 318 | 211 | 66 | 0 | 27.9% |
 | src/dew/data/sources/tfds.py | 256 | 169 | 70 | 5 | 28.2% |
 | src/dew/interop/families/gemma.py | 265 | 166 | 84 | 0 | 28.4% |

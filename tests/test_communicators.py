@@ -679,3 +679,19 @@ def a_program_loaded_from_the_compilation_cache_is_admitted_from_its_kept_commun
     (requests, hits), read = ran()
     assert len(written) == 1 and read == written
     assert requests and hits == requests
+
+
+def test_a_hosts_measurement_reaches_its_parent_whatever_the_measuring_process_prints(tmp_path, monkeypatch):
+    """The measuring process's record reaches its parent (`communicators._child`) however much the process
+    prints on its stdout, here a line written as the interpreter exits, after the record, as NCCL's debug log
+    does: its record comes over a pipe of its own (`dew._isolated`). The parent read the child's stdout's
+    last line as the record, and NCCL_DEBUG=INFO's log there refused a 2xH100 training start (row 6497).
+    Measured over two host devices, whose memory the measurement reads as none."""
+    (tmp_path / "sitecustomize.py").write_text(
+        "import atexit, os\natexit.register(lambda: os.write(1, b'node:1:2 [0] NCCL INFO comm 0x1 done\\n'))\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(tmp_path), *sys.path]))
+    monkeypatch.setenv("JAX_PLATFORMS", "cpu")
+    monkeypatch.setenv("XLA_FLAGS", device_flags(2))
+    needs = communicators._child({})
+    assert set(needs.to_json()) >= {"collective", "exchanged", "permuted", "runtime"}

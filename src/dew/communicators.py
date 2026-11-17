@@ -579,7 +579,7 @@ def measure(selected: str) -> dict:
                                            int((device.memory_stats() or {}).get("pool_bytes", 0)))
                 for device in devices}
 
-    spent = dict.fromkeys(before, 0)
+    spent = dict.fromkeys((device.local_hardware_id for device in devices), 0)
 
     def taken(group: list, program: Callable) -> dict[int, int]:
         """The bytes each GPU of `group` gave as `program` first ran over it, kept in `spent` as well."""
@@ -630,6 +630,6 @@ def measure(selected: str) -> dict:
                                jax.lax.conv(image, jnp.ones((8, 8, 3, 3), jnp.float32), (1, 1), "SAME")))
     after = held_now()
     # The runtime's share on each GPU: what went that neither the pool's growth nor a communicator took.
-    runtime = {gpu: before[gpu] - after[gpu][0] - after[gpu][1] - spent[gpu] for gpu in after}
+    runtime = {gpu: before[gpu] - after[gpu][0] - after[gpu][1] - spent[gpu] for gpu in before}
     return {"collective": collective, "exchanged": exchanged, "permuted": permuted,
             "connections": [[*pair, *gave] for pair, gave in connections.items()], "runtime": runtime}

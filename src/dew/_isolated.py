@@ -22,7 +22,8 @@ from multiprocessing.connection import Connection
 
 class Isolated:
     """A process of its own (this module's): `call` runs a module-level function there. It ends with the
-    context. Its environment is the caller's with `environment`'s settings over it."""
+    context. Its environment is the caller's with `environment`'s settings over it, its PYTHONPATH always
+    the caller's `sys.path`, which its loads need."""
 
     def __init__(self, environment: Mapping[str, str] | None = None):
         asked, asks = os.pipe()
