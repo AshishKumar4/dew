@@ -323,12 +323,6 @@ def earlier_layout(value: JSON) -> JSON:
             "fields": {**EARLIER_LAYOUTS[named], **fields}}
 
 
-EARLIER_DESCRIPTIONS: list[Callable[[JSON], JSON]] = []
-"""The readers of a saved data plan's earlier descriptions, each registered by the package whose classes
-those descriptions name as it is imported (`dew.decision.layout.earlier_described`): a plan whose steps
-hold such a class has imported it. A data plan's comparison applies each (`dew.data.plan.Plan.check`), so
-the data layer reads them with no import of the feature package."""
-
 
 def moved_record(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved record's fields, the JSON its file holds, with the paths they name translated

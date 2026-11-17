@@ -19,6 +19,7 @@ import pytest
 from arm_arithmetic import float64_held
 from flax import linen as nn
 from jax.experimental import checkify
+from map_judge import marked_seeds
 from model_support import Digits, decoder, serving_task as task
 from reference_error import as_given, assert_as_exact
 from serving_support import (
@@ -1261,20 +1262,24 @@ of four a later prompt reads where an earlier request wrote them, its first page
 the first page and no other, whatever the earlier requests drew."""
 QUANTIZED_CACHE_BUDGET = 8
 """Each quantized-cache cell's tokens each request draws."""
-QUANTIZED_CACHE_SEEDS = {"int8": 128, "float8-over-pages": 64, "int8-over-a-shared-prefix": 128}
-"""Each quantized-cache cell's declared seeds, sized paired by `seeds_for` on armada's CPUs (2026-11-14,
-kvq-size-1 at 021c8ff5a4c; the shared prefix's prefix-size-1 at bfe8c21f164)."""
-
-
-@pytest.mark.parametrize("cell", list(QUANTIZED_CACHES))
-def test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does(cell):
+@pytest.mark.parametrize("cell", [
+    pytest.param("int8", id="int8", marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
+    pytest.param("float8-over-pages", id="float8-over-pages",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("int8-over-a-shared-prefix", id="int8-over-a-shared-prefix",
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=32))])
+def test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does(cell, request):
     """Each cell of `QUANTIZED_CACHES`: the server's draws score on par with the decoder's own cached decode
     of them through a cache of the same format, each held to the float64 forward that reads the codes and
-    scales its cache held (check 1, followed)."""
+    scales its cache held (check 1, followed), over its mark's declared seeds (`marked_seeds`), sized paired
+    by `seeds_for` on armada's CPUs (2026-11-14, kvq-size-1 at 021c8ff5a4c; the shared prefix's
+    prefix-size-1 at bfe8c21f164). Each cell's draws run in armada's map tasks of 32: whole, CI's int8
+    cell took 123 to 240 s, its shared prefix's 122 to 147 s and float8's pages 73 to 106 s (CI at mains
+    3e5b75d3c to 599a23f5d, row 6971)."""
     serving, requests, hits = QUANTIZED_CACHES[cell]
     assert_served_through_its_cache_as_exact(measured_task(measured_decoder()), requests,
                                              f"served arithmetic: a quantized cache, {cell}", serving=serving,
-                                             budget=QUANTIZED_CACHE_BUDGET, seeds=QUANTIZED_CACHE_SEEDS[cell],
+                                             budget=QUANTIZED_CACHE_BUDGET, seeds=marked_seeds(request),
                                              hits=hits)
 
 
@@ -2442,7 +2447,7 @@ if mode == "keep":
         tokens = served()
     saved = programs.save(path)
     # Each kept program by its function's name.
-    found = {"kept": sorted({program.call["function"][2] for program in saved.kept.values()}),
+    found = {"kept": sorted({program.called.rsplit(".", 1)[-1] for program in saved.kept.values()}),
              "refused": sorted(programs.refused.values())}
 else:
     with kept(path), Compiles(None) as compiles:
@@ -2459,14 +2464,14 @@ print(json.dumps({"tokens": tokens, **found}))
 
 def test_a_text_server_serving_under_keeping_keeps_every_program_it_compiles(tmp_path):
     """A text server built and serving within `keeping` keeps each program it compiles and refuses none: the
-    server's own context, its stack and sequences whole (`dew.nn.sharding.whole`), is part of what each
-    call's identity states, its formats' chosen layouts too, and its checks' tracebacks are held as their
-    frames (`HeldTraceback`). A fresh process handed them serves the same tokens compiling none of them,
-    the step that chooses its state's layout among them (`OuterProgram.handed`)."""
+    programs' formats' chosen layouts are part of what each lowers to, and its checks' tracebacks are held
+    as their frames (`HeldTraceback`). A fresh process handed them, with no persistent cache, serves the
+    same tokens compiling none of them, the step that chooses its state's layout among them, which its
+    tuned lowering finds by its fingerprint."""
     import process_support
 
     path = str(tmp_path / "text.dew-aot")
     keep = process_support.fresh(KEPT_TEXT, "keep", path)
     assert keep["refused"] == [] and keep["kept"]
-    take = process_support.fresh(KEPT_TEXT, "take", path)
+    take = process_support.fresh(KEPT_TEXT, "take", path, variables={"JAX_ENABLE_COMPILATION_CACHE": "false"})
     assert not set(take["compiled"]) & set(keep["kept"]) and take["tokens"] == keep["tokens"]

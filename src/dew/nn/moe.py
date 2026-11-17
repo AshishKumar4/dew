@@ -57,6 +57,7 @@ from .precision import (
     projection_role,
     recipe_role,
     rounded_operand,
+    softplus,
 )
 from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import declared
@@ -308,7 +309,7 @@ def sqrt_softplus(logits: jax.Array) -> jax.Array:
     logits its side takes, so neither's derivative is evaluated past its range."""
     tail = jnp.log(jnp.finfo(logits.dtype).eps)
     below = logits < tail
-    plain = jnp.sqrt(jax.nn.softplus(jnp.where(below, tail, logits)))
+    plain = jnp.sqrt(softplus(jnp.where(below, tail, logits)))
     return jnp.where(below, jnp.exp(jnp.minimum(logits, tail) / 2), plain)
 
 
@@ -757,15 +758,23 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
     compute = canonicalize_dtype(tokens, *(_held(kernel.stack if isinstance(kernel, Layered) else kernel)
                                            for kernel in (first, second)), dtype=dtype)
     if (isinstance(first, Layered) or isinstance(second, Layered) or isinstance(first, formats.NvFp4)
-            or isinstance(second, formats.NvFp4) or recipe_role() is not None):
+            or isinstance(second, formats.NvFp4) or _recipe_takes_experts(first)):
         # A stack's layer, a packed bank (its product the NVFP4 one, which pairs with none), or a run's
-        # low-precision recipe, takes each product apart (`expert_projection`).
+        # low-precision recipe that takes the experts (`recipe_refusal`), takes each product apart
+        # (`expert_projection`); experts the recipe leaves pair as without one.
         return (expert_projection(x, first, group_sizes, compute, implementation, precision),
                 expert_projection(x, second, group_sizes, compute, implementation, precision))
     with _named(implementation):
         gate, up = gemm.gemm(tokens, first, group_sizes, compute=compute, out_dtype=compute,
                              out_dtypes=(compute, compute), precision=precision, paired=second, gather=rows)
     return gate, up
+
+
+def _recipe_takes_experts(matrix: jax.Array) -> bool:
+    """Whether the run's low-precision recipe takes experts of `matrix`'s widths (`recipe_refusal`), in the
+    experts' role `expert_projection` multiplies them in, whatever role its caller traces in."""
+    with projection_role("experts"):
+        return projections.recipe_takes(*matrix.shape[-2:])
 
 
 def _held(kernel):

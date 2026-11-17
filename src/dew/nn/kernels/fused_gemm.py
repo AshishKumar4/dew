@@ -47,6 +47,7 @@ from jax.custom_derivatives import zero_from_primal
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
+from jax.extend.core import primitives
 
 from dew import _cache, algebra
 from dew.algebra import cost as algebra_cost
@@ -295,6 +296,9 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
         return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
                          precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
+    # The program's names lifted first (`_named`): the algebra's rewriting reads a name as an identity.
+    named_consumer = consumer
+    consumer, names = _named(consumer, values, acc)
     consumer = _rewritten_consumer(consumer, values, acc)
     leaves, treedef = jax.tree.flatten(values)
     if collected is not None:
@@ -309,17 +313,20 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     if axes is None:
         summed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
                            precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
-        return consumer(values, summed)
+        return _rewritten_consumer(named_consumer, values, acc)(values, summed)
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
     value_types = tuple(jax.typeof(leaf) for leaf in leaves)
     epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc)
     dtypes = tuple(leaf.dtype for leaf in out_leaves)
     several = len(dtypes) > 1
+    # Each value the program names (`checkpoint_name`) an output of the launch's, a residual of its
+    # derivative under that name (`gemm`'s `named`), the consumer's outputs then the named values (`_named`).
+    outputs = len(out_leaves) - len(names)
     consumed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
                          epilogue_operands=tuple(zip(leaves, axes, strict=True)),
                          out_dtype=dtypes[0], out_dtypes=dtypes if several else None, precision=precision,
-                         interpret_on_cpu=interpret_on_cpu, **prologue)
-    return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))
+                         interpret_on_cpu=interpret_on_cpu, named=(None,) * outputs + names, **prologue)
+    return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))[0]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -394,6 +401,36 @@ def _rewritten_consumer(consumer, values, acc):
         return jax.tree.unflatten(structure, jax_core.jaxpr_as_fun(closed)(*jax.tree.leaves((values, acc))))
 
     return rewritten
+
+
+def _named(consumer, values, acc):
+    """`consumer` with the values its program names (`checkpoint_name`, a gate's projection before its
+    SwiGLU) as outputs after its own, unnamed in it, and their names in order: `consumer(values, acc)` gives
+    `(outputs, named)`. A launch's body runs no name (Mosaic's lowering has no rule for one); the launch's
+    derivative names its outputs (`gemm`'s `named`), so a remat policy keeping a name keeps that output and
+    the reverse pass recomputes no product (row 7131)."""
+    closed, shapes = jax.make_jaxpr(consumer, return_shape=True)(values, acc)
+    jaxpr = closed.jaxpr
+    aliases, eqns, names, kept = {}, [], [], []
+    for eqn in jaxpr.eqns:
+        invars = [aliases.get(var, var) if isinstance(var, jax_core.Var) else var for var in eqn.invars]
+        if eqn.primitive is primitives.name_p:
+            aliases[eqn.outvars[0]] = invars[0]
+            names.append(eqn.params['name'])
+            kept.append(invars[0])
+            continue
+        eqns.append(eqn.replace(invars=invars))
+    if not names:
+        return (lambda values, acc: (consumer(values, acc), ())), ()
+    outvars = [aliases.get(var, var) if isinstance(var, jax_core.Var) else var for var in jaxpr.outvars]
+    unnamed = closed.replace(jaxpr=jaxpr.replace(eqns=eqns, outvars=[*outvars, *kept]))
+    structure = jax.tree.structure(shapes)
+
+    def renamed(values, acc):
+        flat = jax_core.jaxpr_as_fun(unnamed)(*jax.tree.leaves((values, acc)))
+        return jax.tree.unflatten(structure, flat[:len(outvars)]), tuple(flat[len(outvars):])
+
+    return renamed, tuple(names)
 
 
 def _split(producer, values):

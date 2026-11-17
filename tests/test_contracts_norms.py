@@ -34,6 +34,18 @@ def test_an_exact_gelu_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_softplus_holds_every_order(edge):
+    """`precision.softplus` (its log1p by its own series, its derivative the logistic, row 7062): every
+    order finite wherever float64 is a normal float32 and the plain formula, log(1 + exp(x)) as JAX writes
+    it, is."""
+    (x,) = normal_draw(2661, (4, 7), scale=EDGES[edge])
+    (direction,) = normal_draw(2662, x.shape, scale=EDGES[edge])
+    (cotangent,) = normal_draw(2663, x.shape)
+    assert_contract(precision.softplus, (x,), (direction,), cotangent, f"softplus {edge}",
+                    truth_fn=jax.nn.softplus, plain_fn=jax.nn.softplus)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_the_precision_seams_hold_every_order(edge):
     """`precision`'s correctly rounded division (a primitive of its own), compensated sum and rounded operand
     (each a custom derivative): every order finite wherever float64 is a normal float32 and the plain

@@ -57,6 +57,7 @@ from .sessions import (
 )
 
 if TYPE_CHECKING:
+    from dew.data.text import Tokenizer
     from dew.objectives.base import SavedTask, Task
 
 OLD_VALUES_KEY = "old_values"
@@ -81,6 +82,14 @@ class ValueHead(nn.Module):
         if not isinstance(self.backbone, ForkedCalls):
             return "the critic's backbone states no reading of a call over forks"
         return self.backbone.fork_refusal(train)
+
+    @nn.nowrap
+    def prefix_sharing_refusal(self, train: bool = False) -> str | None:
+        """Why its rows should not be packed over their shared prefixes (`ForkedCalls`): its backbone's
+        reason, or that it states no reading of a call over forks."""
+        if not isinstance(self.backbone, ForkedCalls):
+            return "the critic's backbone states no reading of a call over forks"
+        return self.backbone.prefix_sharing_refusal(train)
 
     @nn.nowrap
     def projected(self, params: Variables, *, updated: bool) -> Variables:
@@ -228,9 +237,9 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
     def shares_prefixes(self, train: bool = False) -> bool:
         """Whether its rows are packed over one copy of the prompt a group's chains begin with: where its
         actor shares (`TokenScorer.shares_prefixes`) and its critic reads a call over forks as each chain's
-        own row (`ForkedCalls`)."""
+        own row at no more work than the rows laid whole (`ForkedCalls.prefix_sharing_refusal`)."""
         return (self.actor.shares_prefixes(train) and isinstance(self.critic, ForkedCalls)
-                and self.critic.fork_refusal(train) is None)
+                and self.critic.prefix_sharing_refusal(train) is None)
 
     def policy(self, variables: Variables) -> EpisodeInference:
         """Return the actor's episode inference task, whose `bind` reads only a tree's `policy` subtree."""
@@ -240,6 +249,11 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         """The actor's decoder settings; a loader rebuilds the decoder from them under PPO's
         own record and takes the policy half of the saved tree."""
         return self.actor.task_settings()
+
+    def run_tokenizer(self) -> "Tokenizer | None":
+        """The actor's tokenizer, whose files its settings state (`task_settings`) and a checkpoint holds
+        (`dew.inference.tasks.hold_tokenizer`)."""
+        return self.actor.run_tokenizer()
 
     def recorded_model(self) -> nn.Module:
         """The actor's decoder, without the critic."""

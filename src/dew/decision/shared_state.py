@@ -219,8 +219,9 @@ def forkable(layout: SegmentLayout) -> bool:
 def shared_for(layout: SegmentLayout, backbone: nn.Module | TokenModel, head: Head, *,
                train: bool = False) -> SegmentLayout:
     """`layout` as `head` reads rows over `backbone`: its questions over one state where the backbone
-    computes each question's documents as its own row does (`ForkedCalls`, in a training step where
-    `train`, no dropout drawing) and the head reads each question apart from the others
+    computes each question's documents as its own row does at no more work than the rows apart
+    (`ForkedCalls.prefix_sharing_refusal`, in a training step where `train`, no dropout drawing) and the
+    head reads each question apart from the others
     (`Head.reads_apart`, one question a row not asked), as many as a row holds where the layout states
     none (`SegmentLayout.shared_state`); a row a question otherwise. Siblings are no sharing to derive
     but what a row's questions read (`SegmentLayout.siblings`): kept where the backbone runs forks, as it
@@ -236,7 +237,7 @@ def shared_for(layout: SegmentLayout, backbone: nn.Module | TokenModel, head: He
                              f"forks, which this model cannot: {refusal}")
         return layout
     reads = (head.reads_apart and not head.one_question and isinstance(backbone, ForkedCalls)
-             and backbone.fork_refusal(train) is None)
+             and backbone.prefix_sharing_refusal(train) is None)
     if not reads:
         return dataclasses.replace(layout, shared_state=1) if layout.shares else layout
     if layout.shared_state is None and forkable(layout):

@@ -15,6 +15,25 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   context keeps its first tokens in the room the schema leaves under the cross-attention's `context_length`,
   and a context cut there is reported in the run's data report (`data/cut/<corpus>/context` rows,
   `data/cut_removed/<corpus>/context` tokens) and a server's usage. Records are unchanged.
+- Programs a process keeps (`dew.training.ahead.keeping`) are kept and handed by their fingerprint: the
+  digest of the lowered program, its trees and its arguments' types under the XLA options it compiled
+  with (`dew.nn.kernels.options.program_digest`), with the target they were built for (`BuildTarget`).
+  Within `kept(path)` every call traces and lowers as it would and runs the kept executable of the program
+  it lowers to; a call of changed code, settings or facts lowers another program and compiles, and a file
+  kept for another target hands nothing, every call compiling: nothing raises for a mismatch and no stale
+  executable runs. This replaces the verify default an entry below states: the call identity and the
+  process record that kept programs were handed by (`dew.training.identity`), `kept(path, verify=False)`,
+  `NotTheKeptProgram`, `options.handing` and `generation.TRACED_FACTS` are gone. A run's warm start is
+  JAX's persistent compilation cache with the rung records, which key a compile by the same lowered
+  program, options and target.
+
+- A run holds its Hugging Face tokenizer's files in itself (`<run>/tokenizer/<digest>`), each checked against
+  the hashes its record states, so its loaders (`from_run`, `dew.pipeline`, `dew export`, a run started with
+  `--pretrained <run>`) read the run's own copy on any host, with the place it was first read from gone. Runs
+  and token stores are one tokenizer where their files hash alike, whatever each names it. A run saved before
+  this that names its tokenizer by a hub cache snapshot directory resolves it by its repo and commit, and holds
+  it from its next save. A run whose checkpoints hold a tokenizer this host cannot resolve is refused before
+  its first step, naming it, where it trained to its first checkpoint.
 - A decision layout is one class, `dew.decision.SegmentLayout`, whose `form` names the row it writes:
   `SegmentLayout.marker_row(...)` (Laya's, formerly `MarkerLayout(...)`), `state_first_row(...)` (formerly
   `StateFirstLayout(...)`) and `joint_row(...)` (formerly `JointLayout(...)`), each laying out the rows its class
@@ -27,6 +46,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   start on CPU). It still traces its step, whose kernel report its lowering gives; `options.release` drops
   them with every program's executables.
 
+- A data step that reaches a dataclass or an attrs class (as the step itself, or one its code reads) is now
+  stated by every part of each field (its annotation, keyword-only flag, comparison flags, factory's
+  `takes_self`, converter, alias, ...) and by the options its generator records (an attrs class's frozen,
+  slotted, hashability, ...), so editing any of them refuses an exact resume. This changes the statement of
+  every such step once: a data position saved before this release under such a pipeline no longer resumes
+  exactly. Resumed with `data_resume="relaxed"` it reads on, naming the step; resumed exactly it is refused,
+  naming it. Positions of pipelines whose steps reach no such class are unaffected.
 - `dew.training.ahead.kept(path)` verifies by default: each handed call's own program is lowered and held to
   the kept one's digest before the kept executable runs, so a kept program its call no longer lowers to is
   refused (`NotTheKeptProgram`), never run; it still compiles nothing. `kept(path, verify=False)` is the
@@ -55,7 +81,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   configures, as a resumed one does. A run refused before it takes the start it began compiling beside its
   planning exits at its refusal instead of waiting for that compile (97 s for a 4B start). A QK-Clip inside
   `optax.MultiSteps(...).gradient_transformation()`, which Optax builds as a transformation of no extra
-  arguments, is handed the attention logits' maxima: it stepped unclipped.
+  arguments and which runs its inner update at the window's last call alone, is clipped by the largest
+  logits of every microstep of its window: each step's commit folds its maxima into the clip's state
+  (`dew.optim.pooled_update`, `QKClipState.pooled`), where it stepped unclipped. Under `optax.apply_every`,
+  which runs the clip every call, a post-step effect acts only where the update applied
+  (`dew.optim.stepped`): the weights were rescaled on every call whose update it zeroes. A checkpoint saved before the
+  clip's state held them restores with none pooled.
 
 - A run handed a step file compiled without its GPU kind's tuned choices (`AheadOfTime.tuned` false: one
   compiled on compile-only GPUs outside a prepare) no longer runs it: it compiles its step on its own

@@ -165,8 +165,7 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         every waiting request, or at most `rows`. A server built directly compiles each program on its
         first pass. Built within `dew.training.ahead.kept`, with the file an earlier process of this
         task kept its programs in (`dew.training.ahead.keeping`), it loads each program the file holds
-        for a pass in place of compiling it, its trace and lowering proving it (none with `kept`'s
-        `verify=False`)."""
+        for a pass in place of compiling it, its trace and lowering proving it."""
         server = cls(task, variables, rows=rows)
         # Under the context its passes run in (`_context`), so the programs compiled are the ones they run.
         with server._context():

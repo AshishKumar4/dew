@@ -430,15 +430,15 @@ class Trainer(Generic[Loss, Effects]):
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
             updates=jnp.zeros((), jnp.int32),
-            # A state of its own, the given scale's leaves copied: the step donates the state.
-            scale=None if self._loss_scale is None else jax.tree.map(
-                lambda leaf: jnp.array(leaf, copy=True), self._loss_scale),
+            # A state of its own, the given scale's leaves copied by the transfer, compiling no program: the
+            # step donates the state.
+            scale=None if self._loss_scale is None else jax.tree.map(transferred_copy, self._loss_scale),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
             variables=params,
             opt_state=opt_state,
-            # The average starts equal to the parameters but as its own buffers: the step donates
-            # the state, and a buffer can be donated once.
-            ema=None if ema is None else jax.tree.map(jnp.copy, select(params, ema.select)),
+            # The average starts equal to the parameters but as its own buffers, copied by the transfer: the
+            # step donates the state, and a buffer can be donated once.
+            ema=None if ema is None else jax.tree.map(transferred_copy, select(params, ema.select)),
             key=run_key,
             consumed=None if self._shape.examples is None else jnp.zeros((), jnp.int32),
             deferred=waiting(opt_state))
@@ -808,7 +808,6 @@ class Trainer(Generic[Loss, Effects]):
         `__main__` or a function, or holding what no record carries) still checkpoints: the record says
         why, a loader raises that, and the first checkpoint warns it. Any other error is the record's own
         bug, and raises."""
-        from dew.inference.tasks import hold_tokenizer
         from dew.interop.saved_sources import with_release_sources
 
         artifact: JSON
@@ -817,9 +816,6 @@ class Trainer(Generic[Loss, Effects]):
             # The releases of saved runs its paths lie within, each mapped to the saved run it holds, so a
             # host lacking one writes its own (`dew.interop.saved_sources.with_release_sources`).
             artifact = with_release_sources(self.objective.inference_record())
-            if self.checkpoints is not None:
-                # Its tokenizer's files held in the run itself, which a load reads on any host.
-                hold_tokenizer(artifact, self.checkpoints.directory)
         except Unrecordable as error:
             reason = f"{type(self.objective).__name__}: {error}"
             artifact = {'unrecorded': reason}
@@ -1304,14 +1300,13 @@ class Trainer(Generic[Loss, Effects]):
                        tracer: Profiler | None, profile: ProfileWindow | None,
                        checkpoints: Checkpoints | None,
                        initial: TrainState | None = None, resume: Resume = "auto") -> TrainState:
-        """Place the state, dispatch the numerical steps and finish their loop
-        before resource cleanup. Returns the final state, the placed one for a
-        run already complete, its last checkpoint written, so nothing ran.
+        """Place the state, dispatch the numerical steps and finish their loop before resource cleanup.
+        Returns the final state, the placed one for a run already complete, its last checkpoint written.
 
-        The loop is the state's one holder: each step donates the state it is
-        handed, and a reference kept past that, as fit's own once was, holds
-        an array whose buffers the step consumed."""
-        current, position, placed, abstract, fresh = self._starting(run, plan.dataset, initial, resume)
+        The loop is the state's one holder: each step donates the state it is handed, and a reference
+        kept past that, as fit's own once was, holds an array whose buffers the step consumed."""
+        with run.startup.phase("start", "tracing the state's start"):
+            current, position, placed, abstract, fresh = self._starting(run, plan.dataset, initial, resume)
         run.last_checkpoint = time.perf_counter()
         interval = Interval.resumed(run.stop_control, last_saved=(
             current if checkpoints is not None and checkpoints.latest is not None else None))
@@ -1406,7 +1401,7 @@ class Trainer(Generic[Loss, Effects]):
                 batch = device = None
                 if run.first_step is None:
                     loss.block_until_ready()
-                    run.first_step = time.perf_counter() - run.started
+                    run.first_step = run.startup.first_step(run.started)
             # The step row is complete once its scope exits; the window's last step closes it before the work
             # after it, whose evaluations, saves and cooldowns run outside it (`FitRun.outside_window`).
             if run.tracing and profile is not None:
@@ -1598,20 +1593,23 @@ class Trainer(Generic[Loss, Effects]):
             if self.rollout is None:
                 # Read on the host before the state is placed, and agreed: a process whose read failed
                 # stops its peers before any of them places one. The prefetcher places it at the first step.
-                first = waited_read(run, interval, agree=True, peek=True)
+                with run.startup.phase("read", "reading the first batch"):
+                    first = waited_read(run, interval, agree=True, peek=True)
                 if first is not None:
                     placed_first = placed_abstract(mesh, first)
                     # A process whose reader changed a field or a shape is refused by every process, as
                     # a compile refuses it, before the state it would check is traced from that batch.
                     agreed_same("training batch layout", lambda: batch_layout(split_fields(placed_first)[0]))
-                    self._fitting(abstract, placed_first)
+                    with run.startup.phase("check", "checking the state fits"):
+                        self._fitting(abstract, placed_first)
                     if fresh is not None:
                         begun = self._compiled_fresh(run, fresh, first, placed_first)
             elif position is not None:
                 # Its first batch read, so its worker has restored the stream or started it again
                 # (`_prefetched`), which the run reports as it starts (`DataRestarted`).
                 waited_read(run, interval, agree=True, peek=True)
-        state, shardings = placed(begun)
+        with run.startup.phase("place", "placing the state"):
+            state, shardings = placed(begun)
         if begun is not None:
             run.startup.overlapped = begun.taken.is_set()
         if int(state.step) != current:
@@ -2103,8 +2101,15 @@ class Trainer(Generic[Loss, Effects]):
         checkpoints its state in a pool (`_rollout_admitted`), and a pipeline's batch, whose placement could
         take minutes or run out of memory before the error. Every other mesh's batch is checked with its
         stream (`check_stream`), a ramp's at each of its stages. The checkpoints learn why no record rebuilds
-        a run of this trainer on the data it was `stated` (`Checkpoints.python_run`)."""
+        a run of this trainer on the data it was `stated` (`Checkpoints.python_run`), and its checkpoints'
+        declaration is built (`_artifact`), resolving the tokenizer whose files it states and the checkpoints
+        hold (`Checkpoints.save`), held to be the objective's run tokenizer (`declared_tokenizer`): a host
+        that cannot resolve it, or an objective whose run tokenizer is not the one its record states, refuses
+        before step 0, not at the first checkpoint (train 972's and 978's reviews)."""
         if self.checkpoints is not None:
+            from dew.inference.tasks import declared_tokenizer
+
+            declared_tokenizer(self._artifact(), self.objective.run_tokenizer())
             given = {"a rollout (rollout=)": _rollout_admitted(self.rollout),
                      "a custom step (step=)": self.step, "a tracker (tracker=)": self.tracker,
                      "recording each step's draws (record=True)": self.record or None}
@@ -2226,8 +2231,10 @@ class Trainer(Generic[Loss, Effects]):
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         envelope = self._checkpoint_envelope(state, position, interval, run, weights_only=weights_only)
+        # The run holds the tokenizer its declaration states the files of (`Checkpoints.save`).
         write = functools.partial(checkpoints.save, step, metrics=metadata, ranking=ranking,
-                                  weights_only=weights_only, **envelope)
+                                  weights_only=weights_only, tokenizer=self.objective.run_tokenizer(),
+                                  **envelope)
         with run.outside_window(), run.held():
             self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step, resumable=not weights_only)
@@ -2330,7 +2337,8 @@ class Trainer(Generic[Loss, Effects]):
                 if jax.process_index() == 0:
                     wall = time.perf_counter() - run.started
                     # A run that logged no step reports its start here (`Startup.scalars`).
-                    scalars = {**goodput(wall, run.first_step, run.other), **run.startup.scalars()}
+                    scalars = {**goodput(wall, run.first_step, run.other),
+                               **run.startup.scalars()}
                     self._display.summary(run.current, wall, scalars,
                                           None if run.loss is None else float(jax.device_get(run.loss)))
                     if self.tracker is not None:

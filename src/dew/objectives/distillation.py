@@ -240,6 +240,10 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         tree = jax.eval_shape(self.init, jax.random.key(0))
         return tuple(leaf.shape for leaf in tree["params"].get(PROJECTIONS, {}).values())
 
+    def run_tokenizer(self) -> Tokenizer | None:
+        """The student's tokenizer, whose record a saved distillation loads as."""
+        return self.student.run_tokenizer()
+
     def inference_record(self) -> JSON:
         """The student's record: a saved distillation loads as the student it trained, on the
         student's own tree, the teacher and the projections left unread (`UNREAD`)."""

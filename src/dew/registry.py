@@ -12,9 +12,14 @@ wherever its class moves, and only that kind is consulted for it.
 
 Where a person writes a record, in a config file or on the command line, the
 class may be a short alias instead, `{"class": "simple_dit"}`. Each kind's
-aliases are a static table below (`models`, `mixers`, ...) that maps a name to
-a path and imports the class only when it is read. An unknown name or field
-raises an error.
+aliases are one table (`models`, `mixers`, ...) that maps a name to a path:
+Dew's own classes are its static entries, imported only when one is read, and a
+user's class joins it under a name of its own with a decorator,
+`@dew.register("my_model")` for a model (`register`) or a kind's own
+`@mixers.register("my_mixer")`, as its module is imported. A record still
+names the user's class by its path, so it loads without that module imported
+first where the process trusts its package (`import_trusted`), as any class
+outside Dew does. An unknown name or field raises an error.
 
 A run's model is one such record, `ModelConfig`: the model's class, the fields
 the run gives it, the defaults it took and the wrappers it was made in. A
@@ -245,14 +250,19 @@ def trust_sources(names: Sequence[str]) -> None:
 
 
 def import_trusted(record: JSON | Mapping[str, object], trust: Sequence[str]) -> None:
-    """Trust the packages in `trust` for the rest of the process, and import
-    every module of theirs that `record` names by an import path, so reading
-    the record finds them imported (`imported`) and may construct their
-    classes where a field declares no base class (`_owned`). A source named
-    there, a Hub repository or a directory, has its own code run where a
-    load reads it (`trusts_source`)."""
+    """Trust the packages in `trust` for the rest of the process, import each
+    of them, so the classes their modules name by a decorator join their kinds
+    (`Aliases.register`, a run.json's `{"name": "my_model"}`), and import every
+    module of theirs that `record` names by an import path, so reading the
+    record finds them imported (`imported`) and may construct their classes
+    where a field declares no base class (`_owned`). A source named there, a
+    Hub repository or a directory, has its own code run where a load reads it
+    (`trusts_source`)."""
     _TRUSTED.update(trust)
     trust_sources(trust)
+    for package in trust:
+        if package.replace(".", "").isidentifier():
+            importlib.import_module(package)
     # Only JSON a record holds (`json_value` refuses any other), its every string read once.
     for named in strings_of(json_value(record, "record")):
         module, colon, name = named.partition(":")
@@ -269,7 +279,11 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
 
     def __init__(self, kind: str, paths: Mapping[str, str], base: str | None = None):
         self.kind = kind
-        self.paths = types.MappingProxyType(dict(paths))
+        self._paths = dict(paths)
+        self.paths = types.MappingProxyType(self._paths)
+        """Each alias's import path: Dew's own, the static table's, then each one a user's class took
+        (`register`)."""
+        self._own = frozenset(paths)
         self.base = base
         """The import path of the class every member derives from, or of the
         protocol they share, whose members are then classes of Dew's or of a
@@ -295,6 +309,25 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
             self._imported[name] = member
         return self._imported[name]
 
+    def register[M: Callable[..., Any]](self, name: str, /) -> Callable[[M], M]:
+        """A decorator naming the class (or function) it decorates `name` in this kind, as its module is
+        imported: `models.build("name", ...)`, a config's `{"class": "name"}` and the command line build it
+        as they build Dew's own. The member must be of the kind (`base`), and the name no other member's; a
+        record names the member by its import path still (`name_of`), so it loads in a process that has
+        not imported the member's module, once that process trusts its package (`import_trusted`)."""
+        def registered(member: M) -> M:
+            path = import_path(member)
+            held = self._paths.get(name)
+            if held is not None and held != path:
+                raise ValueError(f"{name!r} names the {self.kind} {held} already, not {path}")
+            # A user's own code, imported to be registered: a kind of no base takes it as it is.
+            if self.base is not None and not self._holds(member):
+                raise ValueError(f"{path} is no {self.kind}, which {name!r} would name")
+            self._paths[name] = path
+            self._imported[name] = member
+            return member
+        return registered
+
     def _holds(self, member: Callable[..., Configured]) -> bool:
         if self.base is None:
             return _owned(member, called=False)
@@ -317,9 +350,11 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         return next((alias for alias, held in self.paths.items() if held == path), path.rpartition(":")[2])
 
     def name_of(self, member: Importable) -> str:
-        """The name a record writes for `member`: its alias in this kind, else its import path."""
+        """The name a record writes for `member`: its alias among Dew's own in this kind, else its import
+        path, a user's registered class's among them (`register`)."""
         path = import_path(member)
-        return next((alias for alias, held in self.paths.items() if held == path), path)
+        return next((alias for alias, held in self.paths.items() if held == path and alias in self._own),
+                    path)
 
     def alias_of(self, member: Importable) -> str:
         """The alias of `member`, for a run's human-readable name; KeyError
@@ -1235,6 +1270,13 @@ class Wrapper(Protocol):
 
     def apply(self, model: nn.Module) -> nn.Module: ...
 
+    def keeps_products_linear(self, train: bool) -> bool:
+        """Whether every product the wrapper holds stays the linear map of its input by its kernel in a call,
+        a training one where `train`: an adapter's where it drops nothing there, a quantization's never.
+        A layer that reads forks along a linear path at no more work than one row (an in-context memory's
+        recurrence) unfolds them under a wrapper that does not (`MixerBase.fork_sharing_refusal`)."""
+        ...
+
 
 @runtime_checkable
 class Recorded(Protocol):
@@ -1650,6 +1692,11 @@ rollouts: Aliases[type[DreamerRollout] | type[ControlRollout], DreamerRollout | 
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objectives, mixers, towers,
                               projectors, schedules)
 """Every kind, which a record's alias is looked up across."""
+
+register = models.register
+"""A decorator naming a user's model class in `models` (`Aliases.register`): `@dew.register("my_model")` over
+an `nn.Module`, which a config's `{"class": "my_model"}` then builds. Every other kind registers through its
+own table, `mixers.register("my_mixer")`."""
 
 JsonDict = Annotated[
     Mapping[str, object],
