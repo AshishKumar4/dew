@@ -60,6 +60,7 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -564,6 +565,8 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     and compiled as the gate compiles it (`_arm_compile`): its run calls each draw's executable
     (`_ahead_arm`), tracing, lowering and compiling none. An arm the gate runs as given, or one running Dew's
     own programs (`dew_programs`, a host loop), holds no program."""
+    given = [fn for fn, _ in arms.values() if fn is not None]
+    _refuse_numpy_arms(draw, *given)
     inputs: dict[str, tuple] = {}
     for seed in range(staged_units(seeds)):
         drawn = draw(seed)
@@ -571,13 +574,16 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
             inputs.setdefault(named("arms", ordered), ordered)
     programs: dict = {}
     held: dict = {}
-    with store.tracing(), summed_as_run():
+    # The arithmetic arms run in on the store's devices: a GPU's own (`summed_as_run`'s, read on the CPU
+    # lane alone), whatever the host the prepare runs on.
+    arithmetic = summed_as_run if store.target is None else contextlib.nullcontext
+    with store.tracing(), arithmetic():
         for role, (fn, reference) in arms.items():
             for drawn in inputs.values() if fn is not None else ():
                 _arm_program(programs, held, role, fn, drawn, reference=reference)
     if programs:
         plain = any(_given(fn) for fn in (arms["dew"][0], arms["reference"][0]) if fn is not None)
-        with summed_as_run():
+        with arithmetic():
             store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain))
 
 
@@ -599,27 +605,74 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
     traced_fn = unrewritten(fn) if reference and not _declared(fn) else fn
     closed, shapes = jax.make_jaxpr(traced_fn, return_shape=True)(*inputs)
     structure = jax.tree.structure(inputs)
-    _hold(programs, held, named(_arm_role(role, fn), inputs), closed, jax.tree.structure(shapes), inputs,
-          lambda flat: jax.make_jaxpr(traced_fn)(*jax.tree.unflatten(structure, flat)))
+    name = named(_arm_role(role, fn), inputs)
+
+    def again(flat):
+        # Its lowering's own trace, whose constants are the program's held (a relowering's, past a spill,
+        # derives its launches afresh: a halved chunk's sequence table), never the first trace's.
+        retraced = jax.make_jaxpr(traced_fn)(*jax.tree.unflatten(structure, flat))
+        held[name]["constants"] = [*map(np.asarray, retraced.consts)]
+        return retraced
+
+    _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
 
 
 def _arm_role(role: str, fn) -> str:
-    """An arm's role in its site's store (`_compile_arms`) with its function's identity (`_identity`): a run
-    that passes the site another function under that role finds none (`truths_ahead.MissingTruth`), never
-    the prepare's run in its place."""
-    return f"{role} {hashlib.sha256(_identity(fn).encode()).hexdigest()[:12]}"
+    """An arm's role in its site's store (`_compile_arms`) with its computation's fingerprint
+    (`_fingerprint`): a run that passes the site another computation under that role finds none
+    (`truths_ahead.MissingTruth`), never the prepare's run in its place."""
+    digest = hashlib.sha256()
+    _fingerprint(fn, digest, {})
+    return f"{role} {digest.hexdigest()[:16]}"
 
 
-def _identity(fn) -> str:
-    """A plain arm's function by its module and qualified name, a jit's by the function it wraps, a partial's
-    by its function's and the arguments it binds."""
-    if isinstance(fn, functools.partial):
-        return f"{_identity(fn.func)}({fn.args!r}, {sorted(fn.keywords.items())!r})"
-    wrapped = getattr(fn, "__wrapped__", None)
-    if wrapped is not None:
-        return _identity(wrapped)
-    named_by = fn if isinstance(fn, types.FunctionType | types.MethodType | type) else type(fn)
-    return f"{named_by.__module__}.{named_by.__qualname__}"
+def _fingerprint(value, digest, seen: dict[int, object]) -> None:
+    """`value` into `digest` as what an arm computes reads it, without tracing it, alike in every process of
+    a commit (a prepare's and its run's): a function by its code, its defaults and what it closes over; a
+    jit by the function it wraps; a partial by its function and what it binds; a bound method by its
+    function and its object; an array by its dtype, shape and bytes; a tuple or a frozenset by its items, a
+    mutable container (a list, a dict, a set: a cache, a record a test keeps) by its type alone, its items
+    being what a run did, not what it computes; a class or a module by its name; any other object by its
+    type and its attributes (by its type alone where it has none), each value once (`seen`, which holds
+    each, so no id is another's later). No address enters it."""
+    digest.update(type(value).__qualname__.encode())
+    if isinstance(value, np.ndarray | jax.Array | np.generic):
+        array = np.asarray(value)
+        digest.update(f"{array.dtype}{array.shape}".encode() + np.ascontiguousarray(array).tobytes())
+        return
+    if value is None or isinstance(value, bool | int | float | complex | str | bytes):
+        digest.update(repr(value).encode())
+        return
+    # A container or an object once, its later references marked: an object graph's cycles end.
+    if id(value) in seen:
+        digest.update(b"seen")
+        return
+    seen[id(value)] = value
+    if isinstance(value, types.FunctionType):
+        digest.update(f"{value.__module__}.{value.__qualname__}".encode())
+        for part in (value.__code__, value.__defaults__, value.__kwdefaults__,
+                     tuple(cell.cell_contents for cell in value.__closure__ or ())):
+            _fingerprint(part, digest, seen)
+    elif isinstance(value, types.CodeType):
+        digest.update(value.co_code + repr(value.co_names).encode())
+        _fingerprint(value.co_consts, digest, seen)
+    elif isinstance(value, type | types.ModuleType):
+        digest.update(f"{getattr(value, '__module__', '')}.{getattr(value, '__qualname__', value.__name__)}"
+                      .encode())
+    elif isinstance(value, types.MethodType):
+        _fingerprint((value.__func__, value.__self__), digest, seen)
+    elif isinstance(value, functools.partial):
+        _fingerprint((value.func, value.args, tuple(sorted(value.keywords.items()))), digest, seen)
+    elif isinstance(value, tuple | frozenset):
+        for item in sorted(value, key=repr) if isinstance(value, frozenset) else value:
+            _fingerprint(item, digest, seen)
+    elif isinstance(value, list | dict | set):
+        return
+    elif (wrapped := getattr(value, "__wrapped__", None)) is not None:
+        _fingerprint(wrapped, digest, seen)
+    elif isinstance(attributes := getattr(value, "__dict__", None), dict):
+        for key in sorted(attributes):
+            _fingerprint((key, attributes[key]), digest, seen)
 
 
 def _ahead_arm(given, compiled, call: Callable, role: str):

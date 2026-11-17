@@ -855,7 +855,8 @@ def lowering_for(generation: str, multiprocessors: int | None = None) -> Iterato
 def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDtypeStruct]]],
                      generation: str, multiprocessors: int | None = None, *,
                      compiled: Compile = owned_program) -> AheadPrograms:
-    """`programs`, each a function and the shapes and dtypes of its arguments, by its name, compiled ahead for
+    """`programs`, each a function and its arguments' shapes, dtypes and weak types (each a
+    `ShapeDtypeStruct` or an abstract value), by its name, compiled ahead for
     one GPU of the CUDA `generation`, of the `multiprocessors` it states (`built_target`), on any host holding
     the CUDA plugin (`compile_only_gpus`), its launches derived for that GPU's facts (`lowering_for`), and
     serialized: a CPU host builds what a GPU node then
@@ -871,7 +872,8 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     placed = jax.sharding.NamedSharding(_gpu_mesh(generation, multiprocessors), jax.sharding.PartitionSpec())
     lowerings = []
     for name, (function, arguments) in programs.items():
-        shapes = tuple(jax.ShapeDtypeStruct(argument.shape, argument.dtype, sharding=placed)
+        shapes = tuple(jax.ShapeDtypeStruct(argument.shape, argument.dtype, sharding=placed,
+                                            weak_type=argument.weak_type)
                        for argument in arguments)
 
         def lowered(function=function, shapes=shapes, name=name) -> jax.stages.Lowered:

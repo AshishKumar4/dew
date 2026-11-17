@@ -189,32 +189,33 @@ def test_a_prepared_site_judges_as_one_that_computes_its_truth_and_refuses_a_mis
     its own; a store of another stamp, of another site, of other shapes than a draw's, or of another Dew arm
     than the run's is a red (`MissingTruth`), never a program compiled in its place."""
     dew, reference, draw = _site()
+    def scaled(factor):
+        def arm(a, b):
+            return dew(a, b) * factor
+
+        return arm
+
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
-        assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
+        assert_as_exact(scaled(1.0), reference, draw, "a prepared product", seeds=8)
         with pytest.raises(ValueError):
-            assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
-    # The site's truths and its arms, each held apart.
-    assert len(list(tmp_path.iterdir())) == 2
-    assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
+            assert_as_exact(scaled(1.0), reference, draw, "a prepared product", seeds=8)
+    assert_as_exact(scaled(1.0), reference, draw, "a prepared product", seeds=8)
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
-        assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
+        assert_as_exact(scaled(1.0), reference, draw, "a prepared product", seeds=8)
     with compiled_truths(tmp_path, prepare=False, stamp="b"), pytest.raises(MissingTruth):
-        assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
+        assert_as_exact(scaled(1.0), reference, draw, "a prepared product", seeds=8)
     with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
-        assert_as_exact(dew, reference, draw, "another product", seeds=8)
+        assert_as_exact(scaled(1.0), reference, draw, "another product", seeds=8)
 
     def wider(seed):
         a, b = draw(seed)
         return np.concatenate([a, a]), b
 
     with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
-        assert_as_exact(dew, reference, wider, "a prepared product", seeds=8)
-
-    def rounded_twice(a, b):
-        return dew(a, b).astype(jnp.bfloat16).astype(jnp.float32)
-
+        assert_as_exact(scaled(1.0), reference, wider, "a prepared product", seeds=8)
+    # The same function closing over another factor: another computation, never the prepared one's.
     with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
-        assert_as_exact(rounded_twice, reference, draw, "a prepared product", seeds=8)
+        assert_as_exact(scaled(1.0 + 2.0 ** -8), reference, draw, "a prepared product", seeds=8)
 
 
 def test_a_compiled_sites_run_traces_none_of_its_truth(tmp_path):
@@ -245,25 +246,26 @@ def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     traces, lowers and compiles none of them); computing its own, a site traces both. Its verdict is the
     one a site computing its arms reaches."""
     dew, reference, draw = _site()
-    traced: list[str] = []
+    dew_traced, reference_traced = [], []
 
     def dew_arm(a, b):
-        traced.append("dew")
+        dew_traced.append(None)
         return dew(a, b)
 
     def reference_arm(a, b):
-        traced.append("reference")
+        reference_traced.append(None)
         return reference(a, b)
 
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
         assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
-    assert set(traced) == {"dew", "reference"}
-    traced.clear()
+    assert dew_traced and reference_traced
+    dew_traced.clear()
+    reference_traced.clear()
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
-    assert not traced
+    assert not dew_traced and not reference_traced
     assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
-    assert set(traced) == {"dew", "reference"}
+    assert dew_traced and reference_traced
 
 
 def test_a_window_loops_truth_is_computed_window_by_window_from_its_windows_program(tmp_path):

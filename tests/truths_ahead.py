@@ -53,10 +53,12 @@ reads."""
 
 
 def named(role: str, inputs) -> str:
-    """A program's name in its site's store: its `role` and its inputs' tree, shapes and dtypes, as a trace
-    keys them (`float64_terms.traced`)."""
+    """A program's name in its site's store: its `role` and its inputs' tree, shapes, dtypes and weak types,
+    as a trace keys them (`float64_terms.traced`): a weak Python scalar beside a bfloat16 array keeps it
+    bfloat16, a strong one promotes it."""
     leaves, tree = jax.tree.flatten(inputs)
-    shapes = (str(tree), tuple((tuple(np.shape(leaf)), str(jax.typeof(leaf).dtype)) for leaf in leaves))
+    shapes = (str(tree), tuple((tuple(np.shape(leaf)), str(jax.typeof(leaf).dtype),
+                                jax.typeof(leaf).weak_type) for leaf in leaves))
     return f"{role} {hashlib.sha256(repr(shapes).encode()).hexdigest()[:16]}"
 
 
@@ -140,7 +142,8 @@ class CompiledTruths:
         compile_one = compiled or jax.jit
 
         def built(function, shapes):
-            placed_shapes = (jax.ShapeDtypeStruct(np.shape(shape), shape.dtype, sharding=placed)
+            placed_shapes = (jax.ShapeDtypeStruct(np.shape(shape), shape.dtype, sharding=placed,
+                                                  weak_type=shape.weak_type)
                              for shape in shapes)
             return Executable.of(compile_one(function, out_shardings=placed).lower(*placed_shapes).compile())
 
