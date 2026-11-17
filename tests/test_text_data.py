@@ -1001,7 +1001,7 @@ from dew.inference.tasks import earlier_shapes, hold_tokenizer, recorded_files, 
 read = earlier_shapes({"tokenizer": sys.argv[1]})
 found = tokenizer_for(read["tokenizer"])
 files = recorded_files(RunProcessor(found))
-hold_tokenizer({"tokenizer": read["tokenizer"], "tokenizer_files": files}, sys.argv[2])
+hold_tokenizer({"tokenizer": read["tokenizer"], "tokenizer_files": files}, sys.argv[2], found)
 print(json.dumps({"tokenizer": read["tokenizer"], "files": files}))
 """
 
@@ -1012,6 +1012,31 @@ files = json.loads(sys.argv[3])
 found = tokenizer_for(sys.argv[1], files=files, held=sys.argv[2])
 print(json.dumps({"directory": found.pinned.directory, "files": found.pinned.files}))
 """
+
+
+def test_a_tokenizer_objects_steps_name_it_as_positions_saved_before_name_it(tmp_path, monkeypatch):
+    """A transformers tokenizer object a step tokenizes with is named by the directory of this host's cache
+    its saved files are written to, as positions saved before name it: one digest of every saved file's path
+    and bytes in order, which a step's identity carries, so a run saved before resumes its data as it was;
+    the directory holds every file the object saved and loads as the object encodes. It was renamed by its
+    tokenizer files' hashes alone, and every such run's resume restarted its data (train 985's review)."""
+    import hashlib
+
+    from transformers import AutoTokenizer
+
+    from dew.data.text import HFTokenizer, tokenize
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    made = AutoTokenizer.from_pretrained(str(FIXTURES / "tokenizers" / "gpt2"))
+    made.save_pretrained(tmp_path / "saved")
+    paths = sorted(path for path in (tmp_path / "saved").rglob("*") if path.is_file())
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(str(path.relative_to(tmp_path / "saved")).encode() + b"\0" + path.read_bytes())
+    named = Path(tokenize(made).tokenizer)
+    assert named.name == digest.hexdigest()
+    assert sorted(path.name for path in named.iterdir()) == sorted(path.name for path in paths)
+    assert HFTokenizer(str(named)).encode("the quick brown fox") == made.encode("the quick brown fox")
 
 
 def test_an_earlier_runs_snapshot_tokenizer_is_resolved_by_its_commit_and_held_from_its_next_save(tmp_path):
@@ -1046,3 +1071,30 @@ def test_an_earlier_runs_snapshot_tokenizer_is_resolved_by_its_commit_and_held_f
     held = json.loads(again.stdout.strip().splitlines()[-1])
     assert held["files"] == resolved["files"]
     assert held["directory"].startswith(str(tmp_path / "fresh"))
+
+
+def test_a_run_holds_its_objectives_own_tokenizer_checked_file_by_file(tmp_path):
+    """A checkpoint holds the tokenizer its objective encodes with, copied from where that tokenizer was
+    pinned and checked file by file, whatever this process pinned before for the same files: a copy of
+    the same files read first and then deleted leaves the hold as it is. A declaration whose files are not
+    the objective's own is refused. The hold copied from the first directory the process pinned for those
+    hashes, and a checkpoint crashed where it was gone (train 972's review)."""
+    from dew.data.text import HELD_FILES, HFTokenizer, held_place
+    from dew.inference.tasks import RunProcessor, hold_tokenizer, recorded_files
+
+    fixture = Path(__file__).parent / "fixtures" / "laya" / "tiny" / "tokenizer"
+    first, own = tmp_path / "first", tmp_path / "own"
+    shutil.copytree(fixture, first)
+    shutil.copytree(fixture, own)
+    files = recorded_files(RunProcessor(HFTokenizer(str(first))))
+    assert files is not None
+    shutil.rmtree(first)
+    run = tmp_path / "run"
+    tokenizer = HFTokenizer(str(own))
+    hold_tokenizer({"tokenizer": str(own), "tokenizer_files": files}, str(run), tokenizer)
+    held = held_place(str(run), files)
+    assert (held / HELD_FILES).exists()
+    assert {path: hashlib.sha256((held / path).read_bytes()).hexdigest() for path in files} == files
+    with pytest.raises(TypeError):
+        hold_tokenizer({"tokenizer": str(own), "tokenizer_files": {**files, "extra.json": "0" * 64}},
+                       str(run / "other"), tokenizer)

@@ -255,11 +255,17 @@ def _head_changes(first: Mapping[str, object], other: Mapping[str, object]) -> l
     return [f"head.{name}" for name in registry.computing_differences(
         registry.imported(str(first["class"])), *stated, kept=(_records.NUMBERS,))]
 
-def _tokenizer_files(settings: "DecideSettings") -> Mapping[str, str] | str | None:
-    """What a run's text tokenizer is, which runs compare by: its files' hashes (`tokenizer_files`, which a
-    run's load states where its record did not, `dew.inference.tasks.tokenizer_here`), else its name (`byte`,
-    which has no files), else None."""
-    return settings.tokenizer_files if settings.tokenizer_files is not None else settings.tokenizer
+def _tokenizer_held(settings: "DecideSettings", run: str) -> Mapping[str, str] | str | None:
+    """What the text tokenizer of the run in `run` is, which runs compare by: the hashes of the files it
+    reads (`PinnedTokenizer.files`), whether its record states them or was saved before records did
+    (`dew.inference.tasks.saved_tokenizer`); the byte vocabulary, which has no files, by its name."""
+    from dew.data.text import HFTokenizer
+    from dew.inference.tasks import saved_tokenizer
+
+    if settings.tokenizer is None:
+        return None
+    found = saved_tokenizer(settings.tokenizer, settings.tokenizer_files, run)
+    return found.pinned.files if isinstance(found, HFTokenizer) else settings.tokenizer
 
 
 @dataclass(frozen=True)
@@ -474,8 +480,7 @@ class Decide(SavedRunTask, InItsForm):
                   weights: Weights, dtype: DTypeLike | None) -> Self:
         """The task a run's `record` describes over `backbone` and `variables`, the `weights` they are:
         its head, layout, tokenizer, special tokens and processor as the run recorded them."""
-        from dew.data.text import tokenizer_for
-        from dew.inference.tasks import saved_settings
+        from dew.inference.tasks import saved_settings, saved_tokenizer
         from dew.interop.pretrained import load_processor
 
         settings = saved_settings(record, DecideSettings)
@@ -497,7 +502,7 @@ class Decide(SavedRunTask, InItsForm):
         # here as documents continuing the shared part: the same tokens at the same positions, each
         # question reading the shared part and itself (with siblings, the questions before it), so the
         # same function, each held to its questions' own rows (tests/test_decision_state_once.py).
-        tokenizer = tokenizer_for(settings.tokenizer, files=settings.tokenizer_files, held=directory)
+        tokenizer = saved_tokenizer(settings.tokenizer, settings.tokenizer_files, directory)
         return cls(model, variables, settings.layout, tokenizer, settings.specials,
                    name=str(epath.Path(directory).name), weights=weights, processor=processor, budget=budget,
                    derives_sharing=False)
@@ -611,8 +616,8 @@ class Decide(SavedRunTask, InItsForm):
         settings = [saved_settings(saved, DecideSettings) for saved in recorded]
         # A setting its data derives (its padding, `metadata["derived"]`) may differ between the runs, and
         # their heads by how they run or train alone (`_head_changes`).
-        # Their tokenizers by what they are, their files' hashes, wherever each found it (`_tokenizer_files`).
-        tokenizers = [_tokenizer_files(own) for own in settings]
+        # Their tokenizers by what they are, their files' hashes, wherever each found it (`_tokenizer_held`).
+        tokenizers = [_tokenizer_held(own, run.directory) for own, run in zip(settings, pinned, strict=True)]
         for directory, own, held in zip(runs, settings, tokenizers, strict=True):
             differing = [entry.name for entry in fields(DecideSettings)
                          if entry.metadata.get("derived") != "data"
@@ -721,7 +726,6 @@ class Decide(SavedRunTask, InItsForm):
         import optax
 
         from dew.decision.objective import DecisionObjective
-        from dew.inference.tasks import hold_tokenizer
         from dew.interop.saved_sources import with_release_sources
         from dew.state import TrainState
 
@@ -740,8 +744,8 @@ class Decide(SavedRunTask, InItsForm):
                 # The releases of saved runs its paths lie within mapped to the runs they hold, as a
                 # trainer's checkpoint carries them (`with_release_sources`).
                 record = with_release_sources(DecisionObjective(self).inference_record())
-            hold_tokenizer(record, checkpoints.directory)
-            checkpoints.save(self.weights.step, state, artifact=record, weights_only=True)
+            checkpoints.save(self.weights.step, state, artifact=record, weights_only=True,
+                             tokenizer=self.tokenizer)
             checkpoints.wait()
 
     @overload

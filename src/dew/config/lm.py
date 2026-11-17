@@ -461,9 +461,14 @@ def same_vocabulary(written: str, loaded, name: str) -> bool:
     """
     if written == "byte" or loaded.tokenizer == "byte":
         return written == loaded.tokenizer
-    if loaded.processor is None:
-        return written == name
-    carried = HFTokenizer(str(loaded.source), local_files_only=True).tokenizer
+    match loaded.tokenizer:
+        case HFTokenizer() as held:
+            # A saved run's own tokenizer, the copy it holds (`dew.inference.tasks.saved_tokenizer`).
+            carried = held.tokenizer
+        case _ if loaded.processor is None:
+            return written == name
+        case _:
+            carried = HFTokenizer(str(loaded.source), local_files_only=True).tokenizer
     return HFTokenizer(written).tokenizer.get_vocab() == carried.get_vocab()
 
 
