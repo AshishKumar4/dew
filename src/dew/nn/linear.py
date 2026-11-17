@@ -599,10 +599,8 @@ def _forked(mixed, taps, bias, scan, state_shape: tuple[int, ...], *, coordinate
     """`held_scan` of a call over forks: its conv (`forked_conv`) and its scan a level of the forks' chains
     in one pass (`forked_scan`), `scan(convolved, *, starts, valid, held, forked)` running each document from
     its table slot (`forked` its `(loads, stores, held)`, `held` its given memories, `Chunk.loads`); a cached
-    call from the layer's held conv history and state `held`, read and left as they were."""
-    if sequence_shards() > 1:
-        raise LayoutRefused("documents that continue another are read whole in their rows; a sequence axis "
-                            "splits them")
+    call from the layer's held conv history and state `held`, read and left as they were. Under a sequence
+    axis the call runs whole, its documents read across the axis (`sequence_split`)."""
     history, held = (None, None) if held is None else held
     convolved = forked_conv(mixed, taps, coordinates, history=history, bias=bias, parts=parts, dtype=dtype)
 
