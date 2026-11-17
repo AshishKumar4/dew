@@ -188,6 +188,49 @@ def lifelines() -> int:
     return found
 
 
+def test_an_interruption_at_any_line_its_caller_runs_in_start_reaches_it_as_raised():
+    """An interruption (an exception a signal handler raises) landing at each line the caller's thread runs
+    in `start`, its own and those of what it calls and waits on, reaches the caller as the handler raised
+    it, leaving no lifeline and no descriptor of the start. `threading`'s waits reacquire a condition's
+    lock as they unwind, and an interruption landing there raised "RuntimeError: release unlocked lock" in
+    the handler's place (row 7619, once in CI, where alarms land at random)."""
+    def interrupt(number: int, frame: object) -> None:
+        raise Interrupted
+
+    def started(at: int) -> int:
+        """The lines the caller's thread ran in a `start` interrupted at its `at`th (none where 0)."""
+        ran = [0]
+
+        def trace(frame: object, event: str, arg: object) -> object:
+            if event == "line":
+                ran[0] += 1
+                if ran[0] == at:
+                    signal.raise_signal(signal.SIGALRM)
+            return trace
+
+        sys.settrace(trace)
+        try:
+            process = start(["sleep", "600"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        finally:
+            sys.settrace(None)
+        stop(process)
+        return ran[0]
+
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    descriptors, held = len(os.listdir("/proc/self/fd")), lifelines()
+    try:
+        lines = started(0)
+        for at in range(1, lines + 1):
+            with pytest.raises(Interrupted):
+                started(at)
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+    deadline = time.monotonic() + 30
+    while lifelines() > held and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert lifelines() == held and len(os.listdir("/proc/self/fd")) == descriptors
+
+
 def test_a_start_interrupted_before_its_command_runs_leaves_nothing_behind(tmp_path):
     """An interruption that reaches `start` while its group starts (in its lifeline's or its gate's Popen,
     or while its gate is released and executes the command) leaves nothing of it: its command, once it
