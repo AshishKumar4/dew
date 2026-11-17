@@ -108,6 +108,7 @@ from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
 from truths_ahead import COMPILED, CompiledTruths, judged, named, running
 
 from dew._accuracy import distance, reduction_bound, within
+from dew._sources import names_read
 from dew.algebra import passes
 from dew.nn import programs
 from dew.parity import (
@@ -657,7 +658,10 @@ def _fingerprint(value, digest, seen: dict[int, object]) -> None:
     calls), whose contents differ by what a process ran before (a prepare runs a part's every test, its
     run a part of them), so each enters by its type alone: an arm parameterized through one is told from
     another by its code, its other bindings and its site's own label. A function's keyword defaults enter
-    as its other bindings do. Taken before the arm is traced or called."""
+    as its other bindings do, and so do the plain globals it reads and its own module's functions: a
+    prepare reading a module's flag otherwise than its run (a backend read at import) names another arm,
+    a red in the run (`truths_ahead.MissingTruth`), never the prepare's program in its place. Taken before
+    the arm is traced or called."""
     digest.update(type(value).__qualname__.encode())
     if isinstance(value, np.ndarray | jax.Array | np.generic):
         array = np.asarray(value)
@@ -676,6 +680,14 @@ def _fingerprint(value, digest, seen: dict[int, object]) -> None:
         for part in (value.__code__, value.__defaults__, tuple(sorted((value.__kwdefaults__ or {}).items())),
                      tuple(cell.cell_contents for cell in value.__closure__ or ())):
             _fingerprint(part, digest, seen)
+        # The globals it reads that state what it computes: a module's flag or constant (a test's
+        # `ON_GPU`, read where its module was imported: a prepare's CPU and its run's GPU read two), and a
+        # function of its own module, as it reads them; a library's by its name, its code the commit's.
+        for name in sorted(names_read(value.__code__)):
+            found = value.__globals__.get(name)
+            own = isinstance(found, types.FunctionType) and found.__module__ == value.__module__
+            if own or _plain(found):
+                _fingerprint((name, found), digest, seen)
     elif isinstance(value, types.CodeType):
         digest.update(value.co_code + repr(value.co_names).encode())
         _fingerprint(value.co_consts, digest, seen)
@@ -700,6 +712,13 @@ def _fingerprint(value, digest, seen: dict[int, object]) -> None:
         _fingerprint(wrapped, digest, seen)
     elif isinstance(attributes := getattr(value, "__dict__", None), dict):
         _fingerprint(tuple(sorted(attributes.items())), digest, seen)
+
+
+def _plain(value) -> bool:
+    """Whether `value` is plain data: None, a number, a string, bytes, or a tuple of them."""
+    if isinstance(value, tuple):
+        return all(_plain(item) for item in value)
+    return value is None or isinstance(value, bool | int | float | complex | str | bytes | np.generic)
 
 
 def _part_of(item, seen: dict[int, object]) -> bytes:

@@ -240,6 +240,29 @@ def test_a_compiled_sites_run_traces_none_of_its_truth(tmp_path):
     assert traced
 
 
+ARM_FACTOR = 1.0
+"""A module's flag an arm reads (`test_an_arm_reading_another_flag_than_its_prepares_is_a_red`), as a test's
+backend read at import is one."""
+
+
+def test_an_arm_reading_another_flag_than_its_prepares_is_a_red(tmp_path, monkeypatch):
+    """An arm whose module's flag reads otherwise in its run than in its prepare (a backend read at import:
+    the prepare's CPU, the run's GPU) is another arm: its run finds none of it (`MissingTruth`), never the
+    prepare's program in its place; read alike, it passes."""
+    dew, reference, draw = _site()
+
+    def flagged(a, b):
+        return dew(a, b) * ARM_FACTOR
+
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(flagged, reference, draw, "a flagged product", seeds=8)
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(flagged, reference, draw, "a flagged product", seeds=8)
+    monkeypatch.setattr(sys.modules[__name__], "ARM_FACTOR", 1.0 + 2.0 ** -8)
+    with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
+        assert_as_exact(flagged, reference, draw, "a flagged product", seeds=8)
+
+
 def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     """Judged from programs compiled ahead (`compiled_truths(prepare=False)`), a site's run computes every
     draw's arms with them and runs none of its arms' code, which its prepare alone traced (a GPU run then
