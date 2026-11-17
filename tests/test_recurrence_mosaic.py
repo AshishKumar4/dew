@@ -856,7 +856,8 @@ def test_lightning_attentions_write_at_fp32s_edge_is_as_exact_as_flas_rounding_i
         key[0, 0, 0, 0], value[0, 0, 0, 0] = 2.0 ** 64, 145 / 128 * 2.0 ** 64
         log_decay = jnp.zeros((1, 128, 1), jnp.float32).at[0, 1, 0].set(-0.1268)
         return (Chunk(jnp.zeros(key.shape, jnp.bfloat16), jnp.asarray(key, jnp.bfloat16),
-                      jnp.asarray(value, jnp.bfloat16), log_decay=log_decay),)
+                      jnp.asarray(value, jnp.bfloat16), log_decay=log_decay,
+                      state=jnp.zeros((1, 1, 128, 128), jnp.float32)),)
 
     def final(run):
         return jax.jit(lambda operands: run(operands)[1])
