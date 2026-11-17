@@ -477,22 +477,12 @@ def _expands(stage: Stage) -> bool:
 
 def _one_example_until(pipeline: Pipeline) -> int:
     """The place in `pipeline`'s stages before which a source example is still one example: its first
-    step that packs or windows records, makes several rows of each (`_expands`) or rejects one it cannot
-    make (`_rejects`: an image that does not decode), else its batch's, else its end. A bound in examples
-    stands there (`_bounded`), one pass's examples are counted to it (`_pass_examples`) and a memory
-    read's epochs are bounded ahead of it (`_held_ahead`): an example a step rejects after it is consumed
-    as it is read, its count carried to the next row kept (`CONSUMED`), so a pass is the records read,
-    which the source states, where the bound after a reject counted none ahead (an image recipe's epochs
-    were refused)."""
+    step that packs or windows records or makes several rows of each (`_expands`), else its batch's, else
+    its end. A bound in examples stands there (`_bounded`), one pass's examples are counted to it
+    (`_pass_examples`) and a memory read's epochs are bounded ahead of it (`_held_ahead`)."""
     batched = _until(pipeline.stages, (BatchStage, TokenBudget))
     return next((index for index, stage in enumerate(pipeline.stages[:batched])
-                 if isinstance(stage, (Pack, Windows)) or _expands(stage) or _rejects(stage)), batched)
-
-
-def _rejects(stage: Stage) -> bool:
-    """Whether `stage` drops a record it cannot make (`rejects`: a decode's failure), keeping every other
-    one for one, as no selection (a `Filter`) does."""
-    return isinstance(stage, (Map, MapWithIndex, RandomMap)) and stage.rejects
+                 if isinstance(stage, (Pack, Windows)) or _expands(stage)), batched)
 
 
 def _lays_out(pipeline: Pipeline) -> bool:

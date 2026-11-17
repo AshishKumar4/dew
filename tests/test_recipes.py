@@ -91,6 +91,8 @@ def diffusion(args: list[str], root: Path) -> Callable[[], object]:
     sized = scaled(args, {"data.images.size": "8", "data.images.batch": "8", "--trainer.epochs": "1",
                           **IMAGE_MODEL})
     config = DiffusionRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs"),
+                                     "--set", "validation.images.size=8",
+                                     "--set", "validation.images.batch=8",
                                      "--text.encoder", "char_table", "--text.checkpoint", "char_table"],
                                     default=recipe.default(*pictures()))
     return config.run
@@ -103,7 +105,8 @@ def jepa(args: list[str], root: Path) -> Callable[[], object]:
     sized = scaled(args, {"data.images.size": "16", "data.images.batch": "8", "--trainer.epochs": "1",
                           "--probe-classes": "2", **IMAGE_MODEL})
     images = TFDS("dew_images", path=str(IMAGES), split="train")
-    config = JepaRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs")],
+    config = JepaRunConfig.cli([*sized, *TRAINED, "--trainer.checkpoint-dir", str(root / "runs"),
+                                "--set", "validation.images.size=16", "--set", "validation.images.batch=8"],
                                default=recipe.default(*images.holdout(split="test")))
     return config.run
 
