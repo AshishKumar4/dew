@@ -119,7 +119,7 @@ def test_what_every_layer_of_a_run_updating_in_its_backward_reads_takes_its_laye
 
     def kept(path, index, gradient, weights, moments):
         # The update is no part of what this holds: the weights stay as they are.
-        return weights, {}, jnp.asarray(a=True)
+        return weights, {}
 
     def layer(weights, x, key, context):
         return jnp.tanh(x @ weights["kernel"] + context)
