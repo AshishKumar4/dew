@@ -1532,32 +1532,35 @@ class PassPlan:
 
     def taken(self) -> tuple[int, ...]:
         """Which of its rows, by the order they were added, the pass runs now (`ScoringServer`): all of
-        them, or those in the windows of a smaller declared count where they and the rest, in a pass of
-        their own, compute fewer tokens. A pass whose rows overrun a declared window count by a little
-        takes the next count whole (the counts are powers of 8): a server's last pass of 512 requests held
-        29% of its 32 windows' tokens, a fifth of every pass's tokens padding (row 3330); the rows in the
-        windows of the count below run now, the rest in a pass of their own shape, each split costed by
-        the shapes the two passes take (`Decide._shape`)."""
+        them, or those in the windows of a smaller declared count where they and the rest, in passes of
+        their own, compute fewer tokens (`_split`). A pass whose rows overrun a declared window count by a
+        little takes the next count whole (the counts are powers of 8): a server's last pass of 512
+        requests held 29% of its 32 windows' tokens, a fifth of every pass's tokens padding (row 3330)."""
+        return self._split()[1]
+
+    def _split(self) -> tuple[int, tuple[int, ...]]:
+        """The fewest tokens the plan's rows compute in passes of declared shapes, and the rows the first
+        of those passes runs: its own shape's, or, for each count smaller than its windows at its length,
+        the rows in that count's windows at that shape and the rest planned again, alike (each split
+        costed by the shapes its passes take, `Decide._shape`)."""
         rows, decide = self.rows, self.decide
         everything = tuple(range(len(rows)))
+        whole = decide._shape(rows)
         if not rows or not self.alive:
-            return everything
-
-        def cost(indices: Sequence[int]) -> int:
-            shape = decide._shape([rows[index] for index in indices])
-            return shape.rows * shape.length
-
-        length = self.alive[0]
-        windows = self.placing[length].windows
-        kept, least = everything, cost(everything)
+            return whole.rows * whole.length, everything
+        windows = self.placing[self.alive[0]].windows
+        least, kept = whole.rows * whole.length, everything
         for shape in decide.pass_shapes:
-            if shape.length != length or shape.rows > max(windows):
+            if shape.length != whole.length or shape.rows > max(windows):
                 continue
             inner = tuple(index for index, window in enumerate(windows) if window < shape.rows)
-            rest = tuple(index for index, window in enumerate(windows) if window >= shape.rows)
-            if (split := cost(inner) + cost(rest)) < least:
-                kept, least = inner, split
-        return kept
+            rest = decide.planned()
+            if not all(rest.add(row) for index, row in enumerate(rows) if index not in inner):
+                continue
+            first = decide._shape([rows[index] for index in inner])
+            if (split := first.rows * first.length + rest._split()[0]) < least:
+                least, kept = split, inner
+        return least, kept
 
     def shape(self) -> PassShape:
         """The pass's shape: of the shortest length that holds its rows, the fewest windows declared that
