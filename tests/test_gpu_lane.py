@@ -710,17 +710,20 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     fetcher(tmp_path)
     # Dew's admission standing in, in the lane's environment as the real one runs: a program's least pool its
     # resident and beside bytes and twice its temporaries, as a stranding allocator's.
-    monkeypatch.setattr(ci, "NEEDED", "import json, sys\n"
+    monkeypatch.setattr(ci.gpu_measures, "NEEDED", "import json, sys\n"
                         "units = json.load(sys.stdin)\n"
                         "print(json.dumps({name: max(p['resident'] + p['beside'] + 2 * p['temporaries'] "
                         "for p in programs) for name, programs in units.items()}))\n")
     truths = tmp_path / "truths"
     monkeypatch.setenv("DEW_TIER_TRUTHS", str(truths))
     gib, total = 2 ** 30, 81920 * 2 ** 20
-    for inputs in (None, ci.lane_inputs("3.12")):
-        at = "/" + ci.record_key("3.12", "3.12:tests/test_flow.py", ci.device_class(), inputs)
-        stored[at] = json.dumps({"key": None, "depends": ["tests/test_flow.py"], "row": {}, "reads": [],
-                                 "peak": 2 * gib, "shares": 0, "pools": 0}).encode()
+
+    def measured() -> None:
+        # Its measured 2 GiB, as each run here records its own (with no GPU, none) over it.
+        for inputs in (None, ci.lane_inputs("3.12")):
+            at = "/" + ci.record_key("3.12", "3.12:tests/test_flow.py", ci.device_class(), inputs)
+            stored[at] = json.dumps({"key": None, "depends": ["tests/test_flow.py"], "row": {}, "reads": [],
+                                     "peak": 2 * gib, "shares": 0, "pools": 0}).encode()
 
     def filed(*programs: tuple[int, int, int]) -> None:
         name = "tests/test_flow.py"
@@ -730,14 +733,14 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
             json.dumps({"unit": name, "programs": listed}))
 
     def lane() -> tuple[float, str]:
+        measured()
         out = tmp_path / "verdict.json"
         assert ci.gpu_lane("3.12", ["tests/test_flow.py"], out, cache="off", processes=1, deadline=600.0) == 0
         [row] = json.loads(out.read_text())["rows"]
         return float(lane_runs(tmp_path, "test_flow")[-1][0]) * total, row["output"]
 
     # Its measured 2 GiB alone: 3.5 GiB, its peak and headroom.
-    measured, _ = lane()
-    assert measured == 2 * gib * 1.25 + gib
+    assert lane() == (2 * gib * 1.25 + gib, "")
     # Its arms, and its float64 walk beside them, whose stranded temporaries need 7 GiB: given those.
     filed((gib, gib // 2, gib // 4), (gib, gib, int(2.5 * gib)))
     assert lane() == (7 * gib, "")

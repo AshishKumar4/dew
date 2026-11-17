@@ -1,8 +1,15 @@
 """What tools/armada/ci.py's GPU lane takes a test file to hold on a GPU: the share its process is given over
-its recorded peak, and of the records its runs left, the one that held the most."""
+its recorded peak, and of the records its runs left, the one that held the most; and a unit's least pool by
+Dew's admission of the programs its prepare filed."""
 
 import concurrent.futures
+import hashlib
+import json
+import os
+import subprocess
+import sys
 from collections.abc import Callable, Hashable, Iterable
+from pathlib import Path
 
 GPU_HEADROOM = (1.25, 2 ** 30)
 """A file's share of the GPU over its recorded peak, a factor and bytes beside it: the allocator's
@@ -46,3 +53,70 @@ def largest(keys: Iterable[str], read: Callable[[str], dict | None],
                 for each in ("peak", "shares", "pools"):
                     held[each] = max(held[each], found.get(each, 0))
     return most
+
+
+UNIT = "DEW_TIER_UNIT"
+"""The lane unit a prepare's process prepares (`gpu_prepared`): its file, or `<file>#G/N`, as the lane names
+it, so its flows file their programs' memory under it (`prepared_needs`)."""
+NEEDS = "needs"
+"""Under the tier's store (DEW_TIER_TRUTHS), each prepared unit's programs' memory, in bytes:
+`<sha256(unit)[:16]>.json`, holding `{"unit": UNIT, "programs": [{"resident", "beside", "temporaries"}, ...]}`
+(tests/model_flows.py)."""
+NEEDED = """import json, sys
+import jax
+from dew.training.memory import needed
+device = jax.local_devices()[0]
+units = json.load(sys.stdin)
+print(json.dumps({name: max(needed(device, p["resident"], p["beside"], p["temporaries"]) for p in programs)
+                  for name, programs in units.items()}))
+"""
+"""Each unit's least pool, by Dew's own admission (dew.training.memory `needed`, the inverse of `admitted`) of
+the most demanding of its programs on this GPU, its allocator's stranding counted: one accounting, the one the
+planner trusts (Main, 2026-11-17)."""
+
+
+def prepared_programs(names: Iterable[str]) -> dict[str, list[dict]]:
+    """The programs' memory each of `names` filed at its prepare (`NEEDS`), by unit; none where the tier's
+    store names none, or the unit filed nothing."""
+    store = os.environ.get("DEW_TIER_TRUTHS")
+    if not store:
+        return {}
+    found = {}
+    for name in names:
+        path = Path(store) / NEEDS / f"{hashlib.sha256(name.encode()).hexdigest()[:16]}.json"
+        if path.is_file() and (filed := json.loads(path.read_text()))["unit"] == name and filed["programs"]:
+            found[name] = filed["programs"]
+    return found
+
+
+def prepared_needs(python: str, names: Iterable[str]) -> dict[str, float]:
+    """Each of `names`' least pool in bytes by Dew's admission of the programs it filed at its prepare
+    (`NEEDED`), read on this GPU in a process of the lane's environment that takes no pool (its allocator
+    grows): a part's float64 truths, which no measured run of it held, are admitted before they run
+    (2026-11-17: two flows' 1.71 GiB terms walk beside 1.1 GiB of arms ran out of a 2.84 GiB share). None
+    where none filed, or Dew could not read them, which the lane says: their measured shares stand."""
+    programs = prepared_programs(names)
+    if not programs:
+        return {}
+    path = os.pathsep.join(filter(None, ("src", os.environ.get("PYTHONPATH"))))
+    read = subprocess.run([f".venv-{python}/bin/python", "-c", NEEDED], input=json.dumps(programs),
+                          capture_output=True, text=True, check=False,
+                          env={**os.environ, "PYTHONPATH": path, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"})
+    if read.returncode != 0:
+        print(f"the prepared programs' memory could not be admitted ({read.stderr.strip()[-600:]}): "
+              "their units run on their measured shares", file=sys.stderr)
+        return {}
+    return {name: float(need) for name, need in json.loads(read.stdout).items()}
+
+
+def prepared_shares(needed: dict[str, tuple[float, float]], prepared: dict[str, float],
+                    budget: float) -> tuple[dict[str, float], dict[str, float], dict[str, str]]:
+    """Each unit's share and what it holds (`needed`, by `gpu_needs`), each no less than its least pool by
+    Dew's admission of its prepared programs (`prepared`, `prepared_needs`), within `budget`; and, for a unit
+    whose programs need more than the budget, what its row says (2026-11-10: a need cut to a lane without a
+    word read as the test's own failure)."""
+    shares = {name: min(max(share, prepared.get(name, 0.0)), budget) for name, (share, _) in needed.items()}
+    holds = {name: max(held, shares[name]) for name, (_, held) in needed.items()}
+    short = {name: f"admitted at {budget / 2 ** 30:.1f} GiB, below the {need / 2 ** 30:.2f} GiB its prepared "
+                   "programs need" for name, need in prepared.items() if need > budget}
+    return shares, holds, short
