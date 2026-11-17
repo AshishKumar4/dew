@@ -15,9 +15,10 @@ token's `B` and `C` turned by its angle `phi_t`, `dt theta` summed over its docu
 state's turn between two tokens is their angles' difference, and the previous token's write folded into each
 token's own. Unrolled, token `u`'s value reaches a later token's output at weight `gamma_u + delta_{u+1}`
 (`delta = (1 - lambda) dt`, the next token's, zero past its document) times the decays between, and its own
-at `gamma_u` alone, so the chunked op writes at `gamma_u + delta_{u+1}` and each output takes back its own
-token's `delta_{u+1}` term (`chunk_mamba3`). The recurrence a token at a time on the complex state
-(`recurrent_mamba3`) is the definitional form and, in float64, check 1's truth."""
+at `gamma_u` alone, so the chunked op writes at `gamma_u + delta_{u+1}` and reads apart from each token's own
+writes (`Hooks.reads` 'apart'), which the token's output takes at `gamma_u` beside it (`_rank_terms`), as
+mamba_ssm's kernels do (strictly lower scores, `gamma q . k` apart). The recurrence a token at a time on the
+complex state (`recurrent_mamba3`) is the definitional form and, in float64, check 1's truth."""
 
 from __future__ import annotations
 
@@ -263,8 +264,8 @@ def _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, state, star
     """The chunked op of a call's tokens (`chunk_mamba3`, `entered_mamba3`): `B` and `C` rotated by
     `angles` and rounded to the operands' dtype, the first rank's decay `unturned * A`, the write gate
     `lam dt + following`, from `state` (`[B, H, N, P]`, or a forked call's table's given memories `[B, S',
-    H, N, P]`) with `starts` `[B, S]` each document's first token, and the rank terms on the rounded keys and
-    queries the op read, so they cancel its own. A forked call's `forked` is `(loads, stores, held,
+    H, N, P]`) with `starts` `[B, S]` each document's first token, its readout apart from each token's own
+    writes, and the token's own at `gamma` (`_rank_terms`). A forked call's `forked` is `(loads, stores, held,
     entries)`, `entries(keys)` its documents' entry writes from the rotated keys (`Chunk.entry_key`).
     Returns `(output, final state, rotated keys)`."""
     batch, length, rank, heads, _ = x.shape
@@ -522,7 +523,7 @@ class Mamba3(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """The in and out projections and the state's write and read a rank (`ssd_flops`): the trapezoid's
-        previous write folds into each token's own (`chunk_mamba3`)."""
+        previous write folds into each token's own (`chunk_mamba3`), its own writes read apart."""
         return (projection_flops(lengths, self.emb_features, sum(self.widths) + self.intermediate_size)
                 + self.mimo_rank * ssd_flops(lengths, self.num_heads, self.state_size, self.head_dim))
 
