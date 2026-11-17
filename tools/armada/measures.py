@@ -3,6 +3,7 @@ its recorded peak, and of the records its runs left, the one that held the most;
 Dew's admission of the programs its prepare filed."""
 
 import concurrent.futures
+import functools
 import importlib.util
 import json
 import math
@@ -57,8 +58,11 @@ def largest(keys: Iterable[str], read: Callable[[str], dict | None],
     return most
 
 
-def _wire():
-    """The tier's prepare-to-lane contract (tests/tier_wire.py, its one owner), loaded by its path."""
+@functools.cache
+def wire():
+    """The tier's prepare-to-lane contract (tests/tier_wire.py, its one owner), loaded by its path when a lane
+    first needs it: a harness checkout with no tests/ (a page generator's scratch copy) imports ci.py all the
+    same (review)."""
     spec = importlib.util.spec_from_file_location("tier_wire", Path(__file__).resolve().parents[2] / "tests"
                                                   / "tier_wire.py")
     module = importlib.util.module_from_spec(spec)
@@ -66,7 +70,6 @@ def _wire():
     return module
 
 
-wire = _wire()
 NEEDED = """import json, sys
 import jax
 from dew._devices import allocator_limit
@@ -84,14 +87,14 @@ GPU, its allocator's stranding counted: one accounting, the one the planner trus
 
 
 def prepared_programs(names: Iterable[str]) -> dict[str, list[dict]]:
-    """The programs' memory each of `names` filed at its prepare (`wire.needs_file`), by unit; none where the
-    tier's store names none, or the unit filed nothing."""
-    store = os.environ.get(wire.TRUTHS)
+    """The programs' memory each of `names` filed at its prepare (`wire`'s `needs_file`), by unit; none
+    where the tier's store names none, or the unit filed nothing."""
+    store = os.environ.get(wire().TRUTHS)
     if not store:
         return {}
     found = {}
     for name in names:
-        path = wire.needs_file(Path(store), name)
+        path = wire().needs_file(Path(store), name)
         if path.is_file() and (filed := json.loads(path.read_text()))["unit"] == name and filed["programs"]:
             found[name] = filed["programs"]
     return found
