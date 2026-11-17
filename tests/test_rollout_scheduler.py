@@ -421,23 +421,34 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
                for rollout in watched.rollouts if int(rollout.task) % 5 == 1)
 
 
-def test_a_served_rollouts_server_shares_its_prompts_pages_by_default():
-    """A served rollout's server (`RolloutScheduler.serve`) that names no page size pages its cache where
-    paging computes what the model computes, its prefix cache on as a paged server keeps one, so a group's
+def test_a_server_shares_its_prompts_pages_by_default():
+    """A server that names no layout (`Server.from_task`'s `kv_cache`) pages its cache wherever a server
+    over pages keeps a prefix cache, as a served rollout's and the native GRPO backend's do, so a group's
     samples of one prompt prefill it once (row 5375); a model whose LongRoPE rebuilds a crossing request,
-    and one whose max_seq_len holds no row in whole pages, keeps each row's cache whole."""
+    one whose loop shares a cache its later passes rewrite, which shares no prompt over pages, and one
+    whose max_seq_len holds no row in whole pages keep each row's cache whole."""
     from model_support import serving_task
 
+    from dew.inference.serving import PAGE_SIZE, PagedRows
+    from dew.nn.backbones.decoder_stack import Loop
     from dew.nn.rope import LongRopeScaling
 
-    task = serving_task(capacity=64)
-    assert RolloutScheduler.serve(task, slots=4, capacity=64).reuses_prefixes
+    task = serving_task(capacity=2 * PAGE_SIZE)
+    server = Server.from_task(task, slots=2, capacity=2 * PAGE_SIZE)
+    assert server.reuses_prefixes
+    prompt = [1 + index % 11 for index in range(PAGE_SIZE + 6)]
+    server([prompt, prompt], 2, key=0)
+    # The second sample of the prompt read its first page from the first's.
+    assert server.prefix_hits == PAGE_SIZE
     # Factors for each of a head's 8 widths' rotated pairs.
     scaling = LongRopeScaling(short_factor=(1.0,) * 4, long_factor=(2.0,) * 4,
                               original_max_position_embeddings=16)
-    rebuilding = dataclasses.replace(task, model=task.model.clone(rope_scaling=scaling))
-    assert not RolloutScheduler.serve(rebuilding, slots=4, capacity=64).reuses_prefixes
-    assert not RolloutScheduler.serve(serving_task(capacity=12), slots=4, capacity=8).reuses_prefixes
+    looped = task.model.clone(loop=Loop(steps=2, shared_cache=True))
+    for model in (task.model.clone(rope_scaling=scaling), looped):
+        whole = Server.from_task(dataclasses.replace(task, model=model), slots=2, capacity=2 * PAGE_SIZE)
+        assert not isinstance(whole.rows, PagedRows) and not whole.reuses_prefixes
+    short = Server.from_task(serving_task(capacity=12), slots=2, capacity=8)
+    assert not isinstance(short.rows, PagedRows)
 
 
 def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
@@ -471,7 +482,7 @@ def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
 def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):
     """A served rollout whose run names its page size 'whole' (`--rollout.served.page-size whole`,
     `ServedRollout.page_size`) serves over each row's whole cache, no prompt page shared, where one naming
-    none pages wherever pages serve the policy (`RolloutScheduler.serve`, row 5375); the run records the
+    none pages wherever pages serve the policy (`Server.from_task`, row 5375); the run records the
     choice and loads with it."""
     import rl_support
     from model_support import serving_task
@@ -484,10 +495,10 @@ def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):
     served = config.rollout.served
     assert served is not None and served.page_size == "whole"
     task = serving_task(capacity=64)
-    assert not RolloutScheduler.serve(task, slots=4, capacity=64, page_size=served.page_size).reuses_prefixes
+    assert not Server.from_task(task, slots=4, capacity=64, kv_cache=served.page_size).reuses_prefixes
     # A model that declares pages of its own is served whole all the same.
     paged = dataclasses.replace(task, model=task.model.with_kv_cache(KVCache(page_size=8)))
-    assert RolloutScheduler.serve(paged, slots=4, capacity=64).reuses_prefixes
-    assert not RolloutScheduler.serve(paged, slots=4, capacity=64, page_size="whole").reuses_prefixes
+    assert Server.from_task(paged, slots=4, capacity=64).reuses_prefixes
+    assert not Server.from_task(paged, slots=4, capacity=64, kv_cache="whole").reuses_prefixes
     config.save(str(tmp_path / "whole"))
     assert LMRunConfig.load(str(tmp_path / "whole")).rollout == config.rollout
