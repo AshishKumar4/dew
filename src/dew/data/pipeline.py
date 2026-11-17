@@ -858,6 +858,16 @@ class BatchStage:
         return {**facts, "batch": self.size}
 
 
+@runtime_checkable
+class LaysOutWindows(Protocol):
+    """A step over each packed window (`ObjectiveData.packed`) that lays its documents out itself, as its
+    model reads them (a decision's rows, `dew.decision.rows.PackedRows`): the read then states the bound of
+    its windows' documents alone (`dew.data.steps.generic.Coordinated`). Stated by the step's class, so no
+    recorded plan changes."""
+
+    lays_out_windows: ClassVar[bool]
+
+
 @dataclasses.dataclass(frozen=True)
 class Pack:
     """Documents packed into windows of `seq_len` tokens along `fields`.

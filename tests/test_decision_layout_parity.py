@@ -68,6 +68,19 @@ def joint() -> dict[str, object]:
                 (16384, 220), (("release", None), ("schema first", schema_first)), (None, 24))}
 
 
+ADDED_SINCE = frozenset({"context_cut"})
+"""The fields an encoded row gained since main's renderers wrote the digests (`decision_layout_plans.json`),
+each at its default on every row a layout writes, which `with_context` alone sets."""
+
+
+def main_fields(row) -> tuple:
+    """`row`'s every field main's rows held, by value, each field added since at its default."""
+    held = dataclasses.astuple(row)
+    names = [field.name for field in dataclasses.fields(row)]
+    assert all(value == 0 for name, value in zip(names, held, strict=True) if name in ADDED_SINCE)
+    return tuple(value for name, value in zip(names, held, strict=True) if name not in ADDED_SINCE)
+
+
 def digest(layout_type, settings: dict) -> str:
     """Every row `layout_type(**settings)` writes over each state and question set, digested: each row's
     every field and its refusal, or the error that refused the layout or a set's rows."""
@@ -79,7 +92,7 @@ def digest(layout_type, settings: dict) -> str:
     for state, questions in itertools.product(STATES.values(), QUESTIONS.values()):
         try:
             rows = layout.rows(TOKENIZER, SPECIALS, state, questions)
-            cells.append([(dataclasses.astuple(row), layout.refusal(row)) for row in rows])
+            cells.append([(main_fields(row), layout.refusal(row)) for row in rows])
         except (TypeError, ValueError) as error:
             cells.append(f"refused {type(error).__name__}")
     return hashlib.sha256(repr(cells).encode()).hexdigest()[:24]

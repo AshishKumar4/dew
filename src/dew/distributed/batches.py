@@ -312,6 +312,14 @@ def restore_position(source: Checkpointable, saved: bytes) -> None:
     source.set_state(saved if isinstance(source.get_state(), bytes) else json.loads(saved))
 
 
+def _read_one(iterator: Iterator, source: Checkpointable | None) -> tuple[Batch, object]:
+    """The next batch `iterator` gives and its source's position after it (None where it states none)."""
+    with region("data.read"):
+        batch = next(iterator)
+    with region("data.position"):
+        return batch, source.get_state() if source is not None else None
+
+
 class DevicePrefetchIterator:
     """Reads batches on a worker thread and places them on the mesh ahead of the step.
 
@@ -351,7 +359,8 @@ class DevicePrefetchIterator:
     def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = PREFETCH_DEPTH,
                  source_state: bytes | None = None, *, prepare: Callable[[Batch], Batch] | None = None,
                  reads: Mapping[Signature, tuple[bool, ...]] | None = None,
-                 restore: Callable[[Checkpointable, bytes], None] = restore_position):
+                 restore: Callable[[Checkpointable, bytes], None] = restore_position,
+                 primed: tuple[Batch, object] | None = None):
         if depth <= 0:
             raise ValueError("prefetch depth must be positive")
         self._iterator: Iterator | None = iter(iterator)
@@ -373,6 +382,10 @@ class DevicePrefetchIterator:
         self._error: BaseException | None = None
         self._cleanup_error: BaseException | None = None
         self.source_state = source_state
+        # The source's first batch, read already where the run started (an objective reading its input's
+        # shape off it), with the source's position after it: the worker hands it on as its first, so the
+        # run reads it once (training.md, the batch contract).
+        self._primed = primed
         self._prepare = prepare
         # The worker places batches by the rules its creator reads, which flax
         # keeps per thread (`batch_shardings`).
@@ -458,14 +471,13 @@ class DevicePrefetchIterator:
                 if source is None:
                     raise TypeError(f"{self._source_name} cannot resume from a saved position")
                 self._restore(source, self.source_state)
+            primed, self._primed = self._primed, None
             while not self._stop.is_set():
-                with region("data.read"):
-                    batch = next(iterator)
+                batch, read = _read_one(iterator, source) if primed is None else primed
+                primed = None
                 if self._stop.is_set():
                     break
-                with region("data.position"):
-                    read = source.get_state() if source is not None else None
-                    state = read if read is None or isinstance(read, bytes) else json.dumps(read).encode()
+                state = read if read is None or isinstance(read, bytes) else json.dumps(read).encode()
                 if self._prepare is not None:
                     with region("data.place"), nn.logical_axis_rules(self._rules):
                         batch = self._prepare(batch)

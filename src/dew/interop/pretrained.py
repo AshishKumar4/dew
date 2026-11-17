@@ -358,14 +358,21 @@ class Pretrained:
     def text_processor(self) -> TaskProcessor | None:
         """Return what the bundle's tasks encode and decode text with.
 
-        That is the source's processor, or a run processor over the vocabulary that
-        `tokenizer` names (a run's export, including Dew's byte vocabulary).
+        That is the source's processor, or a run processor over a saved run's tokenizer (its held copy,
+        `dew.inference.tasks.saved_tokenizer`) or the vocabulary `tokenizer` names (Dew's byte vocabulary).
         """
-        if self.processor is not None or not isinstance(self.tokenizer, str):
-            return self.processor
-        from dew.data.text import tokenizer_for
+        from dew.data.text import HFTokenizer, tokenizer_for
         from dew.inference.tasks import RunProcessor
-        return RunProcessor(tokenizer_for(self.tokenizer, local_files_only=True))
+
+        match self.tokenizer:
+            case _ if self.processor is not None:
+                return self.processor
+            case HFTokenizer() as held:
+                return RunProcessor(held)
+            case str(name):
+                return RunProcessor(tokenizer_for(name, local_files_only=True))
+            case _:
+                return self.processor
 
     @classmethod
     def from_run(cls, directory: str | Path, *, step: int | str | None = None,
@@ -387,6 +394,7 @@ class Pretrained:
         `param_dtype` where given. A decoder no family's layout writes (`dew.interop.layouts.source_layout`)
         is held in its native layout: the bundle a run starts from, whose `export` refuses with the
         layout's reason (row 4785)."""
+        from dew.data.text import ByteTokenizer
         from dew.inference.tasks import (
             BlockSettings,
             MaskedSettings,
@@ -394,6 +402,7 @@ class Pretrained:
             TextSettings,
             saved_model,
             saved_settings,
+            saved_tokenizer,
         )
         from dew.registry import models
 
@@ -406,7 +415,11 @@ class Pretrained:
         held = None if run.objective.settings is None else saved_settings(run.record, run.objective.settings)
         task = held if isinstance(held, TaskSettings) else None
         budget = None if task is None else task.max_new_tokens
-        tokenizer = None if task is None else task.tokenizer
+        # A run's tokenizer as its loaders build it, the copy the run holds (`saved_tokenizer`), which its
+        # export writes and a run started from it encodes with; the byte vocabulary by its name.
+        found = None if task is None or task.tokenizer is None else saved_tokenizer(
+            task.tokenizer, task.tokenizer_files, run.directory)
+        tokenizer = found.name if isinstance(found, ByteTokenizer) else found
         # A run over a source's own processor records its source, and the bundle writes its files.
         processor = None if task is None or task.processor is None else load_processor(task.processor, model)
         trained = models[model_config.name]

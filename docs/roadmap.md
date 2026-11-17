@@ -50,6 +50,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Mosaic has no float32 forward at width 256 on Hopper. [6508]
 - The attention backward's derivation proposes a spilling attention_dkv_fused at width 64 on sm100 and sm80. [6944]
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
+- A certification verdict's key names the ptxas that assembled it by the installed nvcc wheels alone. [7309]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
@@ -85,7 +86,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
-- Src/dew/optim.py _placement refuses Muon for a rank-2 kernel declared with one named axis and one None. [6746]
 
 ## Data
 
@@ -97,7 +97,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Training and serving efficiency. [3330, 1880, 5292]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
-- CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
 
 ## Algebra
 
@@ -114,7 +113,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Every model comparison on check 1. [2300, 3722, 5212]
 - Saved runs carried across. [2791, 2792]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
-- The saved data plan as recorded rules, one last version, and the resume modes. [6861]
 
 ## Tutorials and docs
 
