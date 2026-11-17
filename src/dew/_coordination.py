@@ -450,6 +450,7 @@ def _agree(phase: str, error: BaseException | None, word: str) -> list[str]:
     context = f"Process phase {phase} failed on rank {failed[0]}: {words[failed[0]][2:]}"
     if error is not None:
         error.add_note(context)
+        _HEARD.append(error)
         raise error
     raise PeerFailure(context, phase=phase, rank=failed[0])
 
@@ -546,9 +547,20 @@ def publish_failure(error: BaseException, where: str) -> bool:
     return True
 
 
-def withdraw_failure() -> None:
-    """Remove the published failure once the pool has heard it at an agreement."""
-    _client().key_value_delete(FAILURE_KEY)
+def withdraw_failure() -> bool:
+    """Remove the published failure once the pool has heard it at an agreement; False where the service
+    holds it no more, process 0 having ended with the agreement's refusal and taken the service with it,
+    so no watch can read it either."""
+    try:
+        _client().key_value_delete(FAILURE_KEY)
+    except jax.errors.JaxRuntimeError:
+        return False
+    return True
+
+
+_HEARD: list[BaseException] = []
+"""The errors this process raised at an agreement its peers heard (`_agree`), which leaving the program on
+one (`end_pool_on_failure`) publishes no more: the pool knows it, and its service may be gone."""
 
 
 def stop_at_exit(thread: threading.Thread, stop: Callable[[], None], *,
@@ -595,7 +607,9 @@ def end_pool_on_failure(grace: float | None = None) -> None:
     def leave(kind: type[BaseException], value: BaseException,
               trace: types.TracebackType | None) -> None:
         previous(kind, value, trace)
-        publish_failure(value, "the program")
+        # An error an agreement's peers heard (`_HEARD`) ends them already, and its service may be gone.
+        if not any(value is heard for heard in _HEARD):
+            publish_failure(value, "the program")
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(130 if issubclass(kind, KeyboardInterrupt) else 1)
