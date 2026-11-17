@@ -1816,7 +1816,8 @@ def test_lightning_attentions_training_step_starts_unspilled_asking_each_rung_on
     # kernel's next rung reads nothing that moved. A rung's kernels that did not move keep their modules.
     spilled = [(each.pulled, module) for each in certified for module, binary in each.kernels.values()
                if binary.refused]
-    # Rungs are certified one after another: each kernel's walk stops at the rung it holds at.
+    # Rungs are certified one after another: the launch's walk stops at the first rung where all its kernels
+    # hold, so a kernel that holds first keeps climbing with the launch.
     held: dict[str, bool] = collections.defaultdict(bool)
     for each in certified:
         for _, binary in each.kernels.values():

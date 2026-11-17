@@ -718,7 +718,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """The tiles a refused `config`'s spilling launches step through (`_stepped`): each one's producer's
         top first, then a setmaxnreg step lower a rung, and past its foot a program fewer a multiprocessor
         with its producer's ladder run again, each planned as it is asked for: the ladder `_settled` takes a
-        compile at a time, which certification asks its top alone and then a round at a time
+        compile at a time, which certification asks in turn, the first that holds taken
         (`tuning.KernelOp._climbed`)."""
         if not self._typed(config):
             return
