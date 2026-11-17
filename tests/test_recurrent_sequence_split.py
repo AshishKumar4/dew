@@ -10,8 +10,10 @@ import pytest
 from reference_error import as_given, assert_as_exact, widened
 from sequence_split_support import SPLIT_BATCH, SPLIT_ROWS, assert_decodes_as_whole, assert_split_as_whole
 
+from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.linear import GatedDeltaNet, held_conv1d, over_sequence, sequence_conv, sequence_halo
+from dew.nn.mixers.lightning import LightningAttention
 from dew.nn.mixers.mamba import Mamba
 from dew.nn.mixers.mamba2 import Mamba2
 from dew.training import MeshSpec
@@ -69,6 +71,78 @@ def test_a_recurrent_mixer_decodes_under_a_sequence_axis_as_on_one_device(name):
     variables = jax.tree.map(np.asarray, module.init(jax.random.key(7), hidden))
     assert_decodes_as_whole(module, variables, DECODE_SEEDS, f"{name} decoded under a sequence axis",
                             width=WIDTH)
+
+
+LIGHTNING = LightningAttention(emb_features=WIDTH, num_heads=2, head_dim=8, slopes=(0.5, 0.25), layers=4,
+                               chunk_size=4)
+"""MiniMax's lightning layer at a small geometry, the second of a stack of four."""
+
+LIGHTNING_CALL = {"depth": jnp.ones((SPLIT_BATCH, 32), jnp.int32)}
+"""The lightning layer's place in its stack, which sets its heads' rates."""
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("row", sorted(SEEDS))
+def test_a_lightning_layer_split_over_the_sequence_runs_its_rows_as_whole_ones(row):
+    """Under a sequence axis of 4, a lightning layer runs each row as on one device, each shard from the
+    memory the earlier ones leave it (`lightning._sequence_memory`, row 7400), where it refused the axis."""
+    hidden = jnp.zeros((1, 32, WIDTH), jnp.float32)
+    variables = jax.tree.map(np.asarray, LIGHTNING.init(jax.random.key(7), hidden, MixerCall(
+        depth=jnp.ones((1, 32), jnp.int32))))
+    assert_split_as_whole(LIGHTNING, variables, row, SEEDS[row], f"lightning split over the sequence, {row}",
+                          width=WIDTH, call_fields=LIGHTNING_CALL)
+
+
+FORK_ROWS = [[3, 4, 5, 6, 7, 8, 9, 10, 11], [3, 4, 5, 6, 7, 8, 9, 12], [20, 21, 22, 23, 24]]
+"""Two rows over one prompt of seven tokens, and a row of its own."""
+
+FORK_SEEDS = 32
+"""Each mixer's declared draws over forks under the axis."""
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", [*sorted(DECODE_MIXERS), "lightning"])
+def test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device(name):
+    """Under a sequence axis of 4, a call over forks runs whole, each document continuing its parent's state
+    across the axis (`linear.sequence_split`, row 7400), where `held_scan`'s forked path refused the axis:
+    its output and every gradient are check 1's against the same call on one device, from float64."""
+    from dew.data.forked_rows import ForkedRows
+    from dew.nn.inputs import AttentionMetadata
+
+    module = LIGHTNING if name == "lightning" else DECODE_MIXERS[name]
+    forks = ForkedRows.pack(FORK_ROWS, 24)
+    batch, length = forks.tokens.shape
+    depth = jnp.ones((batch, length), jnp.int32) if name == "lightning" else None
+    call = MixerCall(AttentionMetadata(coordinates=forks.coordinates), depth=depth)
+    hidden = jnp.zeros((batch, length, WIDTH), jnp.float32)
+    variables = jax.tree.map(np.asarray, module.init(jax.random.key(7), hidden, MixerCall(depth=depth)))
+
+    def draw(seed):
+        rng = np.random.default_rng([0x7400, seed])
+        return (rng.standard_normal((batch, length, WIDTH)).astype(np.float32),
+                rng.standard_normal((batch, length, WIDTH)).astype(np.float32))
+
+    def pulled(model):
+        def run(params, hidden, cotangent):
+            out, pull = jax.vjp(lambda params, hidden: model.apply(params, hidden, call), params, hidden)
+            return out, *pull(cotangent)
+        return jax.jit(run)
+
+    whole, wide = pulled(module), pulled(module.clone(dtype=jnp.float64))
+    mesh = MeshSpec(sequence=4).build(jax.devices()[:4])
+
+    @as_given
+    def split(hidden, cotangent):
+        with jax.set_mesh(mesh):
+            return whole(variables, hidden, cotangent)
+
+    @as_given
+    def truth(hidden, cotangent):
+        with jax.enable_x64(new_val=True):
+            return wide(*widened((variables, hidden, cotangent)))
+
+    assert_as_exact(split, lambda hidden, cotangent: whole(variables, hidden, cotangent), draw,
+                    f"{name} over forks under a sequence axis", seeds=FORK_SEEDS, truth_fn=truth)
 
 
 CONV_SEEDS = 96
