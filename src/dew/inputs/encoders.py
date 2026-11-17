@@ -13,18 +13,15 @@ registry's `{"class": ..., "fields": ...}` whose fields `recorded_fields` wrote.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import ClassVar
+from dataclasses import dataclass
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
 
 from dew.batch import Variables
-from dew.inputs.condition import BackboneCall, BackboneEncoder, ConditionEncoder
+from dew.inputs.condition import ConditionEncoder
 from dew.nn.blocks import table_rows
-from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.dit import TextContext
 from dew.nn.flops import ConditionWork
 from dew.registry import dtype_name, resolve_dtype
@@ -117,37 +114,3 @@ clip (0.0 is silence); or a conditioning record holding either under `audio`."""
 
 
 __all__ = ["AudioRow", "CharTable", "ConditionEncoder", "char_codes"]
-
-
-@dataclass(frozen=True)
-class BackboneContext(BackboneEncoder[Sequence[int]]):
-    """A stream of the model's own tokens its cross-attention reads (decision-inputs.md section 2), encoded
-    by the model itself (`dew.nn.cross_attention.encode_context`): `table`, each token's row of its own
-    token table, or `backbone`, its own final states over the stream in a pass of its own, a forward alone
-    where the model trains nothing but its cross-attention blocks. Its tokens are a `ContextTokens`."""
-
-    encoder: ContextEncoder = "table"
-    params: Variables = field(default_factory=dict, compare=False)
-    """None of its own: the model it conditions holds its weights."""
-    keyword: ClassVar[str] = "conditioning"
-
-    def encode_backbone(self, backbone: BackboneCall, tokens: ContextTokens) -> Mapping[str, jax.Array]:
-        return encode_context(backbone.module, backbone.variables, tokens.tokens, tokens.lengths,
-                              encoder=self.encoder, train=backbone.train, rngs=backbone.rngs,
-                              segments=tokens.segments, max_segments=tokens.max_segments,
-                              progress=backbone.progress)
-
-    def recorded_fields(self) -> Mapping[str, object]:
-        return {"encoder": self.encoder}
-
-
-@dataclass(frozen=True)
-class ContextTokens:
-    """A context stream's tokens as a window packs them: `tokens` `[B, C]`, each row's first `lengths` real,
-    and where a row packs several documents' contexts, each token's document (`segments`), at most
-    `max_segments` a row (`dew.nn.cross_attention.encode_context`)."""
-
-    tokens: jax.Array
-    lengths: jax.Array
-    segments: jax.Array | None = None
-    max_segments: int = 1

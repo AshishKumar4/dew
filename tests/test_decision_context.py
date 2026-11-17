@@ -554,29 +554,29 @@ def test_a_backbone_encoded_context_is_the_backbones_own_pass_over_it():
     assert DecisionObjective(tasks[1]).model.context_encoder == "backbone"
 
 
-def test_a_context_its_cross_attention_cannot_hold_is_refused_never_cut():
-    """A context of more tokens than the cross-attention reads is refused, by a task and over the wire
-    (ValueError, which a server turns into the request's own refusal), and refuses a run's data where
-    its fitting reads the record; one of exactly that many is read whole."""
+def test_a_context_past_its_cross_attentions_room_is_cut_and_its_caller_told():
+    """A context of more tokens than the cross-attention reads keeps its first ones, as a context beside a
+    schema does (one policy, `with_context`): a task answers from them, a served answer states the
+    request's context tokens and those it read, and a run's data counts the cut (`data/cut/.../context`).
+    It was refused, and refused a run's data inside its fitting (train 985's review, F5)."""
     from dew.decision.rows import Fit
 
     objective = conditioned(16, (0,))
     task = Decide(objective.model, objective.init(jax.random.key(0)), objective.layout, objective.tokenizer,
                   objective.specials)
-    exact, over = "x" * 16, "x" * 17
-    [row] = task._encoded("one two", QUESTION, context=exact)
-    assert row.context is not None and len(row.context) == 16
-    with pytest.raises(ValueError):
-        task("one two", QUESTION, context=over)
+    exact, over = "x" * 16, "x" * 17 + "y"
+    [whole] = task._encoded("one two", QUESTION, context=exact)
+    [cut] = task._encoded("one two", QUESTION, context=over)
+    assert whole.context == cut.context and cut.cuts == {"context": 2}
+    assert task("one two", QUESTION, context=over)["pick"].probabilities.tolist() == task(
+        "one two", QUESTION, context=exact)["pick"].probabilities.tolist()
     wire = {"pick": {"type": "choice", "instructions": "Which one?", "criteria": ["a", "b", "c"]}}
-    [refused] = task.systemone([{"state": "one two", "questions": wire, "context": over}])
-    assert isinstance(refused, ValueError)
+    served = task.systemone({"state": "one two", "questions": wire, "context": over})
+    assert (served["usage"]["context_tokens"], served["usage"]["context_kept"]) == (18, 16)
     fit = Fit(objective.layout, objective.tokenizer, objective.specials, objective.model.head,
               objective.context_length)
-    assert not isinstance(fit.map({"example": Example("one two", QUESTION, {"pick": "a"}, context=exact)}),
-                          type(None))
-    with pytest.raises(ValueError):
-        fit.map({"example": Example("one two", QUESTION, {"pick": "a"}, context=over)})
+    fitted = fit.map({"example": Example("one two", QUESTION, {"pick": "a"}, context=over)})
+    assert isinstance(fitted, dict) and fitted["_dew_cut"] == {"context": (1, 2)}
 
 
 def test_a_backbone_without_cross_attention_refuses_a_requests_context():

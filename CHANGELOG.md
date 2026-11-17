@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A decision's context longer than its cross-attention's room is now cut to its first tokens and the cut
+  told, where it was refused: a run's data report counts it (`data/cut/<corpus>/context`), and a served
+  answer states `usage.context_tokens` and `usage.context_kept`.
 - A decision row whose schema is read as its context (`Schema(stream="context")`) now reads its example's or
   request's own context too, after the schema, where both were refused together. The schema stays whole; the
   context keeps its first tokens in the room the schema leaves under the cross-attention's `context_length`,

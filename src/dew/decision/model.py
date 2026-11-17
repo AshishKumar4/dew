@@ -1,7 +1,8 @@
 """A backbone and a decision head, applied as two modules over one variables tree."""
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -10,10 +11,9 @@ from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
 from dew.decision.head import Head, answer_states
 from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import HOWS
-from dew.inputs.condition import BackboneCall
-from dew.inputs.encoders import BackboneContext, ContextTokens
+from dew.inputs.condition import BackboneCall, BackboneEncoder
 from dew.inputs.spec import Condition, encode_conditions
-from dew.nn.cross_attention import ContextEncoder
+from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
 from dew.nn.inspection import INSPECTED, QK, component, in_parts, observed_maxima
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
@@ -30,13 +30,38 @@ def context_streams(context: ContextEncoder) -> tuple[tuple[str, Condition], ...
             ("schema", Condition(BackboneContext("backbone"), field="context")))
 
 
-def _encoder_of(condition: Condition) -> ContextEncoder:
-    """How a stream's backbone encodes it (`BackboneContext.encoder`)."""
-    encoder = condition.encoder
-    if not isinstance(encoder, BackboneContext):
-        raise TypeError(f"a decision model's context streams are encoded by its backbone, not "
-                        f"{type(encoder).__name__}")
-    return encoder.encoder
+@dataclass(frozen=True)
+class BackboneContext(BackboneEncoder[Sequence[int]]):
+    """A stream of the model's own tokens its cross-attention reads (decision-inputs.md section 2), encoded
+    by the model itself (`dew.nn.cross_attention.encode_context`): `table`, each token's row of its own
+    token table, or `backbone`, its own final states over the stream in a pass of its own, a forward alone
+    where the model trains nothing but its cross-attention blocks. Its tokens are a `ContextTokens`."""
+
+    encoder: ContextEncoder = "table"
+    params: Variables = field(default_factory=dict, compare=False)
+    """None of its own: the model it conditions holds its weights."""
+    keyword: ClassVar[str] = "conditioning"
+
+    def encode_backbone(self, backbone: BackboneCall, tokens: ContextTokens) -> Mapping[str, jax.Array]:
+        return encode_context(backbone.module, backbone.variables, tokens.tokens, tokens.lengths,
+                              encoder=self.encoder, train=backbone.train, rngs=backbone.rngs,
+                              segments=tokens.segments, max_segments=tokens.max_segments,
+                              progress=backbone.progress)
+
+    def recorded_fields(self) -> Mapping[str, object]:
+        return {"encoder": self.encoder}
+
+
+@dataclass(frozen=True)
+class ContextTokens:
+    """A context stream's tokens as a window packs them: `tokens` `[B, C]`, each row's first `lengths` real,
+    and where a row packs several documents' contexts, each token's document (`segments`), at most
+    `max_segments` a row (`dew.nn.cross_attention.encode_context`)."""
+
+    tokens: jax.Array
+    lengths: jax.Array
+    segments: jax.Array | None = None
+    max_segments: int = 1
 
 
 @dataclass(frozen=True)
@@ -66,14 +91,14 @@ class DecisionModel(HeadedModel):
 
     def stream(self, spans_in_context: bool) -> Condition:
         """The stream a row's context is: the schema's where the row reads its schema in its context
-        (`DecisionInputs.spans_in_context`), else the context's."""
-        return dict(self.conditions)["schema" if spans_in_context else "context"]
+        (`DecisionInputs.spans_in_context`), the backbone's own pass, else the context's."""
+        return Condition(BackboneContext("backbone" if self.own_pass(spans_in_context) else "table"),
+                         field="context")
 
     def own_pass(self, spans_in_context: bool) -> bool:
         """Whether the stream a row's context is (`stream`) is the backbone's own pass over it, which a
         step counts the work of (`dew.decision.DecisionObjective`), rather than its token table."""
-        return _encoder_of(self.stream(spans_in_context)) == "backbone"
-
+        return spans_in_context or self.context_encoder == "backbone"
 
     def reads_progress(self) -> bool:
         """Whether its backbone's computation changes over a run (`dew.nn.progress.ReadsProgress`)."""
@@ -160,7 +185,7 @@ class DecisionModel(HeadedModel):
                                    inputs.max_segments)
             live = BackboneCall(self.backbone, part(variables, "backbone"), train, rngs, progress)
             conditioning = encode_conditions((("stream", stream.encoder),), {}, {"stream": tokens},
-                                             backbone=live)["stream"]
+                                             path="DecisionModel", backbone=live)["stream"]
             spanned = conditioning[CONTEXT] if inputs.spans_in_context else None
         if media is not None:
             if inputs.slots is not None or inputs.streams is not None:

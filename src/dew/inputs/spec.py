@@ -372,18 +372,21 @@ class AudioCondition:
 
 
 def encode_conditions(encoders: Sequence[tuple[str, ConditionEncoder]], weights: Mapping[str, Variables],
-                      tokens: Mapping[str, object], *, backbone: BackboneCall | None = None) -> dict:
+                      tokens: Mapping[str, object], *, path: str,
+                      backbone: BackboneCall | None = None) -> dict:
     """Each of `encoders` (`InputSpec.encoders`) over the tokens under its keyword, with the weights
     under its keyword, or, for an encoder that reads the backbone (`BackboneEncoder`), with the live model
     `backbone`, which no other encoder is handed: the conditions a model is passed, by keyword. The one
     encoding a training step (`DiffusionObjective.encode`), a sampling task (`TextToImage`) and a
-    decision model's context streams (`dew.decision.DecisionModel`) run."""
+    decision model's context streams (`dew.decision.DecisionModel`) run, the one it is named by `path`: a
+    path that hands no model refuses an encoder that reads one, naming the path, as no such encoder can run
+    there."""
     def encoded(keyword: str, encoder: ConditionEncoder):
         match encoder:
             case BackboneEncoder():
                 if backbone is None:
-                    raise TypeError(f"{type(encoder).__name__} encodes with the model it conditions, which "
-                                    "this encoding was not handed")
+                    raise TypeError(f"condition {keyword!r}: {type(encoder).__name__} encodes with the model "
+                                    f"it conditions, which {path} has none of to hand it")
                 return encoder.encode_backbone(backbone, tokens[keyword])
             case _:
                 return encoder.encode(weights[keyword], tokens[keyword])

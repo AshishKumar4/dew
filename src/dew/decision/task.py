@@ -51,6 +51,7 @@ from dew.decision.layout import (
     Laid,
     Layout,
     Specials,
+    context_tokens,
     per_question,
     render,
     with_context,
@@ -224,10 +225,18 @@ class Usage:
     state_tokens: int
     state_kept: int
     cut: Mapping[str, tuple[int, int]] = field(default_factory=dict)
+    context_tokens: int = 0
+    """The tokens of the request's own context, whole (`context_tokens`), of which its rows read
+    `context_kept`."""
 
     @property
     def truncated(self) -> bool:
         return self.state_kept < self.state_tokens
+
+    @property
+    def context_kept(self) -> int:
+        """The tokens of the request's context its rows read, its first, the rest a `context` cut."""
+        return self.context_tokens - self.cut.get("context", (0, 0))[1]
 
     @property
     def trimmed(self) -> bool:
@@ -1391,6 +1400,9 @@ class Decide(SavedRunTask, InItsForm):
         """A Jev response body of a request's answers and usage."""
         gated = self.calibration.abstention is not None
         reported: dict[str, JSON] = {"input_tokens": usage.input_tokens, "output_tokens": 0}
+        if usage.context_tokens:
+            # Every caller whose context its rows cut is told so in its own answer, details or not.
+            reported.update(context_tokens=usage.context_tokens, context_kept=usage.context_kept)
         if details:
             reported.update(state_tokens=usage.state_tokens, state_kept=usage.state_kept,
                             truncated=usage.truncated,
@@ -1674,7 +1686,9 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
             with self.counting:
                 self.counts.dropped(Rejected(refused.reason))
             raise
-        usage = usage_of([row.encoded for row in rows])
+        # The request's context, whole, which its answer states it read part of where its rows cut it.
+        usage = replace(usage_of([row.encoded for row in rows]),
+                        context_tokens=len(context_tokens(decide.tokenizer, context)))
         if self.whole and (usage.truncated or usage.trimmed):
             # Counted as a run counts a row it refused: its reason and the tokens its cut removed.
             removed = {kind: tokens for kind, (_, tokens) in usage.cut.items()}

@@ -336,34 +336,28 @@ def render(value: JSON) -> str:
             return json.dumps(value, ensure_ascii=False)
 
 
-def context_tokens(tokenizer: Tokenizer, context: JSON | None, length: int | None) -> np.ndarray:
-    """A context's tokens as a row carries them: its text's (`render`), without specials, and none for
-    no context. A context of more than `length` tokens, which the cross-attention reads no more of,
-    is refused (ValueError), never cut: a cut would answer from part of what the caller gave; None
-    reads it whole, as a count of a context no cross-attention reads does."""
+def context_tokens(tokenizer: Tokenizer, context: JSON | None) -> np.ndarray:
+    """A context's tokens, whole, as a row reads them: its text's (`render`), without specials, and none
+    for no context. A row keeps those its cross-attention has room for (`with_context`)."""
     if context is None:
         return np.zeros(0, np.int32)
-    tokens = rendered_chunks([Chunk(render(context))], tokenizer, "pieces").tokens
-    if length is not None and len(tokens) > length:
-        raise ValueError(f"the context is {len(tokens)} tokens, more than the {length} its cross-attention "
-                         "reads (context_length)")
-    return np.asarray(tokens, np.int32)
+    return np.asarray(rendered_chunks([Chunk(render(context))], tokenizer, "pieces").tokens, np.int32)
 
 
 def with_context(rows: Sequence[Encoded], tokenizer: Tokenizer, context: JSON | None,
                  length: int | None) -> list[Encoded]:
     """`rows` with the context a backbone's cross-attention of `length` context tokens reads beside
     each (None: a backbone with none): a schema laid out as the rows' context (`Schema.stream`), read
-    whole, and after it `context`, a request's or an example's own, in the room the schema leaves, its
-    first tokens, the rest cut and counted (`Encoded.context_cut`, a `context` cut a run's data report and
-    a server's usage report); or else `context` alone, its first `length` tokens (`context_tokens`). The
+    whole, then `context`, a request's or an example's own, in the room the schema leaves, or `length`
+    where no schema is; of a context longer than its room its first tokens, the rest cut and counted
+    (`Encoded.context_cut`, a `context` cut a run's data report counts and a served answer states). The
     one resolution of a row's context, which a run's encoding and a task's admission both read. Refused
     (ValueError): a context with no cross-attention to read it, and a schema longer than `length`."""
     if any(row.spans_in_context for row in rows):
         if length is None:
             raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
                              "layers to read it (Pretrained.with_cross_attention)")
-        given = context_tokens(tokenizer, context, None)
+        given = context_tokens(tokenizer, context)
         beside = []
         for row in rows:
             if row.context is None:
@@ -381,8 +375,9 @@ def with_context(rows: Sequence[Encoded], tokenizer: Tokenizer, context: JSON | 
     if length is None:
         raise ValueError("a request's context is read by a backbone's cross-attention, which this "
                          "backbone does not have")
-    tokens = tuple(context_tokens(tokenizer, context, length).tolist())
-    return [dataclasses.replace(row, context=tokens) for row in rows]
+    given = context_tokens(tokenizer, context)
+    kept = tuple(given[:length].tolist())
+    return [dataclasses.replace(row, context=kept, context_cut=len(given) - len(kept)) for row in rows]
 
 def _conversation(state: JSON) -> bool:
     """Whether `state` is a conversation, a list of turns, which keeps its newest turns (Laya's agent)."""
