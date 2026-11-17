@@ -86,13 +86,24 @@ def test_an_image_prompt_is_on_par_with_the_releases(vision_source):
     """The vision half over drawn image prompts its selections clear: the span the image fills, the
     prefill's logits with it and each teacher-forced text step's after it, through Dew's cache
     (`vision_run`), on par with the release's from its float64 run's (check 1, the recording's), Dew's
-    own float64 run of the bundle its truth (row 354)."""
+    own float64 run of the bundle its truth (row 354): the span, and one full pass over the prompt and
+    its steps, a float64 truth's products rounding alike at every shape (`model_support.called_outputs`,
+    ledger 1543), where its prefill and steps compiled three programs more (row 7389)."""
     from model_support import float64_twin, recorded_site
 
-    from tools.deepseek_v41_numerics import vision_run
+    from tools.deepseek_v41_numerics import unquantized, vision_run
 
     loaded, prompts, shape = vision_source
     wide = float64_twin(loaded.model)
+    # The quantizers off, as the reference ran (`vision_run`).
+    plain = wide.clone(language_model=unquantized(wide.language_model))
+    span = jax.jit(lambda variables, media: plain.apply(
+        variables, media, method=lambda module, pixels: module.conditioner(pixels)))
+    whole = jax.jit(lambda variables, ids, indices, media: plain.apply(
+        variables, ids, image_indices=indices, conditioning=media))
+    prompt = int(shape["decode_prompt"])
+    images = shape["token_types"] >= 0
+    indices = jnp.asarray(np.where(images, np.cumsum(images, -1) - 1, -1))
 
     def leaves(model, variables, prompt) -> dict:
         span, prompt_logits, steps = vision_run(model, variables, {**prompt, **shape})
@@ -100,8 +111,11 @@ def test_an_image_prompt_is_on_par_with_the_releases(vision_source):
 
     def twin(inputs):
         with jax.enable_x64(new_val=True):
-            return leaves(wide, float64_held(loaded.variables),
-                          {**inputs, "pixels": jnp.asarray(inputs["pixels"], jnp.float64)})
+            variables = float64_held(loaded.variables)
+            media = {"pixel_values": jnp.asarray(inputs["pixels"], jnp.float64)[None, None]}
+            logits = whole(variables, jnp.asarray(inputs["input_ids"]), indices, media)
+            return {"vision_span": span(variables, media)[0], "vision_prompt_logits": logits[:, :prompt],
+                    "vision_decode_logits": logits[:, prompt:]}
 
     site = "deepseek v41 vision"
     draw, recorded, truth, seeds = recorded_site(VISION_RECORDING, site, lambda seed: prompts[int(seed)],
