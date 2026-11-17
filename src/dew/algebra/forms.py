@@ -73,7 +73,10 @@ class Derived(NamedTuple):
     forms: a mainloop's accumulator, a compensated walk's running sums, a guard's shifted ones), the factor a
     row's, the parts the rules state (`derive.rescaled_by`, `summand`), each evaluated once), and with
     `outputs` (places) returns those of the tile's outputs along the walked axis beside the state, by the
-    same evaluation; its `merge(a, b, operands=None, shapes=, merged=)` (a mainloop's own merge,
+    same evaluation, and with `anchor(old, exact)` carries its sums at the anchor it picks for each walked
+    maximum from its carried value and the tile's joined one (a lazy rescale's: the old one kept unless the
+    tile passes it by a margin, the factor then exactly 1; `derive._anchored`), its merges the exact maxima's;
+    its `merge(a, b, operands=None, shapes=, merged=)` (a mainloop's own merge,
     `merged(firsts, seconds, parts)`, called once with each state's `Merged` factors or None, as `stepped`)
     and `finish(state, operands=None, shapes=)` read the state (and the unwalked operands given) by the forms
     of the walk whose tiles were of `shapes` (`init`'s), named, as a state's values alone name no walk (a
@@ -287,7 +290,8 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
               chosen: Mapping[Hashable, terms.Term] | None = None,
               exponential: tuple[str, Callable[..., jax.Array]] | None = None,
               named: Callable[[terms.Term, terms.Term], str] | None = None,
-              rescale: Callable[[jax.Array, jax.Array], jax.Array] | None = None
+              rescale: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
+              adjusted: Mapping[Hashable, Callable[[jax.Array], jax.Array]] | None = None
               ) -> Callable[[terms.Term], jax.Array]:
     """The values of a region's forms, each term once however many forms read it: its leaves the given values
     (`leaves`, by index; None for one no form reads) and the outputs of the region's equations outside the
@@ -299,7 +303,8 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
     language's name of its base and its function, `exponential(x, scale=1.0)`,
     `derive.Reduction.exponential`; a product with a literal its `scale`, `_scaled`) and each rescale of
     two anchors by the declaration's (`rescale`, `terms.RESCALE`), every other term the engine's
-    (`terms.value_of`)."""
+    (`terms.value_of`); a term `adjusted` names (by `terms.key`) its value passed through its function, every
+    form reading it reading that (a walk's anchor, `derive.Derived.step`)."""
     values = dict(known)
     outside = {leaf: opaque for opaque in region.opaque for leaf in opaque.outputs}
     given = dict(enumerate(leaves))
@@ -345,6 +350,8 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
         else:
             # Every leaf is read above.
             made = terms.value_of(term, value, region, ())
+        if adjusted is not None and key in adjusted:
+            made = adjusted[key](made)
         values[key] = made
         return made
 

@@ -280,7 +280,8 @@ def _placed_step(walk: _Backward, rows_of, coords_of, dq_added, index, slots, ca
 class _PlacedDq:
     """A fused keys-first walk's dQ (`_placed_step`'s `dq_added`): each compute warpgroup's stage of its
     step's score cotangents (`staged(turn)`, `[bk, bq]`), and its step's dQ halves added into the call's at a
-    query tile (`added(halves, first query, turn)`) through its output stage, a stage of columns at a time."""
+    query tile (`added(halves, first query, turn)`) through its turn's output stage, a stage of columns at a
+    time, the step before's reduces through the other turn's stage still reading."""
 
     walk: _Backward
     dq_ref: Any
@@ -294,12 +295,16 @@ class _PlacedDq:
         row, head = self.place
         family, rows = self.walk.program.family, self.walk.program.tiles.block_q
         view = self.dq_ref.at[turn if self.walk.interpret else 0, row, pl.ds(q_first, rows), head]
+        smem = self.stages[1].at[turn]
+        # The reduces a step issues, a stage's columns each (`mosaic.chunked`): the step before's, through
+        # the other turn's stage, left reading while this step's first rewrites its own (`Family.added`'s
+        # `pending`), where waiting on them stalled the compute warpgroup on its own reduces.
+        issued = sum(-(-half.shape[1] // smem.shape[-1]) for half in halves)
         first = 0
-        for half in halves:
+        for index, half in enumerate(halves):
             columns = half.shape[1]
-            # A stage's columns at a time (`Family.added`'s chunks).
-            family.added(half, view.at[:, pl.ds(first, columns)], self.walk.interpret,
-                         smem=self.stages[1].at[turn])
+            family.added(half, view.at[:, pl.ds(first, columns)], self.walk.interpret, smem=smem,
+                         pending=issued if index == 0 else 0)
             first += columns
 
 

@@ -257,10 +257,16 @@ def planned(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     rows, row_spans, initial = packed(query, spans, kv_heads, hooks.initial)
     whole = dataclasses.replace(hooks, initial=initial)
     target = generation.gpu_target()
+    planned_walk = functools.partial(plan, rows, key, value, row_spans, whole, scale=scale, target=target,
+                                     table=table, sources=sources, scales=scales, in_key=in_key)
+    # The plain walk first: where its family decides a scaled second walk in its launch
+    # (`MosaicForward.deciding`), it is the step's one walk, whatever its rows' sums can reach.
+    plain = planned_walk(walk="plain")
+    if plain is not None and not attention_mosaic.bundle_of(plain.config, rows.dtype).places_on_role:
+        return {"plain": plain}, rows, row_spans, whole
     work = {}
     for walk in launched(query, value, scales):
-        found = plan(rows, key, value, row_spans, whole, scale=scale, target=target, table=table,
-                     sources=sources, scales=scales, walk=walk, in_key=in_key)
+        found = plain if walk == "plain" else planned_walk(walk=walk)
         if found is None:
             return None, rows, row_spans, whole
         work[walk] = found

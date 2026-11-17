@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import functools
 import itertools
 import math
 import time
@@ -719,10 +720,11 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                 for side, state in enumerate(states)
                 for index in range(len(made.reductions))}
 
-    def step(state, tiles, *, product=None, stepped=None, outputs: Sequence[int] = ()):
+    def step(state, tiles, *, product=None, stepped=None, outputs: Sequence[int] = (), anchor=None):
         made = forms(shaped(tiles))
         value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)],
-                          carried(made, state), product=product, **declared)
+                          carried(made, state), product=product, **declared,
+                          adjusted=None if anchor is None else _anchored(made, state, anchor))
         # The tile's outputs along the walked axis `outputs` names (by place), by the same evaluation: a
         # term both read, once.
         along = []
@@ -783,6 +785,36 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
     return Derived(init, step, merge, finish, mapped,
                    {"rounding": "reorders", "walked": declaration.walked, "exponent": declaration.exponent,
                     "rules": ("walking", "decoupled")}, slots=slots)
+
+
+def _anchored(made: _Forms, state, anchor: Callable) -> dict:
+    """A step's anchors (`Derived.step`'s `anchor`): each walked maximum's new value, its carried one and the
+    tile's joined (`max(old, tile)`, floored where its declaration floors it), passed through
+    `anchor(old, exact)`, the value the step's sums are carried at and its state keeps, by its key in the
+    forms (`forms.evaluator`'s `adjusted`). A sum carried at any anchor is the declared function's, its merge
+    the exact maxima's (`merge`); its weights then reach `exp(tile - anchor)`, past 1 where the anchor is
+    below the tile's maximum. Refused where a step reads its maximum but through its exponent (the held
+    weights' select, `x < m`, an accurate form's: exactly 0 at the maximum, which a lower anchor makes
+    false), and where no sum reads the maximum the step keeps (the anchor would reach no weight)."""
+    adjusted = {}
+    for index, (reduction, form) in enumerate(zip(made.reductions, made.steps, strict=True)):
+        if _role(reduction) != "max":
+            continue
+        kept = terms.key(form)
+        others = [other for place, other in enumerate(made.steps) if place != index]
+        read = [term for other in others for term in terms.subterms(other)]
+        if not any(terms.key(term) == kept for term in read):
+            raise Refused(f"{reduction}: no sum of the walk reads the maximum its step keeps, so an anchor "
+                          "would reach no weight")
+        for term in read:
+            args = get_callable_args(term, Term.compare)
+            if args is not None and any(terms.key(read_term) == kept for arg in args if isinstance(arg, Term)
+                                        for read_term in terms.subterms(arg)):
+                raise Refused(f"{reduction}: a step compares its values with the maximum it keeps (the held "
+                              "weights' select), which a lower anchor makes false: an anchor of an accurate "
+                              "form's walk")
+        adjusted[kept] = functools.partial(anchor, state[index])
+    return adjusted
 
 
 def _role(reduction: Term) -> str:

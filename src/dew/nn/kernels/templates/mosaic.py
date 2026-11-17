@@ -591,6 +591,30 @@ class Kept:
 
 
 @dataclasses.dataclass(frozen=True)
+class Decided:
+    """A walk its program's consumers decide to take again, over the same steps, after the walk before it
+    (`Transport.stream`'s `again`, `Family.walk_own`'s `counted`): each consumer's verdict a word of its own
+    (`words`, `Transport.decided_scratch`'s) published at a barrier of the consumers' arrivals, which the
+    producer and every consumer wait on, so all of them read the same words and walk again, or none does."""
+
+    words: Any
+    barrier: Any
+    consumers: int
+
+    def stated(self, wg, verdict: jax.Array) -> jax.Array:
+        """Consumer `wg`'s `verdict` (a scalar, uniform over its warpgroup) published, and whether any
+        consumer's takes the walk again (`taken`)."""
+        self.words[wg] = verdict.astype(jnp.int32)
+        plgpu.barrier_arrive(self.barrier)
+        return self.taken()
+
+    def taken(self) -> jax.Array:
+        """Whether some consumer's published verdict takes the walk again, read once every consumer's is."""
+        plgpu.barrier_wait(self.barrier)
+        return functools.reduce(operator.or_, (self.words[index] for index in range(self.consumers))) != 0
+
+
+@dataclasses.dataclass(frozen=True)
 class Walk:
     """A program's walk of its tile, its steps storing what it computes (no accumulator past them, and its
     `carry`, from its value here, only between them: a per-key memory's gradients across key blocks):
@@ -1663,17 +1687,19 @@ class Transport[Allocated, Opened](abc.ABC):
         return streams
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0) -> R:
         """Consumer `wg`'s walk of its own steps `own` (`lo`, `hi`) among its program's `streamed` ones,
         `walk(streams, lo, hi, first)` its walk of steps `lo` to `hi` counted from `first`: on a layout with a
         producer, the steps before and after its own passed (`passed`, `between()` after each), which its
         partners read; on one whose consumers feed their rings (`ConsumerFed.walk_own`), every streamed step
-        over its own feed (`fed`), a step none of its own masked by its step. Returns `walk`'s value."""
+        over its own feed (`fed`), a step none of its own masked by its step. `counted` turns past the rings'
+        first, a decided walk's second pass over the same steps (`Decided`). Returns `walk`'s value."""
         del views, wg
         lo, hi = own
-        self.passed(streams, streamed[0], lo, first=streamed[0], between=between)
-        walked = walk(streams, lo, hi, streamed[0])
-        self.passed(streams, hi, streamed[1], first=streamed[0], between=between)
+        first = streamed[0] - counted
+        self.passed(streams, streamed[0], lo, first=first, between=between)
+        walked = walk(streams, lo, hi, first)
+        self.passed(streams, hi, streamed[1], first=first, between=between)
         return walked
 
     def run(self, allocated: Allocated, walk: Walk, interpret: bool, *, floor: int | None = None,
@@ -1738,9 +1764,16 @@ class Transport[Allocated, Opened](abc.ABC):
         return {name: ring.acquire(ring.turn(0)) for name, ring in held.items()}
 
     @abc.abstractmethod
-    def stream(self, streams, views: dict, lo, hi) -> None:
+    def stream(self, streams, views: dict, lo, hi, *, again: "Decided | None" = None) -> None:
         """The producer's loads of steps `lo` to `hi` from `views` (`opened`'s), where the family has one
-        (`streamed`)."""
+        (`streamed`); with `again`, the same steps once more where its consumers take their walk again
+        (`Decided.taken`), the rings' turns running on past the first pass."""
+
+    def decided_scratch(self, consumers: int) -> dict:
+        """The scoped allocations a decided walk's verdicts take (`Decided`): a word each of `consumers`
+        consumers and the barrier they publish them at."""
+        return {"words": plgpu.SMEM((consumers,), jnp.int32),
+                "barrier": plgpu.Barrier(num_arrivals=consumers)}
 
     @abc.abstractmethod
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
@@ -2242,13 +2275,15 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         # Its once streams held apart, one deep, beside its rings.
         return self.opened(allocated, views), views, self.opened(once, once_views)
 
-    def stream(self, streams, views: dict, lo, hi) -> None:
+    def stream(self, streams, views: dict, lo, hi, *, again: "Decided | None" = None) -> None:
         rings = tuple(streams.values())
 
         def tiles(index):
             return tuple(ring.viewed(views[name], index) for name, ring in zip(streams, rings, strict=True))
 
         streamed(rings, tiles, lo, hi)
+        if again is not None:
+            pl.when(again.taken())(lambda: streamed(rings, tiles, lo, hi, counted=hi - lo))
 
     def output_staging(self, outputs: tuple, consumers: int) -> list:
         # Each consumer's share of each output in two chunk buffers, not the whole tile (`output_staging`).

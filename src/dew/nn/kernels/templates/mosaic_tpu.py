@@ -330,9 +330,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             raise ValueError("a TPU ring's streams take their views where they open (its walk copies)")
         return Streams(allocated, views)
 
-    def stream(self, streams, views, lo, hi) -> None:
-        # No producer role: the walk issues its own copies.
-        del streams, views, lo, hi
+    def stream(self, streams, views, lo, hi, *, again=None) -> None:
+        # No producer role: the walk issues its own copies, a decided walk's second pass's too.
+        del streams, views, lo, hi, again
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
@@ -423,11 +423,11 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         return carry
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0) -> R:
         # One role a core: no partner reads a step it passes, so it walks its own steps alone.
         del views, wg, between
         lo, hi = own
-        return walk(streams, lo, hi, streamed[0])
+        return walk(streams, lo, hi, streamed[0] - counted)
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         # Its walk copies only the steps it reads: a passed step loads nothing.

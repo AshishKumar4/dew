@@ -1483,11 +1483,18 @@ def bounded_past(largest: jax.Array, *, keys_axis: int, initial: jax.Array | Non
     return bound >= np.float32(2.0 ** (HEADROOM - 1 - BOUND_UNIT))
 
 
-def _queries_taken(coords: Coords, factor: jax.Array | None, held: Scaled | None, acc):
-    """`carry_factor` on a mainloop's own sums `acc` (`Keys.accumulate`'s `scale`), each query's factor
-    (none where None) and its change of scale broadcast over its sums as the mainloop holds them."""
-    taken = acc if factor is None else coords.queries(factor, acc) * acc
-    return taken if held is None else power2(taken, coords.queries(held.drop, acc))
+@dataclasses.dataclass(frozen=True)
+class Taken:
+    """`carry_factor` on a mainloop's own sums (`Keys.accumulate`'s `scale`, called on them): each query's
+    factor (none where None) and its change of scale (`held`) broadcast over its sums as the mainloop holds
+    them, its factor stated beside the call that applies it."""
+    coords: Coords
+    factor: jax.Array | None
+    held: Scaled | None
+
+    def __call__(self, acc):
+        taken = acc if self.factor is None else self.coords.queries(self.factor, acc) * acc
+        return taken if self.held is None else power2(taken, self.coords.queries(self.held.drop, acc))
 
 
 Gathered = Callable[[jax.Array], jax.Array]
@@ -1620,7 +1627,7 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
         if keys.accumulate is None:
             acc = power2(state.acc, expand(drop, state.acc)) + summed_products(parts, value, keys.dot)
         else:
-            rescale = functools.partial(_queries_taken, keys.coords, None, held)
+            rescale = Taken(keys.coords, None, held)
             acc = keys.accumulate(state.acc, rescale, parts, value)
         total = power2(state.total, drop) + power2(p.sum(axis=-1), -held.exponent, reach=2 * 127)
         return (Partial(acc, state.m, total, scale), anchor, power2(own, drop) + own_tile,
@@ -2257,6 +2264,37 @@ def _softmax(spec: Forward, state: Partial, keys: Keys):
     return m, added.factor, added.terms, accumulated.values
 
 
+KEY_BINADES = 31
+"""The binades a call's key count stays below: its positions are int32."""
+
+
+def lazy_margin(spec: Forward, weights) -> float | None:
+    """The margin, in the walk's logits' units (binades where it folds to base 2, `Forward.base2`, else
+    nats), by which a tile's maximum may pass a row's kept one before the walk
+    moves its anchor (`lazy_anchor`), or None where it moves on every larger maximum: the accurate form's
+    (`Forward.natural`), whose held weights assume their anchor at least every logit (`derive`'s select of
+    `exp(x - b)` under `b >= x`), and a compensated walk's. A kept anchor leaves each weight at most
+    `2^margin`, so the margin is the least of the binades above 1 its product's narrowed weights hold
+    (`weights`' largest exponent: fp16's 15) and those the scaled walk's bound leaves for its keys
+    (`BOUND_UNIT` less `KEY_BINADES`: each term of `weighed_reach` a weight times a value below 2^128, held at
+    `2^-BOUND_UNIT`, summed over fewer than `2^KEY_BINADES` keys); an unscaled walk (fp16's values,
+    `headroom`) adds at most its keys times fp16's largest times that weight, far below fp32's largest. A
+    kept anchor's factor is exactly 1, so a mainloop whose sums live apart (tcgen05's tensor memory) skips
+    their rescale where no row's anchor moved."""
+    if spec.natural or spec.compensated:
+        return None
+    binades = min(jnp.finfo(weights).maxexp - 1, BOUND_UNIT - 1 - KEY_BINADES)
+    return float(binades if spec.base2 else binades * np.log(2.0))
+
+
+def lazy_anchor(margin: float | None) -> Callable | None:
+    """The walk's anchor (`forms.step`'s `anchor`): a row's maximum kept unless the tile's passes it by more
+    than `margin` (`lazy_margin`), then the tile's; None where the walk anchors at every larger maximum."""
+    if margin is None:
+        return None
+    return lambda kept, exact: jnp.where(exact > kept + np.float32(margin), exact, kept)
+
+
 def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     """The state after a tile `keys` by the derived forms: the tile's logits (-inf where a query does not see
     a key, as `modify` writes them) and values, its maximum, rescale and weights the forms'; the weighted
@@ -2297,7 +2335,7 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
                          else tile_parts(added.terms, held, value.dtype, multiplier, bound, axis=axis))
                 # The weighted values' sums taken by their factor, a row's (none where the forms state none),
                 # and a scaled tile's change of scale.
-                taken = functools.partial(_queries_taken, keys.coords, accumulated.factor, held)
+                taken = Taken(keys.coords, accumulated.factor, held)
                 acc = held_by(states[fields.index("acc")], taken, parts, value)
                 return Partial(acc, state.m, total, scale)
             # The template's step over the forms' weights (the denominator's terms, before their narrowing
@@ -2314,7 +2352,7 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
 
     derived = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
                          stepped=None if held_by is None and plain and state.scale is None and drop is None
-                         else own)
+                         else own, anchor=lazy_anchor(lazy_margin(spec, keys.values.dtype)))
     found = Partial(**dict(zip(fields, derived, strict=True)))
     return found if not after else found._replace(scale=after[0].scale, low=after[0].low)
 

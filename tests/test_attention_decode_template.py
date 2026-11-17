@@ -77,6 +77,56 @@ def _operands(query_shape: tuple[int, ...], keys: int):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("device", ["sm90", "sm80"])
+def test_a_decode_steps_rows_whose_sums_pass_fp32s_largest_walk_again_scaled_interpreted(device):
+    """A bf16 decode step (`attention_decode.attend`) whose first row's values are near 2^126, so its walk's
+    unscaled sums pass fp32's largest, beside a row of ordinary values, interpreted as an H100 or an A100
+    runs it: on par with the reference path (check 1), the first row's programs walking their keys again
+    scaled in their launch (`mosaic.Decided`) and the second's not, with no pass over the values before
+    the launch to choose its walk."""
+    positions, heads, kv_heads = CALLS["one-query"]
+    spans = _spans(positions)
+    drawn = _drawn(positions, heads, kv_heads, jnp.bfloat16)
+
+    def draw(seed: int):
+        query, key, value, _ = drawn(seed)
+        return query, key, value.at[0].multiply(jnp.bfloat16(2.0 ** 126))
+
+    def ours(query, key, value):
+        with generation.assumed(device):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    def reference(query, key, value):
+        return template.reference(query, key, value, spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template decode {device} past fp32's largest",
+                    seeds=SEEDS)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("device", ["sm90", "sm80"])
+def test_a_decode_step_over_a_value_it_reads_not_a_number_is_the_references_interpreted(device):
+    """A bf16 decode step whose first row reads a value of NaN at one key: its rows' sums are no number, so
+    its programs walk their keys again scaled, and the step's output is NaN where the reference path's is,
+    never made finite; the second row, its values ordinary, bit for bit its own without the NaN beside it."""
+    positions, heads, kv_heads = CALLS["one-query"]
+    spans = _spans(positions)
+    query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
+    poisoned = value.at[0, 5, 0, 3].set(jnp.nan)
+    ours = np.asarray(_assumed_attend(device, query, key, poisoned, spans), np.float32)
+    theirs = np.asarray(template.reference(query, key, poisoned, spans), np.float32)
+    np.testing.assert_array_equal(np.isnan(ours), np.isnan(theirs))
+    assert np.isnan(theirs[0]).any() and not np.isnan(theirs[1]).any()
+    alone = np.asarray(_assumed_attend(device, query, key, value, spans), np.float32)
+    np.testing.assert_array_equal(ours[1].view(np.uint32), alone[1].view(np.uint32))
+
+
+def _assumed_attend(device: str, query, key, value, spans):
+    with generation.assumed(device):
+        return attention_decode.attend(query, key, value, spans, interpret=True)
+
+
+@INTERPRETS
 @pytest.mark.parametrize("hook", HOOKS)
 @pytest.mark.parametrize("call", CALLS)
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])

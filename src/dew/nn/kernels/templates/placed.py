@@ -119,10 +119,10 @@ class Tcgen05Placed(Tcgen05Rings):
                                   handoffs.Role("issuer", warp=True, weight=0)), floor=producer)
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0) -> R:
         # Its consumer reads no ring (its issuer does): no step it passes.
         del views, wg, between
-        return walk(streams, *own, streamed[0])
+        return walk(streams, *own, streamed[0] - counted)
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
                         ahead: tuple[int, ...] = (), sums: tuple[int, ...] = (),

@@ -1782,12 +1782,15 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     block_q, block_k = tiles.block_q, tiles.block_k
     if family.places_on_role:
         # A consumer of products a role issues (`Issuer.places_on_role`, tcgen05's rows): its rows' maxima
-        # and denominators carried, and at a step's widest its logits read from tensor memory beside their
-        # weights, fp32 (its sums kept there, rescaled a block of columns at a time once the weights are
-        # written; its mask's places a row's scalar beside constant columns). A thread holds its row: ptxas
-        # held the 4B call's 128 x 64 walk at width 256 in 196 registers (et-rows-abi).
+        # and denominators carried, and at a step's widest its logits read from tensor memory, fp32, beside
+        # their weights narrowed to the operands' dtype for the product, two to a register where 16-bit (its
+        # sums kept there, rescaled a block of columns at a time once the weights are written; its mask's
+        # places a row's scalar beside constant columns). A thread holds its row: ptxas held the 4B call's
+        # 128 x 64 walk at width 256 in 196 registers (et-rows-abi), and the 8B's at width 128 in 176 at
+        # 128 x 64 and 248 at 128 x 128, spilling none (et-sm100-128), where two fp32 tiles priced the
+        # 128-key tile past its budget.
         return resources.live_registers(family, [(block_q, 1, jnp.float32)] * 2,
-                                        [(block_q, block_k, jnp.float32)] * 2)
+                                        [(block_q, block_k, jnp.float32), (block_q, block_k, dtype)])
     hooked, vectors = _hook_live(family, block_q, block_k, params, held=True)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)

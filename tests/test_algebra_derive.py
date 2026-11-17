@@ -190,6 +190,79 @@ KEYED_SEEDS = 16
 """A declaration closing over a typed key's declared draws against its whole function (check 1)."""
 
 
+MARGIN = 4.0
+"""A lazy rescale's margin (`Derived.step`'s `anchor`): a row's maximum kept until a tile passes it
+by more."""
+
+
+def lazily(old, exact):
+    """A lazy rescale's anchor: the carried maximum kept unless the tile's joined one passes it by
+    `MARGIN`."""
+    return jnp.where(exact > old + MARGIN, exact, old)
+
+
+def lazy_whole(forms: derive.Derived):
+    """The declaration's derived step over every key tile in order, each carried at its lazy anchor
+    (`lazily`), finished: a function of (q, k, v)."""
+    def run(q, k, v):
+        values = operands(q, k, v)
+        tiles = [tile_of(values, tile) for tile in range(KEYS // TILE)]
+        state = forms.init(shaped(tiles[0]))
+        for tile in tiles:
+            state = forms.step(state, tile, anchor=lazily)
+        return forms.finish(state, values, shapes=shaped(tiles[0]))
+
+    return run
+
+
+def near_peaks(seed):
+    """`draw`'s operands with every logit within `MARGIN` of every other in its row, so a lazy walk keeps
+    its first tile's maximum and weighs later keys past 1."""
+    q, k, v = draw(seed)
+    q = q / jnp.max(jnp.abs(q), axis=-1, keepdims=True)
+    return q, k * (0.5 * MARGIN * WIDTH ** 0.5 / jnp.sqrt(WIDTH)), v
+
+
+@pytest.mark.parametrize("draws", [draw, near_peaks], ids=["drawn", "kept within the margin"])
+def test_a_walk_at_a_lazy_anchor_computes_the_declared_function(draws):
+    """The derived step carried at a lazy anchor (`Derived.step`'s `anchor`: the row's maximum kept unless
+    a tile passes it by a margin, the factor then exactly 1), finished: on par with the whole-operand
+    function (check 1), where the rows' maxima move and where every tile is kept, its weights past 1."""
+    forms = derive.derive(declared(attention), accurate=False, saturation=SATURATION)
+    assert_as_exact(jax.jit(lazy_whole(forms)), jax.jit(whole(attention)), draws,
+                    f"attention at a lazy anchor, {draws.__name__}", seeds=16)
+
+
+def test_a_kept_anchor_carries_the_state_by_exactly_one():
+    """A step whose lazy anchor keeps the carried maximum keeps that maximum, and each sum's factor is exactly
+    1 (`Accumulated`'s, `Added`'s: what a mainloop's own step takes), so a mainloop skips its rescale where
+    no row moved."""
+    forms = derive.derive(declared(attention), accurate=False, saturation=SATURATION)
+    values = operands(*near_peaks(0))
+    tiles = [tile_of(values, tile) for tile in range(2)]
+    first = forms.step(forms.init(shaped(tiles[0])), tiles[0])
+    factors = []
+
+    def stepped(states, parts):
+        factors.extend(part.factor for part in parts if part is not None and part.factor is not None)
+        return (None,) * len(states)
+
+    kept = forms.step(first, tiles[1], anchor=lambda old, exact: old, stepped=stepped)
+    np.testing.assert_array_equal(kept[0], first[0])
+    assert factors and all(np.all(np.asarray(factor) == 1) for factor in factors)
+
+
+def test_an_anchor_of_an_accurate_forms_held_weights_is_refused():
+    """A walk whose weights are held to 0 at the maximum by a select (`held`: the accurate form's, `x < m`)
+    is refused a lazy anchor at its step (`derive.Refused`): a lower anchor makes the select false where a
+    logit passes it and weighs that key 1, not its exponential."""
+    forms = derive.derive(declared(held), accurate=True, saturation=SATURATION)
+    values = operands(*draw(0))
+    tile = tile_of(values, 0)
+    with pytest.raises(derive.Refused):
+        forms.step(forms.init(shaped(tile)), tile, anchor=lazily)
+
+
 def test_a_declaration_closing_over_a_typed_key_derives():
     """A declared attention whose logits are scaled by a temperature drawn from a typed PRNG key it closes
     over (`jax.random.key`): its derivation reads each constant's magnitude, sign and dtype (`terms`), a

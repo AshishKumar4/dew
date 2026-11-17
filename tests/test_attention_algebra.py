@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from contract_support import normal_float32
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 from test_attention_template import CASES, ROWS, arguments
 from test_attention_triton import (
     BACKWARD_FORMS,
@@ -531,6 +531,84 @@ def test_a_padded_calls_padding_rows_stay_finite_and_read_zero():
         out = np.asarray(algebra.finish(spec, walked, initial=False)[0])
         assert np.isfinite(out).all()
         np.testing.assert_array_equal(out[queries:], 0.0)
+
+
+LAZY_SEEDS = 8
+"""The lazy walk's sites' declared draws (check 1), as sized."""
+
+LAZY_SCALES = {"base 2": 0.25, "natural": 1.0}
+"""A lazy walk's scales: one whose logits fold to base 2 (`Forward.base2`: the scale times log2(e) below 1)
+and one whose stay natural, its margin in nats (`algebra.lazy_margin`)."""
+
+
+def _lazy_spec(scale: float) -> algebra.Forward:
+    return algebra.Forward("full", 96, ids=False, scale=scale, natural=False,
+                           headroom=algebra.headroom(jnp.bfloat16))
+
+
+def _lazy_draw(rise):
+    """Three tiles of 32 keys' logits over 16 rows, in the walk's units, and their bf16 values 16 wide: each
+    tile's logits a normal draw plus `rise(tile)`, so a row's tile maxima rise by about that."""
+    def draw(seed):
+        streams = jax.random.split(jax.random.key(seed), 2)
+        logits = jax.random.normal(streams[0], (3, 16, 32), jnp.float32)
+        logits = logits + jnp.asarray([rise(tile) for tile in range(3)], jnp.float32)[:, None, None]
+        values = jax.random.normal(streams[1], (3, 32, 16), jnp.float32).astype(jnp.bfloat16)
+        return logits, values
+    return draw
+
+
+def _lazy_walk(spec):
+    """The walk's output over `logits` `[T, rows, keys]` (as `algebra.logits_of` gives them) and `values`
+    `[T, keys, width]`, a tile at a time by `algebra.plain_step`."""
+    def walk(logits, values):
+        tiles, rows, keys = logits.shape
+
+        def dot(a, b):
+            return jnp.matmul(a, b, preferred_element_type=jnp.float32)
+
+        state = algebra.started(spec, None, rows, values.shape[-1])
+        for tile in range(tiles):
+            coords = algebra.Coords(jnp.arange(rows)[:, None], tile * keys + jnp.arange(keys)[None, :])
+            tiled = values[tile]
+            operand = algebra.Operand(tiled.shape, tiled.dtype, lambda tiled=tiled: tiled)
+            state = algebra.plain_step(spec, state, algebra.Keys(coords, logits[tile], operand, dot))
+        return algebra.finish(spec, algebra.settled(state), initial=False)[0]
+    return walk
+
+
+def _exact_softmax(spec):
+    """The softmax at each row's exact maximum over every tile's keys, in the walk's base, as FlashAttention
+    takes it: its weights narrowed to the values' dtype for their product (fp32 sums), its denominator
+    fp32."""
+    exponential = jnp.exp2 if spec.base2 else jnp.exp
+
+    def softmax(logits, values):
+        joined = jnp.concatenate(list(logits), axis=-1)
+        weights = exponential(joined - jnp.max(joined, axis=-1, keepdims=True))
+        joined_values = jnp.concatenate(list(values), axis=0)
+        summed = jnp.matmul(weights.astype(joined_values.dtype), joined_values,
+                            preferred_element_type=jnp.float32)
+        return summed / jnp.sum(weights, axis=-1, keepdims=True)
+    return softmax
+
+
+@pytest.mark.parametrize("base", sorted(LAZY_SCALES))
+@pytest.mark.parametrize("family", ["within", "at"])
+def test_a_lazy_walks_kept_anchor_is_on_par_with_the_exact_maximum(family, base):
+    """The fold walk keeps a row's anchor while its tiles' maxima pass it by no more than the margin
+    (`algebra.lazy_anchor`, `algebra.lazy_margin` in the walk's units), so its weights exceed 1 (within it:
+    tiles rising by a quarter of it each; at it: the second tile's logits risen by it whole, a row's
+    anchor kept or moved by its noise): its output is on par with the softmax at each row's exact maximum
+    (check 1), jitted and op by op, its weights' factor exactly 1 wherever the anchor stays (the algebra's
+    cells for the lazy rescale)."""
+    spec = _lazy_spec(LAZY_SCALES[base])
+    margin = algebra.lazy_margin(spec, jnp.bfloat16)
+    rises = (0.0, margin / 4, margin / 2) if family == "within" else (0.0, margin, 0.0)
+    draw, walk = _lazy_draw(rises.__getitem__), _lazy_walk(spec)
+    for program, run in ((jax.jit(walk), "jitted"), (as_given(walk), "op by op")):
+        assert_as_exact(program, as_given(_exact_softmax(spec)), draw,
+                        f"a lazy walk {family} ({base}), {run}", seeds=LAZY_SEEDS)
 
 
 ANCHORED_SEEDS = 8
