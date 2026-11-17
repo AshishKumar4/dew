@@ -247,33 +247,44 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     assert LMRunConfig.load(str(tmp_path / "runs" / "second")).pretrained == str(source)
 
 
-def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, monkeypatch):
-    """A chat-format decision run, a joint head over Qwen 3.5's chat backbone, its rows framed as a
-    conversation by the backbone's chat template, saved, is a source a second decision run names
-    (`--pretrained <run>`): its release, written by `dew export` and by its task's `save_pretrained`,
-    reloads answering as the run's task serves its written weights, bit for bit; the second run trains
-    on from the first's final weights, head and backbone, its record names the run and step it read, and
-    its task loads and answers (a run from a finished chat-format run, which the export's Laya-only
-    layout refused: "Laya's layout is a marker row over a Hugging Face tokenizer", row 4310); and a
-    third, naming a head of its own, draws it fresh over the first's backbone and trains (it was refused:
-    "a decision release reads with its own")."""
+def joint_flags() -> list[str]:
+    """A chat-format decision run's flags: a joint head over Qwen 3.5's chat backbone, its rows framed as a
+    conversation by the backbone's chat template."""
     from run_kinds import QWEN_TINY
 
-    from dew.decision import Choice, Decide
+    return ["--pretrained", str(QWEN_TINY), "head:joint-shape", "--head.width", "16",
+            "--head.routing-layers", "1", "--head.layers", "1", "--head.heads", "2",
+            "--head.feedforward", "32", "--max-len", "768"]
 
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    joint = ["--pretrained", str(QWEN_TINY), "head:joint-shape", "--head.width", "16",
-             "--head.routing-layers", "1", "--head.layers", "1", "--head.heads", "2",
-             "--head.feedforward", "32", "--max-len", "768"]
-    first = DecisionRunConfig.cli(joint, default=decision(tmp_path, drawn=False))
-    state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
-    source = tmp_path / "runs" / "first"
-    # Its release, written by `dew export` and by its task's `save_pretrained`, reloads as the run's task
-    # serves its weights as written, on the host (the run's own task is placed on its training mesh).
+
+@pytest.fixture(scope="module")
+def chat_decision_run(tmp_path_factory):
+    """A chat-format decision run (`joint_flags`) trained a step and saved, its directory and its state:
+    the source each of the run-from-run cells below names, trained once for them."""
+    root = tmp_path_factory.mktemp("chat-decision")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("XDG_CACHE_HOME", str(root / "cache"))
+        first = DecisionRunConfig.cli(joint_flags(), default=decision(root, drawn=False))
+        state, _ = trained(first, root, "first", trainer={"checkpoint_final": True})
+    return root / "runs" / "first", state
+
+
+TEAM = {"billing": "payments", "technical": "outages", "sales": "pricing"}
+"""The question the chat-format decision runs answer, `Choice("Which team?", TEAM)`."""
+
+
+def test_a_saved_chat_format_decision_runs_release_answers_as_its_run(chat_decision_run, tmp_path,
+                                                                      monkeypatch):
+    """A chat-format decision run's release, written by `dew export` and by its task's `save_pretrained`,
+    reloads answering as the run's task serves its written weights, bit for bit, on the host (the run's
+    own task is placed on its training mesh)."""
     from dew._cli.main import main
+    from dew.decision import Choice, Decide
     from dew.decision.sources import PretrainedDecision
 
-    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    source, _ = chat_decision_run
+    team = Choice("Which team?", TEAM)
     task = Decide.from_run(str(source))
     assert main(["export", str(source), str(tmp_path / "exported")]) == 0
     task.save_pretrained(tmp_path / "saved")
@@ -284,6 +295,19 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
         for state_text in ("charged twice", "is the site down?"):
             np.testing.assert_array_equal(reloaded(state_text, {"team": team})["team"].probabilities,
                                           served(state_text, {"team": team})["team"].probabilities)
+
+
+def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(chat_decision_run, tmp_path,
+                                                                    monkeypatch):
+    """A saved chat-format decision run is a source a second decision run names (`--pretrained <run>`):
+    the second run trains on from the first's final weights, head and backbone, its record names the run
+    and step it read, and its task loads and answers (a run from a finished chat-format run, which the
+    export's Laya-only layout refused: "Laya's layout is a marker row over a Hugging Face tokenizer", row
+    4310)."""
+    from dew.decision import Choice, Decide
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    source, state = chat_decision_run
     run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest", "--max-len", "768"],
                                 default=decision(tmp_path, drawn=False))
     started = run.prepare().objective.init(jax.random.key(0))
@@ -292,11 +316,22 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
     assert int(second.step) == 1
     recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "second"))
     assert recorded.pretrained == str(source) and recorded.source.step == SavedRun.pinned(str(source)).step
-    answer = Decide.from_run(str(tmp_path / "runs" / "second"))("charged twice", {"team": team})["team"]
+    answer = Decide.from_run(str(tmp_path / "runs" / "second"))("charged twice",
+                                                                {"team": Choice("Which team?", TEAM)})["team"]
     assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
-    # A run naming a head of its own over the finished run draws it fresh over the run's backbone, its
-    # head, layout and calibration set aside: it starts from the run's backbone and from the head a run
-    # drawing the same head over the base draws (row 4310's run-from-run, a fresh head).
+
+
+def test_a_decision_run_naming_its_own_head_draws_it_fresh_over_a_saved_chat_format_runs_backbone(
+        chat_decision_run, tmp_path, monkeypatch):
+    """A run naming a head of its own over a saved chat-format decision run draws it fresh over the run's
+    backbone, its head, layout and calibration set aside: it starts from the run's backbone and from the
+    head a run drawing the same head over the base draws (row 4310's run-from-run, a fresh head), and
+    trains, its task loading and answering (it was refused: "a decision release reads with its own")."""
+    from dew.decision import Choice, Decide
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    source, state = chat_decision_run
+    joint = joint_flags()
     fresh = ["--pretrained", str(source), "--source.step", "latest", *joint[2:]]
     drawn = DecisionRunConfig.cli(fresh, default=decision(tmp_path, drawn=False)).prepare().objective
     over_base = DecisionRunConfig.cli(joint, default=decision(tmp_path, drawn=False)).prepare().objective
@@ -306,7 +341,8 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
     third, _ = trained(DecisionRunConfig.cli(fresh, default=decision(tmp_path, drawn=False)), tmp_path,
                        "third", trainer={"checkpoint_final": True})
     assert int(third.step) == 1
-    answer = Decide.from_run(str(tmp_path / "runs" / "third"))("charged twice", {"team": team})["team"]
+    answer = Decide.from_run(str(tmp_path / "runs" / "third"))("charged twice",
+                                                               {"team": Choice("Which team?", TEAM)})["team"]
     assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
 
 
