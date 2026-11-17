@@ -260,6 +260,13 @@ class DiffusionObjective(Objective[Ratio]):
 
     counts_tokens = False
 
+    grid_process: bool
+    """Whether it trains its pipeline's own process over its grid, read once as it is built: the source's
+    process object itself (`process` None, or the source's own given back, as a run naming no preset
+    passes it) where that is its grid's (`PipelineSource.grid_process`). A process given over the
+    source's, even an equal one, is the run's own, kept as it is at another size
+    (`dew.interop.pipeline_assembly.resized`)."""
+
     def data(self, tokenizer=None) -> ObjectiveData:
         """Each batch's captions tokenized for the conditions, on the host, as
         the step reads them, and kept beside as host strings, which a metric
@@ -441,17 +448,11 @@ class DiffusionObjective(Objective[Ratio]):
         normalizes its latents, with the running statistics in the `LATENT_STATS`
         collection. A published task includes the tuned autoencoder, with those
         statistics as its latent normalization.
-
-        `grid_process` records whether the objective trains its pipeline's own process over its grid, read
-        once here: the source's process object itself (`process` None, or the source's own given back,
-        as a run naming no preset passes it) where that is its grid's (`PipelineSource.grid_process`).
-        A process given over the source's, even an equal one, is the run's own, kept as it is at
-        another size (`dew.interop.pipeline_assembly.resized`).
         """
-        grid_process = False
+        grid_process = (isinstance(model, PipelineSource) and model.grid_process
+                        and (process is None or process is model.process))
         if isinstance(model, PipelineSource):
             source = model
-            grid_process = source.grid_process and (process is None or process is source.process)
             model = source.model
             process = source.process if process is None else process
             inputs = source.inputs if inputs is None else inputs

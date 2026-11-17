@@ -106,8 +106,8 @@ def on_one_device(module, call: MixerCall, shape: tuple[int, int], seeds: int, s
 @pytest.mark.parametrize("row", sorted(SEEDS))
 def test_a_lightning_layer_split_over_the_sequence_runs_its_rows_as_whole_ones(row):
     """Under a sequence axis of 4, a lightning layer runs each row of `SEEDS`' as on one device, each shard
-    from the memory the earlier ones leave it (`linear.sequence_entered`, rows 7400, 7423), where it refused the
-    axis: real tokens, packed documents, right padding and an interior shard of padding."""
+    from the memory the earlier ones leave it (`linear.sequence_entered`, rows 7400, 7423), where it refused
+    the axis: real tokens, packed documents, right padding and an interior shard of padding."""
     from dew.batch import coordinates
     from dew.nn.inputs import AttentionMetadata
 

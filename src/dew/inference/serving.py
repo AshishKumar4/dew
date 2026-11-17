@@ -887,15 +887,11 @@ class Server:
         verifies and emits a block in every row, which draws as the row-wise
         sampler draws, over a dense cache whose prompts prefill whole.
 
-        `kv_cache` replaces the model's cache layout (`dew.nn.kv_cache`); a
-        page size lays the model's own in pages of that many slots, its format
-        kept, and 'whole' unpaged, each row's cache whole. None, the default,
-        keeps the model's own, in pages of `PAGE_SIZE` where it names no page
-        size and the server keeps a prefix cache over them (`prefix_cache`'s
-        default) whose rows' capacity the model's max_seq_len holds in whole
-        pages, so requests over one prompt, a group's samples of it, prefill it
-        once (`_laid`). A paged layout pools the pages of every row, so short
-        requests fit more rows than `pages * page_size / capacity`. `chunk` prefills a prompt in
+        `kv_cache` replaces the model's cache layout (`dew.nn.kv_cache`), a
+        page size pages the model's own and 'whole' keeps each row's whole;
+        None pages it where a prefix cache serves over pages (`_laid`). A paged
+        layout pools the pages of every row, so short requests fit more rows
+        than `pages * page_size / capacity`. `chunk` prefills a prompt in
         pieces of at most that many tokens, one piece a step, so a long prompt
         does not stall the rows beside it. It also works over a dense cache
         where the admitting step is mixed. `prefix_cache` lets a request reuse
