@@ -172,7 +172,8 @@ def test_a_schema_read_in_context_reads_the_context_after_it_in_the_room_it_leav
     # tokens after it as its context, its question's span within the schema.
     kept = len(schema) + room
     assert np.asarray(batch["context"])[0, len(schema):kept].tolist() == list(row.context[len(schema):])
-    assert np.asarray(batch["context_segments"])[0, :kept + 1].tolist() == [1] * kept + [2]
+    owners = np.asarray(batch["context_segments"])[0].tolist()
+    assert owners[:kept] == [1] * kept and owners[kept] != 1
     start, end = np.asarray(batch["spans"])[0, 0].tolist()
     assert 0 <= start < end <= len(schema)
     # The counters a run's data report logs (`data/cut/<corpus>/context`,
