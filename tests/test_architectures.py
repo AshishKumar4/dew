@@ -479,8 +479,10 @@ def test_a_jepa_video_encoder_trains_on_every_layout_as_on_one_device(case, step
 @pytest.mark.parametrize(("case", "steps", "layout"), THREE_D_UNET_CELLS, ids=cell_ids(THREE_D_UNET_CELLS))
 @pytest.mark.check1_shards(seeds=32, per_task=8)
 def test_a_3d_unet_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
-    """`test_architecture_trains_on_every_layout_as_on_one_device` over the 3D U-Net."""
-    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the 3D U-Net, its arms' `fit` checked
+    by a test of their own (`test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave`): its draws task beside
+    a fit took 498 s for four draws (train CI at 42b3d7ab9, row 7633)."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path, fits=False)
 
 
 @pytest.mark.parametrize(("case", "steps", "layout"), UNET_CELLS, ids=cell_ids(UNET_CELLS))
@@ -495,19 +497,23 @@ def test_a_unet_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp
 @pytest.mark.check1_shards(seeds=8, per_task=3)
 def test_a_hierarchical_mmdit_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
     """`test_architecture_trains_on_every_layout_as_on_one_device` over the hierarchical MMDiT, its arms'
-    `fit` checked by a test of their own (`test_a_hierarchical_mmdit_fits_as_its_drawn_steps`): a map task
-    of one draw took 261 to 375 s and the one beside the layout's `fit` 608 s (train CI at de27b8e32, row
-    7457), its fixed cost the arms' programs and the fit's checkpoints and evaluations."""
+    `fit` checked by a test of their own (`test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave`): a
+    map task of one draw took 261 to 375 s and the one beside the layout's `fit` 608 s (train CI at
+    de27b8e32, row 7457), its fixed cost the arms' programs and the fit's checkpoints and evaluations."""
     assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path, fits=False)
 
 
+FIT_APART = [*HIERARCHICAL_MMDIT_CELLS, *THREE_D_UNET_CELLS]
+"""The sharded cells whose arms' `fit` a test of its own checks, so no map task of their draws trains a fit
+beside them (rows 7457, 7633)."""
+
+
 @pytest.mark.parametrize("arm", ["one device", "layout"])
-@pytest.mark.parametrize(("case", "steps", "layout"), HIERARCHICAL_MMDIT_CELLS,
-                         ids=cell_ids(HIERARCHICAL_MMDIT_CELLS))
-def test_a_hierarchical_mmdit_fits_as_its_drawn_steps(case, steps, layout, arm, tmp_path):
-    """The hierarchical MMDiT's `fit`, on one device and on each layout, leaves what its drawn steps leave
-    on the cell's own batch (`assert_fits_as_drawn`): what its check 1 judges is the run's
-    (`test_a_hierarchical_mmdit_trains_on_every_layout_as_on_one_device`), each arm a test of its own."""
+@pytest.mark.parametrize(("case", "steps", "layout"), FIT_APART, ids=cell_ids(FIT_APART))
+def test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave(case, steps, layout, arm, tmp_path):
+    """A `FIT_APART` cell's `fit`, on one device and on its layout, leaves what its drawn steps leave on the
+    cell's own batch (`assert_fits_as_drawn`): what its check 1 judges is the run's, each arm a test of its
+    own."""
     assert_fits_on_the_layout(case, steps, layout, arm == "layout", tmp_path)
 
 
