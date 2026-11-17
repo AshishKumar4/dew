@@ -617,7 +617,8 @@ def test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_d
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         objective=ObjectiveConfig("diffusion", {"steps": 2, "ema_decay": None}))
     saved_after_one_step(config, lambda task: batch_for(task, 4), tmp_path / "run", 1e-2)
-    size = (2 * height, height + width)
+    # Wider and taller apart: a rectangle's two extents each read where they are.
+    size = (2 * height, width + width // 2)
     saved = load_diffusion_source(str(tmp_path / "run"), dtype="float32", size=size)
     published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=size)
     assert isinstance(saved, RunPipeline) and saved.grid is not None
