@@ -31,7 +31,7 @@ from dew._records import (
     moved_spelling,
     record,
 )
-from dew._stated import Unestablished, again, stated
+from dew._stated import Unestablished, met_again, stated
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 
@@ -471,12 +471,12 @@ def by_content(value) -> bool:
 
 def _described(value, walking: tuple[int, ...] = ()) -> tuple[JSON, bool]:
     """`structured`'s description of `value` and whether it is `value`'s alone (`by_content`): one walk, a
-    value met again on its own path (`walking`) stated as a reference back to it (`dew._stated.again`), as
+    value met again on its own path (`walking`) stated as a reference back to it (`dew._stated.met_again`), as
     a step whose fields loop back to it does, where the walk recursed past Python's limit (train 966's
     review)."""
     if _walked(value):
         if id(value) in walking:
-            return again(value, walking), True
+            return met_again(value, walking), True
         walking = (*walking, id(value))
     if _sources.generated_instance(value):
         # A dataclass's or an attrs class's instance, by its class and every field its generator records
