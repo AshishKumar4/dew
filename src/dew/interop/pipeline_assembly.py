@@ -724,8 +724,9 @@ def latent_tokens(height: int, width: int, patch: int) -> int:
     return (height // patch) * (width // patch)
 
 
-def resized(inputs: InputSpec, process: Process, grid: SourceGrid | None, autoencoder: AutoEncoder | None,
-            size: tuple[int, ...], *, grid_process: bool) -> tuple[InputSpec, Process, SourceGrid | None]:
+def bound_at_size(inputs: InputSpec, process: Process, grid: SourceGrid | None,
+                  autoencoder: AutoEncoder | None, size: tuple[int, ...], *,
+                  grid_process: bool) -> tuple[InputSpec, Process, SourceGrid | None]:
     """A pipeline's inputs, process and grid bound at the sample `size` (an image's height and width, a
     clip's frames before them), as `assemble` binds a published pipeline's at its size: the sample and a
     mask at it, the autoencoder refusing a size it does not encode (`AutoEncoder.latent_shape`), a published

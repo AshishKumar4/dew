@@ -273,7 +273,7 @@ class DiffusionObjective(Objective[Ratio]):
     process and grid objects themselves (each None or omitted, or the source's own given back, as a run
     naming no preset passes its process) where its process is its grid's (`PipelineSource.grid_process`).
     A process or grid given over the source's, even an equal one, is the run's own, its process kept as
-    it is at another size (`dew.interop.pipeline_assembly.resized`)."""
+    it is at another size (`dew.interop.pipeline_assembly.bound_at_size`)."""
 
     def data(self, tokenizer=None) -> ObjectiveData:
         """Each batch's captions tokenized for the conditions, on the host, as

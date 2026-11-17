@@ -11,14 +11,13 @@ import jax
 import numpy as np
 import pytest
 from process_support import run_pool
-from run_kinds import SEQ, decision, diffusion, lm, pictures, read, trained
+from run_kinds import SEQ, captioned, decision, diffusion, lm, pictures, trained
 from saved_run_kinds import over, windows
 from token_support import write_token_corpus
 
 from dew.batch import FROZEN
 from dew.config import ObjectiveConfig, SourceOptions
 from dew.config.diffusion import DEFAULT_MODEL_CONFIG, DiffusionRunConfig
-from dew.data import images as image_steps, presets
 from dew.decision.config import DecisionRunConfig
 from dew.inference import TextToImage
 from dew.inference.tasks import SavedRun
@@ -573,12 +572,8 @@ def test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task(tmp_
     larger = load_diffusion_source(str(source), dtype="float32", size=(8, 8))
     assert larger.inputs.sample == dataclasses.replace(task.inputs.sample, shape=(8, 8, 3))
     train, held = pictures()
-
-    def at_eight(rows):
-        return read(rows.pipe(presets.images, 8, batch=8, caption=image_steps.caption(), augment=False))
-
-    state, _ = trained(dataclasses.replace(run, data=at_eight(train), validation=at_eight(held)), tmp_path,
-                       "larger")
+    state, _ = trained(dataclasses.replace(run, data=captioned(train, 8, drawn=False),
+                                           validation=captioned(held, 8, drawn=False)), tmp_path, "larger")
     assert int(state.step) == 1
     with pytest.raises(ValueError):
         released_run(source)

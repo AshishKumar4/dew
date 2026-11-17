@@ -243,14 +243,14 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
     A run of another task, a revision of a directory, and `text=False`, which the restore of a run's
     tree cannot skip, are refused, as is a kernel other than `auto` for a denoiser that takes none. A
     `size` other than the run's own binds its inputs, conditioning, grid and process at it, as a published
-    pipeline's are bound (`pipeline_assembly.resized`, ledger 2792). A run that tuned its autoencoder
+    pipeline's are bound (`pipeline_assembly.bound_at_size`, ledger 2792). A run that tuned its autoencoder
     (`end_to_end`) is started from with its tuned autoencoder, which the started run records and holds
     (`TunedAutoEncoder`, ledger 2791)."""
     from dew._records import record
     from dew.diffusion.schedules.source import SourceGrid
     from dew.inference.images import ImageSettings, TextToImage, restored_tree
     from dew.inference.tasks import saved_settings
-    from dew.interop.pipeline_assembly import resized
+    from dew.interop.pipeline_assembly import bound_at_size
     from dew.objectives.diffusion.objective import without_loss_heads
 
     if not samples_images(run):
@@ -286,8 +286,8 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
     inputs, process = task.inputs, task.process
     if size is not None:
         # At the size the run's data has, as a published pipeline binds its own (ledger 2792).
-        inputs, process, grid = resized(inputs, process, grid, task.autoencoder, tuple(size),
-                                        grid_process=task.grid_process)
+        inputs, process, grid = bound_at_size(inputs, process, grid, task.autoencoder, tuple(size),
+                                              grid_process=task.grid_process)
     return RunPipeline(model, tree, process, inputs, task.autoencoder, task.solver, task.steps, task.guidance,
                        grid, task.grid_process)
 
