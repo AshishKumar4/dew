@@ -413,7 +413,7 @@ def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly
     assert isinstance(objective.inputs.conditions["context"].encoder, CharTable)
     data = decision_rows(examples(), 8, objective=objective.data())
     batch = next(iter(data.train(DataPartition())))
-    codes = CharTable.from_pretrained(tokens=12, features=16).tokenize([note for *_, note in ROWS])
+    codes = CharTable.from_pretrained(tokens=12, features=16).tokenize([note for *_, note in ROWS if note])
     notes = {tuple(ids[mask != 0].tolist()) for ids, mask in zip(codes["input_ids"], codes["attention_mask"],
                                                                   strict=True)}
     lengths = np.asarray(batch["context_lengths"])

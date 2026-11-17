@@ -25,7 +25,7 @@ from PIL import Image
 from dew import _records
 from dew._files import write_atomically
 from dew._records import JSON, json_value, record
-from dew.batch import Batch, SegmentBound, Variables, part
+from dew.batch import Batch, SegmentBound, Variables
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.mixing import CorpusCounts
@@ -519,6 +519,8 @@ class Decide(SavedRunTask, InItsForm):
         head = Head.from_record(settings.head, width)
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
+        from dew.batch import part
+
         context = None if settings.context is None else Condition.bound(
             settings.context, params=part(variables, "context")["params"])
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),

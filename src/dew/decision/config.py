@@ -274,6 +274,19 @@ class DecisionRunConfig(DecoderRunConfig):
         if self.context_form != "idefics" and self.context_layers is None:
             raise ValueError("--context-form says which block context layers run; set --context-layers")
 
+    def _context_blocks(self, configured: ConditionEncoder | None) -> CrossAttention | SharedCrossAttention:
+        """The context layers the run draws (`context_form`), reading a configured encoder's states at its own
+        width (`ConditionWork.features`), else the backbone's."""
+        assert self.context_layers is not None
+        if configured is None:
+            form = SharedCrossAttention if self.context_form == "shared" else CrossAttention
+            return form(self.context_layers, self.context_length)
+        if self.context_form == "shared":
+            raise ValueError("--context-form shared reads a context in the layer's own attention, at the "
+                             "backbone's width, which a configured --context-text encoder's states are not")
+        return CrossAttention(self.context_layers, self.context_length,
+                              context_features=_encoded_width(configured))
+
     def build_run(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
         or the mixture's rows, scored on the held-out ones, which calibrate the
@@ -294,7 +307,7 @@ class DecisionRunConfig(DecoderRunConfig):
         budgets = self._row_fields()
         self._refuse_unread_context()
         derived: dict[str, object] = {}
-        configured = None if self.context_text is None else self.context_text.build(dtype=dtype).encoder
+        configured = None if self.context_text is None else self.context_text.build().encoder
         if self.context_layers is not None:
             derived["context_encoder"] = self.context_encoder if configured is None else configured
         from dew.decision.slot_source import reads_blocks
@@ -322,18 +335,7 @@ class DecisionRunConfig(DecoderRunConfig):
         start = self.looped(start)
         if self.context_layers is not None:
             # Drawn from a key of their own, apart from the adapter's and the head's.
-            form = SharedCrossAttention if self.context_form == "shared" else CrossAttention
-            # A configured encoder's states at its own width (`ConditionWork.features`), else the backbone's.
-            if configured is None:
-                blocks = form(self.context_layers, self.context_length)
-            elif form is CrossAttention:
-                blocks = CrossAttention(self.context_layers, self.context_length,
-                                        context_features=_encoded_width(configured))
-            else:
-                raise ValueError("--context-form shared reads a context in the layer's own attention, at "
-                                 "the backbone's width, which a configured --context-text encoder's states "
-                                 "are not")
-            start = start.with_cross_attention(blocks, key=jax.random.fold_in(
+            start = start.with_cross_attention(self._context_blocks(configured), key=jax.random.fold_in(
                 jax.random.key(self.trainer.key), 1), frozen=self.context_frozen)
         start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
         assumed = start.assumed if isinstance(start, PretrainedDecision) else frozenset()

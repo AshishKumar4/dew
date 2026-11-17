@@ -420,17 +420,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             # one its rows are laid out by, which names them where the layout names none.
             head, labels = head.labelled(layout.labels, tokenizer)
             layout = dataclasses.replace(layout, labels=labels)
-        # A configured context encoder is the context's condition (`DecisionModel.context`); the backbone's
-        # own encodings are named by `context_encoder`, as a run records them.
-        match context_encoder:
-            case ConditionEncoder() as configured:
-                if segments is not None and segments > 1:
-                    raise ValueError(f"a configured context encoder ({type(configured).__name__}) reads a "
-                                     "window's context as one sequence, so it keeps no two rows' contexts "
-                                     "apart; set segments=1 (one row a window)")
-                self.model = DecisionModel(module, head, "table", Condition(configured, field="context"))
-            case _:
-                self.model = DecisionModel(module, head, context_encoder or "table")
+        self.model = _decision_model(module, head, context_encoder, segments)
         if layout is None:
             if not isinstance(module, TokenModel):
                 raise ValueError(
@@ -925,7 +915,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             self.model.context_encoder,
             self.options,
             recorded_files(RunProcessor(self.tokenizer)),
-            None if self.model.context is None else to_record(self.model.context))
+            None if self.model.context is None else record(to_record(self.model.context, Condition),
+                                                           "context condition"))
 
     def recorded_model(self) -> nn.Module:
         """The backbone; the head is a task setting of its own."""
@@ -958,3 +949,20 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             processor=self.image_processor,
             budget=Budget(options=self.options),
         )
+
+
+def _decision_model(module: nn.Module, head: Head, context_encoder: ContextEncoder | ConditionEncoder | None,
+                    segments: int | None) -> DecisionModel:
+    """The model over `module` and `head`: a configured context encoder is the context's condition
+    (`DecisionModel.context`), the backbone's own encodings named by `context_encoder`, as a run records them.
+    A configured encoder reads a window's context as one sequence, keeping no two rows' contexts apart, so
+    windows of several rows are refused (ValueError)."""
+    match context_encoder:
+        case ConditionEncoder() as configured:
+            if segments is not None and segments > 1:
+                raise ValueError(f"a configured context encoder ({type(configured).__name__}) reads a "
+                                 "window's context as one sequence, so it keeps no two rows' contexts apart; "
+                                 "set segments=1 (one row a window)")
+            return DecisionModel(module, head, "table", Condition(configured, field="context"))
+        case _:
+            return DecisionModel(module, head, context_encoder or "table")
