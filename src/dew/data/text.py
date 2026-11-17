@@ -463,8 +463,15 @@ def tokenizer_name(tokenizer: str | SavedTokenizer) -> str:
         return tokenizer
     with tempfile.TemporaryDirectory() as saved:
         tokenizer.save_pretrained(saved)
-        files = PinnedTokenizer(*pin_files(saved, _TOKENIZER_FILES)).files
-        return cached_tokenizer(epath.Path(saved), files)
+        # Every file it saved, by its hash, under the name the steps that read it have always carried in
+        # their identities: one digest of each file's path and bytes in order (train 985's review).
+        paths = sorted(path for path in Path(saved).rglob("*") if path.is_file())
+        files = {str(path.relative_to(saved)): hashlib.sha256(path.read_bytes()).hexdigest()
+                 for path in paths}
+        named = hashlib.sha256()
+        for path in paths:
+            named.update(str(path.relative_to(saved)).encode() + b"\0" + path.read_bytes())
+        return cached_tokenizer(epath.Path(saved), files, named=named.hexdigest())
 
 
 def tokenize(tokenizer: str | SavedTokenizer = "byte", *, field: str = "text",
@@ -942,14 +949,15 @@ def held_place(run: str, files: Mapping[str, str]) -> epath.Path:
     return epath.Path(run) / HELD_TOKENIZERS / files_digest(files)
 
 
-def cached_tokenizer(source: epath.Path, files: Mapping[str, str]) -> str:
+def cached_tokenizer(source: epath.Path, files: Mapping[str, str], *, named: str | None = None) -> str:
     """The tokenizer whose `files` stand in `source` (a run's held copy, a local directory or a bucket's,
     or a tokenizer object's saved files) as a directory of this host's cache (`dew._builds.dew_cache_dir`)
-    under their digest (`files_digest`), written once, whole (`dew._files.staged`), each file checked
-    (`copy_checked`): the one writer of Dew's cache of tokenizers."""
+    under their digest (`files_digest`), or `named`, a tokenizer object's (`tokenizer_name`), written once,
+    whole (`dew._files.staged`), each file checked (`copy_checked`): the one writer of Dew's cache of
+    tokenizers."""
     from dew._builds import dew_cache_dir
 
-    local = Path(dew_cache_dir()) / "tokenizers" / files_digest(files)
+    local = Path(dew_cache_dir()) / "tokenizers" / (named or files_digest(files))
     if not local.is_dir():
         # Another process caching the same files writes the same bytes; whichever publishes second finds
         # the directory there.

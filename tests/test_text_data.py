@@ -1014,6 +1014,31 @@ print(json.dumps({"directory": found.pinned.directory, "files": found.pinned.fil
 """
 
 
+def test_a_tokenizer_objects_steps_name_it_as_positions_saved_before_name_it(tmp_path, monkeypatch):
+    """A transformers tokenizer object a step tokenizes with is named by the directory of this host's cache
+    its saved files are written to, as positions saved before name it: one digest of every saved file's path
+    and bytes in order, which a step's identity carries, so a run saved before resumes its data as it was;
+    the directory holds every file the object saved and loads as the object encodes. It was renamed by its
+    tokenizer files' hashes alone, and every such run's resume restarted its data (train 985's review)."""
+    import hashlib
+
+    from transformers import AutoTokenizer
+
+    from dew.data.text import HFTokenizer, tokenize
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    made = AutoTokenizer.from_pretrained(str(FIXTURES / "tokenizers" / "gpt2"))
+    made.save_pretrained(tmp_path / "saved")
+    paths = sorted(path for path in (tmp_path / "saved").rglob("*") if path.is_file())
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(str(path.relative_to(tmp_path / "saved")).encode() + b"\0" + path.read_bytes())
+    named = Path(tokenize(made).tokenizer)
+    assert named.name == digest.hexdigest()
+    assert sorted(path.name for path in named.iterdir()) == sorted(path.name for path in paths)
+    assert HFTokenizer(str(named)).encode("the quick brown fox") == made.encode("the quick brown fox")
+
+
 def test_an_earlier_runs_snapshot_tokenizer_is_resolved_by_its_commit_and_held_from_its_next_save(tmp_path):
     """A run saved before runs held their own tokenizer, whose record names the hub cache snapshot
     directory of the host that trained it and no hashes, read on a host whose hub cache holds no snapshot of
