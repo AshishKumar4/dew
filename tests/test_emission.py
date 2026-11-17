@@ -337,3 +337,17 @@ def test_a_product_or_a_masks_reduction_counts_one_operation_an_input_element_as
 
     assert counted(reduced).fixed.operations == counted(jnp.sum).fixed.operations, counted(reduced).fixed
 
+
+@pytest.mark.parametrize("move", [
+    lambda x: lax.concatenate([x[:, 64:], x[:, :64]], 1), lambda x: lax.dynamic_slice(x, (0, 0), (1, 64)),
+    lambda x: lax.dynamic_update_slice(x, x[:, :64], (0, 64)), lambda x: lax.split(x, [64, 64], axis=1)[1],
+    lambda x: lax.stack([x], axis=0), lambda x: lax.tile(x, (1, 2)),
+    lambda x: lax.unstack(x[None], axis=0)[0]],
+    ids=["concatenate", "dynamic_slice", "dynamic_update_slice", "split", "stack", "tile", "unstack"])
+def test_a_layout_move_counts_nothing_as_a_slice_does(move):
+    """Each layout move the Pallas fuser tiles, alone in a body over a [1, 128] row (its slices free beside
+    it), counts no operation of any unit, as a slice does (`emission._FREE`): a fused prologue's stage
+    holding one is priced, never refused unpriced (rows 7260, 7261)."""
+    role = _emitted(move, jax.ShapeDtypeStruct((1, 128), jnp.float32)).roles[0]
+    assert role.fixed == Work(), role.fixed
+

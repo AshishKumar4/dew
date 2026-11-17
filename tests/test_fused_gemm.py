@@ -291,26 +291,70 @@ def test_a_producer_whose_row_value_is_any_reduction_fuses_through_the_public_en
                         seeds=8)
 
 
-@pytest.mark.parametrize("chosen", [{}, {"gemm_prologue": "xla", "grouped_matmul": "xla"}],
-                         ids=["selected", "named xla"])
-def test_a_producer_stage_no_kernel_prices_is_refused_and_formed_by_xla(chosen):
-    """A producer whose stage holds an operation the kernels' counter prices none of (a `stack`'s layout
-    beside the rows) on an H100: its prologue refused as unpriced, never raised (base review of dc7063c94,
-    F1), the operand formed by XLA before the product, selected so or named so, and the region's value the
-    program's."""
-    keys = jax.random.split(jax.random.key(3), 3)
-    x = jax.random.randint(keys[0], (64, 128), -3, 4).astype(jnp.float32)
-    b = jax.random.randint(keys[1], (128,), -3, 4).astype(jnp.float32)
-    w = jax.random.randint(keys[2], (128, 64), -3, 4).astype(jnp.float32)
+def test_a_prologues_sides_are_priced_by_their_arithmetic_as_xla_runs_them():
+    """Two producers scaling each row of an 8192 x 4096 bf16 operand by a row value XLA computes beside the
+    prologue, a sum of the row and a sum of its exponentials, feeding one 4096-wide product on an H100: the
+    exponential's side prices above the sum's by its 33.5M exponentials, as the algebra prices XLA's
+    program (`algebra.program.priced`), where bytes alone priced them alike (row 7260); the fused price of
+    each its unfused one's less its forming, the stage priced once."""
+    x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16)
 
-    def region(x, b, w):
-        # A stack, then its first row: a concatenation's layout and a slice beside the rows.
-        return fused_gemm.product(x + jnp.stack([b, b], axis=0)[:1], w, out_dtype=jnp.float32,
-                                  interpret_on_cpu=True)
+    def region(side):
+        def fn(x, w):
+            return fused_gemm.product(x * side(x), w, out_dtype=jnp.bfloat16)
+        return fn
 
-    with generation.assumed("sm90"), generation.chosen(**chosen):
-        found = fused_gemm.analysis(region, x, b, w)
-        got = fused_gemm.fused(region, x, b, w)
-    assert found.prologue is not None and found.prologue.kernel == "xla", found
-    np.testing.assert_array_equal(np.asarray(got), np.asarray(jnp.dot(x + b[None], w, precision="highest")))
+    with generation.assumed("sm90"):
+        summed = fused_gemm.analysis(region(lambda x: jnp.sum(x, axis=1, keepdims=True)), x, w)
+        exponential = fused_gemm.analysis(region(lambda x: jnp.sum(jnp.exp(x), axis=1, keepdims=True)), x, w)
+    for found in (summed, exponential):
+        assert found.prologue is not None and found.prologue.kernel == "fused", found.prologue
+    assert exponential.fused_seconds > summed.fused_seconds, (exponential, summed)
 
+
+def test_an_elementwise_producer_formed_whole_prices_xlas_launch_of_it():
+    """`fused_gemm.analysis` on an H100 of a small product (128 x 128 x 128, a bias its consumer) whose
+    operand an elementwise producer forms (`x * scale`), against the same region given its operand: its
+    unfused price is XLA's launch forming the operand whole beside it, at least the part's fixed latency
+    more (row 7284: an elementwise program priced no launch), its bytes a few hundred nanoseconds at most."""
+    x, w = (jax.ShapeDtypeStruct((128, 128), jnp.bfloat16) for _ in range(2))
+    scale, bias = (jax.ShapeDtypeStruct((128,), jnp.bfloat16) for _ in range(2))
+
+    def scaled(x, scale, w, bias):
+        return fused_gemm.product(x * scale, w, out_dtype=jnp.bfloat16) + bias
+
+    def given(x, w, bias):
+        return fused_gemm.product(x, w, out_dtype=jnp.bfloat16) + bias
+
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        formed = fused_gemm.analysis(scaled, x, scale, w, bias)
+        bare = fused_gemm.analysis(given, x, w, bias)
+    assert formed.unfused_seconds - bare.unfused_seconds >= target.fixed_seconds, (formed, bare)
+
+
+def test_a_prologues_side_program_prices_what_its_sides_read():
+    """`fused_gemm.analysis` on an H100 of an 8192 x 4096 x 4096 bf16 product whose producer scales each row
+    by its sum, its stage `x` or an exponential read through a bitcast (an equation the algebra reads as
+    opaque, whose inputs a program's roots price): the sides XLA computes beside the launch are the row sums
+    alike, so the fused prices agree (the stage's work hidden under the launch's products), where the side
+    program priced the stage's dead equations (row 7285)."""
+    x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16)
+
+    def region(stage):
+        def fn(x, w):
+            scaled = stage(x) * jnp.sum(x, axis=1, keepdims=True)
+            return fused_gemm.product(scaled, w, out_dtype=jnp.bfloat16)
+        return fn
+
+    def bitcast(x):  # an exponential through a bitcast, which the algebra reads as an opaque equation
+        return jax.lax.bitcast_convert_type(jax.lax.bitcast_convert_type(jnp.exp(x), jnp.int16), jnp.bfloat16)
+
+    with generation.assumed("sm90"):
+        plain = fused_gemm.analysis(region(lambda x: x), x, w)
+        exponential = fused_gemm.analysis(region(bitcast), x, w)
+    for found in (plain, exponential):
+        assert found.prologue is not None and found.prologue.kernel == "fused", found.prologue
+    assert exponential.fused_seconds == plain.fused_seconds, (exponential, plain)

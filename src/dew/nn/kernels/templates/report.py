@@ -1651,15 +1651,21 @@ def _carried(serialized: bytes, decoded: bool = False, spills: bool = False) -> 
     return found
 
 
-def launched_kernels(executable: jax.stages.Compiled) -> list[tuple[str, int]]:
-    """Every custom kernel `executable` launches, by the name its thunk gives it, with the shared bytes its
-    launch asks for (`custom_kernel`): a Pallas-Triton call's whatever its name (`binaries` keeps a
-    template launch's), and XLA's own custom kernels, read from its serialized form as `binaries`."""
+def custom_kernels(executable: jax.stages.Compiled) -> list[tuple[str, bytes, int]]:
+    """Every custom kernel `executable` launches, by the name its thunk gives it, with its cubin and the
+    shared bytes its launch asks for (`custom_kernel`): a Pallas-Triton call's whatever its name (`binaries`
+    keeps a template launch's), and XLA's own custom kernels, read from its serialized form as `binaries`."""
     runtime = executable.runtime_executable()
     if runtime is None:
         raise ValueError("a compiled program with no runtime executable launches no kernel to read")
-    return [(name, kernel[1]) for name, proto in _thunk_protos(runtime.serialize())
+    return [(name, *kernel) for name, proto in _thunk_protos(runtime.serialize())
             if (kernel := custom_kernel(proto)) is not None]
+
+
+def launched_kernels(executable: jax.stages.Compiled) -> list[tuple[str, int]]:
+    """Every custom kernel `executable` launches (`custom_kernels`), by its name, with the shared bytes its
+    launch asks for."""
+    return [(name, shared) for name, _, shared in custom_kernels(executable)]
 
 
 def _thunk_protos(serialized: bytes) -> list[tuple[str, bytes]]:
@@ -1792,7 +1798,7 @@ def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = Fal
     if REGISTER_COUNT not in stated:
         raise ValueError(f"the binary of {function} states no registers")
     frame = stated.get(FRAME_SIZE, 0)
-    listing = _listing(elf) if decoded or (spills and frame) else None
+    listing = sass_listing(elf) if decoded or (spills and frame) else None
     return Binary(*kernel_of(function), stated[REGISTER_COUNT], frame,
                   sass=(None if listing is None else sass_findings_of(listing)) if decoded else (),
                   spilled_in=(None if listing is None else spilled_roles(listing)) if frame else ())
@@ -1810,23 +1816,24 @@ def disassembler() -> Path | None:
     return None if found is None else Path(found)
 
 
-def sass_findings(elf: bytes) -> tuple[str, ...] | None:
-    """What the machine code of the cubin `elf` breaks of the SASS rules (`sass_findings_of`, nvdisasm's
-    listing of it); None where no disassembler is installed (`disassembler`), the rules unread."""
-    listing = _listing(elf)
-    return None if listing is None else sass_findings_of(listing)
-
-
-def _listing(elf: bytes) -> str | None:
-    """nvdisasm's listing of the cubin `elf`; None where no disassembler is installed (`disassembler`)."""
+def sass_listing(elf: bytes) -> str | None:
+    """nvdisasm's listing of the machine code of the cubin `elf`; None where no disassembler is installed
+    (`disassembler`)."""
     tool = disassembler()
     if tool is None:
         return None
     with tempfile.NamedTemporaryFile(suffix=".cubin") as cubin:
         cubin.write(elf)
         cubin.flush()
-        return subprocess.run([str(tool), "-c", cubin.name], capture_output=True, text=True,
-                              check=True).stdout
+        listing = subprocess.run([str(tool), "-c", cubin.name], capture_output=True, text=True, check=True)
+    return listing.stdout
+
+
+def sass_findings(elf: bytes) -> tuple[str, ...] | None:
+    """What the machine code of the cubin `elf` breaks of the SASS rules (`sass_findings_of`, its listing,
+    `sass_listing`); None where no disassembler is installed, the rules unread."""
+    listing = sass_listing(elf)
+    return None if listing is None else sass_findings_of(listing)
 
 
 PRODUCER, CONSUMERS = "producer", "consumers"
