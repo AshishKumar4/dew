@@ -48,7 +48,7 @@ env:
   # of capacity, never red (armada 0da5300). The pin is armada's main, never a branch off an older pin:
   # dew-ops runs the pinned client too (its `pack` stages a hub-only commit for a TPU run), and 0da5300, cut
   # from bc61de0, had none (2026-11-16: every hub-only Colab run failed after booking from 23:39Z).
-  ARMADA: github:AshishKumar4/armada#7e94d6c412220fb5c0ad70e0396998da5b695915
+  ARMADA: github:AshishKumar4/armada#e7c1f7a4884bd94a4267cdb9f6ab42a3b17f60b1
 
 jobs:
   # A commit this workflow passed on another push, or one the land queue
