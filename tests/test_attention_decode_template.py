@@ -916,10 +916,10 @@ def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
 @COMPILES_ON_CPU
 def test_a_decode_steps_price_reads_its_keys_and_a_paged_pool_walks_no_fewer_steps():
     """A decode step's price (`attention_decode.priced_step`: its launches' work as their emission counts it,
-    `cost.seconds` its seconds) for one row of 8 query heads over 2 key heads 128 wide in bf16 on an H100: twice the keys read more
-    device bytes and walk at least as many steps, and the same keys from a paged pool of 64-key pages walk no
-    fewer steps than from a dense cache, every step's tile within a page (row 7420: a server's choice
-    between the two reads what each costs)."""
+    `cost.seconds` its seconds) for one row of 8 query heads over 2 key heads 128 wide in bf16 on an H100:
+    twice the keys read more device bytes, walk at least as many steps and take longer, and the same keys
+    from a paged pool of 64-key pages walk no fewer steps than from a dense cache, every step's tile within a
+    page (row 7420: a server's choice between the two reads what each costs)."""
     def priced(keys, page_size=None):
         return attention_decode.priced_step(generation.gpu_target("sm90"), rows=1, queries=1, keys=keys,
                                             heads=8, kv_heads=2, width=128, dtype=jnp.bfloat16,
