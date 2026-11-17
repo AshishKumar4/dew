@@ -188,8 +188,9 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
     each within half again), so the next plan cuts it to fit, and so does a file whose tests together took
     under a third of its record though its cut fits; a file whose cut fits and whose total holds keeps its
     entries byte for byte, as does one whose heaviest group is a test past the budget alone, which no cut
-    shortens, though its time moves; a file with a red group keeps its own; a file the checkout no longer has
-    loses them; the newest Python's times move nothing."""
+    shortens, though its time moves; a file with a red group keeps its own but for what its rows timed past
+    them, which raises them (`raised`); a file the checkout no longer has loses them; the newest Python's times
+    move nothing."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
     record, rows = {}, []
 
@@ -230,9 +231,13 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
     for name in ("test_grown", "test_drift", "test_shrunk"):
         assert {node: s for node, s in folded.items() if f"/{name}.py" in node} == {
             node: s for node, s in observed.items() if f"/{name}.py" in node}
-    for name in ("test_steady", "test_straggler", "test_partial"):
+    for name in ("test_steady", "test_straggler"):
         assert {node: s for node, s in folded.items() if f"/{name}.py" in node} == {
             node: s for node, s in record.items() if f"/{name}.py" in node}
+    # Its green group's tests took 400 s of their recorded 150 s: raised; its red group's took no more.
+    assert {node: s for node, s in folded.items() if "/test_partial.py" in node} == {
+        **{node: s for node, s in record.items() if "/test_partial.py" in node},
+        "tests/test_partial.py::test_000": 400.0, "tests/test_partial.py::test_001": 400.0}
     assert not [node for node in folded if node.startswith("tests/test_gone.py")]
 
 
