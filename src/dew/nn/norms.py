@@ -16,6 +16,7 @@ from flax import linen as nn, struct
 from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
 
+from .activations import silu
 from .dense import Dense
 from .derivatives import portable_formed
 from .kernels import norm_swiglu
@@ -374,7 +375,7 @@ class NormGate(nn.Module):
     def __call__(self, y):
         dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
-        return dense(y.shape[-1], name='fc2')(nn.silu(dense(self.rank, name='fc1')(y)))
+        return dense(y.shape[-1], name='fc2')(silu(dense(self.rank, name='fc1')(y)))
 
 
 class GatedRMSNorm(nn.Module):

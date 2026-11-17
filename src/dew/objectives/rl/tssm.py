@@ -23,6 +23,7 @@ import jax.numpy as jnp
 from flax import struct
 from flax.typing import Dtype
 
+from dew.nn.activations import silu
 from dew.nn.attention import reference_attention
 from dew.nn.precision import at_least_fp32, float32_einsum
 from dew.nn.rope import rotary_freqs, rotate
@@ -96,7 +97,7 @@ class _Block(nn.Module):
         projection added, then the feed-forward layer's."""
         x = x + self.out(attended)
         h = self.feed_norm(x)
-        return x + self.down(nn.silu(self.gate(h)) * self.up(h))
+        return x + self.down(silu(self.gate(h)) * self.up(h))
 
 
 class TSSM(nn.Module):
@@ -143,13 +144,13 @@ class TSSM(nn.Module):
 
     def posterior(self, tokens: jax.Array) -> jax.Array:
         """q(z_t | x_t): the latent's log-probabilities from an observation's tokens alone."""
-        return self._logits(self.post_out(nn.silu(self.post_norm(self.post_hidden(tokens)))))
+        return self._logits(self.post_out(silu(self.post_norm(self.post_hidden(tokens)))))
 
     def prior(self, deter: jax.Array) -> jax.Array:
         """p(z_t | h_t): the latent's log-probabilities predicted from the state."""
         x = deter
         for linear, norm in self.prior_layers:
-            x = nn.silu(norm(linear(x)))
+            x = silu(norm(linear(x)))
         return self._logits(self.prior_out(x))
 
     def inputs(self, stoch: jax.Array, previous: jax.Array, first: jax.Array) -> jax.Array:

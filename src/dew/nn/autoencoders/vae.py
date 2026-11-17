@@ -14,6 +14,7 @@ import flax.linen as nn
 import jax.numpy as jnp
 from flax.typing import Dtype
 
+from dew.nn.activations import silu
 from dew.nn.attention_blocks import NormalAttention
 from dew.nn.blocks import ResidualBlock, Upsample
 from dew.nn.conv import Conv
@@ -137,7 +138,7 @@ class FlaxEncoder(nn.Module):
                             "down" if index != len(channels) - 1 else None, self.dtype,
                             name=f"down_blocks_{index}")(sample)
         sample = FlaxUNetMidBlock2D(channels[-1], self.norm_num_groups, self.dtype, name="mid_block")(sample)
-        sample = GroupNorm(self.norm_num_groups, activation=nn.swish, dtype=self.dtype,
+        sample = GroupNorm(self.norm_num_groups, activation=silu, dtype=self.dtype,
                            name="conv_norm_out")(sample)
         return _conv(2 * self.out_channels, self.dtype, "conv_out")(sample)
 
@@ -164,7 +165,7 @@ class FlaxDecoder(nn.Module):
             sample = _Level(width, self.layers_per_block + 1, self.norm_num_groups,
                             "up" if index != len(channels) - 1 else None, self.dtype,
                             name=f"up_blocks_{index}")(sample)
-        sample = GroupNorm(self.norm_num_groups, activation=nn.swish, dtype=self.dtype,
+        sample = GroupNorm(self.norm_num_groups, activation=silu, dtype=self.dtype,
                            name="conv_norm_out")(sample)
         return _conv(self.out_channels, self.dtype, "conv_out")(sample)
 

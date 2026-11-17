@@ -10,6 +10,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.batch import Variables
+from dew.nn.activations import silu
 from dew.nn.attention import AttentionImpl
 from dew.nn.attention_blocks import BasicTransformerBlock
 from dew.nn.blocks import ResidualBlock, sinusoidal_time
@@ -188,7 +189,7 @@ class _Level(nn.Module):
                 dtype=self.dtype,
                 precision=self.precision,
                 name=f"residual_{index}",
-            ), x, operations.activated(time, nn.silu), train=train)
+            ), x, operations.activated(time, silu), train=train)
             if self.stage.cross_attention:
                 x = operations.attention(_SpatialAttention(
                     self.stage,
@@ -372,7 +373,7 @@ class UNet2DCondition(nn.Module):
                 dtype=self.dtype,
                 precision=self.precision,
                 name="middle_in",
-            ), x, operations.activated(time, nn.silu), train=train)
+            ), x, operations.activated(time, silu), train=train)
             x = operations.attention(_SpatialAttention(
                 stage,
                 self.linear_projection,
@@ -392,7 +393,7 @@ class UNet2DCondition(nn.Module):
                 dtype=self.dtype,
                 precision=self.precision,
                 name="middle_out",
-            ), x, operations.activated(time, nn.silu), train=train)
+            ), x, operations.activated(time, silu), train=train)
         for index, stage in enumerate(reversed(self.stages)):
             count = self.blocks_per_level + 1
             inputs, skips = tuple(skips[-count:]), skips[:-count]
@@ -413,7 +414,7 @@ class UNet2DCondition(nn.Module):
                 approximate_gelu=self.approximate_gelu,
                 name=f"up_{index}",
             ), x, time, context, inputs, upsample_shape=target, train=train)
-        norm = GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, activation=nn.silu, dtype=self.dtype,
+        norm = GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, activation=silu, dtype=self.dtype,
                          name="output_norm")
         x = operations.normalized(x, norm)
         return operations.project(self._convolution(self.out_channels, name="output"), x)

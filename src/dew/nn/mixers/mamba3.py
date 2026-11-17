@@ -38,6 +38,7 @@ from dew.algebra import scan
 from dew.batch import document_firsts, real_bounds
 from dew.mesh import LayoutRefused
 from dew.nn import rope
+from dew.nn.activations import silu
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.derivatives import portable_formed
@@ -649,7 +650,7 @@ class Mamba3(nn.Module):
         if self.outproj_norm:
             out = self.norm(out.reshape(ranks), z.reshape(ranks)).astype(wide).reshape(out.shape)
         else:
-            out = out * nn.silu(z.astype(wide))
+            out = out * silu(z.astype(wide))
         if self.mimo_rank > 1:
             out = jnp.einsum('bsrhp,hrp->bshp', out, self.mimo_o)
         out = out.reshape(batch, length, self.intermediate_size).astype(projected.dtype)

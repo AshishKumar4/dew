@@ -20,6 +20,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
 from dew.batch import Coordinates
+from dew.nn.activations import silu
 from dew.nn.attention import (
     AttentionImpl,
     attention_case,
@@ -353,7 +354,7 @@ class _Masking(NamedTuple):
 
 GATE_ACTIVATIONS = {
     'sigmoid': jax.nn.sigmoid,
-    'silu': jax.nn.silu,
+    'silu': silu,
     # torch's softplus at beta log 2, log(1 + exp(x log 2)) / log 2.
     'softplus2': lambda gate: divided(softplus(gate * math.log(2)), math.log(2)),
     # torch's softplus in at least float32, Laguna's `F.softplus(g_proj(x).float())`, which the branch's

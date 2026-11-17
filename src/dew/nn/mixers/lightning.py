@@ -32,6 +32,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.nn.activations import silu
 from dew.nn.dense import Dense
 from dew.nn.flops import projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
@@ -47,7 +48,7 @@ from dew.nn.residuals import Residual
 LIGHTNING = recurrence.Hooks(decay='scalar', delta=False)
 """The recurrence's form: one log decay a head, no delta rule, no write gate, no scale."""
 
-ACTIVATIONS = {'silu': nn.silu}
+ACTIVATIONS = {'silu': silu}
 """The activations the projection takes, by the config's `hidden_act`: every release's SiLU."""
 
 

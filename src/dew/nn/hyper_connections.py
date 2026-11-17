@@ -69,6 +69,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.activations import silu
 from dew.nn.dense import Dense
 
 from .flops import projection_flops
@@ -391,7 +392,7 @@ class GatedResidual(nn.Module):
         normed = RMSNorm(epsilon=self.norm_eps, scale_offset=True, groups=hc, dtype=streams.dtype,
                          name='hc_norm')(streams.reshape(batch, length, hc * width))
         down = dense(self.projections()['input_mix_weight_down'][1], name='input_mix_weight_down')(normed)
-        weights = nn.sigmoid(dense(hc * width, name='input_mix_weight_up')(nn.silu(down / hc)))
+        weights = nn.sigmoid(dense(hc * width, name='input_mix_weight_up')(silu(down / hc)))
         read = jnp.mean(weights.reshape(streams.shape) * normed.reshape(streams.shape), axis=2)
         if not self.injects:
             return read, None
