@@ -34,6 +34,7 @@ from dew.nn.precision import (
     l2norm,
     rms_statistics,
     rms_weighted,
+    silu,
     softplus,
     stochastic_bf16,
 )
@@ -306,7 +307,7 @@ def read(hooks: Hooks, operands, *, optional: tuple[str, ...] = ()) -> dict:
 
 def _activated(pre, conv: Conv):
     """The conv's sums `pre` activated as `conv` says: SiLU, or as they are."""
-    return pre if conv.activation is None else pre * jax.nn.sigmoid(pre)
+    return pre if conv.activation is None else silu(pre)
 
 
 def conv_pieces(conv: Conv, key_heads: int, value_heads: int, key_width: int,

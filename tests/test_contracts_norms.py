@@ -34,6 +34,17 @@ def test_an_exact_gelu_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_silu_holds_every_order(edge):
+    """`precision.silu` (`x / (1 + e^-x)`, its exp the most accurate and a true division, its tangent
+    declared, row 7062): every order finite wherever float64 is a normal float32 and JAX's silu is."""
+    (x,) = normal_draw(2671, (4, 7), scale=EDGES[edge])
+    (direction,) = normal_draw(2672, x.shape, scale=EDGES[edge])
+    (cotangent,) = normal_draw(2673, x.shape)
+    assert_contract(precision.silu, (x,), (direction,), cotangent, f"silu {edge}",
+                    truth_fn=jax.nn.silu, plain_fn=jax.nn.silu)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_softplus_holds_every_order(edge):
     """`precision.softplus` (its log1p by its own series, its derivative the logistic, row 7062): every
     order finite wherever float64 is a normal float32 and the plain formula, log(1 + exp(x)) as JAX writes

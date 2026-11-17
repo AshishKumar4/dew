@@ -914,23 +914,25 @@ def test_a_weighted_total_rounds_once_and_keeps_excluded_values_out(axis):
     np.testing.assert_array_equal(np.asarray(mass), exact_mass)
 
 
+@pytest.mark.parametrize("name", ["softplus", "silu"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=str)
 @pytest.mark.parametrize("span", [(-88.0, -20.0), (-20.0, -1e-3), (-1e-3, 1e-3), (1e-3, 20.0), (20.0, 88.0)],
                          ids=str)
-def test_softplus_is_as_exact_as_jaxs_across_its_range(dtype, span):
-    """`dew.nn.precision.softplus`, its log1p by its own series (row 7062), and its derivative on par with
-    JAX's softplus from float64 on this backend over each span of its range, large negative to large
-    positive and near zero, its input in fp32 and bf16 (check 1)."""
+def test_dews_own_transcendentals_are_as_exact_as_jaxs_across_their_range(name, dtype, span):
+    """`dew.nn.precision.softplus` (its log1p by its own series) and `silu` (`x / (1 + e^-x)`, no logistic),
+    each past the backend's own (row 7062), and their derivatives on par with JAX's from float64 on this
+    backend over each span of their range, large negative to large positive and near zero, their input in
+    fp32 and bf16 (check 1)."""
     from dew.nn import precision
 
     def draw(seed):
         x = np.random.default_rng(seed).uniform(*span, 4096).astype(np.float32)
         return (jnp.asarray(x, dtype),)
 
-    for name, ours, theirs in (("value", precision.softplus, jax.nn.softplus),
-                               ("slope", jax.vmap(jax.grad(precision.softplus)),
-                                jax.vmap(jax.grad(jax.nn.softplus)))):
-        assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, f"softplus's {name} {span} {dtype}", seeds=8)
+    ours, theirs = getattr(precision, name), getattr(jax.nn, name)
+    for part, mine, jaxs in (("value", ours, theirs),
+                             ("slope", jax.vmap(jax.grad(ours)), jax.vmap(jax.grad(theirs)))):
+        assert_as_exact(jax.jit(mine), jax.jit(jaxs), draw, f"{name}'s {part} {span} {dtype}", seeds=8)
 
 
 def test_a_routes_declaration_is_the_runs_configured_precision_where_the_call_states_none():

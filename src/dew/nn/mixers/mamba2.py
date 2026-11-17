@@ -87,6 +87,7 @@ from dew.nn.precision import (
     float32_dot_general,
     rms_statistics,
     rms_weighted,
+    silu,
     softplus,
 )
 from dew.nn.residuals import Residual
@@ -217,14 +218,14 @@ class MambaRMSNormGated(nn.Module):
 
         y = x.astype(wide)
         if not self.gate_after:
-            y = y * nn.silu(gate.astype(wide))
+            y = y * silu(gate.astype(wide))
         # Weighted wide, or the normalized values cast back before the weight multiplies them.
         weight, rounded = ((scale.astype(wide), None) if self.scale_wide
                            else (scale.astype(dtype), lambda normalized: normalized.astype(dtype)))
         y = rms_weighted(grouped(y), rms_statistics(grouped(y), self.epsilon)[1], weight=grouped(weight),
                          rounded=rounded).reshape(y.shape)
         if self.gate_after:
-            y = y.astype(wide) * nn.silu(gate.astype(wide))
+            y = y.astype(wide) * silu(gate.astype(wide))
         return y.astype(dtype)
 
 
@@ -353,7 +354,7 @@ class Mamba2(nn.Module):
         if self.norm_order is not None:
             return self.norm(out, gate)
         wide = at_least_fp32(out.dtype)
-        return (out.astype(wide) * nn.silu(gate.astype(wide))).astype(out.dtype)
+        return (out.astype(wide) * silu(gate.astype(wide))).astype(out.dtype)
 
     @nn.nowrap
     def cache_spec(self, rows: int) -> dict[str, Opened]:
