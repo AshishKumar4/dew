@@ -35,7 +35,7 @@ from flax.typing import Dtype
 
 from .derivatives import Protected, contracted, declared_tangent
 from .kernels import norm_swiglu
-from .precision import at_least_fp32, capped_logits, rounded_to
+from .precision import at_least_fp32, capped_logits, rounded_to, softplus
 
 
 def gelu_exact(x: jax.Array) -> jax.Array:
@@ -146,8 +146,8 @@ class Xielu(nn.Module):
         eps = self.variable('constants', 'eps', lambda: jnp.asarray(self.eps, self.param_dtype)).value
         alpha_p, alpha_n, beta, eps = (value.astype(x.dtype) for value in (alpha_p, alpha_n, beta, eps))
         wide = at_least_fp32(x.dtype)
-        alpha_p = jax.nn.softplus(alpha_p.astype(wide)).astype(x.dtype)
-        alpha_n = beta + jax.nn.softplus(alpha_n.astype(wide)).astype(x.dtype)
+        alpha_p = softplus(alpha_p.astype(wide)).astype(x.dtype)
+        alpha_n = beta + softplus(alpha_n.astype(wide)).astype(x.dtype)
         return jnp.where(x > 0, alpha_p * x * x + beta * x,
                          (jnp.expm1(jnp.minimum(x, eps)) - x) * alpha_n + beta * x)
 

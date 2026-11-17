@@ -195,8 +195,9 @@ def update(state, query, key, value, decay, write, *, delta: bool, reads: Reads 
     largest at its prefix (4.4e38) where float64's sum was 3.0e38 (the decode step's contract near the
     largest, 128-wide heads).
     Read `reads` 'before', the output is the state entering the token's, `q^T S`, the decay and the write
-    after it; `own` `[..., Dk]`, where given, weighs the token's own write in the output a key dimension,
-    `(q * own)^T ((beta k) c^T)`, RWKV6's bonus (`Hooks.own_weight`)."""
+    after it; `own` `[..., Dk]`, where given, adds the token's own write to the output weighed a key
+    dimension, `(q * own)^T ((beta k) c^T)`, RWKV6's bonus (`Hooks.own_weight`), beside the query's whole
+    read of it where it reads the state after the update, as the chunked form adds it."""
     def read(x, rows):
         return jnp.sum(x[..., :, None] * rows, axis=-2)
 
@@ -204,8 +205,11 @@ def update(state, query, key, value, decay, write, *, delta: bool, reads: Reads 
     outer = jnp.swapaxes(corrected[..., :, None] * (key * write)[..., None, :], -1, -2)
     reading = query * decay if reads == 'after' else query
     out = read(reading, state)
-    if reads == 'after' or own is not None:
-        out = out + read(query if own is None else query * own, outer)
+    # Read after the update, the token's write is the query's; its own weight, where given, adds to it.
+    if reads == 'after':
+        out = out + read(query, outer)
+    if own is not None:
+        out = out + read(query * own, outer)
     return out, state * decay[..., :, None] + outer
 
 

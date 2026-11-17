@@ -139,7 +139,8 @@ def _broadcast(x, params):
     return np.broadcast_to(x.reshape(laid), target)
 
 
-TERM_METHODS = frozenset({"binary", "compare", "unary", "convert", "dot", "shaped", "reduce", "select"})
+TERM_METHODS = frozenset({"binary", "compare", "unary", "convert", "dot", "shaped", "reduce", "select",
+                          "clamp"})
 """The methods a term's value is an array of."""
 
 
@@ -232,6 +233,10 @@ class Evaluated:
                 return np.vectorize(lambda p, f, t: sympy.Piecewise((t, p), (f, True)), otypes=[object])(
                     predicate, false, true)
             return np.where(predicate, true, false)
+        if name == "clamp":
+            # XLA's clamp: the minimum of its upper bound and the maximum of its operand and lower bound.
+            lower, operand, upper = values
+            return _binary("min", _binary("max", operand, lower), upper)
         if name in ("__getitem__",):
             return values[0][values[1]]
         if name == "length":
@@ -659,6 +664,9 @@ class Traced(Evaluated):
         if name == "select":
             predicate, false, true = values
             return jnp.where(predicate, true, false)
+        if name == "clamp":
+            lower, operand, upper = values
+            return lax.clamp(lower, operand, upper)
         return super()._method(name, values)
 
 

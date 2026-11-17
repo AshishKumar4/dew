@@ -75,11 +75,11 @@ from dew.nn.precision import (
 )
 from dew.nn.protocols import (
     AffineHead,
-    Bounded,
     HiddenStates,
     Lacks,
     LogitsFromHidden,
     OutputTable,
+    StatesVocabulary,
     forward_method,
     head_table,
 )
@@ -144,7 +144,7 @@ def final_read(model, variables, *args, **kwargs):
     the final states of a model that scores them through a head
     (`reads_states`), else the logits it gives from its tokens: its `logits`
     (`Logits`), or a native module's own forward (`forward_method`), which must
-    give `[B, S, vocab]`, its `vocab_size` where it declares one (`Bounded`): a
+    give `[B, S, vocab]`, its `vocab_size` where it declares one (`StatesVocabulary`): a
     forward that gives anything else (its hidden states) is refused by name
     here, not read as logits by the loss."""
     method = "hidden_states" if reads_states(model) else forward_method(model, "logits")
@@ -156,9 +156,10 @@ def final_read(model, variables, *args, **kwargs):
 
 def _refuse_unlike_logits(model, read) -> None:
     """Refuse what a model's forward gave (`final_read`'s read, beside its sown collections where any were
-    opened) unless it is `[B, S, vocab]`, `vocab` its `vocab_size` where it declares one (`Bounded`)."""
+    opened) unless it is `[B, S, vocab]`, `vocab` its `vocab_size` where it declares one
+    (`StatesVocabulary`)."""
     logits = read[0] if isinstance(read, tuple) else read
-    vocabulary = model.vocab_size if isinstance(model, Bounded) else None
+    vocabulary = model.vocab_size if isinstance(model, StatesVocabulary) else None
     if jnp.ndim(logits) != 3 or (isinstance(vocabulary, int) and jnp.shape(logits)[-1] != vocabulary):
         raise ValueError(f"a {type(model).__name__} has no `logits`, so its `__call__` is read as its "
                          f"logits, [B, S, vocab{'' if vocabulary is None else f' = {vocabulary}'}], and "

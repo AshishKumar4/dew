@@ -114,6 +114,7 @@ _speaks("reduction", jax.lax.reduce_max_p, monoid="max", keeps_magnitude=True, k
 _speaks("reduction", jax.lax.reduce_min_p, monoid="min", keeps_magnitude=True, keeps_sign=True)
 _speaks("cast", jax.lax.convert_element_type_p, keeps_magnitude=True, keeps_sign=True)
 _speaks("select", jax.lax.select_n_p)
+_speaks("clamp", jax.lax.clamp_p)
 _speaks("product", jax.lax.dot_general_p)
 
 
@@ -130,7 +131,8 @@ class Written(NamedTuple):
 WRITTEN = {"binary": Written("binary", 2, "symbol"), "comparison": Written("compare", 2, "symbol"),
            "unary": Written("unary", 1, "symbol"), "shape": Written("shaped", 1, "symbol"),
            "reduction": Written("reduce", 1, "monoid"), "cast": Written("convert", 1, None),
-           "select": Written("select", 3, None), "product": Written("dot", 2, None)}
+           "select": Written("select", 3, None), "clamp": Written("clamp", 3, None),
+           "product": Written("dot", 2, None)}
 """Each kind of operation (`Operation.kind`) as its term, the one statement of the correspondence: an
 equation is written as a term by it (`_term`, `spoken_as`) and a term's operation read back by it
 (`written_as`, a rule's left side's head)."""
@@ -179,6 +181,9 @@ class Term(Expr):
 
     @method(cost=1)
     def select(self, false: Term, true: Term) -> Term: ...
+
+    @method(cost=1)
+    def clamp(self, operand: Term, upper: Term) -> Term: ...
 
     @method(cost=1)
     def convert(self, params: i64Like) -> Term: ...
@@ -265,6 +270,9 @@ class Skeleton:
 
     def select(self, false: Skeleton, true: Skeleton) -> Skeleton:
         return Skeleton.made(("select", self, false, true))
+
+    def clamp(self, operand: Skeleton, upper: Skeleton) -> Skeleton:
+        return Skeleton.made(("clamp", self, operand, upper))
 
     def convert(self, params: int) -> Skeleton:
         return Skeleton.made(("convert", self, params))
@@ -918,6 +926,30 @@ def _apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitu
     return _held_apart(made._replace(number=made.number or finite, finite=finite), aval.dtype)
 
 
+def _extremes(name: str, operands: list[Apart]) -> Apart:
+    """`_apart` of a maximum, a minimum or a clamp, XLA's: the minimum of its upper bound and the maximum of
+    its operand and its lower bound (`_extreme`), finite between finite bounds whatever its operand."""
+    if name == "clamp":
+        lower, operand, upper = operands
+        clamped = _extreme(-1, [_extreme(1, [operand, lower]), upper])
+        # Finite where it is a number between finite bounds, whatever its operand: an infinity clamps to one.
+        return clamped._replace(finite=clamped.number and lower.finite and upper.finite)
+    return _extreme(1 if name == "max" else -1, operands)
+
+
+def _extreme(side: int, operands: list[Apart]) -> Apart:
+    """`_apart` of a maximum (`side` 1) or a minimum (-1) of `operands`: on the side of an operand on that
+    side, else of theirs where they share one; at least the largest floor of an operand on that side, else
+    the least of all their floors (it is one of them); a number, and finite, where they all are."""
+    floors, signs = [held.floor for held in operands], [held.sign for held in operands]
+    known = [floor for floor in floors if floor is not None]
+    sign = side if side in signs else signs[0] if len(set(signs)) == 1 else 0
+    beyond = [held.floor for held in operands if held.sign == side and held.floor is not None]
+    least = min(known) if len(known) == len(floors) else None
+    return Apart(max(beyond) if beyond else least, sign, all(held.number for held in operands),
+                 all(held.finite for held in operands))
+
+
 def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitude | None],
                  dtype: DTypeLike) -> Apart:
     """`_apart` of a float output of `dtype` before its dtype holds it (`_held_apart`), `finite` before its
@@ -949,11 +981,8 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
         base, exponent = operands
         held = base.positive and base.finite and exponent.finite
         return Apart(None, 1 if base.positive else 0, held, held)
-    if name in ("max", "min"):
-        side = 1 if name == "max" else -1
-        sign = side if side in signs else signs[0] if len(set(signs)) == 1 else 0
-        beyond = [held.floor for held in operands if held.sign == side and held.floor is not None]
-        return Apart(max(beyond) if beyond else None if every is None else min(every), sign, numbers, finite)
+    if name in ("max", "min", "clamp"):
+        return _extremes(name, operands)
     if name == "select_n":
         cases = operands[1:]
         kept = [held.floor for held in cases if held.floor is not None]
@@ -1160,6 +1189,11 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apar
         return UNIT + 1
     if name in APART_BOUNDED or (name == "integer_pow" and equation.params["y"] < 1):
         return _apart_bound(equation, operands, apart, dtype) if real else None
+    if name == "clamp":
+        # Its operand where it lies between its bounds, else a bound: no larger than either bound, whatever
+        # its operand is.
+        lower, _, upper = operands
+        return None if lower is None or upper is None else max(lower, upper)
     if any(bound is None for bound in operands):
         return None
     given: list[int] = [bound for bound in operands if bound is not None]
@@ -1426,8 +1460,9 @@ def _term[Node: (Term, Skeleton)](equation: jcore.JaxprEqn, read: Callable[..., 
         return None
     first, *others = (read(atom) for atom in equation.invars)
     write = getattr(first, written.constructor)
-    if operation.kind == "select":
-        # Its operands in the equation's order: the predicate, then the value where it is false.
+    if operation.kind in ("select", "clamp"):
+        # Its operands in the equation's order: a selection's predicate, then the value where it is false; a
+        # clamp's lower bound, its operand, then its upper bound.
         return write(*others)
     if operation.kind == "cast":
         return write(param(primitive, equation.params))
@@ -1488,9 +1523,11 @@ def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, le
         if (args := get_callable_args(term, constructor)) is not None:
             # An operation's name stands between its two operands.
             return bound(args[0], args[2], args[3])
-    if (args := get_callable_args(term, Term.select)) is not None:
-        operands = jax_core.auto_insert_reshard(*(value(operand) for operand in args))
-        return jax.lax.select_n_p.bind(*operands)
+    for constructor, primitive in ((Term.select, jax.lax.select_n_p), (Term.clamp, jax.lax.clamp_p)):
+        if (args := get_callable_args(term, constructor)) is not None:
+            # A clamp binds as itself, its derivative JAX's own (zero at a bound, where a maximum and a
+            # minimum would halve it).
+            return primitive.bind(*jax_core.auto_insert_reshard(*(value(operand) for operand in args)))
     # Each other constructor's primitive parameters, by index, last after its operand and its other arguments.
     for constructor in (Term.unary, Term.convert, Term.shaped, Term.reduce):
         if (args := get_callable_args(term, constructor)) is not None:

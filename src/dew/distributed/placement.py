@@ -398,6 +398,9 @@ class Validation:
     """Each logical axis the variables declare that no rule names, with the leaves that
     declare it. A leaf keeps the dimensions it names whole on every device where a rule
     places another of its names, and takes the shape heuristic where none does (`shardings`)."""
+    by_shape: tuple[str, ...] = ()
+    """Every parameter its module declared no logical axes for, which the shape heuristic placed
+    (`parameter_spec`), by its path: the layout keeps it so (training.md, the layout), and names it."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -767,7 +770,18 @@ class Layout:
         with nn.logical_axis_rules(self.axis_rules):
             rows = batch_axes(mesh)
         return Validation(leaves, device_bytes, limits, rows, _implied_collectives(mesh, rows, split),
-                          self._unbound(state))
+                          self._unbound(state), self._by_shape(state))
+
+    def _by_shape(self, state) -> tuple[str, ...]:
+        """The parameters of `state` its modules declared no logical axes for, which `shardings` places
+        by the shape heuristic, by their paths."""
+        found = []
+        with boxed({**current_boxes(), **boxed_axes(state)}):
+            for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
+                inner = _within_variables(path)
+                if inner and _variable_path(inner[:1]) == "params" and self._axes(path, leaf.ndim) is None:
+                    found.append(_variable_path(inner))
+        return tuple(found)
 
     def _unbound(self, state) -> dict[str, tuple[str, ...]]:
         """The logical axes the variables of `state` declare that no rule names, each with
