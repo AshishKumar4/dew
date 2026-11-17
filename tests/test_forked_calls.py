@@ -390,6 +390,22 @@ def test_a_tree_call_reads_each_token_as_its_path_decoded_alone(tree, model):
 
 
 @pytest.mark.parametrize("tree", [TREE, (-1, 0, 1)], ids=["branching", "chain"])
+def test_a_tree_call_rounds_a_quantized_memory_as_each_path_decoded_alone(tree):
+    """A memory off its recurrence whose inner gradients a quantization rounds stochastically from the
+    row's key in the cache folded with each token's place (`ROUNDING_KEYS`): a cached call over a tree
+    unfolds each token's path (`InContextMemory._unfolded`), rounding at each token's place along it
+    (`Forks.positions`), on par with the path decoded as a plain cached call, from the same quantized
+    computation in float64 (check 1), on a stack of the memory alone."""
+    pytest.importorskip("qwix")
+    from dew.quantization import Quantization
+
+    spec = Quantization(patterns=(r"(.*/)?head_\d+/.*",), bwd_qtype="int8", bwd_stochastic_rounding="uniform")
+    stack = hybrid_model("memory", unfolded=True).clone(num_layers=1, layer_types=("linear_attention",))
+    assert_reads_paths(spec.apply(stack), tree, f"quantized memory tree {len(tree)}",
+                       wide=spec.apply(stack.clone(dtype=jnp.float64)))
+
+
+@pytest.mark.parametrize("tree", [TREE, (-1, 0, 1)], ids=["branching", "chain"])
 def test_a_windowed_tree_call_reads_its_cached_keys_at_the_places_forks_give_them(tree):
     """A windowed decoder's cached call over a tree reads each cached key at its place (`fork_key_places`:
     the prefix counted back from the root's place, each node at its depth's), not its slot: each token's
@@ -448,12 +464,13 @@ def test_a_tree_after_a_packed_prompt_reads_its_last_document_alone():
 
 
 def assert_reads_paths(model: CausalTransformer, tree: tuple[int, ...], label: str, *,
-                       valid: jax.Array | None = None) -> None:
+                       valid: jax.Array | None = None, wide: CausalTransformer | None = None) -> None:
     """`model`'s cached call over `tree` past a cached prompt (`tree_coordinates`), on par with each token's
     root-to-token path decoded as a plain cached call from the same cache, from the float64 run's (check 1),
     over drawn weights and ids; the tokens each row holds `valid` (`[2, S]`, every one where None), each
-    path's held alike, for a stack with no attention, whose keys a tree's runs name whether held or not."""
-    wide = float64_twin(model)
+    path's held alike, for a stack with no attention, whose keys a tree's runs name whether held or not;
+    `wide` the float64 decoder whose paths are the truth, `model`'s twin where None."""
+    wide = float64_twin(model) if wide is None else wide
     rows = 2
     initialized = jax.jit(model.init)
 
