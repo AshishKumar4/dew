@@ -246,6 +246,7 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
     from dew.diffusion.schedules.source import SourceGrid
     from dew.inference.images import ImageSettings, TextToImage, restored_tree
     from dew.inference.tasks import saved_settings
+    from dew.objectives.diffusion.objective import without_loss_heads
 
     if not samples_images(run):
         raise ValueError(f"{checkpoint} is a {run.objective.__name__} run, which Pretrained.load reads; a "
@@ -257,11 +258,14 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
                          "denoiser; text=False skips none of it")
     settings = saved_settings(run.record, ImageSettings)
     if variables is None:
-        # The tree as the checkpoint holds it, then as the task publishes it: its loss heads the run's own
-        # and dropped, a tuned autoencoder's weights and statistics under `autoencoder` (`EndToEnd.tuned`).
-        task = TextToImage.from_saved(run, dtype=dtype, variables=restored_tree(
-            run, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype))
-        tree = task.variables
+        restored = restored_tree(run, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
+        task = TextToImage.from_saved(run, dtype=dtype, variables=restored)
+        # The tree as the checkpoint holds it (an adapter's frozen base split from its factors), its loss
+        # heads the run's own; a tuned autoencoder as the task holds it, its weights and running
+        # statistics under `autoencoder` (`EndToEnd.tuned`).
+        tree = without_loss_heads(restored)
+        if settings.end_to_end is not None:
+            tree = {**tree, "autoencoder": task.variables["autoencoder"]}
     else:
         # The starting run's own tree, which holds the task's published form.
         task = TextToImage.from_saved(run, dtype=dtype, variables=variables, published=True)
