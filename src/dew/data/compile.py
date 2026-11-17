@@ -1148,7 +1148,7 @@ def _compiled(
         rules=build.rules(train),
         volatile=any(_volatile(stage) for stage in (*_steps(original), *(
             stage for source in sources for stage in _written(source, ())))),
-        earlier=earlier_readers((*_steps(original), *host)),
+        earlier=earlier_readers(tuple(_steps(original)), host),
     )
     tuned = build.tuned(train, batches=batches)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
