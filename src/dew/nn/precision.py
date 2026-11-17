@@ -430,8 +430,7 @@ def rounds_products() -> bool:
     return numerics().forms == "fast" and asks_default_precision(None, configured=True)
 
 
-@jax.custom_jvp
-def softplus(x) -> jax.Array:
+def _softplus(x) -> jax.Array:
     """`jax.nn.softplus(x)`, `log(1 + exp(x))`, as its larger part plus `log1p` of the smaller's exponential
     `y` in (0, 1], the `log1p` by its series in `s = y / (2 + y)`, at most a third, `2 (s + s^3 / 3 + s^5 /
     5 + ...)` to its working dtype's rounding (`_series_terms`): a backend's own `log1p` is no part of it,
@@ -459,10 +458,16 @@ def _series_terms(dtype) -> int:
     return last
 
 
-@softplus.defjvp
-def _softplus_jvp(primals, tangents):
+def _softplus_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
+    """`softplus`'s value and tangent: its derivative the logistic, as JAX's softplus's, in at least float32
+    and rounded once to its input's dtype."""
     (x,), (tangent,) = primals, tangents
-    return softplus(x), jax.nn.sigmoid(x) * tangent
+    work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
+    return softplus(x), (jax.nn.sigmoid(work) * tangent.astype(work.dtype)).astype(tangent.dtype)
+
+
+softplus = contracted("test_softplus_holds_every_order")(
+    declared_tangent(Protected(), _softplus, _softplus_jvp))
 
 
 def iteration_dtype() -> jnp.dtype:
