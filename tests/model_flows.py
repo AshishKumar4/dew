@@ -557,23 +557,24 @@ def unit_needs(programs: list[dict[str, int]]) -> None:
 
 def need(dew, reference, truths: Path) -> dict[str, list[dict[str, int]]]:
     """A flow's run's programs as the allocator admits them (`dew.training.memory.admitted`), each its
-    compile's memory (`Executable.memory`, `truths_ahead.compiled_memory`): the bytes `resident` in the
-    allocator's pool as it runs (its arguments; a float64 truth's or terms program's beside the arms' state,
-    the most any arm takes as arguments, which the run holds while its truths compute; every program's
-    outputs are fetched to the host, `loaded`, `CompiledTruths.called`), the bytes `beside` its temporaries
-    (its outputs no donated argument holds) and its `temporaries`, one block. A part's worker fits a slot
-    where every program of its flows is admitted there."""
+    compile's memory (`Executable.memory`, `truths_ahead.compiled_memory`) in the admission's own terms
+    (`dew.training.memory.admission`): a float64 truth's or terms program's with the arms' state held beside
+    it (the most any arm takes as arguments, which the run keeps while its truths compute; every program's
+    outputs are fetched to the host, `loaded`, `CompiledTruths.called`). A part's worker fits a slot where
+    every program of its flows is admitted there."""
+    from dew.telemetry.instrumentation import CompiledMemory
+    from dew.training.memory import admission
+
     arms = [executable.memory for programs in (dew, reference) for executable in programs.programs.values()
             if executable.memory is not None]
     state = max((memory.argument for memory in arms), default=0)
 
-    def admitted_as(memory, held: int) -> dict[str, int]:
-        # The allocator's bytes alone: a program's code lives outside its pool (`dew.communicators`).
-        return {"resident": held + memory["argument"], "beside": memory["output"] - memory["alias"],
-                "temporaries": memory["temp"]}
+    def admitted_as(memory: CompiledMemory, held: int) -> dict[str, int]:
+        return dict(zip(("resident", "beside", "temporaries"), admission(memory, held), strict=True))
 
-    return {"programs": [*(admitted_as(memory._asdict(), 0) for memory in arms),
-                         *(admitted_as(memory, state) for memory in compiled_memory(truths))]}
+    truths_memory = [CompiledMemory(**memory) for memory in compiled_memory(truths)]
+    return {"programs": [*(admitted_as(memory, 0) for memory in arms),
+                         *(admitted_as(memory, state) for memory in truths_memory)]}
 
 
 PREPARED_APART = """import sys
