@@ -313,6 +313,36 @@ def test_a_second_trainer_of_one_step_plans_on_the_executable_the_first_compiled
         np.testing.assert_array_equal(np.asarray(one), np.asarray(other))
 
 
+def scaled_on_the_host(scale: float) -> optax.GradientTransformation:
+    """Plain descent whose rate a host callback answers (`jax.pure_callback`): `scale` is the callback's
+    closure, so two of other scales trace one program text calling other callbacks."""
+    def update(updates, state, params=None):
+        del params
+        rate = jax.pure_callback(lambda: np.float32(1e-2 * scale), jax.ShapeDtypeStruct((), jnp.float32))
+        return jax.tree.map(lambda update: -rate * update, updates), state
+
+    return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+
+
+def test_a_second_trainer_whose_step_calls_another_host_callback_runs_its_own():
+    """Two trainers of one step whose optimizers differ only in what their host callback answers (a rate
+    `jax.pure_callback` reads from its closure, of one program text) each step by their own callback: the
+    process holds an executable by the callbacks its program calls (`dew.nn.kernels.options.program_key`),
+    where the second ran the first's executable, its rate, a wrong result with nothing to show it (the
+    base review of c5eb090ed's F1)."""
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ)
+
+    def run(scale: float):
+        return one_device(Trainer(LMObjective(model, seq_len=SEQ), scaled_on_the_host(scale),
+                                  key=jax.random.key(0), split=1))
+
+    once, twice = (trained(run(scale), steps=1) for scale in (1.0, 2.0))
+    # From one start over one batch: the second's step at its own rate lands elsewhere.
+    assert not all(np.array_equal(np.asarray(one), np.asarray(two)) for one, two in zip(
+        jax.tree.leaves(once.variables["params"]), jax.tree.leaves(twice.variables["params"]), strict=True))
+
+
 def trained(trainer, steps=3, batch=None):
     """The state after `steps` steps of `batch`, BATCH where None."""
     batch = BATCH if batch is None else batch

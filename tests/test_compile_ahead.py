@@ -408,6 +408,8 @@ def test_a_kept_programs_failed_check_raises_where_handed_as_where_kept(tmp_path
 
 
 ORPHANED_START = """
+import atexit
+import os
 import threading
 
 import jax
@@ -417,7 +419,7 @@ from dew.nn.kernels import options
 from dew.nn.kernels.templates import report
 
 # A start's compile, XLA's own, of a program long enough to compile that it is in flight when the run is
-# refused: its thread is shown to have entered XLA's compile, and not to have left it.
+# refused: its thread is shown to have entered XLA's compile.
 begun, ended = threading.Event(), threading.Event()
 compiled = report.attempted
 
@@ -431,6 +433,11 @@ def attempted(lowered, held):
 
 
 report.attempted = attempted
+# Registered before the compile begins, so the exit runs it after its wait for the compile and before JAX's
+# own cleanup: 3 where the compile had ended by then, 5 where the exit went on with it running, and 4 where
+# it had ended before the refusal, whose exit then says nothing of the wait.
+early = threading.Event()
+atexit.register(lambda: os._exit(4 if early.is_set() else 3 if ended.is_set() else 5))
 
 
 def long(x):
@@ -441,20 +448,21 @@ def long(x):
 
 options.compiling(jax.jit(long), jnp.ones(2))
 begun.wait()
-# Refused before its start was taken, with an exit status of its own, its compile still running (else the
-# exit's timing says nothing of it, and the run says so by another status).
-raise SystemExit(4 if ended.wait(0.5) else 3)
+# Refused before its start was taken, its compile still running (else the exit's timing says nothing of it,
+# and the exit hook says so by its own status).
+if ended.wait(0.5):
+    early.set()
+raise SystemExit(1)
 """
 """A run that begins its start's compile beside its planning and is refused before it takes the start."""
 
 
-@pytest.mark.parametrize("run", range(8))
-def test_a_run_refused_before_its_start_is_taken_exits_with_its_refusal_while_its_compile_runs(run):
+def test_a_run_refused_before_its_start_is_taken_exits_once_its_compile_ends():
     """A run whose start's compile is begun beside its planning (`options.compiling`) and which is refused
-    before it takes the start, its compile still running, exits with its refusal's status once that compile
-    ends (`_exit_waits`): JAX's exit cleanup and the C runtime's exit tore XLA down under it, and 12 of 48
-    such exits ended by a segmentation fault (row 6837). A status of 4 says the compile ended before the
-    refusal, and the cell then proves nothing."""
+    before it takes the start, its compile still running, exits once that compile ends, saying it waits:
+    JAX's exit cleanup and the C runtime's exit tore XLA down under the running compile, and 12 of 48 such
+    exits ended by a segmentation fault (row 6837). The child's own exit hook, run after the wait and before
+    JAX's cleanup, states whether the compile had ended: deterministically, where a crash came 1 in 4."""
     import process_support
 
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(process_support.REPO_ROOT / "src"),

@@ -160,9 +160,10 @@ def decoded_ahead(planes: jax.Array, live: jax.Array, dtype) -> None:
     for a mesh rebuilt over the same devices and spec, `NamedSharding`'s equality), so the program is in the
     persistent compilation cache when a run resumes from the checkpoint, which then compiles no program the
     runs before it did not (testing.md, a resumed run reuses its compiled programs). The step never waits on
-    the compile; a checkpoint's wait for its writes waits for it too (`decodes_done`), and a process that
-    exits without closing its checkpoints does not. A compile ahead that fails is no failed save: it is
-    logged, and the resume compiles the program as it would have."""
+    the compile; a checkpoint's wait for its writes waits for it too (`decodes_done`), and so does a
+    process's exit, which never ends while a compile runs inside jaxlib (`options.compiling`). A compile
+    ahead that fails is no failed save: it is logged, and the resume compiles the program as it would
+    have."""
     abstract = [jax.ShapeDtypeStruct(array.shape, array.dtype, sharding=array.sharding)
                 for array in (planes, live)]
     key = (*((each.shape, each.dtype, each.sharding) for each in abstract), np.dtype(dtype))
