@@ -1,8 +1,8 @@
 """The shipped recipes' documented commands (their docstrings' `python recipes/...` lines, `RUN`), run
 as written at a tiny size on CPU: their flags as documented, with only the model's sizes, the run's
-length, the data and the pretrained source swapped for small local ones (`TINY`). A recipe whose defaults refuse its own
-command is red: the decision recipe's `--trainer.steps 2000` was refused at its default cadence ("epoch"),
-which no test of the recipes ran."""
+length, the data and the pretrained source swapped for small local ones (`TINY`). A recipe whose
+defaults refuse its own command is red: the decision recipe's `--trainer.steps 2000` was refused at its
+default cadence ("epoch"), which no test of the recipes ran."""
 
 import ast
 import shlex
