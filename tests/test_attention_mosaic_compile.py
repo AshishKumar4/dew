@@ -82,14 +82,6 @@ BACKWARD_GATE += [(generation_name, width, accurate, hooks) for generation_name 
                   for width in (64, 128) for accurate in (False, True) for hooks in COMPILED_HOOKS]
 BACKWARD_GATE += [("sm90", 256, False, "softcap")]
 BACKWARD_GATE = [case for case in BACKWARD_GATE if _takes(case[0], case[2], case[3])]
-SPILLING = {("sm86", 64, False, "temperature"), ("sm89", 64, False, "temperature")}
-"""The gate's cases that spill, each an open row's: an sm86's and an sm89's dK/dV at width 64 under a
-temperature, 64 bytes, the operand pipeline's per-thread shared offsets formed at the launch's entry and
-held through its loop beside the statistics' reads (row 5483, the owner's exception). Each fails here until
-it compiles spill-free, and is deleted with the fix: a cell held to spill-free qualification, never to the
-declined form below, which would make an owed fix a green cell."""
-SPILLS = pytest.mark.xfail(strict=True, reason="row 5483: 64 bytes spilled")
-BACKWARD_GATE = [pytest.param(*case, marks=SPILLS) if case in SPILLING else case for case in BACKWARD_GATE]
 """The backward resource gate's cases, each a form its GPU's bundles take (`_takes`; a form of two
 launches refused by its typed fact where the bundle's dQ launch has no producer): each GPU whose family the
 backward runs on (`BACKWARD_GATED`), a causal
@@ -576,8 +568,7 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
     print(f"GATE backward {generation_name} {width} {'accurate' if accurate else 'fast'} {hooks}: "
           + ("claimed" if not failed else "declined " + "; ".join(f"{cert['config']}: {kernels(cert)}"
                                                                    for cert in offered)))
-    if not failed or (generation_name, width, accurate, hooks) in SPILLING:
-        assert not failed, "\n".join(failed)
+    if not failed:
         return
     # Declined: the family claims no config of the call, every one it derives refused by the assembler,
     # spilling or serializing (each certification's own record, not the failure's message), and none failing
