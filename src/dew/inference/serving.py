@@ -41,8 +41,8 @@ never waits for it; a row's exit reaches the host a step late, and its slot
 is refilled the step after. Submitting a request with an integer seed
 launches nothing on the device: the admission's program makes its key.
 
-Over a paged cache (`kv_cache=KVCache(page_size=...)`, or a page size, and by
-default wherever pages serve the task with a prefix cache, `Server.from_task`)
+Over a paged cache (`kv_cache=KVCache(page_size=...)`, a page size, or
+'shared', wherever pages serve requests that repeat prompts, `Server.from_task`)
 the rows share one page pool whose ledger is `dew.inference.pages.Pages`, and a prompt runs over
 the pool through its row's page table from the row's cursor. A prompt can
 then prefill in pieces while the other rows draw (`chunk`, which a dense
@@ -608,31 +608,34 @@ def _unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bool = Fa
 
 
 PAGE_SIZE = 64
-"""The slots a page holds where neither a caller nor the model's layout names a page size
-(`Server.from_task`'s default layout). A served GRPO batch of 8 prompts x 8 samples at Qwen3-0.6B's config on
-a GH200 (M-IG-11, 64 new tokens, medians of 5 rounds, each arm alone): pages of 64 took 0.453 s at
-512-token prompts and 0.615 s at 2048 against a dense cache's 0.439 and 1.154, and pages of 16 0.509 and
-0.703."""
+"""The slots a page holds where a server's requests share prompts and neither its caller nor the model's
+layout names a page size (`Server.from_task`'s 'shared'). A served GRPO batch of 8 prompts x 8 samples at
+Qwen3-0.6B's config on a GH200 (M-IG-11, 64 new tokens, medians of 5 rounds, each arm alone): pages of 64
+took 0.453 s at 512-token prompts and 0.615 s at 2048 against a dense cache's 0.439 and 1.154, and pages of
+16 0.509 and 0.703. Over prompts no two of which share, pages cost what they cannot save: on an A100 at that
+config, 256- and 512-token prompts at 32 to 128 slots, pages of 64 drew 13 to 21% fewer output tokens a
+second than whole rows (M-IG-12), so a server pages only where its caller says its prompts repeat."""
 
 
-type PageSize = int | Literal["whole"] | None
+type PageSize = int | Literal["whole", "shared"] | None
 """A page size a caller names for a server's cache (`Server.from_task`'s `kv_cache`): pages of that many
-slots, each row's cache whole ('whole'), or None, the server's default layout."""
+slots; each row's cache whole ('whole'); pages wherever a server over them keeps a prefix cache, where the
+caller's requests repeat prompts, a group's samples of one or a session's turns ('shared'); or None, the
+model's own layout."""
 
 
 def served_layout(task: TextGeneration, capacity: int, kv_cache: KVCache | PageSize = None) -> KVCache | None:
     """The cache layout `Server.from_task` lays `task`'s rows of `capacity` slots in for its `kv_cache`
-    (`_laid`), None for a model of no layout, whose rows are whole; and where it names none, that layout
-    only where a server over it keeps a prefix cache (`_reuses_prefixes`) and the model's max_seq_len
-    holds a row of `capacity` in its whole pages (`_holds`), None where not: what a caller serving the
-    task only where its server shares prompts' pages reads, as an episode cohort does
+    (`_laid`), None for a model of no layout, whose rows are whole; and for 'shared', that layout only where
+    a server over it keeps a prefix cache (`_reuses_prefixes`) and the model's max_seq_len holds a row of
+    `capacity` in its whole pages (`_holds`), None where not: what a caller serving the task only where its
+    server shares prompts' pages reads, as an episode cohort does
     (`dew.objectives.rl.RolloutScheduler.episodes`)."""
     *_, strategy = resolve(*task.controls(), task.strategy)
     layout = _laid(task.model, kv_cache, capacity, strategy, None)
-    if kv_cache is None and not (_reuses_prefixes(task.model, layout, strategy, None)
-                                 and layout is not None and _holds(task.model, capacity, layout.page_size)):
-        return None
-    return layout
+    shares = (layout is not None and _reuses_prefixes(task.model, layout, strategy, None)
+              and _holds(task.model, capacity, layout.page_size))
+    return None if kv_cache == "shared" and not shares else layout
 
 
 def _served_mesh(task: TextGeneration) -> Mesh | None:
@@ -890,10 +893,10 @@ class Server:
         sampler draws, over a dense cache whose prompts prefill whole.
 
         `kv_cache` replaces the model's cache layout (`dew.nn.kv_cache`), a
-        page size pages the model's own and 'whole' keeps each row's whole;
-        None pages it where a prefix cache serves over pages (`_laid`). A paged
-        layout pools the pages of every row, so short requests fit more rows
-        than `pages * page_size / capacity`. `chunk` prefills a prompt in
+        page size pages the model's own, 'whole' keeps each row's whole and
+        'shared' pages it where requests repeat prompts (`_laid`); None keeps
+        the model's own. A paged layout pools the pages of every row, so short
+        requests fit more rows than `pages * page_size / capacity`. `chunk` prefills a prompt in
         pieces of at most that many tokens, one piece a step, so a long prompt
         does not stall the rows beside it. It also works over a dense cache
         where the admitting step is mixed. `prefix_cache` lets a request reuse
@@ -1808,16 +1811,18 @@ def _laid(model: nn.Module, kv_cache: KVCache | PageSize, capacity: int, strateg
           prefill_mesh: Mesh | None) -> KVCache | None:
     """The layout a server lays its rows' cache in for `from_task`'s `kv_cache`, None for a model of no
     layout, whose rows are whole: a `KVCache` as given; for a page size, the model's own layout, its format
-    kept, in pages of that many slots, or unpaged, each row's cache whole, for 'whole'; and for None the
-    model's own, in pages of `PAGE_SIZE` where it names no page size and a server over them keeps a prefix
-    cache (`_reuses_prefixes`) whose rows' `capacity` its max_seq_len holds in whole pages (`_rounded`), so
-    requests over one prompt prefill it once (rows 5374, 5375)."""
+    kept, in pages of that many slots, or unpaged, each row's cache whole, for 'whole'; for None the
+    model's own; and for 'shared' the model's own, in pages of `PAGE_SIZE` where it names no page size and
+    a server over them keeps a prefix cache (`_reuses_prefixes`) whose rows' `capacity` its max_seq_len
+    holds in whole pages (`_holds`), so requests over one prompt prefill it once (rows 5374, 5375)."""
     if isinstance(kv_cache, KVCache):
         return kv_cache
     own = model.kv_cache if isinstance(model, Layered) else None
     if kv_cache == "whole":
         return None if own is None else dataclasses.replace(own, page_size=None, pages=None, groups=1)
-    if kv_cache is not None:
+    if kv_cache is None:
+        return own
+    if kv_cache != "shared":
         return dataclasses.replace(KVCache() if own is None else own, page_size=kv_cache)
     if own is None or own.page_size is not None:
         return own
