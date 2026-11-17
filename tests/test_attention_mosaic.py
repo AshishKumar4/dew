@@ -29,8 +29,15 @@ from jax.sharding import Mesh
 from kernel_compile import compile_mosaic_kernels, mosaic_failures
 from reference_error import assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
-from test_attention_triton import (BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, bucketed, gate_of, hooks_for,
-                                   score_hooks)
+from test_attention_triton import (
+    BACKWARD_SEEDS,
+    HOOKS,
+    SCORE_HOOKS,
+    bucketed,
+    gate_of,
+    hooks_for,
+    score_hooks,
+)
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
