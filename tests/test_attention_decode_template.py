@@ -645,6 +645,56 @@ def test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100
     assert found and all(binary.frame == 0 for binary in found), found
 
 
+@COMPILES_ON_CPU
+def test_a_decode_step_launches_only_kernels_its_certification_held():
+    """A decode step through the public route (`attention_route.attend`: fp16, one query row of four heads
+    over two key heads 128 wide and 1024 keys) compiled for an H100 (`kernel_compile.compile_mosaic_kernels`):
+    each Mosaic kernel it launches is one certification compiled alone and held (`report.certified`), its
+    plan's config the one certified at the key tile its walk streams at, where the plan pinned its derived
+    config uncertified and its kernels met the assembler first in the program's compile (row 7259)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_route
+
+    query = jax.ShapeDtypeStruct((1, 1, 4, 128), jnp.float16)
+    key = jax.ShapeDtypeStruct((1, 1024, 2, 128), jnp.float16)
+    spans = template.spans(1, 1024, 1, causal=False)
+
+    def decode(query, key, value):
+        return attention_route.attend(query, key, value, spans, natural=False)
+
+    with generation.assumed("sm90"):
+        assert attention_decode.serves(query, key, None, natural=False, target=generation.gpu_target())
+        case = KernelCase("decode", lambda: (decode, (query, key, key)))
+        found = compile_mosaic_kernels([case], "sm90")
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)
+    (record,) = found
+    assert record["modules"] and record["modules"].items() <= record["certified"].items(), record
+
+
+@COMPILES_ON_CPU
+def test_a_decode_step_prepared_for_devices_no_run_tuned_is_certified():
+    """The public decode step (`attention_route.attend`, the cell above's) lowered in a prepare for devices no
+    run has tuned (`report.for_devices`, a compile ahead's) on a compile-only H100: its launch certified there
+    as anywhere, its launch alone compiled to be read (`report.read_offline`), where XLA's want of a tuned
+    result for the launch's own fusions ended its certification (`report.Untuned`)."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.templates import attention_route
+
+    query = jax.ShapeDtypeStruct((1, 1, 4, 128), jnp.float16)
+    key = jax.ShapeDtypeStruct((1, 1024, 2, 128), jnp.float16)
+    spans = template.spans(1, 1024, 1, causal=False)
+    before = report.uncertified()
+    with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]), report.for_devices():
+        lowered_for(lambda q, k, v: attention_route.attend(q, k, v, spans, natural=False), (query, key, key),
+                    "sm90")
+    assert not set(report.uncertified()) - set(before), report.uncertified()
+    assert any(found.op == "MosaicForward" for found in report.certifications()), report.certifications()
+
+
 @pytest.mark.parametrize("slices", [1, 3, 7])
 def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices):
     """Slices of a row's keys, each its output normalized, its maximum and its denominator, a slice of no
