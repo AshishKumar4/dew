@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import kernel_matrix
 import numpy as np
 import pytest
+from generation_support import COMPILES_ON_CPU
 from reference_error import assert_as_exact
 from test_recurrence_chunk import ROUTES, on_route
 
@@ -419,6 +420,7 @@ def test_a_step_reads_its_updated_state(delta, per_key):
     np.testing.assert_array_equal(out, jnp.full((1, width), 2.0 ** 80, jnp.float32))
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("local", [True, False], ids=["per-shard", "partitioned"])
 def test_a_decode_tokens_launch_runs_per_shard_moving_nothing(local):
     """A gated delta rule's decode token (`recurrence.step`, the template's step) over four rows split over
@@ -456,6 +458,7 @@ def test_a_decode_tokens_launch_runs_per_shard_moving_nothing(local):
     assert (failed == []) == local, failed
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize('rows', [1, 128], ids=['one row', '128 rows'])
 @pytest.mark.parametrize('target', ['sm80', 'sm90', 'sm100'])
 def test_a_decode_step_holds_its_registers_at_the_residency_it_plans(target, rows):
