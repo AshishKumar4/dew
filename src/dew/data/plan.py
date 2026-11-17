@@ -31,7 +31,7 @@ from dew._records import (
     moved_spelling,
     record,
 )
-from dew._stated import Unestablished, stated
+from dew._stated import Unestablished, again, stated
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 
@@ -438,12 +438,26 @@ its structure; a behaviour change of it is a new value (docs/design/data.md, the
 
 def structured(value) -> JSON:
     """`value`, a step or any part of one, described by its structure, the one description a plan records:
-    a dataclass by its class and each field it records (`repr=True`, and an
-    added one where set, `dew._records.ADDED`), whatever it computes from beside (`dependencies`, which its
+    a dataclass or attrs instance by its class and each field that decides its equality
+    (`_sources.decides`: all but `compare=False` or `eq=False`, an added one where set,
+    `dew._records.ADDED`), whatever it computes from beside (`dependencies`, which its
     identity records apart), another configured object by what it computes, a container entry by entry (a
     mapping's in its order), an array by its fingerprint, a callable by its own identity (`StepIdentity`), a
     scalar as JSON holds it, and anything else by its text, without addresses."""
     return _described(value)[0]
+
+
+def _walked(value) -> bool:
+    """Whether `_described` walks into `value`'s parts, where a part can lead back to it: a generated
+    class's instance, a list, a tuple or a mapping."""
+    return _sources.generated_instance(value) or isinstance(value, (list, tuple, Mapping))
+
+
+def _added(field: _sources.GeneratedField) -> bool:
+    """Whether `field` was added to its class after records of it were written (`dew._records.ADDED`), so
+    an identity states it only where it is set, an earlier identity unchanged."""
+    metadata = dict(field.parts).get("metadata")
+    return isinstance(metadata, Mapping) and bool(metadata.get(ADDED))
 
 
 def by_content(value) -> bool:
@@ -455,27 +469,27 @@ def by_content(value) -> bool:
     return _described(value)[1]
 
 
-def _described(value) -> tuple[JSON, bool]:
-    """`structured`'s description of `value` and whether it is `value`'s alone (`by_content`): one walk."""
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+def _described(value, walking: tuple[int, ...] = ()) -> tuple[JSON, bool]:
+    """`structured`'s description of `value` and whether it is `value`'s alone (`by_content`): one walk, a
+    value met again on its own path (`walking`) stated as a reference back to it (`dew._stated.again`), as
+    a step whose fields loop back to it does, where the walk recursed past Python's limit (train 966's
+    review)."""
+    if _walked(value):
+        if id(value) in walking:
+            return again(value, walking), True
+        walking = (*walking, id(value))
+    if _sources.generated_instance(value):
+        # A dataclass's or an attrs class's instance, by its class and every field its generator records
+        # as deciding its equality (`_sources.decides`), an added one where set (`dew._records.ADDED`).
         kind = type(value)
         described: dict[str, JSON] = {"class": f"{kind.__module__}.{kind.__qualname__}"}
         alone = True
-        for field in dataclasses.fields(value):
-            held = getattr(value, field.name)
-            if field.repr or (field.metadata.get(ADDED) and held != field.default):
-                described[field.name], own = _described(held)
-                alone = alone and own
-        return described, alone
-    if _sources.generated_instance(value):
-        # An attrs class's instance, field by field as its generator records them, each its `repr` shows.
-        kind = type(value)
-        described = {"class": f"{kind.__module__}.{kind.__qualname__}"}
-        alone = True
         for field in _sources.generated_fields(kind):
-            if dict(field.parts).get("repr", True) is not False:
-                described[field.name], own = _described(getattr(value, field.name, None))
-                alone = alone and own
+            held = getattr(value, field.name, None)
+            if not _sources.decides(field) or (_added(field) and held == field.default):
+                continue
+            described[field.name], own = _described(held, walking)
+            alone = alone and own
         return described, alone
     if isinstance(value, _Dependencies):
         return json_value(value.dependencies(), type(value).__qualname__), True
@@ -487,12 +501,12 @@ def _described(value) -> tuple[JSON, bool]:
         case Enum():
             return {"enum": f"{type(value).__module__}.{type(value).__qualname__}", "name": value.name}, True
         case list() | tuple():
-            entries = [_described(entry) for entry in value]
+            entries = [_described(entry, walking) for entry in value]
             alone = isinstance(value, tuple) and all(own for _, own in entries)
             return [entry for entry, _ in entries], alone
         case Mapping():
             # In its order, which a reader of it may take (a chat template's labels, rendered in turn).
-            entries = [(name, _described(entry)) for name, entry in value.items()]
+            entries = [(name, _described(entry, walking)) for name, entry in value.items()]
             return ({"mapping": [[name if isinstance(name, str) else repr(name), entry]
                                  for name, (entry, _) in entries]},
                     all(isinstance(name, str) and own for name, (_, own) in entries))
@@ -506,7 +520,7 @@ def _described(value) -> tuple[JSON, bool]:
         return {"class": f"{value.__module__}.{value.__qualname__}"}, True
     if inspect.ismethod(value):
         # A bound method computes what its object's configuration says.
-        of, alone = _described(value.__self__)
+        of, alone = _described(value.__self__, walking)
         return {"method": callable_name(value), "of": of}, alone
     if inspect.isfunction(value):
         identity = StepIdentity.of(value)

@@ -227,6 +227,14 @@ class GeneratedField(NamedTuple):
     parts: tuple[tuple[str, Any], ...] = ()
 
 
+def decides(field: GeneratedField) -> bool:
+    """Whether `field` takes part in its instances' equality, as its generator records it: a dataclass
+    field's `compare`, an attrs field's `eq`. A field that declares it does not (`compare=False`,
+    `eq=False`: credentials, a timeout) decides no rows, and an identity leaves it out."""
+    parts = dict(field.parts)
+    return parts.get("compare", parts.get("eq", True)) is not False
+
+
 def attrs_made(held: type) -> bool:
     """Whether attrs made `held` itself (its own `__attrs_attrs__`, which a subclass it did not decorate
     inherits)."""

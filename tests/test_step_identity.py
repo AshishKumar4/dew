@@ -927,3 +927,97 @@ def test_an_exact_resume_refuses_an_attrs_step_whose_long_array_changed(tmp_path
     assert resumed_changes(reader(), state) == ()
     with pytest.raises(ValueError):
         resumed_changes(reader(changed=True), state)
+
+
+HIDDEN = """import attrs
+import dataclasses
+
+import numpy as np
+
+
+@attrs.define(frozen=True, eq=False)
+class AttrsRemap:
+    table: np.ndarray = attrs.field(repr=False)
+    note: str = attrs.field(default="", eq=False)
+
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + int(self.table[int(row["id"])])}}
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class DataclassRemap:
+    table: np.ndarray = dataclasses.field(repr=False)
+    note: str = dataclasses.field(default="", compare=False)
+
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + int(self.table[int(row["id"])])}}
+
+
+@attrs.define(frozen=True, eq=False)
+class AttrsRoute:
+    handlers: dict
+
+    def __call__(self, row):
+        return row
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class DataclassRoute:
+    handlers: dict
+
+    def __call__(self, row):
+        return row
+
+
+def remap(kind, changed=False, note=""):
+    table = np.arange(8)
+    if changed:
+        table[1] = -1
+    return {{"attrs": AttrsRemap, "dataclass": DataclassRemap}}[kind](table, note)
+
+
+def route(kind):
+    handlers = {{}}
+    routed = {{"attrs": AttrsRoute, "dataclass": DataclassRoute}}[kind](handlers)
+    handlers["fallback"] = routed
+    return routed
+"""
+
+
+@pytest.fixture
+def hidden(tmp_path, monkeypatch):
+    """`HIDDEN`'s steps, written as a module of their own."""
+    module = tmp_path / f"hidden_{uuid4().hex}.py"
+    module.write_text(HIDDEN.format())
+    monkeypatch.syspath_prepend(str(tmp_path))
+    return importlib.import_module(module.stem)
+
+
+@pytest.mark.parametrize("kind", ["attrs", "dataclass"])
+def test_an_exact_resume_refuses_a_steps_hidden_field_that_changed_and_holds_one_that_decides_nothing(
+        hidden, kind):
+    """A step is stated by every field that decides its equality: a table it hides from its repr
+    (`repr=False`, as a large array is) and that changed refuses an exact resume, where it resumed and read
+    other rows; a field that declares it decides no equality (`eq=False`, `compare=False`: a note,
+    credentials) changes nothing it reads, and the run resumes exactly (train 966's review, F3)."""
+    def reader(**settings):
+        pipeline = Pipeline(ROWS).map(hidden.remap(kind, **settings)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(note="another"), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(changed=True), state)
+
+
+@pytest.mark.parametrize("kind", ["attrs", "dataclass"])
+def test_a_step_whose_fields_lead_back_to_it_compiles_and_resumes_exactly(hidden, kind):
+    """A step whose field holds a mapping that holds the step itself is stated with a reference back to it,
+    and its pipeline compiles, reads and resumes exactly; describing it recursed past Python's limit and
+    crashed the compile (train 966's review, F2)."""
+    def reader():
+        pipeline = Pipeline(ROWS).map(hidden.route(kind)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(), state) == ()

@@ -376,7 +376,7 @@ class Files(Dataset):
     where: ds.Expression | None = None
     partitioning: str | None = "hive"
     shard_bytes: int = 64 * 2**20
-    storage_options: Mapping[str, object] | None = field(default=None, repr=False)
+    storage_options: Mapping[str, object] | None = field(default=None, compare=False, repr=False)
     spark: bool = False
     file_info: Mapping[str, Mapping[str, object]] | None = None
     suffixes: tuple[str, ...] | None = None
