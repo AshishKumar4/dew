@@ -23,10 +23,13 @@ from dew.config.lm import LMRunConfig
 from dew.data import presets
 from dew.data.sources.tokens import TokenFiles
 
-# The windows are read by index and ordered by the shuffle and repeat written before them, so a run
-# knows its epoch's length.
-WINDOWS = TokenFiles("data/shakespeare-byte").shuffle(seed=0).repeat().pipe(
-    presets.token_windows, seq_len=256, batch=32)
+
+def default(store: str = "data/shakespeare-byte") -> LMRunConfig:
+    """The recipe's run over the token store at `store`: its windows read by index and ordered by the
+    shuffle and repeat written before them, so a run knows its epoch's length."""
+    return LMRunConfig(data=TokenFiles(store).shuffle(seed=0).repeat().pipe(
+        presets.token_windows, seq_len=256, batch=32))
+
 
 if __name__ == "__main__":
-    LMRunConfig.cli(default=LMRunConfig(data=WINDOWS)).run()
+    LMRunConfig.cli(default=default()).run()
