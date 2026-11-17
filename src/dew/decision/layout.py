@@ -33,14 +33,7 @@ from dew._records import EARLIER_LAYOUTS, JSON
 from dew.data.text import HFTokenizer, Offsets, Tokenizer
 from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
-from dew.decision.renderer import (
-    Chunk,
-    Point,
-    Rendered,
-    Unit,
-    render as rendered_chunks,
-    stream_point,
-)
+from dew.decision.renderer import Chunk, Point, Rendered, Unit, render as rendered_chunks, stream_point
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -994,7 +987,7 @@ class SegmentLayout(Layout):
                           tuple(slots[name]), readout=len(row_tokens) - 1 if labels is not None else None,
                           label_ids=labels.ids(encoder, len(slots[name])) if labels is not None else None)
                      for name, question in questions.items())
-        positions, option_slots = (_parallel(_option_groups(laid, len(rows[0].slots)), len(row_tokens))
+        positions, option_slots = (_parallel(_option_groups(laid, len(rows[0].options)), len(row_tokens))
                                    if self.parallel else (None, None))
         # A cut of a row encoded whole is its characters (`_cut`); of a row of pieces, its own tokens.
         retokenized = unit == "whole" and bool(copies)
