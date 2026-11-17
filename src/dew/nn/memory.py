@@ -426,7 +426,7 @@ class InContextMemory(LinearProducts):
         hooks, segments = self._route(), tokens.max_segments
         # A cached call's tokens at their places in the row's document, which the cache counts, and its
         # rounding stream from the row's key where the call brings none (`_cached`).
-        cached, counted = self._cached(steps) if call.decode else (None, None)
+        cached, counted = self._cached(steps, tokens) if call.decode else (None, None)
         if tokens.forks is not None and hooks is None:
             read = self._unfolded(heads, steps if cached is None else cached, tokens, log_kept,
                                   decoded=cached is not None)
@@ -620,16 +620,17 @@ class InContextMemory(LinearProducts):
         own = jnp.broadcast_to(numbers[None, :, None], (batch, count, 1))
         chains = jnp.concatenate([own, forks.ancestors()], axis=2)
         real = steps.real[:, None] & jnp.any(documents[:, None, :, None] == chains[:, :, None, :], axis=-1)
-        # A chain's places from its root.
-        places = jnp.maximum(jnp.cumsum(real, axis=-1, dtype=jnp.int32) - 1, 0)
 
         def unfolded(field: jax.Array) -> jax.Array:
             """`field` `[B, S, ...]` once for each document's row `[B * D, S, ...]`."""
             return jnp.broadcast_to(field[:, None], (batch, count, *field.shape[1:])).reshape(
                 batch * count, *field.shape[1:])
 
-        laid = jax.tree.map(unfolded, steps)._replace(real=real.reshape(batch * count, -1),
-                                                      places=places.reshape(batch * count, -1))
+        # Each token's place along its chain (`Forks.positions`), a cached call's from the row's count
+        # (`_cached`), the same in every chain that holds it.
+        places = steps.places if decoded else forks.positions(documents, valid=steps.real)
+        laid = jax.tree.map(unfolded, steps._replace(places=places))._replace(
+            real=real.reshape(batch * count, -1))
         if not decoded:
             reads = self._chunked(heads, laid)
         elif self._recurrence() is not None:
@@ -640,13 +641,12 @@ class InContextMemory(LinearProducts):
             held, share_kept = (unfolded(rows_like(cache[name].value, steps.real)) for name in (STATE, KEPT))
             reads = self._stepped_from_recurrence(heads, laid, unfolded(log_kept), held, share_kept)[0]
         else:
-            # The weights the cache holds, the chain counted past the row's tokens it has seen (`_decoded`).
+            # The weights the cache holds (`_decoded`).
             spec = self.cache_spec(batch, heads)
             cache = cache_variables(self, {name: spec[name] for name in (START, STATE, MOMENTUM)})
             held = tuple(jax.tree.map(lambda leaf: unfolded(rows_like(leaf, steps.real)), cache[name].value)
                          for name in (START, STATE, MOMENTUM))
-            seen = unfolded(rows_like(cache_variables(self, self._counts(batch))[COUNT].value, steps.real))
-            reads = self._stepped(heads, laid._replace(places=laid.places + seen[:, None]), held)[0]
+            reads = self._stepped(heads, laid, held)[0]
         reads = reads.reshape(batch, count, *reads.shape[1:])
         read = jnp.take_along_axis(reads, jnp.maximum(documents - 1, 0)[:, None, :, None, None], axis=1)[:, 0]
         return jnp.where(steps.real[..., None, None], read, 0)
@@ -890,11 +890,13 @@ class InContextMemory(LinearProducts):
                         for initial in moving)
         return {**spec, START: weights, STATE: weights, MOMENTUM: weights}
 
-    def _cached(self, steps: _Steps) -> tuple[_Steps, Callable[[], None]]:
+    def _cached(self, steps: _Steps, coordinates: Coordinates) -> tuple[_Steps, Callable[[], None]]:
         """A cached call's steps at their places in the row's document, counted from the real tokens of
         it the cache has seen (`COUNT`): the call's first document continues the row's, one that starts
-        in the call counts from 0; and the count's update past this call's tokens, which the caller runs
-        once its read is done. Where the call's quantization rounds a
+        in the call counts from 0, and in a call over forks each token at its place along its chain from
+        the row's count, as its path decoded alone counts it (`Forks.positions`); and the count's update
+        past this call's tokens, which the caller runs once its read is done. Where the call's quantization
+        rounds a
         head's gradients stochastically (`dew.quantization.quantized_products`), the steps'
         `stochastic_rounding` stream is the row's key in the cache (`ROUNDING_KEYS`) folded with each
         token's place and head (`_rounding_keys`), unless the call brings its own; a memory that rounds
@@ -902,7 +904,12 @@ class InContextMemory(LinearProducts):
         rows = steps.real.shape[0]
         cache = cache_variables(self, self._counts(rows))
         seen = cache[COUNT]
-        places = steps.places + jnp.where(_documents(steps)[1], rows_like(seen.value, steps.real)[:, None], 0)
+        held = rows_like(seen.value, steps.real)
+        forks = coordinates.forks
+        if forks is not None:
+            places = forks.positions(coordinates.segments, base=held, valid=steps.real)
+        else:
+            places = steps.places + jnp.where(_documents(steps)[1], held[:, None], 0)
         keys = dict(steps.keys or {})
         if ROUNDING_KEYS in cache and not any(name == "stochastic_rounding" for name, _ in keys):
             keys.update(_rounding_keys(rows_like(cache[ROUNDING_KEYS].value, steps.real), places, self.heads))

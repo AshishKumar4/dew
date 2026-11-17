@@ -389,6 +389,37 @@ def test_a_tree_call_reads_each_token_as_its_path_decoded_alone(tree, model):
     assert_reads_paths(built, tree, f"{model} tree")
 
 
+def test_a_tree_call_rounds_a_memorys_gradients_at_each_tokens_place_along_its_path():
+    """A memory off its recurrence whose inner gradients a quantization rounds stochastically from the
+    row's key in the cache folded with each token's place (`ROUNDING_KEYS`): a cached call over a chain of
+    three tokens, each continuing the one before, unfolds each token's path (`InContextMemory._unfolded`)
+    and rounds each token at its place along it (`Forks.positions`), as the path decoded as a plain cached
+    call rounds it, bit for bit; another place's rounding would move the logits by the rounding's step."""
+    pytest.importorskip("qwix")
+    from dew.quantization import Quantization
+
+    model = Quantization(patterns=(r"(.*/)?head_\d+/.*",), bwd_qtype="int8",
+                         bwd_stochastic_rounding="uniform").apply(hybrid_model("memory", unfolded=True))
+    tree, rows = (-1, 0, 1), 2
+    ids = jax.random.randint(jax.random.key(4527), (rows, PROMPT + len(tree)), 0, VOCAB)
+    params = nn.unbox(model.init(jax.random.key(1), ids))
+    prompt, block = ids[:, :PROMPT], ids[:, PROMPT:]
+
+    @jax.jit
+    def tree_logits(params):
+        logits, _ = model.apply({**params, "cache": cached(model, params, prompt)}, block, decode=True,
+                                mutable=["cache"], coordinates=tree_coordinates(tree, rows, PROMPT))
+        return logits
+
+    @jax.jit
+    def path_logits(params):
+        logits, _ = model.apply({**params, "cache": cached(model, params, prompt)}, block, decode=True,
+                                mutable=["cache"])
+        return logits
+
+    np.testing.assert_array_equal(np.asarray(tree_logits(params)), np.asarray(path_logits(params)))
+
+
 @pytest.mark.parametrize("tree", [TREE, (-1, 0, 1)], ids=["branching", "chain"])
 def test_a_windowed_tree_call_reads_its_cached_keys_at_the_places_forks_give_them(tree):
     """A windowed decoder's cached call over a tree reads each cached key at its place (`fork_key_places`:
