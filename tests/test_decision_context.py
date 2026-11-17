@@ -814,7 +814,6 @@ def test_a_configured_context_encoder_is_frozen_unless_trained_and_counted_as_it
     for trained in (False, True):
         objective = configured(trained=trained)
         data = decision_rows(examples(), 8, objective=objective.data())
-        batch = next(iter(data.train(DataPartition())))
         drawn = objective.model.context.encoder.params
         # Two steps: the cross-attention's gate opens from zero on the first, so the second reaches the
         # encoder.
