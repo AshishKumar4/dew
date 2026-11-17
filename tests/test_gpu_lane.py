@@ -100,13 +100,13 @@ def test_a_gpu_lane_given_the_whole_gpu_hands_its_files_jaxs_default_share(ci, t
 
 def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_nothing(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A lane's prepare (`gpu-lane --prepare`) runs each of its files that holds a test marked `prepares`, on
-    the CPU under the prepare's word (DEW_TIER_PREPARE, which the suite's conftest reads to skip every other
-    test), with the store its environment names: a cut file's group prepares exactly the tests its run then
-    holds, as both select and cut the file alike (a prepare that selected the marked tests alone would cut
-    them into other groups, and a run would find a test its part never prepared); a file with nothing to
-    prepare starts no process; and a prepare records no row, so no lane or task reuses it as a test's run.
-    The fixtures are fetched first, as a run's are."""
+    """A lane's prepare (`gpu-lane --prepare`) runs every file of its part, on the CPU under the prepare's
+    word (DEW_TIER_PREPARE, under which the suite's conftest has each test prepare what its run reads, one
+    that prepares nothing skipped), with the store its environment names: a cut file's group prepares exactly
+    the tests its run then holds, as both select and cut the file alike (a prepare that selected some tests
+    alone would cut them into other groups, and a run would find a test its part never prepared); every file,
+    so a site its run reaches is never unprepared (Main, 2026-11-17); and a prepare records no row, so no lane
+    or task reuses it as a test's run. The fixtures are fetched first, as a run's are."""
     url, stored, _ = cache_worker
     gpu_lane_at(tmp_path, monkeypatch, url, 0)
     interpreter(tmp_path, "3.12")
@@ -153,12 +153,12 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         name = f"tests/test_flows.py#{group}"
         assert ci.gpu_prepared("3.12", [name, "tests/test_plain.py"], out, processes=2, deadline=600.0) == 0
         assert [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]] == [
-            (f"3.12:{name}", 0)]
+            (f"3.12:{name}", 0), ("3.12:tests/test_plain.py", 0)]
         lines = said("prepared")
         # Each told the unit it prepares, as the lane names it, under which its programs' memory is filed.
         assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"), name)}
         prepared[group] = {line[0] for line in lines}
-    assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "nothing to prepare starts no process"
+    assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "a test that prepares nothing is skipped"
     assert not stored, "a prepare records no row"
     assert not (tmp_path / "artifacts" / "progress.jsonl").exists(), "nor any test as passed (review)"
     monkeypatch.delenv("ARMADA_RESUME")
