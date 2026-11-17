@@ -1392,7 +1392,7 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         raise refused.refusing("step") from refused
     # The sampled step as the search compiled it, its program what it lowered then.
     sampled = (None if planned.sampled is None
-               else AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable))
+               else AheadProgram.of(planned.sampled.digest, planned.sampled.executable))
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     memory = compiled_memory(compiled)
