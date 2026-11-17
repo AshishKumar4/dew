@@ -30,8 +30,8 @@ import weakref
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import rounds_nothing, unrewritten
-from float64_terms import SUMS, _static, _target, evaluated_on, walked
+from arm_arithmetic import on_float64_device, on_float64_host, rounds_nothing, unrewritten
+from float64_terms import SUMS, _target, evaluated_on, static, walked
 from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
@@ -162,12 +162,13 @@ def rounding_scale(fn, *args, seed: int = 0):
     tree = jax.tree.structure(shapes)
     # Traced in the caller's arithmetic (its default matmul precision among it), replayed in float64's own.
     traced = str(jax.config.jax_default_matmul_precision)
-    with evaluated_on(jax.tree.leaves(args)), jax.enable_x64(new_val=True), \
+    moved = on_float64_host(jax.tree.leaves(args))
+    with on_float64_device(), evaluated_on(moved), jax.enable_x64(new_val=True), \
             jax.default_matmul_precision("highest"):
-        leaves = [jnp.asarray(_widened(leaf)) for leaf in jax.tree.leaves(args)]
-        consts = [_widened(value) for value in closed.consts]
+        leaves = [jnp.asarray(_widened(leaf)) for leaf in moved]
+        consts = [_widened(value) for value in on_float64_host(closed.consts)]
         keys = _keys(seed)
-        if _static(closed.jaxpr):
+        if static(closed.jaxpr):
             signature = (jax.tree.structure(args), tuple((np.shape(leaf), jnp.result_type(leaf),
                                                           getattr(jax.typeof(leaf), "weak_type", False))
                                                          for leaf in jax.tree.leaves(args)),

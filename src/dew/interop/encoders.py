@@ -116,6 +116,10 @@ class _TextTower(ConditionEncoder[str, TextContext]):
         return {"input_ids": np.asarray(tokens["input_ids"], np.int32),
                 "attention_mask": np.asarray(tokens["attention_mask"], np.int32)}
 
+    def token_counts(self, texts: Sequence[str]) -> np.ndarray:
+        # The checkpoint tokenizer's tokens, specials included, before `context` cuts them.
+        return np.asarray([len(ids) for ids in self.tokenizer(list(texts))["input_ids"]], np.int64)
+
     def conditioning_flops(self, tokens) -> ConditionWork:
         return ConditionWork.of_tokens(self.transformer, tokens, self.transformer.emb_features)
 

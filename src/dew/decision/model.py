@@ -1,6 +1,6 @@
 """A backbone and a decision head, applied as two modules over one variables tree."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
@@ -11,23 +11,16 @@ from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
 from dew.decision.head import Head, answer_states
 from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import HOWS
-from dew.inputs.condition import BackboneCall, BackboneEncoder
+from dew.inputs.condition import BackboneCall, BackboneEncoder, ConditionEncoder
 from dew.inputs.spec import Condition, encode_conditions
 from dew.nn.cross_attention import ContextEncoder, encode_context
-from dew.nn.inputs import CONTEXT, ModelInputs
+from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, ModelInputs
 from dew.nn.inspection import INSPECTED, QK, component, in_parts, observed_maxima
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import EXITS, Looped, TokenModel, VocabularyRows
 from dew.nn.visibility import block_ends, block_starts
 from dew.nn.wrapping import HeadedModel
 from dew.objectives.base import joined
-
-
-def context_streams(context: ContextEncoder) -> tuple[tuple[str, Condition], ...]:
-    """A decision model's conditioning streams (`DecisionModel.conditions`): a row's context encoded as
-    `context` says, and a schema read as the row's context by the backbone's own pass."""
-    return (("context", Condition(BackboneContext(context), field="context")),
-            ("schema", Condition(BackboneContext("backbone"), field="context")))
 
 
 @dataclass(frozen=True)
@@ -78,27 +71,61 @@ class DecisionModel(HeadedModel):
     context_encoder: ContextEncoder = "table"
     """How the backbone encodes a row's context for its cross-attention (`BackboneContext.encoder`): `table`,
     its tokens through the backbone's own embedding table, or `backbone`, its own final states over it in a
-    pass of its own, which a run records."""
+    pass of its own, which a run records; read where no other encoder is configured (`context`)."""
+    context: Condition | None = None
+    """The context's condition where a run configures its encoder (any `ConditionEncoder`, a frozen text
+    encoder or a character table, as a diffusion run configures its conditions), its tokens the batch's
+    `context` field, which the encoder tokenizes, its weights the model's `context` module; None, the
+    backbone's own (`context_encoder`)."""
 
-    @property
-    def conditions(self) -> tuple[tuple[str, Condition], ...]:
-        """The conditioning streams its cross-attention reads, by name, each an ordinary `Condition` whose
-        encoder is the backbone itself (`BackboneContext`, decision-inputs.md section 2): `context`, a row's
-        context, as `context_encoder` says, and `schema`, a schema read as the row's context, with the
-        example's context in the room after it, always the backbone's own pass, whose states its spans are
-        pooled from (`context_streams`)."""
-        return context_streams(self.context_encoder)
-
-    def stream(self, spans_in_context: bool) -> Condition:
-        """The stream a row's context is: the schema's where the row reads its schema in its context
-        (`DecisionInputs.spans_in_context`), the backbone's own pass, else the context's."""
-        return Condition(BackboneContext("backbone" if self.own_pass(spans_in_context) else "table"),
-                         field="context")
+    def context_condition(self, spans_in_context: bool) -> Condition:
+        """The condition a row's context is (decision-inputs.md section 2): a schema read as the row's
+        context is the backbone's own pass over it, whose states its spans are pooled from; else the
+        configured one (`context`), or the backbone's by `context_encoder`."""
+        if spans_in_context:
+            return Condition(BackboneContext("backbone"), field="context")
+        return self.context or Condition(BackboneContext(self.context_encoder), field="context")
 
     def own_pass(self, spans_in_context: bool) -> bool:
-        """Whether the stream a row's context is (`stream`) is the backbone's own pass over it, which a
-        step counts the work of (`dew.decision.DecisionObjective`), rather than its token table."""
-        return spans_in_context or self.context_encoder == "backbone"
+        """Whether a row's context (`context_condition`) is the backbone's own pass over it, which a step
+        counts the work of (`dew.decision.DecisionObjective`), rather than its token table or another
+        encoder."""
+        match self.context_condition(spans_in_context).encoder:
+            case BackboneContext(encoder="backbone"):
+                return True
+            case _:
+                return False
+
+    def _conditioned(self, condition: Condition, variables: Variables, inputs: DecisionInputs,
+                     live: BackboneCall) -> Mapping[str, jax.Array]:
+        """The conditioning the backbone's cross-attention reads of `inputs`' context under `condition`
+        (`encode_conditions`, the one encoding of a condition): the backbone's own encoding, handed the live
+        model (`BackboneContext`), or a configured encoder's over its tokens of the context under the
+        model's `context` weights, its states and lengths the context's."""
+        assert inputs.context is not None and inputs.context_lengths is not None
+        match condition.encoder:
+            case BackboneEncoder() as backbone:
+                tokens = ContextTokens(inputs.context, inputs.context_lengths, inputs.context_segments,
+                                       inputs.max_segments)
+                return encode_conditions((("context", backbone),), {}, {"context": tokens},
+                                         path="DecisionModel", backbone=live)["context"]
+            case encoder:
+                weights = {"context": part(variables, "context")["params"]}
+
+                def encoded(tokens: jax.Array, lengths: jax.Array) -> jax.Array:
+                    mask = (jnp.arange(tokens.shape[1])[None, :] < lengths[:, None]).astype(jnp.int32)
+                    held = {"context": {"input_ids": tokens, "attention_mask": mask}}
+                    return encode_conditions((("context", encoder),), weights, held,
+                                             path="DecisionModel")["context"].hidden
+
+                # Each row's context a document of its own, a window's rows' contexts end to end, each
+                # encoded alone at the encoder's own width (`_apart`), as the backbone's pass reads each
+                # document alone.
+                segments, documents = context_documents(inputs.context, inputs.context_lengths,
+                                                        inputs.context_segments, inputs.max_segments)
+                states = _apart(encoded, inputs.context, segments, documents, encoded_width(encoder))
+                return {CONTEXT: states, CONTEXT_LENGTHS: inputs.context_lengths,
+                        **({} if inputs.context_segments is None else {CONTEXT_SEGMENTS: segments})}
 
     def reads_progress(self) -> bool:
         """Whether its backbone's computation changes over a run (`dew.nn.progress.ReadsProgress`)."""
@@ -177,15 +204,11 @@ class DecisionModel(HeadedModel):
                 raise TypeError(f"rows carry a context, which a {type(self.backbone).__name__} without "
                                 "cross-attention layers does not read")
             assert inputs.context_lengths is not None, "a row's context comes with its length"
-            # The schema's stream where the context holds it, whose spans the head pools from its pass,
-            # else the context's (`stream`), the backbone handed to it as its encoder.
-            # A window's rows each read their own context (`DecisionInputs.context_segments`).
-            stream = self.stream(inputs.spans_in_context)
-            tokens = ContextTokens(inputs.context, inputs.context_lengths, inputs.context_segments,
-                                   inputs.max_segments)
+            # The row's context condition (`context_condition`), the backbone handed to it where it is its
+            # encoder; a window's rows each read their own context (`DecisionInputs.context_segments`).
             live = BackboneCall(self.backbone, part(variables, "backbone"), train, rngs, progress)
-            conditioning = encode_conditions((("stream", stream.encoder),), {}, {"stream": tokens},
-                                             path="DecisionModel", backbone=live)["stream"]
+            condition = self.context_condition(inputs.spans_in_context)
+            conditioning = self._conditioned(condition, variables, inputs, live)
             spanned = conditioning[CONTEXT] if inputs.spans_in_context else None
         if media is not None:
             if inputs.slots is not None or inputs.streams is not None:
@@ -433,3 +456,46 @@ def _array(applied: object) -> jax.Array:
         raise TypeError(f"expected an array from the module, got {type(applied).__name__}")
     return applied
 
+
+def context_documents(tokens: jax.Array, lengths: jax.Array, segments: jax.Array | None,
+                      documents: int) -> tuple[jax.Array, int]:
+    """Each context token's document (1 to `documents`, 0 none) and how many a row holds at most: a packed
+    window's own (`DecisionInputs.context_segments`), or each row's context one document of its
+    `lengths`."""
+    if segments is not None:
+        return segments, documents
+    return (jnp.arange(tokens.shape[1])[None, :] < lengths[:, None]).astype(jnp.int32), 1
+
+
+def document_lengths(segments: jax.Array, documents: int) -> jax.Array:
+    """Each row's documents' token counts `[B, documents]`, by `segments` (`context_documents`)."""
+    return jnp.sum(segments[:, :, None] == jnp.arange(1, documents + 1), axis=1)
+
+
+def encoded_width(encoder: ConditionEncoder) -> int:
+    """The tokens a configured context encoder reads a text at, its own tokenization's width, which a
+    document of a row's context is encoded at (`_apart`)."""
+    return len(encoder.tokenize([""])["input_ids"][0])
+
+
+def _apart(encoded: Callable[[jax.Array, jax.Array], jax.Array], tokens: jax.Array, segments: jax.Array,
+           documents: int, width: int) -> jax.Array:
+    """`encoded` (tokens `[N, width]` and lengths `[N]` to states `[N, width, F]`) over each document of a
+    window's context alone: the tokens of each document `segments` `[B, C]` names (1 to `documents`, 0
+    none) moved to a row of their own `width` long, encoded, and their states moved back to where the
+    tokens stood, zeros where none does; so a configured encoder keeps a window's rows' contexts apart, as
+    the backbone's pass does, each at its own width (a document is at most that long: the encoder's
+    tokenization kept no more of it, `dew.decision.layout.context_tokens`)."""
+    batch, columns = tokens.shape
+    owned = segments[:, :, None] == jnp.arange(1, documents + 1)
+    place = jnp.sum((jnp.cumsum(owned, axis=1) - 1) * owned, axis=-1)
+    document = jnp.clip(segments - 1, 0, documents - 1)
+    rows = jnp.broadcast_to(jnp.arange(batch)[:, None], (batch, columns))
+    # A token of no document is dropped (an index past the documents').
+    target = jnp.where(segments > 0, document, documents)
+    apart = jnp.zeros((batch, documents, width), tokens.dtype)
+    apart = apart.at[rows, target, place].set(tokens, mode="drop")
+    lengths = document_lengths(segments, documents).reshape(-1)
+    states = encoded(apart.reshape(batch * documents, width), lengths)
+    states = states.reshape(batch, documents, width, -1)[rows, document, jnp.minimum(place, width - 1)]
+    return jnp.where((segments > 0)[:, :, None], states, 0).astype(states.dtype)

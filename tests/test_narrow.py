@@ -680,8 +680,7 @@ def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_only_where_dropping_t
     own = {probe["narrow"]: probe for probe in probes if {key: probe[key] for key in rung} == at_base}
     with_copies, without = own[True], own[False]
     assert not with_copies["fits"] and not without["fits"]
-    recomputing = [index for index, probe in enumerate(probes) if probe["remat"] != base["remat"]]
-    assert probes.index(without) < min(recomputing)
+    assert all(probe["remat"] == base["remat"] for probe in probes[:probes.index(without) + 1])
     # The plan, a rung above, holds them dropped where dropping them left the step less short, and back where
     # it did not, and the run trains on the plan it found.
     kept = without["headroom"] <= with_copies["headroom"]
