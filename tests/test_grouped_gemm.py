@@ -242,19 +242,15 @@ def test_a_16_bit_products_stated_dot_algorithm_reaches_xla():
         np.asarray(jax.jit(xla_own, static_argnums=(2, 3))(xb, wb, preset.BF16_BF16_F32, jnp.float32)))
 
 
-def test_a_kept_calls_identity_states_the_installed_cutlass_wheel(tmp_path, monkeypatch):
-    """A call's identity (`dew.training.identity.facts`, what a kept program is handed by) states which
-    generations' kernels the installed dew-cutlass holds, as CUTLASS's eligibility reads them
-    (`generation.cutlass_built`): a process that installs the wheel, or another build of it, after a
-    program was kept is not handed that program, its route to CUTLASS untraced (audit P9). Two builds, one
-    holding Hopper's kernels and one Ampere's, stand in for the wheel ahead of any installed one."""
-    from dew.training import identity
-
-    fact = "dew.nn.kernels.generation.cutlass_built"
-    before = identity.facts()[fact]
+def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path, monkeypatch):
+    """Which generations' kernels the installed dew-cutlass holds is read where CUTLASS's eligibility asks
+    (`generation.cutlass_built`), from the build installed then: a process that installs the wheel, or
+    another build of it, routes as that build allows (audit P9), and the program its trace lowers states
+    the route it took. Two builds, one holding Hopper's kernels and one Ampere's, stand in for the wheel
+    ahead of any installed one."""
     path = list(sys.path)
 
-    def installed(minimum: tuple[int, int], built: str):
+    def installed(minimum: tuple[int, int], built: str) -> dict:
         # Each build its own directory ahead of the installed packages, so no build's bytecode stands in
         # for another's.
         wheel = tmp_path / built
@@ -264,15 +260,14 @@ def test_a_kept_calls_identity_states_the_installed_cutlass_wheel(tmp_path, monk
         monkeypatch.setattr(sys, "path", [str(wheel), *path])
         monkeypatch.delitem(sys.modules, "dew_cutlass", raising=False)
         importlib.invalidate_caches()
-        return identity.facts()[fact]
+        return generation.cutlass_built()
 
     hopper = installed((9, 0), "sm90")
-    built = generation.cutlass_built()
-    assert built["sm90"] == "sm90" and built["sm80"] is None
+    assert hopper["sm90"] == "sm90" and hopper["sm80"] is None
     assert grouped_matmul.cutlass_built_for("sm90") == "sm90"
     assert grouped_matmul.cutlass_built_for("sm80") is None
-    assert hopper != before
-    assert installed((8, 0), "sm80") != hopper
+    ampere = installed((8, 0), "sm80")
+    assert ampere["sm80"] == "sm80" and grouped_matmul.cutlass_built_for("sm80") == "sm80"
 
 
 def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
