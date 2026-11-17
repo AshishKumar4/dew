@@ -45,10 +45,10 @@ HIDDEN_INPUTS = (".github", ".armada.json", ".python-version", ".gitattributes",
 thresh's annotations), each the input of the files that read it alone; any other hidden entry (.git, an
 environment, a cache) is none."""
 READS = {"open", "os.listdir", "os.scandir"}
-LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
-"""The cgroup files that set a process's execution limits, by the input a run that read one keys, which host.py's
-`limit` reads the binding value of."""
 """Audit events of a read: a file opened, a directory listed."""
+LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
+"""The cgroup files that set a process's execution limits, by the input a run that read one keys, which
+host.py's `limit` reads the binding value of."""
 IMPORTING = {"<frozen importlib._bootstrap>", "<frozen importlib._bootstrap_external>", "<frozen zipimport>"}
 """The import system's frozen modules, which list the directories it imports from and read the modules it
 executes: what a run executed of a module is its record's (`code_unit`), the code it entered, not the text
