@@ -529,7 +529,7 @@ def refuse_causal(model: nn.Module) -> None:
 
 def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelInputs,
                       budget: int, steps: int, n: int, eos_ids: tuple[int, ...], pad_id: int) -> None:
-    from dew.nn.protocols import Bounded
+    from dew.nn.protocols import Bounded, StatesVocabulary
 
     refuse_causal(model)
     for name, value, minimum in (("max_new_tokens", budget, 0), ("steps", steps, 1), ("n", n, 1)):
@@ -537,7 +537,7 @@ def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelI
             raise ValueError(f"{name} must be an integer >= {minimum}")
     # A model that declares no vocabulary or capacity is checked for neither, as text generation does.
     bounded = isinstance(model, Bounded)
-    vocab = model.vocab_size if bounded else None
+    vocab = model.vocab_size if isinstance(model, StatesVocabulary) else None
     # Ids by the one law every parser of them reads; the vocabulary bounds them here.
     ids = {"mask_id": [token_id(process.mask_id, where="mask_id")],
            "pad_token_id": [token_id(pad_id, where="pad_token_id")],

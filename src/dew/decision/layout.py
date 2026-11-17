@@ -20,7 +20,6 @@ import functools
 import itertools
 import json
 import re
-import weakref
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, TypeGuard, get_args
@@ -29,6 +28,7 @@ import numpy as np
 from typing_extensions import get_protocol_members
 
 from dew import _records
+from dew._cache import Same
 from dew._records import EARLIER_LAYOUTS, JSON
 from dew.data.text import HFTokenizer, Offsets, Tokenizer
 from dew.data.tokens import share_tokens
@@ -75,34 +75,13 @@ def _holds_specials(tokenizer: "Tokenizer | TokenizerSpecials | PreTrainedTokeni
     return all(hasattr(tokenizer, name) for name in get_protocol_members(TokenizerSpecials))
 
 
-class _Same:
-    """An encoder as a cache key (`_same`), so a tokenizer need not hash."""
-
-    __slots__ = ("__weakref__", "encoder")
-
-    def __init__(self, encoder: Tokenizer):
-        self.encoder = encoder
-
-
-_keys: weakref.WeakValueDictionary[int, _Same] = weakref.WeakValueDictionary()
-
-
-def _same(encoder: Tokenizer) -> _Same:
-    """`encoder`'s key. A key holds its encoder, so while the key lives no
-    other object takes the encoder's id."""
-    key = _keys.get(id(encoder))
-    if key is None:
-        key = _keys[id(encoder)] = _Same(encoder)
-    return key
-
-
 @functools.lru_cache(maxsize=1 << 14)
-def _piece(encoder: _Same, text: str) -> tuple[int, ...]:
+def _piece(encoder: Same, text: str) -> tuple[int, ...]:
     """`text`'s tokens under `encoder`, without specials. A layout writes the
     same templates, instructions and options into every row of a corpus, so
     the last 16,384 texts it wrote are kept, and a text the corpus repeats is
     read back while it is among them."""
-    return tuple(encoder.encoder.encode(text, add_special_tokens=False))
+    return tuple(encoder.value.encode(text, add_special_tokens=False))
 
 
 @dataclass(frozen=True)
@@ -313,7 +292,7 @@ class _Pieces:
     a corpus's rows repeat their templates, instructions and options."""
 
     def __init__(self, encoder: Tokenizer):
-        self.same = _same(encoder)
+        self.same = Same(encoder)
 
     def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
         del add_special_tokens
@@ -608,7 +587,7 @@ class Labels:
     def _spelled_apart(self, encoder: Tokenizer) -> list[str]:
         """The names of `LABEL_NAMES` whose every variant `encoder` spells as one token that no earlier such
         name's holds."""
-        same, taken, named = _same(encoder), set[int](), list[str]()
+        same, taken, named = Same(encoder), set[int](), list[str]()
         for name in LABEL_NAMES:
             pieces = [_piece(same, variant.format(name)) for variant in self.variants]
             if all(len(piece) == 1 for piece in pieces) and not taken & {piece[0] for piece in pieces}:
@@ -632,7 +611,7 @@ class Labels:
 
     def ids(self, encoder: Tokenizer, count: int) -> tuple[tuple[int, ...], ...]:
         """Each of the first `count` labels' ids, one a variant; two labels of one id are refused."""
-        same = _same(encoder)
+        same = Same(encoder)
         found, owners = [], dict[int, str]()
         for name in self.names_for(count):
             ids = []
@@ -1186,7 +1165,7 @@ class SegmentLayout(Layout):
         if self.head_max_len is None and self.option_tokens is None:
             return 0, 0, False
         assert head_at is not None
-        same = _same(encoder)
+        same = Same(encoder)
         head = list(_piece(same, _text(chunks[head_at])))
         whole = [list(_piece(same, _text(chunks[at]))) for at in line_at]
         fixed = 0 if cue_at is None else len(_piece(same, _text(chunks[cue_at])))
@@ -1609,18 +1588,18 @@ class Framing:
         from dew.registry import to_record
 
         # The record keeps the options in their own order, which a template that walks them reads.
-        return _framed(_same(encoder), json.dumps(to_record(self, Framing)))
+        return _framed(Same(encoder), json.dumps(to_record(self, Framing)))
 
 
 @functools.lru_cache(maxsize=64)
-def _framed(encoder: _Same, recorded: str) -> tuple[str, str]:
-    """`Framing.around`, rendered once a tokenizer and framing, the framing by its record (`_same`).
-    A chat template of the framing's own renders through a tokenizer that renders templates
-    (`HFTokenizer`), and is refused (ValueError) over one that does not, rather than left unread."""
+def _framed(encoder: Same, recorded: str) -> tuple[str, str]:
+    """`Framing.around`, rendered once a tokenizer (held by itself, `dew._cache.Same`) and framing, the
+    framing by its record. A chat template of the framing's own renders through a tokenizer that renders
+    templates (`HFTokenizer`), and is refused (ValueError) over one that does not, rather than left unread."""
     from dew.registry import from_record
 
     framing = from_record(Framing, json.loads(recorded), dtypes=False)
-    tokenizer = encoder.encoder
+    tokenizer = encoder.value
     if framing.chat_template is not None and not isinstance(tokenizer, HFTokenizer):
         raise ValueError(f"a framing's own chat template renders through a tokenizer with a chat "
                          f"template renderer, which {type(tokenizer).__name__} is not")

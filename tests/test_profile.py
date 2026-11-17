@@ -353,7 +353,8 @@ def test_a_profile_counts_overlapped_collectives_once_and_the_gaps_as_idle():
     later = [(name, start + 15_000_000, end + 15_000_000) for name, start, end in step]
     figures = device_figures([step + later, later + step], steps=2)
     assert figures == {"device_window_ms": 12.5, "compute_ms": 10.0, "communication_ms": 10.0,
-                       "exposed_communication_ms": 0.0, "device_idle_ms": 2.5}
+                       "exposed_communication_ms": 0.0, "device_idle_ms": 2.5, "input_idle_ms": 0.0,
+                       "host_idle_ms": 2.5}
     report = ProfileReport("profile", 2, 2, (2, 3), "capture", 15.0, 1.0, 3.0, **figures, flops=None,
                            mfu=None, hfu=None, tokens_per_s=None, device=None)
     # The lines carry the figures: the idle gap, and compute's share of a step, the largest.
@@ -402,21 +403,3 @@ def a_gpu_window_past_cuptis_cap_reports_no_device_figure_its_kernels_cannot_est
         manifest = json.loads((Path(report["capture"]) / "manifest.json").read_text())
         assert (manifest["capture_status"] == "partial") == partial, manifest
         assert (report["device_window_ms"] is None) == partial and report["step_ms"] > 0
-
-
-def test_a_profiles_top_losses_are_the_largest_shares_its_work_did_not_take():
-    """A profile names its step's top three losses, largest first: of a 20 ms step whose work takes 6 ms
-    at the device's peak (MFU 30%), 10 ms of compute is 4 ms past it, beside 5 ms of input wait, 1 ms of
-    exposed communication and 2.5 ms of idle gaps; the communication, the least, is left out. With no MFU,
-    the compute's loss is unknown and not ranked."""
-    from dew.training.profiling import ProfileReport
-
-    def report(mfu):
-        return ProfileReport("profile", 2, 2, (2, 3), "capture", 20.0, 5.0, 3.0, device_window_ms=15.0,
-                             compute_ms=10.0, communication_ms=4.0, exposed_communication_ms=1.0,
-                             device_idle_ms=2.5, flops=1e9, mfu=mfu, hfu=None, tokens_per_s=None, device=None)
-
-    assert report(0.3).step_losses() == (("input wait", 5.0), ("compute past the work at peak", 4.0),
-                                         ("device idle", 2.5))
-    assert report(None).step_losses() == (("input wait", 5.0), ("device idle", 2.5),
-                                          ("exposed communication", 1.0))

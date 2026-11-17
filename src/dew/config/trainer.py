@@ -140,6 +140,10 @@ class TrainerConfig:
     """How a resume treats the data (docs/design/data.md, resuming data): "relaxed" reads on at its saved
     position where its plan still makes the same rows and otherwise starts it again, naming what differs in
     the log and the run's records, its state resuming either way; "exact" refuses any difference."""
+    skip_nonfinite: bool = False
+    """Whether a step with no loss scale whose loss or gradient norm is not finite is skipped, its optimizer
+    taking one step of zero gradient, the run stopping after five in a row; off, the step is taken as it is
+    formed and the run stops at its next log, naming it (training.md, a step that is not finite)."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """The metric name and ranking policy; None selects validation loss or training loss."""
     update_tokens: int | None = None

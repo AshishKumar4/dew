@@ -71,15 +71,15 @@ class Targets:
         self.index = json.loads(state)
 
 
-@pytest.mark.parametrize('cadence,step', [(1, 7), (2, 8)])
-def test_a_non_finite_run_stops_at_the_step_whose_losses_it_read(cadence, step):
-    """The losses go non-finite from step 3 on. A log is read once the next
-    step is dispatched, and the run stops at the log whose losses held the
-    fifth non-finite one, every earlier log reported; the same run over
+@pytest.mark.parametrize('skip,cadence,step', [(True, 1, 7), (True, 2, 8), (False, 1, 3), (False, 2, 4)])
+def test_a_non_finite_run_stops_at_the_step_whose_losses_it_read(skip, cadence, step):
+    """The losses go non-finite from step 3 on. A log is read once the next step is dispatched, and the run
+    stops at the log whose losses held the first non-finite one, by default (training.md, a step that is not
+    finite), or, skipping such steps, the fifth in a row, every earlier log reported; the same run over
     finite losses trains to its end."""
     Trainer(Squared(), optax.sgd(.1), key=0).fit(targets([1.] * 10), steps=10, log_every=cadence)
     sink = RecordingTracker()
-    trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink)
+    trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink, skip_nonfinite=skip)
     with pytest.raises(RuntimeError):
         trainer.fit(targets([1., 1.] + [float('nan')] * 8), steps=10, log_every=cadence)
     logged = [row for row, scalars in sink.scalars if 'train/loss' in scalars]

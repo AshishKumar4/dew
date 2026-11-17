@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
+import functools
 from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import jax
@@ -28,6 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.derivatives import Surrogate, contracted, declared_derivative, with_gradients_formed
+from dew.nn.finite import zeroed_unless
 from dew.nn.programs import holes
 
 type Tree = Mapping[str, object]
@@ -66,6 +68,8 @@ class InBackward:
 
 _PLAN: contextvars.ContextVar[InBackward | None] = contextvars.ContextVar("dew_in_backward", default=None)
 _GATE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_in_backward_gate", default=None)
+_FINITE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_in_backward_finite",
+                                                                          default=None)
 
 
 @contextlib.contextmanager
@@ -79,14 +83,20 @@ def planned(plan: InBackward) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def gated(due: jax.Array) -> Iterator[None]:
+def gated(due: jax.Array, finite: jax.Array | None = None) -> Iterator[None]:
     """Let the backward a step takes in it write the runs' updates where `due`, and leave each run's state
-    as it was elsewhere: whether the step commits, known once its forward is."""
-    token = _GATE.set(due)
+    as it was elsewhere: whether the step commits, known once its forward is. Given `finite`, whether the
+    step's loss is finite, a layer whose loss or own gradient is not takes the update of a zero gradient:
+    its weights as they were, its optimizer one step on (training.md, a step that is not finite), as every
+    layer of a step with no loss scale that is not finite does; a layer the walk reached before is moved.
+    Once a layer is held, every layer after it in walk order is, across the step's runs: a run that held one
+    hands the run below a cotangent that is not finite (`_passed_down`), whose layers its gate then holds."""
+    tokens = _GATE.set(due), _FINITE.set(finite)
     try:
         yield
     finally:
-        _GATE.reset(token)
+        _GATE.reset(tokens[0])
+        _FINITE.reset(tokens[1])
 
 
 PERIOD_NORMS = "layers_0"
@@ -139,6 +149,55 @@ def _written(tree, layer, index):
                                                                               index, 0), tree, layer)
 
 
+def _flowing(shared: tuple, *, flows: tuple[bool, ...]) -> tuple:
+    """What every layer reads that the layers differentiate (`flows`), the floating arrays among `shared`."""
+    return tuple(leaf for leaf, flow in zip(shared, flows, strict=True) if flow)
+
+
+def _merged(shared: tuple, flowed: tuple, *, flows: tuple[bool, ...]) -> tuple:
+    """`shared` with its differentiated arrays (`flows`) taken from `flowed` in order."""
+    given = iter(flowed)
+    return tuple(next(given) if flow else leaf for leaf, flow in zip(shared, flows, strict=True))
+
+
+def _norms(gradient) -> tuple[jax.Array, jax.Array]:
+    """A layer's gradient's sum of squares and whether it is not finite, 1 or 0 (`NORMS`): a value not finite
+    anywhere makes the sum so, read with no pass of its own."""
+    leaves = jax.tree.leaves(gradient)
+    squares = jnp.sum(jnp.stack([jnp.sum(jnp.square(leaf.astype(jnp.float32))) for leaf in leaves]))
+    return squares, (~jnp.isfinite(squares)).astype(jnp.float32)
+
+
+def _passed_down(cotangent, tripped: jax.Array):
+    """A cotangent a run hands what it read (its input and every differentiated shared input, an encoder's
+    context among them): not finite where it held a layer (`tripped`), so the walk's latch holds across
+    runs as data the backward carries, every layer reached below gated on its own gradient, which is then
+    not finite (`gated`)."""
+    return jax.tree.map(lambda leaf: jnp.where(tripped, jnp.full_like(leaf, jnp.nan), leaf), cotangent)
+
+
+def _layer_update(update: Callable, finite: jax.Array | None, tripped: jax.Array, gradient, held, moments,
+                  bad: jax.Array):
+    """One layer's update as the walk takes it: as it is where no step's finiteness gates the walk
+    (`gated`: a run that takes its steps as formed), else gated (`_gated_layer`) on the loss's finiteness,
+    the walk's latch (`tripped`) and the layer's own gradient's (`bad`, from its norm). The layer's weights,
+    moments, non-finite count and the latch after it."""
+    if finite is None:
+        moved, moved_moments = update(gradient, held, moments)
+        return moved, moved_moments, bad, tripped
+    ok = finite & (bad == 0) & ~tripped
+    moved, moved_moments = _gated_layer(update, ok, gradient, held, moments)
+    return moved, moved_moments, bad, tripped | ~ok
+
+
+def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments):
+    """One layer's update in a step that skips what is not finite (`gated`): where `ok` (the loss finite,
+    the layer's gradient finite) by its gradient, else by a zero gradient, its weights kept as they were and
+    its moments stepped as a commit's are. The layer's moved weights and moments."""
+    moved, moved_moments = update(zeroed_unless(ok, gradient), held, moments)
+    return jax.tree.map(lambda new, old: jnp.where(ok, new, old), moved, held), moved_moments
+
+
 def _pulled(back: Callable, dx):
     """`back(dx)`, a layer's VJP: its parameters' gradients, the layer below's cotangent and the flowed
     state's, the cotangent returned only with the gradients formed (`with_gradients_formed`, row 6027), which
@@ -169,12 +228,7 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
     # Which of them the layers differentiate: the floating ones.
     flows = tuple(bool(jnp.issubdtype(jnp.result_type(leaf), jnp.inexact)) for leaf in arrays)
 
-    def flowing(shared):
-        return tuple(leaf for leaf, flow in zip(shared, flows, strict=True) if flow)
-
-    def merged(shared, flowed):
-        given = iter(flowed)
-        return tuple(next(given) if flow else leaf for leaf, flow in zip(shared, flows, strict=True))
+    flowing, merged = functools.partial(_flowing, flows=flows), functools.partial(_merged, flows=flows)
 
     def forward_layer(x, slices, shared):
         weights_i, per_layer_i = slices
@@ -213,7 +267,7 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
         weights, masters, moments, norms, kept, inputs, per_layer, shared = residuals
         assert traced.structure is not None, "the run's forward traces its layer before its backward"
         (treedef,), slots = traced.structure, traced.slots
-        due = _GATE.get()
+        due, finite = _GATE.get(), _FINITE.get()
         count = jax.tree.leaves(weights)[0].shape[0]
         shared_leaves = jax.tree.leaves(shared)
 
@@ -223,7 +277,7 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
         narrow = masters is not None
 
         def body(carry, index):
-            dx, moving, moments, sumsq, nonfinite, dshared = carry
+            dx, moving, moments, sumsq, nonfinite, dshared, tripped = carry
             weights_i = _sliced(weights if narrow else moving, index)
             given = {"weights": jax.tree.leaves(weights_i), "shared": shared_leaves,
                      "x": jax.tree.leaves(_sliced(inputs, index)),
@@ -235,24 +289,25 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
             dshared = jax.tree.map(jnp.add, dshared, dflowed)
             held = _sliced(moving, index)
             held_moments = {name: _sliced(tree, index) for name, tree in moments.items()}
-            moved, moved_moments = current.update(path, index, gradient, held, held_moments)
-            leaves = jax.tree.leaves(gradient)
-            squares = jnp.sum(jnp.stack([jnp.sum(jnp.square(leaf.astype(jnp.float32))) for leaf in leaves]))
-            bad = jnp.sum(jnp.stack([jnp.sum(~jnp.isfinite(leaf)) for leaf in leaves])).astype(jnp.float32)
+            squares, bad = _norms(gradient)
+            moved, moved_moments, bad, tripped = _layer_update(
+                functools.partial(current.update, path, index), finite, tripped, gradient, held,
+                held_moments, bad)
             if due is not None:
-                moved = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old), moved, held)
-                moved_moments = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old),
-                                             moved_moments, held_moments)
+                moved, moved_moments = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old),
+                                                    (moved, moved_moments), (held, held_moments))
             moving = _written(moving, moved, index)
             moments = {name: _written(tree, moved_moments[name], index) for name, tree in moments.items()}
             sumsq = sumsq.at[index].set(squares)
             nonfinite = nonfinite.at[index].set(bad)
-            return (dx, moving, moments, sumsq, nonfinite, dshared), None
+            return (dx, moving, moments, sumsq, nonfinite, dshared, tripped), None
 
         start = (cotangent, masters if narrow else weights, moments, jnp.zeros((count,), jnp.float32),
-                 jnp.zeros((count,), jnp.float32), tuple(jnp.zeros_like(leaf) for leaf in flowing(shared)))
-        (dx, moved, moments, sumsq, nonfinite, dshared), _ = jax.lax.scan(body, start, jnp.arange(count),
-                                                                         reverse=True)
+                 jnp.zeros((count,), jnp.float32), tuple(jnp.zeros_like(leaf) for leaf in flowing(shared)),
+                 jnp.asarray(a=False))
+        (dx, moved, moments, sumsq, nonfinite, dshared, tripped), _ = jax.lax.scan(
+            body, start, jnp.arange(count), reverse=True)
+        dx, dshared = _passed_down((dx, dshared), tripped)
         written_norms = {"sumsq": sumsq.astype(norms["sumsq"].dtype),
                          "nonfinite": nonfinite.astype(norms["nonfinite"].dtype)}
         # The copies' cotangent is nothing the step reads (`Transaction.split_planned` takes the masters').

@@ -762,11 +762,11 @@ def _columns(batches) -> dict[str, list]:
 
 
 def test_a_packed_decision_run_main_saved_resumes_exactly():
-    """A packed decision read main saved at ecb9577e7, its layout named by the class it was then
-    (`JointLayout`), one budget of windows in, resumes exactly and reads the windows a read of the same
-    chain reads after its first: the decision steps the read describes read a saved plan's earlier layouts
-    (`dew.decision.layout.ReadsEarlierLayouts`). The steps a configured layout makes (`LayoutRows`,
-    `EvaluateRows`) read none, so its plan was refused as changed."""
+    """A packed decision read main saved at ecb9577e7, one budget of windows in, resumes exactly and reads
+    the windows a read of the same chain reads after its first: who lays a window out is the decision's own
+    window step's (`dew.data.pipeline.LaysOutWindows`), which changes no recorded plan. A stored field on
+    the pack set off its default changed every packed decision run's plan, an exact resume refused and a
+    relaxed one starting its data again (train 921's review, F2)."""
     import dataclasses
     from pathlib import Path
 

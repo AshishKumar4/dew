@@ -7,7 +7,7 @@ import dataclasses
 import hashlib
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TypeGuard
+from typing import ClassVar, TypeGuard
 
 import grain.python as pygrain
 import numpy as np
@@ -908,6 +908,7 @@ class PackedRows(pygrain.MapTransform):
     slots (`compacted`). Every window is `max_length` tokens, which a token
     budget divides into rows."""
 
+    lays_out_windows: ClassVar[bool] = True
     max_length: int
     option_slots: int | None = None
     spans_in_context: bool = False

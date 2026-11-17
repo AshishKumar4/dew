@@ -146,10 +146,20 @@ def test_a_python_run_whose_chain_is_unrecorded_trains_from_dew_train(tmp_path):
 
 def profiled(report_file: Path) -> dict:
     """A profile's report, held to the capture it names: the steps the capture's training annotations
-    hold are exactly the two after its warmup of two, the steps its log covers."""
+    hold are exactly the two after its warmup of two, the steps its log covers; its kernels the plan's
+    record of the program its window ran, the run's latest compiled before it (rows 6665, 6715); its
+    losses at most three of the step's shares, disjoint, largest first: where the capture holds a device
+    track, the device's own idle shares in place of the loop's input wait (row 6714)."""
     from dew.training.profiling import traced_steps
 
     report = json.loads(report_file.read_text())
+    (records,) = Path(report["directory"]).glob("*/tracking/records.jsonl")
+    compiled = [entry for entry in map(json.loads, records.read_text().splitlines())
+                if entry["type"] == "StepCompiled" and entry["step"] <= 3]
+    assert report["kernels"] == (compiled[-1]["value"]["plan"] or {}).get("kernels")
+    values = [value for _, value in report["losses"]]
+    assert len(values) <= 3 and values == sorted(values, reverse=True) and all(value > 0 for value in values)
+    assert len({name for name, _ in report["losses"]}) == len(values)
     assert traced_steps(Path(report["capture"])) == (2, 3) and tuple(report["traced"]) == (2, 3)
     assert (report["steps"], report["warmup"]) == (2, 2)
     assert report["step_ms"] > 0 and report["input_wait_ms"] >= 0 and report["compile_s"] > 0
