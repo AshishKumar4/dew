@@ -1037,7 +1037,10 @@ class Plan:
         if version >= DECIDED or self.rebuilt is None:
             return self
         with described_under(version):
-            return self.rebuilt()
+            fresh = self.rebuilt()
+        # What the rule describes, its manifest and members' digests, as it describes them; the rest as this
+        # plan holds it, what its read set on it after it was built (its topology) among it.
+        return dataclasses.replace(self, manifest=fresh.manifest, members=fresh.members, rebuilt=None)
 
     def record(self) -> dict[str, JSON]:
         """The plan as a position holds it, its order's stages held by their steps' places in its manifest
