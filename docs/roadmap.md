@@ -22,7 +22,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5322, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900]
 - The kernel challenge's lessons in the templates. [5271]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
-- The suite's wall. [5478, 7457]
 - Convolution repairs above their owner. [5665]
 - The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
 - The sm100 training backward runs Ampere's mma.sync two-launch backward at 32x32 tiles where the template holds a certified tcgen05 backward it does not route. [6918]
@@ -61,6 +60,7 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Models and interop
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646, 1446]
+- The suite's wall. [5478, 7457, 7633]
 - Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [1506, 1437]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
