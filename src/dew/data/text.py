@@ -438,13 +438,14 @@ class HFTokenizer:
         return [*ids, ending] if eos and ending is not None and ids else ids
 
     def save_pretrained(self, directory) -> None:
-        """Write this tokenizer's own files into an export directory, byte for byte as it holds them (its
-        pinned files, `pinned`), each checked against its hash (`copy_checked`): a release holds the files
-        its run read, so its tokenizer is its run's by their hashes, and a run continued from it averages
-        with its start. transformers' `save_pretrained` rewrote them, tokenizer.json among them, so a
-        release differed from its own run by hash."""
-        pinned = self.pinned
-        copy_checked(epath.Path(pinned.directory), epath.Path(directory), pinned.files)
+        """Write this tokenizer's own files into an export directory.
+
+        The tokenizer writes tokenizer.json, tokenizer_config.json and its vocabulary itself, as it holds
+        them (a run's processor may have set its special tokens and template), so the export copies no files
+        by hand and the result loads in anything that reads the HF layout. Its files' hashes are not its
+        run's: runs compare tokenizers through one canonical form where the hashes differ
+        (`canonical_files`)."""
+        self.tokenizer.save_pretrained(str(directory))
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self.name!r})"
