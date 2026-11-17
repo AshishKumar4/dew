@@ -794,8 +794,8 @@
 "tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[own-documents-blocks-two-key-heads]",
 "tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[own-documents-valid-places-one-key-head]",
 "tests/test_attention_route.py::test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward[block-causal-documents-window-bfloat16]",
-"tests/test_attention_route.py::test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward[cache-call-valid-bfloat16]",
-"tests/test_attention_route.py::test_a_template_call_filling_its_masked_logits_is_on_par_with_the_portable_path[within-reach-plain]",
+"tests/test_attention_route.py::test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward[cross-documents-causal-bfloat16]",
+"tests/test_attention_route.py::test_a_row_that_sees_no_key_weighs_each_value_before_summing_them",
 "tests/test_attention_route.py::test_key_heads_the_query_heads_do_not_lead_are_gathered_on_a_tensor_and_expert_mesh"
 ],
 "tests/test_attention_splash.py": [
@@ -1151,7 +1151,7 @@
 "tests/test_contracts_objectives.py::test_the_lm_heads_hold_every_order_of_their_gradient[normal-tiled]"
 ],
 "tests/test_contracts_recurrence.py": [
-"tests/test_contracts_recurrence.py::test_the_chunked_delta_rule_holds_every_order[one sequence-normal-jvp of grad]",
+"tests/test_contracts_recurrence.py::test_the_chunked_delta_rule_holds_every_order[one sequence-near the least normal-first orders]",
 "tests/test_contracts_recurrence.py::test_the_chunked_delta_rule_holds_every_order[packed-the largest its chunk holds-grad of grad]",
 "tests/test_contracts_recurrence.py::test_the_decode_step_holds_every_order[near the largest]",
 "tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[near the least normal-fla_kda-jvp of grad]",
@@ -1159,10 +1159,10 @@
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-kimi_delta]",
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rules_chunk_adjoint_holds_its_orders[near the largest]",
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rules_chunk_adjoint_holds_its_orders[normal]",
-"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the largest-first orders]",
+"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the largest-grad of grad]",
 "tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the least normal-first orders]",
 "tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the least normal-second orders, staged]",
-"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[normal-second orders, staged]",
+"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[normal-second jvp]",
 "tests/test_contracts_recurrence.py::test_the_ssd_port_holds_its_orders[near the least normal-jvp of grad]",
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[near the least normal-second orders, staged]"
 ],
@@ -1189,9 +1189,6 @@
 "tests/test_data_automatic_cache.py::test_a_chain_resumes_across_its_automatic_cache_turned_on_or_off[saved-cached-2-indexed-rejecting]",
 "tests/test_data_automatic_cache.py::test_a_chain_resumes_across_its_automatic_cache_turned_on_or_off[saved-cached-2-streamed-rejecting]",
 "tests/test_data_automatic_cache.py::test_a_chain_resumes_across_its_automatic_cache_turned_on_or_off[saved-uncached-2-indexed-rejecting]"
-],
-"tests/test_data_cache.py": [
-"tests/test_data_cache.py::test_a_holdout_by_a_field_its_cached_step_drops_reads_the_parts_it_reads_uncached"
 ],
 "tests/test_data_elastic.py": [
 "tests/test_data_elastic.py::test_an_elastic_expansion_reads_one_readers_pieces_in_or_out_of_workers[2]",
@@ -1528,7 +1525,7 @@
 "tests/test_deepseek_v41.py::test_a_quantized_bundle_loaded_text_only_is_its_quantized_text_checkpoint",
 "tests/test_deepseek_v41.py::test_a_sequence_shorter_than_its_candidate_sources_rate_computes_and_trains",
 "tests/test_deepseek_v41.py::test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens[coordinates]",
-"tests/test_deepseek_v41.py::test_consecutive_reindex_layers_publish_their_selections_under_scan_layers",
+"tests/test_deepseek_v41.py::test_left_padding_changes_no_row",
 "tests/test_deepseek_v41.py::test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk",
 "tests/test_deepseek_v41.py::test_the_candidate_pool_decides_the_logits",
 "tests/test_deepseek_v41.py::test_the_decode_ops_draft_what_dspark_drafts_over_the_history",
@@ -1573,8 +1570,8 @@
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a column near fp32's least normal beside an overflowing one-as drawn-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a decode step's sink near fp32's largest and one key-as drawn-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a resumed state beside an overflowing column-as drawn-fast]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a row of small values beside one that overflows in its tile, float32-as drawn-fast]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a sink and one key, its logit near fp32's largest-float16-fast]",
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a row that overflows beside one that does not-as drawn-accurate]",
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a sink and one key-as drawn-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a small weight on a large value, bfloat16-as drawn-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a subnormal share beside 255 equal weights, bfloat16-as drawn-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a subnormal share of an overflowing row, float32-float16-accurate]",
@@ -1582,7 +1579,7 @@
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[keys an ulp apart, float32-as drawn-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[small values beside unseen ones near fp32's largest, float32-float16-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[two finite slices whose merge overflows-as drawn-accurate]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[values near fp32's largest over 64 equal keys-as drawn-fast]"
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[values near fp32's largest over 64 equal keys-float16-accurate]"
 ],
 "tests/test_diffusion_gemma_workflow.py": [
 "tests/test_diffusion_gemma_workflow.py::test_public_pipeline_source_storage_and_saved_block_compute_are_independent",
@@ -1795,7 +1792,7 @@
 "tests/test_forked_calls.py::test_the_per_layer_embedding_reads_each_documents_chain_over_forks[permuted]"
 ],
 "tests/test_fp8_preset.py": [
-"tests/test_fp8_preset.py::test_the_experts_kernel_gradient_keeps_the_master_dtype"
+"tests/test_fp8_preset.py::test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference[experts-mxfp8]"
 ],
 "tests/test_fresh_rate.py": [
 "tests/test_fresh_rate.py::test_a_decision_run_records_its_default_fresh_group_over_its_block_and_head",
@@ -2599,8 +2596,8 @@
 ],
 "tests/test_moe_precision.py": [
 "tests/test_moe_precision.py::test_a_projection_rounds_whole_contractions_once[columns-8-1-random-float32-float32]",
-"tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[pallas-2-4-False-False-None-geglu]",
-"tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[xla-2-4-False-False-None-geglu]",
+"tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[pallas-2-4-True-True-0.7-swiglu]",
+"tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[pallas-8-1-True-True-0.7-swiglu]",
 "tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[xla-8-1-True-True-0.7-geglu]",
 "tests/test_moe_precision.py::test_the_pallas_kernels_hold_the_contract_on_one_device[bfloat16-ragged]"
 ],
@@ -2759,9 +2756,6 @@
 "tests/test_optim.py::test_narrow_weights_step_on_float32_moments_as_float32_weights_do[bfloat16-muonclip]",
 "tests/test_optim.py::test_rates_of_one_schedule_lower_to_one_update[groups-gauss_newton]"
 ],
-"tests/test_outside_packages.py": [
-"tests/test_outside_packages.py::test_dew_pipeline_loads_a_packages_run_only_when_trusted"
-],
 "tests/test_parallelism.py": [
 "tests/test_parallelism.py::test_accumulated_ema_matches_a_plain_run_at_equal_update_counts"
 ],
@@ -2867,21 +2861,17 @@
 "tests/test_placement.py::test_each_parameter_is_placed_by_its_declared_axes[causal_transformer+glm5-next-tiny]"
 ],
 "tests/test_plan.py": [
-"tests/test_plan.py::test_a_fit_whose_step_fits_only_recomputing_searches_it_once_and_compiles_its_plan_once[remat-stated]",
+"tests/test_plan.py::test_a_fits_start_traces_its_loss_once_for_its_fit_check_and_its_plan",
 "tests/test_plan.py::test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_recomputing",
 "tests/test_plan.py::test_a_pinned_split_is_read_as_given_and_its_state_holds_it",
 "tests/test_plan.py::test_a_plan_made_before_the_state_is_placed_is_searched_again_where_the_placed_devices_cover_a_miss",
-"tests/test_plan.py::test_a_plan_with_no_second_point_to_fit_is_not_timed[2]",
-"tests/test_plan.py::test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trained_on",
-"tests/test_plan.py::test_a_run_resumed_at_a_finer_split_lands_where_the_uninterrupted_run_does",
-"tests/test_plan.py::test_a_run_that_fails_after_its_profile_window_still_reports_the_window",
-"tests/test_plan.py::test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits[decoder-cpu]",
+"tests/test_plan.py::test_a_resumed_run_continues_its_admitted_plan_without_timing",
+"tests/test_plan.py::test_a_run_trains_only_its_requested_steps_without_timing_a_frontier",
 "tests/test_plan.py::test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits[decoder-h100]",
 "tests/test_plan.py::test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits[delta-scanned-h100]",
 "tests/test_plan.py::test_a_step_compiled_ahead_is_profiled_on_a_trial_under_autopgle[two-microbatches]",
-"tests/test_plan.py::test_a_tight_start_settles_the_split_beside_one_that_missed_and_compiles_once_warm[16-between1]",
-"tests/test_plan.py::test_fit_keeps_an_explicit_policy_without_a_frontier_probe[full]",
-"tests/test_plan.py::test_two_processes_name_one_run_alike"
+"tests/test_plan.py::test_each_probe_of_a_held_plan_states_its_own_headroom",
+"tests/test_plan.py::test_fit_keeps_an_explicit_policy_without_a_frontier_probe[save_qkv_proj]"
 ],
 "tests/test_ppo.py": [
 "tests/test_ppo.py::test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged[sessions]"
@@ -3299,9 +3289,6 @@
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[mimo-v2-sliding-tiny-native]",
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[mimo-v2-tiny-saved]"
 ],
-"tests/test_ring_protocol.py": [
-"tests/test_ring_protocol.py::test_the_ring_familys_walk_holds_every_property_in_every_interleaving[stages3-consumers2-tiles(3,)-inflight0-stepped]"
-],
 "tests/test_rl_contracts.py": [
 "tests/test_rl_contracts.py::test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima[DPOObjective]",
 "tests/test_rl_contracts.py::test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima[GRPOObjective]"
@@ -3614,7 +3601,7 @@
 "tests/test_serving.py::test_a_server_over_loaded_weights_places_them_once",
 "tests/test_serving.py::test_a_server_over_split_rows_takes_its_projections_on_each_devices_rows[scanned]",
 "tests/test_serving.py::test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic[a-parallel-hybrid]",
-"tests/test_serving.py::test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic[speculative-blocks]",
+"tests/test_serving.py::test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic[several-steps-over-pages]",
 "tests/test_serving.py::test_a_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_mesh_draws[one]",
 "tests/test_serving.py::test_a_speculating_server_over_an_adapter_set_reseeds_its_depths_under_each_rows_adapter",
 "tests/test_serving.py::test_a_text_server_serving_under_keeping_keeps_every_program_it_compiles",
