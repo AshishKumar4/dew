@@ -44,7 +44,7 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels.recurrence import Hooks, skip_added
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
-from dew.nn.linear import forked_scan
+from dew.nn.linear import forked_scan, sequence_split
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.mixers.mamba2 import MambaRMSNormGated
@@ -52,7 +52,6 @@ from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general, softplus
 from dew.nn.residuals import Residual
 from dew.nn.scatter import gather_positions
-from dew.nn.sharding import sequence_shards
 
 CHUNK_SIZE = 64
 """mamba_ssm's Mamba-3 `chunk_size` for a single input and output."""
@@ -437,7 +436,8 @@ class Mamba3(nn.Module):
     The decode cache holds `Carried`'s four in at least fp32 (`ssm_state` `[B, H, P, N]`, `angle_state` `[B,
     H, A]`, `k_state` `[B, H, R, N]`, `v_state` `[B, H, R, P]`): a one-token call runs the step and a longer
     one the chunked form from them. Padded slots (`attention_metadata.valid`) take a zero step and packed
-    documents (`starts`) run as if alone; a call under a mesh sequence axis above one is refused.
+    documents (`starts`) run as if alone; under a mesh sequence axis above one a decode call and one over
+    forks run whole (`dew.nn.linear.sequence_split`), and a training call is refused.
     """
 
     reads: ClassVar[frozenset[str]] = frozenset({"forks"})
@@ -563,9 +563,11 @@ class Mamba3(nn.Module):
         batch, length, _ = x.shape
         tokens = coordinates_of(call.metadata, batch, length)
         valid = tokens.valid
-        if (shards := sequence_shards()) > 1:
-            raise LayoutRefused(f"mamba3 runs a sequence on one shard; this mesh splits it over {shards}. "
-                                "Run it on a mesh with sequence=1.")
+        if (shards := sequence_split(call.decode, tokens)) > 1:
+            # A decode call and one over forks run whole (`sequence_split`); a training call's split is
+            # refused.
+            raise LayoutRefused(f"mamba3 runs a training sequence on one shard; this mesh splits it over "
+                                f"{shards}. Run it on a mesh with sequence=1.")
         if valid is not None:
             x = jnp.where(valid[:, :, None], x, 0)
         projected = self.in_proj(x)
