@@ -26,6 +26,7 @@ import optax
 import process_support
 import pytest
 from lane_environment import without_flags
+from generation_support import COMPILES_ON_CPU
 from jax.extend import custom_call_targets, xla
 from kernel_compile import gate_generations
 from model_support import TINY_DECODER, memory_limited_to
@@ -1081,6 +1082,7 @@ asks it, in a process of its own (`process_support.fresh`): its directory is its
 saved step's generation and every kernel its routes took."""
 
 
+@COMPILES_ON_CPU
 def test_a_gated_delta_steps_mosaic_kernels_compile_ahead_for_the_gpu_it_targets(tmp_path):
     """A bf16 gated-delta decoder's run compiled ahead for a compile-only A100 by its command
     (`--trainer.compile-ahead.generation sm80`, rows 3916, 3977) saves a step for sm80 whose gated delta
@@ -1223,6 +1225,7 @@ def test_a_program_holding_a_kernel_this_host_cannot_lower_is_refused_ahead_nami
                                                                                   "attention")
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("generation", [name for name in gate_generations() if capability(name) >= (9, 0)])
 def test_a_compile_only_gpu_assembles_mosaic_gpus_architecture_specific_code(generation):
     """A Mosaic GPU kernel compiled for a compile-only GPU of each generation from Hopper on, in a process
