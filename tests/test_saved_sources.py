@@ -600,7 +600,6 @@ def test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_d
     from interop_support import extract_fixture
 
     from dew.config import TrainerConfig
-    from dew.diffusion.schedules.flow import FlowMatchingScheduler
     from dew.interop.conditioners import DiffusionConditioner
     from dew.interop.pretrained import PretrainedPipeline
     from dew.interop.saved_sources import RunPipeline
@@ -635,13 +634,61 @@ def test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_d
     assert ((saved.grid.tokens, saved.grid.origin, dict(saved.grid.config)) ==
             (published.task.grid.tokens, published.task.grid.origin, dict(published.task.grid.config)))
     assert saved.grid.tokens != own.task.grid.tokens
+    # The run named no preset, so it trained the pipeline's own process (`grid_process`), which follows the
+    # grid to the size.
+    assert saved.grid_process
     if pipeline == "flux":
-        def shift(source) -> float:
-            schedule = source.process.schedule
-            assert isinstance(schedule, FlowMatchingScheduler)
-            return schedule.shift
+        assert flow_shift(saved) == flow_shift(published) != flow_shift(own)
 
-        assert shift(saved) == shift(published) != shift(own)
+
+def flow_shift(source) -> float:
+    """The shift of `source`'s rectified-flow process."""
+    from dew.diffusion.schedules.flow import FlowMatchingScheduler
+
+    schedule = source.process.schedule
+    assert isinstance(schedule, FlowMatchingScheduler)
+    return schedule.shift
+
+
+def test_a_run_naming_its_own_resolution_shift_keeps_its_process_at_another_size(tmp_path):
+    """A run from a published Flux pipeline naming a resolution shift of its own keeps its process at another
+    size, where its source's follows its grid there: the run's shift equals the grid's at its own size,
+    its own shift's constants a mu flat in the token count at the grid's own mu there, so no shift's value
+    tells the two apart, and the record its objective writes does (`DiffusionObjective.grid_process`,
+    ledger 2792)."""
+    from diffusion_stubs import batch_for
+    from diffusion_support import images_of, saved_after_one_step
+    from interop_support import extract_fixture
+
+    from dew.config import TrainerConfig
+    from dew.diffusion.presets import Flow, ResolutionShift
+    from dew.interop.pretrained import PretrainedPipeline
+    from dew.interop.saved_sources import RunPipeline
+
+    archive, folder = PUBLISHED["flux"]
+    directory = extract_fixture(Path(__file__).parent / "fixtures" / f"{archive}.tar.xz", tmp_path / archive)
+    directory = directory / folder
+    own = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    assert isinstance(own, PretrainedPipeline)
+    flow = own.grid.schedule.policy.flow
+    assert flow is not None and flow.dynamic and own.grid.tokens is not None
+    mu = flow.mu(own.grid.tokens)
+    height, width = own.inputs.sample.shape[-3:-1]
+    config = DiffusionRunConfig(
+        pretrained=str(directory), data=images_of("tfds://oxford_flowers102", height),
+        preset=Flow(resolution_shift=ResolutionShift(base_shift=mu, max_shift=mu)),
+        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32", "attention_impl": "xla"}),
+        val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
+        objective=ObjectiveConfig("diffusion", {"steps": 2, "ema_decay": None}))
+    task, _, _ = saved_after_one_step(config, lambda task: batch_for(task, 4), tmp_path / "run", 1e-2)
+    # At its own size the run's process is the grid's, value for value.
+    assert flow_shift(task) == flow_shift(own)
+    size = (2 * height, width + width // 2)
+    saved = load_diffusion_source(str(tmp_path / "run"), dtype="float32", size=size)
+    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=size)
+    assert isinstance(saved, RunPipeline)
+    assert flow_shift(saved) == flow_shift(own) != flow_shift(published)
+    assert not task.grid_process and not saved.grid_process
 
 
 @pytest.mark.mesh(devices=8)
