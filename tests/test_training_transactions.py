@@ -793,3 +793,52 @@ def test_a_window_whose_summed_gradient_overflows_its_moments_is_dropped_whole()
     for got, want in zip(jax.tree.leaves((state.variables, state.opt_state)), jax.tree.leaves(before),
                          strict=True):
         np.testing.assert_array_equal(np.asarray(got), want)
+
+
+@pytest.mark.parametrize("first", [False, True], ids=["taking first", "skipping first"])
+def test_trainers_of_one_config_and_opposite_skipping_each_step_by_their_own(first):
+    """Two trainers of one optimizer config, one skipping steps not finite and one not, built in either
+    order in one process: on a batch whose loss is finite and gradient not, the skipping one keeps its
+    weights and the other takes the step, each by its own policy. The policy keyed no step, so the second
+    reused the first's (the rebuild's head review, F1)."""
+    bad = batches()[1]
+    for skip in (first, not first):
+        config = OptimConfig(optimizer="adamw", learning_rate=0.1)
+        stepper = Trainer(Tiny(), config, key=jax.random.PRNGKey(9), skip_nonfinite=skip)
+        stepper.scheduled(1)
+        state = stepper.initial_state()
+        before = np.asarray(state.variables["params"]["w"])
+        advanced, _, _, finite, _, _ = stepper.compile(state, bad)(state, bad)
+        moved = np.asarray(advanced.variables["params"]["w"])
+        assert not bool(finite) and np.array_equal(moved, before) == skip
+
+
+class SecondGroupPoisoned(Counting):
+    """`Counting`'s batches, the second's latter half of rows not finite: one DiLoCo group's of two."""
+
+    def __next__(self):
+        batch = super().__next__()
+        if batch["index"][0] == 1:
+            batch["x"][len(batch["x"]) // 2:] = np.nan
+        return batch
+
+
+def test_a_diloco_step_not_finite_in_one_group_alone_stops_the_run():
+    """A DiLoCo run of two groups whose second group's batch is not finite at step 2, the first's finite:
+    the step is not finite, as every group's flag says, and the run stops at it. The flag was the first
+    group's, so the run read on with the second group's weights poisoned (the rebuild's head review, F2)."""
+    from dew.training import DiLoCo, MeshSpec
+
+    trainer = make_trainer(mesh=MeshSpec(diloco=2).build(jax.devices()[:2]),
+                           diloco=DiLoCo(every=4, rate=0.7, momentum=0.9))
+    with pytest.raises(RuntimeError):
+        trainer.fit(dataset(SecondGroupPoisoned), steps=3, log_every=1)
+
+
+def test_a_run_whose_optimizer_holds_updates_back_reads_on_past_one_step_not_finite():
+    """A run whose optimizer holds updates back (`optax.MultiSteps` of two) drops a window a step not finite
+    falls in whole, by default, and reads on to its end, its weights finite, as a scaled run does: such a
+    run stops only at five in a row. It stopped at the first (the rebuild's head review, F3)."""
+    held = optax.MultiSteps(optax.adam(0.1), 2).gradient_transformation()
+    state = make_trainer(optimizer=held).fit(dataset(PoisonedThird), steps=6, log_every=1)
+    assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(state.variables))

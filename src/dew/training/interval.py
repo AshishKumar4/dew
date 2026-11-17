@@ -543,7 +543,7 @@ class Taken(NamedTuple):
         return all(leaf.is_ready() for leaf in jax.tree.leaves(self.reading) if isinstance(leaf, _Settled))
 
     def read(self, display: TrainingDisplay, since: float | None) -> tuple[Reading, float, float]:
-        """The reading on the host, its losses' streak checked (`checked_streak`) at the step it read, the
+        """The reading on the host, its steps' finiteness checked (`checked_finite`) at the step it read, the
         interval's seconds since `since`, the previous log's `done` (the interval's own start for the first),
         and its `done`."""
         read = on_host(self.reading, self.step)

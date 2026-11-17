@@ -56,13 +56,12 @@ class InBackward:
     `update(path, index, gradient, weights, moments)` is the step's optimizer update of one layer: the
     layer `index` of the run at `path` (the run's module path in the model), its `gradient` and
     `weights` (the masters where the step keeps narrow copies), and its `moments` by collection; it returns
-    the moved weights and moments, and whether the update formed (every update the step forms does).
-    `moments` names the collections of the optimizer's moments the step
+    the moved weights and moments. `moments` names the collections of the optimizer's moments the step
     added. `handled` records each run's path as the model traces it in the plan, so the step reads those
     runs' state off the backward."""
 
     update: Callable[[tuple[str, ...], jax.Array, Tree, Tree, Mapping[str, Tree]],
-                     tuple[Tree, dict[str, Tree], jax.Array]]
+                     tuple[Tree, dict[str, Tree]]]
     moments: tuple[str, ...]
     handled: list[tuple[str, ...]] = dataclasses.field(default_factory=list)
 
@@ -181,31 +180,22 @@ def _layer_update(update: Callable, finite: jax.Array | None, tripped: jax.Array
                   bad: jax.Array):
     """One layer's update as the walk takes it: as it is where no step's finiteness gates the walk
     (`gated`: a run that takes its steps as formed), else gated (`_gated_layer`) on the loss's finiteness,
-    the walk's latch (`tripped`) and the layer's own gradient's (`bad`, from its norm), its weights written
-    where its update formed (`InBackward.update`). The layer's weights, moments, non-finite count and the
-    latch after it."""
+    the walk's latch (`tripped`) and the layer's own gradient's (`bad`, from its norm). The layer's weights,
+    moments, non-finite count and the latch after it."""
     if finite is None:
-        moved, moved_moments, _ = update(gradient, held, moments)
+        moved, moved_moments = update(gradient, held, moments)
         return moved, moved_moments, bad, tripped
-    moved, moved_moments, bad, written = _gated_layer(update, finite & (bad == 0) & ~tripped, gradient, held,
-                                                      moments, bad)
-    return moved, moved_moments, bad, tripped | ~written
+    ok = finite & (bad == 0) & ~tripped
+    moved, moved_moments = _gated_layer(update, ok, gradient, held, moments)
+    return moved, moved_moments, bad, tripped | ~ok
 
 
-def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments, bad: jax.Array):
-    """One layer's update in a step that may not be finite (`gated`): where `ok` (the loss finite, the
-    layer's gradient finite) by its gradient, else by a
-    zero gradient, its weights kept as they were, as they are where its update did not form (one the step
-    reads, not finite: `InBackward.update` then forms its moments from the zero gradient), its moments
-    stepped as a commit's are. The layer's moved weights, moments and
-    non-finite count (an update that did not form counted in it), and whether it was written."""
-    gradient = zeroed_unless(ok, gradient)
-    moved, moved_moments, formed = update(gradient, held, moments)
-    written = ok & formed
-    moved = jax.tree.map(lambda new, old: jnp.where(written, new, old), moved, held)
-    # An update that did not form is counted as the layer's own value not finite, so the step is reported
-    # and rejected by its count, whatever reaches the layers below.
-    return moved, moved_moments, bad + (ok & ~formed).astype(bad.dtype), written
+def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments):
+    """One layer's update in a step that skips what is not finite (`gated`): where `ok` (the loss finite,
+    the layer's gradient finite) by its gradient, else by a zero gradient, its weights kept as they were and
+    its moments stepped as a commit's are. The layer's moved weights and moments."""
+    moved, moved_moments = update(zeroed_unless(ok, gradient), held, moments)
+    return jax.tree.map(lambda new, old: jnp.where(ok, new, old), moved, held), moved_moments
 
 
 def _pulled(back: Callable, dx):

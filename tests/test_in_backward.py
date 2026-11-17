@@ -76,8 +76,7 @@ def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
         state = (optax.ScaleByAdamState(count=jnp.zeros((), jnp.int32), mu=moments["mu"], nu=moments["nu"]),
                  optax.EmptyState(), optax.EmptyState())
         moved, after = solver.update(gradient, state, weights)
-        formed = jnp.asarray(a=True)
-        return optax.apply_updates(weights, moved), {"mu": after[0].mu, "nu": after[0].nu}, formed
+        return optax.apply_updates(weights, moved), {"mu": after[0].mu, "nu": after[0].nu}
 
     def loss(model, params, extra, tokens):
         # In float32 at least, a float64 truth's own float64.
@@ -235,15 +234,14 @@ def test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time(opt
                     truth_fn=truth)
 
 
-def _walked(e, *, finite: bool = True, top: float = 1.0, runs: int = 1, through_context: bool = False,
-            rate: float = 0.1):
+def _walked(e, *, finite: bool = True, top: float = 1.0, runs: int = 1, through_context: bool = False):
     """Three layers, each `y = a x + sqrt(0 x + s - s' + e) + c k` with `s'` the stop-gradient of `s` and
     `k` a constant: a finite forward, whose gradient is not finite at a layer whose `e` is zero, in its own
     weights and in the input it hands the layer below (0 times infinity), and whose `c` takes the gradient
     `k`, 1 at every layer but the walk's first (the top of the upper run), whose is `top`. Updated in their
     backward (`dew.nn.in_backward`) by an Adam-like rule that counts its steps per layer, under a step whose
-    loss is `finite`, at `rate`, its update formed where the rate is finite: the weights, moments and
-    per-layer non-finite counts the walk leaves. Given `runs` of
+    loss is `finite`, as a run that skips steps not finite walks it: the weights, moments and per-layer
+    non-finite counts the walk leaves. Given `runs` of
     two, the same three layers run twice, the upper reading the lower's output: each run's own; through
     `through_context`, the upper reading the lower's output as a context every layer reads (`shared`, an
     encoder's to a decoder's cross-attention), its own input a constant."""
@@ -269,9 +267,8 @@ def _walked(e, *, finite: bool = True, top: float = 1.0, runs: int = 1, through_
     def update(path, index, gradient, held, moments):
         mu = jax.tree.map(lambda m, g: 0.9 * m + g, moments["mu"], gradient)
         nu = jax.tree.map(lambda v, g: 0.99 * v + 0.01 * jnp.square(g), moments["nu"], gradient)
-        moved = jax.tree.map(lambda w, m, v: w - rate * m / (jnp.sqrt(v) + 1.0), held, mu, nu)
-        return (moved, {"mu": mu, "nu": nu, "count": jax.tree.map(lambda c: c + 1, moments["count"])},
-                jnp.isfinite(jnp.asarray(rate)))
+        moved = jax.tree.map(lambda w, m, v: w - 0.1 * m / (jnp.sqrt(v) + 1.0), held, mu, nu)
+        return moved, {"mu": mu, "nu": nu, "count": jax.tree.map(lambda c: c + 1, moments["count"])}
 
     def loss(weights, moments, norms):
         x = jnp.ones(())

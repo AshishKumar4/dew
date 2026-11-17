@@ -566,9 +566,8 @@ class Trainer(Generic[Loss, Effects]):
         if settings is UNKEYED:
             return None
         return (type(objective), stated, settings, self._shape.updates, self._shape.examples,
-                self._microbatches,
-                self.accumulation, self.split, self._scaled, self.lower_for, compiler.narrow,
-                self.record)
+                self._microbatches, self.accumulation, self.split, self._scaled, self.lower_for,
+                compiler.narrow, self.record, self.skip_nonfinite)
 
     def _stepping(self, objective: Objective[Loss, Effects] | None = None,
                   compiler: StepCompiler | None = None) -> Stepping[Loss, Effects]:
@@ -1356,7 +1355,7 @@ class Trainer(Generic[Loss, Effects]):
         with run.startup.phase("start", "tracing the state's start"):
             current, position, placed, abstract, fresh = self._starting(run, plan.dataset, initial, resume)
         run.last_checkpoint = time.perf_counter()
-        interval = self._interval(run, current, checkpoints)
+        interval = self._interval(run, current, checkpoints, abstract)
         state, shardings, complete = self._opened(plan, run, interval, current, position, placed, abstract,
                                                   resumed=initial is None and interval.last_saved is not None,
                                                   fresh=fresh)
@@ -1463,12 +1462,17 @@ class Trainer(Generic[Loss, Effects]):
                 break
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
 
-    def _interval(self, run: FitRun, current: int, checkpoints: Checkpoints | None) -> Interval:
-        """The fit's first interval, its clocks read off the run's control (`Interval.resumed`): a scaled
-        run, which drops an overflowing step as its scale backs off, stops at no single step not finite."""
+    def _interval(self, run: FitRun, current: int, checkpoints: Checkpoints | None,
+                  abstract: TrainState) -> Interval:
+        """The fit's first interval, its clocks read off the run's control (`Interval.resumed`): a run that
+        drops a step not finite whole, a scaled one as its scale backs off or one whose optimizer holds
+        updates back (`holds_back`, its groups' inner one under DiLoCo), stops at no single such step."""
+        from dew.held_updates import holds_back
+
+        held = abstract.opt_state if abstract.inner is None else abstract.inner.opt_state
         return Interval.resumed(run.stop_control, last_saved=(
             current if checkpoints is not None and checkpoints.latest is not None else None),
-            skips_nonfinite=self.skip_nonfinite or self.dynamic_scale)
+            skips_nonfinite=self.skip_nonfinite or self.dynamic_scale or holds_back(held))
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:

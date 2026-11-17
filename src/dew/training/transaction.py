@@ -1122,8 +1122,9 @@ class Transaction:
         if applied is not None:
             # The runs that updated in their backward hold no gradient here (zeros where theirs would be):
             # their norm and finiteness come from the backward that read them (`Applied`).
-            native_finite = native_finite & (applied.nonfinite == 0)
             norm = jnp.sqrt(jnp.square(norm) + applied.sumsq.astype(norm.dtype))
+            # The whole gradient's norm finite, as the rest's is read, besides each run's own count.
+            native_finite = native_finite & (applied.nonfinite == 0) & jnp.isfinite(norm)
         # With no loss scale, a run that skips steps not finite (`skip`, its opt-in) gates one where it is
         # computed: its gradient, the forward's statistics and its update read as zero, so its parameters,
         # update count and EMA stay as they were and its optimizer takes one step of zero gradient, holding
@@ -1429,20 +1430,16 @@ class Transaction:
                                   lambda index, _: copies[index])
             descent = layer(jax.tree.map(_descending, gradient, weights))
 
-            def formed_from(descent):
-                moved, after = optimizer_update(self.optimizer, descent, before, held, progress=progress)
-                return stepped(held, moved, before, after, post_step_order(self.optimizer, held)), after
-
-            formed = jnp.asarray(a=True)
-            stepped_held, after = formed_from(descent)
+            moved, after = optimizer_update(self.optimizer, descent, before, held, progress=progress)
+            stepped_held = stepped(held, moved, before, after, post_step_order(self.optimizer, held))
             # Each copy's new value where the update leaves it in the state it read, which the update keeps
             # laid out as it was: a group with no parameter in this run holds placeholders alone there.
             laid = _laid_as(held)
             slots = [slot for copy in copies
                      for slot, node in enumerate(jax.tree.leaves(before, is_leaf=laid)) if node is copy]
             stepped_copies = [jax.tree.leaves(after, is_leaf=laid)[slot] for slot in slots]
-            return (unlayer(stepped_held), {name: unlayer(copy) for name, copy in zip(names, stepped_copies,
-                                                                                    strict=True)}, formed)
+            return unlayer(stepped_held), {name: unlayer(copy) for name, copy in zip(names, stepped_copies,
+                                                                                   strict=True)}
 
         norms = {}
         for path in runs:
