@@ -1936,18 +1936,32 @@ their own names and by their module's path (lines 6, 8, 9, 11); a derivative dec
 derivatives module's functions, which it is not."""
 
 
+SOFTPLUS_SITE = ("import jax\n"
+                 "from jax.nn import softplus\n"
+                 "from flax import linen as nn\n"
+                 "from sparx.nn import precision\n"
+                 "a = jax.nn.softplus(1.0)\n"
+                 "b = softplus(1.0)\n"
+                 "c = nn.softplus(1.0)\n"
+                 "d = precision.softplus(1.0)\n")
+"""SLOP030's site: JAX's softplus by its module's path and imported by its own name, and Flax's (lines 5, 6,
+7); the package's own softplus, which it is not."""
+
+
 @pytest.mark.parametrize(("code", "site", "packages", "lines", "owner"), [
     ("SLOP025", ROLLOUT, ("rl", "objectives", "training"), (3, 5, 6, 8),
      ("src/sparx/nn/kernels/options.py",
       "from sparx.nn.kernels.options import OuterProgram\nfine = OuterProgram(None)\n")),
     ("SLOP026", DERIVATIVE_SITE, ("nn", "precision", "sampling"), (6, 8, 9, 11),
      ("src/sparx/nn/derivatives.py", "import jax\n@jax.custom_vjp\ndef rule(x): return x\n")),
-], ids=["outer program", "custom derivative"])
+    ("SLOP030", SOFTPLUS_SITE, ("nn", "rl", "objectives"), (5, 6, 7),
+     ("src/sparx/nn/precision.py", "import jax\nfine = jax.nn.softplus(1.0)\n")),
+], ids=["outer program", "custom derivative", "softplus"])
 def test_a_construct_built_outside_its_owner_module_is_reported(tmp_path, code, site, packages, lines, owner):
-    """SLOP025 and SLOP026: a construct one module of `src/<package>` owns (the compile point's
-    `OuterProgram`, JAX's custom derivatives) is reported wherever its site builds it in any package but
-    that module, and not in the owner, the tests or the tools. Its findings alone: a custom derivative's site
-    is SLOP028's too, which reads whether it declares its contract."""
+    """SLOP025, SLOP026 and SLOP030: a construct one module of `src/<package>` owns (the compile point's
+    `OuterProgram`, JAX's custom derivatives, softplus) is reported wherever its site builds it in any
+    package but that module, and not in the owner, the tests or the tools. Its findings alone: a custom
+    derivative's site is SLOP028's too, which reads whether it declares its contract."""
     def found(root, files: dict[str, str]) -> list[tuple[str, int, str]]:
         return [entry for entry in linted(root, files) if entry[2] == code]
 

@@ -23,7 +23,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence, short_conv, tuning
 from dew.nn.kernels.templates import mosaic, resources, scan
-from dew.nn.precision import L2NORM_EPS, rms_weighted
+from dew.nn.precision import L2NORM_EPS, rms_weighted, softplus_series
 
 
 @dataclasses.dataclass(frozen=True)
@@ -435,7 +435,7 @@ def _gates(hooks, inputs, row, head, layout):
 
     one = jnp.float32(1.0)
     if hooks.gates is not None:
-        rate = _softplus(scalar('gate') + headed('bias'))
+        rate = softplus_series(scalar('gate') + headed('bias'))
         if hooks.gates.limit is not None:
             rate = jnp.clip(rate, *hooks.gates.limit)
         decay = jnp.exp(-jnp.exp(headed('log_a')) * rate)
@@ -450,14 +450,6 @@ def _gates(hooks, inputs, row, head, layout):
         decay = plgpu.load(inputs['log_decay'].at[row, head], layout=layout, optimized=False)
         return jnp.exp(decay.astype(jnp.float32)), write
     return jnp.exp(scalar('log_decay')), write
-
-
-def _softplus(x):
-    """`jax.nn.softplus`, `max(x, 0) + log1p(exp(-|x|))`, its log1p as `log(u) y / (u - 1)` at `u = 1 + y`
-    (Goldberg's, within an ulp; `y` where `u` rounds to one): Mosaic GPU lowers no log1p."""
-    y = jnp.exp(-jnp.abs(x))
-    u = 1.0 + y
-    return jnp.maximum(x, 0.0) + jnp.where(u == 1.0, y, jnp.log(u) * (y / (u - 1.0)))
 
 
 def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token, halves: _Halves, *,

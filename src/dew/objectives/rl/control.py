@@ -29,6 +29,7 @@ from flax import linen as nn
 from dew.batch import Batch, Variables, unboxed
 from dew.inference.models import ModelSettings, ReleasesModel
 from dew.nn.kernels.options import program
+from dew.nn.precision import softplus
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, own_objective, traced_update_flops
 from dew.rl.distributions import normal_entropy, normal_log_density, tanh_log_jacobian
 from dew.rl.env import Carry, Env, Memory, Observation, Params, Transition, Tree, env_rollout, view
@@ -80,7 +81,7 @@ class ActorCritic(nn.Module):
     def policy(self, observation: jax.Array) -> tuple[jax.Array, jax.Array]:
         """The normal's location and scale before the tanh, each `[..., action_size]`."""
         location, raw = jnp.split(self.policy_net(observation), 2, axis=-1)
-        return location, (jax.nn.softplus(raw) + _MIN_STD) * self.spread
+        return location, (softplus(raw) + _MIN_STD) * self.spread
 
     def value(self, observation: jax.Array) -> jax.Array:
         return self.value_net(observation)[..., 0]
