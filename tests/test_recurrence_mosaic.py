@@ -15,11 +15,8 @@ the stability suite holds the mainloop under its regimes there (tests/test_recur
 import collections
 import dataclasses
 import functools
-import json
-import math
 import types
 from collections.abc import Callable
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -2268,27 +2265,20 @@ def _dealt(units: list, tasks: int, task: int) -> list:
     return [each for name in names for each in parts[int(name)]]
 
 
-IDENTITY_TEST = "test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes"
-"""The identity test's name, by which the durations record keys its tasks (`identity_tasks`)."""
+IDENTITY_TASKS = {'sm90': 50, 'sm100': 45, 'sm80': 17, 'sm86': 17, 'sm89': 17, 'sm120': 5}
+"""The tasks a target's identity units are dealt among (`_dealt`), a function of the code alone, so a task's
+units are its id's at one revision whatever a run's timings (row 7254: a count from the durations record moved
+each id's units, sm100's 44 to 52, where a cached task and a rerun one could cover different units). Sized as
+the kernels the target's units lower (`_identity_units`' last field, summed: sm90 1237, sm100 1103, sm80 409,
+sm120 112 at 4c2215bfa49, identity_groups_probe) at about 2.4 s a kernel (sm90's recorded 2953 s over its
+1237) against 60 s an item, half the group target; a target absent from it takes the largest. Kernels a
+target's units lower that move this far past it move its items' seconds, which the CI plan's past-the-target
+check reports: resize it then."""
 
 
-@functools.cache
 def identity_tasks(target: str) -> int:
-    """The tasks `target`'s identity units are dealt among (`_dealt`), a sharding size like a CI group count,
-    from the record of the gate's own tasks (`ci.durations_record`, folded from main's CI): their seconds over
-    half the group target (.armada.json's), as a task dealt by the kernels a config lowers, not yet by its
-    ladders' rungs, which only a walk counts, holds up to twice its target's mean (jsf-6547e: sm90's tasks
-    16 to 171 s at 28, sm100's 13 to 157 at 32); one for a target the record holds none of, which the next
-    fold sizes. Every gate group lowered took 13,478 s of train 878's CI, twelve of its tasks past the train's
-    bound; a table of the counts by target raised KeyError at a new target's collection (row 6645)."""
-    from tool_support import load
-
-    ci, root = load("ci", "tools/armada"), Path(__file__).resolve().parents[1]
-    task = f"tests/{Path(__file__).name}::{IDENTITY_TEST}[{target}-"
-    seconds = sum(value for node, value in ci.durations_record(root / ci.session.DURATIONS).items()
-                  if node.startswith(task))
-    bound = json.loads((root / ".armada.json").read_text())["target"]
-    return max(1, math.ceil(2 * seconds / bound))
+    """The tasks `target`'s identity units are dealt among (`IDENTITY_TASKS`)."""
+    return IDENTITY_TASKS.get(target, max(IDENTITY_TASKS.values()))
 
 
 @pytest.mark.parametrize('target, task', [pytest.param(target, task, id=f'{target}-{task}')
