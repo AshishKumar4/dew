@@ -49,7 +49,7 @@ from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.mixers.mamba2 import MambaRMSNormGated
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import at_least_fp32, float32_dot_general, softplus
+from dew.nn.precision import at_least_fp32, compensated_add, float32_dot_general, softplus, two_product
 from dew.nn.residuals import Residual
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import sequence_shards
@@ -70,29 +70,57 @@ def _within(starts, length: int, batch: int):
     return ~jnp.asarray(starts, jnp.bool_).at[:, 0].set(True)
 
 
+TWO_PI = (np.float32(2 * np.pi), np.float32(2 * np.pi - float(np.float32(2 * np.pi))))
+"""2 pi as fp32's nearest and what it drops, a turn's whole in double-float."""
+
+
+def _wrapped(angle):
+    """A double-float angle `(hi, lo)` less its whole turns (`TWO_PI`, each turn's product exact, Dekker's),
+    about [0, 2 pi): its rounding a turn's however long the document, as mamba_ssm's `angle_dt` holds it."""
+    turns = jnp.floor(angle[0] * np.float32(1 / (2 * np.pi)))
+    whole, dropped = two_product(-turns, jnp.full_like(turns, TWO_PI[0]))
+    return compensated_add(angle, (whole, dropped - turns * TWO_PI[1]))
+
+
 def _angles(dt, theta, continues):
-    """Each token's angle `[B, S, H, R]` over its document: `dt theta` summed from the document's first token
-    through the token (`dt` zero where a token's turn acts on no state, `chunk_mamba3`), in `dt`'s dtype,
-    held in [0, 2 pi) as mamba_ssm's `angle_dt` holds it, so its rounding stays a turn's however long the
-    document."""
-    step = dt[..., None] * jnp.asarray(theta, dt.dtype)
+    """Each token's angle `[B, S, H, R]` over its document as a double-float `(hi, lo)` pair: `dt theta`
+    (each its exact product, `two_product`) summed from the document's first token through the token (`dt`
+    zero where a token's turn acts on no state, `chunk_mamba3`) and less its whole turns (`_wrapped`), in
+    `dt`'s dtype. The recurrence turns a token's state by its own turn; keys and queries turned by an angle
+    rounded once to fp32, half an ulp of 2 pi, put the packed chunked form of rank two at 2.3 times its error
+    from float64, its final state at 1.3 times and its gradients to 2.1 times, where a double-float angle
+    and its rotation of it (`rotated`'s `residual`) hold them under (row 7402)."""
+    rates = jnp.broadcast_to(jnp.asarray(theta, dt.dtype), (*dt.shape, theta.shape[-1]))
+    step = two_product(jnp.broadcast_to(dt[..., None], rates.shape), rates)
 
     def combine(left, right):
         # A segmented sum: a token that begins a document drops what came before it.
-        (sum_left, keep_left), (sum_right, keep_right) = left, right
-        summed = jnp.where(keep_right, sum_left + sum_right, sum_right)
-        return jnp.remainder(summed, 2 * jnp.pi), keep_left & keep_right
+        (*sum_left, keep_left), (*sum_right, keep_right) = left, right
+        summed = compensated_add(tuple(sum_left), tuple(sum_right))
+        kept = tuple(jnp.where(keep_right, s, r) for s, r in zip(summed, sum_right, strict=True))
+        return *_wrapped(kept), keep_left & keep_right
 
-    keep = jnp.broadcast_to(continues[:, :, None, None], step.shape)
-    summed, _ = jax.lax.associative_scan(combine, (step, keep), axis=1)
-    return summed
+    keep = jnp.broadcast_to(continues[:, :, None, None], step[0].shape)
+    *summed, _ = jax.lax.associative_scan(combine, (*step, keep), axis=1)
+    return tuple(summed)
 
 
-def rotated(x, angles):
+def _turned_by(angles, entering):
+    """Double-float `angles` turned on by `entering` (a pair, or an fp32 angle), wrapped (`_wrapped`)."""
+    entering = entering if isinstance(entering, tuple) else (entering, jnp.zeros_like(entering))
+    return _wrapped(compensated_add(angles, entering))
+
+
+def rotated(x, angles, residual=None):
     """`x` `[B, S, R, H, N]` with each adjacent pair of its first `2 A` dimensions turned by its angle
     (`angles` broadcast against `x` but its last axis, `A` wide), `(v_2j + i v_2j+1) e^{i phi}`, the rest
-    as given: `rope.rotate`'s adjacent pairs."""
-    return rope.rotate(x, jnp.cos(angles), jnp.sin(angles), pairs='adjacent')
+    as given: `rope.rotate`'s adjacent pairs. An angle's `residual`, what its fp32 rounding dropped
+    (`_angles`' pairs), turns it on to first order: `cos(phi + r) = cos phi - r sin phi`, `sin(phi + r) =
+    sin phi + r cos phi`."""
+    cos, sin = jnp.cos(angles), jnp.sin(angles)
+    if residual is not None:
+        cos, sin = cos - residual * sin, sin + residual * cos
+    return rope.rotate(x, cos, sin, pairs='adjacent')
 
 
 def _biased(value, bias):
@@ -201,8 +229,7 @@ def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, sta
         # The first document's angles from the carried angle on, and the carried token's writes again at
         # its first real token's `(1 - lambda) dt`, which the chunked op decays by the alphas to it.
         first = jnp.cumsum(resets.astype(jnp.int32), axis=1) == 0
-        entering = jnp.where(first[:, :, None, None], carried.angle[:, None], 0)
-        angles = jnp.remainder(angles + entering, 2 * jnp.pi)
+        angles = _turned_by(angles, jnp.where(first[:, :, None, None], carried.angle[:, None], 0))
         again = jnp.einsum('bhrn,bhrp->bhnp', carried.key, carried.value)
         held = jnp.swapaxes(carried.state, -1, -2) + entering_weight[:, :, None, None] * again
     out, final, keys = _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, held, starts,
@@ -217,7 +244,8 @@ def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, sta
                   else tuple(jnp.swapaxes(t, 1, 2) for t in (carried.key, carried.value)))
         any_real = jnp.any(valid, axis=1)[:, None, None, None]
         last = tuple(jnp.where(any_real, t, b) for t, b in zip(taken, before, strict=True))
-    return out, Carried(jnp.swapaxes(final, -1, -2), angles[:, -1], *(jnp.swapaxes(t, 1, 2) for t in last))
+    return out, Carried(jnp.swapaxes(final, -1, -2), angles[0][:, -1],
+                        *(jnp.swapaxes(t, 1, 2) for t in last))
 
 
 def _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, state, starts, *, work, operand,
@@ -230,8 +258,8 @@ def _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, state, star
     entries)`, `entries(keys)` its documents' entry writes from the rotated keys (`Chunk.entry_key`).
     Returns `(output, final state, rotated keys)`."""
     batch, length, rank, heads, _ = x.shape
-    keys, queries = (rotated(_per_head(jnp.asarray(t, work), heads), angles[:, :, None]).astype(operand)
-                     for t in (B, C))
+    keys, queries = (rotated(_per_head(jnp.asarray(t, work), heads), *(a[:, :, None] for a in angles))
+                     .astype(operand) for t in (B, C))
     decay = jnp.zeros((batch, length, rank, heads), work).at[:, :, 0].set(unturned * jnp.asarray(A, work))
     gate = jnp.broadcast_to((lam * dt + following)[:, :, None], decay.shape)
     begins = None if starts is None else jnp.zeros((batch, length, rank), bool).at[:, :, 0].set(starts)
@@ -284,22 +312,24 @@ def entered_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, forked, starts,
     ended = jnp.maximum(last, 0)
     # Each document's angles' offset, its source's last angle: the documents in the row's order, a parent
     # before its children, a table of angles carried through them (the start's, then each stored one's).
-    reached = gather_positions(turned, ended)
+    reached = tuple(gather_positions(t, ended) for t in turned)
 
     def offset(table, document):
-        load, store, total = document
-        taken = jnp.where(load > 0, table[jnp.maximum(load - 1, 0)], 0)
-        leaving = jnp.remainder(total + taken, 2 * jnp.pi)
-        return _angle_stored(table, store, leaving), taken
+        # The table and its documents' angles as double-float pairs (`_angles`).
+        load, store, *total = document
+        taken = tuple(jnp.where(load > 0, t[jnp.maximum(load - 1, 0)], 0) for t in table)
+        leaving = _turned_by(tuple(total), taken)
+        return tuple(_angle_stored(t, store, a) for t, a in zip(table, leaving, strict=True)), taken
 
     angles_table = jnp.concatenate([carried.angle, jnp.zeros((batch, held, *carried.angle.shape[2:]),
                                                                carried.angle.dtype)], axis=1)
     _, offsets = jax.lax.scan(
         lambda table, document: jax.vmap(offset)(table, document),
-        angles_table, tuple(jnp.moveaxis(t, 1, 0) for t in (loads, stores, reached)))
-    offsets = jnp.moveaxis(offsets, 0, 1)
-    entering = jnp.take_along_axis(offsets, number[:, :, None, None], axis=1)
-    angles = jnp.remainder(turned + entering, 2 * jnp.pi)
+        (angles_table, jnp.zeros_like(angles_table)),
+        tuple(jnp.moveaxis(t, 1, 0) for t in (loads, stores, *reached)))
+    entering = tuple(jnp.take_along_axis(jnp.moveaxis(t, 0, 1), number[:, :, None, None], axis=1)
+                     for t in offsets)
+    angles = _turned_by(turned, entering)
     # Each stored slot's document, by the slot it stores in, to read its last token's keys and values.
     stored_by = jnp.zeros((batch, held + 1), jnp.int32).at[rows, stores].set(
         jnp.broadcast_to(jnp.arange(documents, dtype=jnp.int32), stores.shape), mode="drop")
