@@ -67,6 +67,13 @@ def passes(model, prompt=4):
     return lambda params, ids: as_stepped(lambda held: forward(params, held), ids, prompt)
 
 
+def whole_pass(model):
+    """`model`'s one full pass over a draw's ids: a float64 truth's, whose products round alike at every
+    shape, where its arms read each call's (`passes`; `model_support.called_outputs`, ledger 1543): one
+    program where the calls' shapes compile one a call."""
+    return jax.jit(model.apply)
+
+
 def unrolled(params, steps):
     """The parameters of a stack `steps` times as deep whose layer i is layer i mod depth."""
     depth = TINY_DECODER["num_layers"]
@@ -540,7 +547,7 @@ def test_decoding_a_loop_that_exits_through_each_passs_coda_matches_its_prefill(
     draw = _with_gate(model_draw(looped, (2, 12), looped.vocab_size), looped.emb_features, 0xE82)
     assert_as_exact(lambda params, ids: decoded(looped, params, ids)[0], passes(looped), draw,
                     "an exiting loop's decode", seeds=EXITING_SEEDS["decode"],
-                    truth_fn=passes(looped.clone(dtype=jnp.float64)))
+                    truth_fn=whole_pass(looped.clone(dtype=jnp.float64)))
     variables, ids = draw(0)
     _, cache = decoded(looped, variables, ids)
     assert sorted(cache) == sorted(f"layers_{index}" for index in range(4 + 2 * 2 + 2 * 1))
