@@ -567,9 +567,10 @@ def test_a_splits_epoch_cadence_is_the_runs_own_under_a_batch_ramp(tmp_path):
 
     from dew.data.dataset import Ramp
 
+    run = lm(tmp_path, drawn=False)
+
     def readied(ramp: Ramp | None):
         """The run's trainer, loader and suites as it trains, under `ramp`."""
-        run = lm(tmp_path, drawn=False)
         trainer = dataclasses.replace(run.trainer, checkpoint_dir=str(tmp_path / "runs"), epochs=2,
                                       eval_every="epoch", multi_host=False, batch_ramp=ramp)
         prepared = dataclasses.replace(run, trainer=trainer, val_every={"val": "epoch"}).prepare()
