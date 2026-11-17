@@ -998,7 +998,8 @@ def same_tokenizer(one: Mapping[str, object], other: Mapping[str, object]) -> bo
     through transformers (`HFTokenizer.save_pretrained`), which writes its tokenizer.json anew, so every
     release's hashes differ from its run's though it is one tokenizer; transformers writes both alike
     again. A store recorded before stores stated a canonical form compares by its hashes alone."""
-    return one["files"] == other["files"] or ("canonical" in one and one["canonical"] == other.get("canonical"))
+    canonical = one.get("canonical")
+    return one["files"] == other["files"] or (canonical is not None and canonical == other.get("canonical"))
 
 
 def confined_files(files: Mapping[str, str]) -> dict[str, str]:

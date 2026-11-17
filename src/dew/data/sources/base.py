@@ -67,7 +67,8 @@ def tokenizer_contract(stated: Iterable[tuple[str, Mapping[str, object]]]) -> di
     """The tokenizer contract (`TOKENIZER_CONTRACT`) of stores read together, each `(name,
     metadata)`: every fact any of them states, as the first states it, which every other that states it
     states alike; a tokenizer by its files where both state them (`stated_revision`, `same_tokenizer`),
-    its name and revision then no part of it. Raises ValueError naming the store whose fact differs from the first's."""
+    its name and revision then no part of it. Raises ValueError naming the store whose fact differs from
+    the first's."""
     declared: dict[str, JSON] = {}
     first: Mapping[str, object] | None = None
     for name, metadata in stated:
