@@ -932,3 +932,31 @@ def test_a_decode_steps_price_reads_its_keys_and_a_paged_pool_walks_no_fewer_ste
     # Its seconds on the device (`cost.seconds`), the server's comparison, grow with the keys it reads.
     target = generation.gpu_target("sm90")
     assert cost.seconds(longer, target) > cost.seconds(dense, target) > 0
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100"])
+def test_a_forward_deciding_its_scaled_walk_holds_the_larger_walks_registers(generation_name):
+    """A bf16 inference forward that decides its scaled walk in its launch (`MosaicForward.deciding`: its
+    unscaled walk, then the scaled one where a row's sums passed fp32's largest), compiled for a compile-only
+    A100, H100 and B200 (`kernel_compile.compile_mosaic_kernels`): every kernel holds its registers spilling
+    nothing, at no more than the scaled walk's launch alone takes, the larger of its two loops, not their
+    sum (row 5274)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    query = jax.ShapeDtypeStruct((1, 64, 4, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 1024, 2, 128), jnp.bfloat16)
+    spans = template.spans(64, 1024, 1, causal=False)
+
+    def launched(scaled):
+        return lambda q, k, v: attention_mosaic.forward(q, k, v, spans, natural=False, scaled=scaled)
+
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels([KernelCase("deciding", lambda: (launched(False), (query, key, key))),
+                                        KernelCase("scaled", lambda: (launched(True), (query, key, key)))],
+                                       generation_name)
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)
+    deciding, scaled = ({kernel["kernel"]: kernel["registers"] for kernel in record["kernels"]}
+                        for record in found)
+    assert max(deciding.values()) <= max(scaled.values()), (deciding, scaled)
