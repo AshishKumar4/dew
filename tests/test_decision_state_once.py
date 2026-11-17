@@ -1,4 +1,4 @@
-"""A row of a request's questions over one copy of its state (`QuestionLayout.shared_state`): what each
+"""A row of a request's questions over one copy of its state (`SegmentLayout.shared_state`): what each
 question's own row writes before its question, written once, and each question's own part after it as a
 document continuing it (`dew.batch.Forks`), each at the positions its own row lays it at; each question
 reads that shared part and itself, so it decides as its own row does, its request's tokens the state's once
@@ -26,10 +26,10 @@ from dew.decision.layout import (
     AnswerCue,
     Instructions,
     OptionLines,
-    QuestionLayout,
+    SegmentLayout,
     State,
-    StateFirstLayout,
     Text,
+    per_question,
 )
 from dew.decision.model import DecisionModel, stream_runs
 from dew.decision.rows import Encoding, Fit
@@ -40,7 +40,7 @@ from dew.objectives.base import Step
 
 pytestmark = pytest.mark.mesh
 
-OWN = StateFirstLayout(
+OWN = SegmentLayout.state_first_row(
     labels=LABELS, max_len=256,
     segments=(Text("STATE:\n"), State(), Instructions({"choice": "\n{}"}),
               OptionLines(line="\n{label}. {option}", bare="\n{label}. {option}", join="",
@@ -120,7 +120,7 @@ def test_each_question_reads_the_shared_part_and_itself():
 
 
 def test_a_question_with_siblings_reads_the_questions_before_it_in_its_row_whole():
-    """With siblings (`QuestionLayout.siblings`, a layout a run saved before rows forked states), each
+    """With siblings (`SegmentLayout.siblings`, a layout a run saved before rows forked states), each
     question reads the shared part whole, the questions before it in its row whole and itself up to each
     token, as the layout's streamed reads read it before (each own stream causal, the shared stream whole
     and with siblings the earlier questions' whole), each token at its own row's position; a row whose
@@ -129,7 +129,7 @@ def test_a_question_with_siblings_reads_the_questions_before_it_in_its_row_whole
     from dew import registry
 
     chained = dataclasses.replace(SHARED, siblings=True)
-    assert registry.from_record(StateFirstLayout, registry.to_record(chained, StateFirstLayout)) == chained
+    assert registry.from_record(SegmentLayout, registry.to_record(chained, SegmentLayout)) == chained
     _, [plain] = own_and_shared()
     _, [row] = own_and_shared(chained)
     assert (row.tokens, row.positions, row.forked) == (plain.tokens, plain.positions, plain.forked)
@@ -228,7 +228,7 @@ def test_a_row_over_one_state_decides_each_question_as_its_own_row_does():
     its own row does in a window of its own, through the unmodified objective (check 1, over drawn
     parameters, float64 truth)."""
     shared = in_streams(SHARED, segments=2)
-    assert isinstance(shared.layout, QuestionLayout) and shared.layout.shares
+    assert per_question(shared.layout) and shared.layout.shares
     alone = in_streams(OWN, segments=1)
     rows = examples()
     windows = {"shared": windows_of(shared, rows, count=8), "alone": windows_of(alone, rows, count=24)}
@@ -431,18 +431,17 @@ def test_a_row_over_one_state_writes_its_state_before_its_question_and_its_instr
     """A layout whose rows write the state after the question (a question-first or a re-reading order), or
     the options before the instructions, shares no part of the state its questions read alike: it is refused
     with several questions a row asked, and lays a question a row by default (review of state-once)."""
-    from dew.decision.layout import MarkerLayout
 
     first, state, instructions, options, cue = OWN.segments
     with pytest.raises(ValueError):
         dataclasses.replace(OWN, shared_state=2, segments=(first, state, options, instructions, cue))
     with pytest.raises(ValueError):
-        MarkerLayout(shared_state=2)
+        SegmentLayout.marker_row(shared_state=2)
     with pytest.raises(ValueError):
         dataclasses.replace(OWN, shared_state=2, segments=None, order="re_read")
     # A layout that states no sharing asks a question a row, as before rows shared a state, until what
     # reads its rows states it (`shared_for`); one that states it shares.
-    assert not MarkerLayout().shares and not dataclasses.replace(OWN, shared_state=None).shares
+    assert not SegmentLayout.marker_row().shares and not dataclasses.replace(OWN, shared_state=None).shares
     assert dataclasses.replace(OWN, shared_state=2).shares
 
 

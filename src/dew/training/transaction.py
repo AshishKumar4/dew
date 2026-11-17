@@ -33,7 +33,7 @@ from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, FROZEN, Batch, Variables, dicts, leaves_by_path, merge
 from dew.data.dataset import rows_of
 from dew.gauss_newton import solves_equations
-from dew.held_updates import holds_back, holds_state, input_taken, refuse_untold, update_applied
+from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
 from dew.nn import in_backward
 from dew.nn.inspection import (
     PROBES,
@@ -62,7 +62,7 @@ from dew.objectives.base import (
     with_projected,
 )
 from dew.objectives.routing import refuse_fixed_routers
-from dew.optim import clips_qk, post_step_order, stepped
+from dew.optim import clips_qk, pooled_update, post_step_order, stepped
 from dew.optim_schedules import injected_edited
 from dew.state import Accumulation, ReplicaState, TokenCount, TrainState, apart, occupancy, together
 from dew.training.distributed import microbatch
@@ -270,20 +270,23 @@ def optimizer_update(optimizer: optax.GradientTransformation, gradient, opt_stat
     (`dew.gauss_newton`). An update its type declares to take none, a plain transformation wrapping the
     clip, is handed the logits' maxima where its state holds a QK-Clip, which reads the step's own and
     would otherwise step unclipped (row 6552); never the statistics, so a solver in it refuses
-    (`dew.gauss_newton`) rather than solve one step's system for the window's update. A QK-Clip inside an
-    accumulating wrapper (`optax.MultiSteps`) is refused as the step traces: the wrapper hands its inner
-    update one step's maxima at the window's end, where the window's update trained on every step's; the
-    trainer's own accumulation (`Trainer(accumulation=k)`) pools them."""
-    if clips_qk(opt_state) and holds_state(opt_state, optax.MultiStepsState):
-        raise ValueError("a QK-Clip inside optax.MultiSteps would be handed its window's last step's "
-                         "attention logit maxima alone, not every step's its update trained on: accumulate "
-                         "with the trainer (`Trainer(accumulation=k)`), which pools them")
+    (`dew.gauss_newton`) rather than solve one step's system for the window's update. Where the optimizer
+    holds its update back over several calls (`optax.MultiSteps`, which runs its inner update at the
+    window's last call alone, or `optax.apply_every`), each call's maxima are pooled in its QK-Clip's state
+    (`dew.optim.pooled_update`), so the update that applies is clipped by every microstep's, as the
+    trainer's own accumulation pools them."""
     clocked = {} if progress is None else {"progress": progress}
-    if isinstance(optimizer, optax.GradientTransformationExtraArgs):
-        solved = {"statistics": statistics} if solves_equations(opt_state) else {}
-        return optimizer.update(gradient, opt_state, params, qk_stats=qk, **solved, **clocked)
-    clipped = {"qk_stats": qk} if clips_qk(opt_state) else {}
-    return optimizer.update(gradient, opt_state, params, **clipped)
+
+    def update(state) -> tuple:
+        if isinstance(optimizer, optax.GradientTransformationExtraArgs):
+            solved = {"statistics": statistics} if solves_equations(state) else {}
+            return optimizer.update(gradient, state, params, qk_stats=qk, **solved, **clocked)
+        clipped = {"qk_stats": qk} if clips_qk(state) else {}
+        return optimizer.update(gradient, state, params, **clipped)
+
+    if qk is not None and clips_qk(opt_state) and holds_back(opt_state):
+        return pooled_update(update, opt_state, params, qk)
+    return update(opt_state)
 
 
 def leaf_local(optimizer: optax.GradientTransformation, gradients, state, *, progressed: bool) -> bool:

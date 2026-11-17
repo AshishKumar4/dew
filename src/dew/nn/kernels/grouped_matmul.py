@@ -43,7 +43,7 @@ from .generation import INHERENT
 from .templates import across, base, bundles, mosaic, report, resources, stores, swizzling
 from .templates.axes import held as held_axes
 from .templates.gemm import mosaic_gpu, packed, pricing, producers, row_tiles
-from .templates.gemm.hooks import NO_HOOKS, Hooks, hook_lowers as hook_lowers, hooks_lower
+from .templates.gemm.hooks import NO_HOOKS, Hooks, hooks_lower
 from .templates.product import SCALE_DEPTH, Product, eight
 
 
@@ -2117,9 +2117,15 @@ class Kind(NamedTuple):
     gathered: bool = False
     scattered: bool = False
     matrix: tuple[int, int] | None = None
+    formed: bool = False
+    """Whether its left operand is formed by a prologue the kernel runs tile by tile (a norm's normalization
+    the algebra's recognition fused into the product, `fused_gemm`), its call one that reads the rows the
+    prologue forms them from: a forward's or a kernel gradient's, a cell of its own where a receipt timed one
+    (`MEASURED`)."""
 
     def __str__(self) -> str:
-        parts = ('fp8',) * self.fp8 + ('gathered',) * self.gathered + ('scattered',) * self.scattered
+        parts = (('fp8',) * self.fp8 + ('gathered',) * self.gathered + ('scattered',) * self.scattered
+                 + ('formed',) * self.formed)
         timed = () if self.matrix is None else ('x'.join(map(str, self.matrix)),)
         return ' '.join(('dense' if self.dense else 'grouped', self.made.value, *parts, *timed))
 
@@ -2265,9 +2271,20 @@ class Timed(NamedTuple):
         return matrix in self.matrices and self.fewest <= rows <= self.most
 
 
-MEASURED: dict[tuple[str | None, Made], Timed] = {
-    (family, made): Timed(frozenset(FOUR_B), 24576, 49152) for family in ('wgmma', 'tcgen05')
-    for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT)}
+NORMED_08B = ((1024, 4096 + 512 + 512), (1024, 2 * 3584))
+"""Qwen3.5-0.8B's normed projections M-EM-65 timed (`M_EM_65`): the attention input norm before the joined
+query (doubled by its output gate), key and value, and the MLP's norm before gate and up, `[in, out]`."""
+
+M_EM_65 = ("M-EM-65-a100 and M-EM-65-gh200 (an A100 and a GH200, main 99c7334e2, rounds.py's two arms "
+           "interleaved 5 rounds, CUPTI medians, 4 x 3072 rows of bf16, a training step's forward and "
+           "backward): the norm in the template's prologue against the fused norm kernel then XLA's dot, "
+           "0.955x and 0.619x at the attention norm + q/k/v, 0.971x and 0.533x at the MLP norm + gate/up, "
+           "ranges apart")
+MEASURED: dict[tuple[str | None, Made, bool], Timed] = {
+    **{(family, made, False): Timed(frozenset(FOUR_B), 24576, 49152) for family in ('wgmma', 'tcgen05')
+       for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT)},
+    **{(family, made, True): Timed(frozenset(NORMED_08B), 12288, 12288) for family in ('mma.sync', 'wgmma')
+       for made in (Made.FORWARD, Made.KERNEL_GRADIENT)}}
 """The dense products each instruction family's receipts timed, by what the product makes: one of them is a
 cell of its own (`Kind.matrix`), which its receipt's winner holds; every other product its kind's. The
 receipts timed 24,576 tokens (M-EM-36, M-EM-52, em35d); the 4B step's 49,152 (four rows) held the same
@@ -2285,6 +2302,9 @@ B200_GRID = ("lab-b200-20261113-grid (a B200, base/kernels 5ac163abbec, medians 
              "0.833x)")
 
 DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {
+    **{(family, Kind(dense=True, made=made, matrix=matrix, formed=True)): (MOSAIC, M_EM_65)
+       for family in ('mma.sync', 'wgmma') for made in (Made.FORWARD, Made.KERNEL_GRADIENT)
+       for matrix in NORMED_08B},
     ('mma.sync', Kind(dense=True, made=Made.FORWARD)):
         (XLA, "DENSE1 (A100, a55c8ffb2, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
              "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens; M-FS-9 (RTX PRO 6000, "
@@ -2387,10 +2407,18 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     call = base.call(launches, *arguments, **options)
     matrix = _matrix_of(launches, arguments) if options['dense'] else None
     rows = _rows_of(launches, arguments)
-    measured = MEASURED.get((generation.family(call.target.generation), made))
-    timed = matrix is not None and measured is not None and measured.holds(matrix, rows)
+    # A left operand a prologue forms (a norm's, fused by the algebra's recognition) is a cell of its own
+    # where a receipt timed it formed; elsewhere it is its matrix's cell as any call's (train 977 F1: the
+    # 4B's normed projections keep the template FOUR_B's receipts measured).
+    family = generation.family(call.target.generation)
+
+    def timed(*, formed: bool) -> bool:
+        measured = MEASURED.get((family, made, formed))
+        return matrix is not None and measured is not None and measured.holds(matrix, rows)
+
+    formed = options['hooks'].prologue is not None and timed(formed=True)
     kind = Kind(bool(options['dense']), made, fp8=fp8, gathered=gathered, scattered=scattered,
-                matrix=matrix if timed else None)
+                matrix=matrix if formed or timed(formed=False) else None, formed=formed)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor

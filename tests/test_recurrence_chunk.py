@@ -66,11 +66,15 @@ FORMED = [
     recurrence.Hooks(decay='vector', delta=False, write_gate=True, skip=True,
                      output=recurrence.OutputNorm(1e-6, 'sigmoid')),
     recurrence.Hooks(decay='scalar', delta=False),
+    recurrence.Hooks(decay='vector', delta=False, reads='before', own_weight=True),
+    recurrence.Hooks(decay='scalar', reads='before', scale=KEY_WIDTH ** -0.5, write_bound=1.0),
 ]
 """The prologue's and epilogue's hooks: the gated delta rule's gates and l2 norm, Mamba2's step gates
 clipped with the skip, the gated RMS norm after the l2 norm and after a plain scale, Mamba2's SSD as
 `chunk_ssd` hands it over (a rated decay, the step its write gate), with its gated norm, a rated decay
-under the delta rule and the l2 norm, the norm after the skip, and a decay without any write gate."""
+under the delta rule and the l2 norm, the norm after the skip, a decay without any write gate, and the
+readout of the memory entering its token (`Hooks.reads`): RWKV6's, a decay a key dimension with its own
+write weighed (`Hooks.own_weight`), and the delta rule's."""
 
 PACKED = (False, True)
 
@@ -139,7 +143,7 @@ def chunk_on(kernel: str, hooks, *args, **kwargs):
 
 SEEDS = dict(zip(((hooks, packed) for hooks in HOOKS + FORMED for packed in PACKED), (
     8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 64, 64, 16, 16, 16, 16, 8, 8, 64, 64, 8, 8, 8, 8,
-    64, 64, 128, 128, 16, 8, 16, 16, 64, 64, 32, 32, 32, 32, 8, 8, 16, 16), strict=True))
+    64, 64, 128, 128, 16, 8, 16, 16, 64, 64, 32, 32, 32, 32, 8, 8, 16, 16, 16, 16, 16, 16), strict=True))
 """Each site's declared seeds (hooks in `HOOKS` then `FORMED` order, one sequence then packed), sized
 independently by `seeds_for` on armada (2026-10-21), on the draw with a memory entering and a
 document starting on a chunk's first token."""
@@ -197,16 +201,17 @@ def cotangents(operands: Chunk, seed: int) -> tuple[jax.Array, jax.Array]:
 
 
 def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH,
-         value_heads: int = VALUE_HEADS) -> tuple[Chunk]:
+         value_heads: int = VALUE_HEADS, value_width: int | None = None) -> tuple[Chunk]:
     """A sequence's operands for `hooks` from `seed` (`hosted`), its keys' and values' dimensions each
     permuted by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries, keys
     and values (`NORMED_WIDTH` wide under the norm), a log decay a head or a key dimension in (-1, 0),
-    a gate in (0, 1), a skip, a memory entering, `length` tokens over `value_heads` value heads, and with
+    a gate in (0, 1), a skip, a memory entering, `length` tokens over `value_heads` value heads, the values
+    `value_width` wide where given, and with
     `packed` documents starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the second, 48 a
     chunk's first token."""
     rng = np.random.default_rng(seed)
     normal = np.random.default_rng([seed, 1]).standard_normal
-    width = VALUE_WIDTH if hooks.output is None else NORMED_WIDTH
+    width = value_width or (VALUE_WIDTH if hooks.output is None else NORMED_WIDTH)
     key_order, value_order = rng.permutation(KEY_WIDTH), rng.permutation(width)
     query = normal((ROWS, length, KEY_HEADS, KEY_WIDTH))[..., key_order]
     key = unit(normal((ROWS, length, KEY_HEADS, KEY_WIDTH)))[..., key_order]
@@ -234,11 +239,12 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
         epilogue = {'z': hosted(normal((ROWS, length, value_heads, width))[..., value_order]),
                     'weight': hosted((1.0 + 0.1 * normal((width,)))[value_order])}
     starts = jnp.asarray(marked(((0, 23, 40), (9, 48)), length)) if packed else None
+    own = {'own': hosted(0.5 * normal((value_heads, KEY_WIDTH))[..., key_order])} if hooks.own_weight else {}
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
     return (Chunk(hosted(query), hosted(key), hosted(value), log_decay=hosted(log_decay) if plain else None,
                   beta=hosted(beta) if reads_beta else None, skip=hosted(skip) if hooks.skip else None,
-                  state=hosted(state), starts=starts, **gates, **epilogue),)
+                  state=hosted(state), starts=starts, **gates, **epilogue, **own),)
 
 
 def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
@@ -263,7 +269,7 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
             state, query=query[:, t], key=key[:, t], value=operands.value[:, t],
             log_decay=at(operands.log_decay), gate=at(operands.gate), log_a=operands.log_a,
             bias=operands.bias, beta=at(operands.beta), skip=operands.skip, z=at(operands.z),
-            weight=operands.weight, rate=operands.rate)
+            weight=operands.weight, rate=operands.rate, own=operands.own)
         out, _, state = recurrence.step_reference(hooks, token)
         return state, out
 
@@ -1126,3 +1132,23 @@ def test_a_call_inside_a_map_holding_an_axis_manual_selects_its_kernel():
     with jax.sharding.use_abstract_mesh(mesh):
         out = jax.eval_shape(mapped, given, given, given, heads, heads)
     assert out.shape == given.shape
+
+
+RWKV6_SITES = tuple(f"rwkv6/{dtype}/{layout}" for dtype in ("bf16", "fp32")
+                    for layout in ("one sequence", "packed"))
+"""RWKV6's recorded sites (`fla_sites.RWKV6`): its recurrence in bf16 and fp32, one sequence and packed."""
+
+
+@pytest.mark.parametrize("site", RWKV6_SITES)
+@pytest.mark.check1_shards(seeds=64, per_task=8)
+def test_rwkv6_through_the_chunked_op_is_as_exact_as_fla(site):
+    """RWKV6's recurrence (a decay a key dimension, its readout of the memory entering its token, its own
+    write weighed a key: `recurrence.Hooks.reads`, `Hooks.own_weight`) through the chunked op, its output,
+    final memory and every operand's gradient, the own weight's included, on par from float64 with
+    recorded fla-core's `chunk_rwkv6` at the site's declared seeds (check 1; the truth the recurrence a
+    token at a time in float64, which the recorder held to fla's `naive_recurrent_rwkv6`). The portable
+    math takes it on every route (`recurrence_chunk.READOUT_HANDOFF`)."""
+    from fla_sites import OWN_LEAVES, RWKV6, the_template_is_as_exact_as_fla
+
+    the_template_is_as_exact_as_fla(lambda operands: chunk(RWKV6, operands), site, OWN_LEAVES,
+                                    label=f"RWKV6 through the chunked op against fla, {site}")

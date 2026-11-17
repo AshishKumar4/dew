@@ -14,8 +14,8 @@ from PIL import Image
 
 from dew._records import JSON
 from dew.data.text import ByteTokenizer, HFTokenizer
-from dew.decision import Choice, JointLayout, Noul
-from dew.decision.layout import JOINT_PREFILL, JOINT_SYSTEM, Framing, Specials
+from dew.decision import Choice, Noul
+from dew.decision.layout import JOINT_PREFILL, JOINT_SYSTEM, Framing, SegmentLayout, Specials
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -40,7 +40,7 @@ def assert_markup_is_its_own(tokenizer: HFTokenizer) -> None:
     """A joint row over `tokenizer`: each special token the template's framing writes is that token's
     one id in the row, as often as the framing writes it, and no ChatML spelled as text where the
     vocabulary has no ChatML token."""
-    layout = JointLayout()
+    layout = SegmentLayout.joint_row()
     [row] = layout.rows(tokenizer, Specials.of(tokenizer), "one two three", QUESTIONS)
     before, after = layout.framing.around(tokenizer)
     from transformers import PreTrainedTokenizerFast
@@ -83,7 +83,7 @@ def test_a_tokenizer_without_a_template_frames_a_row_as_plain_text():
     before, after = Framing().around(tokenizer)
     assert before.startswith(JOINT_SYSTEM) and after.endswith(JOINT_PREFILL)
     specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
-    [row] = JointLayout().rows(tokenizer, specials, "one two three", QUESTIONS)
+    [row] = SegmentLayout.joint_row().rows(tokenizer, specials, "one two three", QUESTIONS)
     assert not any(markup in tokenizer.decode(row.tokens) for markup in CHATML)
     templated = HFTokenizer(str(LOCAL["qwen3.5"]), local_files_only=True)
     assert Framing(template=False).around(templated) == (before, after)
@@ -124,8 +124,8 @@ def test_a_framing_reads_a_chat_template_of_its_own_and_its_variables_and_its_re
         chat_template=template, mark="x", tokenize=False, add_generation_prompt=True)
     assert isinstance(direct, str) and before + CONTENT + after == direct + JOINT_PREFILL
     assert not any(markup in before + after for markup in CHATML)
-    layout = JointLayout(framing=framing)
-    reloaded = from_record(JointLayout, to_record(layout, JointLayout))
+    layout = SegmentLayout.joint_row(framing=framing)
+    reloaded = from_record(SegmentLayout, to_record(layout, SegmentLayout))
     assert reloaded == layout
     specials = Specials.of(templated)
     rows = [laid.rows(templated, specials, "one two", QUESTIONS) for laid in (reloaded, layout)]

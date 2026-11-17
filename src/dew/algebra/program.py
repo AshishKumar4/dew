@@ -173,6 +173,14 @@ def _passed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
     return made
 
 
+def traced_as(traced: jax.stages.Traced, closed: jcore.Jaxpr) -> jax.stages.Traced:
+    """jit's own trace `traced` of a program, its program `closed` (its rewritten one, `rewritten_program`, of
+    the same arguments and results): what it lowers, compiles and runs is `closed`, never traced again (row
+    6977: a replay of the rewritten program was a whole second trace, 1.18 s of a decision step's 7.5)."""
+    return jax.stages.Traced(traced._meta_tys_flat, {**traced._params, "jaxpr": closed}, traced._in_tree,
+                             traced.out_tree, traced._consts, traced._fun_sourceinfo)
+
+
 def replaying(closed: jcore.Jaxpr, structure, numbers: Iterable[int],
               names: Iterable[str]) -> Callable:
     """A function of a program's arguments computing `closed` (its rewritten program, `rewritten_program`)
@@ -843,14 +851,19 @@ def node_count(graph: EGraph) -> int:
     return sum(size for _, size in graph.all_function_sizes())
 
 
-def priced(closed: jcore.Jaxpr, target) -> cost.Seconds:
-    """`closed` as XLA's fusion runs it on `target`: its equations' terms (`terms.region`) in their e-graph
-    (`graphed`), extracted greedily at XLA's schedule (`cost.fused`), which on a graph no rule rewrote is the
-    program as written, each shared value priced once: its leaves' bytes read, its reductions and products
-    each a kernel, its elementwise and special-function work per element (`cost.work`). The one price the
-    algebra gives an XLA program it does not rewrite (a fused GEMM's prologue sides, `fused_gemm.priced`);
-    its `Seconds`, whose work no rate of `target` prices its schedule tells (`Schedule.unpriced`)."""
-    region = terms.region(closed)
+def priced(closed: jcore.Jaxpr, target: generation.GpuTarget) -> cost.Seconds:
+    """`closed` as XLA's fusion runs it on `target`: the equations its outputs read (`_read`: none it leaves
+    dead) as terms (`terms.region`) in their e-graph (`graphed`), extracted greedily at XLA's schedule
+    (`cost.fused`), which on a graph no rule rewrote is the program as written, each shared value priced
+    once: its leaves' bytes read, its reductions and products each a kernel, its elementwise and
+    special-function work per element (`cost.work`), and one kernel at least, its outputs' fusion, which an
+    elementwise program's launch is (a producer formed whole before a GEMM). The one price the algebra
+    gives an XLA program it does not rewrite (a fused GEMM's prologue sides, `fused_gemm.priced`); its
+    `Seconds`, whose work no rate of `target` prices its schedule tells (`Schedule.unpriced`)."""
+    region = terms.region(_read(closed))
     graph, bundle, _ = graphed(region)
-    return extract.cheapest(graph, bundle, cost.model(region, cost.fused(target)))[1]
+    schedule = cost.fused(target)
+    found = extract.cheapest(graph, bundle, cost.model(region, schedule))[1]
+    launched = cost.Work(kernels=max(0.0, 1.0 - found.work.kernels))  # its outputs' fusion, at least one
+    return found + cost.Seconds(launched, schedule)
 

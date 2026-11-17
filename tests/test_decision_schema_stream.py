@@ -17,9 +17,9 @@ from recording import RecordingTracker
 
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
-from dew.decision import Choice, Decide, DecisionHead, Example, JointLayout, Noul, Schema, State, Text
+from dew.decision import Choice, Decide, DecisionHead, Example, Noul, Schema, State, Text
 from dew.decision.head import JointSchemaHead
-from dew.decision.layout import Specials
+from dew.decision.layout import SegmentLayout, Specials
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.questions import ChoiceAnswer
@@ -32,7 +32,8 @@ pytestmark = pytest.mark.mesh
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
 TOKENIZER = ByteTokenizer()
-LAYOUT = JointLayout(max_len=256, segments=(Text("STATE:\n"), State(), Schema(stream="context"), Text("\n")))
+LAYOUT = SegmentLayout.joint_row(max_len=256, segments=(Text("STATE:\n"), State(), Schema(stream="context"),
+                                                        Text("\n")))
 QUESTION = {"pick": Choice("Which one?", ["a", "b", "c"])}
 QUESTIONS = {"pick": Choice("Which one?", ["a", "b", "c"]), "holds": Noul("Does it hold?"),
              "close": Choice("Which letter is closest to it?", ["x", "y"])}

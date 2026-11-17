@@ -1,8 +1,7 @@
 """A process that serves the tiny decision task's requests from a scoring server, keeping its programs or
-handed them (tests/test_decision_serving.py): `python kept_scoring_worker.py keep|take|verify <file>`.
-Prints each request's response, the programs kept and refused or the traces and compiles the server
-needed, as JSON; `verify` hands the programs with each one's own lowering held to the kept one's
-(`dew.training.ahead.kept`'s `verify`)."""
+handed them (tests/test_decision_serving.py): `python kept_scoring_worker.py keep|take <file>`. Prints
+each request's response, the programs kept and refused or the forward's compiles the server needed, as
+JSON."""
 
 import json
 import sys
@@ -39,17 +38,12 @@ if mode == "keep":
     found = {"kept": len(saved.kept), "programs": len(server.programs),
              "refused": list(programs.refused.values())}
     responses = served(server)
-elif mode == "verify":
-    with kept(path, verify=True):
-        server = ScoringServer.from_task(*task.scoring())
-    found = {"programs": len(server.programs)}
-    responses = served(server)
 else:
     with Compiles("logits") as compiles:
-        # The identity alone trusted: the server's programs are handed with no trace or lowering.
-        with kept(path, verify=False):
+        # Each program traced and lowered, and run as kept where it lowers to the kept one.
+        with kept(path):
             server = ScoringServer.from_task(*task.scoring())
         responses = served(server)
     found = {"programs": len(server.programs),
-             "needed": sorted(program.kind for program in compiles.programs)}
+             "compiled": [program.name for program in compiles.programs if program.kind == "compiled"]}
 print(json.dumps({"responses": json.loads(json.dumps(responses, default=str)), **found}))
