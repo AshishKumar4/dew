@@ -12,7 +12,9 @@ import collections
 import contextlib
 import contextvars
 import dataclasses
+import functools
 import hashlib
+import importlib.metadata
 import importlib.util
 import itertools
 import json
@@ -641,7 +643,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
     `uncertified` names;
     a launch Mosaic refuses as it lowers (a block past its shared memory) raises here as its program's
     lowering would. Once a process, by launch (`certifications`), and once a GPU model a
-    machine: each verdict, an accepted config's and a refused one's, is stored with the kernel picks
+    machine: each verdict, an accepted config's and a refused one's, is stored beside the kernel picks
     (`_verdict_key`), so a warm start traces and compiles nothing to certify."""
     device = _certifying_device()
     if device is None or arguments.arguments.get("interpret"):
@@ -717,13 +719,13 @@ def rung_round() -> int:
 
 
 def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
-    """What decides a launch's certification on a GPU model before it traces, as its stored verdict's key
-    (`tuning.stored_verdict`): the launch's `identity` (`_identity`, the same in every process), its config,
-    whether reverse mode runs it, Dew's code (`package_digest`: a Dew edit certifies again), the installed
-    JAX, jaxlib and CUDA plugins, whose compiler assembles it (the Pallas lowering cache's seal of them), and
-    the environment a kernel's lowering and compile read (that cache's policy); the store's file names the
-    GPU model. None where the installation has no seal (an edited or a source install of JAX), whose code
-    no key states: its verdicts are not stored."""
+    """What decides a launch's certification on a GPU model (the store's file, `tuning.stored_verdict`) before
+    it traces, as its stored verdict's key: the launch's `identity` (`_identity`, the same in every process),
+    its config, whether reverse mode runs it, Dew's code (`package_digest`: a Dew edit certifies again), the
+    installed JAX, jaxlib and CUDA plugins, whose Mosaic GPU and XLA lower and compile it (the Pallas lowering
+    cache's seal of them), the ptxas that assembles it (`_assemblers`), and the environment a kernel's
+    lowering and compile read (that cache's policy). None where the installation has no seal (an edited or a
+    source install of JAX), whose code no key states: its verdicts are not stored."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
@@ -733,8 +735,22 @@ def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
     installed = seal().digest
     if installed is None:
         return None
-    stated = [package_digest(), installed.hex(), identity, encoded(config), reverse, _keyed_environment()]
+    stated = [package_digest(), installed.hex(), _assemblers(), identity, encoded(config), reverse,
+              _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
+
+
+@functools.cache
+def _assemblers() -> list[str]:
+    """The installed distributions holding the ptxas a kernel's PTX is assembled with, CUDA's nvcc wheels
+    (`nvidia-cuda-nvcc`, `nvidia-cuda-nvcc-cu12`), each as `name==version`: a relock that moves one
+    certifies again, where the seal, which holds the CUDA plugins alone, kept a verdict another ptxas
+    judged. A system CUDA's ptxas, outside every wheel, none names (row 7309: the ptxas Mosaic GPU's own
+    assembler names, `_get_assembler`, with its version, once Dew's JAX build states it)."""
+    named = (((distribution.metadata.get("Name") or "").lower(), distribution)
+             for distribution in importlib.metadata.distributions())
+    return sorted(f"{name}=={distribution.version}" for name, distribution in named
+                  if re.fullmatch(r"nvidia-cuda-nvcc(-cu\d+)?", name))
 
 
 def certifications() -> tuple[Certification, ...]:
