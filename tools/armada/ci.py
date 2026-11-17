@@ -2246,7 +2246,10 @@ def raised(record: dict[str, float], held: list[dict], marked: dict) -> dict[str
     past its record and makes its group outrun its deadline is timed so, or its group is cut by the old
     time every run and dies at it again (Main, 2026-11-17: base/kernels' test_attention_mosaic_compile
     groups, recorded at about 100 s, ran 12 to 25 min). A site's entries stay as they are
-    (`site_entries`)."""
+    (`site_entries`). The trade-off, Main's: a time a bad red run inflated (a hang) comes down only when a
+    green run finds the file stale (`stale`), so until then its test is packed further apart than it needs,
+    which costs packing, never coverage or a verdict; a green run lowering entries would change the green
+    path's keeping of them byte for byte."""
     taken: dict[str, float] = {}
     for row_ in held:
         timed = list(row_.get("tests", {}).items())
