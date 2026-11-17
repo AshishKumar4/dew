@@ -136,8 +136,9 @@ def rigel(args: list[str], root: Path) -> Callable[[], object]:
     # Eight steps, the fewest whose rescaled phases each end past the one before.
     sizes = {"--width": "128", "--steps": "8", "--batch-size": "8", "--seq-len": "16"}
     sized = [stores.get(word, word) for word in scaled(args, sizes)]
-    rigel_flags = [*sized, *(["--width", "128"] if "--width" not in sized else []),
-                   *(["--steps", "8"] if "--steps" not in sized else []), "--tokenizer", "byte"]
+    # A size the command leaves at the recipe's (Rigel's own batch and length) is given small too.
+    unsized = [word for flag, value in sizes.items() if flag not in sized for word in (flag, value)]
+    rigel_flags = [*sized, *unsized, "--tokenizer", "byte"]
     sized_run = ["--model.num-layers", "4", "--model.layer-types", "mamba", "mamba", "mamba", "attention",
                  "--max-new-tokens", "0", *TRAINED, "--trainer.checkpoint-dir", str(root / "runs")]
     return lambda: recipe.main([*scaled(rigel_flags, {"--trainer.checkpoint-dir": str(root / "runs")}),
@@ -156,7 +157,7 @@ TINY = {"decision/train": decision, "diffusion/train": diffusion, "jepa/train": 
 """How each recipe's documented commands run here: their documented flags at a tiny size, over local data."""
 
 RUN = (("decision/train", 0), ("decision/train", 1), ("diffusion/train", 0), ("jepa/train", 0),
-       ("lm/train", 0), ("lm/rigel", 1), ("lm/mixture", 0))
+       ("lm/train", 0), ("lm/rigel", 0), ("lm/rigel", 1), ("lm/mixture", 0))
 """The documented commands this file runs, each by its recipe and its place among the recipe's commands: those
 that run as documented; a fix that makes another run adds it."""
 
