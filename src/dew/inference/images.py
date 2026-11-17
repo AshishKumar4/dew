@@ -917,9 +917,9 @@ class _ImagePass:
         self.requests += 1
         return True
 
-    def taken(self) -> int:
+    def taken(self) -> tuple[int, ...]:
         """Every request it holds: alike, they run as one batch."""
-        return self.requests
+        return tuple(range(self.requests))
 
 
 @dataclass(frozen=True, eq=False)

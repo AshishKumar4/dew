@@ -54,9 +54,10 @@ class PassPlan[Row](Protocol):
         the plan: it takes no row after."""
         ...
 
-    def taken(self) -> int:
-        """How many of the rows it holds, first added first, the pass runs now: all, or fewer where the
-        rest in a pass of their own compute fewer padded tokens; a later pass takes the rest first."""
+    def taken(self) -> tuple[int, ...]:
+        """Which of the rows it holds, by the order they were added, the pass runs now: all, or fewer
+        where the rest in a pass of their own compute fewer padded tokens; a later pass takes the rest
+        first."""
         ...
 
 
@@ -286,15 +287,22 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
 
     def _kept(self, placed: list[tuple[_Request[Row, Payload, Output, Answer], int] | None],
               plan: PassPlan[Row] | None) -> list[tuple[_Request[Row, Payload, Output, Answer], int]]:
-        """`placed`'s rows the plan runs now (`PassPlan.taken`), the first always; each request whose
-        rows it leaves takes them first in the next pass, running already (its first row's pass may be
-        the next)."""
-        held = len(placed) if plan is None else max(plan.taken(), 1)
-        for row in reversed(placed[held:]):
-            if row is not None:
-                request, index = row
-                request.taken = index
-        return [row for row in placed[:held] if row is not None]
+        """`placed`'s rows the plan runs now (`PassPlan.taken`), the first always, each request's rows in
+        order: a request whose row the pass leaves takes it and its rows after first in the next pass,
+        running already (its first row's pass may be the next)."""
+        run = {0} | (set(range(len(placed))) if plan is None else set(plan.taken()))
+        kept: list[tuple[_Request[Row, Payload, Output, Answer], int]] = []
+        left: dict[int, int] = {}
+        for position, row in enumerate(placed):
+            if row is None:
+                continue
+            request, index = row
+            if position in run and id(request) not in left:
+                kept.append(row)
+            else:
+                left.setdefault(id(request), index)
+                request.taken = min(request.taken, left[id(request)])
+        return kept
 
     def run(self) -> None:
         """Step until no request waits."""

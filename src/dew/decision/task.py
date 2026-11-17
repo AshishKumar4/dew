@@ -983,10 +983,10 @@ class Decide(SavedRunTask, InItsForm):
                 if not plan.add(row) and passing:
                     break
                 passing.append(row)
-            # As many as the plan runs now (`PassPlan.taken`), the rest first in the next pass.
-            passing = passing[:max(plan.taken(), 1)]
-            taken.add(self._shape(passing))
-            waiting = waiting[len(passing):]
+            # Those the plan runs now (`PassPlan.taken`), the first always, the rest first in the next.
+            run = set(plan.taken()) | {0}
+            taken.add(self._shape([row for index, row in enumerate(passing) if index in run]))
+            waiting = [row for index, row in enumerate(waiting) if index not in run]
         return tuple(shape for shape in self.pass_shapes if shape in taken)
 
     @functools.cached_property
@@ -1530,32 +1530,33 @@ class PassPlan:
             self.rows.append(row)
         return bool(held)
 
-    def taken(self) -> int:
-        """How many of its rows, first added first, the pass runs now (`ScoringServer`): all of them, or
-        fewer where the rest in a pass of their own compute fewer tokens. A pass whose rows overrun a
-        declared window count by a little takes the next count whole (the counts are powers of 8): a
-        server's last pass of 512 requests held 29% of its 32 windows' tokens, a fifth of every pass's
-        tokens padding (row 3330); the rows that fill the windows of the count below run now, the rest
-        in a pass of their own shape. Each split is costed by the shapes the two passes would take
-        (`Decide._shape`), the rows kept a prefix, so each request's rows stay in order."""
+    def taken(self) -> tuple[int, ...]:
+        """Which of its rows, by the order they were added, the pass runs now (`ScoringServer`): all of
+        them, or those in the windows of a smaller declared count where they and the rest, in a pass of
+        their own, compute fewer tokens. A pass whose rows overrun a declared window count by a little
+        takes the next count whole (the counts are powers of 8): a server's last pass of 512 requests held
+        29% of its 32 windows' tokens, a fifth of every pass's tokens padding (row 3330); the rows in the
+        windows of the count below run now, the rest in a pass of their own shape, each split costed by
+        the shapes the two passes take (`Decide._shape`)."""
         rows, decide = self.rows, self.decide
+        everything = tuple(range(len(rows)))
         if not rows or not self.alive:
-            return len(rows)
+            return everything
 
-        def cost(part: Sequence[Encoded]) -> int:
-            shape = decide._shape(part)
+        def cost(indices: Sequence[int]) -> int:
+            shape = decide._shape([rows[index] for index in indices])
             return shape.rows * shape.length
 
         length = self.alive[0]
         windows = self.placing[length].windows
-        kept, least = len(rows), cost(rows)
+        kept, least = everything, cost(everything)
         for shape in decide.pass_shapes:
             if shape.length != length or shape.rows > max(windows):
                 continue
-            # The longest prefix whose rows all lie in the count's windows.
-            prefix = next((index for index, window in enumerate(windows) if window >= shape.rows), len(rows))
-            if 0 < prefix < len(rows) and (split := cost(rows[:prefix]) + cost(rows[prefix:])) < least:
-                kept, least = prefix, split
+            inner = tuple(index for index, window in enumerate(windows) if window < shape.rows)
+            rest = tuple(index for index, window in enumerate(windows) if window >= shape.rows)
+            if (split := cost(inner) + cost(rest)) < least:
+                kept, least = inner, split
         return kept
 
     def shape(self) -> PassShape:
@@ -1658,9 +1659,9 @@ class _WirePlan:
         self.seen.append(row)
         return True
 
-    def taken(self) -> int:
+    def taken(self) -> tuple[int, ...]:
         """Its text rows as their plan runs them now (`PassPlan.taken`), or its rows of images, all."""
-        return self.text.taken() if self.texts else len(self.seen)
+        return self.text.taken() if self.texts else tuple(range(len(self.seen)))
 
 
 @dataclass(frozen=True)
