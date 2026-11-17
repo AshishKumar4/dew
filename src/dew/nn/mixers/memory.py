@@ -20,14 +20,25 @@ class InContextMemoryMixer(MixerBase):
 
     memory: InContextMemory
 
-    def fork_refusal(self) -> str | None:
-        """Why the layer reads no forks (`MixerBase.fork_refusal`): no path of the memory continues a
-        fork's document from its parent. On the shared recurrence (`InContextMemory._recurrence`) that
-        is the recurrence's state through the forks' table (`dew.nn.linear.forked_scan`, as lightning's)
-        and the share of W_0 the parent's tokens kept, which no path carries over a fork yet; on the
-        general path each document's weights step from its own start, its chunks counted per document."""
-        return ("an in-context memory continues no fork's document from its parent: neither its recurrence's "
-                "state and W_0 share nor its general path's weights are carried over forks")
+    reads_forks = True
+    """A call's forks, on either path of the memory (`InContextMemory.__call__`): on its shared recurrence
+    (`InContextMemory.recurrent`) each document continues the state its parent's tokens leave, through
+    the forks' table (`dew.nn.linear.forked_scan`, as lightning's), and the share of W_0 they kept; off it
+    each document's chain is unfolded into a row of its own (`InContextMemory._unfolded`)."""
+
+    def fork_sharing_refusal(self, linear: bool) -> str | None:
+        """Why packing rows over their shared prefixes costs the layer more than laying them whole
+        (`MixerBase.fork_sharing_refusal`), None on its shared recurrence where the model's wrappers keep
+        its products `linear`: off it (its configuration's general path, or heads a quantization or an
+        adapter's dropout makes nonlinear, wherever its sites reach them, which only the bound model's
+        scopes tell) the memory unfolds each document's chain into a row of its own, `D` times its work on
+        a packed row of `D` documents, more than the rows laid whole cost it."""
+        if self.memory.recurrent and linear:
+            return None
+        return ("an in-context memory off its shared recurrence (its general path, or under a wrapper whose "
+                "products are not linear) computes a call over forks by unfolding each document's chain into "
+                "a row of its own: D times its work on a packed row of D documents, more than the rows laid "
+                "whole")
 
     def marks(self) -> tuple[str, ...]:
         """The residuals of every path the memory's configuration can take (`InContextMemory.residuals`):

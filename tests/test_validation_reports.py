@@ -10,7 +10,7 @@ from dew.data import Memory
 from dew.data.compile import held
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, MacroF1, ScoredQuestions, decisions
-from dew.decision.layout import Specials, StateFirstLayout
+from dew.decision.layout import SegmentLayout, Specials
 from dew.decision.rows import class_id
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.training.evaluation import Evaluation
@@ -77,7 +77,7 @@ def test_a_pass_writes_every_batchs_decisions_where_asked(tmp_path):
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
                                  max_seq_len=128, attention_impl="xla")
     objective = DecisionObjective(backbone, tokenizer=ByteTokenizer(), specials=SPECIALS,
-                                  layout=StateFirstLayout(max_len=96), shuffle_options=False)
+                                  layout=SegmentLayout.state_first_row(max_len=96), shuffle_options=False)
     question = Choice("Which?", ["red", "green", "blue"])
     colours = ("red", "green", "blue")
     examples = [{"example": Example(f"state {index}", {"q": question}, {"q": colours[index % 3]})}

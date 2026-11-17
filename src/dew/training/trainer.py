@@ -1304,14 +1304,13 @@ class Trainer(Generic[Loss, Effects]):
                        tracer: Profiler | None, profile: ProfileWindow | None,
                        checkpoints: Checkpoints | None,
                        initial: TrainState | None = None, resume: Resume = "auto") -> TrainState:
-        """Place the state, dispatch the numerical steps and finish their loop
-        before resource cleanup. Returns the final state, the placed one for a
-        run already complete, its last checkpoint written, so nothing ran.
+        """Place the state, dispatch the numerical steps and finish their loop before resource cleanup.
+        Returns the final state, the placed one for a run already complete, its last checkpoint written.
 
-        The loop is the state's one holder: each step donates the state it is
-        handed, and a reference kept past that, as fit's own once was, holds
-        an array whose buffers the step consumed."""
-        current, position, placed, abstract, fresh = self._starting(run, plan.dataset, initial, resume)
+        The loop is the state's one holder: each step donates the state it is handed, and a reference
+        kept past that, as fit's own once was, holds an array whose buffers the step consumed."""
+        with run.startup.phase("start", "tracing the state's start"):
+            current, position, placed, abstract, fresh = self._starting(run, plan.dataset, initial, resume)
         run.last_checkpoint = time.perf_counter()
         interval = Interval.resumed(run.stop_control, last_saved=(
             current if checkpoints is not None and checkpoints.latest is not None else None))
@@ -1406,7 +1405,7 @@ class Trainer(Generic[Loss, Effects]):
                 batch = device = None
                 if run.first_step is None:
                     loss.block_until_ready()
-                    run.first_step = time.perf_counter() - run.started
+                    run.first_step = run.startup.first_step(run.started)
             # The step row is complete once its scope exits; the window's last step closes it before the work
             # after it, whose evaluations, saves and cooldowns run outside it (`FitRun.outside_window`).
             if run.tracing and profile is not None:
@@ -1598,20 +1597,23 @@ class Trainer(Generic[Loss, Effects]):
             if self.rollout is None:
                 # Read on the host before the state is placed, and agreed: a process whose read failed
                 # stops its peers before any of them places one. The prefetcher places it at the first step.
-                first = waited_read(run, interval, agree=True, peek=True)
+                with run.startup.phase("read", "reading the first batch"):
+                    first = waited_read(run, interval, agree=True, peek=True)
                 if first is not None:
                     placed_first = placed_abstract(mesh, first)
                     # A process whose reader changed a field or a shape is refused by every process, as
                     # a compile refuses it, before the state it would check is traced from that batch.
                     agreed_same("training batch layout", lambda: batch_layout(split_fields(placed_first)[0]))
-                    self._fitting(abstract, placed_first)
+                    with run.startup.phase("check", "checking the state fits"):
+                        self._fitting(abstract, placed_first)
                     if fresh is not None:
                         begun = self._compiled_fresh(run, fresh, first, placed_first)
             elif position is not None:
                 # Its first batch read, so its worker has restored the stream or started it again
                 # (`_prefetched`), which the run reports as it starts (`DataRestarted`).
                 waited_read(run, interval, agree=True, peek=True)
-        state, shardings = placed(begun)
+        with run.startup.phase("place", "placing the state"):
+            state, shardings = placed(begun)
         if begun is not None:
             run.startup.overlapped = begun.taken.is_set()
         if int(state.step) != current:
@@ -2330,7 +2332,8 @@ class Trainer(Generic[Loss, Effects]):
                 if jax.process_index() == 0:
                     wall = time.perf_counter() - run.started
                     # A run that logged no step reports its start here (`Startup.scalars`).
-                    scalars = {**goodput(wall, run.first_step, run.other), **run.startup.scalars()}
+                    scalars = {**goodput(wall, run.first_step, run.other),
+                               **run.startup.scalars()}
                     self._display.summary(run.current, wall, scalars,
                                           None if run.loss is None else float(jax.device_get(run.loss)))
                     if self.tracker is not None:

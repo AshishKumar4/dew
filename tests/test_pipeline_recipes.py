@@ -10,7 +10,8 @@ from dew.batch import VALID_ROWS
 from dew.data import ByteTokenizer, Loading, Memory, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
-from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout, decisions
+from dew.decision import Choice, DecisionObjective, Example, Specials, decisions
+from dew.decision.layout import SegmentLayout
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
@@ -20,7 +21,7 @@ def _objective():
     return DecisionObjective(
         CausalTransformer(vocab_size=256, emb_features=8, num_layers=1, num_heads=2, mlp_features=16),
         tokenizer=ByteTokenizer(), specials=Specials(0, 1, 2, "<mark>", 3),
-        layout=StateFirstLayout(max_len=128), shuffle_options=True)
+        layout=SegmentLayout.state_first_row(max_len=128), shuffle_options=True)
 
 
 def _rows(batch):

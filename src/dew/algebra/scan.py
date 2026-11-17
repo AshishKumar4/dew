@@ -66,6 +66,10 @@ kernel's segment sums formed as a matmul against a 0/1 triangle stay finite (an 
 thousands of resets in a walk's sum stay far inside fp32's range, and the compensated prefix keeps each
 difference of two partials exact past them."""
 
+Reads = Literal["after", "before"]
+"""Where a scan's readout reads its state (`Scan.reads`): after its token's update, or as it enters."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Scan:
     """A recurrence over its `walked` axis (time): `update(h, **token)` the state after one token,
@@ -91,7 +95,7 @@ class Scan:
     state: tuple[tuple[int, ...], jnp.dtype]
     reset: str | None = None
     ranges: Mapping[str, float | tuple[float, float]] = dataclasses.field(default_factory=dict)
-    reads: Literal["after", "before"] = "after"
+    reads: Reads = "after"
 
 
 def _traced(declaration: Scan, function: Callable, names: tuple[str, ...], chunk: Mapping):
@@ -279,11 +283,17 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
     reaches the one after (row 1966's overflow orders). Each token's parts are formed inside its step
     (`_at_token`), as the token's own update forms them: a factor applied to an operand (a reader's scale,
     a write's gate) then meets the operand's cotangent inside the step, so a second derivative applies it
-    before the step's products, never after them, which near float32's largest overflowed (row 5426)."""
+    before the step's products, never after them, which near float32's largest overflowed (row 5426).
+    The chunk's shared operands (`every`) are laid a copy a token, so their cotangents leave the scan a
+    token each and are summed outside it, as fla sums RWKV6's bonus gradient (chunk_rwkv6's du): closed
+    over, the scan's reverse added them a token at a time in its carry, 1.67 times fla's error from
+    float64."""
     along, every = _walked_tokens(declaration, chunk)
+    count = next(iter(along.values())).shape[0]
+    along.update({name: jnp.broadcast_to(value, (count, *value.shape)) for name, value in every.items()})
 
     def token(h, step):
-        z, b, u, strength, c, q, r = _at_token(declaration, names, affine, {**step, **every})
+        z, b, u, strength, c, q, r = _at_token(declaration, names, affine, step)
         # A token that reads the state entering it (`Scan.reads`) reads it before its decay and its write: a
         # reset's zero, any other's whole, a decay that vanishes at this token erasing nothing it reads.
         entering = None

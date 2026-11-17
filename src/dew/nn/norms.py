@@ -434,8 +434,6 @@ class LayerNorm(nn.remat(_Shifted, policy=jax.checkpoint_policies.nothing_saveab
     residual sums alive (291 MiB of its temporaries on a GH200, row 6741). A caller that states
     `use_fast_variance=False` takes the corrected two-pass, its centered rows centered again."""
 
-    use_fast_variance: bool = True
-
     def spread(self, x: jax.Array) -> jax.Array:
         """Per row, the root mean square of `x` centered, its statistic (`dew.nn.protocols.BoundedNorm`),
         over the last axis it reduces; another reduction is refused."""
@@ -462,8 +460,9 @@ def _gain_of(norm: nn.Module, *, offset: bool) -> jax.Array:
 
 class OffsetLayerNorm(nn.Module):
     """A LayerNorm whose weight is stored as its offset from one, zero at initialization: the input
-    normalized by torch's exact variance in fp32 (flax's `nn.LayerNorm`), times (1 + `scale`), plus
-    `bias` (MaxText's `Gpt3LayerNorm`, maxtext/models/gpt3.py, PaxML's layer norm)."""
+    normalized as `LayerNorm` normalizes it (its rows shifted by their mean, then their mean and mean
+    square in one read), times (1 + `scale`), plus `bias` (MaxText's `Gpt3LayerNorm`,
+    maxtext/models/gpt3.py, PaxML's layer norm)."""
 
     epsilon: float = 1e-5
     use_bias: bool = True

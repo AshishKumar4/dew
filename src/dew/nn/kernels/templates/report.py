@@ -12,11 +12,14 @@ import collections
 import contextlib
 import contextvars
 import dataclasses
+import functools
 import hashlib
+import importlib.metadata
 import importlib.util
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -106,7 +109,7 @@ kernel (3, `CustomKernelProto`), whose loader spec (2) holds its cubin (2, `Cuda
 states the dynamic shared memory its launch asks for (6, `shared_memory_bytes`)."""
 ELF = b"\x7fELF"
 """A cubin's first bytes."""
-REGISTER_COUNT, FRAME_SIZE = 0x2F, 0x11
+REGISTER_COUNT, FRAME_SIZE, MAX_THREADS = 0x2F, 0x11, 0x05
 """A cubin's `.nv.info` attributes for a function's registers a thread and its stack frame's bytes
 (EIATTR_REGCOUNT, EIATTR_FRAME_SIZE), as ptxas states them: its frame holds what its registers spill."""
 
@@ -661,7 +664,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
     `uncertified` names;
     a launch Mosaic refuses as it lowers (a block past its shared memory) raises here as its program's
     lowering would. Once a process, by launch (`certifications`), and once a GPU model a
-    machine: each verdict, an accepted config's and a refused one's, is stored with the kernel picks
+    machine: each verdict, an accepted config's and a refused one's, is stored beside the kernel picks
     (`_verdict_key`), so a warm start traces and compiles nothing to certify."""
     device = _certifying_device()
     if device is None or arguments.arguments.get("interpret"):
@@ -737,13 +740,13 @@ def rung_round() -> int:
 
 
 def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
-    """What decides a launch's certification on a GPU model before it traces, as its stored verdict's key
-    (`tuning.stored_verdict`): the launch's `identity` (`_identity`, the same in every process), its config,
-    whether reverse mode runs it, Dew's code (`package_digest`: a Dew edit certifies again), the installed
-    JAX, jaxlib and CUDA plugins, whose compiler assembles it (the Pallas lowering cache's seal of them), and
-    the environment a kernel's lowering and compile read (that cache's policy); the store's file names the
-    GPU model. None where the installation has no seal (an edited or a source install of JAX), whose code
-    no key states: its verdicts are not stored."""
+    """What decides a launch's certification on a GPU model (the store's file, `tuning.stored_verdict`) before
+    it traces, as its stored verdict's key: the launch's `identity` (`_identity`, the same in every process),
+    its config, whether reverse mode runs it, Dew's code (`package_digest`: a Dew edit certifies again), the
+    installed JAX, jaxlib and CUDA plugins, whose Mosaic GPU and XLA lower and compile it (the Pallas lowering
+    cache's seal of them), the ptxas that assembles it (`_assemblers`), and the environment a kernel's
+    lowering and compile read (that cache's policy). None where the installation has no seal (an edited or a
+    source install of JAX), whose code no key states: its verdicts are not stored."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
@@ -753,8 +756,22 @@ def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
     installed = seal().digest
     if installed is None:
         return None
-    stated = [package_digest(), installed.hex(), identity, encoded(config), reverse, _keyed_environment()]
+    stated = [package_digest(), installed.hex(), _assemblers(), identity, encoded(config), reverse,
+              _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
+
+
+@functools.cache
+def _assemblers() -> list[str]:
+    """The installed distributions holding the ptxas a kernel's PTX is assembled with, CUDA's nvcc wheels
+    (`nvidia-cuda-nvcc`, `nvidia-cuda-nvcc-cu12`), each as `name==version`: a relock that moves one
+    certifies again, where the seal, which holds the CUDA plugins alone, kept a verdict another ptxas
+    judged. A system CUDA's ptxas, outside every wheel, none names (row 7309: the ptxas Mosaic GPU's own
+    assembler names, `_get_assembler`, with its version, once Dew's JAX build states it)."""
+    named = (((distribution.metadata.get("Name") or "").lower(), distribution)
+             for distribution in importlib.metadata.distributions())
+    return sorted(f"{name}=={distribution.version}" for name, distribution in named
+                  if re.fullmatch(r"nvidia-cuda-nvcc(-cu\d+)?", name))
 
 
 def certifications() -> tuple[Certification, ...]:
@@ -856,8 +873,11 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
                                        kernel_bodies(call for call in calls if call.kind == "triton").items()}
     if not modules:
         return {}
-    return {name: (modules[name], binary)
-            for binary in binaries(xla_compiled(lowered, None), spills=True)
+    # Compiled to be read, never run (`read_offline`): its kernels' binaries are what it states, so a prepare
+    # for devices no run has tuned (`for_devices`) certifies as any compile does, its fusions untuned.
+    with read_offline():
+        compiled = xla_compiled(lowered, None)
+    return {name: (modules[name], binary) for binary in binaries(compiled, spills=True)
             if (name := launch_name(binary.kernel, binary.launch)) in modules}
 
 
@@ -988,14 +1008,14 @@ def _commit(proposal: Recorded) -> None:
     _add(rewritten=proposal.rewritten, passes=proposal.passes)
 
 
-def _add(**records: Sequence) -> None:
-    """Each of `records`, a `Recorded` field's entries, added to this context's registry and to every
-    `recording` open in it; a miss once a holder (`_record`), each other record as often as it is made."""
+def _add(*, missed: Sequence["Miss"] = (), rewritten: Sequence = (), passes: Sequence[float] = ()) -> None:
+    """`Recorded` entries added to this context's registry and to every `recording` open in it: a miss once
+    a holder (`_record`), each rewrite and pass as often as it is made."""
     with _GUARD:
         for held in (_registry(), *_RECORDING.get()):
-            for name, entries in records.items():
-                found = getattr(held, name)
-                found.extend(entry for entry in entries if name != "missed" or entry not in found)
+            held.missed.extend(miss for miss in missed if miss not in held.missed)
+            held.rewritten.extend(rewritten)
+            held.passes.extend(passes)
 
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
@@ -1604,6 +1624,14 @@ class Binary:
     """The roles whose code its spill stands in where it spills (`spilled_roles`: `PRODUCER`, `CONSUMERS`),
     read `decoded` or for its `spills` (`binaries`, certification's), none where it spills none; None where
     it was not read, or no disassembler listed it (`disassembler`)."""
+    threads: int | None = None
+    """Its threads a block, as its `.nv.info` states them (`MAX_THREADS`, its PTX's `.maxntid`); None where
+    it states none."""
+    decreased: int | None = None
+    raised: int | None = None
+    """The registers its producer lowers to and its consumers raise to, as its machine code reconfigures
+    them (`reconfigured`: USETMAXREG's deallocation and allocation, its PTX's `setmaxnreg.dec` and `.inc`);
+    None where it reconfigures none that way, or no disassembler read it."""
 
     @property
     def launched(self) -> str | None:
@@ -1770,10 +1798,11 @@ def _kernels(message: bytes, decoded: bool = False, spills: bool = False) -> tup
 
 
 def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = False) -> Binary:
-    """The `Binary` of the kernel `function` from its cubin `elf`: its `.nv.info` attributes' registers and
-    frame (`REGISTER_COUNT`, `FRAME_SIZE`; a Mosaic module compiles one kernel function), `decoded` its
-    SASS findings (`sass_findings`), and where it spills, `decoded` or `spills`, the roles its spill stands
-    in (`spilled_roles`)."""
+    """The `Binary` of the kernel `function` from its cubin `elf`: its `.nv.info` attributes' registers,
+    frame and threads (`REGISTER_COUNT`, `FRAME_SIZE`, `MAX_THREADS`; a Mosaic module compiles one kernel
+    function), `decoded` its SASS findings (`sass_findings_of`), and its register reconfiguration
+    (`reconfigured`) and, where it spills, the roles its spill stands in (`spilled_roles`) wherever its one
+    listing is read (`sass_listing`: `decoded`, or `spills` where it spills)."""
     (sections_at,) = struct.unpack_from("<Q", elf, 0x28)
     entry, count, names = struct.unpack_from("<HHH", elf, 0x3A)
     headers = [struct.unpack_from("<IIQQQQIIQQ", elf, sections_at + index * entry) for index in range(count)]
@@ -1792,6 +1821,9 @@ def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = Fal
                 if attribute in (REGISTER_COUNT, FRAME_SIZE):
                     (value,) = struct.unpack_from("<I", elf, at + 8)
                     stated[attribute] = max(stated.get(attribute, 0), value)
+                elif attribute == MAX_THREADS:
+                    # A function's own section's: its block's three extents, no symbol before them.
+                    stated[attribute] = math.prod(struct.unpack_from("<III", elf, at + 4))
                 at += 4 + length
             else:
                 at += 4
@@ -1799,9 +1831,11 @@ def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = Fal
         raise ValueError(f"the binary of {function} states no registers")
     frame = stated.get(FRAME_SIZE, 0)
     listing = sass_listing(elf) if decoded or (spills and frame) else None
-    return Binary(*kernel_of(function), stated[REGISTER_COUNT], frame,
-                  sass=(None if listing is None else sass_findings_of(listing)) if decoded else (),
-                  spilled_in=(None if listing is None else spilled_roles(listing)) if frame else ())
+    decreased, raised = (None, None) if listing is None else reconfigured(listing)
+    sass = (None if listing is None else sass_findings_of(listing)) if decoded else ()
+    return Binary(*kernel_of(function), stated[REGISTER_COUNT], frame, sass=sass,
+                  spilled_in=(None if listing is None else spilled_roles(listing)) if frame else (),
+                  threads=stated.get(MAX_THREADS), decreased=decreased, raised=raised)
 
 
 def disassembler() -> Path | None:
@@ -1856,6 +1890,19 @@ def spilled_roles(listing: str) -> tuple[str, ...]:
         elif role is not None and opcode.split(".")[0] in ("STL", "LDL"):
             roles.add(role)
     return tuple(sorted(roles))
+
+
+_RECONFIGURED = re.compile(r"\bUSETMAXREG\.(DEALLOC|ALLOC|TRY_ALLOC)\S*\s+(?:UP\d+,\s*)?(0x[0-9a-f]+|\d+)")
+
+
+def reconfigured(listing: str) -> tuple[int | None, int | None]:
+    """The registers a kernel's machine code (nvdisasm's `listing`) lowers its producer to and raises its
+    consumers to: its first USETMAXREG deallocation's and allocation's (a try's too) counts, as its PTX's
+    `setmaxnreg.dec` and `.inc` state them; None for one it makes none of."""
+    found: dict[str, int] = {}
+    for kind, count in _RECONFIGURED.findall(listing):
+        found.setdefault("dec" if kind == "DEALLOC" else "inc", int(count, 0))
+    return found.get("dec"), found.get("inc")
 
 
 _INSTRUCTION = re.compile(r"/\*([0-9a-f]{4,})\*/\s+(.*?)\s*;")

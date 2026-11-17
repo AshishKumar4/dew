@@ -14,7 +14,8 @@ from objective_cases import cases
 from objective_data import corpus_windows
 
 from dew.data.text import ByteTokenizer
-from dew.decision import DecisionObjective, Specials, StateFirstLayout
+from dew.decision import DecisionObjective, Specials
+from dew.decision.layout import SegmentLayout
 from dew.diffusion.discrete import MDLM
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.base import HELD, UNKEYED, Objective, frozen_value, stated_trace
@@ -33,7 +34,7 @@ def deciding(**settings) -> DecisionObjective:
     """A decision objective over a tiny backbone, its rows a state first, read by bytes."""
     backbone = CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, max_seq_len=96)
     specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
-    layout = StateFirstLayout(max_len=96, head_max_len=48, option_tokens=8)
+    layout = SegmentLayout.state_first_row(max_len=96, head_max_len=48, option_tokens=8)
     tokenizer = ByteTokenizer()
     return DecisionObjective(backbone, tokenizer=tokenizer, specials=specials, layout=layout, **settings)
 

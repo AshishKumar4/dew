@@ -33,7 +33,6 @@ from dew.decision import (
     DecisionObjective,
     Encoded,
     Example,
-    JointLayout,
     Noul,
     Question,
     Schema,
@@ -42,7 +41,7 @@ from dew.decision import (
 )
 from dew.decision.calibration import softmax
 from dew.decision.images import Images
-from dew.decision.layout import JOINT_SEGMENTS
+from dew.decision.layout import JOINT_SEGMENTS, SegmentLayout
 from dew.interop import Pretrained
 from dew.nn.kernels import generation
 from dew.training.trainer import Trainer
@@ -130,7 +129,7 @@ def laid_out(tokenizer: HFTokenizer) -> dict[str, tuple[dict[str, Question], Enc
     rows = {}
     for case, request in CASES.items():
         questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
-        [row] = JointLayout().rows(tokenizer, Specials.of(tokenizer), request["state"], questions)
+        [row] = SegmentLayout.joint_row().rows(tokenizer, Specials.of(tokenizer), request["state"], questions)
         rows[case] = questions, row
     return rows
 
@@ -158,7 +157,8 @@ def test_a_joint_schema_read_in_context_is_the_schema_the_row_holds(tokenizer):
                      for segment in JOINT_SEGMENTS)
     for case, (questions, held) in laid_out(tokenizer).items():
         request = CASES[case]
-        [read] = JointLayout(segments=segments).rows(tokenizer, Specials.of(tokenizer), request["state"],
+        [read] = SegmentLayout.joint_row(segments=segments).rows(tokenizer, Specials.of(tokenizer),
+                                                                 request["state"],
                                                     questions)
         assert read.spans_in_context and not held.spans_in_context and read.context is not None
         offset = held.questions[0].span[0] - read.questions[0].span[0]
@@ -381,7 +381,7 @@ def test_a_run_trains_a_loaded_tasks_own_tree_and_a_release_trains_unpacked(tmp_
     own = backbone(Decide.released(bundle).variables)
     task = Decide.from_pretrained(release, attention_impl="xla")
     assert backbone(task.variables) != own
-    trained = DecisionObjective(task, layout=JointLayout(max_len=1024)).init(jax.random.key(0))
+    trained = DecisionObjective(task, layout=SegmentLayout.joint_row(max_len=1024)).init(jax.random.key(0))
     assert backbone(trained) == own
 
 
@@ -405,7 +405,7 @@ def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_pat
     bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
     start = Decide.released(bundle)
     objective = DecisionObjective(replace(start, variables=freeze(start.variables, trains)),
-                                  layout=JointLayout(max_len=1024))
+                                  layout=SegmentLayout.joint_row(max_len=1024))
     team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
     examples = [Example(state, {"team": team}, {"team": label})
                 for state, label in (("charged twice", "billing"), ("site is down", "technical"))] * 4
@@ -432,7 +432,7 @@ def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_pat
     for state_text in ("charged twice!", "is the site down?"):
         found, expected = loaded(state_text, {"team": team}), unsplit(state_text, {"team": team})
         np.testing.assert_array_equal(found["team"].probabilities, expected["team"].probabilities)
-    resumed = DecisionObjective(loaded, layout=JointLayout(max_len=1024)).init(jax.random.key(0))
+    resumed = DecisionObjective(loaded, layout=SegmentLayout.joint_row(max_len=1024)).init(jax.random.key(0))
     for collection in ("params", FROZEN):
         assert jax.tree.structure(resumed[collection]) == jax.tree.structure(state.variables[collection])
 
@@ -464,7 +464,7 @@ def _joint_runs(tmp_path):
     # Training pads every row to the layout's max_len, which holds every row whole; the release serves up
     # to 16384. The runs score no split, which nothing here reads.
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
-                                  layout=JointLayout(max_len=768))
+                                  layout=SegmentLayout.joint_row(max_len=768))
     data = decision_rows(examples, 8, objective=objective.data())
     start = jax.jit(objective.init)(jax.random.key(0))
     runs = [tmp_path / "run0", tmp_path / "run1"]

@@ -32,17 +32,6 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-TRACED_FACTS: dict[str, Callable[[], object]] = {}
-"""Each fact of this process or its host that a trace reads and neither its call's arguments, JAX's trace
-context, the installed code nor Dew's environment variables hold, by where its reader is defined
-(`traced_fact`): what a program kept for another process is held to beside them
-(`dew.training.identity.facts`). The attached devices' own facts, their generation and multiprocessors
-(`device_target`), are no entry here: a kept program's target holds them
-(`dew.training.ahead.BuildTarget`). Nor are the kernel picks stored beside the compilation cache: a
-launch reads them within `dew.nn.kernels.tuning.reading` alone, and a call inside that block has no
-identity (`dew.training.identity`)."""
-
-
 _RECORDINGS: contextvars.ContextVar[tuple[dict[Hashable, tuple[Callable[[], Hashable], Hashable]], ...]] = (
     contextvars.ContextVar("fact_recordings", default=()))
 """The facts read within each open `recording`, innermost last: what a trace records into, no trace reads,
@@ -107,9 +96,8 @@ def traced_fact[**Question, Answer](reader: Callable[Question, Answer]) -> Calla
     presence, a launch config a compile refused), where it is defined: a program compiled under one answer
     is another under the next (a route taken, a kernel refused). Its reader is the fact's one accessor: a
     read records its question and answer into each open `recording`, so a kept trace holds where each answer
-    it read holds (`still`). One taking no question is a fact of the process, by which a process handed
-    programs another kept is refused where any answer differs (`TRACED_FACTS`). A fact read but by its
-    reader is an input no recording holds, a stale trace's."""
+    it read holds (`still`). A fact read but by its reader is an input no recording holds, a stale
+    trace's."""
     name = f"{reader.__module__}.{reader.__qualname__}"
 
     @functools.wraps(reader)
@@ -121,8 +109,6 @@ def traced_fact[**Question, Answer](reader: Callable[Question, Answer]) -> Calla
                 recorded[name, held] = (lambda: stated(reader(*question, **named))), stated(answer)
         return answer
 
-    if not inspect.signature(reader).parameters:
-        TRACED_FACTS[name] = read
     return read
 
 
@@ -1685,8 +1671,8 @@ def cutlass_built() -> dict[str, str | None]:
     dispatches on its compute capability (`dew_cutlass.architecture`, the one statement of it), None for
     one it runs none on or where the wheel is not installed: what CUTLASS's eligibility reads
     (`grouped_matmul.cutlass_built_for`). A call's route reads the wheel's presence and its build, so a
-    program kept without it, or with another build, is not handed to a process that has it (training.md
-    §6); declared here, beside the facts a process's identity states whatever kernels it imported."""
+    program lowered without it, or with another build, is another program, which no executable kept for the
+    first is handed for (training.md §6)."""
     import importlib.util
 
     spec = importlib.util.find_spec('dew_cutlass')
@@ -1696,7 +1682,7 @@ def cutlass_built() -> dict[str, str | None]:
 @functools.cache
 def _cutlass_built_by(origin: str | None) -> dict[str, str | None]:
     """`cutlass_built`'s map for the dew_cutlass found at `origin` (None, none installed): read once a
-    build, as every call's identity reads it."""
+    build."""
     import importlib
 
     capabilities = {name: found for name in sorted(TARGETS) if (found := capability(name)) is not None}

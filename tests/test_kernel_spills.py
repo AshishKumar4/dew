@@ -9,6 +9,7 @@ import dataclasses
 import functools
 import gc
 import os
+import subprocess
 import time
 import weakref
 
@@ -190,19 +191,18 @@ text."""
                                     pytest.param("sm100", marks=lowers("sm100"))])
 def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target):
     """A one-layer decoder of the 4B's gated delta net, its step compiled ahead for a compile-only H100 and a
-    compile-only B200 (`RECURRENT_AHEAD`), twice over one cache: each process lowers the step once.
-    Certification compiles a launch with its outputs live, as a step reads them, so it refuses a spilling
-    config and steps the launch's producer at trace, each rung compiled alone (the B200's output launch steps;
-    the H100's holds at its first rung, its consumers' stated share); and a later process reads the verdicts
-    stored, compiling nothing to certify. Certification that dropped the outputs never compiled the output
-    launch, and the program's compile stepped it down a whole-step relowering a rung, again in every process
-    (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm). Each certification's program is named by its
-    launch, direction and config (`certified_<op>_l<launch>_c<config>[_reverse]`), so a start's events tell
-    its rungs apart: the cold process lowers each once, and the warm one none. Each kernel is lowered afresh
-    once in the cold process: the step's kernels certification lowered are the lowerings it made (a launch's
-    trace held, `tuning.lowered_once`, bound into the step as certification traced it, under the step's own
-    mesh), where the step lowered its kernels again, each a cache miss, 34 of a 4B's 36 kernels on a B200 the
-    ones certification had made (FS-CERTSPLIT4: 27 s of its lowering)."""
+    compile-only B200 (`RECURRENT_AHEAD`), twice over one cache: each process lowers the step once, the cold
+    one certifies each launch's configs once each (whatever its walk takes: a config refused steps the
+    launch's producer down at trace, each rung compiled alone with its outputs live, as a step reads them),
+    and the warm one reads the verdicts stored, certifying nothing. Certification that dropped the outputs
+    never compiled the output launch, and the program's compile stepped it down a whole-step relowering a
+    rung, again in every process (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm). Each
+    certification's program is named by its launch, direction and config
+    (`certified_<op>_l<launch>_c<config>[_reverse]`), so a start's events tell each apart. Each kernel is
+    lowered afresh once in the cold process: the step's kernels certification lowered are the lowerings it
+    made (a launch's trace held, `tuning.lowered_once`, bound into the step as certification traced it,
+    under the step's own mesh), where the step lowered its kernels again, each a cache miss, 34 of a 4B's 36
+    kernels on a B200 the ones certification had made (FS-CERTSPLIT4: 27 s of its lowering)."""
     cache = tmp_path / "cache"
     runs = [fresh(RECURRENT_AHEAD, target, cache_dir=cache) for _ in range(2)]
     cold, warm = (run["events"] for run in runs)
@@ -210,7 +210,7 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target):
     assert len(set(modules)) == len(modules), collections.Counter(modules).most_common(3)
     assert [run.count("jit(step)") for run in (cold, warm)] == [1, 1], (cold, warm)
     certified = [name for name in cold if name.startswith("jit(certified_")]
-    assert len(set(certified)) == len(certified), certified
+    assert certified and len(set(certified)) == len(certified), certified
     assert not [name for name in warm if name.startswith("jit(certified_")], warm
 
 
@@ -1173,3 +1173,40 @@ def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read
     (found,) = kc.reports({}, [unread])
     assert "machine code" in found.unread
     assert found.failure(232448, 0) is not None
+
+
+RECONFIGURING_PTX = """
+.version 8.8
+.target sm_90a
+.address_size 64
+
+.visible .entry reconfiguring() .maxntid 384, 1, 1 .maxnreg 168
+{
+	.reg .b32 %r<2>;
+	.reg .pred %p<2>;
+	mov.u32 %r1, %tid.x;
+	setp.lt.u32 %p1, %r1, 128;
+	@%p1 bra PRODUCER;
+	setmaxnreg.inc.sync.aligned.u32 232;
+	ret;
+PRODUCER:
+	setmaxnreg.dec.sync.aligned.u32 40;
+	ret;
+}
+"""
+
+
+def test_a_binary_states_its_threads_and_the_registers_its_roles_reconfigure_to(tmp_path):
+    """A kernel of 384 threads whose producer lowers to 40 registers and whose consumers raise to 232
+    (`setmaxnreg`), assembled for an H100 by the gate's ptxas (`kernel_compile.assemblers`): its binary
+    (`report._binary`, decoded) states its threads from its `.nv.info` and the two counts from its machine
+    code (USETMAXREG), the facts the compile gate reads where no PTX of a kernel was dumped (row 7105)."""
+    from kernel_compile import assemblers
+
+    source = tmp_path / "reconfiguring.ptx"
+    source.write_text(RECONFIGURING_PTX)
+    cubin = tmp_path / "reconfiguring.cubin"
+    subprocess.run([str(assemblers("sm90")[0]), "-arch=sm_90a", str(source), "-o", str(cubin)], check=True)
+    binary = report._binary("reconfiguring", cubin.read_bytes(), decoded=True)
+    assert (binary.threads, binary.decreased, binary.raised) == (384, 40, 232), binary
+
