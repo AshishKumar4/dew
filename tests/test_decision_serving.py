@@ -395,17 +395,23 @@ def test_a_tasks_scorings_hold_one_plan(decide):
 
 
 def test_a_scoring_pass_looks_at_every_waiting_request(decide):
-    """A pass takes rows from every waiting request while its plan takes them, not from a bounded few: a
-    hundred short requests one pass's windows hold are answered in one step, where a pass of 64 requests
-    at most left the rest to a second, its windows part empty (ledger 2514)."""
+    """A pass takes rows from every waiting request while its plan takes them, not from a bounded few: more
+    than 64 short requests that fill a declared count's windows are answered in one step, where a pass of
+    64 requests at most left the rest to a second, its windows part empty (ledger 2514)."""
     from dew.decision import Question
 
     single = {**REQUEST, "questions": dict(list(REQUEST["questions"].items())[:1])}
     questions = {name: Question.from_wire(wire) for name, wire in single["questions"].items()}
-    plan = decide.planned()
-    assert all(plan.add(row) for _ in range(100) for row in decide._encoded(single["state"], questions))
+    counts = {shape.rows for shape in decide.pass_shapes}
+    # The most requests whose rows fill a declared count's windows (more than 64), the next opening another.
+    plan, filling, requests = decide.planned(), {}, 0
+    while not (requests > 64 and max(plan.windows()) in counts and filling.get(max(plan.windows()), 0) > 64):
+        assert all(plan.add(row) for row in decide._encoded(single["state"], questions))
+        requests += 1
+        filling[max(plan.windows()) + 1] = requests
+    whole = filling[max(plan.windows())]
     server = ScoringServer(*decide.scoring())
-    futures = [server.submit(single) for _ in range(100)]
+    futures = [server.submit(single) for _ in range(whole)]
     server.step()
     assert all(future.done() for future in futures)
 
