@@ -141,7 +141,7 @@ import time
 import tomllib
 import xml.etree.ElementTree as ET
 from collections import Counter
-from collections.abc import Container, Mapping, Sequence
+from collections.abc import Container, Iterable, Mapping, Sequence
 from pathlib import Path
 
 
@@ -2058,9 +2058,10 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
                 "name": row(python, file, varied(group, variant)), "exitCode": 1, "seconds": 0.0, "tests": {},
                 "output": "not prepared: its lane's prepare had no time left for it"}]}))
             return 0
-        return tested(python, [file], group, verdict, mine, "off", session.GRACE, "",
-                      {**PREPARING, "OMP_NUM_THREADS": threads, **(VARIANTS[variant][1] if variant else {}),
-                       **asked_environment(asked)}, recorded=False, variant=variant)
+        environment = {**PREPARING, "OMP_NUM_THREADS": threads, UNIT: name,
+                       **(VARIANTS[variant][1] if variant else {}), **asked_environment(asked)}
+        return tested(python, [file], group, verdict, mine, "off", session.GRACE, "", environment,
+                      recorded=False, variant=variant)
 
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
         for done in [pool.submit(prepared, name, verdict) for name, verdict in verdicts.items()]:
@@ -2068,6 +2069,60 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
     out.write_text(json.dumps({"rows": [row_ for verdict in verdicts.values()
                                         for row_ in json.loads(verdict.read_text())["rows"]]}))
     return 0
+
+
+UNIT = "DEW_TIER_UNIT"
+"""The lane unit a prepare's process prepares (`gpu_prepared`): its file, or `<file>#G/N`, as the lane names
+it, so its flows file their programs' memory under it (`prepared_needs`)."""
+NEEDS = "needs"
+"""Under the tier's store (DEW_TIER_TRUTHS), each prepared unit's programs' memory, in bytes:
+`<sha256(unit)[:16]>.json`, holding `{"unit": UNIT, "programs": [{"resident", "beside", "temporaries"}, ...]}`
+(tests/model_flows.py)."""
+NEEDED = """import json, sys
+import jax
+from dew.training.memory import needed
+device = jax.local_devices()[0]
+units = json.load(sys.stdin)
+print(json.dumps({name: max(needed(device, p["resident"], p["beside"], p["temporaries"]) for p in programs)
+                  for name, programs in units.items()}))
+"""
+"""Each unit's least pool, by Dew's own admission (dew.training.memory `needed`, the inverse of `admitted`) of
+the most demanding of its programs on this GPU, its allocator's stranding counted: one accounting, the one the
+planner trusts (Main, 2026-11-17)."""
+
+
+def prepared_programs(names: Iterable[str]) -> dict[str, list[dict]]:
+    """The programs' memory each of `names` filed at its prepare (`NEEDS`), by unit; none where the tier's
+    store names none, or the unit filed nothing."""
+    store = os.environ.get("DEW_TIER_TRUTHS")
+    if not store:
+        return {}
+    found = {}
+    for name in names:
+        path = Path(store) / NEEDS / f"{hashlib.sha256(name.encode()).hexdigest()[:16]}.json"
+        if path.is_file() and (filed := json.loads(path.read_text()))["unit"] == name and filed["programs"]:
+            found[name] = filed["programs"]
+    return found
+
+
+def prepared_needs(python: str, names: Iterable[str]) -> dict[str, float]:
+    """Each of `names`' least pool in bytes by Dew's admission of the programs it filed at its prepare
+    (`NEEDED`), read on this GPU in a process of the lane's environment that takes no pool (its allocator
+    grows): a part's float64 truths, which no measured run of it held, are admitted before they run
+    (2026-11-17: two flows' 1.71 GiB terms walk beside 1.1 GiB of arms ran out of a 2.84 GiB share). None
+    where none filed, or Dew could not read them, which the lane says: their measured shares stand."""
+    programs = prepared_programs(names)
+    if not programs:
+        return {}
+    path = os.pathsep.join(filter(None, ("src", os.environ.get("PYTHONPATH"))))
+    read = subprocess.run([f".venv-{python}/bin/python", "-c", NEEDED], input=json.dumps(programs),
+                          capture_output=True, text=True, check=False,
+                          env={**os.environ, "PYTHONPATH": path, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"})
+    if read.returncode != 0:
+        print(f"the prepared programs' memory could not be admitted ({read.stderr.strip()[-600:]}): "
+              "their units run on their measured shares", file=sys.stderr)
+        return {}
+    return {name: float(need) for name, need in json.loads(read.stdout).items()}
 
 
 def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str,
@@ -2175,8 +2230,11 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
 
     measures = lane_measures(python, units, held, token)
     needed = {name: gpu_needs(measures[name], budget) for name in tests}
-    shares = {name: share for name, (share, _) in needed.items()}
-    holds = {name: held for name, (_, held) in needed.items()}
+    # A unit's share no less than Dew's admission of the programs its prepare compiled (`prepared_needs`), and
+    # what it holds with it.
+    prepared = prepared_needs(python, tests)
+    shares = {name: min(max(share, prepared.get(name, 0.0)), budget) for name, (share, _) in needed.items()}
+    holds = {name: max(held, shares[name]) for name, (_, held) in needed.items()}
     # A file measured holding more than the lane's share is given all of it, and its row says so: what it
     # was admitted at is the lane's reservation, not its need (2026-11-10: a 5.9 GiB need given a 4 GiB lane
     # without a word, and its run out of memory read as the test's).
@@ -2184,6 +2242,9 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                    f"{need / 2 ** 30:.1f} GiB"
              for name in tests
              if math.isfinite(need := gpu_needs(measures[name], math.inf)[1]) and need > budget}
+    short |= {name: f"admitted at {budget / 2 ** 30:.1f} GiB, below the {need / 2 ** 30:.2f} GiB its "
+                    "prepared programs need"
+              for name, need in prepared.items() if need > budget and name not in short}
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = lane_inputs(python)
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
