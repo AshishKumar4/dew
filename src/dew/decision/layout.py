@@ -211,6 +211,9 @@ class Encoded:
     context: tuple[int, ...] | None = None
     """The tokens of the context the row reads beside its state, through a backbone's
     cross-attention, or None for none."""
+    context_cut: int = 0
+    """The tokens of its example's or request's context that a schema in the row's context left no room
+    for (`with_context`), its first tokens read after the schema."""
     spans_in_context: bool = False
     """Whether the questions' spans are positions in the context, which holds the schema
     (`Schema.stream`), rather than in the row."""
@@ -235,12 +238,13 @@ class Encoded:
     @property
     def cuts(self) -> dict[str, int]:
         """The tokens each cut removed from the row, by what it cut (`instructions`, `options`,
-        `state`), or the characters of a state its row encodes whole (`state_characters`), and
-        `options_alike` where its options' cut left two alike; empty where the row holds its state and
-        its questions whole. Training counts them in
+        `state`, `context` beside a schema in the row's context), or the characters of a state its row
+        encodes whole (`state_characters`), and `options_alike` where its options' cut left two alike;
+        empty where the row holds its state and its questions whole. Training counts them in
         its data counters and a server in its own (`dew.data.mixing.CorpusCounts`), alike."""
         kinds = (("instructions", self.instructions_cut), ("options", self.options_cut),
-                 ("state", self.state_cut), ("state_characters", self.state_characters_cut))
+                 ("state", self.state_cut), ("state_characters", self.state_characters_cut),
+                 ("context", self.context_cut))
         found = {kind: tokens for kind, tokens in kinds if tokens}
         # A row whose cut left two options alike counts once, an event that removes nothing beside the
         # tokens its options lost (`cut_unit`).
@@ -332,49 +336,48 @@ def render(value: JSON) -> str:
             return json.dumps(value, ensure_ascii=False)
 
 
-def context_tokens(tokenizer: Tokenizer, context: JSON | None, length: int | None) -> np.ndarray:
-    """A context's tokens as a row carries them: its text's (`render`), without specials, and none for
-    no context. A context of more than `length` tokens, which the cross-attention reads no more of,
-    is refused (ValueError), never cut: a cut would answer from part of what the caller gave; None
-    reads it whole, as a count of a context no cross-attention reads does."""
+def context_tokens(tokenizer: Tokenizer, context: JSON | None) -> np.ndarray:
+    """A context's tokens, whole, as a row reads them: its text's (`render`), without specials, and none
+    for no context. A row keeps those its cross-attention has room for (`with_context`)."""
     if context is None:
         return np.zeros(0, np.int32)
-    tokens = rendered_chunks([Chunk(render(context))], tokenizer, "pieces").tokens
-    if length is not None and len(tokens) > length:
-        raise ValueError(f"the context is {len(tokens)} tokens, more than the {length} its cross-attention "
-                         "reads (context_length)")
-    return np.asarray(tokens, np.int32)
+    return np.asarray(rendered_chunks([Chunk(render(context))], tokenizer, "pieces").tokens, np.int32)
 
 
 def with_context(rows: Sequence[Encoded], tokenizer: Tokenizer, context: JSON | None,
                  length: int | None) -> list[Encoded]:
     """`rows` with the context a backbone's cross-attention of `length` context tokens reads beside
     each (None: a backbone with none): a schema laid out as the rows' context (`Schema.stream`), read
-    whole, or else `context`, a request's own, its first `length` tokens (`context_tokens`). The one
-    resolution of a row's context, which a run's encoding and a task's admission both read. Refused
-    (ValueError): a request's context beside a schema read as the context, a context with no
-    cross-attention to read it, and a schema longer than `length`."""
+    whole, then `context`, a request's or an example's own, in the room the schema leaves, or `length`
+    where no schema is; of a context longer than its room its first tokens, the rest cut and counted
+    (`Encoded.context_cut`, a `context` cut a run's data report counts and a served answer states). The
+    one resolution of a row's context, which a run's encoding and a task's admission both read. Refused
+    (ValueError): a context with no cross-attention to read it, and a schema longer than `length`."""
     if any(row.spans_in_context for row in rows):
-        if context is not None:
-            raise ValueError("a request's context and a schema read as the row's context are one context "
-                             "too many; a layout that reads the schema in context reads no other context")
         if length is None:
             raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
                              "layers to read it (Pretrained.with_cross_attention)")
+        given = context_tokens(tokenizer, context)
+        beside = []
         for row in rows:
             if row.context is None:
                 raise ValueError("a row whose questions are laid out in its context carries no context")
             if len(row.context) > length:
                 raise ValueError(f"the schema needs {len(row.context)} context tokens, more than the "
                                  f"{length} the backbone's cross-attention reads")
-        return list(rows)
+            # The schema first, so its spans stand where it laid them; the context in the room it leaves.
+            kept = given[:length - len(row.context)]
+            beside.append(dataclasses.replace(row, context=(*row.context, *kept.tolist()),
+                                              context_cut=len(given) - len(kept)))
+        return beside
     if context is None:
         return list(rows)
     if length is None:
         raise ValueError("a request's context is read by a backbone's cross-attention, which this "
                          "backbone does not have")
-    tokens = tuple(context_tokens(tokenizer, context, length).tolist())
-    return [dataclasses.replace(row, context=tokens) for row in rows]
+    given = context_tokens(tokenizer, context)
+    kept = tuple(given[:length].tolist())
+    return [dataclasses.replace(row, context=kept, context_cut=len(given) - len(kept)) for row in rows]
 
 def _conversation(state: JSON) -> bool:
     """Whether `state` is a conversation, a list of turns, which keeps its newest turns (Laya's agent)."""
