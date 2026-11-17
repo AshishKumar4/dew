@@ -1355,9 +1355,9 @@ TPU_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
                 lambda case: f"jax's TPU paged attention blocks its outputs in 128-lane tiles, which a "
                              f"{case.head_dim}-wide head does not fill (Pallas TPU's block rule, row 7228)",
                 row=INHERENT),
-    Requirement('mixed_highest',
+    Requirement('fp32_by_bf16_precise',
                 lambda case: (jax.config.jax_default_matmul_precision not in ('highest', 'float32')
-                              or generation.gpu_target().mixed_highest),
+                              or generation.gpu_target().fp32_by_bf16_precise),
                 "the TPU's MXU takes no fp32-precision product of the kernel's fp32 weights with its bf16 "
                 "values, which a default matmul precision of 'highest' asks of it (a v5e, row 6994)",
                 row=INHERENT),
