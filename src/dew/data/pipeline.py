@@ -8,6 +8,7 @@ import io
 import itertools
 import math
 import pickle
+import sys
 import time
 import types
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -757,16 +758,17 @@ def _main_named(step: _Step) -> list[str]:
 
 
 def _main_importable() -> bool:
-    """Whether a process started afresh imports this one's `__main__` (by its file or its module's name, as
-    `multiprocessing.spawn` prepares a child), which a notebook, `python -c` and a package's `__main__`
-    run with `-m` give it none of. A name defined only under `if __name__ == "__main__":` passes here and
-    fails the read as its process dies (`dew.data.concurrent._Processes`)."""
-    import multiprocessing.spawn
-
-    prepared = multiprocessing.spawn.get_preparation_data("dew")
-    # A main run as a package's `__main__` (`python -m package`) is one spawn does not import again.
-    named = str(prepared.get("init_main_from_name", "__main__"))
-    return "init_main_from_path" in prepared or not (named == "__main__" or named.endswith(".__main__"))
+    """Whether a process started afresh imports this one's `__main__`, as `multiprocessing.spawn` prepares a
+    child: by its module's name where it has one, but a package's `__main__` (run with `-m`), which spawn
+    does not import again, else by its file, which a notebook and `python -c` have none of. Read without
+    asking spawn, which would fix the process's start method (train 977's review). A name defined only
+    under `if __name__ == "__main__":` passes here and fails the read as its process dies
+    (`dew.data.concurrent._Processes`)."""
+    main = vars(sys.modules["__main__"])
+    spec = main.get("__spec__")
+    if spec is not None:
+        return not (spec.name == "__main__" or spec.name.endswith(".__main__"))
+    return main.get("__file__") is not None
 
 
 def examples_bound(stages: Sequence[object]) -> int | None:

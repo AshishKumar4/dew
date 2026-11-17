@@ -846,7 +846,9 @@ def test_a_process_stage_hands_each_process_its_step_once():
     assert all(int(row["pid"]) != os.getpid() for row in rows)
 
 
-DECLARED_IN_MAIN = """from dew.data.pipeline import Pipeline
+DECLARED_IN_MAIN = """import multiprocessing
+
+from dew.data.pipeline import Pipeline
 from dew.data.sources import Memory
 
 
@@ -860,6 +862,9 @@ except ValueError:
     print("refused")
 Pipeline(Memory([{"id": 0}])).map(step, pool="threads")
 print("threads")
+# The declaration fixed no start method, which the process may still choose.
+multiprocessing.set_start_method("spawn")
+print("chosen")
 """
 
 DIES = """import os
@@ -895,11 +900,12 @@ def test_a_process_stage_no_process_can_rebuild_is_refused_and_a_lost_record_rai
     """A step defined in a `__main__` no process started afresh can import (`python -c`, a notebook's cell)
     is refused on processes as it is declared, and read on threads; and a record whose process dies raises
     in the read, never waits. Such a step passed the declaration, its process died unpickling it and the
-    read waited forever (train 967's review, F1)."""
+    read waited forever (train 967's review, F1); and the declaration leaves the process's start method
+    unchosen, which asking spawn chose (train 977's review, F3)."""
     declared = subprocess.run([sys.executable, "-c", DECLARED_IN_MAIN], capture_output=True, text=True,
                               check=False, timeout=300)
     assert declared.returncode == 0, declared.stderr[-3000:]
-    assert declared.stdout.split() == ["refused", "threads"]
+    assert declared.stdout.split() == ["refused", "threads", "chosen"]
     (tmp_path / "dying.py").write_text(DIES)
     read = subprocess.run([sys.executable, "-c", READ_DYING, str(tmp_path)], capture_output=True, text=True,
                           check=False, timeout=300)
