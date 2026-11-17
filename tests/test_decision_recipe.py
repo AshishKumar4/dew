@@ -1031,20 +1031,24 @@ def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():
 
 
 def test_every_head_that_reads_the_base_resumes_a_decision_run_held_as_shapes_to_its_end(tmp_path):
-    """Each head a decision run draws by reading its base (the joint schema head its vocabulary table, the
-    letter readout its output rows, tied and untied) trains a run to half its steps (`Pause`) and resumes
-    it to its end, through `RunConfig.run`. A resume holds its base as shapes, and the draw its optimizer
+    """Each head a decision run of a tiny decoder draws by reading its base (the joint schema head its
+    vocabulary table, the letter readout its output rows, tied and untied) trains to half its steps
+    (`Pause`) and resumes it to its end, through `RunConfig.run`. A resume holds its base as shapes, and
+    the draw its optimizer
     groups read (`Objective.fresh_trained`, `abstract`) handed a head's start the structs themselves, so
     the joint schema run stopped before its first resumed step (a head's start took `.T` of a
     `jax.ShapeDtypeStruct`)."""
-    from run_kinds import decision
+    from run_kinds import lettered
 
-    from dew.decision.config import JointShape, Letters
+    from dew.decision.config import JointShape
     from dew.training import Pause
 
+    # A tiny causal decoder's run (`run_kinds.lettered`), its letters each one token of its tokenizer bare.
+    base = lettered(tmp_path, drawn=False)
+    assert base.head is not None
     for name, head in (("joint", JointShape(width=16, routing_layers=1, layers=1, heads=2, feedforward=32)),
-                       ("letters", Letters(count=4)), ("untied", Letters(count=4, untied=True))):
-        run = dataclasses.replace(decision(tmp_path, drawn=False), head=head, calibrate=False)
+                       ("letters", base.head), ("untied", dataclasses.replace(base.head, untied=True))):
+        run = dataclasses.replace(base, head=head, calibrate=False)
         trainer = dataclasses.replace(run.trainer, name=name, checkpoint_dir=str(tmp_path / "runs"), steps=4,
                                       checkpoint_every=1, eval_every=None, log_every=1, multi_host=False,
                                       compilation_cache_dir=None, stop=Pause(0.5))
