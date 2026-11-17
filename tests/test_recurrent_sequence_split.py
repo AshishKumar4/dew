@@ -8,10 +8,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import as_given, assert_as_exact, widened
-from sequence_split_support import SPLIT_BATCH, SPLIT_ROWS, assert_split_as_whole
+from sequence_split_support import SPLIT_BATCH, SPLIT_ROWS, assert_decodes_as_whole, assert_split_as_whole
 
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.linear import GatedDeltaNet, held_conv1d, over_sequence, sequence_conv, sequence_halo
+from dew.nn.mixers.mamba import Mamba
+from dew.nn.mixers.mamba2 import Mamba2
 from dew.training import MeshSpec
 
 WIDTH = 32
@@ -42,6 +44,31 @@ def test_a_delta_rule_split_over_the_sequence_runs_its_rows_as_whole_ones(name, 
     variables = jax.tree.map(lambda leaf: np.asarray(leaf), module.init(jax.random.key(7), hidden))
     assert_split_as_whole(module, variables, row, SEEDS[row], f"{name} split over the sequence, {row}",
                           width=WIDTH)
+
+
+DECODE_MIXERS = {
+    **MIXERS,
+    "mamba": Mamba(emb_features=WIDTH, intermediate_size=16, state_size=4, time_step_rank=2, chunk_size=4),
+    "mamba2": Mamba2(emb_features=WIDTH, num_heads=4, head_dim=8, state_size=8, n_groups=1, chunk_size=4,
+                     dtype=jnp.float32),
+}
+"""The recurrent mixers that split a training call over the sequence (`linear.sequence_split`)."""
+
+DECODE_SEEDS = 32
+"""Each mixer's declared draws for its decode under the axis."""
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", sorted(DECODE_MIXERS))
+def test_a_recurrent_mixer_decodes_under_a_sequence_axis_as_on_one_device(name):
+    """Under a sequence axis of 4, a decode call runs whole, its state replicated over the axis: one token a
+    row holds no sequence to split (`linear.sequence_split`, row 7400). A prefill and the steps after it
+    decode as on one device (`assert_decodes_as_whole`), where the mixer refused the call."""
+    module = DECODE_MIXERS[name]
+    hidden = jnp.zeros((1, 8, WIDTH), jnp.float32)
+    variables = jax.tree.map(np.asarray, module.init(jax.random.key(7), hidden))
+    assert_decodes_as_whole(module, variables, DECODE_SEEDS, f"{name} decoded under a sequence axis",
+                            width=WIDTH)
 
 
 CONV_SEEDS = 96

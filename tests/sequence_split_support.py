@@ -80,3 +80,36 @@ def assert_split_as_whole(module, variables, row: str, seeds: int, site: str, *,
     assert_as_exact(split, lambda hidden, cotangent: whole(variables, hidden, cotangent), draw, site,
                     seeds=seeds, truth_fn=truth)
     assert not np.any(np.asarray(split(*draw(0))[0])[:, ~valid])
+
+
+def assert_decodes_as_whole(module, variables, seeds: int, site: str, *, width: int, shards: int = 4,
+                            prefill: int = 5, length: int = 8):
+    """Under a sequence axis of `shards`, `module` with `variables` decodes as it decodes on one device: a
+    prefill of `prefill` tokens through its cache, then one token a step to `length`, the call run whole with
+    its state replicated over the axis (`linear.sequence_split`). Every step's output is check 1's against
+    the same decode on one device, from float64, over `seeds` draws of hidden states `width` wide."""
+    from model_support import decode_through
+
+    def draw(seed):
+        rng = np.random.default_rng([0xDEC, seed])
+        return (rng.standard_normal((2, length, width)).astype(np.float32),)
+
+    def decoded(model, params):
+        return jax.jit(lambda hidden: decode_through(model, params, hidden, prefill)[0])
+
+    whole = decoded(module, variables)
+    mesh = MeshSpec(sequence=shards).build(jax.devices()[:shards])
+
+    @as_given
+    def split(hidden):
+        with jax.set_mesh(mesh):
+            return whole(hidden)
+
+    @as_given
+    def truth(hidden):
+        with jax.enable_x64(new_val=True):
+            params, wide_hidden = widened((variables, hidden))
+            return decoded(module.clone(dtype=jnp.float64), params)(wide_hidden)
+
+    assert_as_exact(split, lambda hidden: whole(hidden), draw, site, seeds=seeds, truth_fn=truth)
+
