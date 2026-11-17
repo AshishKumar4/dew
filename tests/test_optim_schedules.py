@@ -187,11 +187,14 @@ def unpooled_clip(tau: float) -> optax.GradientTransformationExtraArgs:
         lambda updates, state, params=None, **extra: (updates, state))
 
 
-def test_a_run_saved_before_the_clip_pooled_its_maxima_resumes_and_steps_on(tmp_path):
+@pytest.mark.parametrize("groups", [None, 2], ids=["one copy", "diloco"])
+def test_a_run_saved_before_the_clip_pooled_its_maxima_resumes_and_steps_on(tmp_path, groups):
     """A checkpoint whose QK-Clip state holds no pooled maxima, as one saved before the state held them,
     restores into a run of this Dew through the translation at the restore boundary
     (`dew.checkpoints._clip_pooled_unsaved`: no microstep held back, zero) and steps on, its clip taking
-    part in the update it resumes with."""
+    part in the update it resumes with: a run's own, and a DiLoCo run's groups' inner one under its outer
+    SGD, whose resume was refused, its inner pooled maxima missing (the morning audit of 2026-11-17,
+    PRODUCT-AM-02)."""
     from dew.checkpoints import Checkpoints
     from dew.data import Memory
     from dew.data.pipeline import Pipeline
@@ -207,17 +210,21 @@ def test_a_run_saved_before_the_clip_pooled_its_maxima_resumes_and_steps_on(tmp_
     data = Pipeline(Memory({"text": text})).repeat().batch(rows)
 
     def fit(clip, steps):
+        from dew.training import DiLoCo, MeshSpec
+
         checkpoints = Checkpoints(str(tmp_path))
         chain = optax.named_chain(("sgd", optax.sgd(1e-2)), ("z_clip", clip))
-        state = Trainer(LMObjective(model, seq_len=7), chain, key=jax.random.key(0),
-                        checkpoints=checkpoints).fit(data, steps=steps, checkpoint_every=1)
+        grouped = {} if groups is None else {"mesh": MeshSpec(diloco=groups).build(jax.devices()[:groups]),
+                                             "diloco": DiLoCo(every=2)}
+        state = Trainer(LMObjective(model, seq_len=7), chain, key=jax.random.key(0), checkpoints=checkpoints,
+                        **grouped).fit(data, steps=steps, checkpoint_every=1)
         checkpoints.wait()
         return state
 
     fit(unpooled_clip(100.0), 1)
     resumed = fit(scale_by_qk_clip(100.0), 2)
-    clip = resumed.opt_state["z_clip"]
-    assert int(resumed.step) == 2 and int(clip.steps) == 1
+    clip = (resumed.opt_state if groups is None else resumed.inner.opt_state)["z_clip"]
+    assert int(resumed.step) == 2 and np.all(np.asarray(clip.steps) == 1)
     assert all(np.all(np.asarray(pooled) == 0) for pooled in clip.pooled.values())
 
 
