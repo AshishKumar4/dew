@@ -1404,7 +1404,10 @@ def _drawn_order(build: _Build, pipeline: Pipeline) -> Callable[[int], tuple[str
     """The twin of draws of the global order a training read of `pipeline` by `build` counts its records in
     (`_Build.batch_order`), by index: the corpus and the place its `index`th record was drawn at,
     where the corpus's chain first repeats (`place_of`); batched and through the stages after its batch
-    that hold a place in it as its batches are (`_Build.placed`), each record its batch's."""
+    that hold a place in it as its batches are (`_Build.placed`), each record its batch's. The twin is no
+    run's training read, so automatic loading reads it in the process (`Loading.unsized`), as a phase's
+    build is handed it before a read sizes its workers."""
+    build = dataclasses.replace(build, loading=build.loading.unsized())
     places = _drawn_records(build, pipeline)
     if build.lowering.rooted:
         places = _repeated(places, None, _name(pipeline), build.loading)
