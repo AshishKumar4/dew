@@ -841,3 +841,16 @@ def node_count(graph: EGraph) -> int:
     """The rows of every table of `graph`, its nodes and its facts' (egglog states no node count of its
     own)."""
     return sum(size for _, size in graph.all_function_sizes())
+
+
+def priced(closed: jcore.Jaxpr, target) -> cost.Seconds:
+    """`closed` as XLA's fusion runs it on `target`: its equations' terms (`terms.region`) in their e-graph
+    (`graphed`), extracted greedily at XLA's schedule (`cost.fused`), which on a graph no rule rewrote is the
+    program as written, each shared value priced once: its leaves' bytes read, its reductions and products
+    each a kernel, its elementwise and special-function work per element (`cost.work`). The one price the
+    algebra gives an XLA program it does not rewrite (a fused GEMM's prologue sides, `fused_gemm.priced`);
+    its `Seconds`, whose work no rate of `target` prices its schedule tells (`Schedule.unpriced`)."""
+    region = terms.region(closed)
+    graph, bundle, _ = graphed(region)
+    return extract.cheapest(graph, bundle, cost.model(region, cost.fused(target)))[1]
+
