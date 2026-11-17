@@ -1,6 +1,6 @@
 """The arithmetic a check's arms and truths run in (tests/reference_error.py): the scope each arm runs in
-(`summed_as_run`), the programs a reference and a truth run (`unrewritten`), the float64 truth's inputs
-(`widened`) and its compiled program (`Truth`)."""
+(`summed_as_run`), the programs a reference and a truth run (`unrewritten`), the device a float64 truth
+computes on (`float64_host`), its inputs (`widened`) and its compiled program (`Truth`)."""
 
 import contextlib
 
@@ -13,15 +13,47 @@ from dew.nn import programs
 from dew.nn.precision import FP32_SUMS
 
 
+def float64_host() -> jax.Device | None:
+    """The device this process's float64 truths compute on where its accelerators only emulate float64: a
+    TPU's host CPU. A TPU keeps float64 as a dtype but computes it as pairs of float32s, within float32's
+    range (1/3 is 0.33333333333333304 on a v5e), so a truth there is no float64's: a splash cell's dV truth
+    gave every seed's error NaN, its arms finite (row 7226). None elsewhere, where float64 runs where its
+    values lie: a GPU's FP64 units, a CPU's."""
+    return jax.devices("cpu")[0] if jax.default_backend() == "tpu" else None
+
+
+def on_float64_device():
+    """The scope a float64 truth, its terms or its evaluation computes in: on `float64_host` where one is
+    named (a TPU's process), every array it makes placed there; else where its values lie. Check 2's
+    certification of native kernels (`certified`) runs on the lane's own device, outside it."""
+    host = float64_host()
+    return contextlib.nullcontext() if host is None else jax.default_device(host)
+
+
+def on_float64_host(tree):
+    """`tree`'s arrays put on `float64_host` where one is named (a truth's inputs and the constants its
+    program holds, so it computes there whatever device made them), as they are elsewhere."""
+    host = float64_host()
+    if host is None:
+        return tree
+    with jax.enable_x64(new_val=True):
+        def put(leaf):
+            return jax.device_put(leaf, host) if isinstance(leaf, (jax.Array, np.ndarray)) else leaf
+
+        return jax.tree.map(put, tree)
+
+
 def widened(tree):
     """`tree` in float64, its complex leaves in complex128 and its integer leaves as they are: the inputs
     of a float64 truth. A leaf an accelerator holds is widened where it lies, so its truth runs on that
     device's FP64 units with no host round trip (a decode step's keys and values, a hundred megabytes a
-    draw to the host and back); any other is a host array."""
+    draw to the host and back); any other is a host array, as is every leaf on a process whose float64
+    computes on its host (`float64_host`, a TPU's): a truth computes there (`on_float64_device`, `Truth`),
+    and one run as given reads host values (a torch truth's `torch.from_numpy`)."""
     def wide(leaf):
         to = (np.complex128 if jnp.issubdtype(leaf.dtype, jnp.complexfloating)
               else np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype)
-        if isinstance(leaf, jax.Array) and to != leaf.dtype and all(
+        if isinstance(leaf, jax.Array) and to != leaf.dtype and float64_host() is None and all(
                 device.platform != "cpu" for device in leaf.devices()):
             with jax.enable_x64(new_val=True):
                 return leaf.astype(to)
@@ -167,8 +199,9 @@ class Truth:
 
     def __call__(self, *inputs):
         # On `device` where one is named: a GPU run's sizing computes its truths on the host, as a prepare
-        # does.
-        return self.run(*(inputs if self.device is None else jax.device_put(inputs, self.device)))
+        # does; a process whose float64 is its host's (`float64_host`) computes them there.
+        device = self.device or float64_host()
+        return self.run(*(inputs if device is None else jax.device_put(inputs, device)))
 
     @property
     def trace(self):

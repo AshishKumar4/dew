@@ -715,18 +715,22 @@ def _occupancy_unsaved(template, metadata):
     return template.with_window(dataclasses.replace(template.window, fill=None))
 
 
+_OPTIMIZERS = (("opt_state",), ("inner", "opt_state"))
+"""Where a step's state tree holds an optimizer's state: the run's own (under DiLoCo the outer one's), and
+under DiLoCo its groups' inner one's."""
+
+
 def _clip_pooled_unsaved(template, metadata):
     """A restore's `template`, a train state's, whose QK-Clip states hold their held microsteps' pooled
-    maxima (`dew.optim.QKClipState.pooled`), where the checkpoint was saved before the state held them:
-    each such leaf made as no microstep held back (zero), which every such checkpoint's run held none of
-    (its trainer refused a clip under a held update), so the restore keeps it as made. The one translation
-    of that form at the restore boundary (CONTRIBUTING), deleted at 1.0. Any other template as it is."""
+    maxima (`dew.optim.QKClipState.pooled`), where the checkpoint was saved before the state held them: in
+    each optimizer's state the tree holds (`_OPTIMIZERS`, a DiLoCo run's inner one's among them), each such
+    leaf made as no microstep held back (zero), which every such checkpoint's run held none of (its trainer
+    refused a clip under a held update), so the restore keeps it as made. The one translation of that form
+    at the restore boundary (CONTRIBUTING), deleted at 1.0. Any other template as it is."""
     from dew.optim import QKClipState, clips_qk
     from dew.state import TrainState
 
-    if not isinstance(template, TrainState) or not clips_qk(template.opt_state):
-        return template
-    if not _clip_states_unpooled(metadata.get("opt_state")):
+    if not isinstance(template, TrainState):
         return template
 
     def made(leaf):
@@ -738,8 +742,17 @@ def _clip_pooled_unsaved(template, metadata):
             return state
         return state._replace(pooled={key: made(leaf) for key, leaf in state.pooled.items()})
 
-    return dataclasses.replace(template, opt_state=jax.tree.map(
-        unpooled, template.opt_state, is_leaf=lambda node: isinstance(node, QKClipState)))
+    def translated(opt_state, path):
+        if not clips_qk(opt_state) or not _clip_states_unpooled(_at(metadata, path)):
+            return opt_state
+        return jax.tree.map(unpooled, opt_state, is_leaf=lambda node: isinstance(node, QKClipState))
+
+    outer, inner = _OPTIMIZERS
+    template = dataclasses.replace(template, opt_state=translated(template.opt_state, outer))
+    if template.inner is None:
+        return template
+    return dataclasses.replace(template, inner=dataclasses.replace(
+        template.inner, opt_state=translated(template.inner.opt_state, inner)))
 
 
 def _clip_states_unpooled(tree) -> bool:

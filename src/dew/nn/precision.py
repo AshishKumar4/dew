@@ -430,22 +430,112 @@ def rounds_products() -> bool:
     return numerics().forms == "fast" and asks_default_precision(None, configured=True)
 
 
+_LN2_HI, _LN2_LO = 0.693145751953125, 1.428606765330187e-06
+"""ln 2 in two parts (Cody-Waite), the first's 16 bits times an exponent's at most 8 exact."""
+_EXP_TERMS = (1.0 / 5040.0, 1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0)
+"""`e^r`'s Taylor sum to `r^7` by Horner, its highest term first: at `|r| <= ln 2 / 2` the next is 5e-9."""
+
+
+def _exp_value(base2: bool, x) -> jax.Array:
+    """`e^x` (`2^x` where `base2`) of an fp32 `x`: `x = n ln 2 + r`, `n` integral and `|r| <= ln 2 / 2` (a
+    base-2 `x` split exactly), `e^r` by its Taylor sum (`_EXP_TERMS`), times `2^n` as two powers of two each
+    set in the exponent bits, so a result past fp32's largest is infinite and one below its least normal
+    rounds into the subnormals; `x` held first where its power passes both (its tangent declared apart)."""
+    if base2:
+        x = jnp.clip(x, -150.0, 129.0)
+        n = jnp.round(x)
+        r = (x - n) * math.log(2.0)
+    else:
+        x = jnp.clip(x, -104.0, 90.0)
+        n = jnp.round(x * (1.0 / math.log(2.0)))
+        r = (x - n * _LN2_HI) - n * _LN2_LO
+    summed = functools.reduce(lambda p, term: p * r + term, _EXP_TERMS[1:], jnp.full_like(r, _EXP_TERMS[0]))
+    half = jnp.floor(n * 0.5)
+    return summed * _power_of_two(half) * _power_of_two(n - half)
+
+
+def _power_of_two(n) -> jax.Array:
+    """`2^n`, fp32, of an integral `n` within fp32's normal exponents, set in its exponent bits."""
+    return jax.lax.bitcast_convert_type((n.astype(jnp.int32) + 127) << 23, jnp.float32)
+
+
+def _exp_jvp(base2: bool, primals, tangents) -> tuple[jax.Array, jax.Array]:
+    """`_exp`'s value and tangent, the value times the direction (times ln 2 where `base2`)."""
+    (x,), (tangent,) = primals, tangents
+    value = _exp(base2, x)
+    return value, value * (math.log(2.0) if base2 else 1.0) * tangent
+
+
+_exp = contracted("test_accurate_exp_holds_every_order")(
+    declared_tangent(Protected(), _exp_value, _exp_jvp, nondiff_argnums=(0,)))
+
+
+def accurate_exp(x, *, base2: bool = False) -> jax.Array:
+    """`e^x` (`2^x` where `base2`) to fp32's rounding in every form, not the run's (`Numerics.forms`): the
+    recurrences' decays (a scan's, `A = -exp(A_log)`, the softplus's), where an fp32 default path must meet
+    its upstream's bound. The backend's own where it is so (a GPU's and a CPU's default, a GH200's that of
+    `jax.lax.AccuracyMode.HIGHEST` bit for bit, M-JS-135); on a TPU below float64, Dew's own on the vector
+    unit's adds and multiplies (`_exp_value`): a v5e's default fp32 exp is 1.6e-6 from float64 (its exp of a
+    reduced argument alike), which held Mamba-2's layer cell at 5.5 times its CPU float32, and at HIGHEST
+    took the cell's training step 4.5% longer in its scan's decays (11.58 to 12.10 ms, M-JS-138); Dew's own
+    is 2.6e-8 there."""
+    from dew.nn.kernels.generation import backend
+
+    x = jnp.asarray(x)
+    if backend() != "tpu" or x.dtype == jnp.float64:
+        return jnp.exp2(x) if base2 else jnp.exp(x)
+    return _exp(base2, x.astype(jnp.float32)).astype(x.dtype)
+
+
+def _logistic(x) -> jax.Array:
+    work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
+    return 1.0 / (1.0 + accurate_exp(-work))
+
+
+def _logistic_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
+    """`logistic`'s value and tangent `s (1 - s)`, each order finite where `e^-x` overflows (`s` zero)."""
+    (x,), (tangent,) = primals, tangents
+    s = logistic(x)
+    return s, s * (1.0 - s) * tangent.astype(s.dtype)
+
+
+logistic = contracted("test_silu_holds_every_order")(declared_tangent(Protected(), _logistic, _logistic_jvp))
+"""`1 / (1 + e^-x)` in at least float32, its exp accurate (`accurate_exp`) and a true division: a backend's
+logistic is no part of it (`silu`'s)."""
+
+
+def silu(x) -> jax.Array:
+    """`x / (1 + e^-x)` as `x` times its `logistic` (its exp accurate and a true division), in at least
+    float32 and rounded once, its derivative through the logistic's declared tangent: a backend's logistic is
+    no part of it, a v5e's approximate even at HIGHEST, which held Mamba-2's layer at 3.5 times its CPU
+    float32 through its conv's and its gate's silus, where this holds it at 0.89 times, its training step
+    unchanged (row 7062, M-JS-136). A gated MLP's silu stays JAX's (`activations.silu`): on a v5e this one
+    took a SwiGLU MLP's bf16 training step 2.1% longer, where JAX's held its fp32 output within its CPU
+    float32's distance from float64 (4.9e-7 against 1.05e-6); on a GH200 the two are the same (M-JS-137)."""
+    given = jnp.asarray(x)
+    x = given.astype(at_least_fp32(given.dtype))
+    return (x * logistic(x)).astype(given.dtype)
+
+
 def softplus_series(x) -> jax.Array:
     """`jax.nn.softplus(x)`'s value, `log(1 + exp(x))`, as its larger part plus `log1p` of the smaller's
     exponential `y` in (0, 1], the `log1p` by its series in `s = y / (2 + y)`, at most a third, `2 (s + s^3 /
     3 + s^5 / 5 + ...)` to its working dtype's rounding (`_series_terms`): a backend's own `log1p` is no part
     of it, a v5e's 1.4e-4 from float64 (its `log` alike), which held a Mamba-2 layer's output at 2.9e-5 from
-    float64 where this holds it at 1.4e-6 (row 7062). Formed in at least float32 and rounded once to `x`'s
-    dtype; its derivative the logistic, as JAX's."""
+    float64 where this holds it at 1.4e-6 (row 7062). Its leading term `2 s` formed as `y / (1 + y / 2)`,
+    normal wherever `y` is, the series in `s^2` alone: `s` itself, half of `y` near fp32's least normal
+    (`x` near -87), is subnormal, which a target flushing them (a TPU's, a GPU's) made zero, and the softplus
+    with it, where `y` is the answer; `s^2` underflowing leaves the series its first term, one. Formed in at
+    least float32 and rounded once to `x`'s dtype; its derivative the logistic, as JAX's."""
     given = jnp.asarray(x)
     x = given.astype(at_least_fp32(given.dtype))
-    y = jnp.exp(-jnp.abs(x))
-    s = y / (2.0 + y)
-    square = s * s
-    series = jnp.zeros_like(s)
+    y = accurate_exp(-jnp.abs(x))
+    leading = y / (1.0 + 0.5 * y)
+    square = 0.25 * (leading * leading)
+    series = jnp.zeros_like(y)
     for odd in range(_series_terms(x.dtype), 0, -2):
         series = series * square + 1.0 / odd
-    return (jnp.maximum(x, 0) + 2.0 * s * series).astype(given.dtype)
+    return (jnp.maximum(x, 0) + leading * series).astype(given.dtype)
 
 
 def _series_terms(dtype) -> int:

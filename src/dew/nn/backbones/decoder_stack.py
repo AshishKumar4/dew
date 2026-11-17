@@ -146,18 +146,23 @@ def _rows_read(tree, index: jax.Array):
 
 def _rows_recomputed(remat: RematPolicy | None) -> Callable[..., bool]:
     """What a scanned run's body that reads rows keeps for the backward: where it names no rung (`remat`
-    None), every product's result (`dots_saveable`), what its layers would hold unscanned, each other value
-    (a row's cast to the compute dtype, an elementwise step) recomputed in the backward as XLA's fusions
-    recompute it in an unscanned program, where saving every value stacked each of them beside the products
-    (row 4751: a frozen base read where it lies in bf16, 318,296 bytes of temporaries against its unscanned
-    program's 169,616; 129,456 so); a block recomputing named residuals itself everything else
-    (`RematPolicy.recompute`, `DecoderBlock.__call__`); `RematPolicy.checkpoint_policy` otherwise, nothing
-    where that is None, the full rung; and never the rows it read (`_rows_read`, named `LAYER_ROWS`), which
-    the backward reads again from the iteration's index. JAX 0.12's `save_anything_except_these_names`
-    saves every value, the names it is given among them, which kept each iteration's rows among the scan's
-    residuals."""
-    layer = (jax.checkpoint_policies.dots_saveable if remat is None
-             else (lambda *_, **__: True) if remat.recompute
+    None) or recomputes named residuals itself (`RematPolicy.recompute`, `DecoderBlock.__call__`), every
+    product's result (`dots_saveable`), what its layers would hold unscanned, and the residuals the
+    lightest saving rung names (`minimal_with_scan_and_conv`'s, its recurrences' scans and convolutions
+    beside the projections), each other value (a row's cast to the compute dtype, an elementwise step)
+    recomputed in the backward as XLA's fusions recompute it in an unscanned program, where saving every
+    value stacked each of them beside the products (row 4751: a frozen base read where it lies in bf16,
+    318,296 bytes of temporaries against its unscanned program's 169,616; 129,456 so). So each rung keeps
+    no less than the one above it on the ladder (`DECODER_REMAT`), as unscanned: the rung that recomputes
+    named residuals kept every value here, more than no rung, which inverted the ladder's order.
+    `RematPolicy.checkpoint_policy` otherwise, nothing where that is None, the full rung; and never the rows
+    it read (`_rows_read`, named `LAYER_ROWS`), which the backward reads again from the iteration's index.
+    JAX 0.12's `save_anything_except_these_names` saves every value, the names it is given among them, which
+    kept each iteration's rows among the scan's residuals."""
+    layer = (jax.checkpoint_policies.save_from_both_policies(
+                 jax.checkpoint_policies.dots_saveable,
+                 jax.checkpoint_policies.save_only_these_names(*_KEPT_WITHOUT_A_RUNG.save))
+             if remat is None or remat.recompute
              else remat.checkpoint_policy() or jax.checkpoint_policies.nothing_saveable)
 
     def policy(primitive: jax.extend.core.Primitive, *avals, **params) -> bool:
@@ -505,7 +510,9 @@ of a layer at a time do, so its stacked residuals hold no more than that loop's 
 def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematPolicy | None):
     """A scanned run as `dew.nn.in_backward.scanned_run` computes it: each layer the run's own module
     applied on its row of the run's weights, its dropout drawn from a key of its own split from the run's,
-    under the layer's rung, or where it names none what a layer at a time keeps (`_KEPT_WITHOUT_A_RUNG`).
+    under the layer's rung, or where it names none or recomputes named residuals itself what a layer at a time
+    keeps (`_KEPT_WITHOUT_A_RUNG`): no more than the ladder's next rung, as unscanned, where the recomputing
+    rung kept every value, more than no rung.
     Its masks are this program's own, as a stack's a layer at a time and its scan's each are: Linen's scan
     splits the run's key below the scope's own fold, which no public form reads."""
     held = run.variables
@@ -527,7 +534,7 @@ def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematP
         return alone.apply({"params": weights_i, **constants_i}, carry, train=True, decode=False,
                            kv_store=None, per_layer_input=None, attention_metadata=metadata, rngs=rngs)
 
-    layer = applied if remat is not None else jax.checkpoint(
+    layer = applied if remat is not None and not remat.recompute else jax.checkpoint(
         applied, policy=_KEPT_WITHOUT_A_RUNG.checkpoint_policy(), prevent_cse=False)
 
     return in_backward.scanned_run(
