@@ -988,17 +988,15 @@ class Decide(SavedRunTask, InItsForm):
         many as it takes (`PassPlan.taken`), the rest opening the next, and a row no plan holds a pass of
         its own; each shape once, in `pass_shapes`' order."""
         taken: set[PassShape] = set()
-        waiting = list(rows)
-        while waiting:
-            plan, passing = self.planned(), []
-            for row in waiting:
-                if not plan.add(row) and passing:
-                    break
-                passing.append(row)
+        start = 0
+        while start < len(rows):
+            plan, end = self.planned(), start
+            while end < len(rows) and (plan.add(rows[end]) or end == start):
+                end += 1
             # Those the plan runs now (`PassPlan.taken`), the first always, the rest first in the next.
-            run = set(plan.taken()) | {0}
-            taken.add(self._shape([row for index, row in enumerate(passing) if index in run]))
-            waiting = [row for index, row in enumerate(waiting) if index not in run]
+            run = max(plan.taken(), 1)
+            taken.add(self._shape(rows[start:start + run]))
+            start += run
         return tuple(shape for shape in self.pass_shapes if shape in taken)
 
     @functools.cached_property
@@ -1541,31 +1539,32 @@ class PassPlan:
             self.rows.append(row)
         return bool(held)
 
-    def taken(self) -> tuple[int, ...]:
-        """Which of its rows, by the order they were added, the pass runs now (`ScoringServer`): all of
-        them, or, where they fill every window of the declared count below their shape's and overrun it,
-        those in that count's windows, the rest left to a pass of its own shape, of fewer windows than
-        theirs, where the two passes compute fewer tokens (each costed by its shape, `Decide._shape`). The
-        counts are powers of 8, so a pass that overruns one by a little took the next count whole: a
-        server's last pass of 512 requests held 29% of its 32 windows' tokens, a fifth of every pass's
-        tokens padding (row 3330). One count below and one pass after, its windows fewer, so a pass splits
-        once and a server's passes stay few: a rest that takes the whole pass's count again would only
-        shorten its length, a pass more for each row it left, so it runs whole."""
+    def taken(self) -> int:
+        """How many of its rows, the first by the order they were added, the pass runs now
+        (`ScoringServer`): all of them, or, where they overrun the declared count below their shape's, those
+        added before the first row placed past that count's windows, the rest left to a pass of its own
+        shape, of fewer windows than theirs, where the two passes compute fewer tokens (each costed by its
+        shape, `Decide._shape`). The counts are powers of 8, so a pass that overruns one by a little took
+        the next count whole: a server's last pass of 512 requests held 29% of its 32 windows' tokens, a
+        fifth of every pass's tokens padding (row 3330). The rows run are the first added, so each request
+        keeps its rows in order, and the passes are costed as they run. One count below and one pass after,
+        its windows fewer, so a pass splits once and a server's passes stay few: a rest that takes the whole
+        pass's count again would only shorten its length, a pass more for each row it left, so it runs
+        whole."""
         rows, decide = self.rows, self.decide
-        everything = tuple(range(len(rows)))
         if not rows or not self.alive:
-            return everything
+            return len(rows)
         whole = decide._shape(rows)
         windows = self.placing[self.alive[0]].windows
         below = max((shape.rows for shape in decide.pass_shapes
                      if shape.length == whole.length and shape.rows < whole.rows), default=None)
-        if below is None or max(windows) < below or len(set(windows) & set(range(below))) < below:
-            return everything
-        inner = tuple(index for index, window in enumerate(windows) if window < below)
-        first = decide._shape([rows[index] for index in inner])
-        rest = decide._shape([row for index, row in enumerate(rows) if index not in inner])
+        cut = next((index for index, window in enumerate(windows) if below is not None and window >= below),
+                   len(rows))
+        if cut in (0, len(rows)):
+            return len(rows)
+        first, rest = decide._shape(rows[:cut]), decide._shape(rows[cut:])
         split = first.rows * first.length + rest.rows * rest.length
-        return inner if rest.rows < whole.rows and split < whole.rows * whole.length else everything
+        return cut if rest.rows < whole.rows and split < whole.rows * whole.length else len(rows)
 
     def shape(self) -> PassShape:
         """The pass's shape: of the shortest length that holds its rows, the fewest windows declared that
@@ -1667,9 +1666,9 @@ class _WirePlan:
         self.seen.append(row)
         return True
 
-    def taken(self) -> tuple[int, ...]:
+    def taken(self) -> int:
         """Its text rows as their plan runs them now (`PassPlan.taken`), or its rows of images, all."""
-        return self.text.taken() if self.texts else tuple(range(len(self.seen)))
+        return self.text.taken() if self.texts else len(self.seen)
 
 
 @dataclass(frozen=True)
