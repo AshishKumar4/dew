@@ -165,7 +165,7 @@ def pytest_runtest_makereport(item, call):
     `gate_findings`, a JSON list of each finding's leaf, rule, measure (an infinite one `Infinity`) and
     the phase it failed: what a promotion matches a candidate's failures to its parent's by."""
     outcome = yield
-    # A GPU test that prepared no check-1 site in a part's prepare (`compiled_ahead`) failed before any, on a
+    # A part's test that prepared no check-1 site in its prepare (`compiled_ahead`) failed before any, on a
     # device that computes nothing: it has none to prepare, and runs in the part's run, where a site it does
     # reach is a red (`truths_ahead.MissingTruth`) naming it, never compiled there.
     if (call.when == "call" and call.excinfo is not None and os.environ.get(tier_wire.PREPARE) == "1"
@@ -271,8 +271,8 @@ def pytest_runtest_setup(item):
 
 
 def _sites_store(item) -> Path | None:
-    """A GPU test's directory of its tier part's store of programs compiled ahead (`compiled_ahead`), by its
-    node id; None for a flow's (which opens its own), a test no GPU runs, or outside a part with a store."""
+    """A test's directory of its GPU tier part's store of programs compiled ahead (`compiled_ahead`), by its
+    node id; None for a flow's (which opens its own), or outside a part with a store."""
     if item.get_closest_marker("prepares") is not None or tier_wire.TRUTHS not in os.environ:
         return None
     digest = hashlib.sha256(item.nodeid.encode()).hexdigest()[:24]
@@ -281,8 +281,9 @@ def _sites_store(item) -> Path | None:
 
 @pytest.fixture(autouse=True)
 def compiled_ahead(request):
-    """A GPU test's check-1 sites on its tier part's store of programs compiled ahead (tests/truths_ahead.py,
-    its own directory of the part's, `DEW_TIER_TRUTHS`), but a flow's, which opens its own
+    """A GPU tier part's test's check-1 sites on the part's store of programs compiled ahead
+    (tests/truths_ahead.py, its own directory of the part's, `DEW_TIER_TRUTHS`), whatever marks the test (a
+    `gpu`, `kernel` or `runs` test alike: the part runs each on its GPU), but a flow's, which opens its own
     (tests/model_flows.py): its prepare, on the node's CPU, compiles each site's truths and arms for the
     node's GPU with that GPU's compile-only device this process's default, on which nothing computes, so a
     test computing more than its draws before its sites fails at once, naming itself (bible §8: no dense
