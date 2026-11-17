@@ -117,7 +117,7 @@ class Assumption:
     """The device `assumed` stands in for the default device's: its generation, its facts (`target`)
     where it was given them, whether its kernels are `interpreted` on this process's platform, and whether
     the program is compiled for any GPU of its generation (`portable`). Equal wherever the generation,
-    every fact and the modes are (`_facts`), as JAX's trace key reads it, not by a target's identity or
+    every fact and the modes are (`stated`), as JAX's trace key reads it, not by a target's identity or
     its partial hash."""
     generation: str
     target: GpuTarget | None = dataclasses.field(default=None, compare=False, hash=False)
@@ -153,7 +153,7 @@ def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False,
     from dew import _cache
 
     if isinstance(generation, GpuTarget):
-        value = Assumption(generation.generation, generation, _facts(generation), interpreted, portable)
+        value = Assumption(generation.generation, generation, stated(generation), interpreted, portable)
     else:
         value = None if generation is None else Assumption(generation, interpreted=interpreted,
                                                            portable=portable)
@@ -172,19 +172,6 @@ def _cross_compiled(value: Assumption | None) -> contextlib.AbstractContextManag
     import tokamax
 
     return tokamax.config.cross_compile(value=True)
-
-
-def _facts(value: Hashable | Mapping | list) -> Hashable:
-    """`value`'s facts as a hashable tree, equal wherever the facts are: a dataclass's fields by name, a
-    mapping's entries sorted by key, a sequence's items in order."""
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return (type(value).__name__, *((field.name, _facts(getattr(value, field.name)))
-                                       for field in dataclasses.fields(value)))
-    if isinstance(value, Mapping):
-        return tuple(sorted((key, _facts(entry)) for key, entry in value.items()))
-    if isinstance(value, (tuple, list)):
-        return tuple(_facts(element) for element in value)
-    return value
 
 
 class Choice(enum.StrEnum):
