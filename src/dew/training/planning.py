@@ -57,7 +57,10 @@ from dew.training.ahead import handed
 from dew.training.distributed import batch_divisor
 from dew.training.interval import latest
 from dew.training.memory import (
+    LIMIT_EXIT,
+    LiveSet,
     MemoryMiss,
+    compile_limit,
     compiled_if_it_fits,
     head_fused_of,
     head_tile_of,
@@ -67,7 +70,6 @@ from dew.training.memory import (
     placed_beside,
     recompute_more,
     recompute_record,
-    remat_more,
     remat_offloaded,
     rung_record,
     step_fits,
@@ -314,13 +316,13 @@ def walked(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
     recorded or one a search before it found); past a miss, of the split that compile computes as the
     first that can fit (`after`, an index into `candidates`, from what it read: `MemoryMiss`), the finest
     where they compute none, and so on from each compile that misses, upward, until one fits or the finest
-    misses. A split that fits past one not asked is asked of the split before it, down to one that misses:
-    the figures take every temporary as scaled by a microbatch's rows, and XLA fuses and schedules each
-    split's program again, so its temporaries can fall faster than its rows and a coarser split fit that
-    the figures said would not (a phased run's three-pass step fit at two microbatches where its whole
-    batch's figures computed none). XLA states no live set of a GPU compile to Python, so no figure it
-    gives bounds what a split frees; the compile at each is the judge. A tight start at one rung is two
-    compiles where the split computed is the fewest that fit.
+    misses. A split that fits past one not asked is asked of the split before it, down to one that misses;
+    the split before `first` is taken as missed, by the record the start read or the miss that computed
+    `first`. XLA fuses and schedules each split's program again, so its temporaries can fall faster than
+    its rows and a coarser split fit that the figures said would not (a phased run's three-pass step fit at
+    two microbatches where its whole batch's figures computed none); no figure bounds what a split frees,
+    and the compile at each is the judge. A tight start at one rung is two compiles where the split
+    computed is the fewest that fit.
     """
     index, missed = first, first - 1
     while index is not None:
@@ -332,22 +334,9 @@ def walked(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
     return None
 
 
-def _least[T](rungs: Sequence[T], fits: Callable[[T], bool]) -> int | None:
-    """The index of the first of `rungs` that `fits`, each holding no more than the one before it, by
-    bisection: each asked once at most, about log2 of them in all; None where none fits."""
-    low, high = 0, len(rungs)
-    while low < high:
-        middle = (low + high) // 2
-        if fits(rungs[middle]):
-            high = middle
-        else:
-            low = middle + 1
-    return high if high < len(rungs) else None
-
-
 @dataclasses.dataclass(frozen=True)
 class Probe:
-    """One compile of a plan's search (`planned`): the split, the rows of
+    """One compile of a plan's search (`searched`, `walked`): the split, the rows of
     its microbatch and the rung (`rung_record`) it compiled at, what
     the fit check read, this process's tightest headroom and XLA's
     temporaries and arguments and what the step places beside its temporaries (`beside`), None where none
@@ -438,23 +427,42 @@ class PlanRefused(RuntimeError):
 
 
 @dataclasses.dataclass(frozen=True)
+class Rung:
+    """A place on the fit ladder (`FitSearch.ladder`): the modules the objective runs (their remat), its
+    head's tile and fusion, whether the step compiles under XLA's defaults (`required` alone) and whether it
+    reads narrow copies, all `FitSearch.at` puts the objective and the search at."""
+    modules: tuple[nn.Module, ...]
+    tile: tuple[int, int] | None
+    fused: bool
+    xla_defaults: bool
+    narrow: bool
+
+    @staticmethod
+    def of(objective, xla_defaults: bool, narrow: bool) -> Rung:
+        """Where `objective` stands, under XLA's defaults or not and reading narrow copies or not."""
+        return Rung(tuple(entry.module for entry in objective.program_key()), head_tile_of(objective),
+                    head_fused_of(objective), xla_defaults, narrow)
+
+    def put(self, objective) -> None:
+        """`objective` at this rung: its modules and its head's tile and fusion. The options and copies are
+        its compiler's or its search's to set (`FitSearch.at`, `StepCompiler._at_plan`)."""
+        objective.substitute(list(self.modules))
+        objective.restore_head(self.tile, fused=self.fused)
+
+
+@dataclasses.dataclass(frozen=True)
 class Planned:
     """A plan `FitSearch` found: the step reading its batch in `split`
-    microbatches, its executable and the options it compiled under, whether it keeps XLA's default
-    options and reads the parameters through narrow copies, and the rung it compiled
-    at, as a record and as the objective's modules, head tile and whether that
-    head is fused. `profiled` is the runs and the bytes of the profile that guided its executable
-    (`guided`), None where none did."""
+    microbatches, its executable and the options it compiled under, and the rung it compiled at, as a
+    record (`rung`) and as the place on the ladder the objective and its compiler stand at (`at`: its
+    modules, head tile and fusion, XLA's default options or not, narrow copies or not). `profiled` is the
+    runs and the bytes of the profile that guided its executable (`guided`), None where none did."""
     split: int
     candidate: Candidate
     executable: jax.stages.Compiled
     options: jax.stages.CompilerOptions | None
-    xla_defaults: bool
-    narrow: bool
     rung: Mapping[str, JSON]
-    modules: tuple
-    tile: tuple[int, int] | None
-    fused: bool
+    at: Rung
     profiled: tuple[int, int] | None = None
     sampled: SampledStep | None = None
     """The step that also summarizes what the run inspects (`Candidate.sampled`), compiled under the
@@ -594,10 +602,10 @@ def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOption
 def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch,
             frontier: Sequence[Probe] | None = None) -> dict[str, JSON]:
     """The admitted plan, its kernel report, every compile needed to find it, and the kernels those compiles
-    found spilling and the launch
-    configs refused where it searched (`FitSearch.kernels`), which the run's telemetry reports with it
-    (`StepCompiled`); planned ahead with its `frontier`, each rung above the plan that fits at fewer
-    microbatches (`FitSearch.above`). There is no alternative-policy timing or selection in the record."""
+    found spilling and the launch configs refused where it searched (`FitSearch.kernels`), which the run's
+    telemetry reports with it (`StepCompiled`); planned ahead with its `frontier`, each rung above the plan
+    that fits at fewer microbatches (`FitSearch.above`). There is no alternative-policy timing or selection
+    in the record."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
     above: dict[str, JSON] = {} if frontier is None else {"frontier": [probe.record() for probe in frontier]}
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
@@ -672,16 +680,13 @@ def spending(candidate: Candidate | None = None) -> Iterator[dict[str, float]]:
         held[made.kind] = held.get(made.kind, 0.0) + made.seconds
 
 
-@dataclasses.dataclass(frozen=True)
-class Rung:
-    """A place on the fit ladder (`FitSearch.ladder`): the modules the objective runs (their remat), its
-    head's tile and fusion, whether the step compiles under XLA's defaults (`required` alone) and whether it
-    reads narrow copies, all `FitSearch.at` puts the objective and the search at."""
-    modules: tuple[nn.Module, ...]
-    tile: tuple[int, int] | None
-    fused: bool
-    xla_defaults: bool
-    narrow: bool
+def batch_rows(candidate: Candidate) -> frozenset[tuple[int, int]]:
+    """The (argument, axis) pairs of the batch's rows among `candidate`'s step's arguments (its state's
+    moving and frozen trees, its batch, its part, `step_program`): each batch leaf's leading axis, by its
+    flat index among them."""
+    moving, frozen = apart(candidate.prepared)
+    offset = len(jax.tree.leaves(moving)) + len(jax.tree.leaves(frozen))
+    return frozenset((offset + index, 0) for index in range(len(jax.tree.leaves(candidate.micro))))
 
 
 @dataclasses.dataclass
@@ -697,17 +702,20 @@ class FitSearch[LossT, EffectsT]:
     less short, the ladder above keeps them dropped; where it fell no less short (a GPU's step casts its
     weights whole either way), they come back (`copies_freed`). Past it the ladder is the remat rungs,
     least recomputation first, each with its head's rungs under the step's options and XLA's defaults
-    (`ladder`), and the search bisects it (`searched`): the least remat rung that fits at its head holding
-    least, then the first of that rung's head rungs that fits, in the climb's order, so a start whose first
-    miss was far short asks a few rungs, not each one up from the bottom, and none twice. Each compile that
-    misses names the split asked next (`after`); `resumed`, a checkpoint's rung, is warned of where it
-    misses; where nothing fits it raises with the closest candidate's numbers. The objective is left at the
-    plan's rung.
-
-    The ladder's order is the one the figures cannot yet decide: XLA states no live set of a GPU compile
-    to Python, its memory statistics carrying sizes alone, so no compile's figures say which rung frees
-    the bytes it was short. Each rung holds no more than the one before it at the same head; bisecting
-    assumes no more, and asks only the rungs it must.
+    (`ladder`). Each attempt is one compile which, on a GPU, stops after buffer assignment where the step
+    cannot fit (`LIMIT_EXIT`), so a miss costs its assignment and no code generation, and states its live
+    set (`LiveSet`), from which the split asked next at that rung is computed (`MemoryMiss`). The search
+    climbs the ladder in its order and the plan is the first rung that fits, at the coarsest split seen to
+    fit there: every lighter rung was asked and missed in this start, so the plan's lightness is a result.
+    What a rung keeps orders its residuals, not XLA's allocated peak (a scanned delta decoder at four
+    microbatches needed 31.71 MB recomputing all but its scans and convolutions and 32.14 MB recomputing
+    them too, a heavier rung needing more), so no rung is passed over for one above or below it; the log
+    names every rung asked with what it needed.
+    Each compile that misses names the split asked next (`after`); `resumed`, a checkpoint's rung, is
+    warned of where it misses; where nothing fits it raises with the closest candidate's numbers. The
+    objective is left at the plan's rung. A miss read from JAX's persistent cache states its live set as
+    a fresh compile does (`peak_live` reads its stored buffer assignment, its argument map from the
+    lowering's kept arguments).
 
     The ladder holds no host offload. XLA:GPU holds the optimizer state and the EMA whole on the device
     for the update wherever they rest between steps, so keeping them on the host frees nothing at a
@@ -733,15 +741,14 @@ class FitSearch[LossT, EffectsT]:
     """What each compile that did not fit read, by its rung and split (`MemoryMiss`), which names the split
     the search asks next (`after`)."""
     chosen: jax.stages.CompilerOptions | None = None
-    fitted: tuple[Candidate, jax.stages.Compiled, jax.stages.CompilerOptions | None] | None = None
-    """The plan the search found to fit: its candidate, executable and the options it compiled under."""
-    fits_at: dict[str, tuple[tuple[Candidate, jax.stages.Compiled, jax.stages.CompilerOptions | None],
-                             SampledStep | None, int, int | None]] = dataclasses.field(default_factory=dict)
-    """Each rung (`rung`) a split fitted at, its plan there (`fitted`), its sampled step, its split and its
-    headroom: the plan `searched` takes once it settles on the rung."""
+    fits_at: dict[str, tuple[int, tuple[Candidate, jax.stages.Compiled, jax.stages.CompilerOptions | None],
+                             SampledStep | None]] = dataclasses.field(default_factory=dict)
+    """Each rung a split fitted at, by its record (`rung`, as `misses` holds a rung: a rung's modules are
+    Flax modules, which need not hash), the last that fitted there (a walk's descent ends at its fewest):
+    the split, its candidate, executable and the options it compiled under, and its sampled step. The plan
+    is the one at the rung `searched` settles on (`found`)."""
     sampled: SampledStep | None = None
     """The last measured candidate's sampled step (`measured`)."""
-    fitted_sampled: SampledStep | None = None
     """The fitted plan's sampled step, which summarizes what the run inspects (`Candidate.sampled`)."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
@@ -797,7 +804,7 @@ class FitSearch[LossT, EffectsT]:
         # regions' own: what the pass cost this plan's compiles.
         passes: list[JSON] = list(report.passes()[passed:])
         self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites, "passes": passes}
-        if split is None or self.fitted is None:
+        if split is None:
             allocators = [device_memory(device) for device in local_devices(self.mesh)]
             raise PlanRefused(self.probes, allocators) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
@@ -816,7 +823,7 @@ class FitSearch[LossT, EffectsT]:
         # A frontier rung that misses is no checkpoint's rung missing (`fits_here`).
         self.resumed = None
         fewer, found = list(candidates[:candidates.index(split)]), []
-        top = (split, self.configuration()) if offloads(self.objective) else None
+        top = (split, self.rung_now()) if offloads(self.objective) else None
         while fewer and recompute_more(self.objective, self.base):
             asked = len(self.probes)
             fewest = walked(fewer, 0, self.fits_here, functools.partial(self.after, fewer))
@@ -825,23 +832,12 @@ class FitSearch[LossT, EffectsT]:
                                   if probe.fits and probe.split == fewest))
                 fewer = fewer[:fewer.index(fewest)]
                 if offloads(self.objective):
-                    top = (fewest, self.configuration())
+                    top = (fewest, self.rung_now())
         if top is not None:
-            self.restore(top[1])
+            self.at(top[1])
             if remat_offloaded(self.objective) and self.fits_here(top[0]):
                 found.append(self.probes[-1])
         return tuple(found)
-
-    def configuration(self) -> tuple[tuple[nn.Module, ...], tuple[int, int] | None, bool]:
-        """The objective's modules and its head's tile and fusion as they stand, which `restore` puts back."""
-        return (tuple(entry.module for entry in self.objective.program_key()), head_tile_of(self.objective),
-                head_fused_of(self.objective))
-
-    def restore(self, configuration: tuple[tuple[nn.Module, ...], tuple[int, int] | None, bool]) -> None:
-        """Put the objective's modules and head policy back as `configuration` holds them."""
-        modules, tile, fused = configuration
-        self.objective.substitute(list(modules))
-        self.objective.restore_head(tile, fused=fused)
 
     def fitting(self, executable: jax.stages.Compiled | None,
                 candidate: Candidate) -> tuple[bool, int | None]:
@@ -896,8 +892,20 @@ class FitSearch[LossT, EffectsT]:
     def compiled_options(self, candidate: Candidate) -> jax.stages.CompilerOptions | None:
         """The options the search compiles `candidate` under: `required` at a rung of XLA's defaults, else
         the step's own (`options`), so a step whose options are its towers' own is that rung's program
-        (`ladder` asks none such); the compile point adds the target's own (`report.targeted`)."""
-        return self.required if self.xla_defaults else self.options(candidate)
+        (`ladder` asks none such); the compile point adds the target's own (`report.targeted`). On a GPU,
+        each compile stops after buffer assignment past the bytes no step fits in (`limited`)."""
+        return self.limited(candidate, self.required if self.xla_defaults else self.options(candidate))
+
+    def limited(self, candidate: Candidate, options: jax.stages.CompilerOptions | None
+                ) -> jax.stages.CompilerOptions | None:
+        """`options` with the limit past which a GPU compile of `candidate` stops after buffer assignment
+        (`LIMIT_EXIT`, `compile_limit`): an attempt that cannot fit costs its assignment, not its compile.
+        As given where a device states no limit or is no GPU."""
+        devices = local_devices(self.mesh)
+        # The fit check's own held and built bytes (`fitting`): the state's unplaced bytes count in both.
+        limit = (compile_limit(devices, candidate.held, candidate.built)
+                 if all(device.platform == "gpu" for device in devices) else None)
+        return options if limit is None else {**(options or {}), LIMIT_EXIT: limit}
 
     def compiled_key(self, lowered: jax.stages.Lowered,
                      options: jax.stages.CompilerOptions | None) -> Hashable:
@@ -990,11 +998,14 @@ class FitSearch[LossT, EffectsT]:
         fit, headroom = probe.fits, probe.headroom
         self.probes.append(probe)
         if not fit and headroom is not None and probe.temp is not None:
-            self.misses[(self.rung(), split)] = MemoryMiss(split, probe.temp, -headroom, self.factor)
+            live = None if executable is None else LiveSet.of(executable, batch_rows(candidate))
+            # Its temporaries a microbatch's rows scale, as its live set states them, those it states no
+            # provenance of among them (the most a split can free of them); every one where it states none.
+            scaled = probe.temp if live is None else live.scaled + live.unknown
+            self.misses[(self.rung(), split)] = MemoryMiss(split, scaled, -headroom, self.factor)
         if fit:
             assert executable is not None
-            self.fitted, self.fitted_sampled = (candidate, executable, self.chosen), self.sampled
-            self.fits_at[self.rung()] = (self.fitted, self.fitted_sampled, split, headroom)
+            self.fits_at[self.rung()] = (split, (candidate, executable, self.chosen), self.sampled)
             return True
         if self.resumed is not None:
             _log.warning("the step does not fit the devices at the rung its checkpoint trained on (%s); from "
@@ -1015,65 +1026,64 @@ class FitSearch[LossT, EffectsT]:
 
     def rung_now(self) -> Rung:
         """Where on the ladder the objective and the search stand (`Rung`)."""
-        modules = tuple(entry.module for entry in self.objective.program_key())
-        return Rung(modules, head_tile_of(self.objective), head_fused_of(self.objective), self.xla_defaults,
-                    self.narrow)
+        return Rung.of(self.objective, self.xla_defaults, self.narrow)
 
     def at(self, rung: Rung) -> None:
         """Put the objective and the search at `rung`."""
-        self.objective.substitute(list(rung.modules))
-        self.objective.restore_head(rung.tile, fused=rung.fused)
+        rung.put(self.objective)
         self.xla_defaults, self.narrow = rung.xla_defaults, rung.narrow
 
     def ladder(self, start: Rung, narrow: bool) -> list[list[Rung]]:
-        """The rungs above `start`, where the search began, by remat rung, least recomputation first: at
-        each, its head's rungs, the whole logits (or `start`'s own head, at `start`'s remat) then the tile
-        fused then unfused (`recompute_more`'s order), each under the step's options and then under XLA's
-        defaults where those are another program (`compiled_options`: the Triton GEMM fusions they keep can
-        take fewer temporaries, sm89), each reading the narrow copies where `narrow`. A run that states its
-        remat has its head's rungs alone (docs/design/training.md, every choice can be overridden). The
-        rungs at `start`'s remat and head are left out, asked already; the objective is left at `start`."""
-        defaults = (False, True) if self.chosen != self.required else (False,)
-        remats = [start.modules]
-        while not self.remat_set and remat_more(self.objective):
-            remats.append(tuple(entry.module for entry in self.objective.program_key()))
+        """The rungs above `start`, where the search began, by remat rung, least recomputation first: the
+        places the one climb visits from `start` (`recompute_more`: at each remat rung its head's rungs,
+        then the next remat rung with its head back at the run's tile), each under the step's options and
+        then under XLA's defaults where those are another program (`compiled_options`: the Triton GEMM
+        fusions they keep can take fewer temporaries, sm89), each reading the narrow copies where `narrow`.
+        A run that states its remat has its head's rungs alone (docs/design/training.md, every choice can be
+        overridden). The rungs at `start`'s remat and head are left out, asked already; the objective is
+        left at `start`."""
+        # The step's own options as its program reads them, the compile's stop past the limit no option of
+        # the program's (`limited`): where they are XLA's defaults, a rung under them is the same program.
+        own = {name: value for name, value in (self.chosen or {}).items() if name != LIMIT_EXIT} or None
+        defaults = (False, True) if own != self.required else (False,)
+        places = [Rung.of(self.objective, xla_defaults=False, narrow=narrow)]
+        while recompute_more(self.objective, self.base):
+            place = Rung.of(self.objective, xla_defaults=False, narrow=narrow)
+            if self.remat_set and place.modules != start.modules:
+                break
+            places.append(place)
         ladder: list[list[Rung]] = []
-        for index, modules in enumerate(remats):
-            self.objective.substitute(list(modules))
-            tile, fused = (start.tile, start.fused) if index == 0 else (self.base, True)
-            self.objective.restore_head(tile, fused=fused)
-            heads = [(head_tile_of(self.objective), head_fused_of(self.objective))]
-            if heads[0][0] == self.base and self.objective.tile_head() is not None:
-                heads.append((head_tile_of(self.objective), head_fused_of(self.objective)))
-            if self.objective.unfuse_head() is not None:
-                heads.append((head_tile_of(self.objective), head_fused_of(self.objective)))
-            rungs = [Rung(modules, tile, fused, defaults_on, narrow)
-                     for tile, fused in heads for defaults_on in defaults]
-            ladder.append([rung for rung in rungs
-                           if not (index == 0 and (rung.tile, rung.fused, rung.xla_defaults)
-                                   == (start.tile, start.fused, start.xla_defaults))])
+        for place in places:
+            if not ladder or ladder[-1][0].modules != place.modules:
+                ladder.append([])
+            ladder[-1].extend(dataclasses.replace(place, xla_defaults=on) for on in defaults)
         self.at(start)
+        own = (start.modules, start.tile, start.fused, start.xla_defaults)
+        ladder = [[rung for rung in rungs if (rung.modules, rung.tile, rung.fused, rung.xla_defaults) != own]
+                  for rungs in ladder]
         return [rungs for rungs in ladder if rungs]
 
     def searched(self, candidates: Sequence[int], first: int) -> int | None:
         """The split the step fits at, the objective and the search left at its rung (`FitSearch`), or None
-        where no rung fits. The rung it stands on first, from `candidates[first]`; then, where its step read
-        narrow copies, the same rung without them, the ladder's first rung, whose miss and the one before
-        it decide whether the ladder above reads them (`copies_freed`); past it, the least remat rung of the
-        `ladder` that fits at its head holding least (its last), under the step's options or else XLA's
-        defaults, bisected, then the first of that remat rung's rungs that fits, in the ladder's order. Each
-        rung's splits are walked from the batch whole as its misses' figures leave possible (`walked`), and
-        no rung is asked twice."""
+        where no rung fits: the rung it stands on first, from `candidates[first]` (`walked`, `after`); then,
+        where its step read narrow copies, the same rung without them, whose miss and the one before it
+        decide whether the ladder above reads them (`copies_freed`); past it, each rung of the ladder in its
+        order from the batch whole, until one fits. No rung is asked twice; every process asks the same."""
         start = self.rung_now()
         after = functools.partial(self.after, candidates)
         split = walked(candidates, first, self.fits_here, after)
         if split is not None:
             return split
         narrow = self.narrow
+        # The rungs walked already, all missed: none is asked again; and each as its record names it.
+        asked: list[Rung] = [start]
+        named = [self.rung()]
         if narrow and any(candidate.copies for candidate in self.lowered.values()):
             # The narrow copies, two bytes a parameter held all run for 1-2% of a step, dropped first.
             kept = self.rung()
-            self.at(dataclasses.replace(start, narrow=False))
+            asked.append(dataclasses.replace(start, narrow=False))
+            self.at(asked[-1])
+            named.append(self.rung())
             _log.warning("the step does not fit the devices with its narrow copies; compiling it again "
                          "without them")
             split = walked(candidates, 0, self.fits_here, after)
@@ -1085,31 +1095,29 @@ class FitSearch[LossT, EffectsT]:
                 # its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with them),
                 # so the copies come back, their 1-2% of a step kept, and the ladder climbs with them.
                 _log.warning("the step's narrow copies free nothing it needs: it keeps them and climbs on")
-        ladder = self.ladder(start, narrow)
-        verdicts: dict[Rung, bool] = {}
+        for rung in (rung for group in self.ladder(start, narrow) for rung in group):
+            if rung in asked:
+                continue
+            asked.append(rung)
+            self.at(rung)
+            named.append(self.rung())
+            _log.warning("the step does not fit the devices; compiling it again at %s",
+                         json.dumps(self.current(), sort_keys=True))
+            split = walked(candidates, 0, self.fits_here, after)
+            if split is not None:
+                self.said(named)
+                return split
+        self.said(named)
+        return None
 
-        def fits(rung: Rung) -> bool:
-            if rung not in verdicts:
-                self.at(rung)
-                _log.warning("the step does not fit the devices; compiling it again at %s",
-                             json.dumps(self.current(), sort_keys=True))
-                verdicts[rung] = walked(candidates, 0, self.fits_here, after) is not None
-            return verdicts[rung]
-
-        def holding_least(rungs: list[Rung]) -> bool:
-            # Its head holding least, under the step's options and else XLA's defaults: neither holds no
-            # more than the other on every step.
-            last = rungs[-1]
-            plain = dataclasses.replace(last, xla_defaults=False)
-            return fits(plain) or (last.xla_defaults and fits(last))
-
-        remat = _least(ladder, holding_least)
-        if remat is None:
-            return None
-        rung = next(rung for rung in ladder[remat] if fits(rung))
-        self.at(rung)
-        self.fitted, self.fitted_sampled, split, _ = self.fits_at[self.rung()]
-        return split
+    def said(self, named: list[str]) -> None:
+        """Log every rung the search asked (`named`, as `rung` names each), in the ladder's order, with the
+        least it was short by where it missed (its misses' figures, `misses`); the last fits where one did."""
+        def short(rung: str) -> str:
+            missed = [miss.shortfall // self.factor for (at, _), miss in self.misses.items() if at == rung]
+            return f"{rung}: short by {min(missed)} bytes" if missed else f"{rung}: fits"
+        _log.info("the rungs the step's search asked, in the ladder's order: %s",
+                  "; ".join(short(rung) for rung in named))
 
     def copies_freed(self, kept: str, dropped: str) -> bool:
         """Whether dropping the narrow copies brought the step nearer to fitting: at `dropped`, the rung
@@ -1123,8 +1131,8 @@ class FitSearch[LossT, EffectsT]:
         return not any(self.gather(held))
 
     def found(self, split: int) -> Planned:
-        assert self.fitted is not None
-        modules = tuple(entry.module for entry in self.objective.program_key())
-        return Planned(split, *self.fitted, self.xla_defaults, self.narrow, self.current(), modules,
-                       head_tile_of(self.objective), head_fused_of(self.objective),
-                       sampled=self.fitted_sampled)
+        """The plan at `split` on the rung the search stands at, as it fitted there (`fits_at`)."""
+        at = self.rung_now()
+        fitted, (candidate, executable, options), sampled = self.fits_at[self.rung()]
+        assert fitted == split, (fitted, split)
+        return Planned(split, candidate, executable, options, self.current(), at, sampled=sampled)

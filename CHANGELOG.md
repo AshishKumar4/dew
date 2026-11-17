@@ -12,6 +12,21 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `--context-text.checkpoint`, as a diffusion run's text condition), in place of the backbone's own token table
   or pass: its tokenization reads the context, its states reach the context layers at its width, its weights
   are the model's `context` module, a run records it and its task rebuilds it.
+- A fit's search climbs the remat ladder in its order where the step does not fit at its own rung and settles
+  the first rung that fits, every lighter rung asked and missed in that start: what a rung keeps orders its
+  residuals and not XLA's peak (a scanned delta decoder needed more recomputing its scans and convolutions
+  too), so no rung is passed over, where the search galloped and bisected the ladder. On a GPU each attempt
+  stops after buffer assignment past the devices' limit (`xla_gpu_memory_limit_early_exit_bytes`), so a miss
+  costs no code generation, and its live set computes the split asked next at that rung: the buffers a
+  microbatch's rows scale, by their dimensions' provenance. The log names every rung asked with what it was
+  short by. A plan made before the state is placed is searched again where the placed devices' room covers one
+  of its misses (a fine-tune's copied sources let go). A decoder whose layers scan keeps, with no rung or the
+  one recomputing the delta rule's memory, the products and `minimal_with_scan_and_conv`'s residuals (with its
+  layers updating in the backward, those residuals), where the recomputing rung kept every value, more than no
+  rung. `dew.training.ahead.twin(devices)` gives compile-only GPUs of the attached GPUs' own target, and
+  `probed(lowered)` compiles a program for them as far as its buffer assignment: what a plan reads of a
+  layout without compiling it whole.
+
 - Programs a process keeps (`dew.training.ahead.keeping`) are kept and handed by their fingerprint: the
   digest of the lowered program, its trees and its arguments' types under the XLA options it compiled
   with (`dew.nn.kernels.options.program_digest`), with the target they were built for (`BuildTarget`).

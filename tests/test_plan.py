@@ -11,6 +11,7 @@ import functools
 import gc
 import itertools
 import json
+import logging
 import struct
 import weakref
 from collections.abc import Callable, Iterator
@@ -40,7 +41,7 @@ from dew.diffusion.discrete import MDLM
 from dew.distributed.placement import Layout, MeshSpec, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import REMAT_POLICIES
+from dew.nn.backbones.decoder_block import DECODER_REMAT, REMAT_POLICIES, remat_record
 from dew.nn.kernels import options
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective
@@ -60,7 +61,7 @@ from dew.training.memory import (
     recompute_more,
     rung_record,
 )
-from dew.training.planning import Trials, splits, walked
+from dew.training.planning import PlanRefused, Trials, splits, walked
 
 ROWS, SEQ = 32, 16
 BATCH = {"text": jnp.asarray((np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1) * 7) % 64, jnp.int32)}
@@ -1216,7 +1217,7 @@ HALVED_BATCH = {"text": jnp.asarray((np.arange(ROWS * 257).reshape(ROWS, 257) * 
 def a_step_that_fits_once_its_delta_rule_recomputes_its_memory_plans_at_that_rung(monkeypatch):
     """With room for four microbatches when a delta rule recomputes its memory alone, which no
     recomputation needs more than, the plan is four at that rung ('all_but_delta_memory', the ladder's
-    first above none): the search finds it bisecting the ladder, no compile asked twice. The decoder's
+    first above none): the lightest rung seen to fit, no compile asked twice. The decoder's
     delta rule holds a share of the step the rung saves (`HALVED`), which the cell checks first. The delta
     rule runs its port (`port_support.row_names_port`), whatever the generation's row names: the rung
     recomputes the memory the port names (`checkpoint_name`), and the portable route, an A10's, names
@@ -1234,8 +1235,133 @@ def a_step_that_fits_once_its_delta_rule_recomputes_its_memory_plans_at_that_run
         state, _, _ = trainer.place()
         trials = Trials(state, HALVED_BATCH)
         trainer.compile(state, HALVED_BATCH, trials)
-    assert trainer.objective.model.remat == REMAT_POLICIES[rung]
+    assert trainer.objective.model.remat == REMAT_POLICIES[rung], (room, trainer.plan["probes"])
     assert_searched(trainer, (4, rung))
+
+
+LONG = 64
+"""Rows of 64 tokens: a four-layer decoder's activations, which recomputation frees, outweigh its state."""
+LONG_BATCH = {"text": jnp.asarray((np.arange(ROWS * (LONG + 1)).reshape(ROWS, LONG + 1) * 7) % 64, jnp.int32)}
+
+
+H100 = 2 ** 40
+"""The allocator limit of the compile-only H100 a census shape's need at each rung is read on: past any."""
+
+
+def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of) -> tuple[list, int, tuple, tuple]:
+    """A census shape's step at four microbatches on `target` ('cpu', its devices' memory stated through
+    `free`; 'h100', a compile-only H100 compiled ahead, what a GPU start plans for): its need at each place
+    of the fit ladder in its order (`recompute_more`: at each remat rung its head's rungs, then the next),
+    each place's step compiled with room past all; the room `room_of` the needs by remat at the run's own
+    head; the place the start's climb settles in that room, its rung unstated; and the first place of the
+    ladder whose step, compiled in that room, fits: an exhaustive walk. XLA schedules a GPU's program to
+    the memory its target states, so a place's need in that room is its compile there, not its need with
+    room past all. A place is its head's tile, whether that head is fused, and its remat."""
+    from dew.training.memory import recompute_more
+
+    def placed(trainer) -> tuple:
+        plan = trainer.plan
+        return (plan["head_tile"], plan["head_fused"], plan["remat"], plan["xla_defaults"])
+
+    if target == "cpu":
+        def planned(moves: int, room: int):
+            free(monkeypatch, room)
+            trainer = lm(split=4, **fields)
+            for _ in range(moves):
+                assert recompute_more(trainer.objective)
+            state, _, _ = trainer.place()
+            trainer.compile(state, batch, Trials(state, batch))
+            return trainer
+    else:
+        from model_support import memory_limited_to
+
+        from dew.nn.kernels.generation import compile_only_gpus
+        from dew.training.ahead import compile_ahead
+
+        def planned(moves: int, room: int):
+            trainer = lm(split=4, **fields)
+            trainer.device_mesh = MeshSpec().build(compile_only_gpus("sm90", 1, memory_limited_to(room)))
+            for _ in range(moves):
+                assert recompute_more(trainer.objective)
+            compile_ahead(trainer, batch)
+            return trainer
+
+    room_past = LIMIT if target == "cpu" else H100
+    ladder = lm(split=4, **fields).objective
+    places = 1
+    while recompute_more(ladder):
+        places += 1
+    need = []
+    for moves in range(places):
+        trainer = planned(moves, room_past)
+        need.append((placed(trainer), room_past - trainer.plan["probes"][0]["headroom"]))
+    whole = {remat: held for (tile, _, remat, _), held in need if tile is None}
+    room = room_of(whole)
+    def fits(moves: int) -> bool:
+        # The place's own step compiled in the room, its first compile the judge: where it misses, the
+        # search past it may find nothing more at a remat the run now states (`PlanRefused`).
+        try:
+            return planned(moves, room).plan["probes"][0]["fits"]
+        except PlanRefused as refused:
+            return refused.probes[0].fits
+
+    lightest = next((place for moves, (place, _) in enumerate(need) if fits(moves)), None)
+    return need, room, placed(planned(0, room)), lightest
+
+
+CENSUS = {
+    # Four attention layers over 64 tokens, room between what 'minimal' and no rung need.
+    "decoder": ({"seq": LONG, "width": 32, "layers": 4}, LONG_BATCH,
+                lambda need: (need[None] + need["minimal"]) // 2),
+    # Two scanned gated delta net layers over 256 tokens, room for what 'minimal' needs.
+    "delta-scanned": ({**HALVED, "scan_layers": True}, HALVED_BATCH, lambda need: need["minimal"]),
+}
+"""The census shapes: their decoders' fields, batches, and the room each start is given of their needs by
+remat at their own head."""
+
+
+@pytest.mark.parametrize("target", ["cpu", "h100"])
+@pytest.mark.parametrize("shape", list(CENSUS))
+def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target):
+    """A start whose step does not fit at its own rung climbs the ladder in its order, each rung asked, and
+    settles the first that fits: no later than the first place of the ladder an exhaustive walk compiles
+    under the step's own options and finds fits in the same room, and that place where the plan is no rung
+    of XLA's default options, which the walk does not compile (a GPU's step under them can fit a place
+    earlier: its Triton GEMM fusions hold fewer temporaries), on the census shapes, on the CPU and for a
+    compile-only H100. What a rung keeps orders its residuals, not XLA's peak (the scanned delta decoder
+    needed more recomputing its scans and convolutions too than not), so a search that passed over a rung
+    for one seen to miss settled a heavier plan than one that fits."""
+    fields, batch, room_of = CENSUS[shape]
+    with row_names_port("gated_delta_rule", "fla"):
+        need, room, plan, lightest = climbed(monkeypatch, target, fields, batch, room_of)
+    places = [place[:3] for place, _ in need]
+    assert lightest is not None and places.index(plan[:3]) <= places.index(lightest[:3]), (need, room, plan)
+    assert plan[3] or plan == lightest, (need, room, plan, lightest)
+
+
+def test_a_plan_made_before_the_state_is_placed_is_searched_again_where_the_placed_devices_cover_a_miss(
+        monkeypatch, caplog):
+    """A fresh fit plans its step before its state is placed (`StepCompiler.planned_unplaced`), judging each
+    candidate beside the state's bytes it will place: room for two microbatches and not the batch whole.
+    Placed, the devices read no fewer free bytes (a fine-tune's copied sources let go as their copies are
+    placed), room for the batch whole, whose miss that room covers: the step is searched again there and
+    reads the batch whole, where the held plan's two microbatches ran the whole run."""
+    # The step the run compiles, its split unstated, read whole and in halves.
+    whole, halves = needs(monkeypatch, lm()), needs(monkeypatch, lm(split=2))
+    assert halves < whole, (halves, whole)
+    state, _, _ = lm().place()
+    held = sum(leaf.nbytes for leaf in jax.tree.leaves(state) if isinstance(leaf, jax.Array))
+    # Room for the batch whole once its state is placed, short of it while the state's bytes stand beside
+    # it unplaced: the step the search compiles over the unplaced state needs as much as the placed one
+    # within those bytes.
+    free(monkeypatch, whole + held)
+    trainer = lm()
+    with caplog.at_level(logging.INFO, logger="dew.training.compiler"):
+        trainer.fit(Pipeline(Memory({"text": np.asarray(BATCH["text"])})).repeat().batch(ROWS), steps=1)
+    assert any("searched again there" in record.getMessage() for record in caplog.records), (
+        held, whole, halves, [(probe["split"], probe["fits"], probe["headroom"]) for probe in
+                              trainer.plan["probes"]], caplog.text)
+    assert (trainer.plan["split"], trainer.plan["remat"]) == (1, None), trainer.plan["probes"]
 
 
 def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
@@ -1263,9 +1389,31 @@ def test_a_decoder_that_fits_split_asks_its_splits_at_no_recomputation(monkeypat
     assert all(remat is None for _, remat, _ in asked(trainer))
 
 
+def test_a_step_the_fit_check_admits_is_within_the_limit_its_compile_stops_at():
+    """The bytes past which a plan's GPU compile stops (`compile_limit`) are the fit check's own arithmetic
+    solved for XLA's sum (arguments, outputs that write over none, temporaries): row 5805's lab step, its
+    arguments 63.1 GB with 22.0 GB of them built on its first call, held beside it, its temporaries 18.9 GB,
+    which the check admitted on a GH200's 96.4 GB, compiles whole within it, where the limit, its
+    allocator's less all it held, counted the built arguments twice, stopped its compile at 74.4 GB and its
+    first run refused it; a prefetched batch held beside the step outside its arguments lowers the limit by
+    its bytes."""
+    from model_support import memory_limited_to
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.training.memory import compile_limit
+
+    room, held, built = 96_395_591_680, 21_975_318_136, 21_975_318_136
+    summed = 63_111_557_912 + 63_110_666_810 - 63_110_643_844 + 18_894_096_952
+    devices = compile_only_gpus("sm90", 1, memory_limited_to(room))
+    assert compile_limit(devices, held, built) >= summed
+    batch = 2**20
+    assert compile_limit(devices, held + batch, built) == compile_limit(devices, held, built) - batch
+
+
 def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool():
     """A newly compiled step whose first run fails on its devices is raised as the step's, from the
-    devices' own error, with the record of the check that said it fits and what each device holds now,
+    devices' own error, which its message states, so a reader of the message alone tells an out-of-memory
+    from any other failure, with the record of the check that said it fits and what each device holds now,
     each GPU's bytes free outside XLA's pool among it: a collective's communicators (NCCL) take their
     buffers there, beside cuBLAS's workspaces and the kernels loaded (row 2901). A first run that
     succeeds tells each GPU's free bytes there at the check and after it."""
@@ -1289,6 +1437,7 @@ def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool()
     with pytest.raises(FirstRunFailed) as raised:
         first_run(Refused(), 0, record, mesh)
     assert isinstance(raised.value.__cause__, jax.errors.JaxRuntimeError)
+    assert str(raised.value.__cause__) in str(raised.value)
     assert raised.value.fitted == record
     assert [(device["id"], device["outside"] is not None) for device in raised.value.now] == [
         (device.id, device.id in gpus) for device in devices]
@@ -1463,26 +1612,23 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
     assert (outcome, refusals) == ((None, [error]) if refused else (error, []))
 
 
-@pytest.mark.parametrize("width, between, cold", [
-    # Its temporaries scaled by its rows (a narrow layer): the batch whole's miss computes two
-    # microbatches, which fit: two compiles.
-    (16, (1, 2), 2),
-    # They fall faster than its rows: the miss computes four, which fit, and two, not asked, is asked, and
-    # misses: the third compile, stated.
-    (16, (2, 4), 3),
-    # Mostly fixed (a wide layer over few tokens: the gradients of its weights): XLA states no live set of
-    # a compile to Python, so the miss takes them as scaled and computes two, which misses, and that miss
-    # computes four, which fit: the third compile, stated.
-    (1024, (2, 4), 3),
+@pytest.mark.parametrize("width, between", [
+    # Its temporaries scaled by its rows (a narrow layer).
+    (16, (1, 2)),
+    # They fall faster than its rows.
+    (16, (2, 4)),
+    # Mostly fixed (a wide layer over few tokens: the gradients of its weights).
+    (1024, (2, 4)),
 ])
-def test_a_tight_start_compiles_twice_cold_and_once_warm(monkeypatch, tmp_path, width, between, cold):
+def test_a_tight_start_settles_the_split_beside_one_that_missed_and_compiles_once_warm(monkeypatch, tmp_path,
+                                                                                        width, between):
     """What a run pays at its start where its batch does not fit whole (the owner's contract: "a single
-    trace and compile most often"): cold, the batch whole compiles and misses, and that compile computes
-    the split asked next (`MemoryMiss`), XLA's compile the judge of it, until the fewest microbatches that
-    fit, those `between` missing at the first and fitting at the second; warm, the plan its cold start
-    recorded (`keep_rung`, beside the compilation cache) is the first candidate, one compile. The devices'
-    memory lies between the fewest's need and the least of the whole batch's and the first's, so both miss:
-    the whole batch's need, its accumulator absent, is not the most of every split's."""
+    trace and compile most often"): cold, the plan is the split seen to fit beside the next coarser seen
+    to miss, those `between`, each split compiled once at most, no more than the splits there are; warm,
+    the plan its cold start recorded (`keep_rung`, beside the compilation cache) is the first candidate,
+    one compile, its step the one it runs. The devices' memory lies between the fewest's need and the least
+    of the whole batch's and the first's, so both miss: the whole batch's need, its accumulator absent, is
+    not the most of every split's."""
     whole, fewer, fewest = (needs(monkeypatch, lm(split=split, width=width)) for split in (1, *between))
     missing = min(whole, fewer)
     assert fewest < missing, (fewest, whole, fewer)
@@ -1491,7 +1637,11 @@ def test_a_tight_start_compiles_twice_cold_and_once_warm(monkeypatch, tmp_path, 
     cold_run, warm = lm(width=width), lm(width=width)
     with Compiles("step") as compiles:
         trained(cold_run, steps=0)
-    assert compiles.count == cold and cold_run.plan["split"] == between[1]
+    probes = cold_run.plan["probes"]
+    assert cold_run.plan["split"] == between[1], probes
+    assert any(probe["split"] == between[0] and not probe["fits"] for probe in probes), probes
+    asked = [probe["split"] for probe in probes]
+    assert len(set(asked)) == len(asked) <= ROWS and compiles.count <= len(asked), (compiles.count, probes)
     # A warm process: the cold one's record, none of its executables.
     options.unhold()
     with Compiles("step") as compiles:
@@ -1512,9 +1662,16 @@ def test_a_run_that_sets_its_remat_compiles_its_step_once(monkeypatch, tmp_path)
     assert trainer.plan["remat"] == "full" and trainer.objective.model.remat == REMAT_POLICIES["full"]
 
 
-LONG = 64
-"""Rows of 64 tokens: a four-layer decoder's activations, which recomputation frees, outweigh its state."""
-LONG_BATCH = {"text": jnp.asarray((np.arange(ROWS * (LONG + 1)).reshape(ROWS, LONG + 1) * 7) % 64, jnp.int32)}
+def test_a_fits_start_traces_its_loss_once_for_its_fit_check_and_its_plan(monkeypatch):
+    """A fit's check of the whole state its steps keep (`Trainer._whole_validated`) and its plan's
+    candidates read one trace of its loss's shapes (`StepCompiler.loss_shaped`): a CPU start traced it
+    twice, the fit check's and the plan's, 4.1 s and 0.6 s of a chat-format decision run's 55 s."""
+    trainer = lm()
+    data = Pipeline(Memory({"text": np.asarray(BATCH["text"])})).repeat().batch(ROWS)
+    with Compiles(None) as compiles:
+        trainer.fit(data, steps=1)
+    traced = [program for program in compiles.programs if program.kind == "traced" and program.name == "loss"]
+    assert len(traced) == 1, [program.where for program in traced]
 
 
 def lowered_and_compiled(run: Callable[[], object]) -> tuple[int, int]:
@@ -1551,13 +1708,74 @@ def test_a_fit_whose_step_fits_only_recomputing_searches_it_once_and_compiles_it
         return needs(monkeypatch, trainer, lambda: trained(trainer, steps=0, batch=LONG_BATCH))
 
     recomputing, whole = measured(remat=REMAT_POLICIES["minimal"]), measured()
-    free(monkeypatch, (recomputing + whole) // 2)
+    room = (recomputing + whole) // 2
+    free(monkeypatch, room)
     trainer = lm(**fields, **({"remat": REMAT_POLICIES["minimal"]} if stated else {}))
     data = Pipeline(Memory({"text": np.asarray(LONG_BATCH["text"])})).repeat().batch(ROWS)
     lowered, compiled = lowered_and_compiled(lambda: trainer.fit(data, steps=1))
     probes = trainer.plan["probes"]
     assert trainer.plan["remat"] is not None and probes[-1]["fits"]
-    assert lowered == compiled == len(probes) == (1 if stated else len(probes)), (lowered, compiled, probes)
+    # Each candidate asked lowered and compiled once at most, the plan's executable the step the run takes;
+    # a run that states its rung compiles that alone.
+    assert lowered <= len(probes) and compiled <= len(probes), (lowered, compiled, probes)
+    assert not stated or (lowered, compiled, len(probes)) == (1, 1, 1), probes
     if not stated:
         assert probes[0]["remat"] is None and not probes[0]["fits"]
+        # Only the rungs at or below the plan's recomputation are asked: a step that fits one remat rung
+        # up asks what a climb to it asks, no heavier rung that fits and is not taken.
+        keys = [tuple(json.dumps(probe[name]) for name in ("split", "remat", "head_tile", "head_fused",
+                                                        "xla_defaults", "narrow")) for probe in probes]
+        assert len(set(keys)) == len(keys), keys
+        order = [None, *(remat_record(policy) for policy in DECODER_REMAT[1:])]
+        assert all(order.index(probe["remat"]) <= order.index(trainer.plan["remat"]) for probe in probes), (
+            [probe["remat"] for probe in probes])
 
+
+def test_each_probe_of_a_held_plan_states_its_own_headroom(monkeypatch):
+    """A fit's plan made before its state is placed, its state's bytes beside its step, taken once the
+    state is placed (`StepCompiler.compile`): the headroom the placed devices read is the plan's own
+    probe's, the last that fit at its split, where its search asked a coarser split after it, which missed
+    (the batch whole's miss computes four microbatches; four fit; two, asked after, do not): every probe's
+    headroom says what its verdict says, a missed one's no plan's."""
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+    from dew.distributed.placement import placed_bytes
+
+    state, _, _ = lm().place()
+    beside = placed_bytes(state)
+    fours = needs(monkeypatch, lm(split=4)) + beside
+    halves = needs(monkeypatch, lm(split=2)) + beside
+    assert fours < halves, (fours, halves)
+    free(monkeypatch, (fours + halves) // 2)
+    trainer = lm()
+    trainer.fit(Pipeline(Memory({"text": np.asarray(BATCH["text"])})).repeat().batch(ROWS), steps=1)
+    probes = trainer.plan["probes"]
+    assert trainer.plan["split"] == 4 and [probe["split"] for probe in probes if not probe["fits"]][-1] == 2
+    assert all((probe["headroom"] >= 0) is probe["fits"] for probe in probes), probes
+
+
+def two_products(device) -> jax.stages.Lowered:
+    """`tanh(x @ w) @ w` over two 512 x 512 bfloat16 operands on `device`, lowered: at its second product's
+    peak its parameters and the first product's value are live."""
+    placed = jax.sharding.SingleDeviceSharding(device)
+    tile = jax.ShapeDtypeStruct((512, 512), jnp.bfloat16, sharding=placed)
+    return jax.jit(lambda x, w: jnp.tanh(x @ w) @ w).trace(tile, tile).lower()
+
+
+def test_a_probe_states_the_memory_and_the_peaks_buffers_its_whole_compile_does():
+    """A program compiled for a compile-only H100 as far as its buffer assignment (`probed`, Dew's JAX
+    build's early exit, no code emitted) states the temporaries its whole compile does and the same buffers
+    live at its peak (`Compiled.peak_live`), its two parameters among them: what a plan reads of a layout
+    it probes is the compile's own."""
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import probed
+
+    (device,) = compile_only_gpus("sm90", 1, 40 * 2**30)
+    lowered = two_products(device)
+    whole, probe = report.xla_compiled(lowered, None), probed(lowered)
+    assert probe.memory_analysis().temp_size_in_bytes == whole.memory_analysis().temp_size_in_bytes
+    live = whole.peak_live()
+    assert live is not None and probe.peak_live() == live
+    assert [(buffer.shape, buffer.dtype) for buffer in live if buffer.kind == "parameter"] == [
+        ((512, 512), "bf16")] * 2, live
