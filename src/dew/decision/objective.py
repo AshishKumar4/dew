@@ -420,7 +420,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             # one its rows are laid out by, which names them where the layout names none.
             head, labels = head.labelled(layout.labels, tokenizer)
             layout = dataclasses.replace(layout, labels=labels)
-        self.model = _decision_model(module, head, context_encoder, segments)
+        self.model = _decision_model(module, head, context_encoder)
         if layout is None:
             if not isinstance(module, TokenModel):
                 raise ValueError(
@@ -951,18 +951,13 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         )
 
 
-def _decision_model(module: nn.Module, head: Head, context_encoder: ContextEncoder | ConditionEncoder | None,
-                    segments: int | None) -> DecisionModel:
+def _decision_model(module: nn.Module, head: Head,
+                    context_encoder: ContextEncoder | ConditionEncoder | None) -> DecisionModel:
     """The model over `module` and `head`: a configured context encoder is the context's condition
-    (`DecisionModel.context`), the backbone's own encodings named by `context_encoder`, as a run records them.
-    A configured encoder reads a window's context as one sequence, keeping no two rows' contexts apart, so
-    windows of several rows are refused (ValueError)."""
+    (`DecisionModel.context`), the backbone's own encodings named by `context_encoder`, as a run records
+    them."""
     match context_encoder:
         case ConditionEncoder() as configured:
-            if segments is not None and segments > 1:
-                raise ValueError(f"a configured context encoder ({type(configured).__name__}) reads a "
-                                 "window's context as one sequence, so it keeps no two rows' contexts apart; "
-                                 "set segments=1 (one row a window)")
             return DecisionModel(module, head, "table", Condition(configured, field="context"))
         case _:
             return DecisionModel(module, head, context_encoder or "table")

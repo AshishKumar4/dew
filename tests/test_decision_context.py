@@ -390,14 +390,14 @@ def test_a_decisions_context_is_its_inputs_condition_and_its_check_reads_it():
 def configured(tokens: int = 12) -> DecisionObjective:
     """A decision over the tiny Llama whose context is encoded by a configured encoder (`CharTable`, a
     character table of 16 features) in place of the backbone's own, read by fresh cross-attention before
-    layer 0 at that width, one row a window."""
+    layer 0 at that width, its windows packing rows as a decision's do."""
     from dew.inputs import CharTable
 
     table = CharTable.from_pretrained(tokens=tokens, features=16)
     source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
     blocks = CrossAttention((0,), tokens, context_features=16)
     return DecisionObjective(source.with_cross_attention(blocks, key=0), tokenizer=ByteTokenizer(),
-                             specials=SPECIALS, context_encoder=table, segments=1)
+                             specials=SPECIALS, context_encoder=table)
 
 
 def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly(tmp_path):
@@ -437,16 +437,21 @@ def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly
     assert int(resumed.step) == 3
 
 
-def test_a_configured_context_encoder_packs_one_row_a_window():
-    """A configured context encoder reads a window's context as one sequence, so it keeps no two rows'
-    contexts apart: a decision configured so with windows of several rows is refused, naming the fix."""
-    from dew.inputs import CharTable
+def test_a_configured_encoder_reads_each_packed_rows_context_alone():
+    """A window's rows' contexts, packed end to end, reach a configured encoder each alone
+    (`dew.decision.model._apart`): an encoder whose states mix its tokens (a running sum) gives each token
+    the state its document alone gives it, zeros where no document is, as the backbone's own pass reads
+    each document alone. An encoder over the window's whole context mixed its rows'."""
+    from dew.decision.model import _apart
 
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
-    blocks = CrossAttention((0,), 12, context_features=16)
-    with pytest.raises(ValueError):
-        DecisionObjective(source.with_cross_attention(blocks, key=0), tokenizer=ByteTokenizer(),
-                          specials=SPECIALS, context_encoder=CharTable.from_pretrained(tokens=12), segments=4)
+    def running(tokens, lengths):
+        real = jnp.arange(tokens.shape[1])[None, :] < lengths[:, None]
+        return jnp.cumsum(jnp.where(real, tokens, 0), axis=1)[:, :, None].astype(jnp.float32)
+
+    tokens = jnp.asarray([[3, 4, 5, 6, 7, 0], [8, 9, 1, 0, 0, 0]], jnp.int32)
+    segments = jnp.asarray([[1, 1, 2, 2, 2, 0], [1, 2, 2, 0, 0, 0]], jnp.int32)
+    states = np.asarray(_apart(running, tokens, segments, 3))[:, :, 0]
+    np.testing.assert_array_equal(states, [[3, 7, 5, 11, 18, 0], [8, 9, 10, 0, 0, 0]])
 
 
 def test_the_context_layers_work_is_counted_in_a_conditioned_batch():

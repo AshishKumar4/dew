@@ -11,8 +11,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   run may configure its encoder as any registered condition encoder (`--context-text.encoder`,
   `--context-text.checkpoint`, as a diffusion run's text condition), in place of the backbone's own token table
   or pass: its tokenization reads the context, its states reach the context layers at its width, its weights
-  are the model's `context` module, a run records it and its task rebuilds it. Such a run packs one row a
-  window (`--objective.segments 1`).
+  are the model's `context` module, a run records it and its task rebuilds it.
 - A decision's context longer than its cross-attention's room is now cut to its first tokens and the cut
   told, where it was refused: a run's data report counts it (`data/cut/<corpus>/context`), and a served
   answer states `usage.context_tokens` and `usage.context_kept`.

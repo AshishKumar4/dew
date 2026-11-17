@@ -1,6 +1,6 @@
 """A backbone and a decision head, applied as two modules over one variables tree."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
@@ -14,7 +14,7 @@ from dew.decision.layout import HOWS
 from dew.inputs.condition import BackboneCall, BackboneEncoder
 from dew.inputs.spec import Condition, encode_conditions
 from dew.nn.cross_attention import ContextEncoder, encode_context
-from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs
+from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, ModelInputs
 from dew.nn.inspection import INSPECTED, QK, component, in_parts, observed_maxima
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import EXITS, Looped, TokenModel, VocabularyRows
@@ -110,13 +110,22 @@ class DecisionModel(HeadedModel):
                 return encode_conditions((("context", backbone),), {}, {"context": tokens},
                                          path="DecisionModel", backbone=live)["context"]
             case encoder:
-                width = inputs.context.shape[1]
-                mask = (jnp.arange(width)[None, :] < inputs.context_lengths[:, None]).astype(jnp.int32)
-                tokens = {"input_ids": inputs.context, "attention_mask": mask}
                 weights = {"context": part(variables, "context")["params"]}
-                encoded = encode_conditions((("context", encoder),), weights, {"context": tokens},
-                                            path="DecisionModel")["context"]
-                return {CONTEXT: encoded.hidden, CONTEXT_LENGTHS: inputs.context_lengths}
+
+                def encoded(tokens: jax.Array, lengths: jax.Array) -> jax.Array:
+                    mask = (jnp.arange(tokens.shape[1])[None, :] < lengths[:, None]).astype(jnp.int32)
+                    held = {"context": {"input_ids": tokens, "attention_mask": mask}}
+                    return encode_conditions((("context", encoder),), weights, held,
+                                             path="DecisionModel")["context"].hidden
+
+                if inputs.context_segments is None:
+                    return {CONTEXT: encoded(inputs.context, inputs.context_lengths),
+                            CONTEXT_LENGTHS: inputs.context_lengths}
+                # A window's rows' contexts end to end, each encoded alone (`_apart`), as the backbone's
+                # pass reads each document alone.
+                states = _apart(encoded, inputs.context, inputs.context_segments, inputs.max_segments)
+                return {CONTEXT: states, CONTEXT_LENGTHS: inputs.context_lengths,
+                        CONTEXT_SEGMENTS: inputs.context_segments}
 
     def reads_progress(self) -> bool:
         """Whether its backbone's computation changes over a run (`dew.nn.progress.ReadsProgress`)."""
@@ -447,3 +456,23 @@ def _array(applied: object) -> jax.Array:
         raise TypeError(f"expected an array from the module, got {type(applied).__name__}")
     return applied
 
+
+def _apart(encoded: Callable[[jax.Array, jax.Array], jax.Array], tokens: jax.Array, segments: jax.Array,
+           documents: int) -> jax.Array:
+    """`encoded` (tokens `[N, C]` and lengths `[N]` to states `[N, C, F]`) over each of a window's packed
+    documents alone: the tokens of each document `segments` `[B, C]` names (1 to `documents`, 0 none) moved
+    to a row of their own, encoded, and their states moved back to where the tokens stood, zeros where none
+    does; so a configured encoder keeps a window's rows' contexts apart, as the backbone's pass does."""
+    batch, width = tokens.shape
+    owned = segments[:, :, None] == jnp.arange(1, documents + 1)  # [B, C, S]
+    place = jnp.sum((jnp.cumsum(owned, axis=1) - 1) * owned, axis=-1)  # each token's place in its document
+    document = jnp.clip(segments - 1, 0, documents - 1)
+    rows = jnp.broadcast_to(jnp.arange(batch)[:, None], (batch, width))
+    # A token of no document is dropped (an index past the documents').
+    target = jnp.where(segments > 0, document, documents)
+    apart = jnp.zeros((batch, documents, width), tokens.dtype)
+    apart = apart.at[rows, target, place].set(tokens, mode="drop")
+    states = encoded(apart.reshape(batch * documents, width),
+                     jnp.sum(owned, axis=1).reshape(batch * documents))
+    states = states.reshape(batch, documents, width, -1)[rows, document, place]
+    return jnp.where((segments > 0)[:, :, None], states, 0).astype(states.dtype)

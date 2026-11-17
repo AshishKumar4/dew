@@ -217,8 +217,8 @@ class DecisionRunConfig(DecoderRunConfig):
     context_text: TextCondition | None = dataclasses.field(default=None, metadata={ADDED: True})
     """A configured encoder of the context in place of the backbone's own (`DecisionModel.context`): any
     registered condition encoder and its checkpoint, as a diffusion run's text condition names one, its
-    tokenization the context's, its states read by the cross-attention at its own width; one row a window
-    (`--objective.segments 1`). With `context_layers` alone."""
+    tokenization the context's, each row's context encoded alone, its states read by the cross-attention at
+    its own width. With `context_layers` alone."""
     context_form: Literal["idefics", "shared"] = "idefics"
     """The block each context layer runs: IDEFICS's gated block, an attention and a
     feed-forward of its own drawn beside the layer (`CrossAttention`), or the
