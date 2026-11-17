@@ -398,8 +398,10 @@ def test_a_tree_call_rounds_a_memorys_gradients_at_each_tokens_place_along_its_p
     pytest.importorskip("qwix")
     from dew.quantization import Quantization
 
+    # A stack of the memory alone, so the two calls differ in nothing but how the memory reads the tokens.
+    stack = hybrid_model("memory", unfolded=True).clone(num_layers=1, layer_types=("linear_attention",))
     model = Quantization(patterns=(r"(.*/)?head_\d+/.*",), bwd_qtype="int8",
-                         bwd_stochastic_rounding="uniform").apply(hybrid_model("memory", unfolded=True))
+                         bwd_stochastic_rounding="uniform").apply(stack)
     tree, rows = (-1, 0, 1), 2
     ids = jax.random.randint(jax.random.key(4527), (rows, PROMPT + len(tree)), 0, VOCAB)
     params = nn.unbox(model.init(jax.random.key(1), ids))
