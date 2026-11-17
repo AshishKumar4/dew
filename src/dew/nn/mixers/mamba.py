@@ -40,7 +40,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.mesh import SEQUENCE_AXIS, LayoutRefused
+from dew.mesh import SEQUENCE_AXIS
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
@@ -48,12 +48,12 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.kernels import chunked_launch, recurrence_algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY
 from dew.nn.kv_cache import Opened, compute_dtype
-from dew.nn.linear import DepthwiseConv1d, held_scan, over_sequence, scan_cache, sequence_conv
+from dew.nn.linear import DepthwiseConv1d, held_scan, over_sequence, scan_cache, sequence_conv, sequence_split
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, accurate_exp, at_least_fp32, float32_dot_general, silu, softplus
 from dew.nn.residuals import Residual
-from dew.nn.sharding import rows_like, sequence_shards
+from dew.nn.sharding import rows_like
 from dew.nn.ssm import affine_spans
 
 CHUNK_SIZE = 64
@@ -236,11 +236,7 @@ class Mamba(nn.Module):
         batch, length, _ = x.shape
         tokens = coordinates_of(attention_metadata, batch, length)
         valid = tokens.valid
-        shards = sequence_shards()
-        if shards > 1 and decode and tokens.forks is None:
-            raise LayoutRefused(
-                f"mamba under a sequence axis of {shards} runs whole training sequences; a decode step "
-                "holds one state per row. Decode on a mesh with sequence=1.")
+        shards = sequence_split(decode, tokens)
         if valid is not None:
             x = jnp.where(valid[:, :, None], x, 0)
         mixed, gate = jnp.split(self.in_proj(x), 2, axis=-1)
@@ -248,7 +244,7 @@ class Mamba(nn.Module):
         # casts them, or in the model's own dtype where it is wider.
         wide = at_least_fp32(mixed.dtype)
         taps, bias = self.conv1d()
-        if shards > 1 and tokens.forks is None:
+        if shards > 1:
             # Each shard convolves its slice reading the real tokens before it from the earlier ones
             # (`sequence_conv`); the step, B and C come token by token outside; each shard scans from
             # zero, then from the state the earlier ones leave it (`_sequence_scan`), as Mamba-2's does.

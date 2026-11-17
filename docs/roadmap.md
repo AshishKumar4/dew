@@ -88,7 +88,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Training and serving efficiency. [3330, 1880, 5292]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
-- Mamba-1 and Mamba-2 refuse a decode step under a mesh sequence axis above one (nn/mixers/mamba.py and mamba2.py: LayoutRefused 'runs whole training sequences;…. [7400]
+- A served rollout's or episode cohort's server pages its cache wherever pages serve the policy as it draws (serving.served_layout, theme 15), at every prompt…. [7420]
 
 ## Algebra
 

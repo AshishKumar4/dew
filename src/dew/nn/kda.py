@@ -37,7 +37,6 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.mesh import LayoutRefused
 from dew.nn.dense import Dense
 
 from .flops import conv_flops, delta_flops, projection_flops
@@ -54,12 +53,13 @@ from .linear import (
     held_scan,
     over_sequence,
     scan_cache,
+    sequence_split,
     split_delta_rule,
 )
 from .mixer_base import MixerBase, MixerContext
 from .precision import at_least_fp32, float32_dot_general, softplus
 from .residuals import DELTA_RULE_RESIDUALS
-from .sharding import LogicalAxes, sequence_shards
+from .sharding import LogicalAxes
 
 KDA_AXES: dict[str, LogicalAxes] = {
     # The attention mixer's projections under its names (`ATTENTION_AXES`).
@@ -242,12 +242,8 @@ class KimiDeltaAttention(nn.Module):
         # beta a sigmoid's, of the queries and keys the conv l2-normalized (`causal_conv1d`'s pieces).
         ported = S > 1 and kernel_routed(rows, keys, values, g, beta, write_bound=1.0)
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
-        shards = sequence_shards()
-        if shards > 1 and not forked:
-            if decode:
-                raise LayoutRefused(f"Kimi delta attention under a sequence axis of {shards} runs whole "
-                                    f"training sequences; a decode step holds one state per row. Decode on a "
-                                    f"mesh with sequence=1.")
+        shards = sequence_split(decode, tokens)
+        if shards > 1:
             rule = functools.partial(chunk_gated_delta_rule, chunk_size=self.chunk_size,
                                      max_segments=tokens.max_segments, write_bound=1.0)
             out = over_sequence(functools.partial(split_delta_rule, widths=(self.head_dim,) * 3, parts=heads,

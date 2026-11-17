@@ -281,17 +281,32 @@ def _head_changes(first: Mapping[str, object], other: Mapping[str, object]) -> l
     return [f"head.{name}" for name in registry.computing_differences(
         registry.imported(str(first["class"])), *stated, kept=(_records.NUMBERS,))]
 
-def _tokenizer_held(settings: "DecideSettings", run: str) -> Mapping[str, str] | str | None:
-    """What the text tokenizer of the run in `run` is, which runs compare by: the hashes of the files it
-    reads (`PinnedTokenizer.files`), whether its record states them or was saved before records did
-    (`dew.inference.tasks.saved_tokenizer`); the byte vocabulary, which has no files, by its name."""
+def _tokenizer_held(settings: "DecideSettings", run: str) -> "Tokenizer | str | None":
+    """The text tokenizer of the run in `run`, which runs compare by (`_same_tokenizer`): whether its record
+    states its files or was saved before records did (`dew.inference.tasks.saved_tokenizer`); the byte
+    vocabulary, which has no files, by its name."""
     from dew.data.text import HFTokenizer
     from dew.inference.tasks import saved_tokenizer
 
     if settings.tokenizer is None:
         return None
     found = saved_tokenizer(settings.tokenizer, settings.tokenizer_files, run)
-    return found.pinned.files if isinstance(found, HFTokenizer) else settings.tokenizer
+    return found if isinstance(found, HFTokenizer) else settings.tokenizer
+
+
+def _same_tokenizer(one: "Tokenizer | str | None", other: "Tokenizer | str | None") -> bool:
+    """Whether two runs read one tokenizer: their files' hashes alike (`PinnedTokenizer.files`), else their
+    files each written again by this host's transformers alike (`dew.data.text.canonical_files`), which a
+    release exported before releases copied their run's files (`HFTokenizer.save_pretrained`) is read by:
+    transformers rewrote its tokenizer.json, so its hashes differ from its run's though it is one
+    tokenizer, which a run continued from it averages with its start by. A byte vocabulary by its name."""
+    from dew.data.text import HFTokenizer, canonical_files
+
+    match one, other:
+        case HFTokenizer(), HFTokenizer():
+            return one.pinned.files == other.pinned.files or canonical_files(one) == canonical_files(other)
+        case _:
+            return one == other
 
 
 @dataclass(frozen=True)
@@ -658,7 +673,7 @@ class Decide(SavedRunTask, InItsForm):
                          and entry.name not in ("head", "tokenizer", "tokenizer_files")
                          and getattr(own, entry.name) != getattr(settings[0], entry.name)]
             differing += _head_changes(settings[0].head, own.head)
-            differing += ["tokenizer"] if held != tokenizers[0] else []
+            differing += [] if _same_tokenizer(held, tokenizers[0]) else ["tokenizer"]
             if differing:
                 raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
                                  f"{', '.join(differing)}, so their weights are not one task's to average")
