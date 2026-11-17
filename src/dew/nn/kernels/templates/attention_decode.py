@@ -33,7 +33,7 @@ import jax.numpy as jnp
 from jax.extend import core as jaxpr_core
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, report
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic
 from dew.nn.kernels.templates.attention import (
     Hooks,
     Initial,
@@ -217,20 +217,24 @@ def _certified_stream(op: attention_mosaic.MosaicForward, ba, target: generation
                       ) -> attention_mosaic.Tiles | None:
     """The config a decode launch of `ba` runs, which its plan pins: the forward's own as certification holds
     it (`taken`: a pin, a tuned pick, else the first derived config whose kernels hold), at the key tile a
-    decode step's few rows a key head stream at (`MosaicForward.streaming`), that tile's kernels certified in
-    turn: one that spills is refused (`report.refuse_launch`, which `streaming`'s legality reads), so the walk
-    streams at its next tile, else at the certified config itself. None where certification refuses every
-    config. A pinned raw proposal compiled uncertified (row 7259)."""
+    decode step's few rows a key head stream at (`MosaicForward.streaming`), that tile certified in turn
+    (`KernelOp._certified`): one that spills is refused, which `streaming`'s legality reads, so the launch
+    offers its next tile, a held rung of it taken first, else `taken`'s config itself, uncertified here as a
+    pick is. None where certification refuses every config. A pinned raw proposal compiled uncertified (row
+    7259)."""
     config = op.taken(ba)
     if not isinstance(config, attention_mosaic.Tiles):
         return None
-    seen = set()
-    while (streamed := op.streaming(ba, config, target)) != config and streamed not in seen:
-        seen.add(streamed)
-        if not (spilling := report.certified(op, ba, streamed)):
-            return streamed
-        report.refuse_launch(op, ba, streamed, {binary.kernel for binary in spilling})
-    return config
+
+    def streamed() -> attention_mosaic.Tiles | None:
+        # Its next streamed tile, none past the taken config itself: a pin or tuned pick is a measured choice
+        # `_certified` leaves to its program's compile (`report.settled`), a derived one `taken` certified.
+        tile = op.streaming(ba, config, target)
+        return None if tile == config else tile
+
+    first = streamed()
+    found = None if first is None else op._certified(ba, first, offered=streamed)
+    return found if isinstance(found, attention_mosaic.Tiles) else config
 
 
 def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | None) -> algebra.Forward:

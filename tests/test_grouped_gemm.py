@@ -1216,7 +1216,7 @@ def _dense_route(generation_name: str, made: str, matrix: tuple[int, int], rows:
 @pytest.mark.parametrize(("generation_name", "made", "matrix", "kernel"), TIMED, ids=_named)
 def test_a_timed_dense_product_takes_the_route_its_receipt_timed_fastest(generation_name, made, matrix,
                                                                           kernel):
-    """A dense product of a matrix its family's receipts timed is a cell of its own (`grouped_matmul.Kind`'s
+    """A dense product of a matrix its family's receipts timed is a cell of its own (`grouped_cells.Kind`'s
     `matrix`, `MEASURED`), which the route its receipt timed fastest holds (`DECLARED`): the template where it
     won, XLA's dot where it lost; a matrix no receipt timed takes its kind's cell, as before (owner, ops
     361caffc)."""
@@ -1225,7 +1225,7 @@ def test_a_timed_dense_product_takes_the_route_its_receipt_timed_fastest(generat
 
 @pytest.mark.parametrize("made", ("forward", "input_gradient", "kernel_gradient"))
 def test_a_timed_matrix_over_rows_no_receipt_timed_takes_its_kinds_cell(made):
-    """A receipt is evidence for the rows it timed alone (`grouped_matmul.Timed`, row 6794): the 4B key's
+    """A receipt is evidence for the rows it timed alone (`grouped_cells.Timed`, row 6794): the 4B key's
     matrix, whose cells the template holds on Hopper at 24,576 tokens, takes its kind's cell, XLA's dot, over
     a fine-tune row's 2,048, where the template's launches made the step's products 1.75 ms slower."""
     assert _dense_route("sm90", made, (2560, 1024), 24576) == "mosaic"

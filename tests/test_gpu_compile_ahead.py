@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from ahead_programs import arguments, programs
 
+from dew._devices import pool_share
 from dew.nn.kernels.generation import assumed, built_target
 from dew.nn.kernels.options import owned_program
 from dew.training.ahead import BuildTarget, compiled_in, dumps
@@ -245,10 +246,13 @@ def test_a_run_compiled_ahead_for_this_gpu_compiles_nothing_on_it_and_is_refused
     for name, text in (("quiet_build.py", QUIET_BUILD), ("quiet.py", QUIET), ("refused.py", TRAIN_REFUSED)):
         (tmp_path / name).write_text(text)
     environment = environment_of(tmp_path)
-    # Its memory stated as the GPU's allocator limit: a plan for no more than the GPU holds, which it loads.
+    # Its memory stated as the GPU's own (`CompileAhead.memory`, a capacity), which the build takes its pool's
+    # share of as the GPU's allocator does: the attached GPU's allocator limit (`own.memory`) is that share
+    # already, so the GPU's memory is it over the share (row 6717: stated as the limit, the build planned
+    # for the share of the share, 2.0 GB of an 80 GB GPU at the tier's fraction).
     assert own.memory is not None
     build = [sys.executable, str(tmp_path / "quiet_build.py"), own.generation, str(tmp_path / "step.dew-aot"),
-             str(own.multiprocessors), str(own.memory)]
+             str(own.multiprocessors), str(round(own.memory / pool_share()))]
     subprocess.run(build, env={**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}, check=True)
     subprocess.run([sys.executable, str(tmp_path / "quiet.py"), str(tmp_path / "step.dew-aot")],
                    env=environment, check=True)
@@ -284,3 +288,23 @@ def test_a_deviceless_compile_stores_nothing_a_device_run_reads(tmp_path):
     # The GPU hidden as well: a process that sees one of the topology's own compiles through it, tuned.
     assert ran("compile", generation, JAX_PLATFORMS="cpu", CUDA_VISIBLE_DEVICES="") == {"read": 0}
     assert ran("run") == {"read": 0}
+
+
+def test_a_fresh_state_placed_on_a_gpu_is_bitwise_its_draws_under_jaxs_default_lowering():
+    """A fresh run's state placed on the GPU (`Trainer.place`, its start program drawn through loops over
+    threefry's rounds, `dew.training.distributed.drawing`) is bit for bit the state its initializer draws
+    jitted under JAX's default lowering, every round unrolled: the looped draw changes the start program's
+    compile alone (row 6740)."""
+    import optax
+
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import Trainer
+
+    model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
+                         mlp_features=64, max_seq_len=16)
+    trainer = Trainer(LMObjective(model, 15), optax.adam(1e-3), key=jax.random.key(3))
+    placed = trainer.place()[0]
+    drawn = jax.jit(lambda key: trainer.initial_state(None, key))(trainer.key)
+    for mine, theirs in zip(jax.tree.leaves(placed.variables), jax.tree.leaves(drawn.variables), strict=True):
+        assert np.array_equal(np.asarray(mine), np.asarray(theirs))

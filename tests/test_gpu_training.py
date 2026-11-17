@@ -7,8 +7,8 @@ directory, rung records and data cache of its own:
   a live run takes the saved offline split before it loads the executable; a watched run handed its step and
   sampled step compiles neither (test_compile_ahead).
 - A recorded plan settles its kernel launches without lowering the step for them; a step guided by its
-  profile is the step the run takes, as exact; a step that fits once its delta rule recomputes its memory
-  plans at that rung (test_plan).
+  profile is the step the run takes, as exact; a step under its room without recomputation plans a step
+  that fits there (test_plan).
 - A CUDA LM repeats and resumes bit for bit under deterministic ops; a convolution model trains to the bit
   again after another run measured kernels into its cache (test_trainer).
 - An accumulating step updates the optimizer in its commit alone (test_training_transactions).
@@ -57,7 +57,7 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
     settled, guided, half, failed = (
         plan.a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them,
         plan.a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly,
-        plan.a_step_that_fits_once_its_delta_rule_recomputes_its_memory_plans_at_that_rung,
+        plan.a_step_under_its_room_without_recomputation_plans_a_step_that_fits_there,
         plan.test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool)
     admitted = communicators.a_program_on_this_gpu_is_admitted_against_the_room_its_pool_left
     loaded = communicators.a_program_loaded_from_the_compilation_cache_is_admitted_from_its_kept_communicators
@@ -75,7 +75,7 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
              in_own(settled, "settled")),
         Cell("a step guided by its profile is the step the run takes and trains as exactly",
              in_own(guided, "guided")),
-        Cell("a step that fits once its delta rule recomputes its memory plans at that rung",
+        Cell("a step under its room without recomputation plans a step that fits there",
              in_own(half, "half")),
         Cell("a step that fails on its first run states the room outside XLA's pool",
              in_own(failed, "failed")),

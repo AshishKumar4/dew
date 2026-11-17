@@ -7,8 +7,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from check1_wire import LATER, QUALIFY
-from map_judge import LaterUnits, site_id
-from reference_error import MissingTruth, StaleSeeds, as_given, assert_as_exact, seeds_for, stored_truths
+from reference_error import StaleSeeds, as_given, assert_as_exact, seeds_for
+from truths_ahead import compiled_truths
 
 from dew.parity_stages import staged_units
 
@@ -61,17 +61,17 @@ def test_a_qualification_run_fails_a_site_that_declares_fewer_seeds_than_it_size
 
 
 def test_a_site_judged_from_its_prepared_truths_sizes_itself_in_its_run(monkeypatch, tmp_path):
-    """A site judged under a prepared store (a GPU flow's: its prepare writes its verdict's truths, its run
-    reads them) sizes itself in its run under `QUALIFY`, its sizing draws' truths its own: it records the
-    count it sizes unprepared, and raises StaleSeeds where it declares fewer."""
+    """A site judged under programs compiled ahead (a GPU flow's: its prepare compiles its truths' programs,
+    its run computes its truths with them) sizes itself in its run under `QUALIFY`, its sizing draws' truths
+    its own: it records the count it sizes unprepared, and raises StaleSeeds where it declares fewer."""
     dew, reference, truth, draw = site()
     sized = seeds_for(reference, draw, LABEL, dew_fn=dew, truth_fn=truth)
 
     def run(declared: int) -> None:
         store = tmp_path / str(declared)
-        with stored_truths(store, prepare=True, stamp="here"):
+        with compiled_truths(store, prepare=True, stamp="here"):
             assert_as_exact(dew, reference, draw, LABEL, seeds=declared, truth_fn=truth)
-        with monkeypatch.context() as qualifying, stored_truths(store, prepare=False, stamp="here"):
+        with monkeypatch.context() as qualifying, compiled_truths(store, prepare=False, stamp="here"):
             qualifying.setenv(QUALIFY, str(tmp_path / "qualified.jsonl"))
             assert_as_exact(dew, reference, draw, LABEL, seeds=declared, truth_fn=truth)
 
@@ -83,36 +83,27 @@ def test_a_site_judged_from_its_prepared_truths_sizes_itself_in_its_run(monkeypa
     assert found == [(sized, sized), (sized // 2, sized)]
 
 
-@pytest.mark.parametrize("repeated", [False, True], ids=["drawn apart", "a draw repeated"])
-def test_a_prepared_site_its_first_stage_leaves_undecided_asks_for_its_second_stage(tmp_path, monkeypatch,
-                                                                                    repeated):
-    """A site under prepared truths (a GPU flow's) whose first stage leaves it undecided (this one sizes far
-    above the 64 it declares): its prepare stores its first stage's draws alone; its run asks a later job
-    for its second stage where that stage begins (`map_judge.ask_later`: its ask, every unit its stages
-    take, appended to `check1_wire.LATER`, and `LaterUnits`), or with no channel to ask is refused
-    (`MissingTruth`), its first stage's inputs drawn apart or one drawn twice (its store then holding one
-    truth fewer than its stage's draws); and a follow-up given that ask (`check1_wire.ASKED`'s sites)
-    prepares every draw and judges it over both stages."""
-    dew, reference, truth, drawn = site()
+def test_a_compiled_sites_run_draws_its_second_stage_from_its_programs(tmp_path, monkeypatch):
+    """A site under programs compiled ahead (a GPU flow's, `truths_ahead.compiled_truths`) whose first stage
+    leaves it undecided (this one sizes far above the 64 it declares) draws its second stage in its run, its
+    truths computed by the program its prepare compiled for its draws' shape: no later job is asked
+    (`check1_wire.LATER` set, nothing appended to it), and it passes as a site computing its own truths
+    passes."""
+    dew, reference, _, drawn = site()
+    seeds = []
 
     def draw(seed):
-        return drawn(0 if repeated and seed == 1 else seed)
+        seeds.append(seed)
+        return drawn(seed)
 
-    first, follow_up, asks = tmp_path / "first", tmp_path / "follow-up", tmp_path / "later.jsonl"
-    with stored_truths(first, prepare=True, stamp="here"):
-        assert_as_exact(dew, reference, draw, LABEL, seeds=64, truth_fn=truth)
-    assert len(list(first.rglob("*.truth"))) == (63 if repeated else 64)
-    # Where no later job can be asked (no LATER), refused: its second stage was never prepared.
-    monkeypatch.delenv(LATER, raising=False)
-    with stored_truths(first, prepare=False, stamp="here"), pytest.raises(MissingTruth):
-        assert_as_exact(dew, reference, draw, LABEL, seeds=64, truth_fn=truth)
-    assert not asks.exists()
+    def truth(x, w):
+        return jnp.dot(x, w)
+
+    asks, programs = tmp_path / "later.jsonl", tmp_path / "programs"
     monkeypatch.setenv(LATER, str(asks))
-    with stored_truths(first, prepare=False, stamp="here"), pytest.raises(LaterUnits):
+    with compiled_truths(programs, prepare=True, stamp="here"):
         assert_as_exact(dew, reference, draw, LABEL, seeds=64, truth_fn=truth)
-    (ask,) = [json.loads(line) for line in asks.read_text().splitlines()]
-    assert (ask["site"], ask["from"], ask["to"]) == (site_id(LABEL), 64, staged_units(64))
-    with stored_truths(follow_up, prepare=True, stamp="here", later={ask["site"]}):
+    seeds.clear()
+    with compiled_truths(programs, prepare=False, stamp="here"):
         assert_as_exact(dew, reference, draw, LABEL, seeds=64, truth_fn=truth)
-    with stored_truths(follow_up, prepare=False, stamp="here", later={ask["site"]}):
-        assert_as_exact(dew, reference, draw, LABEL, seeds=64, truth_fn=truth)
+    assert not asks.exists() and max(seeds) >= 64

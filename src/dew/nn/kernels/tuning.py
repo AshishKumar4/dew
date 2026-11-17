@@ -54,7 +54,6 @@ import functools
 import hashlib
 import importlib
 import inspect
-import itertools
 import json
 import logging
 import os
@@ -605,22 +604,27 @@ class KernelOp(tokamax.Op):
             return None if derived is None else self._certified(ba, derived)
         return pick.fastest_config
 
-    def _certified(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable | None:
+    def _certified(self, ba: tokamax.BoundArguments, config: Hashable, *,
+                   offered: Callable[[], Hashable | None] | None = None) -> Hashable | None:
         """The derived `config`, or, where its kernels spill as the GPU assembles them alone
         (`report.certified`), each refused (`report.refuse_launch`, so its legality
         refuses it) and its misses recorded (`report.missed`: stepped where the next was derived),
-        and the next derived in turn (`remaining`): the first whose kernels hold, None where the derivation
-        offers none past the refused. A derivation that offers a refused config again (its legality reads no
-        refusal) has it kept, its program's compile left to read it (`report.settled`). A pinned or a tuned
-        pick is a measured choice, not certified here: its program's compile reads it."""
+        and the next in turn: a rung of it that holds (`_climbed`), else what the launch offers now
+        (`offered`, its derivation's `remaining` unless a caller launches another form of its configs, a
+        decode's streamed tile): the first whose kernels hold, None where nothing is offered past the
+        refused. An offer of a refused config again (its legality reads no refusal) has it kept, its
+        program's compile left to read it (`report.settled`). A pinned or a tuned pick is a measured
+        choice, not certified here: its program's compile reads it."""
+        offered = offered or functools.partial(self.remaining, ba)
         seen = set()
         while config not in seen and (spilling := report.certified(self, ba, config)):
             seen.add(config)
             report.refuse_launch(self, ba, config, {binary.kernel for binary in spilling},
                                  {binary.kernel: binary.spilled_in for binary in spilling})
-            # Each refused config stepped to the next refused one; the last, to what the derivation offers.
-            refused = [(config, spilling), *self._climbed(ba, config, spilling, seen)]
-            stepped = self.remaining(ba)
+            # Each refused config stepped to the next refused one; the last, to its held rung or the offer.
+            climbed, held = self._climbed(ba, config, spilling, seen)
+            refused = [(config, spilling), *climbed]
+            stepped = held if held is not None else offered()
             for (refusal, its), later in zip(refused, [*refused[1:], None], strict=True):
                 report.missed(self, ba, refusal, its, stepped=later is not None or (
                     stepped is not None and stepped not in seen))
@@ -651,33 +655,31 @@ class KernelOp(tokamax.Op):
         return iter(())
 
     def _climbed(self, ba: tokamax.BoundArguments, config: Hashable, spilling: tuple, seen: set
-                 ) -> list[tuple[Hashable, tuple]]:
-        """`config`'s rungs (`rungs`), its kernels `spilling`, certified until one holds, which the derivation
-        then takes: the first alone (a ladder's top, which usually holds), then a round at a time
-        (`report.certified_together`, `report.rung_round` a round); each rung before it refused, returned with
-        its spilling kernels for its misses (`_certified`'s); a rung of the same round after it that spilled
-        recorded as a miss stepped nowhere, neither refused nor taken. A rung certification cannot read
-        (`report.certified`'s None: the assembler rejects it, or XLA compiles it nowhere alone) never holds:
-        it is refused for the kernels that spilled at `config`. The assembler reports whether a config holds,
-        never what it would need (its stack frame stays a word or two at every rung short of one that holds),
-        so rungs are asked, not computed."""
-        rungs, size, refused = self.rungs(ba, config), 1, []
+                 ) -> tuple[list[tuple[Hashable, tuple]], Hashable | None]:
+        """`config`'s rungs (`rungs`), its kernels `spilling`, certified one after another until one holds,
+        which `_certified` takes next whatever its launch offers; each rung before it refused, returned with
+        its spilling kernels for its misses (`_certified`'s), beside the rung that held (None where none
+        did). In turn, not in threaded rounds: a rung's certification is mostly its launch's trace and
+        Mosaic GPU lowering, Python that holds the GIL, so a round of N rungs cost N rungs' work however
+        many threads ran it, and every rung past the one that held was spent for nothing (a 4B decision
+        step's start on a GH200 certified 13 rungs of one reverse launch at once, each 15 s traced and 17 s
+        lowered under that contention, M-MC-18 at 54416de4b; row 7287: an sm80 key-bias backward 161.3 s in
+        turn against 189.5 s in four rounds). A rung certification cannot read (`report.certified`'s None:
+        the assembler rejects it, or XLA compiles it nowhere alone) never holds: it is refused for the
+        kernels that spilled at `config`. The assembler reports whether a config holds, never what it would
+        need (its stack frame stays a word or two at every rung short of one that holds), so rungs are
+        asked, not computed."""
+        refused = []
         named = {binary.kernel for binary in spilling}
-        while batch := list(itertools.islice(rungs, size)):
-            answers = list(zip(batch, report.certified_together(self, ba, batch), strict=True))
-            held = next((index for index, (_, found) in enumerate(answers) if found == ()), None)
-            for rung, found in answers[:held]:
-                seen.add(rung)
-                report.refuse_launch(self, ba, rung, {binary.kernel for binary in found} if found else named,
-                                     {binary.kernel: binary.spilled_in for binary in found or ()})
-                refused.append((rung, found or ()))
-            if held is not None:
-                for rung, found in answers[held + 1:]:
-                    if found:
-                        report.missed(self, ba, rung, found, stepped=False)
-                return refused
-            size = report.rung_round()
-        return refused
+        for rung in self.rungs(ba, config):
+            found = report.certified(self, ba, rung)
+            if found == ():
+                return refused, rung
+            seen.add(rung)
+            report.refuse_launch(self, ba, rung, {binary.kernel for binary in found} if found else named,
+                                 {binary.kernel: binary.spilled_in for binary in found or ()})
+            refused.append((rung, found or ()))
+        return refused, None
 
     def variants(self, ba: tokamax.BoundArguments) -> tuple[Hashable, ...]:
         """The configs an opt-in tuning run (`tune`) times for `ba`: the launch's heuristic alone, or, where
@@ -1109,12 +1111,11 @@ def _candidates(op: KernelOp, ba: tokamax.BoundArguments) -> list[Hashable]:
     space the call takes (`KernelOp.pinnable`: one it refuses, measured, raised `Unpinnable` and ended the
     run, row 5326, a Triton forward's 128 x 128 tile holding 320 registers a thread) and the GPU's assembler
     does not refuse alone, as a run's derivation certifies a config (`report.certified`: it spills, or
-    serializes its warpgroup MMAs), all certified in one round; a config certification cannot compile alone
-    stays, its own compile the judge. Uncertified, a spilling config was timed, as slow as its spills, and
-    could be chosen."""
+    serializes its warpgroup MMAs), each certified in turn, as a ladder's rungs are (`KernelOp._climbed`); a
+    config certification cannot compile alone stays, its own compile the judge. Uncertified, a spilling config
+    was timed, as slow as its spills, and could be chosen."""
     pinnable = [config for config in ba.autotuning_configs if op.pinnable(ba, op.completed(ba, config))]
-    refused = report.certified_together(op, ba, [op.completed(ba, config) for config in pinnable])
-    return [config for config, spilling in zip(pinnable, refused, strict=True) if not spilling]
+    return [config for config in pinnable if not report.certified(op, ba, op.completed(ba, config))]
 
 
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:

@@ -60,20 +60,16 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
-import contextlib
-import contextvars
 import dataclasses
 import functools
 import hashlib
 import json
 import os
-import pickle
-import shutil
 import time
-from collections.abc import Callable, Collection, Mapping, Sequence
-from pathlib import Path
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, NamedTuple
 
+import arm_arithmetic
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -92,11 +88,13 @@ from arm_forms import (
 )
 from check1_judge import SWITCHED, Verdict, _judged_pooled, _logged, _narrow, _verdicts
 from check1_wire import CENSUS, QUALIFY
-from float64_terms import evaluated_on, float64_terms, lowered, scan_groups
-from map_judge import ask_later, drawing, judging, record_units, site_id
+from float64_terms import POWER, evaluated, evaluated_on, float64_terms, lowered, scan_groups, static, traced
+from map_judge import drawing, judging, record_units
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
+from truths_ahead import COMPILED, CompiledTruths, judged, named, running
 
 from dew._accuracy import distance, reduction_bound, within
+from dew.algebra import passes
 from dew.nn import programs
 from dew.parity import (
     CONFIDENCE,
@@ -833,144 +831,102 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
                            f"depends on more than them")
 
 
-class MissingTruth(AssertionError):
-    """A check-1 site under a store of prepared truths (`stored_truths`) whose truth its prepare did not
-    write, or wrote for another commit or other inputs: a red with its reason, never a truth computed here
-    in its place (the GPU tier's run computes none of a verdict's, row 5461)."""
-
-
-@dataclasses.dataclass(frozen=True)
-class TruthStore:
-    """Prepared float64 truths (`stored_truths`): each check-1 site's under `directory`, a directory a site
-    by its label's digest, holding a file a draw its two stages may take, its truth and terms, named by the
-    digest of the draw's widened inputs, and the site's own record (`SITE`): its label, whether it is sized
-    by terms, and the `stamp` it was prepared under (the commit and JAX), which a run reads against its own.
-    A draw is written as it is computed, so a site's prepare holds one draw's truth at a time; its record is
-    written last, so a prepare cut short leaves none a run reads."""
-
-    directory: Path
-    prepare: bool
-    stamp: str
-    later: frozenset[str] = frozenset()
-    """The sites (`map_judge.site_id`) a follow-up job draws the second stage of (`check1_wire.ASKED`): each
-    prepared over every draw its stages may take, where any other is prepared over its first stage's
-    alone."""
-    prepared: set[str] = dataclasses.field(default_factory=set, compare=False)
-
-    SITE = "site.json"
-
-    def path(self, label: str) -> Path:
-        return self.directory / hashlib.sha256(label.encode()).hexdigest()[:32]
-
-    @staticmethod
-    def drawn(site: Path, inputs) -> Path:
-        """The file of the draw `inputs` (its widened inputs, `_inputs_digest`) in the site's directory."""
-        return site / f"{int(_inputs_digest(inputs)):016x}.truth"
-
-    def begun(self, label: str) -> Path:
-        """The site's directory, emptied of an earlier prepare's draws; refused for a label this store has
-        prepared already, whose truths a second site of it would replace."""
-        if label in self.prepared:
-            raise ValueError(f"{label}: two sites of one label in one store of prepared truths, where the "
-                             "second would replace the first's: each needs its own")
-        self.prepared.add(label)
-        site = self.path(label)
-        if site.exists():
-            shutil.rmtree(site)
-        site.mkdir(parents=True)
-        return site
-
-    def draws(self, label: str, seeds: int) -> int:
-        """The draws the site's prepare computes: every one its stages may take where a follow-up draws its
-        second stage (`later`), else its first stage's, the stage a site its census decides at (row 6198)."""
-        return staged_units(seeds) if site_id(label) in self.later else seeds
-
-    def finished(self, label: str, terms: bool) -> None:
-        (self.path(label) / self.SITE).write_text(json.dumps({"stamp": self.stamp, "label": label,
-                                                              "terms": terms}))
-
-    def site(self, label: str) -> tuple[Callable, Callable | bool]:
-        """The site's truth and its terms as the gate takes them (`assert_as_exact`'s `truth_fn`, run as
-        given, and `terms`): each the prepared value of the draw's widened inputs; refused, as a red
-        (`MissingTruth`), where the site has none prepared for this stamp or for a draw it takes."""
-        site = self.path(label)
-        if not (site / self.SITE).is_file():
-            raise MissingTruth(f"{label}: no truth prepared under {self.directory} (the tier's prepare did "
-                               f"not reach this site)")
-        stored = json.loads((site / self.SITE).read_text())
-        if stored["stamp"] != self.stamp:
-            raise MissingTruth(f"{label}: its truths were prepared at {stored['stamp']}, not this run's "
-                               f"{self.stamp}")
-
-        @functools.lru_cache(maxsize=1)
-        def read(path: Path):
-            return pickle.loads(path.read_bytes())
-
-        def prepared(inputs, part: int):
-            path = self.drawn(site, inputs)
-            if not path.is_file():
-                raise MissingTruth(f"{label}: no truth prepared for these inputs (its prepare drew others)")
-            return read(path)[part]
-
-        truth = as_given(lambda *inputs: prepared(inputs, 0))
-        return truth, (as_given(lambda *inputs: prepared(inputs, 1)) if stored["terms"] else False)
-
-
-STORE: contextvars.ContextVar[TruthStore | None] = contextvars.ContextVar("reference_error_store",
-                                                                         default=None)
-"""The truth store open (`stored_truths`), None outside one."""
-
-
-@contextlib.contextmanager
-def stored_truths(directory: str | Path, *, prepare: bool, stamp: str, later: Collection[str] = ()):
-    """Check 1's float64 truths prepared ahead of the run that judges them (the GPU tier, row 5461): within
-    the block, a site prepared (`prepare`) computes and writes the truth and terms of its first stage's
-    draws, or every draw its stages may take where a later job draws its second (`later`, sites by
-    `map_judge.site_id`; `TruthStore.draws`), held to float64 on its first draw (`_of_float64`), and runs no
-    arm; a site run reads them (`TruthStore.site`) where it would compute them, its terms the ones its
-    prepare sized it by, and fails where they are missing or made at another `stamp` (the commit and JAX
-    that computed them; `MissingTruth`), or, where its first stage leaves it undecided, asks a later job for
-    its second stage (`map_judge.ask_later`, a red until that job judges it): a prepare leaves out the four
-    fifths of a site's draws its second stage would take, which a site its first stage decides never reads
-    (row 6198). Truths and terms are computed as the gate computes them (`_truth_and_terms`), so a prepared
-    site judges as one that computes its own. A recorded reference (`indexed_recording`) is the other store
-    and answers another question: a reference that cannot run in the test, committed and pinned, its count
-    sized on it; a prepared truth's reference runs live beside it, on the GPU it judges. A site that reads a
-    truth at inputs its prepare does not draw (a weighed or library site) is refused within the block; a
-    qualification run's sizing computes its own (`_qualified`)."""
-    store = TruthStore(Path(directory), prepare, stamp, frozenset(later))
-    token = STORE.set(store)
-    try:
-        yield store
-    finally:
-        STORE.reset(token)
-
-
-def _inputs_digest(inputs) -> np.uint64:
-    """The digest of a draw's widened inputs, each leaf by its path, as a recording's (`input_digest`)."""
-    held = jax.device_get(inputs)
-    return input_digest(dict(zip(_leaf_paths(held), jax.tree.leaves(held), strict=True)))
-
-
-def _prepare_site(store: TruthStore, dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn,
+def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn,
                   terms) -> None:
-    """`assert_as_exact`'s site prepared into `store` (`stored_truths`): its truth program and terms as
-    `_site_judged` decides them, the draws its store asks (`TruthStore.draws`: its first stage's, or every
-    stage's where a later job draws its second) computed and written, no arm run."""
+    """`assert_as_exact`'s site prepared into `store` (`truths_ahead.compiled_truths`): every program its
+    truths and terms take (`_ahead`), at each shape the draws of its stages take, compiled for the devices its
+    run computes on, and its truth held to float64 on its first draw's shapes (`_of_float64`); no truth
+    computed and no arm run. A truth the gate runs as given or replays (a recording) has no program."""
     terms_fn, _ = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=None,
                         library_row=None, library_leaves=(), also=None, terms=terms)
-    truth_program = _truth_program(truth_fn if truth_fn is not None else reference_fn)
-    terms_fn = _site_terms(terms_fn, terms, draw, truth_fn if truth_fn is not None else reference_fn,
-                           truth_program)
-    site = store.begun(label)
-    for seed in range(store.draws(label, seeds)):
+    truth = truth_fn if truth_fn is not None else reference_fn
+    shaped = {}
+    for seed in range(staged_units(seeds)):
         inputs = draw(seed)
-        truth, found = _truth_and_terms(truth_program, terms_fn, inputs)
-        if not seed:
-            _of_float64(label, truth_program, inputs, truth)
-        with jax.enable_x64(new_val=True):
-            store.drawn(site, widened(inputs)).write_bytes(pickle.dumps(jax.device_get((truth, found))))
-    store.finished(label, terms_fn is not None)
+        shaped.setdefault(named("truth", widened(inputs)), inputs)
+    programs, held = {}, {}
+    with (jax.enable_x64(new_val=True), passes(on=False), jax.default_device(store.device()),
+          evaluated_on([])):
+        for index, inputs in enumerate(shaped.values()):
+            wide = widened(inputs)
+            if index == 0:
+                _of_float64(label, _truth_program(truth), inputs, _shaped_truth(truth, wide))
+            _ahead(programs, held, label, truth, terms_fn, terms=terms, wide=wide)
+        store.compile_site(label, programs, held)
+
+
+def _ahead(programs: dict, held: dict, label: str, truth, terms_fn, *, terms, wide) -> None:
+    """Into `programs` and `held` (`truths_ahead.CompiledTruths.compile_site`), the programs a site's draw of
+    widened inputs `wide` takes: its truth's (`truth`; a window loop's on one window, its every window's
+    shapes), unless the gate runs it as given or replays it (`_given`); its own terms program's
+    (`_SiteTerms`), or the float64 walk of its truth its rows may be sized by (`terms`, unless False: the walk
+    a site's first draw decides on, `_cancelling_terms`), where the walk is static: one that takes a branch
+    or loop its values pick is read as it runs, so its run walks it on its own device where it needs it
+    (`float64_terms._termed`). Each traced as written, its constants arguments held beside it."""
+    if isinstance(truth, _Windowed):
+        # Its truth window by window; its terms on the whole draw, as its run reads them: a site's own
+        # program, or the walk of its window's function (`terms=True`, `_site`).
+        window = jax.tree.map(lambda leaf: leaf[0], wide)
+        _ahead(programs, held, label, truth.fn, None, terms=False, wide=window)
+        if isinstance(terms_fn, _SiteTerms):
+            _held_program(programs, held, "site terms", terms_fn.fn, wide)
+        elif terms is True and not _given(truth):
+            _held_walk(programs, held, truth.fn, wide)
+        return
+    if not _given(truth):
+        _held_program(programs, held, "truth", truth, wide)
+    if isinstance(terms_fn, _SiteTerms):
+        _held_program(programs, held, "site terms", terms_fn.fn, wide)
+    elif terms is not False and not _given(truth):
+        _held_walk(programs, held, truth, wide)
+
+
+def _held_walk(programs: dict, held: dict, fn, wide) -> None:
+    """`fn`'s float64 terms walk at `wide` (`float64_terms`) as a program of its constants and inputs, flat,
+    its terms alone, beside `fn`'s truth at `wide` (`_held_program`), which its values are: two programs a
+    draw runs in turn, each within a GPU part's memory where the walk's values and terms together were not
+    (a sinks flow's training step: 1.33 GiB and 1.71 GiB against 2.86 GiB, its worker's 2.84). Where the
+    walk is static; held as one its run walks as it runs where its values steer it."""
+    closed, _ = traced(fn, wide)
+    name = named(f"terms {POWER.get()}", wide)
+    if not static(closed.jaxpr):
+        held[name] = {"walked": "its truth takes a branch or loop its values pick, which its terms' walk "
+                                "reads as it runs"}
+        return
+    if named("truth", wide) not in programs:
+        _held_program(programs, held, "truth", fn, wide)
+    count = len(closed.consts)
+
+    def walked(*flat):
+        return evaluated(closed.jaxpr, flat[:count], list(flat[count:]))[1]
+
+    programs[name] = (walked, [*map(jax.typeof, closed.consts), *map(jax.typeof, jax.tree.leaves(wide))])
+    held[name] = {"constants": [*map(np.asarray, closed.consts)]}
+
+
+def _shaped_truth(truth, wide):
+    """`truth` on widened inputs `wide` as `_of_float64` reads it, its leaves' dtypes and sizes: its value
+    where the gate runs it as it is (`_given`), else its shapes alone (a window loop's on one window), no
+    float64 computed."""
+    if _given(truth):
+        return truth(*wide)
+    if isinstance(truth, _Windowed):
+        return jax.eval_shape(unrewritten(truth.fn), *jax.tree.map(lambda leaf: leaf[0], wide))
+    return jax.eval_shape(unrewritten(truth), *wide)
+
+
+def _held_program(programs: dict, held: dict, role: str, fn, wide) -> None:
+    """`fn` at `wide` as a program of its constants and inputs, flat (`truths_ahead.CompiledTruths`), traced
+    as written (`float64_terms.traced`)."""
+    closed, tree = traced(fn, wide)
+    count = len(closed.consts)
+
+    def run(*flat):
+        return tree.unflatten(jax.core.eval_jaxpr(closed.jaxpr, flat[:count], *flat[count:]))
+
+    name = named(role, wide)
+    programs[name] = (run, [*map(jax.typeof, closed.consts), *map(jax.typeof, jax.tree.leaves(wide))])
+    held[name] = {"constants": [*map(np.asarray, closed.consts)], "tree": tree}
 
 
 class NarrowTruth(TypeError):
@@ -1112,7 +1068,8 @@ def _of_float64(label: str, truth_fn, inputs, truth) -> None:
     # A window loop's truth is traced on a window, as its loop calls it.
     wide = widened(jax.tree.map(lambda leaf: leaf[0], inputs) if windowed else inputs)
     # The branch of a platform's choice that the truth's run keeps: on the device its evaluation runs on.
-    with jax.enable_x64(new_val=True), evaluated_on(jax.tree.leaves(wide)) as device:
+    with (jax.enable_x64(new_val=True), arm_arithmetic.on_float64_device(),
+          evaluated_on(jax.tree.leaves(wide)) as device):
         program = lowered(trace(*wide).jaxpr).jaxpr
     lowering = programs.lowering_platform(device)
     count = len(program.outvars)
@@ -1176,7 +1133,7 @@ def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None, scale=None) -> 
         inputs = draw(seed)
         with summed_as_run():
             ran_here = jax.device_get(ran_fn(*inputs))
-        with jax.enable_x64(new_val=True):
+        with jax.enable_x64(new_val=True), arm_arithmetic.on_float64_device():
             return ran_here, jax.device_get((true_fn or unrewritten(ran_fn))(*widened(inputs)))
 
     return Conditioning(scale_of, heavy_masks(map(ran_and_true, seeds)))
@@ -1189,14 +1146,30 @@ def _truth_and_terms(truth_fn, terms_fn, inputs):
     evaluated op by op (`float64_terms`)."""
     truth_fn = unrewritten(truth_fn)
     if terms_fn is None or isinstance(terms_fn, _SiteTerms):
-        with jax.enable_x64(new_val=True):
-            truth = truth_fn(*widened(inputs))
+        with jax.enable_x64(new_val=True), arm_arithmetic.on_float64_device():
+            truth = _truth_of(truth_fn, widened(inputs))
         if terms_fn is None:
             return truth, None
-        with jax.enable_x64(new_val=True):
+        with jax.enable_x64(new_val=True), arm_arithmetic.on_float64_device():
             return truth, terms_fn.of(truth, *widened(inputs))
-    with jax.enable_x64(new_val=True):
+    with jax.enable_x64(new_val=True), arm_arithmetic.on_float64_device():
         return terms_fn(*widened(inputs))
+
+
+def _truth_of(truth_fn, wide):
+    """`truth_fn`, a site's truth as the gate runs it, on a draw's widened inputs `wide`: by the program a
+    store compiled ahead where a run reads one (`truths_ahead.running`), unless the gate runs the truth as
+    given."""
+    ran = running()
+    if ran is None or _given(truth_fn):
+        return truth_fn(*wide)
+    if isinstance(truth_fn, _Windowed):
+        # A window loop's truth by its window's program, window by window, as the loop runs it.
+        return stacked_on_host([
+            _truth_of(truth_fn.fn, jax.tree.map(lambda leaf, index=index: leaf[index], wide))
+            for index in range(_window_count(wide))])
+    store, label = ran
+    return store.called(label, "truth", wide)
 
 
 def _draw_truth(truth_and_terms, prepared, followed, dew_fn, inputs):
@@ -1271,7 +1244,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         with summed_as_run():
             _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms, ran = _draw_truth(truth_and_terms, prepared_followed, followed, dew_fn, inputs)
-        if not at:
+        if not at and running() is None:  # compiled ahead, its prepare held it (`_compile_site`)
             _of_float64(label, _truth_read(truth_fn or reference_fn, followed, ran), inputs, truth)
         if reference_seeds is None:
             their_inputs, their_truth, their_terms = inputs, truth, terms
@@ -1353,8 +1326,11 @@ class _SiteTerms:
     fn: Callable
 
     def of(self, truth, *inputs):
-        """The terms of `truth`, the draw's at `inputs`, held to its leaves, paths and shapes."""
-        terms = jax.device_get(self.fn(*inputs))
+        """The terms of `truth`, the draw's at `inputs`, held to its leaves, paths and shapes: by the program
+        a store compiled ahead where a run reads one (`truths_ahead.running`)."""
+        ran = running()
+        terms = jax.device_get(self.fn(*inputs) if ran is None
+                               else ran[0].called(ran[1], "site terms", inputs))
         if _leaf_paths(terms) != _leaf_paths(truth):
             raise ValueError(f"the site's terms are {_leaf_paths(terms)}, the truth's {_leaf_paths(truth)}")
         for path, term, true in zip(_leaf_paths(truth), jax.tree.leaves(terms), jax.tree.leaves(truth),
@@ -1387,20 +1363,25 @@ def _cancelling_terms(draw, truth, program=None):
     # The draw as every seed's is drawn, outside float64, then widened (under x64 a draw's own defaults
     # would draw float64 values the arms never see).
     inputs = widened(draw(0))
-    with jax.enable_x64(new_val=True):
-        leaves = [*map(np.asarray, jax.tree.leaves(run(*inputs)))]
+    with jax.enable_x64(new_val=True), arm_arithmetic.on_float64_device():
+        leaves = [*map(np.asarray, jax.tree.leaves(_truth_of(run, inputs)))]
         zero_leaves = [index for index, leaf in enumerate(leaves)
                        if np.any(_LaidTruths.of([leaf]).sizes == 0)]
         if not zero_leaves:
             return None
         # Only these leaves can change the decision below: a terms program of every output compiled each
         # leaf's sums too (the SSD mesh contract's data mesh 205 s, 78 s on its zero leaf alone; rows 5770,
-        # 5961).
+        # 5961). A run reading programs compiled ahead reads every leaf's, its prepare's one walk.
         def selected(*args):
             outputs = jax.tree.leaves(truth(*args))
             return [outputs[index] for index in zero_leaves]
 
-        truths, terms = float64_terms(selected, *inputs)
+        if running() is None:
+            truths, terms = float64_terms(selected, *inputs)
+        else:
+            whole, every = float64_terms(truth, *inputs)
+            truths, terms = ([jax.tree.leaves(tree)[index] for index in zero_leaves]
+                             for tree in (whole, every))
     plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
         jax.tree.leaves(truths), _term_leaves(terms, truths))
     return truth if bool(np.any((plain.sizes == 0) & (termed.sizes > 0))) else None
@@ -1541,19 +1522,29 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     (tests/certified.py)."""
     terms = terms if followed is None else _followed_site(label, truth_fn, orders, library_fn, terms,
                                                           conditioning, examples)
-    store = STORE.get()
+    store = COMPILED.get()
     if store is not None and (conditioning is not None or library_fn is not None):
         raise ValueError(f"{label}: a weighed or library site reads its reference's own rounding and arms "
-                         "at its truth's inputs, which no prepared truth holds")
+                         "at its truth's inputs, which no program compiled ahead holds")
     if store is not None and store.prepare:
-        _prepare_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, terms=terms)
+        _compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, terms=terms)
         return
     if os.environ.get(QUALIFY) and not (drawing() or judging()):
         _qualified(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
                    examples=examples, plain=not (library_fn or also or terms or conditioning),
                    followed=followed)
-    if store is not None:
-        truth_fn, terms = store.site(label)
+    with judged(label):
+        _judged_site(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
+                     library_fn=library_fn, library_row=library_row, library_leaves=library_leaves, also=also,
+                     terms=terms, examples=examples, conditioning=conditioning,
+                     conditioning_scale=conditioning_scale, followed=followed)
+
+
+def _judged_site(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,
+                 library_row, library_leaves, also, terms, examples, conditioning, conditioning_scale,
+                 followed) -> None:
+    """`assert_as_exact`'s site judged, deferred to the weighed check where it states `conditioning`: its
+    truths computed by the programs a store compiled ahead where one is read (`truths_ahead.running`)."""
     if conditioning is not None:
         _deferred(dew_fn, reference_fn, draw, label, seeds=seeds, conditioning=conditioning,
                   truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
@@ -1580,8 +1571,8 @@ def _followed_site(label: str, truth_fn, orders, library_fn, terms, conditioning
         raise ValueError(f"{label}: a site of followed roundings holds each arm to the truth of its own "
                          f"decisions, with none of truth_fn, orders, a library arm, terms, conditioning or "
                          f"examples")
-    if STORE.get() is not None:
-        raise ValueError(f"{label}: a followed truth is the arm's own, which no prepared truth holds")
+    if COMPILED.get() is not None:
+        raise ValueError(f"{label}: a followed truth is the arm's own, which no program compiled ahead holds")
     return False
 
 
@@ -1631,10 +1622,9 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
     references, terms of its own, a weighed check), which this sizing does not judge. A site whose draw
     cannot draw a sizing seed (one that indexes a fixed set of draws) fails with its draw's own error: it has
     no pilot stream, so its count cannot be sized again (`seeds_for`'s contract). A site judged under a
-    prepared store (`stored_truths`: a GPU flow's) sizes in its run, on its run's device, its sizing draws'
-    truths computed here from its own `truth_fn`, as its store holds its verdict's draws alone; none sizes in
+    store of programs compiled ahead (`truths_ahead.compiled_truths`: a GPU flow's) sizes in its run, its
+    sizing draws' truths computed here from its own `truth_fn`, on the host as a sizing's are; none sizes in
     a prepare, a map task or its judge."""
-    import json
 
     record = {"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0], "label": label,
               "declared": seeds}
@@ -1642,18 +1632,17 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
     if not plain or recorded:
         record["unsized"] = "its verdict is not the plain pair's" if not plain else "a recording's count"
     else:
-        # Its sizing draws' truths its own, never a prepared store's, which holds the verdict's draws alone,
-        # computed on the host under one (a GPU run's), as its prepare computes them: the GPU's memory is the
-        # arms'.
-        prepared = STORE.get() is not None
+        # Its sizing draws' truths its own, never the store's programs', computed on the host under one (a GPU
+        # run's): the GPU's memory is the arms'.
+        prepared = COMPILED.get() is not None
         if prepared and truth_fn is not None and not _given(truth_fn) and not isinstance(truth_fn, Truth):
             truth_fn = Truth(truth_fn, jax.local_devices(backend="cpu")[0])
-        token = STORE.set(None)
+        token = COMPILED.set(None)
         try:
             record["sized"] = seeds_for(reference_fn, draw, label, truth_fn=truth_fn, dew_fn=dew_fn,
                                         orders=orders, examples=examples, followed=followed)
         finally:
-            STORE.reset(token)
+            COMPILED.reset(token)
     with open(os.environ[QUALIFY], "a", encoding="utf-8") as log:
         log.write(json.dumps(record) + "\n")
     if (sized := record.get("sized", 0)) > seeds:
@@ -1704,15 +1693,6 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     def drawn_for(index: int):
         def drawn(start, stop):
             assert not judging(), f"{label}: a judge draws nothing of its own, its draws are its pool's"
-            store = STORE.get()
-            if store is not None and start >= seeds and site_id(label) not in store.later:
-                # Its first stage left it undecided, and its prepare stored that stage alone
-                # (`TruthStore.draws`): its second stage is a later job's, which it asks for.
-                ask_later(label, seeds, staged_units(seeds))
-                raise MissingTruth(f"{label}: its first stage leaves it undecided and its prepare stored "
-                                   "that stage alone; a later job draws its second where check1_wire.LATER "
-                                   "is set, or a prepare given its site (stored_truths' `later`) stores "
-                                   "every stage")
             if (start, stop) not in ranges:
                 draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
                                library_fn=library_fn, library_leaves=library_leaves, also=further,
@@ -1850,9 +1830,9 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     against its second), and the reference on the same inputs runs once. `orders` sizes a site whose
     verdict sweeps them (`assert_as_exact`'s `orders`): each seed's evidence is its draw's over every
     order, as the verdict reads it. `examples` sizes a site that stacks them as its verdict judges it."""
-    if STORE.get() is not None:
-        raise ValueError(f"{label}: a sizing draws seeds past a prepared site's, whose truths no prepare "
-                         "holds")
+    if COMPILED.get() is not None:
+        raise ValueError(f"{label}: a sizing draws seeds past a prepared site's, whose truths' programs no "
+                         "prepare compiled")
     if dew_fn is not None and getattr(reference_fn, "recorded", False):
         pilots = getattr(reference_fn, "pilots", None)
         if pilots is None:

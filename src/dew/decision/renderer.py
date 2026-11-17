@@ -131,15 +131,3 @@ def stream_point[Piece](chunks: list[Chunk | Piece], stream: str, current: str) 
         chunks.append(Chunk(ids=(), points=((("stream", len(chunks), stream), 0),)))
         return stream
     return current
-
-
-def streamed_chunks(chunks: Sequence[Chunk], streams: Sequence[str]) -> list[Chunk]:
-    """`chunks`, each in its stream of `streams`, with the boundaries where the row turns to another
-    (`stream_point`), the row's own again after them."""
-    marked: list[Chunk] = []
-    current = "row"
-    for chunk, stream in zip(chunks, streams, strict=True):
-        current = stream_point(marked, stream, current)
-        marked.append(chunk)
-    stream_point(marked, "row", current)
-    return marked

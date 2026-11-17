@@ -371,7 +371,9 @@ def _prologue(hooks: Hooks, given: dict, work):
         taps, width = given['taps'].astype(work), window.shape[1]
         # Each tap's inputs a slice of the window and its weights a column of the taps, the conv's one
         # multiply and add a tap.
-        bias = given['conv_bias'].astype(work) if hooks.conv.bias else None
+        # A conv's bias spread at each row's token, its gradient summed compensated (`short_conv.conv_bias`).
+        bias = (short_conv.conv_bias(given['conv_bias'].astype(work), (token.shape[0], 1))
+                if hooks.conv.bias else None)
         pre = short_conv.preactivation([window[:, tap:tap + 1] for tap in range(width)],
                                        [taps[:, tap] for tap in range(width)], bias)[:, 0]
         query, key, value = _split(_activated(pre, hooks.conv), hooks.conv, key_heads, value_heads,
@@ -513,7 +515,7 @@ def _one_tap(hooks: Hooks, conv: Conv, operands: Step, given: dict, dtype):
     work = at_least_fp32(token.dtype)
     pre = token.astype(work) * given['taps'][:, 0].astype(work)
     if conv.bias:
-        pre = pre + given['conv_bias'].astype(work)
+        pre = pre + short_conv.conv_bias(given['conv_bias'].astype(work), (token.shape[0],))
     query, key, value = _split(_activated(pre, conv), conv, key_heads, value_heads, key_width, value_width)
     unconvolved = dataclasses.replace(operands, token=None, held=None, taps=None, conv_bias=None,
                                       query=query, key=key, value=value)
