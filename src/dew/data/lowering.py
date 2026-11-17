@@ -712,7 +712,13 @@ def _fill(pipeline: Pipeline, source: Source, at: int, read: Read) -> tuple[Cach
     artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
     if not isinstance(artifact, Artifact):
         raise ValueError(f"stage {at} of {_name(pipeline)} is not a cache")
-    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(_cache_steps(prefix))
+    return _filled(artifact), _cache_manifest(source, prefix, read), cache_prefix(pipeline, at)
+
+
+def cache_prefix(pipeline: Pipeline, at: int) -> _Prefix:
+    """The record steps that fill the cache stage at `at` of `pipeline` (`_fill`), and the pool they run on
+    (`_Prefix.pool`), which a read sizes its threads by (`dew.data.compile._build`)."""
+    return _Prefix(_cache_steps(pipeline.stages[:at]))
 
 
 def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[int, int, int]]:
