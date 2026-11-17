@@ -245,7 +245,11 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
         for part, update in zip(committed, losses, strict=True):
             loss = jnp.where(part.count > 0, update, loss)
     summed = jax.tree.map(lambda *values: sum(values),
-                          *(dataclasses.replace(part, inspected=None, own=None) for part in committed))
+                          *(dataclasses.replace(part, inspected=None, own=None, finite=None,
+                                                unfinite_layer=None) for part in committed))
+    walked = [part.unfinite_layer for part in committed if part.unfinite_layer is not None]
+    summed = dataclasses.replace(summed,
+                                 unfinite_layer=functools.reduce(jnp.maximum, walked) if walked else None)
     sample = None
     for part in committed:
         if part.inspected is not None:

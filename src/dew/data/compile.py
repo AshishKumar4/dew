@@ -84,19 +84,17 @@ from dew.data.dataset import (
     rows_of,
     take_batch,
 )
+from dew.data.epochs import epoch_records, order_records, tail
 from dew.data.facts import laid_out, merge_facts, row_lengths
 from dew.data.handoff import record_stage_of
 from dew.data.lowering import (
     _as_iter,
     _Build,
-    _epoch_records,
     _Locality,
     _member_key,
-    _order_records,
     _Present,
     _repeated,
     _split_spans,
-    _tail,
     _workers,
     cache_prefix,
 )
@@ -118,6 +116,7 @@ from dew.data.pipeline import (
     FlatMap,
     HostStep,
     Interleave,
+    LaysOutWindows,
     Limit,
     Map,
     MapBatch,
@@ -158,7 +157,7 @@ from dew.data.plan import (
     identified,
     structured,
 )
-from dew.data.readers import GRAIN, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
+from dew.data.readers import GRAIN, Replayed, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
     Read,
     Rows,
@@ -679,7 +678,8 @@ def _measure(
     branches = tuple(_promoted(branch) for branch in branches)
     for branch, scored in zip(branches, held, strict=True):
         _analyzed(branch, read, validation=scored)
-    _capabilities(branches, read, provision)
+    _capabilities(branches, read, provision,
+                  [branch for branch, scored in zip(branches, held, strict=True) if scored])
     branches = _pin_sources(branches, read)
     _tokenizer_contract(branches)
     branches = tuple(_automatic(branch, read, automatic) for branch in branches)
@@ -773,14 +773,15 @@ def compile(
     resume: DataResume = "relaxed",
     examples: int | None = None,
     widths: Mapping[str, object] | None = None,
-    measured: _TrainingMeasured | None = None,
+    measured: _TrainingMeasured | tuple[_TrainingMeasured, ...] | None = None,
     epochs: int | None = None,
     steps: int | None = None,
     tokens: int | None = None,
 ) -> Loader:
     """Check every leaf before opening readers, then build both branches; `widths` are the run's
     static widths its steps bind to (`run_widths`), and `measured` its training branch as their
-    measurement prepared it (`_training_measure`), which it binds as it stands.
+    measurement prepared it (`_training_measure`), which it binds as it stands: of a run of phases, each
+    phase's, which a phase that reads its corpora from their start binds (`_compile_phases`).
     With no `read`, the sources choose it (`_preferred_read`). `examples` bounds the training read to
     its first that many source examples, before they are packed and before the objective makes rows
     of them (`_bounded`), a run's `examples=` budget. `epochs` reads the chain endlessly, or, where its
@@ -806,8 +807,11 @@ def compile(
             steps=steps,
             budget=tokens,
             widths=widths,
+            measured=measured if isinstance(measured, tuple) else None,
         )
         return dataclasses.replace(phased, resume=resume)
+    if isinstance(measured, tuple):
+        raise TypeError("a measure of each phase binds a run of phases alone")
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured,
                      epochs=epochs)
@@ -935,7 +939,7 @@ def _staged(
     elif epochs is not None:
         # Epochs of a read with a record count count it, read endlessly; of one with none, the source
         # examples a pass holds, its prepared rows as held, bounded to that many passes (`_bounded`).
-        passes = None if _epoch_records(train, build) is not None else _pass_examples(train, read, build)
+        passes = None if epoch_records(train, build) is not None else _pass_examples(train, read, build)
         original, train = ((_endless(original), _endless(train)) if passes is None else
                            (_bounded(original, epochs * passes), _bounded(train, epochs * passes)))
         build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
@@ -949,8 +953,8 @@ count, set to its epochs' passes once it holds them (`_rebound`, `_staged`)."""
 
 
 def _pass_examples(train: Pipeline, read: Read, build: _Build) -> int | None:
-    """The source examples one pass of a training read with no record count holds (`_epoch_records`,
-    `Loader.pass_examples`): those reaching where a bound in examples stands (`dew.data.compile._bounded`:
+    """The source examples one pass of a training read with no record count holds (`Loader.pass_examples`,
+    `dew.data.epochs.epoch_records`): those reaching where a bound in examples stands (`_bounded`:
     the first step that packs or windows them or makes several rows of each, else the batch), before any
     repeat. Its source's records, as a memory read holds them (its leading steps run, the present ones),
     or a streamed source's rows as its shards state or count them at the build's plan version
@@ -1095,7 +1099,7 @@ def _run_batches(staged: _Staged, *, steps: int | None, examples: int | None, ep
     if examples is not None:
         return -(-examples // batch)
     if epochs is not None:
-        records = staged.passes if staged.passes is not None else _epoch_records(staged.train, staged.build)
+        records = staged.passes if staged.passes is not None else epoch_records(staged.train, staged.build)
         return None if records is None else epochs * -(-records // batch)
     if tokens is not None:
         row = _row_tokens(staged.train)
@@ -1125,15 +1129,10 @@ def _compiled(
     )
     sources = [source for _, source in _leaves(original)]
     # The plan of this read, whole: its manifest, its facts, its members' digests, its caches and its rules.
-    manifest = _manifest(
-        {"sources": [source.fingerprint() for source in sources]},
-        sources,
-        (
-            *(_identity(stage) for stage in written(tuple(_steps(original)))
-              if not isinstance(stage, (Workers, Prefetch))),
-            *(StepIdentity.of(step) for step in host),
-        ),
-    )
+    described = [stage for stage in written(tuple(_steps(original)))
+                 if not isinstance(stage, (Workers, Prefetch))]
+    manifest = _manifest({"sources": [source.fingerprint() for source in sources]}, sources,
+                         (*map(_identity, described), *map(StepIdentity.of, host)))
     members = _member_manifests(train, build, host)
     plan = Plan(
         "global" if global_order else "per-share",
@@ -1148,7 +1147,8 @@ def _compiled(
         rules=build.rules(train),
         volatile=any(_volatile(stage) for stage in (*_steps(original), *(
             stage for source in sources for stage in _written(source, ())))),
-        earlier=earlier_readers((*_steps(original), *host)),
+        # The steps it describes read a saved plan's earlier descriptions of them (`ReadsEarlier`).
+        earlier=earlier_readers(described, host),
     )
     tuned = build.tuned(train, batches=batches)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
@@ -1175,11 +1175,11 @@ def _compiled(
             host=_held_coordinated(validation, packed) + _held_steps(validation) + host,
         )
     )
-    records = _epoch_records(train, build)
+    records = epoch_records(train, build)
     if records == 0:
         raise ValueError(f"corpus {_name(train)} has no accepted rows")
-    order_records = _order_records(train, build)
-    if order_records is None and _native_after_bound(train):
+    ordered = order_records(train, build)
+    if ordered is None and _native_after_bound(train):
         # A native Grain step rebuilds or reorders rows as it likes, so the examples each row consumes
         # (`CONSUMED`), which a run no plan counts ahead reads its progress off, are kept by no contract.
         raise ValueError(f"{_name(train)} runs a native Grain step (`grain`) after its examples bound, which "
@@ -1199,8 +1199,8 @@ def _compiled(
         batch_tokens=staged.batch_tokens,
         device=device,
         widths=_bound_widths(original),
-        tail=_tail(train, build),
-        order_records=order_records,
+        tail=tail(train, build),
+        order_records=ordered,
     )
 
 
@@ -1234,41 +1234,51 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
 
     fields: dict[str, tuple[str, ...]] = {}
     bounds: dict[str, int] = {}
+    laid: dict[str, bool] = {}
     unseen = False
 
-    def declare(pack: Pack, most: int | None) -> None:
+    def declare(pack: Pack, most: int | None, laid_out: bool = True) -> None:
         ids = pack.fields[0]
         fields[ids] = tuple(dict.fromkeys((*fields.get(ids, ()), *pack.fields)))
         bound = pack.seq_len if most is None else max(1, min(pack.seq_len, most))
         bounds[ids] = max(bounds.get(ids, 0), bound)
+        # A field's windows laid out by the read unless a step over a pack's windows lays them out itself.
+        laid[ids] = laid.get(ids, True) and laid_out
 
-    def walk(pipeline: Pipeline, *, packed: bool) -> None:
+    def walk(pipeline: Pipeline, *, packed: bool, itself: bool = False) -> None:
         nonlocal unseen
+        # A window step that lays its windows out (`LaysOutWindows`), after any pack, a plan's or a source's.
+        itself = itself or any(isinstance(stage, Map) and isinstance(stage.step, LaysOutWindows)
+                               for stage in pipeline.stages)
         for at, stage in enumerate(pipeline.stages):
             if isinstance(stage, Pack):
                 floor = _floor(pipeline, at, stage)
                 declare(stage, stage.segments if floor is None else min(
-                    stage.segments or stage.seq_len, max(1, stage.seq_len // floor)))
+                    stage.segments or stage.seq_len, max(1, stage.seq_len // floor)), not itself)
                 packed = True
         source = pipeline.source
         if isinstance(source, Combined):
             for child in source.pipelines:
-                walk(child, packed=packed)
+                walk(child, packed=packed, itself=itself)
             return
         documents = _packed_documents(source)
-        for stage in _written(source, ()):
+        written = _written(source, ())
+        itself = itself or any(isinstance(stage, Map) and isinstance(stage.step, LaysOutWindows)
+                               for stage in written)
+        for stage in written:
             if isinstance(stage, Pack):
-                declare(stage, stage.segments if documents is None else documents)
+                declare(stage, stage.segments if documents is None else documents, not itself)
                 packed = True
         *_, source = beneath(source, ("read", "materialized"))
         if isinstance(source, PackedSource):
-            declare(source.plan.pack, source.plan.most_documents)
+            declare(source.plan.pack, source.plan.most_documents, not itself)
             packed = True
         unseen = unseen or not packed
 
     for pipeline in pipelines:
         walk(pipeline, packed=False)
-    return tuple(Coordinated(fields[ids], None if unseen else bound) for ids, bound in bounds.items())
+    return tuple(Coordinated.laid(fields[ids], None if unseen else bound, laid[ids])
+                 for ids, bound in bounds.items())
 
 
 def _held_coordinated(validation: Pipeline, training: tuple[Coordinated, ...]) -> tuple[Coordinated, ...]:
@@ -1277,7 +1287,8 @@ def _held_coordinated(validation: Pipeline, training: tuple[Coordinated, ...]) -
     validation source may hold packed windows whose packing it does not show."""
     held = _coordinated(validation)
     declared = {step.fields[0] for step in held}
-    return held + tuple(Coordinated(step.fields, None) for step in training if step.fields[0] not in declared)
+    return held + tuple(Coordinated.laid(step.fields, None, step.laid_out) for step in training
+                        if step.fields[0] not in declared)
 
 
 def _floor(pipeline: Pipeline, at: int, pack: Pack) -> int | None:
@@ -1491,6 +1502,16 @@ def _built_phases(source: Phases, staged: Sequence[tuple[_Staged, int | None]],
     return built
 
 
+def _measured_phase(measured: tuple[_TrainingMeasured, ...] | None, index: int, continued: Pipeline,
+                    phases: Sequence[Pipeline], validation: Pipeline | None) -> _TrainingMeasured | None:
+    """The measure among `measured` (each phase's, as `run_widths` read them) that phase `index` binds where
+    it reads its corpora from their start (`continued`, the phase as written) with no validation beside it;
+    None for one continued past an earlier phase, measured as it continues (row 6713: each phase was
+    measured twice, both copies of a memory read held at the start's peak)."""
+    fresh = measured is not None and continued is phases[index] and validation is None
+    return measured[index] if fresh and measured is not None else None
+
+
 def _compile_phases(
     train: Pipeline,
     *,
@@ -1506,9 +1527,11 @@ def _compile_phases(
     steps: int | None = None,
     budget: int | None = None,
     widths: Mapping[str, object] | None = None,
+    measured: tuple[_TrainingMeasured, ...] | None = None,
 ) -> Loader:
     """`train`'s phases, each compiled on its own, every phase and the validation binding the run's
-    `widths` (`run_widths`), measured over every phase and held chain, one program for them all."""
+    `widths` (`run_widths`), measured over every phase and held chain, one program for them all, a phase
+    binding its measure among `measured` where it may (`_measured_phase`)."""
     source = train.source
     if not isinstance(source, Phases):
         raise TypeError("phased compilation needs a Phases source")
@@ -1520,10 +1543,10 @@ def _compile_phases(
         """Phase `index`, each corpus it reads continued past what the phases before it trained of it
         (`_continued`, `_skipping`): on its own stream, those it shares with other phases stamped (`members`,
         `_stamped`)."""
-        phase = _staged(_continued(source.pipelines[index], consumed)._then(*train.stages),
-                        validation if index == 0 else None, objective=objective, read=read,
-                        provision=provision, loading=loading, seed=seed, rejections=rejections,
-                        widths=widths)
+        continued, alone = _continued(source.pipelines[index], consumed), validation if index == 0 else None
+        phase = _staged(continued._then(*train.stages), alone, objective=objective, read=read,
+                        provision=provision, loading=loading, seed=seed, rejections=rejections, widths=widths,
+                        measured=_measured_phase(measured, index, continued, source.pipelines, alone))
         return _skipping(_stamped(phase, members or {}), consumed, source.pipelines[index])
 
     tokens = source.clock == "tokens"
@@ -2088,8 +2111,8 @@ class _Shared(Forwarding):
     the stream's; it never ends where it reads a map dataset repeated without end (`native`, `endless`),
     which says so of nothing it reads."""
 
-    def __init__(self, batches: pygrain.DatasetIterator | _Whole, partition: DataPartition, *, held: bool,
-                 endless: bool = False):
+    def __init__(self, batches: pygrain.DatasetIterator | _Whole | Replayed, partition: DataPartition, *,
+                 held: bool, endless: bool = False):
         self._source, self.partition, self.held, self._endless = batches, partition, held, endless
 
     @property
@@ -2128,23 +2151,35 @@ def native(handed: Handed, *, training: bool) -> Reader:
 
 def native_loader(handed: Handed) -> Loader:
     """The data handed to `fit` as it is (`native`) as the loader the run reads, its global batch
-    its first element's rows."""
+    its first element's rows. A Grain iterable is read once for that element: its run's first stream
+    gives it again and reads on (`Replayed`), as the batch contract asks (training.md; row 6663)."""
     if isinstance(handed, pygrain.IterDataset):
         probe = iter(handed)
         try:
+            before = probe.get_state()
             first = next(probe)
-        finally:
+        except BaseException:
             if isinstance(probe, Closeable):
                 probe.close()
-    else:
-        first = handed[0] if isinstance(handed, pygrain.MapDataset) else {
-            name: np.asarray(column) for name, column in handed.items()}
+            raise
+        replayed = [Replayed(probe, first, before)]
+
+        def train(partition: DataPartition) -> Iterator[Batch]:
+            return _Shared(replayed.pop() if replayed else iter(handed), partition, held=False)
+
+        return Loader(train=train, val=None, records=None, batch=rows_of(_present(first)))
+    first = handed[0] if isinstance(handed, pygrain.MapDataset) else {
+        name: np.asarray(column) for name, column in handed.items()}
+    batch = rows_of(_present(first))
+    records = len(handed) * batch if isinstance(handed, pygrain.MapDataset) else batch
+    return Loader(train=native(handed, training=True), val=None, records=records, batch=batch)
+
+
+def _present(first):
+    """`first`, a dataset's first element, refused where it is missing."""
     if first is None:
         raise ValueError("a Grain dataset handed to fit gives its batches, and its first is missing (None)")
-    batch = rows_of(first)
-    records = (len(handed) * batch if isinstance(handed, pygrain.MapDataset)
-               else batch if isinstance(handed, Mapping) else None)
-    return Loader(train=native(handed, training=True), val=None, records=records, batch=batch)
+    return first
 
 
 def run_widths(measured: Sequence[_Measured], objective: ObjectiveData) -> Mapping[str, object]:
@@ -2234,7 +2269,7 @@ def fitted[Entry](
         widths = (run_widths([*([measured] if measured else []), *phases, *scored.values()], objective)
                   if scored or phases else {})
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
-                         widths=widths, read=read, measured=measured,
+                         widths=widths, read=read, measured=tuple(phases) if phased else measured,
                          epochs=epochs if examples is None else None,
                          steps=steps, tokens=tokens, resume=resume)
     else:

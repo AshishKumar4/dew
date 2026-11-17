@@ -479,3 +479,18 @@ def test_a_gauss_newton_update_held_by_a_wrapper_that_drops_its_statistics_is_re
     # Unwrapped, the same update compiles: the refusal is the wrapper's dropped statistics.
     trainer = Trainer(LeastSquares(4), gauss_newton(damping=1e-3), key=0, layout=LAYOUT)
     trainer.compile(trainer.initial_state(), batch)
+
+
+def test_an_undamped_gauss_newton_step_over_a_singular_system_stops_the_run():
+    """An undamped Gauss-Newton step whose system is singular (a feature every row holds zero, so its
+    normal equations' column is zero) forms a direction that is not finite from finite inputs: the step is
+    taken as formed, no pass reading its direction (training.md, a step that is not finite), and the next
+    step's loss, read from the weights it moved, is not, so the run stops at it."""
+    from dew.data.dataset import Loader
+
+    trainer = Trainer(LeastSquares(4), gauss_newton(damping=0.0), key=0, layout=LAYOUT)
+    x = np.random.default_rng(0).normal(size=(16, 4)).astype(np.float32)
+    x[:, 0] = 0.0
+    with pytest.raises(RuntimeError):
+        trainer.fit(Loader(lambda partition: iter([{"x": x, "y": x[:, 1] * 2}] * 4), None, None, 16), steps=4,
+                    log_every=1)

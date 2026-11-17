@@ -39,6 +39,7 @@ _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from dew.batch import Batch
+    from dew.data.pipeline import HostStep, Stage
 
 _RESUMED = ("resume with the Dew that wrote it, or go on from its weights as a new run that reads its data "
             "afresh: `--pretrained <run directory>` on the command line or in run.json, or its state "
@@ -75,22 +76,22 @@ class ReadsEarlier(Protocol):
     def earlier_described(self, saved: JSON) -> JSON: ...
 
 
-def earlier_readers(steps: Sequence[object]) -> tuple[Callable[[JSON], JSON], ...]:
-    """The readers of earlier descriptions the live `steps` hold (`ReadsEarlier`): a stage's own, its step's
-    and a configured step's factory's, each class's once."""
-    from dew.data.pipeline import Configured, FlatMap, Map
+def earlier_readers(stages: Sequence[Stage],
+                    host: Sequence[HostStep] = ()) -> tuple[Callable[[JSON], JSON], ...]:
+    """The readers of earlier descriptions the live `stages` and `host` steps hold (`ReadsEarlier`): a
+    stage's own and the step it runs (`dew.data.pipeline.runs`, the one analysis of what a stage runs: a
+    map's, a configured step's factory, a batch map's, a native one's), each class's once."""
+    from dew.data.pipeline import runs
 
+    candidates: list[object] = [*host]
+    for stage in stages:
+        ran = runs(stage)
+        candidates += [stage] if ran is None else [stage, ran.step]
     # Each reader once, however many steps' classes share it.
     held: dict[Callable[..., JSON], Callable[[JSON], JSON]] = {}
-    for stage in steps:
-        match stage:
-            case Map(step=inner) | FlatMap(step=inner) | Configured(factory=inner):
-                candidates = (stage, inner)
-            case _:
-                candidates = (stage,)
-        for candidate in candidates:
-            if isinstance(candidate, ReadsEarlier):
-                held.setdefault(type(candidate).earlier_described, candidate.earlier_described)
+    for candidate in candidates:
+        if isinstance(candidate, ReadsEarlier):
+            held.setdefault(type(candidate).earlier_described, candidate.earlier_described)
     return tuple(held.values())
 
 

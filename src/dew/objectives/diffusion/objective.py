@@ -552,7 +552,7 @@ class DiffusionObjective(Objective[Ratio]):
         if tokens is None:
             tokens = {keyword: condition.encoder.tokenize([condition.unconditional])
                       for keyword, condition in self.inputs.conditions.items()}
-        return encode_conditions(self.inputs.encoders, encoders, tokens)
+        return encode_conditions(self.inputs.encoders, encoders, tokens, path="DiffusionObjective.encode")
 
     def blank_conditions(self, params, like: dict) -> dict:
         """The configured unconditional conditions, encoded by `params`' own towers and cast to the

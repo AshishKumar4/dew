@@ -86,7 +86,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
-- Src/dew/optim.py _placement refuses Muon for a rank-2 kernel declared with one named axis and one None. [6746]
 
 ## Data
 
@@ -114,7 +113,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Every model comparison on check 1. [2300, 3722, 5212]
 - Saved runs carried across. [2791, 2792]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
-- The saved data plan as recorded rules, one last version, and the resume modes. [6861]
 
 ## Tutorials and docs
 

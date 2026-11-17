@@ -82,8 +82,9 @@ class StepSettings[LossT, EffectsT]:
     (`Trainer._settings`): its objective, its optimizer once built (`optimizer`), its layout and device
     mesh, the steps a commit pools (`accumulation`), a custom step, its loss scaler, DiLoCo, whether it
     tunes its kernels, its inspection, the microbatches a pipelined step feeds, whether its steps record
-    what they read, the CUDA generation its first step lowers for in place of compiling it (`lower_for`) and
-    where a CPU-owned run keeps its state (`state_mesh`, the device mesh otherwise)."""
+    what they read, the CUDA generation its first step lowers for in place of compiling it (`lower_for`),
+    where a CPU-owned run keeps its state (`state_mesh`, the device mesh otherwise) and whether its steps skip
+    one that is not finite (`skip_nonfinite`)."""
 
     objective: Objective[LossT, EffectsT]
     built_optimizer: optax.GradientTransformation | None
@@ -99,6 +100,9 @@ class StepSettings[LossT, EffectsT]:
     record: bool
     lower_for: str | None
     state_mesh: Mesh
+    skip_nonfinite: bool = False
+    """Whether a step with no loss scale that is not finite is skipped (`Trainer(skip_nonfinite=)`), else
+    taken as formed (`Transaction.skip`)."""
     ns_group: int | None = None
     """The stacks of one shape the step's Newton-Schulz joins at a time where the run states none, its plan's
     (`dew.newton_schulz.released`, `FitSearch`'s release): None joins them all."""
