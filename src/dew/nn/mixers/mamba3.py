@@ -340,8 +340,7 @@ def _complex(t, turned: int):
 def recurrent_mamba3(x, dt, A, B, C, lam, theta, state=None, starts=None):
     """Mamba-3's recurrence a token at a time on its complex state, eqs. 5 and 6 with each pair turned a
     token and a token's ranks' writes summed, in `at_least_fp32` of the operands' dtype (float64 where they
-    are): operands and results as `chunk_mamba3`'s, the final state turned by its document's angle into
-    `chunk_mamba3`'s frame."""
+    are): operands and results as `chunk_mamba3`'s, the final state in its own frame (`Carried`)."""
     work = at_least_fp32(jnp.result_type(x, B, C))
     batch, length, _, heads, head_dim = x.shape
     turned = 2 * theta.shape[-1]
@@ -354,7 +353,7 @@ def recurrent_mamba3(x, dt, A, B, C, lam, theta, state=None, starts=None):
     begins = jnp.zeros((batch, length), jnp.bool_) if starts is None else jnp.asarray(starts, jnp.bool_)
 
     def one_token(carried, step):
-        h, previous, angle = carried                     # each state part [B, H, P, .]; angle [B, H, A]
+        h, previous = carried                            # each state part [B, H, P, .]
         x_t, dt_t, lam_t, alpha_t, turn, key_t, query_t, begun = step
         kept = ~begun[:, None, None, None]
         written = tuple(jnp.einsum('brhp,brhn->bhpn', x_t, k) for k in key_t)
@@ -364,17 +363,14 @@ def recurrent_mamba3(x, dt, A, B, C, lam, theta, state=None, starts=None):
         spun = (jnp.exp(-1j * turn)[:, :, None, :] * entering[0], entering[1])
         h = tuple(jnp.where(kept, s, 0) + (lam_t * dt_t)[..., None, None] * w
                   for s, w in zip(spun, written, strict=True))
-        # The frame restarts at a document's first token, its own turn acting on no state.
-        angle = jnp.where(begun[:, None, None], 0, angle + turn)
         out = (jnp.einsum('bhpa,brha->brhp', h[0], jnp.conj(query_t[0])).real
                + jnp.einsum('bhpn,brhn->brhp', h[1], query_t[1]))
-        return (h, written, angle), out
+        return (h, written), out
 
     steps = jax.tree.map(lambda t: jnp.moveaxis(t, 1, 0), (x, dt, lam, alpha, turns, keys, queries, begins))
     entered = _complex(jnp.asarray(state, work), turned)
-    carried = (entered, jax.tree.map(jnp.zeros_like, entered), jnp.zeros((batch, heads, turned // 2), work))
-    (final, _, angle), out = jax.lax.scan(one_token, carried, steps)
-    pairs = final[0] * jnp.exp(1j * angle)[:, :, None, :]
+    (final, _), out = jax.lax.scan(one_token, (entered, jax.tree.map(jnp.zeros_like, entered)), steps)
+    pairs = final[0]
     final = jnp.concatenate([jnp.stack([pairs.real, pairs.imag], axis=-1).reshape(*pairs.shape[:-1], turned),
                              final[1]], axis=-1)
     return jnp.moveaxis(out, 0, 1), final
