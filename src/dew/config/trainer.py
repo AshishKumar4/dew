@@ -540,26 +540,26 @@ class TrainerConfig:
             return value
         return self.interval(self.checkpoint_every, dataset, "--trainer.checkpoint-every")
 
-    def interval(self, value, dataset: Loader, flag: str) -> int | str | Counted | None:
+    def interval(self, value, dataset: Loader, option: str) -> int | str | Counted | None:
         """A cadence (`eval_every`, `checkpoint_every`, a split's `RunConfig.val_every`) the command
-        line's `flag` sets, resolved against `dataset`: steps for `epoch`, or the source examples a pass
-        holds where the run reads its epochs as
-        passes over them (`Loader.epochs`, `Loader.pass_examples`); for `passes`, the same where the run
-        counts its data's passes, and the run's end (`_AT_END`) where it counts none, which it logs; steps,
-        a share of the run (which `fit` resolves) or None as given."""
+        line's `option` (`--trainer.eval-every`) sets, resolved against `dataset`: steps for `epoch`, or
+        the source examples a pass holds where the run reads its epochs as passes over them
+        (`Loader.epochs`, `Loader.pass_examples`); for `passes`, the same where the run counts its data's
+        passes, and the run's end (`_AT_END`) where it counts none, which it logs; steps, a share of the
+        run (which `fit` resolves) or None as given."""
         if value is None or isinstance(value, int) or is_share(value):
             return value
         passed = dataset.pass_examples if dataset.epochs is not None else None
         if value == PASSES and dataset.steps_per_epoch is None and not passed:
             _log.info("%s passes: the run counts none of its data's passes (no record count, and no "
-                      "--trainer.epochs over source examples), so it runs at the run's end (%s)", flag,
+                      "--trainer.epochs over source examples), so it runs at the run's end (%s)", option,
                       _AT_END)
             return _AT_END
         if dataset.steps_per_epoch is None and passed:
             return Counted(passed, "examples")
         if dataset.steps_per_epoch is None:
             raise ValueError(
-                f"{flag} epoch needs a dataset with a record count; this "
+                f"{option} epoch needs a dataset with a record count; this "
                 f"one streams without one, so give the interval in steps or None")
         return dataset.epoch_steps(window=self.accumulation)
 
