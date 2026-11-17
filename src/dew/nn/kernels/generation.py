@@ -455,17 +455,23 @@ _BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
 # Its VPU's fp32 operations and its transcendental unit's exponentials a clock, measured (Google's pages state
 # neither): a Pallas kernel's chain over one VMEM-resident 512 x 1024 fp32 block, the slope of its wall time
-# over 256 to 4096 iterations (the tpu_rates script on Colab TPUs, colab7062's rates2, two rounds each, at
-# most 1% from the line), over the clock its MXU's peak gives. A step bound by the block's
-# VMEM read and write, a lone add's on both (v5e 0.959 us, v6e 0.413), states no unit's rate: the VPU's is a
-# multiply-add's, two operations an element, which outlasts it (v5e 1.278 us, 8.21e11 operations a second;
-# v6e 0.646, 1.62e12), and the v6e's exponentials an exp2's (0.563 us, 9.33e11 a second). A v5e's exp2 took
-# as long as its add, so its own rate waits on a chain of four exp2 an iteration.
+# over 256 to 4096 iterations, each iteration one step or four, over the clock its MXU's peak gives (the
+# tpu_rates script on Colab TPUs, colab7062's rates2 and rates3, two rounds each, at most 1% from the line).
+# An iteration costs the block's VMEM read and write (v5e 0.65 us, v6e 0.28) beside its steps, so a unit's own
+# rate is the four-step iteration's excess over the one-step's, a third of it a step: the VPU's a
+# multiply-add's, two operations an element (v5e 0.627 us a step, 1.67e12 operations a second; v6e 0.370,
+# 2.83e12, where an add alone takes 0.138), and the exponentials an exp2's (v5e 0.341 us, 1.54e12 a second;
+# v6e 0.293, 1.79e12). That read and write is 4 MiB an iteration, 6.5e12 bytes a second on a v5e and 1.5e13
+# on a v6e, which a TPU states no rate of (no shared memory, `templates.cost.rates`): the unit rates hold none
+# of it, and nothing prices a form's VMEM traffic there. A step (`step_seconds`) holds its body's own, once: a
+# substitution row reads its chunk's 64 x 128 fp32 values and writes a row, 33 KiB, 5 ns at that rate of a
+# v5e's 0.89 us step, the rest the chain's latency.
 _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
-                             vmem_bytes=128 * 2 ** 20, vector_per_clock=8.21e11 / (197e12 / 131072)),
+                             vmem_bytes=128 * 2 ** 20, vector_per_clock=1.67e12 / (197e12 / 131072),
+                             exponentials_per_clock=1.54e12 / (197e12 / 131072)),
          'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
-                             vmem_bytes=128 * 2 ** 20, vector_per_clock=1.62e12 / (918e12 / 524288),
-                             exponentials_per_clock=9.33e11 / (918e12 / 524288))}
+                             vmem_bytes=128 * 2 ** 20, vector_per_clock=2.83e12 / (918e12 / 524288),
+                             exponentials_per_clock=1.79e12 / (918e12 / 524288))}
 
 
 def architecture(generation: str) -> Architecture | None:
