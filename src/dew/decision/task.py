@@ -536,8 +536,8 @@ class Decide(SavedRunTask, InItsForm):
         # the backbone would where the caller overrides the compute dtype, and a configured context
         # encoder in that dtype too (`saved_component`), as a diffusion task's encoders do.
         context = None if settings.context is None else Condition.bound(
-            {**settings.context, "encoder": saved_component(record(settings.context["encoder"], "encoder"),
-                                                            dtype)},
+            {**settings.context, "encoder": saved_component(
+                _records.record(settings.context["encoder"], "encoder"), dtype)},
             params=thaw(part(variables, "context"))["params"])
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
                               settings.context_encoder, context)
