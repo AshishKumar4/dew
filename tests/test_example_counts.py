@@ -13,6 +13,7 @@ from dew.data import Memory
 from dew.data.compile import compile
 from dew.data.dataset import Closeable, DataPartition, Loading
 from dew.data.pipeline import Configured, ObjectiveData, Pack, Pipeline, Rejected
+from dew.decision.layout import SegmentLayout
 
 BATCH = 8
 
@@ -70,9 +71,9 @@ def test_a_decision_corpus_counts_its_source_examples():
     corpus counts every example it delivered as `data/rows`, whatever windows its rows were packed into."""
     from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
 
-    from dew.decision import DecisionObjective, Example, Noul, StateFirstLayout, decisions
+    from dew.decision import DecisionObjective, Example, Noul, decisions
 
-    layout = StateFirstLayout(max_len=128)
+    layout = SegmentLayout.state_first_row(max_len=128)
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=128), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout)
     asked = {"first": Noul("Is it on?"), "second": Noul("Is it off?")}
@@ -92,9 +93,9 @@ def test_a_decision_corpus_counts_the_examples_it_kept_apart_from_those_its_layo
     `data/rows`, and the two refused under their reason."""
     from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
 
-    from dew.decision import DecisionObjective, Example, Noul, StateFirstLayout, decisions
+    from dew.decision import DecisionObjective, Example, Noul, decisions
 
-    layout = StateFirstLayout(max_len=128)
+    layout = SegmentLayout.state_first_row(max_len=128)
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=128), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout)
     asked = {"first": Noul("Is it on?"), "second": Noul("Is it off?")}

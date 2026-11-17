@@ -17,7 +17,8 @@ from reference_error import assert_as_exact
 from dew.batch import PHASE, VALID_ROWS, Phase
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
-from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
+from dew.decision import Choice, DecisionObjective, Example, Specials
+from dew.decision.layout import SegmentLayout
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.protocols import EXITS
@@ -116,7 +117,7 @@ SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=
 
 def decision_objective(model, weights):
     """A decision objective over the looped `model` with `weights`, its rows the eight intents'."""
-    layout = StateFirstLayout(max_len=96, head_max_len=48, option_tokens=8)
+    layout = SegmentLayout.state_first_row(max_len=96, head_max_len=48, option_tokens=8)
     return DecisionObjective(model, tokenizer=ByteTokenizer(), specials=SPECIALS, layout=layout,
                              shuffle_options=False, pass_weights=weights)
 
@@ -303,13 +304,17 @@ def test_each_phase_of_a_phased_run_is_planned_at_its_own_split(monkeypatch, tmp
     room for the one-pass step whole and for the three-pass step only in two microbatches, plans each phase
     when it begins, at an update's end: its first phase reads its batch whole, its second in two
     microbatches (row 5558), where binding the first plan's split would have run the second out of
-    memory. It is, bit for bit, the run read whole through its first phase, stopped there and resumed in
-    two microbatches: each step the same program over the same state."""
+    memory. Its boundary compiles nothing: the second phase's plan off the loop held each executable it
+    compiled, the whole batch's that missed among them (`FitSearch.provisional`), which the boundary judges
+    again in place of compiling it (train 967's F6). It is, bit for bit, the run read whole through its
+    first phase, stopped there and resumed in two microbatches: each step the same program over the same
+    state."""
     from recording import bits
     from test_plan import LIMIT, free
 
     from dew.checkpoints import Checkpoints
     from dew.distributed.placement import placed_bytes
+    from dew.nn.kernels import options
 
     tokens, _ = phased_draw(0)
 
@@ -318,6 +323,8 @@ def test_each_phase_of_a_phased_run_is_planned_at_its_own_split(monkeypatch, tmp
         trainer = phased_trainer(model, 0, None, split=split)
         state, _, _ = trainer.place()
         trainer.compile(state, {"text": jnp.asarray(tokens)})
+        # Measured as in a process apart: the run below compiles nothing of it.
+        options.unhold()
         return LIMIT - trainer.plan["probes"][0]["headroom"] + (placed_bytes(state) if startup else 0)
 
     # The first phase is planned before its state is placed, the state's bytes beside its step
@@ -329,6 +336,7 @@ def test_each_phase_of_a_phased_run_is_planned_at_its_own_split(monkeypatch, tmp
     planned = phased_trainer(looped(), 0)
     landed = phased_params(planned, tokens)
     assert planned.plan["split"] == 2
+    assert [(probe["split"], probe["ahead"]) for probe in planned.plan["probes"]] == [(1, True), (2, True)]
     free(monkeypatch, LIMIT)
     directory = str(tmp_path / "pinned")
     phased_params(phased_trainer(looped(), 0, split=1, checkpoints=Checkpoints(directory)), tokens, steps=2,

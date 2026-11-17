@@ -166,6 +166,73 @@ def test_an_adapters_fused_product_refuses_a_projection_the_recipe_takes():
             low_rank.low_rank(rows, kernel, a, b, 1.0, out_dtype=jnp.float32)
 
 
+def test_a_projection_the_recipe_leaves_runs_under_a_product_wrapper_as_without_the_recipe():
+    """A projection in a role the 'fp8' numerics take whose widths hold no whole 128-wide blocks, which the
+    recipe leaves (`projections.recipe_refusal`), is no recipe's to refuse: under a wrapper's product and
+    as an adapter's fused product it runs as it does in a run of no recipe, bit for bit (row 6914)."""
+    from dew import _cache
+    from dew.nn.dense import Dense
+    from dew.nn.precision import projection_role
+
+    narrow = WIDTH - 32
+    layer = Dense(narrow, dtype=jnp.float32)
+    rng = np.random.default_rng(6914)
+    x = jnp.asarray(rng.normal(size=(4, WIDTH)), jnp.float32)
+    params = layer.init(jax.random.key(0), x)
+    kernel, a, b = (jnp.asarray(rng.normal(size=shape), jnp.float32)
+                    for shape in ((WIDTH, narrow), (WIDTH, 4), (4, narrow)))
+
+    def ran():
+        with _cache.INTERCEPTED(new_value=True):
+            wrapped = layer.apply(params, x)
+        return wrapped, low_rank.low_rank(x, kernel, a, b, 1.0, out_dtype=jnp.float32)
+
+    with projection_role("mlp"):
+        plain = ran()
+        with generation.run_precision(FP8):
+            recipes = ran()
+    for name, without, under in zip(("wrapped", "adapted"), plain, recipes, strict=True):
+        np.testing.assert_array_equal(np.asarray(under), np.asarray(without), err_msg=name)
+
+
+@pytest.mark.parametrize(("roles", "width", "pairs"), [
+    (("mixer", "mlp", "experts"), WIDTH - 32, True), (("mlp",), WIDTH, True),
+    (("mixer", "mlp", "experts"), WIDTH, False)], ids=["no-whole-blocks", "a-role-it-keeps", "taken"])
+def test_experts_the_recipe_leaves_take_their_gate_and_up_as_one_paired_product(roles, width, pairs):
+    """A routed layer's gate and up projections the 'fp8' recipe leaves (`projections.recipe_refusal`), their
+    widths of no whole 128-wide blocks or a recipe keeping the experts' role, take one paired product as in a
+    run of no recipe (`moe.paired_projections`): the same routes, each product bit for bit, whatever role the
+    caller traces in (a block's feed-forward's, `mlp`); experts the recipe takes run their products apart,
+    each in the recipe (row 6914)."""
+    from dew.nn.moe import paired_projections
+    from dew.nn.precision import projection_role
+
+    rng = np.random.default_rng(6914)
+    x = jnp.asarray(rng.normal(size=(6, WIDTH)), jnp.float32)
+    gate, up = (jnp.asarray(rng.normal(size=(2, WIDTH, width)), jnp.float32) for _ in range(2))
+    sizes = jnp.asarray([4, 2], jnp.int32)
+    recipe = dataclasses.replace(FP8, low_precision=LowPrecision(roles=roles))
+
+    def paired():
+        with generation.routes() as routes:
+            products = paired_projections(x, gate, up, sizes, None, "auto", None)
+        return products, [(found.choice, found.kernel) for found in routes]
+
+    with projection_role("mlp"):
+        plain, plain_routes = paired()
+        with generation.run_precision(recipe):
+            recipes, recipe_routes = paired()
+    if not pairs:
+        # Each product apart, in the recipe: its route a kernel of the recipe's choice, none unquantized.
+        recipe_kernels = [kernel for choice, kernel in recipe_routes
+                          if choice == projections.RECIPES["blockwise_fp8"].choice]
+        assert len(recipe_kernels) == 2 and "unquantized" not in recipe_kernels, recipe_routes
+        return
+    assert recipe_routes == plain_routes
+    for without, under in zip(plain, recipes, strict=True):
+        np.testing.assert_array_equal(np.asarray(under), np.asarray(without))
+
+
 def test_the_experts_kernel_gradient_keeps_the_master_dtype():
     """The experts' kernel gradient under the 'fp8' numerics keeps the master's float32, as
     `expert_projection`'s contract says: 257 rows of ones through a matrix of ones, each kernel entry's

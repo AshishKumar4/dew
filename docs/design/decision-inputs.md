@@ -2,7 +2,7 @@
 
 Design record, 2026-10-23.
 
-Built so far: the joint row's user turn as segments (`JointLayout.segments`: `Text`, `Media`, `State`,
+Built so far: the joint row's user turn as segments (`SegmentLayout.segments`: `Text`, `Media`, `State`,
 `Schema`); layouts and heads recorded by import path; and the schema's stream (`Schema.stream`): the
 schema read as the row's context, in a backbone pass of its own over the same weights, which the
 cross-attention reads and the head pools its questions and options from (§2, §3); and a lettered
@@ -18,7 +18,7 @@ each stream attends to. Ownership is PLAN.md's.
 
 ## Today
 
-A layout is one of three classes (`MarkerLayout`, `StateFirstLayout`, `JointLayout` in `src/dew/decision/layout.py`, each recorded, as a decision head is, as a registry class record by import path, `{"class", "fields"}`, an earlier run's `{"name"}` read once at the pinned run boundary). Each takes its row's parts as data, its `segments`, which a run names (`DecisionRunConfig.segments`), so an arrangement is a tuple of segments, not a class. A context beside the state (`Example.context`) has one path of its own: the backbone's token table embeds it, and the backbone's cross-attention reads it.
+A layout is one class, `SegmentLayout` (`src/dew/decision/layout.py`), whose `form` names the row it writes: Laya's marker row, a state-first row, or the joint row, each built by its constructor (`marker_row`, `state_first_row`, `joint_row`), which gives that row its own defaults. It is recorded, as a decision head is, as a registry class record by import path, `{"class", "fields"}`; an earlier run's `{"name"}`, and a record naming one of the three classes it was before (`MarkerLayout`, `StateFirstLayout`, `JointLayout`, or their base `QuestionLayout`), are read once at the pinned boundaries (`dew._records.earlier_layout`) as the segment layout of that row. Each takes its row's parts as data, its `segments`, which a run names (`DecisionRunConfig.segments`), so an arrangement is a tuple of segments, not a class. A context beside the state (`Example.context`) has one path of its own: the backbone's token table embeds it, and the backbone's cross-attention reads it.
 
 ## 1. A layout is data: segments
 
@@ -26,7 +26,7 @@ A row is an ordered tuple of segments and a row budget (`max_len`), each segment
 
 A layout is either joint (every question in one row) or per question (one row a question, the schema segment rendering that question alone). Its record is its segment tuple, each segment a frozen dataclass, recorded and rebuilt by its import path through `dew.registry`'s typed records (`to_record`, `from_record`), with no closed registry. A composition a user writes reloads as written.
 
-Not built: the three classes as three configurations of one segment layout. Its proof would be each configuration laying out the existing fixtures' rows byte for byte as its class does: tokens, spans, positions and option slots, the parallel layout and the cut cases among them, a test that lands before the classes go.
+Built: the three classes are three configurations of one segment layout. Its proof is each configuration laying out the rows its class laid out byte for byte (`tests/test_decision_layout_parity.py`, written against the three classes before they went): every row's tokens, spans, positions, option slots, parallel positions and cuts, and its refusal, over 52 configurations (lengths that cut, parallel and sequential options, markers and labels, each row order, option and question budgets, blocks, the joint row's own segments and state cap) and their states and question sets. A layout's fields that only a row a question reads are refused on the joint row.
 
 ## 2. A segment goes to a stream
 
@@ -70,7 +70,7 @@ no stream segments stands in the row's one stream, which a one-entry table reads
 
 A question's own row holds the request's state, so a request of `q` questions over a state of `S` tokens
 laid out a row a question reads `q·S` of state. A question layout asks a request's questions over one
-copy instead (`QuestionLayout.shared_state`: as many as a row holds where None, at most `n`, a row a
+copy instead (`SegmentLayout.shared_state`: as many as a row holds where None, at most `n`, a row a
 question at 1): what each question's own row writes before its question, the state there, once, and each
 question's own part after it (`dew.decision.shared_state`).
 
@@ -88,7 +88,7 @@ question's own part after it (`dew.decision.shared_state`).
   written to its context or before its state) is a row a question; so is a row a head reads across its
   questions (`Head.reads_apart`, `Head.one_question`) or a backbone would not compute as its own rows
   (`ForkedCalls`: engram, block routing, an expert capacity, a mixer that reads no forks, dropout in a
-  training step), as `QuestionLayout.shared_for` derives it for a run and a task. A layout asking several
+  training step), as `SegmentLayout.shared_for` derives it for a run and a task. A layout asking several
   questions a row explicitly where its rows read otherwise is refused.
 
 ## 3. The head reads the main pass
@@ -100,17 +100,17 @@ With the schema in the main row nothing changes. With the schema on a stream, th
 ## 4. What a user writes
 
 ```python
-from dew.decision import JointLayout, Schema, State, Text
+from dew.decision import Schema, SegmentLayout, State, Text
 from dew.decision.layout import Reads
 
-layout = JointLayout(max_len=4096, segments=(
+layout = SegmentLayout.joint_row(max_len=4096, segments=(
     Text(SYSTEM), Schema(), State(keep="end"), Text(ASSISTANT)))  # schema before state
 
-layout = JointLayout(max_len=4096, segments=(
+layout = SegmentLayout.joint_row(max_len=4096, segments=(
     Text(SYSTEM), State(keep="end"), Text(ASSISTANT),
     Schema(stream="context")))  # the schema read through cross-attention, its own pass
 
-layout = JointLayout(max_len=4096, segments=(
+layout = SegmentLayout.joint_row(max_len=4096, segments=(
     Text(SYSTEM), State(keep="end"), Schema(stream="schema"), Text(ASSISTANT)),
     reads=Reads((("row", "self", "causal"), ("row", "schema", "whole"), ("schema", "self", "causal"))))
 # the schema a stream of the row's own, read whole by the state in one pass (§2a)

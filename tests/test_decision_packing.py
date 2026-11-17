@@ -24,20 +24,10 @@ from torch_layout import node
 from dew.batch import VALID_ROWS
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
-from dew.decision import (
-    Choice,
-    DecisionObjective,
-    Example,
-    JointLayout,
-    LogLoss,
-    Noul,
-    Score,
-    Specials,
-    StateFirstLayout,
-)
+from dew.decision import Choice, DecisionObjective, Example, LogLoss, Noul, Score, Specials
 from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
 from dew.decision.inputs import OPTION_TILE, DecisionInputs, compacted
-from dew.decision.layout import QUESTION_FIELDS, Labels
+from dew.decision.layout import QUESTION_FIELDS, Labels, SegmentLayout
 from dew.decision.rows import TRAINING_FIELDS
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
@@ -79,11 +69,11 @@ def attending(length: int, implementation: str = "xla") -> CausalTransformer:
                              max_seq_len=length, attention_impl=implementation)
 
 
-ROWS = StateFirstLayout(max_len=256, head_max_len=64, option_tokens=8)
+ROWS = SegmentLayout.state_first_row(max_len=256, head_max_len=64, option_tokens=8)
 LABELS = Labels(variants=("{}",))
 """Labels a byte vocabulary spells as one token each: the bare letter."""
 ARMS = {
-    "joint": (JointLayout(max_len=1536), qwen35,
+    "joint": (SegmentLayout.joint_row(max_len=1536), qwen35,
              lambda: JointSchemaHead(64, width=32, routing_layers=1, layers=1, heads=2, feedforward=64)),
     "marker": (ROWS, qwen35, lambda: DecisionHead(64, layers=1)),
     # The parallel arm's decoder on the attention template, which reads the layout's key runs as its spans
@@ -402,7 +392,7 @@ def a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic
     reading nothing. Each packed row's logits and the gradients are the row's alone within the
     float64 gate, the truth the head in float64 on the xla kernel. A head that read the window
     through a dense mask would not run on flash at all."""
-    layout = JointLayout(max_len=1536)
+    layout = SegmentLayout.joint_row(max_len=1536)
     objective = DecisionObjective(
         attending(layout.max_len), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
         head=JointSchemaHead(32, width=128, routing_layers=1, layers=1, heads=2, feedforward=64,
@@ -583,7 +573,8 @@ def test_a_one_question_head_reads_joint_rows_only_of_one_question():
     """The marker head reads one question a row: over joint rows of a schema that asks several, the run
     is refused before a row is read; a schema of one question reads as rows of one."""
     objective = DecisionObjective(qwen35(1536), tokenizer=TOKENIZER, specials=SPECIALS,
-                                  layout=JointLayout(max_len=1536), head=DecisionHead(64, layers=1),
+                                  layout=SegmentLayout.joint_row(max_len=1536), head=DecisionHead(64,
+                                                                                                  layers=1),
                                   shuffle_options=False)
     with pytest.raises(ValueError):
         decision_rows(EXAMPLES, 2, objective=objective.data())
@@ -599,10 +590,10 @@ def test_a_one_question_head_reads_joint_rows_only_of_one_question():
 @pytest.mark.parametrize("causal", [True, False])
 def test_a_joint_head_given_no_layout_reads_every_question_of_a_request_in_one_row(causal):
     """A decision objective given the joint head and no layout lays a request out
-    as that head reads it, every question in one row (`JointLayout`), over a
+    as that head reads it, every question in one row (`SegmentLayout.joint_row`), over a
     causal and a bidirectional backbone alike, as a run's config does: it
     scores a three-question request as the same objective given the
-    JointLayout does."""
+    the joint row does."""
     example = EXAMPLES[4]
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
                                  max_seq_len=2048, attention_impl="xla", causal=causal)
@@ -612,9 +603,9 @@ def test_a_joint_head_given_no_layout_reads_every_question_of_a_request_in_one_r
         return DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, head=head,
                                  shuffle_options=False, **layout)
 
-    stated, defaulted = objective(layout=JointLayout()), objective()
+    stated, defaulted = objective(layout=SegmentLayout.joint_row()), objective()
     # Drawn over a window the backbone holds; the weights are the same whatever the layout's length.
-    variables = objective(layout=JointLayout(max_len=2048)).init(jax.random.key(0))
+    variables = objective(layout=SegmentLayout.joint_row(max_len=2048)).init(jax.random.key(0))
 
     def scores(objective):
         rows = objective.layout.rows(TOKENIZER, SPECIALS, example.state, example.questions)
@@ -630,9 +621,9 @@ def test_single_option_questions_fit_the_packing_bounds(questions):
     """A fitting singleton-choice schema packs even where a two-option row cannot fit."""
     example = Example("", {f"q{index}": Choice("x", ["0"]) for index in range(questions)},
                       {f"q{index}": "0" for index in range(questions)})
-    (encoded,) = JointLayout().rows(TOKENIZER, SPECIALS, example.state, example.questions)
+    (encoded,) = SegmentLayout.joint_row().rows(TOKENIZER, SPECIALS, example.state, example.questions)
     length = len(encoded.tokens) if questions == 1 else 500
-    layout = JointLayout(max_len=length)
+    layout = SegmentLayout.joint_row(max_len=length)
     assert layout.fits(encoded)
     objective = DecisionObjective(attending(length), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
                                   head=JointSchemaHead(32, width=32, routing_layers=1, layers=1,
@@ -705,7 +696,7 @@ def test_a_packed_loss_counts_only_real_scored_questions():
                 {"q0": Choice("x", ["no", "yes"]), "q1": Choice("x", ["u", "v"]),
                  "q2": Noul("x"), "q3": Choice("x", ["0", "1", "2", "3"])}, {"q0": "yes"}),
     ]
-    layout = JointLayout(max_len=1536)
+    layout = SegmentLayout.joint_row(max_len=1536)
     objective = DecisionObjective(attending(layout.max_len), tokenizer=TOKENIZER, specials=SPECIALS,
                                   layout=layout, head=JointSchemaHead(32, width=32, routing_layers=1,
                                       layers=1, heads=2, feedforward=64), shuffle_options=False)

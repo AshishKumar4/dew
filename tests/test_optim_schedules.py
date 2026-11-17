@@ -10,6 +10,7 @@ magnitude more.
 
 import dataclasses
 from pathlib import Path
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -152,7 +153,8 @@ def test_post_step_effects_act_in_the_order_a_named_chain_declares():
     unmoved = jax.tree.map(jnp.zeros_like, params)
 
     def state(clipped: int, bounded: int, rescale: float, upper: float, order=("z_clip", "a_bound")) -> dict:
-        held = {"z_clip": QKClipState(jnp.asarray(clipped), {path: jnp.asarray([rescale])}),
+        held = {"z_clip": QKClipState(jnp.asarray(clipped), {path: jnp.asarray([rescale])},
+                                      {path: jnp.asarray([0.0])}),
                 "a_bound": BoundsState(jnp.asarray(bounded), {path: jnp.asarray([0.0, upper])})}
         return {name: held[name] for name in order}
 
@@ -167,6 +169,58 @@ def test_post_step_effects_act_in_the_order_a_named_chain_declares():
     np.testing.assert_array_equal(deferred["q_proj"]["kernel"], [[1.5]])
 
 
+class UnpooledClip(NamedTuple):
+    """A QK-Clip state as Dew held it before its pooled maxima: the updates it took part in and its
+    rescales, the fields a checkpoint of then holds."""
+
+    steps: jax.Array
+    rescales: dict
+
+
+def unpooled_clip(tau: float) -> optax.GradientTransformationExtraArgs:
+    """A transform whose state is a QK-Clip state of the form before its pooled maxima (`UnpooledClip`),
+    stepping aside: what a run saved before them held."""
+    from dew.optim import _rescales
+
+    return optax.GradientTransformationExtraArgs(
+        lambda params: UnpooledClip(jnp.zeros([], jnp.int32), _rescales(params, None, tau, None)),
+        lambda updates, state, params=None, **extra: (updates, state))
+
+
+def test_a_run_saved_before_the_clip_pooled_its_maxima_resumes_and_steps_on(tmp_path):
+    """A checkpoint whose QK-Clip state holds no pooled maxima, as one saved before the state held them,
+    restores into a run of this Dew through the translation at the restore boundary
+    (`dew.checkpoints._clip_pooled_unsaved`: no microstep held back, zero) and steps on, its clip taking
+    part in the update it resumes with."""
+    from dew.checkpoints import Checkpoints
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.optim import scale_by_qk_clip
+    from dew.training import Trainer
+
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=12, dtype="float32", qk_norm=False)
+    rows = 2 * jax.device_count()
+    text = (np.arange(rows * 8, dtype=np.int32) % 13).reshape(rows, 8)
+    data = Pipeline(Memory({"text": text})).repeat().batch(rows)
+
+    def fit(clip, steps):
+        checkpoints = Checkpoints(str(tmp_path))
+        chain = optax.named_chain(("sgd", optax.sgd(1e-2)), ("z_clip", clip))
+        state = Trainer(LMObjective(model, seq_len=7), chain, key=jax.random.key(0),
+                        checkpoints=checkpoints).fit(data, steps=steps, checkpoint_every=1)
+        checkpoints.wait()
+        return state
+
+    fit(unpooled_clip(100.0), 1)
+    resumed = fit(scale_by_qk_clip(100.0), 2)
+    clip = resumed.opt_state["z_clip"]
+    assert int(resumed.step) == 2 and int(clip.steps) == 1
+    assert all(np.all(np.asarray(pooled) == 0) for pooled in clip.pooled.values())
+
+
 @pytest.mark.parametrize("wrapped", ["bare", "plain", "multisteps"])
 def test_a_fit_moves_its_weights_by_its_named_chains_post_step_effects_in_its_order(wrapped):
     """Through `Trainer.fit`, bare and wrapped as a plain transformation (which declares no extra
@@ -175,8 +229,9 @@ def test_a_fit_moves_its_weights_by_its_named_chains_post_step_effects_in_its_or
     names sort the other way (row 5964): every stored weight is within the bounds, where the rescale after
     the clamp would leave a clipped kernel's under them, and the clip fired, its kernels shrunk under the
     bound and lifted to it, the plain wrapper's clip handed the logits' maxima as the bare chain's is (row
-    6552). Inside `optax.MultiSteps` of two steps, whose inner update would read its window's last step's
-    maxima alone, the run is refused as its step traces."""
+    6552). Inside `optax.MultiSteps` of two steps, whose inner update runs at its window's last step alone,
+    the run trains two steps and its window's clip fires as the bare chain's does: each step's commit
+    pools its maxima in the clip's state (`dew.optim.pooled_update`), where the run was refused (row 6685)."""
     from flax.traverse_util import flatten_dict
 
     from dew.data import Memory
@@ -197,11 +252,7 @@ def test_a_fit_moves_its_weights_by_its_named_chains_post_step_effects_in_its_or
     rows = 2 * jax.device_count()
     text = (np.arange(rows * 8, dtype=np.int32) % 13).reshape(rows, 8)
     data = Pipeline(Memory({"text": text})).repeat().batch(rows)
-    if wrapped == "multisteps":
-        with pytest.raises(ValueError):
-            trainer.fit(data, steps=2)
-        return
-    final = trainer.fit(data, steps=1)
+    final = trainer.fit(data, steps=2 if wrapped == "multisteps" else 1)
     params = flatten_dict(jax.device_get(final.variables["params"]))
     for path, leaf in params.items():
         assert np.all((leaf >= lower) & (leaf <= upper)), (path, np.min(leaf), np.max(leaf))

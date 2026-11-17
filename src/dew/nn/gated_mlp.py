@@ -30,9 +30,10 @@ from jax.ad_checkpoint import checkpoint_name
 from dew.nn import activations
 from dew.nn.dense import Dense, _promoted
 from dew.nn.joined import Projections, projection_requirements, projections_of
-from dew.nn.kernels import gemm, grouped_matmul, projections
+from dew.nn.kernels import gemm, projections
 from dew.nn.kernels.generation import INHERENT, Choice, device_generation, gpu_target
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
+from dew.nn.kernels.templates.gemm.hooks import hook_lowers
 from dew.nn.sharding import on_shards, seen_whole
 
 FUSION_ROW = 'ledger 1958'
@@ -81,7 +82,7 @@ class GatedCase:
         tile = jax.ShapeDtypeStruct((128, 128), self.dtype)
         return (all(projections.launches(rows, kernel, self.dtype, self.precision, whole=self.whole)
                     for rows, kernel in ((self.rows, gate), (hidden, down)))
-                and grouped_matmul.hook_lowers(self.hook, (tile, tile), gpu_target()))
+                and hook_lowers(self.hook, (tile, tile), gpu_target()))
 
 
 FUSED_SUPPORTS: tuple[Requirement[GatedCase], ...] = (

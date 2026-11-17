@@ -260,8 +260,7 @@ def keep_lowerings(path: str) -> None:
 
 UNCACHED = ("jax_enable_compilation_cache",)
 """The settings of JAX's that `uncached` turns off for its block: whether a compile reads and writes the
-persistent cache, which no program reads, so a program's identity states none of them
-(`dew.training.identity.settings`)."""
+persistent cache, which no program reads."""
 
 
 @contextlib.contextmanager
@@ -393,8 +392,7 @@ other, and check 1 drives both (docs/design/algebra.md §6.9)."""
 
 WHOLE = _context(default_value=False)
 """Whether a model runs its layer stack and sequences whole (`dew.nn.sharding.whole`), keyed on as `ALGEBRA`
-is: a trace reads it, so a call's identity states it with JAX's trace context, and a program traced whole
-is never run staged."""
+is: a trace reads it, so JAX's trace context holds it, and a program traced whole is never run staged."""
 
 PLACING = _context(None)
 """What places the traced program's parameters (`dew.nn.sharding.placing`: a trainer's layout, or
@@ -416,9 +414,8 @@ traces, and reports its routes, again."""
 
 RECORDING = (KERNEL_SEEN, KERNEL_ROUTES)
 """The contexts a trace records into (`KERNEL_SEEN`, `KERNEL_ROUTES`): JAX keys its trace caches on their
-values' identities so a cached trace records again, and the program is the same under any of them, so a
-program's identity states none (`dew.training.ahead.call_identity`), as the persistent cache's key reads
-none."""
+values' identities so a cached trace records again, and the program is the same under any of them, as
+the persistent cache's key reads none."""
 
 KERNEL_PINS = _context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
@@ -458,7 +455,7 @@ quantized call. In this context their traces are kept apart."""
 def carried() -> Callable[[], contextlib.AbstractContextManager[None]]:
     """This thread's trace-affecting states as they stand (every context of Dew's but those a trace records
     into, `RECORDING`, and every setting of JAX's that holds
-    per thread, its matmul precision and x64 among them, as `dew.training.identity.settings` reads them),
+    per thread, its matmul precision and x64 among them),
     entered again by what this returns in another thread: a run's numerics and kernel choices
     (`dew.config.RunConfig.traced`) among them, so a program it traces there is the one its loop traces,
     under the same keys."""
