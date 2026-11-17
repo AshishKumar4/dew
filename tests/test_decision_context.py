@@ -419,7 +419,8 @@ def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly
     lengths = np.asarray(batch["context_lengths"])
     held = [tuple(row[:length].tolist()) for row, length in zip(np.asarray(batch["context"]), lengths,
                                                                strict=True)]
-    assert held and set(held) <= notes
+    # Each row's context its encoder's tokens of its note, an example of none holding none.
+    assert held and set(held) <= notes | {()}
     directory = str(tmp_path / "run")
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(directory, keep=2))
     state = trainer.fit(data, steps=2, log_every=1, checkpoint_every=1)
