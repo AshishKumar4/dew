@@ -34,7 +34,7 @@ from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
 from dew._builds import dew_cache_dir
-from dew._files import write_atomically
+from dew._files import inside, write_atomically
 from dew._records import JSON, json_value, record, text
 from dew.data.retention import LocalRetention, evictable, read_pin
 from dew.data.shared import SharedMapping
@@ -678,13 +678,9 @@ class Store:
                      idle_seconds=self.idle_seconds)
 
     def child(self, path: str) -> Store:
+        # One rule for every path read from outside (`dew._files.inside`): a URL's `scheme:` is a drive's.
         path = path.rstrip("/")
-        if (
-            not path
-            or path.startswith("/")
-            or "://" in path
-            or any(part in ("", ".", "..") for part in path.split("/"))
-        ):
+        if not inside(path):
             raise ValueError(f"storage child must stay inside its root: {path!r}")
         return replace(self, url=self.url.rstrip("/") + "/" + path)
 

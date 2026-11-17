@@ -270,7 +270,7 @@ def code_modules(code: SourceCode) -> dict[str, Path]:
 
     def located(file: str) -> Path:
         # A module named by a config or an import is a path inside the source, as a subfolder is.
-        if not file or not inside(file) or file.endswith("/"):
+        if not inside(file, directory=False):
             raise ValueError(f"{file!r} is no module inside the source: its code may not name a path "
                              "outside it")
         if local:
