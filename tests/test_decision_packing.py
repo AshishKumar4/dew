@@ -759,3 +759,33 @@ def _columns(batches) -> dict[str, list]:
         for name, value in batch.items():
             columns.setdefault(name, []).append(value)
     return columns
+
+
+def test_a_packed_decision_run_main_saved_resumes_exactly():
+    """A packed decision read main saved at ecb9577e7, its layout named by the class it was then
+    (`JointLayout`), one budget of windows in, resumes exactly and reads the windows a read of the same
+    chain reads after its first: the decision steps the read describes read a saved plan's earlier layouts
+    (`dew.decision.layout.ReadsEarlierLayouts`). The steps a configured layout makes (`LayoutRows`,
+    `EvaluateRows`) read none, so its plan was refused as changed."""
+    import dataclasses
+    from pathlib import Path
+
+    objective = objective_for("joint")
+    data = decision_rows(EXAMPLES * 4, None, objective=objective.data(), tokens=2 * objective.layout.max_len)
+    saved = (Path(__file__).with_name("fixtures") / "positions" / "main-ecb9577e7"
+             / "decision_packed.position").read_bytes()
+    reader = data.train(DataPartition())
+    try:
+        next(reader)
+        expected = next(reader)
+    finally:
+        reader.close()
+    resumed = dataclasses.replace(data, resume="exact").train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        got = next(resumed)
+    finally:
+        resumed.close()
+    assert set(got) == set(expected)
+    for name in expected:
+        np.testing.assert_array_equal(np.asarray(got[name]), np.asarray(expected[name]))

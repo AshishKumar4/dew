@@ -657,7 +657,7 @@ def _fitted(element: Batch) -> FittedRow:
 
 
 @dataclass(frozen=True)
-class LayoutRows(pygrain.RandomMapTransform):
+class LayoutRows(pygrain.RandomMapTransform, ReadsEarlierLayouts):
     encoding: Encoding
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
@@ -678,7 +678,7 @@ class LayoutRows(pygrain.RandomMapTransform):
 
 
 @dataclass(frozen=True)
-class EvaluateRows(pygrain.MapTransform):
+class EvaluateRows(pygrain.MapTransform, ReadsEarlierLayouts):
     encoding: Encoding
 
     def map(self, element: Batch) -> Batch:
