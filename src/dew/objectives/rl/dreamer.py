@@ -39,7 +39,7 @@ from flax.typing import Dtype
 
 from dew.batch import Batch, Variables, merge, under
 from dew.inference.models import ReleasesModel
-from dew.nn.activations import silu
+from dew.nn.activations import logistic, silu
 from dew.nn.categorical import kl_divergence
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32, divided
@@ -207,7 +207,7 @@ class ConvDecoder(nn.Module):
             x = conv(depths[stage], kernel_init=_init(), name=f"conv{stage}")(x.repeat(2, -2).repeat(2, -3))
             x = silu(norm(name=f"conv{stage}norm")(x))
         x = conv(self.image[-1], kernel_init=_init(), name="imgout")(x.repeat(2, -2).repeat(2, -3))
-        return jax.nn.sigmoid(x).reshape(*lead, *self.image)
+        return logistic(x).reshape(*lead, *self.image)
 
 
 class WorldModel(nn.Module):
@@ -361,8 +361,8 @@ class WorldModel(nn.Module):
         x = silu(self.dynamics_hidden_norm(self.dynamics_hidden(x)))
         gates = self.gru(x).reshape(*deter.shape[:-1], self.blocks, -1)
         reset, candidate, update = (part.reshape(*deter.shape[:-1], -1) for part in jnp.split(gates, 3, -1))
-        candidate = jnp.tanh(jax.nn.sigmoid(reset) * candidate)
-        update = jax.nn.sigmoid(update - 1)
+        candidate = jnp.tanh(logistic(reset) * candidate)
+        update = logistic(update - 1)
         # The state carried at its own dtype, whatever the networks compute in.
         return (update * candidate + (1 - update) * deter).astype(deter.dtype)
 
@@ -419,7 +419,7 @@ class WorldModel(nn.Module):
         x = self.policy_layers(feature)
         wide = at_least_fp32(self.dtype)
         mean, std = (head(x).astype(wide) for head in (self.policy_mean, self.policy_std))
-        std = (self.max_std - self.min_std) * jax.nn.sigmoid(std + 2.0) + self.min_std
+        std = (self.max_std - self.min_std) * logistic(std + 2.0) + self.min_std
         return jnp.tanh(mean), std
 
 
@@ -818,7 +818,7 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio, Variables]):
         actions = jnp.concatenate([jnp.swapaxes(imagined.action, 0, 1), last_action[:, None]], 1)
         still = self.model.bind(held)
         rewards = twohot_mean(still.reward(features), self.bins)
-        cont = jax.nn.sigmoid(still.continue_(features))
+        cont = logistic(still.continue_(features))
         model = self.model.bind(variables)
         values = twohot_mean(model.value(features), self.bins)
         slow = self.model.bind(merge(variables, jax.lax.stop_gradient(step.ema)) if step.ema is not None

@@ -37,6 +37,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.schedules.flow import static_shift
 from dew.held_updates import phased
 from dew.inputs import InputSpec
+from dew.nn.activations import logistic
 from dew.nn.attention import forward_mode_attention
 from dew.nn.inspection import INSPECTED
 from dew.objectives.base import TEACHER, Aux, EMASpec, ProgramModule, Step
@@ -352,7 +353,7 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
     def _times(normal, moments) -> jax.Array:
         """rCM's log-normal training time in rf time, as TrigFlow time, the arctan of rf / (1 - rf)."""
         mean, std = moments
-        rf = jnp.clip(jax.nn.sigmoid(mean + std * normal), 0.0, 1.0)
+        rf = jnp.clip(logistic(mean + std * normal), 0.0, 1.0)
         return jnp.arctan(rf / (1 - rf))
 
     def _draws(self, step: Step, count: int, shape) -> _Draws:

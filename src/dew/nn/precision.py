@@ -181,12 +181,13 @@ def rms_statistics(x: jax.Array, epsilon: float, *, axis=-1, keepdims: bool = Tr
 
 
 def activation_and_slope(gate, activation: str) -> tuple[jax.Array, jax.Array]:
-    """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid'.
+    """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid', its sigmoid the one logistic's
+    arithmetic (`logistic_value`), as a kernel's body takes it.
 
     silu's derivative `s + g s (1 - s)`, with `s = sigmoid(g)`, cancels to
     zero near g = -1.28; formed as the product rule forms it, `s + g (s (1 - s))`,
     its worst element there is half `(g s)(1 - s) + s`'s, as XLA's is."""
-    sigmoid = jax.nn.sigmoid(gate)
+    sigmoid = logistic_value(gate)
     slope = sigmoid * (1.0 - sigmoid)
     if activation == 'sigmoid':
         return sigmoid, slope
@@ -497,6 +498,14 @@ def accurate_exp(x, *, base2: bool = False) -> jax.Array:
     if backend() != "tpu" or x.dtype == jnp.float64:
         return jnp.exp2(x) if base2 else jnp.exp(x)
     return _exp(base2, x.astype(jnp.float32)).astype(x.dtype)
+
+
+def logistic_value(x) -> jax.Array:
+    """`1 / (1 + e^-x)` in at least float32, its exp accurate (`accurate_exp`) and a true division: the one
+    logistic's arithmetic, which `activations.logistic` declares its tangent over and a kernel's body, which
+    differentiates nothing, calls as it is (`activation_and_slope`, the recurrence step's and conv's)."""
+    work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
+    return 1.0 / (1.0 + accurate_exp(-work))
 
 
 def softplus_series(x) -> jax.Array:

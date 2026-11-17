@@ -22,7 +22,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, short_conv, tuning
 from dew.nn.kernels.templates import mosaic, scan
-from dew.nn.precision import compensated_add, compensated_sum
+from dew.nn.precision import compensated_add, compensated_sum, logistic_value
 
 TOKENS = 64
 """The most tokens a program walks: a backward program computes K-1 past them, `(K - 1) / TOKENS` extra."""
@@ -114,7 +114,7 @@ def _activated(pre, activation: bool):
     """The SiLU of the conv's sums, causal_conv1d's one quotient, and their sigmoid (None without one)."""
     if not activation:
         return pre, None
-    return pre / (1.0 + jnp.exp(-pre)), jax.nn.sigmoid(pre)
+    return pre / (1.0 + jnp.exp(-pre)), logistic_value(pre)
 
 
 class _Piece:

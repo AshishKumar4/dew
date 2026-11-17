@@ -16,7 +16,7 @@ from flax import linen as nn, struct
 from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
 
-from .activations import silu
+from .activations import logistic, silu
 from .dense import Dense
 from .derivatives import portable_formed
 from .kernels import norm_swiglu
@@ -398,7 +398,7 @@ class GatedRMSNorm(nn.Module):
         stream, normed = self.norm(name='norm').seam(x, branch, axes=axes)
         gate = NormGate(self.rank, dtype=self.dtype, precision=self.precision, name='mlp')(normed)
         wide = at_least_fp32(normed.dtype)
-        return stream, (normed.astype(wide) * jax.nn.sigmoid(gate.astype(wide))).astype(normed.dtype)
+        return stream, (normed.astype(wide) * logistic(gate.astype(wide))).astype(normed.dtype)
 
 
 class _Shifted(nn.LayerNorm):

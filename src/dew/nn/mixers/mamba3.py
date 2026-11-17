@@ -38,7 +38,7 @@ from dew.algebra import scan
 from dew.batch import document_firsts, real_bounds
 from dew.mesh import LayoutRefused
 from dew.nn import rope
-from dew.nn.activations import silu
+from dew.nn.activations import logistic, silu
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.derivatives import portable_formed
@@ -576,7 +576,7 @@ class Mamba3(nn.Module):
         if self.mimo_rank > 1:
             x, z = ((t.astype(wide) * jnp.swapaxes(weight, 0, 1)).astype(projected.dtype)
                     for t, weight in ((x, self.mimo_x), (z, self.mimo_z)))
-        return x, step, decay, *keys, nn.sigmoid(trap.astype(wide)), rates, z
+        return x, step, decay, *keys, logistic(trap.astype(wide)), rates, z
 
     @nn.nowrap
     def cache_spec(self, rows: int) -> dict[str, Opened]:

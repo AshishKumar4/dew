@@ -20,7 +20,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
 from dew.batch import Coordinates
-from dew.nn.activations import silu
+from dew.nn.activations import logistic, silu
 from dew.nn.attention import (
     AttentionImpl,
     attention_case,
@@ -353,7 +353,7 @@ class _Masking(NamedTuple):
 
 
 GATE_ACTIVATIONS = {
-    'sigmoid': jax.nn.sigmoid,
+    'sigmoid': logistic,
     'silu': silu,
     # torch's softplus at beta log 2, log(1 + exp(x log 2)) / log 2.
     'softplus2': lambda gate: divided(softplus(gate * math.log(2)), math.log(2)),
@@ -1893,7 +1893,7 @@ class CausalSelfAttention(nn.Module):
             wide = at_least_fp32(jnp.result_type(gate, attention))
             scale = gain(self.s_gate, self.ctx.ngpt.gate(self.ctx.emb_features), wide)
             logits = gate.astype(wide) * jnp.square(scale).reshape(self.ctx.num_heads, self.ctx.head_dim)
-            attention = (attention.astype(wide) * jax.nn.sigmoid(logits)).astype(attention.dtype)
+            attention = (attention.astype(wide) * logistic(logits)).astype(attention.dtype)
         elif gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects (modeling_qwen3_5.py:701,
             # modeling_qwen4_exp.py:836 the same), or by K2 Horizon's SiLU or softplus at beta log 2

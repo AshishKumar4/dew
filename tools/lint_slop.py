@@ -91,9 +91,11 @@ Scope is per rule, because the rules are not all about the same thing:
   `softplus` forms its log1p by its own series: a backend's log1p is no part of
   it, a v5e's 1.4e-4 from float64, which held a Mamba-2 layer at 143 times
   its upstream's error (row 7062).
-- SLOP031 is about `src/<package>`: no module calls JAX's or Flax's silu
-  (`SILU`), by any name it is imported as, but `nn/activations.py`, whose
-  `silu` is `x` times Dew's one logistic, its exp accurate on every target:
+- SLOP031 is about `src/<package>`: no module calls JAX's or Flax's silu or
+  logistic (`SILU`: sigmoid, expit), by any name it is imported as, but
+  `nn/activations.py`, whose `logistic` is Dew's one and `silu` `x` times it,
+  its exp accurate on every target (a kernel's body takes its arithmetic,
+  `precision.logistic_value`):
   a v5e's logistic is approximate even at HIGHEST, which held Mamba-2's layer
   at 3.5 times its CPU float32 (row 7062).
 - SLOP029 is about `tests`: no test's every assertion is that a process
@@ -1931,13 +1933,16 @@ SOFTPLUS = frozenset({"jax.nn.softplus", "flax.linen.softplus", "flax.linen.acti
 outside `SOFTPLUS_OWNER`."""
 
 SILU_OWNER = "nn/activations.py"
-"""The module of `src/<package>` that forms silu (SLOP031), as `x` times Dew's one logistic."""
+"""The module of `src/<package>` that forms silu and the logistic (SLOP031): Dew's one logistic and `x` times
+it; a kernel's body takes the logistic's arithmetic (`precision.logistic_value`)."""
 
 SILU = frozenset({"jax.nn.silu", "jax.nn.swish", "flax.linen.silu", "flax.linen.swish",
                   "flax.linen.activation.silu", "flax.linen.activation.swish", "jax._src.nn.functions.silu",
-                  "jax._src.nn.functions.swish"})
-"""JAX's and Flax's silu (and its name swish), by their public paths, which SLOP031 reports outside
-`SILU_OWNER`."""
+                  "jax._src.nn.functions.swish", "jax.nn.sigmoid", "flax.linen.sigmoid",
+                  "flax.linen.activation.sigmoid", "jax._src.nn.functions.sigmoid", "jax.lax.logistic",
+                  "jax._src.lax.lax.logistic", "jax.scipy.special.expit", "jax._src.scipy.special.expit"})
+"""JAX's and Flax's silu (and its name swish) and logistic (sigmoid, expit), by their public paths, which
+SLOP031 reports outside `SILU_OWNER`."""
 
 OWNED = (
     ("SLOP026", DERIVATIVE_OWNER, CUSTOM_DERIVATIVES,
@@ -1947,7 +1952,8 @@ OWNED = (
      "calls {named}, its log1p the backend's; call `dew.nn.precision.softplus` (a log-sigmoid its "
      "`-softplus(-x)`), its series past it"),
     ("SLOP031", SILU_OWNER, SILU,
-     "calls {named}, its logistic the backend's; call `dew.nn.activations.silu`, x times Dew's one logistic"),
+     "calls {named}, its logistic the backend's; call `dew.nn.activations.silu` or `logistic`, Dew's one "
+     "logistic (a kernel's body `dew.nn.precision.logistic_value`)"),
 )
 """The constructs one module of `src/<package>` owns, each its rule, its owner, its names and its finding:
 JAX's custom derivatives (SLOP026: applied by a site, its derivative is a call the algebra pass cannot tell a

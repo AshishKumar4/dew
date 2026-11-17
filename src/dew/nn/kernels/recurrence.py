@@ -26,7 +26,7 @@ from jax.experimental import pallas as pl
 
 from dew._hashing import fmix32
 from dew.algebra.scan import Reads, turned
-from dew.nn.activations import silu
+from dew.nn.activations import logistic, silu
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels import launches
 from dew.nn.precision import (
@@ -266,11 +266,11 @@ def gated(gates: Gates, gate, log_a, bias, beta):
     sigmoid write gate the gated delta rule's (`_gated_decay`, `sigmoid(beta)`), with the step's
     Mamba2's (`-exp(log_a)` times the clipped step, and the step)."""
     if gates.write == 'sigmoid' and gates.limit is None:
-        return _gated_decay(gate, log_a, bias), jax.nn.sigmoid(beta)
+        return _gated_decay(gate, log_a, bias), logistic(beta)
     step = softplus(gate + bias)
     if gates.limit is not None:
         step = jnp.clip(step, *gates.limit)
-    return -accurate_exp(log_a) * step, step if gates.write == 'step' else jax.nn.sigmoid(beta)
+    return -accurate_exp(log_a) * step, step if gates.write == 'step' else logistic(beta)
 
 
 def gated_rms(out, z, weight, norm: OutputNorm):

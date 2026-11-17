@@ -35,7 +35,7 @@ from flax.typing import Dtype
 
 from .derivatives import Protected, contracted, declared_tangent
 from .kernels import norm_swiglu
-from .precision import accurate_exp, at_least_fp32, capped_logits, rounded_to, softplus
+from .precision import at_least_fp32, capped_logits, logistic_value, rounded_to, softplus
 
 
 def gelu_exact(x: jax.Array) -> jax.Array:
@@ -71,12 +71,7 @@ def gelu_tanh(x: jax.Array) -> jax.Array:
 
 def quick_gelu(x: jax.Array) -> jax.Array:
     """CLIP's activation, `x * sigmoid(1.702 x)`, ACT2FN's `quick_gelu`."""
-    return x * jax.nn.sigmoid(1.702 * x)
-
-
-def _logistic(x) -> jax.Array:
-    work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
-    return 1.0 / (1.0 + accurate_exp(-work))
+    return x * logistic(1.702 * x)
 
 
 def _logistic_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
@@ -87,11 +82,18 @@ def _logistic_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
     return s, s * logistic(-x) * tangent.astype(s.dtype)
 
 
+def _logistic(x) -> jax.Array:
+    given = jnp.asarray(x)
+    return logistic_value(given).astype(given.dtype)
+
+
 logistic = contracted("test_silu_holds_every_order")(declared_tangent(Protected(), _logistic, _logistic_jvp))
-"""Dew's one logistic, `1 / (1 + e^-x)` in at least float32, its exp accurate (`precision.accurate_exp`: a
-target's own where it is, Dew's on one whose is not, a v5e's) and a true division: a backend's logistic is
-no part of it, a v5e's approximate even at HIGHEST. Every silu (`silu`), gelu (`gelu_tanh`) and softplus's
-derivative (`precision.softplus`) of Dew's reads it."""
+"""Dew's one logistic, `1 / (1 + e^-x)` formed in at least float32 (`precision.logistic_value`) and rounded
+once to `x`'s dtype, its exp accurate (`precision.accurate_exp`: a target's own where it is, Dew's on one
+whose is not, a v5e's) and a true division: a backend's logistic is no part of it, a v5e's approximate even
+at HIGHEST. Every silu (`silu`), gelu (`gelu_tanh`), sigmoid and softplus's derivative
+(`precision.softplus`) of Dew's reads it; a kernel's body, which differentiates nothing, its arithmetic
+(`precision.logistic_value`)."""
 
 
 def silu(x: jax.Array) -> jax.Array:
@@ -221,7 +223,7 @@ class Situ:
     def __call__(self, gate: jax.Array, up: jax.Array) -> jax.Array:
         wide = at_least_fp32(gate.dtype)
         work_gate, work_up = gate.astype(wide), up.astype(wide)
-        activated = capped_logits(work_gate, self.beta) * jax.nn.sigmoid(work_gate)
+        activated = capped_logits(work_gate, self.beta) * logistic(work_gate)
         if self.linear_beta is not None:
             work_up = capped_logits(work_up, self.linear_beta)
         return (activated * work_up).astype(gate.dtype)

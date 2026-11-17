@@ -90,6 +90,7 @@ from ..precision import (
     at_least_fp32,
     compensated_add,
     compensated_total,
+    logistic_value,
     rms_weighted,
     rounded_to,
     two_product,
@@ -1270,7 +1271,7 @@ def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, porta
 
 def _product(gate, up, dtype, interpret: bool):
     """SwiGLU of fp32 halves: SiLU rounded to the operands' `dtype`, as the model rounds it, times up."""
-    return _round(gate * jax.nn.sigmoid(gate), dtype, interpret) * up
+    return _round(gate * logistic_value(gate), dtype, interpret) * up
 
 
 def _gradients(gate, up, dy):

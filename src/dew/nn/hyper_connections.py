@@ -69,7 +69,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.activations import silu
+from dew.nn.activations import logistic, silu
 from dew.nn.dense import Dense
 
 from .flops import projection_flops
@@ -278,7 +278,7 @@ class HyperConnection(nn.Module):
                  else jnp.ones((3,), jnp.float32))
         mixes = stream_mixes(streams, fn, self.norm_eps)
         pre = pre_weights(mixes[..., :hc], scale[0], base[:hc], spec.hc_eps)
-        post = 2 * nn.sigmoid(mixes[..., hc:2 * hc] * scale[1] + base[hc:2 * hc])
+        post = 2 * logistic(mixes[..., hc:2 * hc] * scale[1] + base[hc:2 * hc])
         if spec.hc_fixed_identity:
             return pre, post, jnp.broadcast_to(jnp.eye(hc, dtype=post.dtype), (*post.shape, hc))
         logits = mixes[..., 2 * hc :].reshape(*mixes.shape[:-1], hc, hc) * scale[2] + base[2 * hc :].reshape(
@@ -302,7 +302,7 @@ def stream_mixes(streams, fn, norm_eps: float):
 
 def pre_weights(mixes, scale, base, eps: float):
     """Each stream's collapse weight from its mixes: `sigmoid(mixes * scale + base) + eps`."""
-    return nn.sigmoid(mixes * scale + base) + eps
+    return logistic(mixes * scale + base) + eps
 
 
 def collapse_by(pre, streams):
@@ -392,11 +392,11 @@ class GatedResidual(nn.Module):
         normed = RMSNorm(epsilon=self.norm_eps, scale_offset=True, groups=hc, dtype=streams.dtype,
                          name='hc_norm')(streams.reshape(batch, length, hc * width))
         down = dense(self.projections()['input_mix_weight_down'][1], name='input_mix_weight_down')(normed)
-        weights = nn.sigmoid(dense(hc * width, name='input_mix_weight_up')(silu(down / hc)))
+        weights = logistic(dense(hc * width, name='input_mix_weight_up')(silu(down / hc)))
         read = jnp.mean(weights.reshape(streams.shape) * normed.reshape(streams.shape), axis=2)
         if not self.injects:
             return read, None
-        return read, 2 * nn.sigmoid(dense(hc, name='block_inject_weight')(normed) / hc)
+        return read, 2 * logistic(dense(hc, name='block_inject_weight')(normed) / hc)
 
 
 def gated_write(streams, injection, output):

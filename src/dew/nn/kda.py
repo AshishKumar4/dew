@@ -37,6 +37,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.activations import logistic
 from dew.nn.dense import Dense
 
 from .flops import conv_flops, delta_flops, projection_flops
@@ -168,7 +169,7 @@ class KimiDeltaAttention(nn.Module):
         bias = jnp.reshape(self.dt_bias, (self.num_heads, self.head_dim))
         log_rate = self.A_log[None, None, :, None]
         if self.lower_bound is not None:
-            return self.lower_bound * nn.sigmoid(accurate_exp(log_rate) * (gate + bias))
+            return self.lower_bound * logistic(accurate_exp(log_rate) * (gate + bias))
         # The gates' log decay as the recurrence forms it (`recurrence._gated_decay`: its exp accurate,
         # torch's softplus Dew's one, its value past 20 the gate's within float32's rounding).
         return recurrence._gated_decay(gate, log_rate, bias)
@@ -200,7 +201,7 @@ class KimiDeltaAttention(nn.Module):
         wide = at_least_fp32(projected.dtype)
         taps = jnp.concatenate([conv()[0] for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
         g = self._decay(x)
-        beta = nn.sigmoid(self.b_proj(x).astype(wide))
+        beta = logistic(self.b_proj(x).astype(wide))
         if valid is not None:
             # exp(0) = 1 and beta = 0 preserve the memory across a padded slot.
             g = jnp.where(valid[:, :, None, None], g, 0.0)
