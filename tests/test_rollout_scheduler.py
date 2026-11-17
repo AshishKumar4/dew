@@ -462,3 +462,24 @@ def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
     paged = layout(task)
     assert paged is not None and paged.page_size == 64
     assert layout(dataclasses.replace(task, n=2)) is None
+
+
+def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):
+    """A served rollout whose run names its page size 'whole' (`--rollout.served.page-size whole`,
+    `ServedRollout.page_size`) serves over each row's whole cache, no prompt page shared, where one naming
+    none pages wherever pages serve the policy (`RolloutScheduler.serve`, row 5375); the run records the
+    choice and loads with it."""
+    import rl_support
+    from model_support import serving_task
+
+    from dew.config.lm import LMRunConfig
+
+    config = rl_support.recorded_grpo_config(tmp_path, "--trainer.name", "whole", "--rollout.served.slots",
+                                             "8", "--rollout.served.page-size", "whole")
+    assert config.rollout is not None
+    served = config.rollout.served
+    assert served is not None and served.page_size == "whole"
+    task = serving_task(capacity=64)
+    assert not RolloutScheduler.serve(task, slots=4, capacity=64, page_size=served.page_size).reuses_prefixes
+    config.save(str(tmp_path / "whole"))
+    assert LMRunConfig.load(str(tmp_path / "whole")).rollout == config.rollout
