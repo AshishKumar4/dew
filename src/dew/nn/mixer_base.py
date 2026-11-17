@@ -294,6 +294,13 @@ class MixerBase:
         does, or None (`reads_forks`)."""
         return None if self.reads_forks else f"{type(self).__name__} reads no forks"
 
+    def fork_sharing_refusal(self, linear: bool) -> str | None:
+        """Why packing rows over their shared prefixes would cost the mixer this kind builds more than
+        laying them whole, where it computes a call over forks (`fork_refusal` None), or None: `linear`,
+        whether the model's wrappers keep its products linear in the call
+        (`dew.registry.Wrapper.keeps_products_linear`). By default a mixer computes each document once."""
+        return None
+
     @property
     def reads_blocks(self) -> bool:
         """Whether the mixer this kind builds reads each block of a call's `block_groups` whole

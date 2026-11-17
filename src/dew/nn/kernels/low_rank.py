@@ -39,9 +39,9 @@ def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scal
     `u = scale · (dy · bᵀ)` rounded once; the factors' gradients are `lhsᵀ · (scale · (dy · bᵀ))` and `tᵀ ·
     dy`, the rank-wide kernel gradients; each operand's only where it is differentiated (a frozen kernel's,
     `lhsᵀ · dy`, never). The concatenations are copies, a materialized strategy (b); a mainloop walking the
-    appended pair in place is row 1304's next form. A projection the run's low-precision recipe takes by
-    its role is refused (`refuse_recipe`): the adapted product does not take the recipe."""
-    refuse_recipe("an adapter's fused product (`gemm.low_rank`)")
+    appended pair in place is row 1304's next form. A projection the run's low-precision recipe takes (its
+    role and its widths, `refuse_recipe`) is refused: the adapted product does not take the recipe."""
+    refuse_recipe("an adapter's fused product (`gemm.low_rank`)", *kernel.shape)
     return _low_rank(lhs, kernel, a, b, jnp.asarray(scale, jnp.float32), out_dtype, precision,
                      interpret_on_cpu)
 

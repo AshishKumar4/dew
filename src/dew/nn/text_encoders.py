@@ -86,7 +86,7 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
                rotary_pairs: Literal["half", "adjacent"] = "half", rotary_interleaved: bool = False,
                rope_theta: float = 10000.0, packed: bool = False, kv_heads: int | None = None,
                head_dim: int | None = None,
-               norm_type: Literal["rms", "layer", "fast_layer"] = "layer", norm_bias: bool = True,
+               norm_type: Literal["rms", "layer"] = "layer", norm_bias: bool = True,
                mlp_bias: bool = True, mlp_packed: bool = False, window: int | None = None,
                branch_scale: float | None = None, attention_bias: bool = True, qk_norm: bool = False,
                wide_logits: bool = False, scale_after_cast: bool = False,

@@ -254,7 +254,7 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
     reloads answering as the run's task serves its written weights, bit for bit; the second run trains
     on from the first's final weights, head and backbone, its record names the run and step it read, and
     its task loads and answers (a run from a finished chat-format run, which the export's Laya-only
-    layout refused: "Laya's layout is a MarkerLayout over a Hugging Face tokenizer", row 4310); and a
+    layout refused: "Laya's layout is a marker row over a Hugging Face tokenizer", row 4310); and a
     third, naming a head of its own, draws it fresh over the first's backbone and trains (it was refused:
     "a decision release reads with its own")."""
     from run_kinds import QWEN_TINY

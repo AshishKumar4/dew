@@ -47,6 +47,7 @@ from jax.custom_derivatives import zero_from_primal
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
+from jax.extend.core import primitives
 
 from dew import _cache, algebra
 from dew.algebra import cost as algebra_cost, program as algebra_program
@@ -249,10 +250,9 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
         prologue = formed.stage + cost.Work(device_bytes=formed.side_bytes)
         # XLA's programs as the algebra prices them, beside the arrays they write: the operand formed whole,
         # or its sides alone.
-        forming = xla(algebra_program.priced(formed.whole, target).work + cost.Work(device_bytes=base))
+        forming = _written(algebra_program.priced(formed.whole, target), base, xla)
         if formed.sides is not None:
-            sides = xla(algebra_program.priced(formed.sides, target).work
-                        + cost.Work(device_bytes=formed.side_bytes))
+            sides = _written(algebra_program.priced(formed.sides, target), formed.side_bytes, xla)
     fused_seconds = sides + launched(product + region.chain + prologue + cost.Work(
         device_bytes=operands + region.captured_bytes + region.output_bytes))
     unfused_seconds = forming + launched(product + cost.Work(device_bytes=operands + written))
@@ -260,6 +260,12 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
         unfused_seconds += xla(region.chain + cost.Work(
             device_bytes=written + region.captured_bytes + region.output_bytes, kernels=1.0))
     return fused_seconds, unfused_seconds
+
+
+def _written(program: algebra_cost.Seconds, written: float, xla: algebra_cost.Fused) -> float:
+    """An XLA program's seconds as the algebra prices it (`algebra.program.priced`) with the `written` bytes
+    of the arrays it stores beside its reads, its unreadable terms' seconds (`Seconds.extra`) kept."""
+    return xla(program.work + cost.Work(device_bytes=written)) + program.extra
 
 
 def _chain(consumer, values, acc) -> cost.Work:
@@ -296,13 +302,17 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     if out_fusion is None:
         return plain()
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
+    # The program's names lifted first (`_named`): the algebra's rewriting reads a name as an identity.
+    named_consumer = consumer
+    consumer, names = _named(consumer, values, acc)
     consumer = _rewritten_consumer(consumer, values, acc)
     leaves, treedef = jax.tree.flatten(values)
     axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
                   if prefetch else _axes(consumer, values, acc))
     if axes is None:
-        # A consumer the launch takes not runs after the plain product, XLA's, unpriced.
-        return consumer(values, plain())
+        # A consumer the launch takes not runs after the plain product, XLA's, unpriced, the program's
+        # names where it wrote them.
+        return _rewritten_consumer(named_consumer, values, acc)(values, plain())
     # A consumer the launch takes as its epilogue is priced (`priced`), its work counted as the launch's
     # body counts it.
     if collected is not None:
@@ -317,11 +327,14 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc)
     dtypes = tuple(leaf.dtype for leaf in out_leaves)
     several = len(dtypes) > 1
+    # Each value the program names (`checkpoint_name`) an output of the launch's, a residual of its
+    # derivative under that name (`gemm`'s `named`), the consumer's outputs then the named values (`_named`).
+    outputs = len(out_leaves) - len(names)
     consumed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
                          epilogue_operands=tuple(zip(leaves, axes, strict=True)),
                          out_dtype=dtypes[0], out_dtypes=dtypes if several else None, precision=precision,
-                         interpret_on_cpu=interpret_on_cpu, **prologue)
-    return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))
+                         interpret_on_cpu=interpret_on_cpu, named=(None,) * outputs + names, **prologue)
+    return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))[0]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -396,6 +409,36 @@ def _rewritten_consumer(consumer, values, acc):
         return jax.tree.unflatten(structure, jax_core.jaxpr_as_fun(closed)(*jax.tree.leaves((values, acc))))
 
     return rewritten
+
+
+def _named(consumer, values, acc):
+    """`consumer` with the values its program names (`checkpoint_name`, a gate's projection before its
+    SwiGLU) as outputs after its own, unnamed in it, and their names in order: `consumer(values, acc)` gives
+    `(outputs, named)`. A launch's body runs no name (Mosaic's lowering has no rule for one); the launch's
+    derivative names its outputs (`gemm`'s `named`), so a remat policy keeping a name keeps that output and
+    the reverse pass recomputes no product (row 7131)."""
+    closed, shapes = jax.make_jaxpr(consumer, return_shape=True)(values, acc)
+    jaxpr = closed.jaxpr
+    aliases, eqns, names, kept = {}, [], [], []
+    for eqn in jaxpr.eqns:
+        invars = [aliases.get(var, var) if isinstance(var, jax_core.Var) else var for var in eqn.invars]
+        if eqn.primitive is primitives.name_p:
+            aliases[eqn.outvars[0]] = invars[0]
+            names.append(eqn.params['name'])
+            kept.append(invars[0])
+            continue
+        eqns.append(eqn.replace(invars=invars))
+    if not names:
+        return (lambda values, acc: (consumer(values, acc), ())), ()
+    outvars = [aliases.get(var, var) if isinstance(var, jax_core.Var) else var for var in jaxpr.outvars]
+    unnamed = closed.replace(jaxpr=jaxpr.replace(eqns=eqns, outvars=[*outvars, *kept]))
+    structure = jax.tree.structure(shapes)
+
+    def renamed(values, acc):
+        flat = jax_core.jaxpr_as_fun(unnamed)(*jax.tree.leaves((values, acc)))
+        return jax.tree.unflatten(structure, flat[:len(outvars)]), tuple(flat[len(outvars):])
+
+    return renamed, tuple(names)
 
 
 def _split(producer, values):

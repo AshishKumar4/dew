@@ -178,7 +178,7 @@ WITNESSED_ON = {"DecideSettings": {
     "decision": ("context_encoder", "layout", "layout.framing", "layout.head_max_len", "layout.option_text",
                  "layout.option_tokens", "layout.order", "layout.parallel", "layout.reads", "options"),
     "blocked": ("layout.blocks", "layout.segments", "layout.split", "specials"),
-    "lettered": ("layout.labels",),
+    "lettered": ("layout.form", "layout.labels"),
     "merged": ("layout.unit",),
     "shared": ("layout.shared_state", "layout.siblings")},
     "ImageSettings": {"diffusion": ("process", "solver", "guidance")}}
@@ -274,12 +274,12 @@ def witnessed_in_shards(settings: type, root: Path, units_declared: int) -> None
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.shards(units=20, per_task=1)
+@pytest.mark.shards(units=21, per_task=1)
 def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_line(tmp_path):
     """DecideSettings' options witnessed one a map task (`witnessed_in_shards`)."""
     from dew.decision.task import DecideSettings
 
-    witnessed_in_shards(DecideSettings, tmp_path, 20)
+    witnessed_in_shards(DecideSettings, tmp_path, 21)
 
 
 @pytest.mark.mesh(devices=8)

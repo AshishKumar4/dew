@@ -40,6 +40,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import PrecisionLike
+from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import zero_from_primal
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_gradients_formed
@@ -81,7 +82,7 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
          epilogue_operands: tuple = (), out_dtype, out_dtypes: tuple | None = None,
          precision: PrecisionLike = None, interpret_on_cpu: bool = False, prologue_jvp=None, compute=None,
          layer: jax.Array | None = None, paired: jax.Array | None = None, gather: jax.Array | None = None,
-         scatter: jax.Array | None = None, applied: jax.Array | None = None):
+         scatter: jax.Array | None = None, applied: jax.Array | None = None, named: tuple = ()):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
     `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default (explicitly or
     through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in the kernels: the
@@ -115,7 +116,12 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
     read): the product multiplies it in place of forming each tile, and every derivative is the prologue's
     (`portable`'s, which forms it), so `applied` takes no cotangent, and reverse mode forms the prologue's
     VJP in the transposed product's epilogue (`_input_cotangents`). An NVFP4 `rhs` (`NvFp4`; a stack of
-    banks at its `layer`, row 4861) is `_nvfp4_gemm`'s, frozen."""
+    banks at its `layer`, row 4861) is `_nvfp4_gemm`'s, frozen. `named`, a remat name or None an output
+    (an epilogue's output that is its accumulator rounded to its dtype, a gate's projection before its
+    SwiGLU, `fused_gemm` lifting the program's name onto it): each named output is a residual of the
+    call's derivative under its name (`checkpoint_name`), so a policy keeping the name keeps it, and the
+    reverse pass reads the accumulator from it where the epilogue reads its accumulator through that
+    rounding alone, recomputing no product (row 7131)."""
     if isinstance(rhs, NvFp4):
         return _nvfp4_gemm(lhs, rhs, group_sizes, epilogue=epilogue, epilogue_operands=epilogue_operands,
                            out_dtype=out_dtype, layer=layer, gather=gather, scatter=scatter,
@@ -161,17 +167,26 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
                                        epilogue_axes, dtypes, several, paired=paired, first=first), scatter)
 
     def forward(*operands):
-        return value(*operands), ()
+        out = value(*operands)
+        if not any(named):
+            return out, ()
+        # Each named output a residual under its name, the one array the output and the residual are.
+        outs = [checkpoint_name(each, name) if name is not None else each
+                for each, name in zip(out if several else (out,), named, strict=True)]
+        kept = tuple(each for each, name in zip(outs, named, strict=True) if name is not None)
+        return (tuple(outs) if several else outs[0]), kept
 
-    call = _Call(prologue, prologue_axes, epilogue, epilogue_axes, dtypes, several, compute, plain)
+    call = _Call(prologue, prologue_axes, epilogue, epilogue_axes, dtypes, several, compute, plain,
+                 tuple(at for at, name in enumerate(named) if name is not None))
 
     def backward(saved, operands, cotangent, live):
-        return _pulled(call, operands, cotangent, live)
+        return _pulled(call, operands, cotangent, live, saved)
 
+    # A named residual is the forward's as it ran, a remat policy's to keep (`linear_tangent`'s `nested`).
     differentiable = contracted("test_a_grouped_gemm_holds_every_order")(
         generation.linear_tangent(forward, grouped_matmul.GROUPED.bound(backward), portable,
                                    live_cotangents=True, zero_cotangents=True, unread=(9,),
-                                   kind=KernelGlue()))
+                                   kind=KernelGlue(), nested=not any(named)))
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather,
                           scatter, None if applied is None else jax.lax.stop_gradient(applied))
 
@@ -190,9 +205,11 @@ class _Call:
     several: bool
     compute: jnp.dtype
     plain: dict
+    named: tuple[int, ...] = ()
+    """The outputs the forward saves under their names (`gemm`'s `named`), in order: its `saved`."""
 
 
-def _pulled(call: "_Call", operands, cotangent, live) -> tuple:
+def _pulled(call: "_Call", operands, cotangent, live, saved: tuple = ()) -> tuple:
     """`gemm`'s reverse mode at `call`: the cotangents of the operands' leaves at `live` (`linear_tangent`'s
     `live_cotangents`), from the outputs' `cotangent`, None for an output no reverse pass reaches."""
     prologue, prologue_axes, epilogue, epilogue_axes = (call.prologue, call.prologue_axes, call.epilogue,
@@ -215,7 +232,8 @@ def _pulled(call: "_Call", operands, cotangent, live) -> tuple:
     d_accs, d_epilogue, narrow = _cotangents(tokens.astype(compute), matrices, group_sizes, prologue,
                                              prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
                                              epilogue_axes, cotangents, dtypes, compute, acc_shape,
-                                             {**held, 'gather': gather})
+                                             {**held, 'gather': gather},
+                                             dict(zip(call.named, saved, strict=True)))
     # Each accumulator's cotangent meets the forward's rounded operands as the portable program's
     # derivative has it: in `lhs`'s dtype where that holds it exactly (a cotangent no wider, passed
     # through), wide otherwise, each product rounding once.
@@ -995,14 +1013,16 @@ def _gemm_call(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, 
 
 def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
                 epilogue_arrays, epilogue_axes, cotangents: tuple, dtypes: tuple, compute, acc_shape: tuple,
-                plain: dict) -> tuple[tuple, tuple, tuple]:
+                plain: dict, saved: dict | None = None) -> tuple[tuple, tuple, tuple]:
     """Each accumulator's cotangent (one a matrix of `matrices`: the product's, and its `paired`'s), the
     epilogue side operands' and whether each accumulator's passes an output's through in `compute`'s dtype
     (`_passes_cotangent`): the outputs' own without an epilogue (None for an output no reverse pass
     reaches), else through the VJP of the epilogue's outputs that have a cotangent, at the accumulators
     recomputed at their own width, where that VJP reads them (from `lhs`'s rows at `plain`'s `gather`, a
-    gathered product's). An output no reverse pass reaches is no part of the VJP, so an output formed for a
-    product of its own (`gemm`'s `applied`) recomputes nothing."""
+    gathered product's), or read from the forward's named output `saved` holds where the epilogue reads its
+    accumulator through that output's rounding alone (`_rounded_accumulator`). An output no reverse pass
+    reaches is no part of the VJP, so an output formed for a product of its own (`gemm`'s `applied`)
+    recomputes nothing."""
     count = len(matrices)
     if epilogue is None:
         d_accs = tuple(cotangents[:count])
@@ -1023,7 +1043,12 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
     acc = jax.ShapeDtypeStruct(acc_shape, at_least_fp32(compute))
     # The epilogue's VJP, traced once, its accumulators' reads and pass-through cotangents read from it.
     vjp = _epilogue_vjp(kept, count, acc, sides)
-    if _reads_accumulators(vjp, count):
+    rounded = _rounded_accumulator(saved or {}, count, epilogue, acc, sides)
+    if rounded is not None and _reads_accumulators(vjp, count):
+        # The epilogue reads its accumulator through its rounding alone, which the forward kept under its
+        # name: its VJP at that rounding widened is its VJP at the accumulator (`_rounded_accumulator`).
+        accs = (rounded.astype(acc.dtype),)
+    elif _reads_accumulators(vjp, count):
         accs = _as_tuple(_gemm(lhs, matrices[0], group_sizes, prologue, prologue_arrays, prologue_axes, None,
                                (), (), (acc.dtype,) * count, several=count > 1,
                                paired=matrices[1] if count > 1 else None, summed_as=(acc.dtype,) * count,
@@ -1478,6 +1503,22 @@ def _prologue_cotangents(prologue, lhs, arrays, axes_of, group_sizes, d_operand)
 def _as_cotangent(cotangent, operand):
     """`cotangent` in `operand`'s dtype; an integer or boolean operand's stays float0, its tangent space."""
     return cotangent if cotangent.dtype == jax.dtypes.float0 else cotangent.astype(operand.dtype)
+
+
+def _rounded_accumulator(kept: dict, count: int, epilogue, acc, sides) -> jax.Array | None:
+    """The forward's kept output (`gemm`'s `named`, by its place among the outputs) that is the epilogue's
+    one accumulator rounded to its dtype, where the epilogue reads that accumulator through the rounding
+    alone (one conversion, which is that output): every value the epilogue computes reads the rounding,
+    so its VJP at the rounding widened back is its VJP at the accumulator, exactly (a rounding to a narrower
+    dtype widened and rounded again is itself). None elsewhere (no output kept, a paired product's two
+    accumulators, an epilogue reading the accumulator otherwise)."""
+    if not kept or count != 1:
+        return None
+    jaxpr = jax.make_jaxpr(lambda acc, *sides: _tupled(epilogue, acc, *sides))(acc, *sides).jaxpr
+    reading = [eqn for eqn in jaxpr.eqns if jaxpr.invars[0] in eqn.invars]
+    if len(reading) != 1 or reading[0].primitive is not jax.lax.convert_element_type_p:
+        return None
+    return next((value for at, value in kept.items() if jaxpr.outvars[at] is reading[0].outvars[0]), None)
 
 
 def _reads_accumulators(vjp: tuple, count: int) -> bool:

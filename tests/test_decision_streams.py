@@ -18,7 +18,7 @@ from test_decision_letters_context import LABELS, QUESTIONS as LETTERED_QUESTION
 
 from dew.data import Memory
 from dew.data.text import ByteTokenizer
-from dew.decision import Choice, Decide, Example, JointLayout, Schema, State, Text, decisions
+from dew.decision import Choice, Decide, Example, Schema, State, Text, decisions
 from dew.decision.config import DecisionRunConfig
 from dew.decision.head import JointSchemaHead, LabelReadout
 from dew.decision.inputs import DecisionInputs
@@ -29,8 +29,8 @@ from dew.decision.layout import (
     OptionLines,
     Reads,
     Segment,
+    SegmentLayout,
     Specials,
-    StateFirstLayout,
 )
 from dew.decision.model import DecisionModel, stream_runs
 from dew.decision.objective import DecisionObjective
@@ -50,12 +50,13 @@ GEMMA = LLAMA.parent / "gemma3-native-tiny"
 reads a row's key runs."""
 SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
 TOKENIZER = ByteTokenizer()
-JOINT = JointLayout(max_len=1024, segments=(Text("STATE:\n"), State(), Schema(stream="schema"), Text("\n")),
+JOINT = SegmentLayout.joint_row(max_len=1024, segments=(Text("STATE:\n"), State(), Schema(stream="schema"),
+                                                        Text("\n")),
                     reads=Reads((("row", "self", "causal"), ("row", "schema", "whole"),
                                  ("schema", "self", "causal"))))
 """A joint row's two streams: its own tokens read the row's before them and the whole schema, though the
 schema follows the state, the schema's tokens the schema's before them alone."""
-LETTERED = StateFirstLayout(
+LETTERED = SegmentLayout.state_first_row(
     labels=LABELS, max_len=256,
     segments=(Text("STATE:\n"), State(), Instructions({"choice": "{}"}, stream="question"),
               OptionLines(line="\n{label}. {option}", bare="\n{label}. {option}", join="",
@@ -224,8 +225,8 @@ def test_a_layouts_reads_name_only_its_streams_and_every_stream_reads_itself():
         Reads((("row", "schema", "whole"),))
     with pytest.raises(ValueError):
         Reads((("row", "self", "sideways"),))
-    assert from_record(JointLayout, to_record(JOINT, JointLayout)) == JOINT
-    assert from_record(StateFirstLayout, to_record(LETTERED, StateFirstLayout)) == LETTERED
+    assert from_record(SegmentLayout, to_record(JOINT, SegmentLayout)) == JOINT
+    assert from_record(SegmentLayout, to_record(LETTERED, SegmentLayout)) == LETTERED
     assert JOINT.attention == (((2, 0, 1), (2, 0, 0)), 3)
 
 

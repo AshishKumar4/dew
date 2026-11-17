@@ -1366,9 +1366,9 @@ class Displayed:
 
 
 def test_a_rung_key_states_its_modules_configuration_not_their_display():
-    """A rung record's key states its modules as an identity states them (`identity.stated`), not as they
-    print: two equal configurations whose displays differ name one record, another width another; a
-    module holding an array of JAX's, which no identity states, keeps no record, its run deciding its rung
+    """A rung record's key states its modules as plain data (`dew._stated.stated`), not as they print: two
+    equal configurations whose displays differ name one record, another width another; a module holding an
+    array of JAX's, which no plain form states, keeps no record, its run deciding its rung
     as it compiles, never refused."""
     from dew.training.rungs import rung_key
 

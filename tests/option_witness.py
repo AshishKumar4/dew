@@ -36,7 +36,7 @@ from dew import registry
 from dew._cli.main import main
 from dew._records import annotations_of
 from dew.config import RunConfig
-from dew.decision.layout import QuestionSegment, Reads, built_in
+from dew.decision.layout import JOINT_ROW, QUESTION_ROW, Reads, RowSegment, SegmentLayout, built_in
 from dew.registry import objectives
 
 
@@ -74,7 +74,7 @@ def members_of(annotation: type, base=None) -> list[object]:
 
 
 WITNESSES = {Reads: (Reads((("row", "self", "whole"),)), Reads((("row", "self", "causal"),))),
-             tuple[QuestionSegment, ...]: (built_in(None, "question_first"),)}
+             tuple[RowSegment, ...]: (built_in(None, "question_first"),)}
 """Values of Dew's classes that build from no defaults, and of tuples of them, each one a run here trains
 with: a row's reads of its streams (`Reads`), here its one stream reading its whole document both ways,
 or up to each token (a bidirectional backbone's rows read so apart), and a question layout's own row
@@ -358,8 +358,12 @@ def witnessed(settings: type, base=None) -> dict[str, list[object]]:
     hints = annotations_of(settings)
     # A field its class's record holds none of (`metadata={"record": False}`) is no option a saved task
     # is built with: no save states it (a question layout's reading under an earlier data plan).
+    # A segment layout's field only another form's row reads (`JOINT_ROW`, `QUESTION_ROW`) is none of the
+    # options a saved task of this form is built with: it holds its default, the form refusing any other.
+    other = (QUESTION_ROW if base.joint else JOINT_ROW) if isinstance(base, SegmentLayout) else None
     declared = {field.name: alternatives(hints[field.name], getattr(base, field.name, None))
-                for field in dataclasses.fields(settings) if field.metadata.get("record", True)}
+                for field in dataclasses.fields(settings)
+                if field.metadata.get("record", True) and not (other and field.metadata.get(other))}
     return {name: values for name, values in declared.items() if len(values) > 1}
 
 
@@ -574,7 +578,7 @@ def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere:
 
 UNHELD = ("states a layout's window, budgets and option layout alone",
           "Laya's layout holds a ModernBERT encoder", "the source's format holds no cross-attention layers",
-          "Laya's layout is a MarkerLayout over a Hugging Face tokenizer")
+          "Laya's layout is a marker row over a Hugging Face tokenizer")
 """What `dew export` says refusing a run whose format holds not all it saved, rather than dropping it: a
 release's config (Laya's) its layout's window, budgets and option layout alone, its weights a ModernBERT
 encoder's, and its source's format no cross-attention layer a context reads through."""

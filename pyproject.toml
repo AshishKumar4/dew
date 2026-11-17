@@ -414,6 +414,9 @@ filterwarnings = [
     # suite exists to catch, so jax's own warning about it is an error
     # wherever it comes from rather than scoped to dew.
     'error:os\.fork\(\) was called:RuntimeWarning',
+    # The gate's statistics compute no log of zero, no division by zero, no overflow: a warning dew.parity
+    # raises is a statistic computed wrong (log_mean_square once warned 233 times in one GPU models run).
+    'error::RuntimeWarning:dew\.parity',
     # CPython warns about the same fork from multiprocessing's start method,
     # and that one is deliberately not listed. A pool forks on its own thread,
     # where an error raised by a filter is swallowed, so making it an error
