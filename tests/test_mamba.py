@@ -11,6 +11,7 @@ import pytest
 from forks_support import LAYOUTS, assert_forks_as_own_rows
 from model_support import as_stepped, decode_through, float64_twin
 from reference_error import assert_as_exact
+from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 
 from dew.interop import Pretrained
 from dew.nn.mixers.mamba import Mamba, selective_scan
@@ -85,6 +86,24 @@ def test_the_layer_decodes_as_it_prefills():
                     draw, "mamba decode", seeds=DECODE_SEEDS, truth_fn=wide.apply)
     variables, x = draw(0)
     assert decode_through(mixer, variables, x, prefill=1)[2]['ssm_state'].shape == (2, 16, 4)
+
+
+SPLIT_SEEDS = {"all_valid": 64, "right_padded": 64, "left_padded": 64, "gaps": 64, "packed": 64,
+               "empty_shard": 64, "empty_shard_packed": 64}
+"""Each row's declared draws."""
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("row", sorted(SPLIT_ROWS))
+def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_ones(row):
+    """Under a sequence axis of 4, the layer runs rows with padding and packed documents as `held_scan`
+    runs them on one device (`assert_split_as_whole`): each shard's conv reads the real tokens before it
+    from the earlier shards, and its scan enters with the state they leave it, each channel's and state's
+    decay its own (`_sequence_scan`, row 1710)."""
+    mixer = Mamba(emb_features=8, intermediate_size=16, state_size=4, time_step_rank=2, chunk_size=4)
+    variables = jax.tree.map(np.asarray, mixer.init(jax.random.key(1), jnp.zeros((1, 32, 8))))
+    assert_split_as_whole(mixer, variables, row, SPLIT_SEEDS[row], f"mamba split over the sequence, {row}",
+                          width=8)
 
 
 
