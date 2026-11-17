@@ -216,6 +216,9 @@ class RunPipeline:
     steps: int
     guidance: Guidance | None
     grid: SourceGrid | None
+    grid_process: bool
+    """Whether `process` is `grid`'s own training process at its tokens, as the run's record states
+    (`ImageSettings.grid_process`)."""
 
     def adapt(self, lora: LoRA, *, key: int | jax.Array) -> RunPipeline:
         """This source with `lora` attached to its denoiser and its factors drawn (`LoRA.apply`), as
@@ -283,9 +286,10 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
     inputs, process = task.inputs, task.process
     if size is not None:
         # At the size the run's data has, as a published pipeline binds its own (ledger 2792).
-        inputs, process, grid = resized(inputs, process, grid, task.autoencoder, tuple(size))
+        inputs, process, grid = resized(inputs, process, grid, task.autoencoder, tuple(size),
+                                        grid_process=task.grid_process)
     return RunPipeline(model, tree, process, inputs, task.autoencoder, task.solver, task.steps, task.guidance,
-                       grid)
+                       grid, task.grid_process)
 
 
 def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema: bool | None = None,

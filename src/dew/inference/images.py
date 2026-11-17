@@ -154,6 +154,10 @@ class ImageSettings:
     # dewml/hybrid-dit-176m's published record predates the fields below.
     end_to_end: JSON = None
     grid: JSON = None
+    grid_process: bool = False
+    """Whether `process` is the grid's own training process at the grid's tokens
+    (`DiffusionObjective.grid_process`), which a run over another size takes at its tokens; a record
+    before it states none, its process kept as it trained."""
 
     def __post_init__(self) -> None:
         from dew._records import integer
@@ -196,6 +200,9 @@ class TextToImage(SavedRunTask, InItsForm):
     grid: Callable[[int], tuple[Process, jax.Array]] | None = None
     final_denoise: bool = True
     finish: Callable[[Variables, jax.Array], jax.Array] | None = None
+    grid_process: bool = False
+    """Whether `process` is `grid`'s own training process at its tokens (`DiffusionObjective.grid_process`,
+    `PipelineSource.grid_process`)."""
 
     def __post_init__(self) -> None:
         # A tree split for training, an adapter's, is read whole.
@@ -234,7 +241,8 @@ class TextToImage(SavedRunTask, InItsForm):
         return cls(objective.model, objective.process, objective.inputs,
                    without_loss_heads(variables), autoencoder,
                    steps=objective.steps, guidance=objective.guidance, solver=objective.solver,
-                   grid=objective.grid, final_denoise=objective.final_denoise)
+                   grid=objective.grid, final_denoise=objective.final_denoise,
+                   grid_process=objective.grid_process)
 
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
@@ -309,7 +317,7 @@ class TextToImage(SavedRunTask, InItsForm):
         grid = None if settings.grid is None else from_record(SourceGrid, fields(settings.grid, 'grid'))
         return cls(config.build(), settings.process, inputs, without_loss_heads(params), autoencoder,
                    steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver,
-                   grid=grid, final_denoise=grid is None)
+                   grid=grid, final_denoise=grid is None, grid_process=settings.grid_process)
 
     @classmethod
     def from_flaxdiff(cls, directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,

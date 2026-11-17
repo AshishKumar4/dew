@@ -242,6 +242,13 @@ class PipelineSource(Protocol):
     @property
     def grid(self) -> SourceGrid | None: ...
 
+    @property
+    def grid_process(self) -> bool:
+        """Whether `process` is `grid`'s own training process at the grid's tokens: a published
+        pipeline's, as it assembles it at its size, and a saved run's where its record says so
+        (`DiffusionObjective.grid_process`)."""
+        ...
+
 
 class DiffusionObjective(Objective[Ratio]):
     """Trains a denoising diffusion model: draw a noise level, corrupt, predict, and weight the loss."""
@@ -434,9 +441,17 @@ class DiffusionObjective(Objective[Ratio]):
         normalizes its latents, with the running statistics in the `LATENT_STATS`
         collection. A published task includes the tuned autoencoder, with those
         statistics as its latent normalization.
+
+        `grid_process` records whether the objective trains its pipeline's own process over its grid, read
+        once here: the source's process object itself (`process` None, or the source's own given back,
+        as a run naming no preset passes it) where that is its grid's (`PipelineSource.grid_process`).
+        A process given over the source's, even an equal one, is the run's own, kept as it is at
+        another size (`dew.interop.pipeline_assembly.resized`).
         """
+        grid_process = False
         if isinstance(model, PipelineSource):
             source = model
+            grid_process = source.grid_process and (process is None or process is source.process)
             model = source.model
             process = source.process if process is None else process
             inputs = source.inputs if inputs is None else inputs
@@ -477,6 +492,7 @@ class DiffusionObjective(Objective[Ratio]):
         self.guidance = guidance
         self.steps = steps
         self.grid = grid
+        self.grid_process = grid_process
         self.ema = (None if ema_decay is None else EMASpec(
             decay=ema_decay if callable(ema_decay) else optax.constant_schedule(ema_decay),
             select=under("params")))
@@ -503,7 +519,8 @@ class DiffusionObjective(Objective[Ratio]):
                              self.solver, self.guidance, self.steps,
                              # A tuned autoencoder's weights and statistics sit in the run's own tree.
                              None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd),
-                             grid=None if self.grid is None else to_record(self.grid, SourceGrid))
+                             grid=None if self.grid is None else to_record(self.grid, SourceGrid),
+                             grid_process=self.grid_process)
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> TextToImage:

@@ -1132,6 +1132,12 @@ class PretrainedPipeline(Pretrained):
         """The sampling grid its call prepares (`SourceTask.grid`)."""
         return self.task.grid
 
+    @property
+    def grid_process(self) -> bool:
+        """True: its process is its grid's training process at the grid's tokens, as `assemble` binds both
+        at its size (`SourceSchedule.training_process`)."""
+        return True
+
     def text_to_image(self) -> TextToImage:
         """Build the pipeline as a sampling task with its published policy.
 
@@ -1141,7 +1147,7 @@ class PretrainedPipeline(Pretrained):
         return self.formed(TextToImage(
             self.model, self.process, self.inputs, self.variables, self.autoencoder, grid=self.grid,
             final_denoise=False, solver=self.solver, steps=self.steps, guidance=self.guidance,
-            finish=self.finish))
+            finish=self.finish, grid_process=self.grid_process))
 
     @property
     def _adaptable(self) -> Mapping[str, WeightLayout]:

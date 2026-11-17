@@ -27,7 +27,6 @@ from flax import linen as nn
 from dew import _records
 from dew.batch import Variables
 from dew.diffusion.process import Process
-from dew.diffusion.schedules.flow import FlowMatchingScheduler
 from dew.diffusion.schedules.source import Origin, SourceGrid, SourceSchedule
 from dew.inference.loading import place
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
@@ -726,15 +725,16 @@ def latent_tokens(height: int, width: int, patch: int) -> int:
 
 
 def resized(inputs: InputSpec, process: Process, grid: SourceGrid | None, autoencoder: AutoEncoder | None,
-            size: tuple[int, ...]) -> tuple[InputSpec, Process, SourceGrid | None]:
+            size: tuple[int, ...], *, grid_process: bool) -> tuple[InputSpec, Process, SourceGrid | None]:
     """A pipeline's inputs, process and grid bound at the sample `size` (an image's height and width, a
     clip's frames before them), as `assemble` binds a published pipeline's at its size: the sample and a
     mask at it, the autoencoder refusing a size it does not encode (`AutoEncoder.latent_shape`), a published
-    composition's size conditioning at it (`DiffusionConditioner.time_id_values`), and the grid's tokens at
-    it (`latent_tokens`, each token's pixels the grid's tokens at the sample's own size state), with the
-    process's resolution shift where it is the grid's (`FlowShift.base`). A run's own resolution shift,
-    whose constants its process does not keep, stays as the run trained it; a preset a run names sets its
-    own at its size (`DiffusionRunConfig.derived_preset`)."""
+    composition's size conditioning at it (`DiffusionConditioner.time_id_values`), the grid's tokens at it
+    (`latent_tokens`, each token's pixels the grid's tokens at the sample's own size state), and, where
+    the process is the grid's own training process (`grid_process`, `DiffusionObjective.grid_process`),
+    the grid's at those tokens (`SourceSchedule.training_process`). Any other process is the run's own,
+    kept as it trained; a preset a run names sets its own at its size (`DiffusionRunConfig.derived_preset`).
+    """
     sample = inputs.sample
     if len(size) != len(sample.shape) - 1 or any(type(extent) is not int or extent < 1 for extent in size):
         raise ValueError(f"a sample of shape {sample.shape[:-1]} resizes to as many positive extents, not "
@@ -757,24 +757,8 @@ def resized(inputs: InputSpec, process: Process, grid: SourceGrid | None, autoen
         raise ValueError(f"the grid's {grid.tokens} tokens at {before} x {after} state no token's pixels a "
                          "side, which its tokens at another size read")
     tokens = latent_tokens(height, width, patch)
-    return inputs, _shifted(process, grid, tokens), replace(grid, tokens=tokens)
-
-
-def _shifted(process: Process, grid: SourceGrid, tokens: int) -> Process:
-    """`process` at `tokens` latent tokens (`resized`): a schedule whose shift is the grid's resolution shift
-    at the grid's tokens takes its shift at `tokens`, every other control kept; any other is kept."""
-    flow = grid.schedule.policy.flow
-
-    def at(schedule):
-        if (flow is None or not flow.dynamic or not isinstance(schedule, FlowMatchingScheduler)
-                or not schedule.dynamic or schedule.shift != flow.base(grid.tokens)):
-            return schedule
-        return FlowMatchingScheduler(shift=flow.base(tokens), logit_mean=schedule.logit_mean,
-                                     logit_std=schedule.logit_std, density=schedule.density,
-                                     mode_scale=schedule.mode_scale, dynamic=True)
-
-    return replace(process, schedule=at(process.schedule),
-                   sampling=None if process.sampling is None else at(process.sampling))
+    return (inputs, grid.schedule.training_process(tokens) if grid_process else process,
+            replace(grid, tokens=tokens))
 
 
 def _geometry(index: Mapping[str, object], size: tuple[int, int]) -> tuple[int, int]:
