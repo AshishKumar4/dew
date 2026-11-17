@@ -57,6 +57,7 @@ from .sessions import (
 )
 
 if TYPE_CHECKING:
+    from dew.data.text import Tokenizer
     from dew.objectives.base import SavedTask, Task
 
 OLD_VALUES_KEY = "old_values"
@@ -240,6 +241,11 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         """The actor's decoder settings; a loader rebuilds the decoder from them under PPO's
         own record and takes the policy half of the saved tree."""
         return self.actor.task_settings()
+
+    def run_tokenizer(self) -> Tokenizer | None:
+        """The actor's tokenizer, whose files its settings state (`task_settings`) and a checkpoint holds
+        (`dew.inference.tasks.hold_tokenizer`)."""
+        return self.actor.run_tokenizer()
 
     def recorded_model(self) -> nn.Module:
         """The actor's decoder, without the critic."""
