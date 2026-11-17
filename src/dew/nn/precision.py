@@ -988,15 +988,19 @@ class RecipeRefused(ValueError):
     (`refuse_recipe`)."""
 
 
-def refuse_recipe(owner: str) -> None:
-    """Refuse a projection the run's low-precision recipe takes by its role (`recipe_role`) whose product
-    `owner` holds instead (a quantizer's product class, a wrapper's interception, an adapter's fused
-    product), which would train it unquantized, silently: the recipe and a product wrapper compose nowhere
-    yet."""
+def refuse_recipe(owner: str, depth: int, width: int) -> None:
+    """Refuse a `depth` x `width` projection the run's low-precision recipe takes (`recipe_refusal`, the one
+    decision: its role the recipe's, its widths whole blocks of the recipe's) whose product `owner` holds
+    instead (a quantizer's product class, a wrapper's interception, an adapter's fused product), which would
+    train it unquantized, silently: the recipe and a product wrapper compose nowhere yet. A projection the
+    recipe leaves (a role it keeps, widths of no whole blocks) runs under the wrapper as without a recipe."""
+    from dew.nn.kernels.projections import recipe_refusal
+
     held = recipe_role()
-    if held is not None and held[1] in held[0].roles:
-        raise RecipeRefused(f"the run's {held[0].recipe} recipe takes this {held[1]} projection, whose "
-                            f"product {owner} holds: train it in the recipe or under the wrapper, not both")
+    if held is not None and recipe_refusal(depth, width) is None:
+        raise RecipeRefused(f"the run's {held[0].recipe} recipe takes this {depth} x {width} {held[1]} "
+                            f"projection, whose product {owner} holds: train it in the recipe or under the "
+                            "wrapper, not both")
 
 
 @dataclasses.dataclass(frozen=True)

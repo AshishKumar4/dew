@@ -17,6 +17,7 @@ from arm_arithmetic import float64_held
 from decision_support import decision_rows
 from float64_terms import float64_forward
 from interop_support import assert_reloads, assert_same_stored_tensors, token_draw
+from map_judge import marked_seeds
 from model_support import as_stepped
 from reference_error import (
     as_given,
@@ -714,11 +715,9 @@ EXAMPLES = [Example(state, {'team': INTENT}, {'team': label})
                                  ('double charge', 'billing'), ('cannot log in', 'technical'))]
 
 
-def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
-    """The joint schema head's lexical prior gathers the output table's rows: the head's matrix
-    rows times each token's logit gain, which contracted with the final states give Dory's logits.
-    Over the release's own tokenizer it trains a step that moves the head and the backbone, and
-    the saved run answers as the live one does (check 1: the two tasks are two programs)."""
+def test_dorys_vocabulary_rows_contracted_with_its_final_states_give_its_logits():
+    """The rows a joint schema head's lexical prior gathers (`output_table`): the head's matrix rows
+    times each token's logit gain, which contracted with the final states give Dory's logits."""
     loaded = load(max_seq_len=1024)
 
     def contracted(ids):
@@ -726,6 +725,17 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
         return loaded.model.apply(loaded.variables, ids, method='hidden_states') @ table.rows().T
 
     assert_logits_as_vllms(contracted, loaded, "Dory's vocabulary rows", stream=0xD05)
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=32)
+def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path, request):
+    """The joint schema head over Dory's vocabulary rows (`output_table`), over the release's own
+    tokenizer, trains a step that moves the head and the backbone, and the saved run answers as the live
+    one does (check 1: the two tasks are two programs), over its mark's declared seeds (`marked_seeds`),
+    sized by `seeds_for` paired on armada: the two tasks read one trained state's weights. Its draws run
+    in armada's map tasks of 32: whole, with the rows' own check, CI took 109 to 181 s (mains 3e5b75d3c to
+    599a23f5d, row 5200)."""
+    loaded = load(max_seq_len=1024)
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
     objective = DecisionObjective(loaded, layout=JointLayout(max_len=1024), head=head)
     data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
@@ -766,13 +776,8 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
             return scored(wide['task'], seed)
 
     assert_as_exact(as_given(lambda seed: scored(reloaded, seed)), as_given(lambda seed: scored(live, seed)),
-                    lambda seed: (np.int64(seed),), "the saved run's answers", seeds=SAVED_SEEDS,
+                    lambda seed: (np.int64(seed),), "the saved run's answers", seeds=marked_seeds(request),
                     truth_fn=truth)
-
-
-SAVED_SEEDS = 128
-"""Check 1's declared seeds for the saved run's answers against the live task's, sized by `seeds_for`
-paired on armada: the two tasks read one trained state's weights."""
 
 
 DORY_FIELDS = ('vocab_size', 'hidden_size', 'num_hidden_layers', 'intermediate_size', 'num_attention_heads',

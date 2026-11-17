@@ -94,6 +94,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.objectives import Objective
     from dew.objectives.base import Aux, EMASpec, Step
     from dew.objectives.supervised import Supervised
+    from dew.registry import register
     from dew.sampling import CFG, sample
     from dew.state import TrainState
     from dew.telemetry.profile import Profiler
@@ -139,6 +140,7 @@ _EXPORTS = {
     "ImageGrid": "dew.artifacts", "VideoGrid": "dew.artifacts",
     "TextSamples": "dew.artifacts", "Representations": "dew.artifacts",
     "TokenScores": "dew.artifacts",
+    "register": "dew.registry",
     "__version__": "dew._version",
 }
 
@@ -193,6 +195,7 @@ __all__ = [
     "jit",
     "kernels",
     "pipeline",
+    "register",
     "sample",
 ]
 
