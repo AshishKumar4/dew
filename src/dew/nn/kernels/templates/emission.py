@@ -10,11 +10,13 @@ operation of the CUDA cores its output's elements; a copy between memories its b
 shared memory. A primitive no rule here prices raises (`Unpriced`): the count states every instruction a
 kernel emits."""
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import math
 import weakref
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -665,25 +667,55 @@ def _filled(jaxpr: jax_core.Jaxpr, stated: Stated) -> jax_core.Jaxpr:
     rule's, `plgpu.kernel`'s) rewritten around it."""
     def rewritten(equation):
         if equation.primitive in (mpmd.mpmd_map_p, pallas_call.pallas_call_p):
-            return equation.replace(params={**equation.params, "cost_estimate": _estimate(equation, stated)})
+            work = launch_work(equation, stated)
+            if (works := _RECORDED.get()) is not None:
+                works.append(work)
+            return equation.replace(params={**equation.params, "cost_estimate": _estimate(work)})
         return equation.replace(params={name: _filled(value, stated) if isinstance(value, jax_core.Jaxpr)
                                         else value for name, value in equation.params.items()})
 
     return jaxpr.replace(eqns=[rewritten(equation) for equation in jaxpr.eqns])
 
 
-def _estimate(kernel, stated: Stated) -> pl.CostEstimate:
-    """A kernel equation's cost from its body's emission: its tensor work (every precision's FLOPs) and its
-    exponentials, a step's `stated.steps` times and the rest each program's (`Emitted.issued`), and the
-    bytes it states."""
+def launch_work(kernel, stated: Stated) -> Work:
+    """A kernel equation's work from its body's emission, a launch's: each unit's, a step's `stated.steps`
+    times and the rest each program's (`Emitted.issued`), the bytes it states its device's, its span the
+    steps one of its programs walks, and one kernel. Its cost estimate's (`_estimate`) and a step's price
+    (`attention_decode.priced_step`) alike."""
     if kernel.primitive is mpmd.mpmd_map_p:
         (mesh,), (body,) = kernel.params["meshes"], kernel.params["jaxprs"]
         counted, programs = emitted(body, mesh.num_threads or 1, mesh.thread_name), math.prod(mesh.grid)
     else:
         body, programs = kernel.params["jaxpr"], math.prod(kernel.params["grid_mapping"].grid)
         counted = emitted(body, 1, None)
-    return pl.CostEstimate(
-        flops=int(counted.issued(lambda work: work.flops + work.tf32_flops + work.fp8_flops, stated.steps,
-                                 programs)),
-        transcendentals=int(counted.issued(lambda work: work.exponentials, stated.steps, programs)),
-        bytes_accessed=stated.bytes_accessed)
+
+    def issued(field: str) -> float:
+        return counted.issued(lambda work: getattr(work, field), stated.steps, programs)
+
+    return Work(flops=issued("flops"), operations=issued("operations"), exponentials=issued("exponentials"),
+                conversions=issued("conversions"), device_bytes=stated.bytes_accessed,
+                shared_bytes=issued("shared_bytes"), tf32_flops=issued("tf32_flops"),
+                span=stated.steps / programs, fp8_flops=issued("fp8_flops"), kernels=1)
+
+
+def _estimate(work: Work) -> pl.CostEstimate:
+    """A kernel's cost estimate from its launch's work (`launch_work`): its tensor work (every precision's
+    FLOPs), its exponentials and the bytes it states."""
+    return pl.CostEstimate(flops=int(work.flops + work.tf32_flops + work.fp8_flops),
+                           transcendentals=int(work.exponentials), bytes_accessed=int(work.device_bytes))
+
+
+_RECORDED: contextvars.ContextVar[list | None] = contextvars.ContextVar("recorded_launches", default=None)
+"""The launches' works `recorded` holds, where a caller records them."""
+
+
+@contextlib.contextmanager
+def recorded() -> Iterator[list[Work]]:
+    """Within the block, each launch a costed launch traces (`costed`) recorded by its work (`launch_work`),
+    in the order they trace: a step's price, its launches' own (`attention_decode.priced_step`)."""
+    works: list[Work] = []
+    token = _RECORDED.set(works)
+    try:
+        yield works
+    finally:
+        _RECORDED.reset(token)
