@@ -294,11 +294,11 @@ class MixerBase:
         does, or None (`reads_forks`)."""
         return None if self.reads_forks else f"{type(self).__name__} reads no forks"
 
-    def wrapped_fork_refusal(self) -> str | None:
-        """Why the mixer this kind builds would not read forks in a model whose products a wrapper makes
-        other than linear (a quantization's, a checkpoint's input quantizer, an adapter's dropout in
-        training: `dew.registry.Wrapper.keeps_products_linear`) where it reads them unwrapped
-        (`fork_refusal`), or None: by default such a wrapper changes no reading of forks."""
+    def fork_sharing_refusal(self, linear: bool) -> str | None:
+        """Why packing rows over their shared prefixes would cost the mixer this kind builds more than
+        laying them whole, where it computes a call over forks (`fork_refusal` None), or None: `linear`,
+        whether the model's wrappers keep its products linear in the call
+        (`dew.registry.Wrapper.keeps_products_linear`). By default a mixer computes each document once."""
         return None
 
     @property

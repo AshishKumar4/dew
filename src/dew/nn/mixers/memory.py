@@ -20,29 +20,25 @@ class InContextMemoryMixer(MixerBase):
 
     memory: InContextMemory
 
-    def fork_refusal(self) -> str | None:
-        """Why the layer reads no forks (`MixerBase.fork_refusal`), None where it does: a memory on the
-        shared recurrence (`InContextMemory.recurrent`) continues a fork's document from the state its
-        parent's tokens leave, through the forks' table (`dew.nn.linear.forked_scan`, as lightning's), and
-        from the share of W_0 they kept; the general path steps each document's weights from its own
-        start, its chunks counted per document, which no fork continues. A call's wrappers that take a
-        recurrent memory's heads off the recurrence (a quantized or nonlinear product) are refused where
-        the call reads forks (`InContextMemory.__call__`)."""
-        if self.memory.recurrent:
-            return None
-        return ("an in-context memory off its shared recurrence continues no fork's document from its "
-                "parent: its general path steps each document's weights from its own start")
+    reads_forks = True
+    """A call's forks, on either path of the memory (`InContextMemory.__call__`): on its shared recurrence
+    (`InContextMemory.recurrent`) each document continues the state its parent's tokens leave, through
+    the forks' table (`dew.nn.linear.forked_scan`, as lightning's), and the share of W_0 they kept; off it
+    each document's chain is unfolded into a row of its own (`InContextMemory._unfolded`)."""
 
-    def wrapped_fork_refusal(self) -> str | None:
-        """Why the layer reads no forks under a wrapper whose products are not linear
-        (`MixerBase.wrapped_fork_refusal`): a quantized kernel, a rounded input or an adapter's dropout
-        takes the memory's heads off its shared recurrence (`InContextMemory._route`), the one path of it
-        that reads them, wherever its sites reach the heads, which only the bound model's scopes tell
-        (`dew.quantization.Quantization.rule_for`); so the decoder lays its rows whole under any such
-        wrapper, a correct run that shares no prefix."""
-        return ("a wrapper whose products are not linear (a quantization's, an adapter's dropout in "
-                "training) may take an in-context memory's heads off its shared recurrence, the one path of "
-                "it that reads forks")
+    def fork_sharing_refusal(self, linear: bool) -> str | None:
+        """Why packing rows over their shared prefixes costs the layer more than laying them whole
+        (`MixerBase.fork_sharing_refusal`), None on its shared recurrence where the model's wrappers keep
+        its products `linear`: off it (its configuration's general path, or heads a quantization or an
+        adapter's dropout makes nonlinear, wherever its sites reach them, which only the bound model's
+        scopes tell) the memory unfolds each document's chain into a row of its own, `D` times its work on
+        a packed row of `D` documents, more than the rows laid whole cost it."""
+        if self.memory.recurrent and linear:
+            return None
+        return ("an in-context memory off its shared recurrence (its general path, or under a wrapper whose "
+                "products are not linear) computes a call over forks by unfolding each document's chain into "
+                "a row of its own: D times its work on a packed row of D documents, more than the rows laid "
+                "whole")
 
     def marks(self) -> tuple[str, ...]:
         """The residuals of every path the memory's configuration can take (`InContextMemory.residuals`):
