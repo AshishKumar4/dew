@@ -94,7 +94,7 @@ from dew.nn.kernels.options import (
 from dew.nn.kernels.selection import Unlowerable
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
-from dew.telemetry.instrumentation import StepFlops, compiled_memory, step_flops
+from dew.telemetry.instrumentation import CompiledMemory, StepFlops, compiled_memory, step_flops
 from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
@@ -229,17 +229,22 @@ def filed(value: Executable | AheadPrograms | AheadOfTime) -> bytes:
 @dataclasses.dataclass(frozen=True)
 class Executable:
     """A program compiled ahead, serialized, and the trees of its inputs and outputs, as
-    `serialize_executable.serialize` gives them."""
+    `serialize_executable.serialize` gives them, and its memory as XLA analysed it where it was compiled
+    (`compiled_memory`), so a run's need is read before any device loads it (the GPU tier's workers sized
+    by their parts' programs); None where its backend states none, and for one filed before it was
+    recorded."""
 
     executable: bytes
     trees: tuple
+    memory: CompiledMemory | None = None
 
     @staticmethod
     def of(compiled: jax.stages.Compiled) -> Executable:
-        """`compiled` serialized with its trees, as a file holds them (`filed`); refused (ValueError) where a
-        tree holds what no file holds, so a file that would hold it is never written short."""
+        """`compiled` serialized with its trees and its memory, as a file holds them (`filed`); refused
+        (ValueError) where a tree holds what no file holds, so a file that would hold it is never written
+        short."""
         executable, in_tree, out_tree = serialize_executable.serialize(compiled)
-        held = Executable(executable, (in_tree, out_tree))
+        held = Executable(executable, (in_tree, out_tree), compiled_memory(compiled))
         try:
             filed(held)
         except (TypeError, pickle.PicklingError) as refusal:

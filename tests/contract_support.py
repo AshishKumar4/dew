@@ -18,8 +18,8 @@ public call."""
 import jax
 import jax.numpy as jnp
 import numpy as np
+from arm_arithmetic import on_float64_device, widened
 from float64_terms import float64_signed_sums
-from reference_error import widened
 
 LEAST = float(np.finfo(np.float32).tiny)
 """Float32's least normal value: a held position's truth is at least it (testing.md's derivative
@@ -140,7 +140,7 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     narrow = orders_of(fn, primals, direction, cotangent)
     plain_orders = {} if plain_fn is None else orders_of(plain_fn, primals, direction, cotangent)
     plain = {name: ran(order, f"{label}, plainly", name) for name, order in plain_orders.items()}
-    with jax.enable_x64(new_val=True):
+    with jax.enable_x64(new_val=True), on_float64_device():
         wide_primals, wide_direction, wide_cotangent = widened((primals, direction, cotangent))
         wide = orders_of(truth_fn or fn, wide_primals, wide_direction, wide_cotangent)
         truths = {name: ran(order, f"{label} in float64", name) for name, order in wide.items()}

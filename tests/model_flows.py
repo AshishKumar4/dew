@@ -1,14 +1,14 @@
 """The GPU tier's model flows (row 5461, the owner's ruling of 2026-11-11): each model family that takes a
 distinct default route on a GPU, built at widths its native kernels take, its training step's loss and
 gradients and its decode loop's logits on par with the reference path's (check 1), both against float64
-truths its prepare computed, from programs its prepare compiled for the node's GPU.
+truths its run computes on the GPU's FP64 units (bible §8), every program from its prepare.
 
-A flow's prepare (`DEW_TIER_PREPARE`, on the node's CPU, no GPU drawn) computes every draw's float64 truth
-into the tier's store (`reference_error.stored_truths`), compiles its programs for the GPU the node's
-serialized topology names (`dew.training.ahead.compile_programs`) beside them, and holds its programs'
-routes to the ones the flow is for (`Flow.native`, read as the GPU's target would choose them,
-`generation.routes`). Its run loads those programs and judges them: it traces, lowers and compiles
-nothing of its own and computes no truth, but where a qualification run sizes its sites
+A flow's prepare (`DEW_TIER_PREPARE`, on the node's CPU, no GPU drawn) compiles its arms' programs for the
+GPU the node's serialized topology names (`dew.training.ahead.compile_programs`) and its float64 truths'
+and terms' programs beside them (`truths_ahead.compiled_truths`), and holds its programs' routes to the
+ones the flow is for (`Flow.native`, read as the GPU's target would choose them, `generation.routes`). Its
+run loads those programs and judges them: it traces, lowers and compiles nothing of its own and computes
+every truth from the programs its prepare compiled, but where a qualification run sizes its sites
 (`check1_wire.QUALIFY`), each computing its sizing draws' truths (`reference_error._qualified`). Under
 the lane's deterministic ops check 1 also holds each arm to its own bits on the same draw
 (`reference_error._of_its_inputs`)."""
@@ -33,7 +33,8 @@ from check1_wire import ASKED
 from gpu_flow import Cell, run_cells
 from map_judge import site_id
 from model_support import float64_twin
-from reference_error import as_given, assert_as_exact, stored_truths
+from reference_error import as_given, assert_as_exact
+from truths_ahead import compiled_memory, compiled_truths
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.categorical import token_log_probs
@@ -45,7 +46,8 @@ PREPARE = "DEW_TIER_PREPARE"
 """Set to 1, a flow prepares rather than runs (`preparing`): on the node's CPU, before its GPU run."""
 
 TRUTHS = "DEW_TIER_TRUTHS"
-"""The directory a part's prepare writes its flows' truths and programs to and its run reads them from."""
+"""The directory a part's prepare writes its flows' programs and their truths' to and its run reads them
+from."""
 
 PARAMS = "params.pickle"
 """The file of a flow's store holding the parameters its prepare drew (`Flow.params`)."""
@@ -382,8 +384,8 @@ def store_of(flow: Flow) -> Path:
 
 
 def stamp() -> str:
-    """The commit (`map_judge.commit`) and JAX the flows' truths are prepared and read at: a truth another
-    computed is never read (`reference_error.stored_truths`)."""
+    """The commit (`map_judge.commit`) and JAX the flows' truths' programs are compiled and read at: a program
+    another compiled is never run (`truths_ahead.compiled_truths`)."""
     from map_judge import commit
 
     return f"{commit()} jax {jax.__version__} jaxlib {importlib.metadata.version('jaxlib')}"
@@ -524,8 +526,56 @@ def prepare(flow: Flow) -> bool:
     reference.save(directory / "reference.programs")
     held_reference(flow, [route for kind in KINDS for route in found[kind]])
     for kind in kinds_of(flow):
-        judge(flow, {}, kind)
+        judge(flow, {}, kind, target)
+    programs = need(dew, reference, directory / "truths")
+    (directory / NEED).write_text(json.dumps(programs))
+    unit_needs(programs["programs"])
     return True
+
+
+NEED = "need.json"
+"""A flow's file in its store stating its run's programs' device memory in the allocator's terms (`need`),
+by which the GPU tier admits a part's worker to a slot (`dew.training.memory.admitted` of each)."""
+
+
+UNIT = "DEW_TIER_UNIT"
+"""The name the GPU tier runs a prepare's unit under (a file, or `<file>#G/N` for a group), which its lane
+sets in the prepare's environment: its flows' needs are filed under it (`unit_needs`)."""
+
+
+def unit_needs(programs: list[dict[str, int]]) -> None:
+    """`programs` (`need`'s) added to the needs of the tier's unit this prepare runs (`UNIT`), one file a
+    unit under the tier's store (`TRUTHS`'s `needs/`), from which its lane sizes the unit's worker by Dew's
+    admission of each (`dew.training.memory.admitted`); none outside the tier's prepare, which names no
+    unit."""
+    unit = os.environ.get(UNIT)
+    if unit is None:
+        return
+    path = Path(os.environ[TRUTHS]) / "needs" / f"{hashlib.sha256(unit.encode()).hexdigest()[:16]}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    held = json.loads(path.read_text())["programs"] if path.exists() else []
+    path.write_text(json.dumps({"unit": unit, "programs": [*held, *programs]}))
+
+
+def need(dew, reference, truths: Path) -> dict[str, list[dict[str, int]]]:
+    """A flow's run's programs as the allocator admits them (`dew.training.memory.admitted`), each its
+    compile's memory (`Executable.memory`, `truths_ahead.compiled_memory`): the bytes `resident` in the
+    allocator's pool as it runs (its arguments; a float64 truth's or terms program's beside the arms' state,
+    the most any arm takes as arguments, which the run holds while its truths compute; every program's
+    outputs are fetched to the host, `loaded`, `CompiledTruths.called`), the bytes `beside` its temporaries
+    (its outputs no donated argument holds) and its `temporaries`, one block. A part's worker fits a slot
+    where every program of its flows is admitted there."""
+    arms = [executable.memory for programs in (dew, reference) for executable in programs.programs.values()
+            if executable.memory is not None]
+    state = max((memory.argument for memory in arms), default=0)
+
+    def admitted_as(memory, held: int) -> dict[str, int]:
+        # The allocator's bytes alone: a program's code lives outside its pool (`dew.communicators`).
+        return {"resident": held + memory["argument"], "beside": memory["output"] - memory["alias"],
+                "temporaries": memory["temp"]}
+
+    return {"programs": [*(admitted_as(memory._asdict(), 0) for memory in arms),
+                         *(admitted_as(memory, state) for memory in compiled_memory(truths))]}
 
 
 PREPARED_APART = """import sys
@@ -558,22 +608,25 @@ def prepared_here(name: str) -> None:
 
 def loaded(flow: Flow) -> dict[str, Callable]:
     """The flow's programs its prepare compiled, loaded onto this GPU, each a function of the parameters and
-    the ids."""
+    the ids whose results are fetched to the host, as check 1 holds an arm's (`reference_error`): no arm's
+    outputs stay on the GPU while the next program runs, which the flow's needs count none of (`need`)."""
     from dew.training.ahead import AheadPrograms
 
     directory = store_of(flow)
     held = {name: program for arm in ("dew", "reference")
             for name, program in AheadPrograms.load(directory / f"{arm}.programs").loaded().items()}
-    return {name: as_given(lambda params, ids, program=program: program(*jax.tree.leaves(params), ids))
-            for name, program in held.items()}
+    return {name: as_given(lambda params, ids, program=program: jax.device_get(
+                program(*jax.tree.leaves(params), ids))) for name, program in held.items()}
 
 
-def judge(flow: Flow, programs: Mapping[str, Callable], kind: str) -> None:
-    """Check 1 of the flow's program `kind` (`KINDS`) against its float64 truth from the tier's store
-    (prepared there where this process prepares, `programs` none)."""
+def judge(flow: Flow, programs: Mapping[str, Callable], kind: str, target=None) -> None:
+    """Check 1 of the flow's program `kind` (`KINDS`) against its float64 truth, computed on this GPU by the
+    programs the tier's prepare compiled for it (`truths_ahead.compiled_truths`); compiled there where this
+    process prepares (`programs` none), for `target` (the node's GPU, `_target`; this process's devices
+    where none)."""
     truth_model = float64_twin(flow.model)
     truth = flow.train(truth_model) if kind == "train" else flow.decode_truth(truth_model)
-    with stored_truths(store_of(flow) / "truths", prepare=preparing(), stamp=stamp(), later=asked()):
+    with compiled_truths(store_of(flow) / "truths", prepare=preparing(), stamp=stamp(), target=target):
         assert_as_exact(programs.get(f"{kind} dew"), programs.get(f"{kind} reference"), flow.draw,
                         f"{flow.name}: {kind}", seeds=flow.seeds[kind], truth_fn=truth)
 

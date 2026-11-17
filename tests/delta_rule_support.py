@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import on_float64_device
 from fla_gdn_support import fla_prefix
 from float64_terms import float64_terms
 from reference_error import widened, with_gradients
@@ -430,7 +431,7 @@ def float64_truth(inputs, cuts) -> tuple[list[np.ndarray], list[np.ndarray]]:
     if cuts is not None:
         starts = np.zeros(q.shape[:2], bool)
         starts[0, list(cuts[1:])] = True
-    with jax.enable_x64(new_val=True):
+    with jax.enable_x64(new_val=True), on_float64_device():
         run = jax.jit(lambda q, k, v, g, beta, h0, do, dht: through(
             functools.partial(recurrence, cuts=rows), do, dht)(q, k, v, g, beta, h0))
         heads, decay = [], []
