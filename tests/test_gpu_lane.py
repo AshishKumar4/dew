@@ -504,10 +504,10 @@ def test_a_gpu_lanes_groups_run_each_test_of_the_tips_file_once_their_rows_their
 
 
 def test_a_gpu_lane_given_test_nodes_grades_each_by_its_own_cases(ci, tmp_path, monkeypatch, cache_worker):
-    """A lane given single tests by node id (`file::test`, a parametrized one among them, as a lane's own GPU run
-    names them) grades each by its own cases: one that passed is green, one whose case failed red with it, none
-    "never ran" (2026-11-17: every node id a tier was given read "no evidence ran", its cases matched against
-    their file's name)."""
+    """A lane given single tests by node id (`file::test`, a parametrized one among them, as a lane's own GPU
+    run names them) grades each by its own cases: one that passed is green, one whose case failed red with
+    it, none "never ran" (2026-11-17: every node id a tier was given read "no evidence ran", its cases
+    matched against their file's name)."""
     url, _, _ = cache_worker
     gpu_lane_at(tmp_path, monkeypatch, url, 0)
     (tmp_path / "tests/test_nodes.py").write_text(
@@ -746,8 +746,9 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
         share, row = lane()
         assert admitted(*programs) <= budget
         assert (row["output"], row["exitCode"]) == ("", 0)
-        # Within the MiB the lane's share is written in.
-        assert abs(share - max(2 * gib * 1.25 + gib, admitted(*programs))) <= mib
+        # Its measured peak's share raised to Dew's admission, exactly as the lane gives it.
+        record = {"depends": ["tests/test_flow.py"], "peak": 2 * gib, "shares": 0, "pools": 0}
+        assert share == float(str(ci.gpu_needs(record, budget, float(admitted(*programs)))[0] / total)) * total
     # Its children each take a share's fraction: what it holds is of its raised share, 7 GiB twice over.
     assert ci.gpu_needs({"depends": [], "peak": 2 * gib, "shares": 1, "pools": 0}, 40 * gib, 7 * gib) == (
         7 * gib, 14 * gib)
