@@ -440,26 +440,32 @@ def accurate_exp(x, *, base2: bool = False) -> jax.Array:
     return (jax.lax.exp2 if base2 else jax.lax.exp)(jnp.asarray(x), accuracy=jax.lax.AccuracyMode.HIGHEST)
 
 
-def _silu(x) -> jax.Array:
+def _logistic(x) -> jax.Array:
+    work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
+    return 1.0 / (1.0 + accurate_exp(-work))
+
+
+def _logistic_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
+    """`logistic`'s value and tangent `s (1 - s)`, each order finite where `e^-x` overflows (`s` zero)."""
+    (x,), (tangent,) = primals, tangents
+    s = logistic(x)
+    return s, s * (1.0 - s) * tangent.astype(s.dtype)
+
+
+logistic = contracted("test_silu_holds_every_order")(declared_tangent(Protected(), _logistic, _logistic_jvp))
+"""`1 / (1 + e^-x)` in at least float32, its exp the backend's most accurate (`accurate_exp`) and a true
+division: a backend's logistic is no part of it (`silu`'s)."""
+
+
+def silu(x) -> jax.Array:
+    """`x / (1 + e^-x)` as `x` times its `logistic` (its exp the backend's most accurate and a true division),
+    in at least float32 and rounded once, its derivative through the logistic's declared tangent: a backend's
+    logistic is no part of it, a v5e's approximate even at HIGHEST, which held Mamba-2's layer at 3.5 times
+    its CPU float32 through its conv's and its gate's silus, where this holds it at 0.89 times, its training
+    step unchanged (row 7062, M-JS-136)."""
     given = jnp.asarray(x)
     x = given.astype(at_least_fp32(given.dtype))
-    return (x / (1.0 + accurate_exp(-x))).astype(given.dtype)
-
-
-def _silu_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
-    """`silu`'s value and tangent `s (1 + x (1 - s))`, `s` the logistic `1 / (1 + e^-x)` formed alike, in at
-    least float32 and rounded once to the tangent's dtype: finite where `e^-x` overflows (`s` zero)."""
-    (x,), (tangent,) = primals, tangents
-    work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
-    s = 1.0 / (1.0 + accurate_exp(-work))
-    return silu(x), (s * (1.0 + work * (1.0 - s)) * tangent.astype(work.dtype)).astype(tangent.dtype)
-
-
-silu = contracted("test_silu_holds_every_order")(declared_tangent(Protected(), _silu, _silu_jvp))
-"""`x / (1 + e^-x)`, its exp the backend's most accurate (`accurate_exp`) and a true division, in at least
-float32 and rounded once: a backend's logistic is no part of it, a v5e's approximate even at HIGHEST, which
-held Mamba-2's layer at 3.5 times its CPU float32 through its conv's and its gate's silus, where this holds it
-at 0.89 times, its training step unchanged (row 7062, M-JS-136)."""
+    return (x * logistic(x)).astype(given.dtype)
 
 
 def softplus_series(x) -> jax.Array:
