@@ -1269,14 +1269,18 @@ def collect_entries(names: list[str], timings: dict, target: float) -> list[dict
             for index, held in enumerate(names[at::count] for at in range(count))]
 
 
-def stale_row(python: str, name: str, group: str, why: str, kind: str = grading.STALE) -> dict:
-    """Row `name` (in `group`'s group) not run, red as `kind`, saying `why`: `grading.STALE`, a kept row this
-    task did not find, graded and run again by the queue; "whole", a unit its lane cannot hold."""
-    said = (f"stale, not run: the plan kept it on a record this task did not find, {why}"
-            if kind == grading.STALE else why)
-    return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0, "output": said,
+KEPT_UNFOUND = "stale, not run: the plan kept it on a record this task did not find, "
+"""How a kept row this task did not find or could not run begins what it says (`stale_row`)."""
+
+
+def stale_row(python: str, name: str, group: str, why: str) -> dict:
+    """Row `name` (in `group`'s group) with no verdict of its tests (`grading.STALE`), not run, saying `why`:
+    a kept row this task did not find, which the queue runs again, or a unit its GPU lane cannot hold
+    (`gpu_lane`), which Platform's harness evidence says, never a red of a test nor its file's verdict (Main's
+    audit, row 7614: as a red of its own kind, the tier read it as its file's verdict and its tests' red)."""
+    return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0, "output": why,
             "tests": {}, "ynn_switched": [], "cells": {}, "timings": {row(python, name, ""): 0.0},
-            **grading.red_as(kind, [])}
+            **grading.red_as(grading.STALE, [])}
 
 
 def stale_cost(name: str, group: str, reading: Reading) -> float:
@@ -1302,7 +1306,8 @@ def afforded(python: str, tests: list[str], group: str, kept: Container[str],
     for name in tests:
         cost = stale_cost(name, group, reading)
         if name in kept and cost > left:
-            stale_rows.append(stale_row(python, name, group, f"its {cost:.0f} s past the {left:.0f} s left"))
+            stale_rows.append(stale_row(python, name, group,
+                                        f"{KEPT_UNFOUND}its {cost:.0f} s past the {left:.0f} s left"))
             continue
         fitting.append(name)
         left -= cost
@@ -1407,7 +1412,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
             # The task's deadline spent on the rows before it: this group is neither read nor run, stale as a
             # kept row the task could not run is (`tested`).
             rows.append(stale_row(python, name, group,
-                                  f"the task's {deadline:.0f} s spent before it was read"))
+                                  f"{KEPT_UNFOUND}the task's {deadline:.0f} s spent before it was read"))
             continue
         part = out.with_name(f"{out.name}.{index}")
         code = max(code, tested(python, [name], group, part, left, cache, grace, common, environ, coverage,
@@ -2196,7 +2201,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                 del running[future]
     rows = [{**verdict, "output": f"{short[name]}\n{verdict.get('output', '')}"} if name in short else verdict
             for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
-    rows += [stale_row(python, file, varied(group, variant), unheld[name], "whole")
+    rows += [stale_row(python, file, varied(group, variant), unheld[name])
              for name, (file, group, variant) in units.items() if name in unheld]
     out.write_text(json.dumps({"rows": rows}))
     return 0

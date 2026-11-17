@@ -667,9 +667,9 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     takes the most demanding of them, beside what its runs measured: a part's float64 truths, which no
     run of it held, are admitted before they run (2026-11-17: two flows' 1.71 GiB terms walk beside
     1.1 GiB of arms ran out of a 2.84 GiB share). One past the lane's share is not run below it: its row
-    is red, naming its need and the GPU (Main, 2026-11-17). Dew's own functions read it, here as the lane
-    does, on a lane a tenth of its GPU, where a need read in the wrong units is ten times off (rows 7460,
-    7461: red unschedulable at 34.88 GiB)."""
+    has no verdict, naming its need and the GPU (Main, 2026-11-17). Dew's own functions read it, here as
+    the lane does, on a lane a tenth of its GPU, where a need read in the wrong units is ten times off
+    (rows 7460, 7461: red unschedulable at 34.88 GiB)."""
     from dew._devices import allocator_limit
     from dew.training.memory import needed
 
@@ -728,7 +728,7 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     # Its children each take a share's fraction: what it holds is of its raised share, 7 GiB twice over.
     assert ci.gpu_needs({"depends": [], "peak": 2 * gib, "shares": 1, "pools": 0}, 40 * gib, 7 * gib) == (
         7 * gib, 14 * gib)
-    # Programs past the lane's share: none runs, each red as its file, its row naming its need and the GPU,
+    # Programs past the lane's share: none runs, none with a verdict, its row naming its need and the GPU,
     # and saying a lane of the whole GPU holds it only where that lane's (JAX's 75%) does.
     for temporaries in (12 * gib, 70 * gib):
         filed((gib, gib, temporaries))
@@ -736,7 +736,8 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
         runs = len(lane_runs(tmp_path, "test_flow"))
         _, row = lane()
         assert need > budget and len(lane_runs(tmp_path, "test_flow")) == runs and row["exitCode"] == 1
-        assert row["kind"] == "whole" and f"{need / gib:.2f} GiB" in row["output"]
+        # No verdict of its tests (`grading.STALE`): Platform's harness evidence, never its file's verdict.
+        assert row["kind"] == ci.grading.STALE and f"{need / gib:.2f} GiB" in row["output"]
         assert ci.device_class() in row["output"] and ("holds it" in row["output"]) == (need <= whole)
 
 
