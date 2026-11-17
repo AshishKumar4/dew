@@ -692,6 +692,7 @@ dew.decision.config.DecisionRunConfig
   context_length: int = 256
   context_encoder: ContextEncoder = 'table'
   context_text: TextCondition | None = None
+  context_text_trained: bool = False
   context_form: Literal['idefics', 'shared'] = 'idefics'
 dew.decision.config.JointShape
   width: int = 1024

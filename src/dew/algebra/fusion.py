@@ -246,6 +246,13 @@ def _elementwise(equation: jcore.JaxprEqn, shape: tuple[int, ...]) -> bool:
             and all(_follows(_shape(var), shape) for var in equation.invars))
 
 
+def _named_value(equation: jcore.JaxprEqn, shape: tuple[int, ...]) -> bool:
+    """Whether `equation` is a remat name (`checkpoint_name`) on a value of `shape`: an epilogue's member
+    (`_regions`), its name lifted off the launch's consumer as a residual (`fused_gemm._named`)."""
+    return (equation.primitive is jcore.primitives.name_p
+            and all(_shape(var) == shape for var in (*equation.invars, *equation.outvars)))
+
+
 def _captured(index: Index, scanned: Sequence[int], members: set[int], claimed: set[int]) -> set[int]:
     """The layout equations of the captured operands of the equations at `scanned` that only `members` read
     (`CAPTURED`: a bias's broadcast, a row statistic's over the depth), no other region holds (`claimed`)
@@ -308,8 +315,12 @@ def _regions(index: Index) -> list[Region]:
             later = jaxpr.eqns[place]
             if not any(isinstance(var, jcore.Var) and var in made for var in later.invars):
                 continue
-            # A product's epilogue takes each entry of its output from the same entry of its inputs.
-            if place in claimed or not _elementwise(later, shape):
+            # A product's epilogue takes each entry of its output from the same entry of its inputs: an
+            # entrywise operation, or a remat name on such a value (`checkpoint_name`, a gate's projection
+            # before its SwiGLU), which the launch's consumer hands out under its name (`fused_gemm._named`,
+            # its residual, row 7131), where it ended the region (row 6102). A name on a prologue's value
+            # stays its boundary: a producer's stage runs no name.
+            if place in claimed or not (_elementwise(later, shape) or _named_value(later, shape)):
                 at = place
                 break
             places.append(place)
