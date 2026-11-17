@@ -21,10 +21,10 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import generation
 from dew.nn.kv_cache import (
     BOUND,
+    TPU_PAGED_SUPPORTS,
     KVCache,
     KVSpec,
     KVStore,
-    TPU_PAGED_SUPPORTS,
     _gather_pages,
     _gathered_attention,
     gpu_paged,
