@@ -75,9 +75,11 @@ from dew.registry import Aliases, JsonDict, from_record, record_argument, schedu
 HEAD_AXES = frozenset({'heads', 'head_dim', 'kv'})
 
 # An expert dimension stacks whole matrices, one per expert, so it is a batch
-# axis. It names neither side, and optax orthogonalizes each expert on its
-# own (optax/contrib/_muon.py:56-74).
-BATCH_AXES = frozenset({'exp'})
+# axis, as a block-diagonal kernel's group dimension is ('groups', DeepSeek
+# V4's grouped output projection). Each names neither side, and optax
+# orthogonalizes each expert or group on its own (optax/contrib/_muon.py:56-74).
+# No rule shards 'groups', so a group stack stays whole on every device.
+BATCH_AXES = frozenset({'exp', 'groups'})
 
 # A parameter that maps into or out of a discrete index is a lookup, so AdamW
 # keeps the embeddings, the head and the router
@@ -232,9 +234,18 @@ def _placement(path: jax.tree_util.KeyPath, param,
         sides = _matrix_sides(named)
         if sides is not None:
             return _shifted(optax.contrib.MuonDimensionNumbers(*sides), stacked), "muon"
+        # Its stacking axes set aside (`BATCH_AXES`: a group stack), two dimensions declared on one side
+        # (('groups', 'attention', None), DeepSeek V4's grouped output projection) are each stacked
+        # matrix as its two dimensions make it, as an undeclared one is: contracted into the output side.
+        matrix = [dimension for dimension, name in enumerate(named) if name not in BATCH_AXES]
+        if len(matrix) == 2 and len(matrix) < len(named):
+            return _shifted(optax.contrib.MuonDimensionNumbers((matrix[0],), (matrix[1],)), stacked), "muon"
     if rank == 3 and param.shape[stacked + 1] == 1:
         return None, "adamw: a per-channel filter, [channels, 1, taps], a vector a channel"
-    if named is not None:
+    # A matrix whose declaration names one side (`('embed', None)`, a projection the rules shard on one
+    # side and leave whole on the other) is the matrix its rank makes it, as an undeclared one is: two
+    # dimensions are one contracted side and one output side whatever the declaration names.
+    if named is not None and rank > 2:
         raise ValueError(
             f"{jax.tree_util.keystr(path)} is declared {named}, which is not one contracted side and one "
             "output side, so Muon cannot tell what its matrix is. An axis that stacks matrices rather "
@@ -1184,10 +1195,12 @@ def scale_by_trust_ratio(min_norm: float = 0.0, trust_coefficient: float = 1.0,
         def scaled(path, update, param):
             stacked = layers_of(path)[1]
             param_norm, update_norm = (layer_norms(leaf, stacked, min_norm) for leaf in (param, update))
-            ratio = trust_coefficient * param_norm / (update_norm + eps)
+            # The update over its own norm, then the parameters' norm: the ratio's product with no quotient of
+            # two norms formed first, which passes float32 where a backend keeps an update's subnormal
+            # squares (a norm near 1e-22 beside one near 1e19).
+            scaled = update / (update_norm + eps) * (trust_coefficient * param_norm)
             # A layer whose parameters or update are zero would never move: it keeps its update.
-            return update * jnp.where((param_norm == 0.0) | (update_norm == 0.0),
-                                      jnp.array(1.0, param.dtype), ratio)
+            return jnp.where((param_norm == 0.0) | (update_norm == 0.0), update, scaled)
         return jax.tree_util.tree_map_with_path(scaled, updates, params), state
 
     return optax.GradientTransformation(optax.init_empty_state, update_fn)

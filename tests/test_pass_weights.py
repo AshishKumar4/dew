@@ -124,23 +124,28 @@ def decision_objective(model, weights):
 
 def test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_weight():
     """`pass_weights` over a decision model's looped backbone, a consistency term beside the label loss
-    over a group of two questions, one negated (`test_decision_consistency.NEGATED`), whose divergence is
-    nonzero: the loss and every parameter's gradient on par from float64 with each `with_passes(k)`
-    backbone's own decision loss at its weight (check 1)."""
-    from test_decision_consistency import LAYOUT, NEGATED
+    over a group of two questions, one negated, whose divergence is nonzero: the loss and every parameter's
+    gradient on par from float64 with each `with_passes(k)` backbone's own decision loss at its weight
+    (check 1). The two questions' options are named, not described, so the joint row fits in 512 tokens,
+    where `test_decision_consistency.NEGATED`'s described nouls and a third question took 959 and the
+    test set its CI train's wall (row 7291)."""
+    from dew.decision import Group, JointSchemaHead
+    from dew.decision.layout import SegmentLayout
 
-    from dew.decision import JointSchemaHead
-
-    model = looped().clone(max_seq_len=LAYOUT.max_len)
+    layout = SegmentLayout.joint_row(max_len=512)
+    asked = {"a": Choice("Billing?", ["y", "n"]), "b": Choice("Other?", ["y", "n"])}
+    negated = Example("charged twice", asked, {"a": "y", "b": "n"}, groups=(
+        Group("billing", {"a": {"y": "yes", "n": "no"}, "b": {"y": "no", "n": "yes"}}),))
+    model = looped().clone(max_seq_len=layout.max_len)
     weights = (0.2, 0.3, 0.5)
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
 
     def objective_of(backbone, stated, head=head):
-        return DecisionObjective(backbone, tokenizer=ByteTokenizer(), specials=SPECIALS, layout=LAYOUT,
+        return DecisionObjective(backbone, tokenizer=ByteTokenizer(), specials=SPECIALS, layout=layout,
                                  head=head, consistency=0.5, pass_weights=stated)
 
     weighed = objective_of(model, weights)
-    reader = decision_rows([NEGATED, NEGATED], None, objective=weighed.data(), tokens=LAYOUT.max_len)
+    reader = decision_rows([negated, negated], None, objective=weighed.data(), tokens=layout.max_len)
     [batch] = list(itertools.islice(reader.train(DataPartition()), 1))
     step = Step(jnp.asarray(0), jax.random.key(0), None)
     draw = drawn(weighed.init)

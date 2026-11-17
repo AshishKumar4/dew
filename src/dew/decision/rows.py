@@ -7,7 +7,7 @@ import dataclasses
 import hashlib
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TypeGuard
+from typing import ClassVar, TypeGuard
 
 import grain.python as pygrain
 import numpy as np
@@ -701,7 +701,7 @@ def _fitted(element: Batch) -> FittedRow:
 
 
 @dataclass(frozen=True)
-class LayoutRows(pygrain.RandomMapTransform):
+class LayoutRows(pygrain.RandomMapTransform, ReadsEarlierLayouts):
     encoding: Encoding
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
@@ -722,7 +722,7 @@ class LayoutRows(pygrain.RandomMapTransform):
 
 
 @dataclass(frozen=True)
-class EvaluateRows(pygrain.MapTransform):
+class EvaluateRows(pygrain.MapTransform, ReadsEarlierLayouts):
     encoding: Encoding
 
     def map(self, element: Batch) -> Batch:
@@ -932,6 +932,7 @@ class PackedRows(pygrain.MapTransform):
     slots (`compacted`). Every window is `max_length` tokens, which a token
     budget divides into rows."""
 
+    lays_out_windows: ClassVar[bool] = True
     max_length: int
     option_slots: int | None = None
     spans_in_context: bool = False

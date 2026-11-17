@@ -432,9 +432,9 @@ def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly
         got = loaded("one two three", QUESTION, context=context)["pick"].probabilities
         want = trained("one two three", QUESTION, context=context)["pick"].probabilities
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-    resumed = Trainer(configured(), optax.adam(1e-3), key=0, checkpoints=Checkpoints(directory, keep=2),
-                      data_resume="exact").fit(dataclasses.replace(data, resume="exact"), steps=3, log_every=1,
-                                               checkpoint_every=1)
+    again = Trainer(configured(), optax.adam(1e-3), key=0, checkpoints=Checkpoints(directory, keep=2),
+                    data_resume="exact")
+    resumed = again.fit(dataclasses.replace(data, resume="exact"), steps=3, log_every=1, checkpoint_every=1)
     assert int(resumed.step) == 3
 
 

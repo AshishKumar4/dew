@@ -72,10 +72,30 @@ class Coordinated(grain.MapTransform):
     None (static, so a compiled step is specialized to it). A window holding
     more than its read declared is refused, which a sequence kernel would run
     into its neighbours' sequences. `ids` is the packed ids field, the first
-    of `fields`."""
+    of `fields`. A read whose objective lays its windows out itself (`dew.data.pipeline.LaysOutWindows`: a
+    decision's rows) states their bound alone (`dew.batch.SegmentBound`), as `<ids>_bound`."""
 
     fields: tuple[str, ...]
     max_segments: int | None
+
+    def __post_init__(self):
+        # Whether the read lays its windows out (`laid`): derived from the chain's own steps (a step over
+        # its windows that lays them out), which its plan describes, so no field of the step's: its
+        # statement, every field of it, reads as a plan main saved states it.
+        object.__setattr__(self, "_laid_out", True)
+
+    @classmethod
+    def laid(cls, fields: tuple[str, ...], max_segments: int | None, laid_out: bool) -> Coordinated:
+        """The step over `fields`' windows, which the read lays out where `laid_out`, else states their
+        bound alone, its objective laying them out itself (`dew.data.pipeline.LaysOutWindows`)."""
+        made = cls(fields, max_segments)
+        object.__setattr__(made, "_laid_out", laid_out)
+        return made
+
+    @property
+    def laid_out(self) -> bool:
+        """Whether the read lays its windows out (`laid`), held beside the step's fields."""
+        return bool(vars(self)["_laid_out"])
 
     def map(self, element: Batch) -> Batch:
         from dew.batch import SegmentBound, coordinates
@@ -90,10 +110,12 @@ class Coordinated(grain.MapTransform):
             raise ValueError(f"a packed {ids} window holds {held} documents, past the {self.max_segments} "
                              "its read declares (Coordinates.max_segments)")
         packing = {f"{field}_{part}" for field in self.fields for part in ("segment_ids", "positions")}
-        if f"{ids}_positions" not in element:
-            # A read whose consumer lays its rows out itself states the bound alone (`SegmentBound`).
+        if not self.laid_out:
             return {**{name: value for name, value in element.items() if name not in packing},
                     f"{ids}_bound": SegmentBound(self.max_segments)}
+        if f"{ids}_positions" not in element:
+            raise ValueError(f"a packed {ids} window holds its segment ids and no positions, which its "
+                             "model's coordinates are laid out by")
         laid = coordinates(segments=segments, positions=element[f"{ids}_positions"],
                            max_segments=self.max_segments, right_padded=True, xp=np)
         return {**{name: value for name, value in element.items() if name not in packing},

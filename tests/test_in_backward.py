@@ -1,6 +1,8 @@
 """A scanned decoder's step that updates each layer's weights in its backward (`dew.nn.in_backward`, row
 4796): the same step as the one that takes the whole gradient first, without holding it."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -13,6 +15,7 @@ from token_support import token_rows
 
 from dew.distributed.batches import shard_batch
 from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.options import program
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig, ParamGroup
 from dew.registry import models
@@ -229,3 +232,144 @@ def test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time(opt
     truth = stepped(plain, optimizer, MeshSpec(), 1, initial, exact=True, ema=None)
     assert_as_exact(updating, whole, draw, "a scanned step updating in its backward", seeds=PLANNED_SEEDS,
                     truth_fn=truth)
+
+
+def _walked(e, *, finite: bool = True, top: float = 1.0, runs: int = 1, through_context: bool = False):
+    """Three layers, each `y = a x + sqrt(0 x + s - s' + e) + c k` with `s'` the stop-gradient of `s` and
+    `k` a constant: a finite forward, whose gradient is not finite at a layer whose `e` is zero, in its own
+    weights and in the input it hands the layer below (0 times infinity), and whose `c` takes the gradient
+    `k`, 1 at every layer but the walk's first (the top of the upper run), whose is `top`. Updated in their
+    backward (`dew.nn.in_backward`) by an Adam-like rule that counts its steps per layer, under a step whose
+    loss is `finite`, as a run that skips steps not finite walks it: the weights, moments and per-layer
+    non-finite counts the walk leaves. Given `runs` of
+    two, the same three layers run twice, the upper reading the lower's output: each run's own; through
+    `through_context`, the upper reading the lower's output as a context every layer reads (`shared`, an
+    encoder's to a decoder's cross-attention), its own input a constant."""
+    from dew.nn import in_backward
+
+    count = 3
+
+    def weights_of(run):
+        first = jnp.arange(count) == count - 1 if run == runs - 1 else jnp.zeros((count,), bool)
+        return {"a": jnp.full((count,), 0.5), "s": jnp.ones((count,)), "e": jnp.asarray(e, jnp.float32),
+                "c": jnp.zeros((count,)), "k": jnp.where(first, top, 1.0).astype(jnp.float32)}
+
+    weights = [weights_of(run) for run in range(runs)]
+    moments = [{"mu": jax.tree.map(jnp.zeros_like, held), "nu": jax.tree.map(jnp.zeros_like, held),
+                "count": {name: jnp.zeros((count,)) for name in held}} for held in weights]
+    norms = [{"sumsq": jnp.zeros((count,)), "nonfinite": jnp.zeros((count,))} for _ in range(runs)]
+
+    def layer(w, x, per_layer, *context):
+        read = x if not context else x + context[0]
+        return (w["a"] * read + jnp.sqrt(0 * x + w["s"] - jax.lax.stop_gradient(w["s"]) + w["e"])
+                + w["c"] * jax.lax.stop_gradient(w["k"]))
+
+    def update(path, index, gradient, held, moments):
+        mu = jax.tree.map(lambda m, g: 0.9 * m + g, moments["mu"], gradient)
+        nu = jax.tree.map(lambda v, g: 0.99 * v + 0.01 * jnp.square(g), moments["nu"], gradient)
+        moved = jax.tree.map(lambda w, m, v: w - 0.1 * m / (jnp.sqrt(v) + 1.0), held, mu, nu)
+        return moved, {"mu": mu, "nu": nu, "count": jax.tree.map(lambda c: c + 1, moments["count"])}
+
+    def loss(weights, moments, norms):
+        x = jnp.ones(())
+        for run in range(runs):
+            if through_context and run:
+                x = in_backward.scanned_run((f"run{run}",), layer, weights[run], None, moments[run],
+                                            norms[run], jnp.ones(()), None, (x,))
+            else:
+                x = in_backward.scanned_run((f"run{run}",), layer, weights[run], None, moments[run],
+                                            norms[run], x, None, ())
+        return x
+
+    with in_backward.planned(in_backward.InBackward(update=update, moments=("mu", "nu", "count"))), \
+            in_backward.gated(jnp.asarray(a=True), jnp.asarray(finite)):
+        # Compiled, as a step is: each run's backward traced on its own (`marked`), so the latch crosses
+        # runs as data the walk carries, not as a value one trace leaves another.
+        walked = program(jax.grad(loss, argnums=(0, 1, 2)))(weights, moments, norms)
+    return walked if runs > 1 else tuple(each[0] for each in walked)
+
+
+def test_a_layer_walked_past_a_gradient_that_is_not_finite_keeps_its_weights_and_steps_its_count():
+    """A step updating in its backward whose gradient first turns non-finite at the middle of three layers,
+    a finite loss above it: the top layer, walked first, moves and stays finite; the middle layer and the
+    one below, whose gradients are not finite, keep their weights and take the zero gradient's update, so
+    every layer's count steps alike; the walk counts both non-finite (training.md, a step that is not
+    finite; train 912's review, F2), as a run that skips such steps walks it; a step whose loss is not
+    finite moves no layer."""
+    weights, moments, norms = _walked([1.0, 0.0, 1.0])
+    assert bool(jnp.all(jnp.isfinite(weights["a"]))) and float(weights["a"][2]) != 0.5
+    np.testing.assert_array_equal(np.asarray(weights["a"][:2]), [0.5, 0.5])
+    np.testing.assert_array_equal(np.asarray(moments["count"]["a"]), [1.0, 1.0, 1.0])
+    assert [bool(count > 0) for count in norms["nonfinite"]] == [True, True, False]
+    unmoved, _, _ = _walked([1.0, 1.0, 1.0], finite=False)
+    np.testing.assert_array_equal(np.asarray(unmoved["a"]), [0.5, 0.5, 0.5])
+
+
+def test_a_walk_names_the_first_layer_it_met_not_finite_across_its_stage_axis():
+    """The first layer a backward walk met a gradient not finite at, of runs whose counts lie on a stage axis
+    and a slot axis (one stage): the top layer of the highest slot holding one, a periodic run's slot its
+    period's layers, numbered across the runs in order. The stage axis was read as the layers, naming
+    layer 0 (the round-2 review's F2), and a period's slot as one layer (the head review's F6)."""
+    from dew.training.transaction import _unfinite_layer
+
+    assert int(_unfinite_layer([(jnp.asarray([[1.0, 1.0, 0.0]]), 1)])) == 1
+    assert int(_unfinite_layer([(jnp.asarray([[0.0, 0.0]]), 1), (jnp.asarray([[1.0, 0.0, 0.0]]), 1)])) == 2
+    assert int(_unfinite_layer([(jnp.asarray([[0.0, 0.0, 0.0]]), 1)])) == -1
+    # A periodic run of two repeats of a six-layer period, its upper repeat holding the count: layers 6 to 11,
+    # topped by 11; a run after it numbered past its twelve layers.
+    assert int(_unfinite_layer([(jnp.asarray([[0.0, 1.0]]), 6)])) == 11
+    assert int(_unfinite_layer([(jnp.asarray([[0.0, 0.0]]), 6), (jnp.asarray([[1.0]]), 1)])) == 12
+
+
+@pytest.mark.parametrize("through_context", [False, True], ids=["its input", "a context"])
+def test_a_layer_held_in_an_upper_run_holds_every_layer_of_the_runs_walked_after_it(through_context):
+    """A compiled step of two in-backward runs, one after the other, whose upper run's top layer, the walk's
+    first, takes a gradient that is not finite, under a run that skips such steps: every layer of both runs
+    keeps its
+    weights, each count stepping alike, as one run's layers after a held one do (training.md, a step that
+    is not finite), whether the lower run reaches the upper as its input or as a context every upper layer
+    reads (an encoder's). The latch started anew in each run, so the lower run's layers moved (train 921's
+    review, F1), carried as a value between runs it escaped the compiled backward's own trace (the head
+    review's F1), and carried on the input's cotangent alone an encoder beneath moved (its round 2, F3)."""
+    weights, moments, _ = _walked([1.0, 1.0, 1.0], top=np.inf, runs=2, through_context=through_context)
+    for run in range(2):
+        np.testing.assert_array_equal(np.asarray(weights[run]["a"]), [0.5, 0.5, 0.5])
+        np.testing.assert_array_equal(np.asarray(moments[run]["count"]["a"]), [1.0, 1.0, 1.0])
+
+
+class CollectionWriting(LMObjective):
+    """The language model's loss beside a collection its forward writes: the exponential of its first
+    token id's mean times `scale`, past float32 where `scale` is large, its loss and gradient finite."""
+
+    scale = 1.0
+
+    def fresh_variables(self, key, held):
+        return {**super().fresh_variables(key, held), "seen": {"value": jnp.zeros(())}}
+
+    def loss(self, variables, batch, step):
+        stats, aux = super().loss(variables, batch, step)
+        seen = jnp.exp(jnp.mean(batch["text"][..., 0].astype(jnp.float32)) * self.scale)
+        return stats, dataclasses.replace(aux, variables={**(aux.variables or {}), "seen": {"value": seen}})
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_scanned_step_whose_collection_is_not_finite_moves_no_weight():
+    """A step of a run that skips steps not finite, updating its runs in their backward, whose loss and
+    gradient are finite and whose forward writes a collection that is not finite (an exponential past
+    float32) moves no weight of its walked
+    runs nor any other, and is reported not finite: the walk reads the forward's statistics and collections
+    as the commit does. It read the loss alone, and its layers moved where the commit rejected the step (the
+    round-3 head review's F1)."""
+    objective = type("Overflowing", (CollectionWriting,), {"scale": 1e4})(decoder(scan=True), SEQ)
+    run = Trainer(objective, ADAMW, key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
+                  layout=Layout(min_shard=TINY_SHARD), checkpoints=None, tracker=None, skip_nonfinite=True)
+    run.device_mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    run.validate(steps=1)
+    state, _, _ = run.place()
+    before = jax.device_get(state.variables["params"])
+    batch = shard_batch(run.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1))
+    moved, loss, _, finite, *_ = run.compile(state, batch)(state, batch)
+    assert bool(jnp.isfinite(loss)) and not bool(finite) and int(jax.device_get(moved.updates)) == 0
+    for old, new in zip(jax.tree.leaves(before), jax.tree.leaves(jax.device_get(moved.variables["params"])),
+                        strict=True):
+        np.testing.assert_array_equal(new, old)

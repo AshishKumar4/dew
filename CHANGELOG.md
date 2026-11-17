@@ -12,14 +12,6 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `--context-text.checkpoint`, as a diffusion run's text condition), in place of the backbone's own token table
   or pass: its tokenization reads the context, its states reach the context layers at its width, its weights
   are the model's `context` module, a run records it and its task rebuilds it.
-- A decision's context longer than its cross-attention's room is now cut to its first tokens and the cut
-  told, where it was refused: a run's data report counts it (`data/cut/<corpus>/context`), and a served
-  answer states `usage.context_tokens` and `usage.context_kept`.
-- A decision row whose schema is read as its context (`Schema(stream="context")`) now reads its example's or
-  request's own context too, after the schema, where both were refused together. The schema stays whole; the
-  context keeps its first tokens in the room the schema leaves under the cross-attention's `context_length`,
-  and a context cut there is reported in the run's data report (`data/cut/<corpus>/context` rows,
-  `data/cut_removed/<corpus>/context` tokens) and a server's usage. Records are unchanged.
 - Programs a process keeps (`dew.training.ahead.keeping`) are kept and handed by their fingerprint: the
   digest of the lowered program, its trees and its arguments' types under the XLA options it compiled
   with (`dew.nn.kernels.options.program_digest`), with the target they were built for (`BuildTarget`).
@@ -39,6 +31,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   this that names its tokenizer by a hub cache snapshot directory resolves it by its repo and commit, and holds
   it from its next save. A run whose checkpoints hold a tokenizer this host cannot resolve is refused before
   its first step, naming it, where it trained to its first checkpoint.
+- A decision's context longer than its cross-attention's room is now cut to its first tokens and the cut
+  told, where it was refused: a run's data report counts it (`data/cut/<corpus>/context`), and a served
+  answer states `usage.context_tokens` and `usage.context_kept`.
+- A decision row whose schema is read as its context (`Schema(stream="context")`) now reads its example's or
+  request's own context too, after the schema, where both were refused together. The schema stays whole; the
+  context keeps its first tokens in the room the schema leaves under the cross-attention's `context_length`,
+  and a context cut there is reported in the run's data report (`data/cut/<corpus>/context` rows,
+  `data/cut_removed/<corpus>/context` tokens) and a server's usage. Records are unchanged.
 - A decision layout is one class, `dew.decision.SegmentLayout`, whose `form` names the row it writes:
   `SegmentLayout.marker_row(...)` (Laya's, formerly `MarkerLayout(...)`), `state_first_row(...)` (formerly
   `StateFirstLayout(...)`) and `joint_row(...)` (formerly `JointLayout(...)`), each laying out the rows its class
