@@ -126,6 +126,11 @@ def _delta_planes(average: jax.Array, live: jax.Array) -> jax.Array:
     return jnp.stack([(delta >> (8 * plane)).astype(jnp.uint8) for plane in range(width)])
 
 
+def _planes_of(averages: Sequence[jax.Array], lives: Sequence[jax.Array]) -> list[jax.Array]:
+    """Each of `averages` as `_delta_planes` against the weight it follows in `lives`."""
+    return [_delta_planes(average, live) for average, live in zip(averages, lives, strict=True)]
+
+
 def _from_delta_planes(planes, live):
     """Invert `_delta_planes`: the average whose difference from `live` is
     `planes`. Works on numpy arrays and on jax arrays alike."""
@@ -317,9 +322,12 @@ def _with_ema_deltas(state_tree: Mapping[str, object]) -> tuple[Mapping[str, obj
                   if _stored_as_delta(average, live)]
         if not chosen:
             continue
-        for index in chosen:
-            encode = program(_delta_planes, out_shardings=_planes_sharding(leaves[index].sharding))
-            planes = encode(leaves[index], lives[index])
+        # One program over every leaf the average writes so (`_planes_of`), one compile a save's tree where a
+        # program a leaf's signature compiled each (31 of a tiny DiT's first save, 3.4 of its 7.3 s).
+        encode = program(_planes_of, out_shardings=[_planes_sharding(leaves[index].sharding)
+                                                    for index in chosen])
+        encoded = encode([leaves[index] for index in chosen], [lives[index] for index in chosen])
+        for index, planes in zip(chosen, encoded, strict=True):
             decoded_ahead(planes, lives[index], leaves[index].dtype)
             leaves[index] = planes
         state_tree = _with(state_tree, path, jax.tree.unflatten(structure, leaves))
