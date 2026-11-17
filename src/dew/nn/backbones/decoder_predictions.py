@@ -1,5 +1,5 @@
 """A `CausalTransformer`'s multi-token prediction depths: the depths it builds (`depths`), the
-mixer kind they mirror (`prediction_kind`), their shifted states and logits over a whole sequence, and
+mixer kind they mirror (`prediction_kind`), their shifted states over a whole sequence, and
 one unshifted step a draft chains. The decoder's methods of these names read them here, within its
 scope."""
 
@@ -112,17 +112,6 @@ def depth_states(decoder: CausalTransformer, hidden, tokens, train: bool = False
             hidden = block(hidden[:, :-1], embeds[:, depth:], train=train, attention_metadata=metadata)
         states.append(hidden)
     return states
-
-
-def depth_logits(decoder: CausalTransformer, hidden, tokens, train: bool = False, input_embeddings=None,
-                 image_groups=None, block_groups=None, rotary_positions=None,
-                 coordinates: Coordinates | None = None, conditioning: Mapping[str, jax.Array] | None = None):
-    """Return the shared language head's logits for each prediction depth's hidden states; a
-    call's `conditioning` is the trunk's (`mtp_hidden_states`)."""
-    return [decoder.logits_from_hidden(state) for state in depth_states(
-        decoder, hidden, tokens, train=train, input_embeddings=input_embeddings, image_groups=image_groups,
-        block_groups=block_groups, rotary_positions=rotary_positions, coordinates=coordinates,
-        conditioning=conditioning)]
 
 
 def depth_step(decoder: CausalTransformer, hidden, tokens, *, depth: int = 0, input_embeddings=None,

@@ -1141,12 +1141,12 @@ class CausalTransformer(LinearProducts):
                    image_groups=None, block_groups=None, rotary_positions=None,
                    coordinates: Coordinates | None = None,
                    conditioning: Mapping[str, jax.Array] | None = None):
-        """The shared head's logits for each prediction depth's states
-        (`decoder_predictions.depth_logits`)."""
-        return decoder_predictions.depth_logits(
+        """Return the shared language head's logits for each prediction depth's hidden states; a
+        call's `conditioning` is the trunk's (`mtp_hidden_states`)."""
+        return [self.logits_from_hidden(state) for state in decoder_predictions.depth_states(
             self, hidden, tokens, train=train, input_embeddings=input_embeddings, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions, coordinates=coordinates,
-            conditioning=conditioning)
+            conditioning=conditioning)]
 
     def mtp_step(self, hidden, tokens, *, depth: int = 0, input_embeddings=None, rotary_positions=None,
                  decode: bool = False, prediction_phase: PredictionPhase = "ordinary",
@@ -1435,8 +1435,9 @@ class CausalTransformer(LinearProducts):
 
     def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
         """Where the run a pipeline over `stages` (or one stage's scan) stacks is stored in `store`, the
-        variables a stage-local state is made from (`decoder_stages.stage_view`): none for a looped stack, nor on one
-        stage where no scan stacks a run (a stack that does not scan, or whose runs are one layer each)."""
+        variables a stage-local state is made from (`decoder_stages.stage_view`): none for a looped stack, nor
+        on one stage where no scan stacks a run (a stack that does not scan, or whose runs are one layer
+        each)."""
         if self.loop is not None:
             return ()
         # A one-stage state another run stacked, which this stack does not scan, holds the runs this stack
