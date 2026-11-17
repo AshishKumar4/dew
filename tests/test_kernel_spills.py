@@ -258,7 +258,7 @@ from dew.training.ahead import AheadOfTime, handed
 
 step = AheadOfTime.load(sys.argv[1])
 identity, config, names = step.refusals[0]
-foreign = (identity, config, frozenset({"another kernel"}))
+foreign = (identity, config, frozenset({("another kernel", None)}))
 report.refuse([foreign])
 with assumed(step.target), handed(step):
     within = report.refused_launches()

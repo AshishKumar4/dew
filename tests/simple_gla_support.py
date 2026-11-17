@@ -10,15 +10,11 @@ state fp32 (ops/common/chunk_h.py:84-151, 319-335; chunk_o.py:88-139; ops/simple
 171-201)."""
 
 import dataclasses
-import os
-import subprocess
-import sys
-import tempfile
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
+from delta_rule_support import fla_run
 
 from dew.nn.kernels.recurrence_chunk import Chunk
 
@@ -91,18 +87,11 @@ def fla_simple_gla(operands: Chunk, cotangents: tuple):
     """fla's own `chunk_simple_gla` on `operands` under `cotangents` (`d_out`, `d_final`), in the interpreter
     `DEW_FLA_PYTHON` names (`SIMPLE_GLA_SIDE`): its output and final memory, and each leaf's gradient as
     `operands`' tree holds it."""
-    python = os.environ.get("DEW_FLA_PYTHON")
-    if not python:
-        pytest.fail("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch: the GPU tier's reference")
     names = ("query", "key", "value", "log_decay", "state")
     leaves = {name: np.asarray(getattr(operands, name), np.float32)
               for name in names if getattr(operands, name) is not None}
-    with tempfile.TemporaryDirectory() as folder:
-        given, found = os.path.join(folder, "given.npz"), os.path.join(folder, "found.npz")
-        np.savez(given, **leaves, d_out=np.asarray(cotangents[0], np.float32),
-                 d_final=np.asarray(cotangents[1], np.float32))
-        subprocess.run([python, "-c", SIMPLE_GLA_SIDE, given, found], check=True, stdout=sys.stderr)
-        theirs = dict(np.load(found))
+    theirs = fla_run(SIMPLE_GLA_SIDE, {**leaves, "d_out": np.asarray(cotangents[0], np.float32),
+                                       "d_final": np.asarray(cotangents[1], np.float32)})
     gradients = {name: jnp.asarray(theirs[f"d_{name}"], getattr(operands, name).dtype) for name in leaves}
     # As `reference_error.with_gradients` returns a call's: its outputs, then its operands' gradients.
     return ((jnp.asarray(theirs["out"], operands.value.dtype), jnp.asarray(theirs["final"])),

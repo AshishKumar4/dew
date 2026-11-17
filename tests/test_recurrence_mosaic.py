@@ -16,11 +16,8 @@ import collections
 import contextlib
 import dataclasses
 import functools
-import json
-import math
 import types
 from collections.abc import Callable
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -841,21 +838,38 @@ def test_lightning_attentions_fast_forms_are_as_exact_as_flas_rounding_interpret
     lightning_fast_forms_are_as_exact_as(jax.jit(with_gradients(functools.partial(fla_rounding, chunk=64))))
 
 
-def test_lightning_attentions_write_rounds_its_decayed_values_where_fla_does_interpreted():
+def test_lightning_attentions_write_at_fp32s_edge_is_as_exact_as_flas_rounding_interpreted():
     """Lightning attention's write under the run's fast forms rounds each token's decayed value, as fla's
     `chunk_fwd_kernel_h` does (`b_v * exp(g_last - g)` cast bf16 before `k^T v`), not its decayed key, as
     mamba_ssm's SSD places its write gate: at fp32's edge the two part. A key of 2^64 and a value of
     (145/128) 2^64 decayed by exp(-0.1268) to the chunk's end: rounded on the key, 113/128, the write is
     (16385/16384) 2^128, past fp32's largest; on the value, 255/256, (255/256) 2^128, fla's, finite (base
-    review 3ee9253c9 F1)."""
+    review 3ee9253c9 F1). Over draws of that edge among normal keys and values, the final memory is finite
+    where fla's rounding's is (`simple_gla_support.fla_rounding`) and on par with it from float64 (check 1,
+    row 7358)."""
+    from simple_gla_support import fla_rounding
+
     hooks = recurrence.Hooks(decay='scalar', delta=False)
-    zeros = jnp.zeros((1, 128, 1, 128), jnp.bfloat16)
-    key, value = (zeros.at[0, 0, 0, 0].set(scale * 2.0 ** 64) for scale in (1.0, 145 / 128))
-    log_decay = jnp.zeros((1, 128, 1), jnp.float32).at[0, 1, 0].set(-0.1268)
-    operands = Chunk(zeros, key, value, log_decay=log_decay)
-    run = formed('fast', functools.partial(chunk_on, 'mosaic_gpu', hooks, chunk_size=64))
-    _, final = jax.jit(run)(operands)
-    assert float(final[0, 0, 0, 0]) == 255 / 256 * 2.0 ** 128, float(final[0, 0, 0, 0])
+
+    def draw(seed):
+        key, value = np.random.default_rng(seed).normal(size=(2, 1, 128, 1, 128))
+        key[0, 0, 0, 0], value[0, 0, 0, 0] = 2.0 ** 64, 145 / 128 * 2.0 ** 64
+        log_decay = jnp.zeros((1, 128, 1), jnp.float32).at[0, 1, 0].set(-0.1268)
+        return (Chunk(jnp.zeros(key.shape, jnp.bfloat16), jnp.asarray(key, jnp.bfloat16),
+                      jnp.asarray(value, jnp.bfloat16), log_decay=log_decay,
+                      state=jnp.zeros((1, 1, 128, 128), jnp.float32)),)
+
+    def final(run):
+        return jax.jit(lambda operands: run(operands)[1])
+
+    dew = final(formed('fast', functools.partial(chunk_on, 'mosaic_gpu', hooks, chunk_size=64)))
+    reference = final(functools.partial(fla_rounding, chunk=64))
+    for seed in range(2):
+        assert np.isfinite(np.asarray(reference(*draw(seed)))).all()
+        assert np.isfinite(np.asarray(dew(*draw(seed)))).all()
+    assert_as_exact(dew, reference, draw, "lightning's final memory at fp32's edge", seeds=8,
+                    truth_fn=final(functools.partial(token_by_token, hooks)))
+
 
 HOOK_CELLS = [(hooks, packed) for hooks in TAKEN for packed in (False, True)]
 """The mainloop's hook cells, each hook combination over one sequence and packed documents."""
@@ -1477,6 +1491,26 @@ def resource_failures(cases: list, found: list, plans: dict, apart: dict) -> lis
     return failed + apart_failures([record for record in found if record['name'] in apart], apart)
 
 
+def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
+    """A kernel's refusal keeps the roles its spill stood in (`report.Refused`): refusals of one config that
+    differ in them alone are two derivations' inputs (`report.derivation_inputs`), whose ladders step
+    apart (`Mosaic._consumers_spilled`), and a plan handing its refusals to another process
+    (`refused_launches` into `refuse`) states them again there (base review 60efbe75f F2: a cache key
+    without them stood for either)."""
+    bound = template.MOSAIC.bind(*resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256), None, bound=1.0)
+    tiles, kernel = mainloop.Tiles(32, 3, 128, 2, chunk=64), 'recurrence_output'
+    keys = []
+    for roles in ((report.CONSUMERS,), (report.PRODUCER,)):
+        with report.refusals(), generation.assumed('sm90'):
+            report.refuse_launch(template.MOSAIC, bound, tiles, {kernel}, {kernel: roles})
+            keys.append(report.derivation_inputs(template.MOSAIC, bound, template.Mosaic.launched()))
+            handed = report.refused_launches()
+        with report.refusals(), generation.assumed('sm90'):
+            report.refuse(handed)
+            assert report.spilled_in(template.MOSAIC, bound, tiles) == {kernel: roles}
+    assert keys[0] != keys[1]
+
+
 def test_a_kernel_is_held_to_its_own_launchs_plan_where_another_launchs_name_begins_its_own():
     """`planned_failures` holds `recurrence_intra_solve` to its own launch's shared memory, not to the larger
     plan of `recurrence_intra`, whose name begins its own, and `recurrence_intra` to its own."""
@@ -1568,16 +1602,10 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
     assert not mosaic_failures([record]), mosaic_failures([record])
 
 
-def _lost(kernel: dict) -> bool:
-    """Whether a compiled kernel's record (`kernel_compile`'s) is one a run's certification refuses: spilled,
-    or its warpgroup MMAs serialized (`report.Binary.refused`)."""
-    return bool(kernel.get("spilled")) or bool(report.SERIALIZED & set(kernel.get("losses", ())))
-
-
 def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:
     """The gate's cases of `group` on `target` (`compiled_cases`) and their records, compiled, then, for as
-    long as a required launch spills or serializes its warpgroup MMAs (`report.SERIALIZED`, which a run's
-    certification refuses, `report.Binary.refused`) at a config not refused before, its launch refused
+    long as a required launch spills or serializes its warpgroup MMAs (`report.refuses`, which a run's
+    certification reads too, `report.Binary.refused`) at a config not refused before, its launch refused
     (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps such a
     launch down through its derivation's configs (`report.settled`): a launch whose every config spills
     derives none and leaves the template. `refused` holds the calls the template's own model refuses (its
@@ -1591,7 +1619,8 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
     stepped: set = set()
     while True:
         spilling = {case.name: {kernel["kernel"] for kernel in record.get("kernels", ())
-                                if _lost(kernel) and kernel["kernel"] not in
+                                if report.refuses(kernel.get("spilled") or 0, kernel.get("losses", ()))
+                                and kernel["kernel"] not in
                                 refused_kernels(record, apart.get(case.name, set()))}
                     for case, record in zip(cases, found, strict=True) if case.required}
         # A case refused once at a config, and again at the config its derivation then gives (a launch's
@@ -2028,14 +2057,14 @@ def test_lightning_attentions_training_step_starts_unspilled_asking_each_rung_on
 
 
 @lowers('sm80')
-def test_a_training_step_no_config_holds_moves_past_the_template_after_one_compile():
+def test_a_training_steps_gradient_lowers_after_one_certification_whatever_its_verdict():
     """The gated delta net's training step at its GPU flow's widths (tests/model_flows.py's Qwen3-Next-tiny: 2
-    key heads and 4 value heads of 128, 2 rows of 256 tokens, bf16) on a compile-only A100: its scores'
-    backward spills 8 bytes at 255 registers at every tiles the derivation offers, which plan it alike, so
-    one compile refuses them all (`Mosaic._refused`); the route's launch requirement reads the certified
-    answer (`Mosaic.holds`) and its gradient lowers by the next kernel, the template's start one
-    certification. It certified 32 tiles, 819 s, and raised Unfitted from inside the call (row 6816; row
-    6860 the coverage gap)."""
+    key heads and 4 value heads of 128, 2 rows of 256 tokens, bf16) on a compile-only A100: its gradient
+    lowers, by the template or, where the template's tiles do not hold, the next kernel, and the template's
+    start is one certification, as reverse mode runs it, whatever it answers: where no tiles held (its
+    scores' backward 8 bytes past 255 registers, row 6860), it certified 32 tiles, 819 s, and raised
+    Unfitted from inside the call (row 6816). Which route takes the call is the template's coverage (row
+    6860), not this test's."""
     from kernel_compile import lowered_for
 
     from dew.nn.kernels.generation import compile_only_gpus
@@ -2052,7 +2081,7 @@ def test_a_training_step_no_config_holds_moves_past_the_template_after_one_compi
     # The training call's launch, certified as reverse mode runs it; its forward alone no step runs.
     certified = [each for each in report.certifications()
                  if id(each) not in before and each.op == type(template.MOSAIC).__name__]
-    assert len(certified) == 1 and certified[0].refused and certified[0].pulled, certified
+    assert len(certified) == 1 and certified[0].pulled, certified
 
 
 @lowers('sm90')
@@ -2370,27 +2399,26 @@ def _dealt(units: list, tasks: int, task: int) -> list:
     return [each for name in names for each in parts[int(name)]]
 
 
-IDENTITY_TEST = "test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes"
-"""The identity test's name, by which the durations record keys its tasks (`identity_tasks`)."""
+IDENTITY_TASKS = {'sm90': 50, 'sm100': 52, 'sm80': 3, 'sm86': 2, 'sm89': 2, 'sm120': 1}
+"""The shards a target's identity units are dealt among (`_dealt`): only how the work is split, every unit
+dealt to some shard whatever the count, and the count a function of the code alone, so a shard's units are its
+id's at one revision whatever a run's timings (row 7254: a count from the durations record moved each id's
+units, sm100's 44 to 52, where a cached task and a rerun one could cover different units). Each the target's
+identity seconds in tests/test_durations.json over 60 s a shard, half the group target, rounded up (at main
+91be41158: sm90 2953 s, sm100 3094, sm80 129, sm86 90, sm89 80, sm120 35); a target absent takes the largest.
+A target whose shards run past the group target shows in the CI plan's check: regenerate it then.
+Regenerated by:
+    python3 -c 'import collections, json, math; seconds = collections.Counter()
+    for node, spent in json.load(open("tests/test_durations.json")).items():
+        if "test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[" in node:
+            seconds[node.split("[", 1)[1].rsplit("-", 1)[0]] += spent
+    print({target: math.ceil(spent / 60) for target, spent in sorted(seconds.items())})'
+"""
 
 
-@functools.cache
 def identity_tasks(target: str) -> int:
-    """The tasks `target`'s identity units are dealt among (`_dealt`), a sharding size like a CI group count,
-    from the record of the gate's own tasks (`ci.durations_record`, folded from main's CI): their seconds over
-    half the group target (.armada.json's), as a task dealt by the kernels a config lowers, not yet by its
-    ladders' rungs, which only a walk counts, holds up to twice its target's mean (jsf-6547e: sm90's tasks
-    16 to 171 s at 28, sm100's 13 to 157 at 32); one for a target the record holds none of, which the next
-    fold sizes. Every gate group lowered took 13,478 s of train 878's CI, twelve of its tasks past the train's
-    bound; a table of the counts by target raised KeyError at a new target's collection (row 6645)."""
-    from tool_support import load
-
-    ci, root = load("ci", "tools/armada"), Path(__file__).resolve().parents[1]
-    task = f"tests/{Path(__file__).name}::{IDENTITY_TEST}[{target}-"
-    seconds = sum(value for node, value in ci.durations_record(root / ci.session.DURATIONS).items()
-                  if node.startswith(task))
-    bound = json.loads((root / ".armada.json").read_text())["target"]
-    return max(1, math.ceil(2 * seconds / bound))
+    """The tasks `target`'s identity units are dealt among (`IDENTITY_TASKS`)."""
+    return IDENTITY_TASKS.get(target, max(IDENTITY_TASKS.values()))
 
 
 @pytest.mark.parametrize('target, task', [pytest.param(target, task, id=f'{target}-{task}')

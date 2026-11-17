@@ -221,11 +221,18 @@ hands a cached trace back without tracing it again, so no trace states when its 
 RECORDS_HELD = 4096
 """The misses, rewrites and pass timings a registry keeps (`_Registry`), the latest; a reader of one
 search's own takes them in a `recording` scope."""
+Refused = tuple[str, tuple[str, ...] | None]
+"""A kernel a compile refused, by its name, and the roles its spill stood in where the compile read them
+(`Binary.spilled_in`: `()` read and spilling none, its warpgroup MMAs serialized alone; None unread): one
+record of both, a kernel once a refusal (`_record` joins its roles), so whatever keys, copies or hands on a
+refusal (`derivation_inputs`, `_proposing`, `refused_launches`) carries what a launch's ladder steps by."""
+
+
 @dataclasses.dataclass
 class _Registry:
-    """Each (launch identity, config) a compile refused (`compiled`: its kernel spilled), by the names of its
-    kernels that spilled, and each miss."""
-    refused: dict[tuple[str, Hashable], frozenset[str]] = dataclasses.field(default_factory=dict)
+    """Each (launch identity, config) a compile refused (`compiled`: its kernel spilled), by its kernels that
+    spilled with their roles (`Refused`), and each miss."""
+    refused: dict[tuple[str, Hashable], frozenset[Refused]] = dataclasses.field(default_factory=dict)
     missed: collections.deque["Miss"] = dataclasses.field(
         default_factory=lambda: collections.deque(maxlen=RECORDS_HELD))
     rewritten: collections.deque = dataclasses.field(
@@ -234,10 +241,6 @@ class _Registry:
     passes: collections.deque[float] = dataclasses.field(
         default_factory=lambda: collections.deque(maxlen=RECORDS_HELD))
     """Each program's whole pass, in seconds: its walks of its bodies and windows beside its regions'."""
-    spilled_in: dict[tuple[str, Hashable], dict[str, tuple[str, ...] | None]] = dataclasses.field(
-        default_factory=dict)
-    """The roles each refused kernel's spill stood in, by its refusal, where its compile read them
-    (`refuse_launch`)."""
     by_launch: dict[str, frozenset] = dataclasses.field(default_factory=dict)
     """`refusals_of`'s answers by launch identity, each dropped as a refusal of its launch is recorded: read
     for every config a derivation weighs, each answer gathered from every launch's refusals took 426 of a
@@ -491,11 +494,12 @@ def traced(digest: str) -> Launch | None:
 
 
 def derivation_inputs(op, arguments: tokamax.BoundArguments, target
-                      ) -> tuple[str, Hashable, frozenset[tuple[Hashable, frozenset[str]]], bool]:
+                      ) -> tuple[str, Hashable, frozenset[tuple[Hashable, frozenset[Refused]]], bool]:
     """What a launch's derivation of its config for `arguments` on `target` reads of the launch and its
     compiles: the launch's identity (`_identity`: the op, its arguments' shapes and dtypes, its hooks), the
-    whole target, whose facts price its schedules, each config this context's compiles refused it
-    (`refused`), so a refusal recorded after a derivation derives it again, and whether the run asked XLA for
+    whole target, whose facts price its schedules, each config this context's compiles refused it with the
+    roles its kernels spilled in (`refused`, `Refused`), so a refusal recorded after a derivation derives it
+    again, and whether the run asked XLA for
     deterministic ops, which a launch's legality reads (a fused attention backward's atomic dQ sums,
     `attention_mosaic.MosaicBackward`), so a flag flipped within a process derives it again."""
     identity = _identity(op, arguments)
@@ -503,9 +507,10 @@ def derivation_inputs(op, arguments: tokamax.BoundArguments, target
 
 
 @generation.traced_fact
-def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[str]]]:
+def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[Refused]]]:
     """Each config this context's compiles refused the launch of `identity` (`_identity`), with the kernels
-    refused at it: what a launch's derivation and legality read of the refusals, the one way a trace reads
+    refused at it and their roles (`Refused`): what a launch's derivation and legality read of the
+    refusals, the one way a trace reads
     them (`traced_fact`), so a trace kept past a refusal of another launch holds."""
     with _GUARD:
         registry = _registry()
@@ -532,15 +537,21 @@ def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable) -> froze
     """The names of `op`'s kernels a compile of this process refused at `config` for `arguments`
     (`Binary.refused`: spilling, or their warpgroup MMAs serialized): a launch of several kernels (a
     recurrence's forward and backward walks) steps the one refused."""
-    return dict(refusals_of(_identity(op, arguments))).get(config, frozenset())
+    return names(dict(refusals_of(_identity(op, arguments))).get(config, ()))
 
 
-def spilled_in(op, arguments: tokamax.BoundArguments, config: Hashable) -> dict[str, tuple[str, ...] | None]:
+def names(kernels: Iterable[Refused]) -> frozenset[str]:
+    """The names of refused `kernels` (`Refused`): what a refusal's readers step by, its roles aside."""
+    return frozenset(kernel for kernel, _ in kernels)
+
+
+def spilled_in(op, arguments: tokamax.BoundArguments, config: Hashable) -> dict[str, tuple[str, ...]]:
     """The roles each of `op`'s kernels a compile refused at `config` for `arguments` spilled in, as its
-    refusal states them (`refuse_launch`'s `spilled_in`, `Binary.spilled_in`), by kernel name: what a launch's
-    ladder steps it by (row 6744). A kernel refused with no roles stated is absent."""
-    with _GUARD:
-        return dict(_registry().spilled_in.get((_identity(op, arguments), config), {}))
+    refusal states them (`Refused`), by kernel name: what a launch's ladder steps it by (row 6744). A kernel
+    whose roles its compile left unread is absent; one read and spilling none (its warpgroup MMAs serialized
+    alone) states `()`."""
+    found = dict(refusals_of(_identity(op, arguments))).get(config, ())
+    return {kernel: roles for kernel, roles in found if roles is not None}
 
 
 def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kernels,
@@ -548,14 +559,11 @@ def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kerne
     """`op`'s launch of `arguments` at `config` refused in this context as a compile that found `kernels`
     spilling refuses it (`settled`), so its derivation takes the next config: a compile gate's, which
     compiles a launch apart from `compiled`, stepping as a run's compile steps (row 4727). `spilled_in`, the
-    roles each kernel's spill stood in where the compile read them (`Binary.spilled_in`), kept for its
-    ladder (`spilled_in`)."""
-    refusal = (_identity(op, arguments), config)
-    _record(refusal, None, frozenset(kernels))
-    if spilled_in:
-        registry = _registry()
-        with _GUARD:
-            registry.spilled_in[refusal] = {**registry.spilled_in.get(refusal, {}), **spilled_in}
+    roles each kernel's spill stood in where the compile read them (`Binary.spilled_in`), kept with it
+    (`Refused`) for its ladder (`spilled_in`)."""
+    roles = spilled_in or {}
+    _record((_identity(op, arguments), config), None,
+            frozenset((kernel, roles.get(kernel)) for kernel in kernels))
 
 
 _CERTIFYING: contextvars.ContextVar = contextvars.ContextVar("certifying_device", default=None)
@@ -906,23 +914,33 @@ def _unit_cotangent(out: jax.Array) -> jax.Array | np.ndarray:
 
 
 @generation.traced_fact
-def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
-    """Every (launch identity, config, spilled kernel names) refused in this context (a `refusals` scope's or
-    the process's), ordered. A validated plan can hand them to another process explicitly (`refuse` within
-    `refusals`); a shared compilation cache alone must not transfer them between programs. A trace after a
-    refusal derives the next config, so a program kept after one is another than a process without it
-    traces (`traced_fact`)."""
+def refused_launches() -> tuple[tuple[str, Hashable, frozenset[Refused]], ...]:
+    """Every (launch identity, config, spilled kernels with their roles, `Refused`) refused in this context (a
+    `refusals` scope's or the process's), ordered. A validated plan can hand them to another process
+    explicitly, the roles with them (`refuse` within `refusals`); a shared compilation cache alone must not
+    transfer them between programs. A trace after a refusal derives the next config, so a program kept after
+    one is another than a process without it traces (`traced_fact`)."""
     with _GUARD:
         return tuple(sorted(((identity, config, kernels)
                              for (identity, config), kernels in _registry().refused.items()), key=repr))
 
 
 def refuse(entries) -> None:
-    """Each `(identity, config, kernels)` of `entries` (`refused_launches`') refused in this context, as a
-    compile's spill refuses it. A handed plan seeds these inside its own `refusals` scope, not unioned with
-    unrelated decisions that the receiving process already holds."""
+    """Each `(identity, config, kernels)` of `entries` (`refused_launches`', its kernels with their roles,
+    `Refused`, or a pair a decoded record gives as a list; a kernel by its name alone states none) refused in
+    this context, as a compile's spill refuses it. A handed plan seeds these inside its own `refusals` scope,
+    not unioned with unrelated decisions that the receiving process already holds."""
     for identity, config, kernels in entries:
-        _record((identity, config), None, frozenset(kernels))
+        _record((identity, config), None, frozenset(map(_refused, kernels)))
+
+
+def _refused(kernel) -> Refused:
+    """A kernel `refuse` is handed as its record (`Refused`): its name alone, no roles stated, or its name and
+    roles, a tuple's or a list's."""
+    if isinstance(kernel, str):
+        return kernel, None
+    name, roles = kernel
+    return name, None if roles is None else tuple(roles)
 
 
 def misses() -> tuple[Miss, ...]:
@@ -983,15 +1001,15 @@ def refusals() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[Recorded]:
-    """Refusals visible while deriving and compiling a replacement, without changing the kept program's
-    registry or its file; every rewrite and pass the replacement's trace records, which a successful
-    replacement commits after this scope ends (`_commit`)."""
+def _proposing(entries: list[tuple[tuple[str, Hashable], Refused]]) -> Iterator[Recorded]:
+    """Refusals visible while deriving and compiling a replacement, each kernel with its roles (`Refused`),
+    without changing the kept program's registry or its file; every rewrite and pass the replacement's trace
+    records, which a successful replacement commits after this scope ends (`_commit`)."""
     registry = _registry()
     with _GUARD:
         proposed = dict(registry.refused)
     for identity, kernel in entries:
-        proposed[identity] = proposed.get(identity, frozenset()) | {kernel}
+        proposed[identity] = _joined(proposed.get(identity, frozenset()) | {kernel})
     # A replacement's records reach the registry and a `recording` only once it is kept (`_commit`).
     proposal = Recorded()
     token, held = _SCOPE.set(_Registry(refused=proposed)), _RECORDING.set((proposal,))
@@ -1018,8 +1036,21 @@ def _add(*, missed: Sequence["Miss"] = (), rewritten: Sequence = (), passes: Seq
             held.passes.extend(passes)
 
 
+def _joined(kernels: frozenset[Refused]) -> frozenset[Refused]:
+    """Refused `kernels` (`Refused`) a kernel once: each kernel's roles every record of it read, joined, None
+    where none read them."""
+    roles: dict[str, set[str] | None] = {}
+    for kernel, read in kernels:
+        if read is not None:
+            roles[kernel] = (roles.get(kernel) or set()) | set(read)
+        else:
+            roles.setdefault(kernel, None)
+    return frozenset((kernel, None if read is None else tuple(sorted(read)))
+                     for kernel, read in roles.items())
+
+
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
-            kernels: frozenset[str] = frozenset()) -> bool:
+            kernels: frozenset[Refused] = frozenset()) -> bool:
     """`refusal` and `miss` recorded; whether `miss` is new to this context's registry. A miss is recorded
     once a holder, the registry and each `recording` open: a launch's derivation asked again (its route's
     eligibility, then its call, `tuning.KernelOp.taken`) reads its certification back and finds the same
@@ -1028,7 +1059,7 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
     registry = _registry()
     with _GUARD:
         if refusal is not None:
-            registry.refused[refusal] = registry.refused.get(refusal, frozenset()) | kernels
+            registry.refused[refusal] = _joined(registry.refused.get(refusal, frozenset()) | kernels)
             registry.by_launch.pop(refusal[0], None)
         if miss is None:
             return False
@@ -1283,8 +1314,8 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     while True:
         # Each step refuses a config no step refused before, of the finitely many its launches derive.
         held = _registry().refused
-        refusals = [(refusal, report.kernel) for refusal, report, _ in found
-                    if refusal is not None and report.kernel not in held.get(refusal, frozenset())]
+        refusals = [(refusal, (report.kernel, report.spilled_in)) for refusal, report, _ in found
+                    if refusal is not None and report.kernel not in names(held.get(refusal, ()))]
         if not refusals:
             break
         try:
@@ -1303,7 +1334,8 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
         if replacement is None:
             break
         _commit(proposal)
-        for refusal, kernel in [*refusals, *((refusal, report.kernel) for refusal, report, _ in alone)]:
+        for refusal, kernel in [*refusals, *((refusal, (report.kernel, report.spilled_in))
+                                             for refusal, report, _ in alone)]:
             _record(refusal, None, frozenset({kernel}))
         _held(found, compiled_from)
         _held(alone, program)
@@ -1445,11 +1477,11 @@ def _stepped_alone(relower: Callable[[], jax.stages.Lowered], options: jax.stage
         found = [(refusal, report, launch)
                  for refusal, report, launch in _misses_of([binary for each in alone.values()
                                                             for binary in each.binaries if binary.refused])
-                 if refusal is not None and report.kernel not in held.get(refusal, frozenset())]
+                 if refusal is not None and report.kernel not in names(held.get(refusal, ()))]
         if not found:
             return program, missed
         for refusal, report, _ in found:
-            _record(refusal, None, frozenset({report.kernel}))
+            _record(refusal, None, frozenset({(report.kernel, report.spilled_in)}))
         missed += found
 
 
@@ -1481,9 +1513,9 @@ def _held(found: list, program: jax.stages.Lowered) -> None:
             tuning.store_verdict(device.device_kind, key, kernels)
 
 
-def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashable], str]]
-             ) -> list[tuple[tuple[str, Hashable], str]]:
-    """Each of `refusals` (a launch's identity and config, and its spilling kernel's name) that `program`,
+def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashable], Refused]]
+             ) -> list[tuple[tuple[str, Hashable], Refused]]:
+    """Each of `refusals` (a launch's identity and config, and its spilling kernel, `Refused`) that `program`,
     relowered under them, launches again: its launch's derivation did not read the refusal. Each is logged,
     so the launch whose rule ignores its refusals is named."""
     from dew.nn.kernels.lowered import kernel_calls
@@ -1492,7 +1524,7 @@ def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashab
     launched = {(launch.identity, launch.config) for call in kernel_calls(program, unrun=True)
                 if (launch := called(call)) is not None}
     untaken = [(refusal, kernel) for refusal, kernel in refusals if refusal in launched]
-    for (_, config), kernel in untaken:
+    for (_, config), (kernel, _) in untaken:
         _log.warning("kernel %s's refusal at %s did not take: the program relowered under it launches it "
                      "again, its launch's derivation not reading it", kernel, config)
     return untaken
@@ -1521,7 +1553,7 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
             tried.setdefault((launch.identity, launch.config), (kernel, launch))
     asked_by = {kernel_of(name)[0]: bytes_asked for name, bytes_asked in alone.items()}
     try:
-        with _proposing([(refusal, kernel) for refusal, (kernel, _) in tried.items()]) as proposal:
+        with _proposing([(refusal, (kernel, None)) for refusal, (kernel, _) in tried.items()]) as proposal:
             replacement, spilling = _compiled_reported(relower(), options)
     except (Exhausted, jax.errors.JaxRuntimeError) as again:
         if isinstance(again, jax.errors.JaxRuntimeError) and shared_asked(again) is None:
@@ -1531,7 +1563,7 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
         raise error from again
     _commit(proposal)
     for refusal, (kernel, launch) in tried.items():
-        _record(refusal, None, frozenset({kernel}))
+        _record(refusal, None, frozenset({(kernel, None)}))
         _missed_block(kernel, launch, asked_by.get(kernel, asked), stepped=True)
     _recorded(_misses_of(spilling), stepped=False)
     return replacement

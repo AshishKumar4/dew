@@ -534,7 +534,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
             # same ladder.
             return frozenset(
                 (name, plan) for config, kernels in refusals
-                if isinstance(config, mainloop.Tiles) and (spent := self._spent(ba, config, kernels, target))
+                if isinstance(config, mainloop.Tiles)
+                and (spent := self._spent(ba, config, report.names(kernels), target))
                 for planned in [self._plans(ba, _base(config), target)]
                 for owned in [_owners(spent, (launch for plan in planned.values() for _, launch in plan))]
                 for name, plan in planned.items() if name in owned)
