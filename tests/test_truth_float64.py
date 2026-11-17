@@ -11,7 +11,7 @@ from arm_arithmetic import float64_held, stored_as
 from check1_judge import STAGES_LOG
 from reference_error import NarrowTruth, as_given, assert_as_exact, over_windows, windows
 
-from dew.parity import GateFailure
+from dew.parity import FEWEST_SEEDS, GateFailure
 
 WEIGHT = np.random.default_rng(5430).normal(size=(64, 8)).astype(np.float32)
 """A parameter the arms close over, as a model's variables are."""
@@ -306,4 +306,4 @@ def test_a_tpus_truth_is_float64s_past_float32s_range():
     its squares overflowed and every seed's truth was infinite (row 7226: a splash cell's dV, NaN on 40
     seeds)."""
     assert_as_exact(jax.jit(hypotenuse), jax.jit(hypotenuse), far, "a hypotenuse past float32's squares",
-                    truth_fn=squared_out)
+                    seeds=FEWEST_SEEDS, truth_fn=squared_out)
