@@ -464,7 +464,7 @@ def same_vocabulary(written: str, loaded, name: str) -> bool:
         return written == loaded.tokenizer
     match loaded.tokenizer:
         case HFTokenizer() as held:
-            # A saved run's own tokenizer, the copy it holds (`dew.inference.tasks.saved_tokenizer`).
+            # A saved run's own tokenizer, the copy it holds (`dew.data.text.tokenizer_for(..., held=run)`).
             carried = held.tokenizer
         case _ if loaded.processor is None:
             return written == name
