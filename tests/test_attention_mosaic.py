@@ -1374,6 +1374,47 @@ def test_a_hooked_launchs_keyed_configs_are_its_derived_ones(launch):
         assert keyed.heuristics_config == ba.heuristics_config
 
 
+def _bucketed(s, q_pos, k_pos, bucket):
+    """A score hook of an int32 key parameter (a key's bucket, its parity a bias)."""
+    del q_pos, k_pos
+    return s + (bucket & 1).astype(s.dtype)
+
+
+def _row_indexed(s, q_pos, k_pos):
+    """A score hook reading its query's place (a unit column of it, `q_pos[:, :1]`)."""
+    del k_pos
+    return s + 0.01 * q_pos[:, :1].astype(s.dtype)
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["live", "keyed"])
+def test_a_hooked_sm80_backward_takes_fewer_rows_where_its_hook_reads_no_querys_place(keyed):
+    """An sm80 accurate-form backward under a score hook (`attention_mosaic._backward_call`, the route's
+    builder) derives fewer rows a consumer than a role's under a hook of an int32 key parameter, and a role's
+    rows under one reading its query's place, which found no layout at fewer: its legality reads the
+    builder's reading of the hook (`MosaicBackward.score_reads`), so a keyed launch (`KernelOp.keyed`, the
+    hook its fingerprint) derives as its live call does, tracing nothing."""
+    tokens, heads = 256, 4
+    spans = template.spans(tokens, tokens, 1, causal=True)
+    query = jnp.zeros((1, tokens, heads, 64), jnp.bfloat16)
+    buckets = template.Param(jnp.zeros((1, heads, tokens), jnp.int32), template.Kind.KEY)
+    derived = {}
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        for name, hooks in (("bucketed", template.Hooks(_bucketed, (buckets,))),
+                            ("row-indexed", template.Hooks(_row_indexed))):
+            op, args = attention_mosaic._backward_call(query, query, query, spans, hooks, query,
+                                                       _residuals(query.shape), scale=None,
+                                                       natural=attention_mosaic.NATURAL, accurate=True)
+            ba = op.bind(*args, interpret=False)
+            if keyed:
+                ba = op.keyed(ba)
+                assert isinstance(ba.op.score_mod, str)
+            derived[name] = ba.op.derived(ba, target)
+    role = attention_mosaic.bundle_of(derived["row-indexed"], jnp.bfloat16).role_rows
+    assert min(derived["bucketed"].block_q, derived["bucketed"].block_k) < role, derived
+    assert min(derived["row-indexed"].block_q, derived["row-indexed"].block_k) >= role, derived
+
+
 @pytest.mark.parametrize("accurate", [False, True], ids=["fast", "accurate"])
 def test_a_backward_config_on_a_family_the_device_lacks_is_illegal(accurate):
     """An A100's backward at a config of an H100's families (wgmma, its dK/dV launch on wgmma.fed) is not
