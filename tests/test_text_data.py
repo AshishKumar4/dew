@@ -1073,6 +1073,55 @@ def test_an_earlier_runs_snapshot_tokenizer_is_resolved_by_its_commit_and_held_f
     assert held["directory"].startswith(str(tmp_path / "fresh"))
 
 
+@pytest.mark.parametrize("path", ["../../saved_runs/victim/run.json", "/saved_runs/victim/run.json",
+                                  "a/./b.json", "a//b.json", "a\\..\\b.json"])
+def test_a_saved_runs_tokenizer_record_naming_a_file_out_of_its_directory_is_refused_before_any_io(
+        tmp_path, monkeypatch, path):
+    """A saved run's record naming a tokenizer file by a path out of the tokenizer's directory (a parent,
+    an absolute path, an empty or `.` part, a backslash) is refused as the record is read, before a file
+    is read or written by it: a host's cached run the path reaches stays as it was, and nothing is cached.
+    The path was joined to the cache's staging directory, and a matching hash of a file the run supplied
+    overwrote the cached run (the morning audit of 2026-11-17, PRODUCT-AM-01)."""
+    from dew.data.text import HELD_FILES, held_place, tokenizer_for
+
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    victim = cache / "dew" / "saved_runs" / "victim" / "run.json"
+    victim.parent.mkdir(parents=True)
+    victim.write_text("the host's own run")
+    run = tmp_path / "run"
+    planted = b"the attacker's bytes"
+    files = {path: hashlib.sha256(planted).hexdigest()}
+    held = held_place(str(run), files)
+    held.mkdir(parents=True)
+    (held / HELD_FILES).write_text(json.dumps(files))
+    (run / "saved_runs" / "victim").mkdir(parents=True)
+    (run / "saved_runs" / "victim" / "run.json").write_bytes(planted)
+    with pytest.raises(ValueError):
+        tokenizer_for("org/name", files=files, held=str(run)).dependencies()
+    assert victim.read_text() == "the host's own run"
+    assert not (cache / "dew" / "tokenizers").exists() or not any((cache / "dew" / "tokenizers").iterdir())
+
+
+def test_a_runs_held_tokenizer_file_linking_out_of_its_directory_is_refused(tmp_path, monkeypatch):
+    """A saved run's held tokenizer whose file is a link out of its directory, to a file of the hash the
+    record states, is refused as the run's tokenizer is read, before it is copied: the copy reads the
+    run's own files alone (the morning audit of 2026-11-17, PRODUCT-AM-01)."""
+    from dew.data.text import HELD_FILES, held_place, tokenizer_for
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+    files = {"tokenizer.json": hashlib.sha256(b"{}").hexdigest()}
+    held = held_place(str(tmp_path / "run"), files)
+    held.mkdir(parents=True)
+    (held / HELD_FILES).write_text(json.dumps(files))
+    Path(held, "tokenizer.json").symlink_to(outside)
+    with pytest.raises(ValueError):
+        tokenizer_for("org/name", files=files, held=str(tmp_path / "run")).dependencies()
+    assert not (tmp_path / "cache" / "dew" / "tokenizers").exists()
+
+
 def test_a_run_holds_its_objectives_own_tokenizer_checked_file_by_file(tmp_path):
     """A checkpoint holds the tokenizer its objective encodes with, copied from where that tokenizer was
     pinned and checked file by file, whatever this process pinned before for the same files: a copy of
