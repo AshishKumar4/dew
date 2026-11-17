@@ -79,7 +79,7 @@ def fetches_on_own_threads(stage: Stage) -> bool:
 def pooled(stage: Stage) -> bool:
     """Whether `stage` runs its records on a pool of its own (`pool_of`): a fetch with threads of its own,
     or a record stage that declares its pool."""
-    return (isinstance(stage, (Map, FlatMap)) and stage.pool is not None) or _threads((stage,)) is not None
+    return declared_pool(stage) is not None or fetches_on_own_threads(stage)
 
 
 def pool_of(stages: Sequence[Stage]) -> Pool | None:
@@ -90,8 +90,7 @@ def pool_of(stages: Sequence[Stage]) -> Pool | None:
     threads = _threads(stages)
     if threads is not None:
         return Pool("threads", threads)
-    declared: list[PoolKind] = [stage.pool for stage in stages
-                                if isinstance(stage, (Map, FlatMap)) and stage.pool is not None]
+    declared = [kind for kind in map(declared_pool, stages) if kind is not None]
     return Pool.declared(declared[0]) if declared else None
 
 

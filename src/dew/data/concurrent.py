@@ -222,8 +222,8 @@ class _ConcurrentIterator[Element, Result](grain.DatasetIterator):
             self._pool = None
 
     def close(self) -> None:
-        # Records not yet started are dropped and a process running one ended (`Running.stop`), so a closed
-        # reader leaves no process of its own; a thread running one finishes first.
+        # Records not yet started are dropped and one running finishes and is waited for (`Running.stop`),
+        # so a closed reader leaves no process or thread of its own.
         self._stopped()
         self._pending.clear()
         self._rows.close()
