@@ -416,11 +416,11 @@ def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly
     codes = CharTable.from_pretrained(tokens=12, features=16).tokenize([note for *_, note in ROWS if note])
     notes = {tuple(ids[mask != 0].tolist()) for ids, mask in zip(codes["input_ids"], codes["attention_mask"],
                                                                   strict=True)}
-    lengths = np.asarray(batch["context_lengths"])
-    held = [tuple(row[:length].tolist()) for row, length in zip(np.asarray(batch["context"]), lengths,
-                                                               strict=True)]
-    # Each row's context its encoder's tokens of its note, an example of none holding none.
-    assert held and set(held) <= notes | {()}
+    # Each packed row's context its encoder's tokens of its note (`context_segments`, a row's document).
+    context, owners = np.asarray(batch["context"]), np.asarray(batch["context_segments"])
+    held = {tuple(row[owned == document].tolist()) for row, owned in zip(context, owners, strict=True)
+            for document in set(owned.tolist()) - {0}}
+    assert held and held <= notes
     directory = str(tmp_path / "run")
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(directory, keep=2))
     state = trainer.fit(data, steps=2, log_every=1, checkpoint_every=1)

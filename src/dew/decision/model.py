@@ -464,8 +464,8 @@ def _apart(encoded: Callable[[jax.Array, jax.Array], jax.Array], tokens: jax.Arr
     to a row of their own, encoded, and their states moved back to where the tokens stood, zeros where none
     does; so a configured encoder keeps a window's rows' contexts apart, as the backbone's pass does."""
     batch, width = tokens.shape
-    owned = segments[:, :, None] == jnp.arange(1, documents + 1)  # [B, C, S]
-    place = jnp.sum((jnp.cumsum(owned, axis=1) - 1) * owned, axis=-1)  # each token's place in its document
+    owned = segments[:, :, None] == jnp.arange(1, documents + 1)
+    place = jnp.sum((jnp.cumsum(owned, axis=1) - 1) * owned, axis=-1)
     document = jnp.clip(segments - 1, 0, documents - 1)
     rows = jnp.broadcast_to(jnp.arange(batch)[:, None], (batch, width))
     # A token of no document is dropped (an index past the documents').
