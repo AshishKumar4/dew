@@ -261,3 +261,26 @@ def test_an_unsplit_step_whose_optimizer_holds_its_update_logs_its_own_batchs_lo
         state, loss, _, _, _, committed = step(state, batch(target))
         logged.append((float(loss), int(committed.count)))
     assert logged == [(1.0, 0), (9.0, 0), (25.0, 0), (37.0, 1)]
+
+
+def test_a_held_optimizers_window_keeps_its_inputs_past_a_step_that_is_not_finite():
+    """With no loss scale, a step that is not finite under an optimizer that holds updates back
+    (`optax.MultiSteps` of two, which skips a non-finite input) is rejected whole, the optimizer's window
+    kept: targets 1, then one not finite, then 3 land where 1 then 3 do, the window closing on the two
+    finite inputs. A gated step handed the optimizer a zero input, which closed its window on the first
+    and the zero and dropped what the window held (the theme's head review, F1)."""
+    rows = jax.device_count()
+
+    def landed(targets):
+        held = optax.MultiSteps(optax.sgd(0.1), 2, should_skip_update_fn=optax.skip_not_finite)
+        trainer = Trainer(Targeted(), held.gradient_transformation(), key=jax.random.key(0))
+        state = trainer.initial_state()
+        step = trainer.compile(state, {"target": jnp.zeros((rows,), jnp.float32)})
+        for target in targets:
+            state, *_ = step(state, {"target": jnp.full((rows,), target, jnp.float32)})
+        return state
+
+    poisoned, clean = landed((1.0, float("nan"), 3.0)), landed((1.0, 3.0))
+    assert int(poisoned.updates) == int(clean.updates) == 1
+    np.testing.assert_array_equal(np.asarray(poisoned.variables["params"]["p"]),
+                                  np.asarray(clean.variables["params"]["p"]))

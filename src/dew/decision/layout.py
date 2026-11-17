@@ -20,7 +20,6 @@ import functools
 import itertools
 import json
 import re
-import weakref
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, TypeGuard, get_args
@@ -29,6 +28,7 @@ import numpy as np
 from typing_extensions import get_protocol_members
 
 from dew import _records
+from dew._cache import Same
 from dew._records import EARLIER_LAYOUTS, JSON
 from dew.data.text import HFTokenizer, Offsets, Tokenizer
 from dew.data.tokens import share_tokens
@@ -75,34 +75,13 @@ def _holds_specials(tokenizer: "Tokenizer | TokenizerSpecials | PreTrainedTokeni
     return all(hasattr(tokenizer, name) for name in get_protocol_members(TokenizerSpecials))
 
 
-class _Same:
-    """An encoder as a cache key (`_same`), so a tokenizer need not hash."""
-
-    __slots__ = ("__weakref__", "encoder")
-
-    def __init__(self, encoder: Tokenizer):
-        self.encoder = encoder
-
-
-_keys: weakref.WeakValueDictionary[int, _Same] = weakref.WeakValueDictionary()
-
-
-def _same(encoder: Tokenizer) -> _Same:
-    """`encoder`'s key. A key holds its encoder, so while the key lives no
-    other object takes the encoder's id."""
-    key = _keys.get(id(encoder))
-    if key is None:
-        key = _keys[id(encoder)] = _Same(encoder)
-    return key
-
-
 @functools.lru_cache(maxsize=1 << 14)
-def _piece(encoder: _Same, text: str) -> tuple[int, ...]:
+def _piece(encoder: Same, text: str) -> tuple[int, ...]:
     """`text`'s tokens under `encoder`, without specials. A layout writes the
     same templates, instructions and options into every row of a corpus, so
     the last 16,384 texts it wrote are kept, and a text the corpus repeats is
     read back while it is among them."""
-    return tuple(encoder.encoder.encode(text, add_special_tokens=False))
+    return tuple(encoder.value.encode(text, add_special_tokens=False))
 
 
 @dataclass(frozen=True)
@@ -211,6 +190,9 @@ class Encoded:
     context: tuple[int, ...] | None = None
     """The tokens of the context the row reads beside its state, through a backbone's
     cross-attention, or None for none."""
+    context_cut: int = 0
+    """The tokens of its example's or request's context that a schema in the row's context left no room
+    for (`with_context`), its first tokens read after the schema."""
     spans_in_context: bool = False
     """Whether the questions' spans are positions in the context, which holds the schema
     (`Schema.stream`), rather than in the row."""
@@ -235,12 +217,13 @@ class Encoded:
     @property
     def cuts(self) -> dict[str, int]:
         """The tokens each cut removed from the row, by what it cut (`instructions`, `options`,
-        `state`), or the characters of a state its row encodes whole (`state_characters`), and
-        `options_alike` where its options' cut left two alike; empty where the row holds its state and
-        its questions whole. Training counts them in
+        `state`, `context` beside a schema in the row's context), or the characters of a state its row
+        encodes whole (`state_characters`), and `options_alike` where its options' cut left two alike;
+        empty where the row holds its state and its questions whole. Training counts them in
         its data counters and a server in its own (`dew.data.mixing.CorpusCounts`), alike."""
         kinds = (("instructions", self.instructions_cut), ("options", self.options_cut),
-                 ("state", self.state_cut), ("state_characters", self.state_characters_cut))
+                 ("state", self.state_cut), ("state_characters", self.state_characters_cut),
+                 ("context", self.context_cut))
         found = {kind: tokens for kind, tokens in kinds if tokens}
         # A row whose cut left two options alike counts once, an event that removes nothing beside the
         # tokens its options lost (`cut_unit`).
@@ -309,7 +292,7 @@ class _Pieces:
     a corpus's rows repeat their templates, instructions and options."""
 
     def __init__(self, encoder: Tokenizer):
-        self.same = _same(encoder)
+        self.same = Same(encoder)
 
     def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
         del add_special_tokens
@@ -332,49 +315,48 @@ def render(value: JSON) -> str:
             return json.dumps(value, ensure_ascii=False)
 
 
-def context_tokens(tokenizer: Tokenizer, context: JSON | None, length: int | None) -> np.ndarray:
-    """A context's tokens as a row carries them: its text's (`render`), without specials, and none for
-    no context. A context of more than `length` tokens, which the cross-attention reads no more of,
-    is refused (ValueError), never cut: a cut would answer from part of what the caller gave; None
-    reads it whole, as a count of a context no cross-attention reads does."""
+def context_tokens(tokenizer: Tokenizer, context: JSON | None) -> np.ndarray:
+    """A context's tokens, whole, as a row reads them: its text's (`render`), without specials, and none
+    for no context. A row keeps those its cross-attention has room for (`with_context`)."""
     if context is None:
         return np.zeros(0, np.int32)
-    tokens = rendered_chunks([Chunk(render(context))], tokenizer, "pieces").tokens
-    if length is not None and len(tokens) > length:
-        raise ValueError(f"the context is {len(tokens)} tokens, more than the {length} its cross-attention "
-                         "reads (context_length)")
-    return np.asarray(tokens, np.int32)
+    return np.asarray(rendered_chunks([Chunk(render(context))], tokenizer, "pieces").tokens, np.int32)
 
 
 def with_context(rows: Sequence[Encoded], tokenizer: Tokenizer, context: JSON | None,
                  length: int | None) -> list[Encoded]:
     """`rows` with the context a backbone's cross-attention of `length` context tokens reads beside
     each (None: a backbone with none): a schema laid out as the rows' context (`Schema.stream`), read
-    whole, or else `context`, a request's own, its first `length` tokens (`context_tokens`). The one
-    resolution of a row's context, which a run's encoding and a task's admission both read. Refused
-    (ValueError): a request's context beside a schema read as the context, a context with no
-    cross-attention to read it, and a schema longer than `length`."""
+    whole, then `context`, a request's or an example's own, in the room the schema leaves, or `length`
+    where no schema is; of a context longer than its room its first tokens, the rest cut and counted
+    (`Encoded.context_cut`, a `context` cut a run's data report counts and a served answer states). The
+    one resolution of a row's context, which a run's encoding and a task's admission both read. Refused
+    (ValueError): a context with no cross-attention to read it, and a schema longer than `length`."""
     if any(row.spans_in_context for row in rows):
-        if context is not None:
-            raise ValueError("a request's context and a schema read as the row's context are one context "
-                             "too many; a layout that reads the schema in context reads no other context")
         if length is None:
             raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
                              "layers to read it (Pretrained.with_cross_attention)")
+        given = context_tokens(tokenizer, context)
+        beside = []
         for row in rows:
             if row.context is None:
                 raise ValueError("a row whose questions are laid out in its context carries no context")
             if len(row.context) > length:
                 raise ValueError(f"the schema needs {len(row.context)} context tokens, more than the "
                                  f"{length} the backbone's cross-attention reads")
-        return list(rows)
+            # The schema first, so its spans stand where it laid them; the context in the room it leaves.
+            kept = given[:length - len(row.context)]
+            beside.append(dataclasses.replace(row, context=(*row.context, *kept.tolist()),
+                                              context_cut=len(given) - len(kept)))
+        return beside
     if context is None:
         return list(rows)
     if length is None:
         raise ValueError("a request's context is read by a backbone's cross-attention, which this "
                          "backbone does not have")
-    tokens = tuple(context_tokens(tokenizer, context, length).tolist())
-    return [dataclasses.replace(row, context=tokens) for row in rows]
+    given = context_tokens(tokenizer, context)
+    kept = tuple(given[:length].tolist())
+    return [dataclasses.replace(row, context=kept, context_cut=len(given) - len(kept)) for row in rows]
 
 def _conversation(state: JSON) -> bool:
     """Whether `state` is a conversation, a list of turns, which keeps its newest turns (Laya's agent)."""
@@ -605,7 +587,7 @@ class Labels:
     def _spelled_apart(self, encoder: Tokenizer) -> list[str]:
         """The names of `LABEL_NAMES` whose every variant `encoder` spells as one token that no earlier such
         name's holds."""
-        same, taken, named = _same(encoder), set[int](), list[str]()
+        same, taken, named = Same(encoder), set[int](), list[str]()
         for name in LABEL_NAMES:
             pieces = [_piece(same, variant.format(name)) for variant in self.variants]
             if all(len(piece) == 1 for piece in pieces) and not taken & {piece[0] for piece in pieces}:
@@ -629,7 +611,7 @@ class Labels:
 
     def ids(self, encoder: Tokenizer, count: int) -> tuple[tuple[int, ...], ...]:
         """Each of the first `count` labels' ids, one a variant; two labels of one id are refused."""
-        same = _same(encoder)
+        same = Same(encoder)
         found, owners = [], dict[int, str]()
         for name in self.names_for(count):
             ids = []
@@ -1183,7 +1165,7 @@ class SegmentLayout(Layout):
         if self.head_max_len is None and self.option_tokens is None:
             return 0, 0, False
         assert head_at is not None
-        same = _same(encoder)
+        same = Same(encoder)
         head = list(_piece(same, _text(chunks[head_at])))
         whole = [list(_piece(same, _text(chunks[at]))) for at in line_at]
         fixed = 0 if cue_at is None else len(_piece(same, _text(chunks[cue_at])))
@@ -1606,18 +1588,18 @@ class Framing:
         from dew.registry import to_record
 
         # The record keeps the options in their own order, which a template that walks them reads.
-        return _framed(_same(encoder), json.dumps(to_record(self, Framing)))
+        return _framed(Same(encoder), json.dumps(to_record(self, Framing)))
 
 
 @functools.lru_cache(maxsize=64)
-def _framed(encoder: _Same, recorded: str) -> tuple[str, str]:
-    """`Framing.around`, rendered once a tokenizer and framing, the framing by its record (`_same`).
-    A chat template of the framing's own renders through a tokenizer that renders templates
-    (`HFTokenizer`), and is refused (ValueError) over one that does not, rather than left unread."""
+def _framed(encoder: Same, recorded: str) -> tuple[str, str]:
+    """`Framing.around`, rendered once a tokenizer (held by itself, `dew._cache.Same`) and framing, the
+    framing by its record. A chat template of the framing's own renders through a tokenizer that renders
+    templates (`HFTokenizer`), and is refused (ValueError) over one that does not, rather than left unread."""
     from dew.registry import from_record
 
     framing = from_record(Framing, json.loads(recorded), dtypes=False)
-    tokenizer = encoder.encoder
+    tokenizer = encoder.value
     if framing.chat_template is not None and not isinstance(tokenizer, HFTokenizer):
         raise ValueError(f"a framing's own chat template renders through a tokenizer with a chat "
                          f"template renderer, which {type(tokenizer).__name__} is not")

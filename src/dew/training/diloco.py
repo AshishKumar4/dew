@@ -311,11 +311,14 @@ def _met(stacked: jax.Array) -> jax.Array:
 
 def _agreed(leaf):
     """A group's metric leaf as the step reports it, inside the groups' `shard_map`: the groups' mean
-    where it is floating, the first group's otherwise."""
+    where it is floating, every group's where it is a flag (a step finite in every group), the first
+    group's otherwise."""
     if not isinstance(leaf, jax.Array):
         return leaf
     if jnp.issubdtype(leaf.dtype, jnp.floating):
         return jax.lax.pmean(leaf, DILOCO_AXIS)
+    if leaf.dtype == jnp.bool_:
+        return jax.lax.pmin(leaf.astype(jnp.int32), DILOCO_AXIS).astype(jnp.bool_)
     first = jax.lax.axis_index(DILOCO_AXIS) == 0
     taken = jax.lax.psum(jnp.where(first, leaf, jnp.zeros_like(leaf)).astype(jnp.int32), DILOCO_AXIS)
     return taken.astype(leaf.dtype)

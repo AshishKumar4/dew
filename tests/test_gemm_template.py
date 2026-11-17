@@ -1001,25 +1001,20 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
 
 
-@pytest.mark.parametrize("columns", [1, 3, 5, 6, 8, 64])
-@pytest.mark.parametrize("group_row_tiles", [None, 1, 2, 4], ids=["dense", "1", "2", "4"])
-def test_a_band_walks_every_tile_once_and_reads_a_groups_rows_once_where_a_wave_holds_them(columns,
-                                                                                           group_row_tiles):
+@pytest.mark.parametrize("columns", [1, 3, 5, 6, 8, 16, 64])
+@pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
+def test_a_band_walks_every_tile_once_and_a_grouped_walk_reads_each_row_block_once(columns, grouped):
     """`resources.band` over Qwen3-30B-A3B's H100 gate forward's facts (132 multiprocessors in pairs, 256-row
-    cluster tiles, 128 x 128 tiles), whatever band it derives: the band is one to every column tile, and the
-    planar snake at it walks every output tile once; a dense walk's band is a power of two (its snake's
-    division by another count spilled a 128 x 256 kernel gradient, NS4053-1); and where a wave's programs
-    hold every column tile of a group's row tiles, its band takes them all, so the walk reads each group's
-    rows once and no last band walks them again (row 4053: the H100 grouped forward's three or six column
-    tiles read its tokens twice, M-NS-3)."""
-    multiprocessors, cluster = 132, 2
-    band = resources.band(multiprocessors, 128, 128, columns, group_row_tiles, cluster=cluster)
+    cluster tiles, 128 x 128 tiles): the band is one to every column tile, and the planar snake at it walks
+    every output tile once; a dense walk's band is a power of two (its snake's division by another count
+    spilled a 128 x 256 kernel gradient, NS4053-1); a grouped walk's band is every column tile, so each
+    row tile's columns are one band and no band walks a group's rows again (M-EM-68: Mixtral's down on a
+    GH200 read 7.40 GB at the band of 8 and 6.73 at every column tile, 1.037x and 0.997x CUTLASS's
+    forward)."""
+    band = resources.band(132, 128, 128, columns, grouped=grouped, cluster=2)
     assert 1 <= band <= columns, band
-    if group_row_tiles is None:
-        assert band & (band - 1) == 0, band
-    elif multiprocessors // cluster >= group_row_tiles * columns:
-        assert -(-columns // band) == 1, band
-    rows = 2 * (group_row_tiles or 3)
+    assert band == columns if grouped else band & (band - 1) == 0, band
+    rows = 6
     walk = jax.vmap(lambda index: tail.planar_snake(index, (rows, columns), 1, band))(
         jnp.arange(rows * columns, dtype=jnp.int32))
     assert sorted(zip(*(np.asarray(side).tolist() for side in walk), strict=True)) == [

@@ -430,11 +430,11 @@ def rounds_products() -> bool:
     return numerics().forms == "fast" and asks_default_precision(None, configured=True)
 
 
-def _softplus(x) -> jax.Array:
-    """`jax.nn.softplus(x)`, `log(1 + exp(x))`, as its larger part plus `log1p` of the smaller's exponential
-    `y` in (0, 1], the `log1p` by its series in `s = y / (2 + y)`, at most a third, `2 (s + s^3 / 3 + s^5 /
-    5 + ...)` to its working dtype's rounding (`_series_terms`): a backend's own `log1p` is no part of it,
-    a v5e's 1.4e-4 from float64 (its `log` alike), which held a Mamba-2 layer's output at 2.9e-5 from
+def softplus_series(x) -> jax.Array:
+    """`jax.nn.softplus(x)`'s value, `log(1 + exp(x))`, as its larger part plus `log1p` of the smaller's
+    exponential `y` in (0, 1], the `log1p` by its series in `s = y / (2 + y)`, at most a third, `2 (s + s^3 /
+    3 + s^5 / 5 + ...)` to its working dtype's rounding (`_series_terms`): a backend's own `log1p` is no part
+    of it, a v5e's 1.4e-4 from float64 (its `log` alike), which held a Mamba-2 layer's output at 2.9e-5 from
     float64 where this holds it at 1.4e-6 (row 7062). Formed in at least float32 and rounded once to `x`'s
     dtype; its derivative the logistic, as JAX's."""
     given = jnp.asarray(x)
@@ -467,7 +467,10 @@ def _softplus_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
 
 
 softplus = contracted("test_softplus_holds_every_order")(
-    declared_tangent(Protected(), _softplus, _softplus_jvp))
+    declared_tangent(Protected(), softplus_series, _softplus_jvp))
+"""Dew's one softplus (`softplus_series`, its derivative the logistic), which every softplus of `src/dew`
+calls (tools/lint_slop.py's SLOP030); a kernel's body, which differentiates nothing, calls
+`softplus_series`."""
 
 
 def iteration_dtype() -> jnp.dtype:

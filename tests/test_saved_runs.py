@@ -13,6 +13,7 @@ parameters' and compute dtypes, its loss scale, the examples it consumed and its
 this main reads back: the record's compute, and the resumed run's parameters, scale, clock and rung."""
 
 import dataclasses
+import hashlib
 import io
 import json
 import re
@@ -324,6 +325,29 @@ def test_an_earlier_mains_run_resumes_its_state_and_its_data_by_its_mode(
     records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
     started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
+    if data_resume == "relaxed":
+        holds_its_tokenizer_from_its_next_save(tmp_path, monkeypatch, run, prepared.objective)
+
+
+def holds_its_tokenizer_from_its_next_save(tmp_path: Path, monkeypatch, run: Path, objective) -> None:
+    """A run an earlier main saved, resumed, holds the Hugging Face tokenizer its next save records, each
+    file as its record states it (`dew.inference.tasks.hold_tokenizer`), and loads as its task from that
+    copy with this host's cache fresh (`saved_tokenizer`). A run saved before runs held their tokenizers
+    holds none, and its next save was checked by no load of a saved run (train 972's review)."""
+    from dew.data.text import files_digest, held_place
+
+    with Checkpoints(str(run)) as checkpoints:
+        artifact = checkpoints.artifact(checkpoints.latest)
+    if not isinstance(artifact, dict) or artifact.get("tokenizer") in (None, "byte"):
+        return
+    files = artifact["tokenizer_files"]
+    held = held_place(str(run), files)
+    assert {path: hashlib.sha256((held / path).read_bytes()).hexdigest() for path in files} == files
+    task = type(objective).saved_task
+    assert task is not None
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "fresh"))
+    answered(task.from_run(str(run)))
+    assert [found.name for found in (tmp_path / "fresh").rglob(files_digest(files))] == [files_digest(files)]
 
 
 def rebuilt(tmp_path: Path, monkeypatch, recorded: str, kind: str, **stated) -> tuple[Path, int, object]:

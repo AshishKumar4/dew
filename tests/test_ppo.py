@@ -706,3 +706,23 @@ def test_a_shared_prompts_branches_read_the_critics_value_after_their_own_prefix
                     lambda seed: (nn.unbox(initialized(jax.random.key(seed))),),
                     "critic over a shared prompt", seeds=64,
                     truth_fn=values(built(float64_twin(model)), whole))
+
+
+def test_a_ppo_run_holds_the_tokenizer_its_actor_records(tmp_path):
+    """A PPO run's task is its actor's, whose settings state its tokenizer's files, and a checkpoint of the
+    run holds that tokenizer (`Checkpoints.save`, `hold_tokenizer`): the run's tokenizer is its actor's.
+    It read the objective's own processor, which PPO sets none of, so a run whose actor read a Hugging Face
+    tokenizer crashed at its first checkpoint (train 978's review)."""
+    from dew.data.text import HELD_FILES, HFTokenizer, held_place
+    from dew.inference.tasks import RunProcessor, hold_tokenizer
+
+    tokenizer = HFTokenizer(str(Path(__file__).parent / "fixtures" / "laya" / "tiny" / "tokenizer"))
+    objective = PPOObjective(ToolPolicy(), PROMPT + RESPONSE - 1, critic=ValueHead(TokenFeatures()),
+                             processor=RunProcessor(tokenizer))
+    settings = objective.task_settings()
+    assert settings is not None and settings.tokenizer_files is not None
+    files = dict(settings.tokenizer_files)
+    run = tmp_path / "run"
+    hold_tokenizer({"tokenizer": settings.tokenizer, "tokenizer_files": files}, str(run),
+                   objective.run_tokenizer())
+    assert (held_place(str(run), files) / HELD_FILES).exists()

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from dew._coordination import agreed, from_every_process
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.records import ProfileTraced, Record
+from dew.training._lowering import KernelRecord, kernel_summary
 from dew.training.tracker import LocalTracker
 
 if TYPE_CHECKING:
@@ -219,7 +220,7 @@ def _exported_under(profiler: "Profiler") -> None:
 
 
 def reported_window(report: Callable[[Record, int], None], note: Callable[[str], None],
-                    profiled: tuple[int, int, str] | None,
+                    profiled: tuple[int, int, str, str | None] | None,
                     error: BaseException | None) -> BaseException | None:
     """Report a fit's window that stopped, `profiled` its steps traced, the step it stopped at and the
     directory its capture is in, once every rank's export is written and the pool agreed the run's
@@ -228,9 +229,9 @@ def reported_window(report: Callable[[Record, int], None], note: Callable[[str],
     none, noted on one that had."""
     if profiled is None:
         return error
-    traced, step, directory = profiled
+    traced, step, directory, program = profiled
     try:
-        report(ProfileTraced(directory, traced), step)
+        report(ProfileTraced(directory, traced, program), step)
         wrote = f"Wrote profile for {traced} steps to {directory}"
         agreed("profile announcement", lambda: note(wrote))
     except BaseException as failure:
@@ -271,7 +272,8 @@ def device_figures(devices: "list[list[tuple[str, float, float]]]", steps: int) 
     return {"device_window_ms": per_step("window"), "compute_ms": per_step("compute"),
             "communication_ms": per_step("communication"),
             "exposed_communication_ms": per_step("exposed_communication"),
-            "device_idle_ms": per_step("idle_input", "idle_host")}
+            "device_idle_ms": per_step("idle_input", "idle_host"), "input_idle_ms": per_step("idle_input"),
+            "host_idle_ms": per_step("idle_host")}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -314,8 +316,12 @@ class ProfileReport:
     hfu: float | None
     tokens_per_s: float | None
     device: str | None
-    kernels: dict | None = None
+    kernels: KernelRecord | None = None
     losses: tuple[tuple[str, float], ...] = ()
+    input_idle_ms: float | None = None
+    """The device's idle gaps an input's arrival ended (`window_split`'s `idle_input`), a step."""
+    host_idle_ms: float | None = None
+    """The device's idle gaps no input ended, the host's own (`window_split`'s `idle_host`), a step."""
 
     @classmethod
     def read(cls, directory: Path, name: str, window: Path, *, warmup: int, steps: int) -> "ProfileReport":
@@ -336,9 +342,18 @@ class ProfileReport:
         logged = {key: value for step, scalars in LocalTracker(run / "tracking").scalars()
                   if step == warmup + steps for key, value in scalars.items()}
         records = (run / "tracking" / "records.jsonl").read_text().splitlines()
-        compiled = [entry["value"] for entry in map(json.loads, records) if entry["type"] == "StepCompiled"]
-        compiles = [value["seconds"] for value in compiled]
-        plan = compiled[0].get("plan") if compiled else None
+        entries = list(map(json.loads, records))
+        compiled = [entry for entry in entries if entry["type"] == "StepCompiled"]
+        compiles = [entry["value"]["seconds"] for entry in compiled]
+        # The program the window ran: the one its last step ran, by its batch signature's digest
+        # (`ProfileTraced.signature`), compiled then or earlier, a signature read again after another's
+        # reusing its program (row 6822).
+        traced_window = next((entry["value"] for entry in reversed(entries)
+                              if entry["type"] == "ProfileTraced"), {})
+        program = traced_window.get("signature")
+        ran = [entry["value"] for entry in compiled
+               if program is not None and entry["value"].get("signature") == program]
+        plan = ran[-1].get("plan") if ran else None
         kernels = plan.get("kernels") if isinstance(plan, dict) else None
         manifest = json.loads((capture / "manifest.json").read_text())
         reasons = manifest.get("capture_reasons") or []
@@ -353,19 +368,25 @@ class ProfileReport:
                      device_window_ms=figures["device_window_ms"], compute_ms=figures["compute_ms"],
                      communication_ms=figures["communication_ms"],
                      exposed_communication_ms=figures["exposed_communication_ms"],
-                     device_idle_ms=figures["device_idle_ms"],
+                     device_idle_ms=figures["device_idle_ms"], input_idle_ms=figures["input_idle_ms"],
+                     host_idle_ms=figures["host_idle_ms"],
                      flops=logged.get("train/flops"), mfu=logged.get("train/mfu"),
                      hfu=logged.get("train/hfu"), tokens_per_s=logged.get("train/tokens_per_s"),
                      device=device, kernels=kernels)
         return dataclasses.replace(report, losses=report.step_losses())
 
     def step_losses(self) -> tuple[tuple[str, float], ...]:
-        """The three largest shares of a step, in ms, its analytic work did not take, largest first: the
-        loop's input wait, the collectives no compute ran beside, the device's idle gaps, and the compute
+        """The three largest shares of a step, in ms, its analytic work did not take, largest first, each
+        disjoint from the others: where the capture holds a device track, the device's idle gaps an input
+        ended and those no input ended (the host's), the collectives no compute ran beside, and the compute
         past the work's time at the device's peak (the compute less `mfu` of the step, the time the work
-        takes at peak); each where the report holds it, and only those that took time."""
-        held = {"input wait": self.input_wait_ms, "exposed communication": self.exposed_communication_ms,
-                "device idle": self.device_idle_ms}
+        takes at peak); with no device track, the loop's input wait in their place, which the device's queue
+        can hide; each where the report holds it, and only those that took time."""
+        device = self.device_window_ms is not None
+        held: dict[str, float | None] = (
+            {"device waiting on input": self.input_idle_ms, "device idle on the host": self.host_idle_ms}
+            if device else {"input wait": self.input_wait_ms})
+        held["exposed communication"] = self.exposed_communication_ms
         if self.compute_ms is not None and self.mfu is not None:
             held["compute past the work at peak"] = self.compute_ms - self.mfu * self.step_ms
         ranked = sorted(((name, value) for name, value in held.items() if value is not None and value > 0),
@@ -404,9 +425,7 @@ class ProfileReport:
             lines.append(f"  tokens        {self.tokens_per_s:10.1f} real tokens a second")
         lines.append("  checkpoints, validation and logging: none inside the window")
         if self.kernels is not None:
-            launches = ", ".join(f"{entry['name']} x{'?' if entry['calls'] is None else entry['calls']}"
-                                 for entry in self.kernels.get("launches", ()))
-            lines.append(f"  kernels       {launches or 'none'}")
+            lines.append(f"  {kernel_summary(self.kernels)}")
         if self.losses:
             lost = "; ".join(f"{name} {value:.2f} ms" for name, value in self.losses)
             lines.append(f"  losses        {lost}")

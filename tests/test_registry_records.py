@@ -285,3 +285,12 @@ model = ModelConfig.from_dict(record).build()
 print(type(model).__module__, type(model).__name__, model.features)
 """)
     assert rebuilt.split() == ["users_models", "UsersDense", "3"]
+    # A run that trusts the user's package (`dew train run.json --trust users_models`, which reads no record
+    # yet) builds the alias its run.json names: trusting the package imports it, its decorators with it.
+    aliased = _ran(tmp_path, """
+from dew.registry import ModelConfig, import_trusted
+import_trusted(None, ("users_models",))
+model = ModelConfig.from_dict({"name": "users_dense", "fields": {"features": 5}}).build()
+print(type(model).__name__, model.features)
+""")
+    assert aliased.split() == ["UsersDense", "5"]
