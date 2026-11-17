@@ -79,7 +79,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Training and parallelism
 
 - Time to first step: the compile path's re-derivations. [5556]
-- QK-Clip under optax.apply_every. [7262]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5361]
 - XLA:CPU edges. [1591]
@@ -100,8 +99,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
-- The in-context memory reads no forks. [6969]
-- One statement answered two questions. [7273]
 
 ## Algebra
 
