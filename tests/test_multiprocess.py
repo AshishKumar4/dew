@@ -76,8 +76,10 @@ AVERAGING = Path(__file__).with_name("averaging_worker.py")
 PROFILE_STOP = Path(__file__).with_name("profile_stop_worker.py")
 """The worker of the pools whose profile window one rank cannot stop."""
 EXAMPLES_CLOCK = Path(__file__).with_name("examples_clock_worker.py")
-SEARCHED_AGAIN = Path(__file__).with_name("searched_again_worker.py")
 """The worker of the pools that run on the examples clock."""
+SEARCHED_AGAIN = Path(__file__).with_name("searched_again_worker.py")
+"""The worker of the pool whose plan, made before its state was placed, one process alone would search
+again once placed."""
 READ_ROUNDS = Path(__file__).with_name("read_rounds_worker.py")
 """The worker of the pool that counts the rounds a fit agrees its reads in."""
 REPLICA_KEY = Path(__file__).with_name("replica_key_worker.py")
