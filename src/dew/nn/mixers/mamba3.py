@@ -90,11 +90,13 @@ def _wrapped(angle):
 def _angles(dt, theta, continues):
     """Each token's angle `[B, S, H, R]` over its document as a double-float `(hi, lo)` pair: `dt theta`
     (each its exact product, `two_product`) summed from the document's first token through the token (`dt`
-    zero where a token's turn acts on no state, `chunk_mamba3`) and less its whole turns (`_wrapped`), in
-    `dt`'s dtype. The recurrence turns a token's state by its own turn; keys and queries turned by an angle
-    rounded once to fp32, half an ulp of 2 pi, put the packed chunked form of rank two at 2.3 times its error
-    from float64, its final state at 1.3 times and its gradients to 2.1 times, where a double-float angle
-    and its rotation of it (`rotated`'s `residual`) hold them under (row 7402)."""
+    zero where a token's turn acts on no state, `chunk_mamba3`) and less its whole turns once summed
+    (`_wrapped`), in `dt`'s dtype: a double float's 48 bits hold a document's sum of turns of at most pi to
+    fp32's rounding past 2^20 tokens, so the scan's combines wrap nothing. The recurrence turns a token's
+    state by its own turn; keys and queries turned by an angle rounded once to fp32, half an ulp of 2 pi, put
+    the packed chunked form of rank two at 2.3 times its error from float64, its final state at 1.3 times
+    and its gradients to 2.1 times, where a double-float angle and its rotation of it (`rotated`'s
+    `residual`) hold them under (row 7402)."""
     rates = jnp.broadcast_to(jnp.asarray(theta, dt.dtype), (*dt.shape, theta.shape[-1]))
     step = two_product(jnp.broadcast_to(dt[..., None], rates.shape), rates)
 
@@ -103,11 +105,11 @@ def _angles(dt, theta, continues):
         (*sum_left, keep_left), (*sum_right, keep_right) = left, right
         summed = compensated_add(tuple(sum_left), tuple(sum_right))
         kept = tuple(jnp.where(keep_right, s, r) for s, r in zip(summed, sum_right, strict=True))
-        return *_wrapped(kept), keep_left & keep_right
+        return *kept, keep_left & keep_right
 
     keep = jnp.broadcast_to(continues[:, :, None, None], step[0].shape)
     *summed, _ = jax.lax.associative_scan(combine, (*step, keep), axis=1)
-    return tuple(summed)
+    return _wrapped(tuple(summed))
 
 
 def _turned_by(angles, entering):
