@@ -926,13 +926,14 @@ def test_dews_own_transcendentals_are_as_exact_as_jaxs_across_their_range(name, 
     to large positive and near zero, their input in fp32 and bf16 (check 1)."""
     from contract_support import on_a_tpu
 
-    from dew.nn import precision
+    from dew.nn import activations, precision
 
     def draw(seed):
         x = np.random.default_rng(seed).uniform(*span, 4096).astype(np.float32)
         return (jnp.asarray(x, dtype),)
 
-    ours, theirs = {"softplus": (precision.softplus, jax.nn.softplus), "silu": (precision.silu, jax.nn.silu),
+    ours, theirs = {"softplus": (precision.softplus, jax.nn.softplus),
+                    "silu": (activations.silu, jax.nn.silu),
                     "exp": (on_a_tpu(precision.accurate_exp), jnp.exp),
                     "exp2": (on_a_tpu(functools.partial(precision.accurate_exp, base2=True)), jnp.exp2)}[name]
     for part, mine, jaxs in (("value", ours, theirs),

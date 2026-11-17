@@ -35,7 +35,7 @@ from flax.typing import Dtype
 
 from .derivatives import Protected, contracted, declared_tangent
 from .kernels import norm_swiglu
-from .precision import at_least_fp32, capped_logits, rounded_to, softplus
+from .precision import accurate_exp, at_least_fp32, capped_logits, rounded_to, softplus
 
 
 def gelu_exact(x: jax.Array) -> jax.Array:
@@ -61,13 +61,12 @@ def gelu_tanh(x: jax.Array) -> jax.Array:
     relative to its size on an A100 where this form lay 1.1e-7 (each alone 5.6e-8 and 4.9e-8). The
     sigmoid also keeps the tail `1 + tanh` cancels: on a CPU the form lies 3.5e-8 from float64 against
     `jax.nn.gelu`'s 4.5e-8 and torch's 2.8e-8, and 3.1e-7 against 1.3e-4 and 3.4e-5 below x = -3,
-    over 2^22 normal inputs at scale 3. The sigmoid is `lax.logistic` at its highest accuracy, whose
-    derivative is `s(z) s(-z)`: the default `s (1 - s)` reads the rounded `s(z)`, which from x near 5
-    in fp32 rounds to 1 and drops the derivative's `x s(z) s(-z) z'`, a derivative of 1 where
-    float64's is 1.0000016. The forward is the default's on a CPU and a GPU, which lower either alike."""
+    over 2^22 normal inputs at scale 3. The sigmoid is Dew's one `logistic`, whose derivative is
+    `s(z) s(-z)`: `s (1 - s)` reads the rounded `s(z)`, which from x near 5 in fp32 rounds to 1 and drops
+    the derivative's `x s(z) s(-z) z'`, a derivative of 1 where float64's is 1.0000016."""
     work = x.astype(at_least_fp32(x.dtype))
     inner = math.sqrt(8 / math.pi) * (work + 0.044715 * work ** 3)
-    return (work * jax.lax.logistic(inner, accuracy=jax.lax.AccuracyMode.HIGHEST)).astype(x.dtype)
+    return (work * logistic(inner)).astype(x.dtype)
 
 
 def quick_gelu(x: jax.Array) -> jax.Array:
@@ -75,9 +74,33 @@ def quick_gelu(x: jax.Array) -> jax.Array:
     return x * jax.nn.sigmoid(1.702 * x)
 
 
+def _logistic(x) -> jax.Array:
+    work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
+    return 1.0 / (1.0 + accurate_exp(-work))
+
+
+def _logistic_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
+    """`logistic`'s value `s(x)` and tangent `s(x) s(-x)`, each order finite where `e^-x` overflows (`s`
+    zero): `s (1 - s)` reads the rounded `s(x)`, one past x near 17 in fp32, its derivative then zero."""
+    (x,), (tangent,) = primals, tangents
+    s = logistic(x)
+    return s, s * logistic(-x) * tangent.astype(s.dtype)
+
+
+logistic = contracted("test_silu_holds_every_order")(declared_tangent(Protected(), _logistic, _logistic_jvp))
+"""Dew's one logistic, `1 / (1 + e^-x)` in at least float32, its exp accurate (`precision.accurate_exp`: a
+target's own where it is, Dew's on one whose is not, a v5e's) and a true division: a backend's logistic is
+no part of it, a v5e's approximate even at HIGHEST. Every silu (`silu`), gelu (`gelu_tanh`) and softplus's
+derivative (`precision.softplus`) of Dew's reads it."""
+
+
 def silu(x: jax.Array) -> jax.Array:
-    """`x * sigmoid(x)` in at least fp32, in `x`'s dtype."""
-    return jax.nn.silu(x.astype(at_least_fp32(x.dtype))).astype(x.dtype)
+    """`x * sigmoid(x)` as `x` times Dew's one `logistic`, in at least fp32 and rounded once to `x`'s dtype,
+    its derivative through the logistic's declared tangent: a backend's logistic, a v5e's approximate even at
+    HIGHEST, held Mamba-2's layer at 3.5 times its CPU float32 through its conv's and its gate's silus, where
+    this holds it at 0.89 times (row 7062, M-JS-136). Every silu of Dew's, an MLP's and a mixer's alike."""
+    work = x.astype(at_least_fp32(x.dtype))
+    return (work * logistic(work)).astype(x.dtype)
 
 
 def relu2(x: jax.Array) -> jax.Array:

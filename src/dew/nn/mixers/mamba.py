@@ -40,6 +40,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.nn.activations import silu
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
@@ -57,7 +58,7 @@ from dew.nn.linear import (
 )
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import accumulated, accurate_exp, at_least_fp32, float32_dot_general, silu, softplus
+from dew.nn.precision import accumulated, accurate_exp, at_least_fp32, float32_dot_general, softplus
 from dew.nn.residuals import Residual
 from dew.nn.sharding import rows_like
 from dew.nn.ssm import affine_spans

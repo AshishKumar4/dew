@@ -499,36 +499,6 @@ def accurate_exp(x, *, base2: bool = False) -> jax.Array:
     return _exp(base2, x.astype(jnp.float32)).astype(x.dtype)
 
 
-def _logistic(x) -> jax.Array:
-    work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
-    return 1.0 / (1.0 + accurate_exp(-work))
-
-
-def _logistic_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
-    """`logistic`'s value and tangent `s (1 - s)`, each order finite where `e^-x` overflows (`s` zero)."""
-    (x,), (tangent,) = primals, tangents
-    s = logistic(x)
-    return s, s * (1.0 - s) * tangent.astype(s.dtype)
-
-
-logistic = contracted("test_silu_holds_every_order")(declared_tangent(Protected(), _logistic, _logistic_jvp))
-"""`1 / (1 + e^-x)` in at least float32, its exp accurate (`accurate_exp`) and a true division: a backend's
-logistic is no part of it (`silu`'s)."""
-
-
-def silu(x) -> jax.Array:
-    """`x / (1 + e^-x)` as `x` times its `logistic` (its exp accurate and a true division), in at least
-    float32 and rounded once, its derivative through the logistic's declared tangent: a backend's logistic is
-    no part of it, a v5e's approximate even at HIGHEST, which held Mamba-2's layer at 3.5 times its CPU
-    float32 through its conv's and its gate's silus, where this holds it at 0.89 times, its training step
-    unchanged (row 7062, M-JS-136). A gated MLP's silu stays JAX's (`activations.silu`): on a v5e this one
-    took a SwiGLU MLP's bf16 training step 2.1% longer, where JAX's held its fp32 output within its CPU
-    float32's distance from float64 (4.9e-7 against 1.05e-6); on a GH200 the two are the same (M-JS-137)."""
-    given = jnp.asarray(x)
-    x = given.astype(at_least_fp32(given.dtype))
-    return (x * logistic(x)).astype(given.dtype)
-
-
 def softplus_series(x) -> jax.Array:
     """`jax.nn.softplus(x)`'s value, `log(1 + exp(x))`, as its larger part plus `log1p` of the smaller's
     exponential `y` in (0, 1], the `log1p` by its series in `s = y / (2 + y)`, at most a third, `2 (s + s^3 /
@@ -538,7 +508,8 @@ def softplus_series(x) -> jax.Array:
     normal wherever `y` is, the series in `s^2` alone: `s` itself, half of `y` near fp32's least normal
     (`x` near -87), is subnormal, which a target flushing them (a TPU's, a GPU's) made zero, and the softplus
     with it, where `y` is the answer; `s^2` underflowing leaves the series its first term, one. Formed in at
-    least float32 and rounded once to `x`'s dtype; its derivative the logistic, as JAX's."""
+    least float32 and rounded once to `x`'s dtype; its derivative Dew's one logistic
+    (`activations.logistic`)."""
     given = jnp.asarray(x)
     x = given.astype(at_least_fp32(given.dtype))
     y = accurate_exp(-jnp.abs(x))
@@ -561,11 +532,13 @@ def _series_terms(dtype) -> int:
 
 
 def _softplus_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
-    """`softplus`'s value and tangent: its derivative the logistic, as JAX's softplus's, in at least float32
-    and rounded once to its input's dtype."""
+    """`softplus`'s value and tangent: its derivative Dew's one logistic (`activations.logistic`), in at
+    least float32 and rounded once to its input's dtype."""
+    from dew.nn.activations import logistic
+
     (x,), (tangent,) = primals, tangents
     work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
-    return softplus(x), (jax.nn.sigmoid(work) * tangent.astype(work.dtype)).astype(tangent.dtype)
+    return softplus(x), (logistic(work) * tangent.astype(work.dtype)).astype(tangent.dtype)
 
 
 softplus = contracted("test_softplus_holds_every_order")(

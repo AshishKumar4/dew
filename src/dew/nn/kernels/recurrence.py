@@ -26,6 +26,7 @@ from jax.experimental import pallas as pl
 
 from dew._hashing import fmix32
 from dew.algebra.scan import Reads, turned
+from dew.nn.activations import silu
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels import launches
 from dew.nn.precision import (
@@ -35,7 +36,6 @@ from dew.nn.precision import (
     l2norm,
     rms_statistics,
     rms_weighted,
-    silu,
     softplus,
     stochastic_bf16,
 )
@@ -511,7 +511,7 @@ def _gates(hooks: Hooks, given: dict, work, key_width: int):
     if g is None:
         decay = jnp.ones((rows, heads, 1), work)
     else:
-        decay = jnp.exp(g)
+        decay = accurate_exp(g)
         decay = (decay[..., None] if hooks.decay == 'scalar'
                  else jnp.broadcast_to(decay, (rows, heads, key_width)))
     write = jnp.ones((rows, heads), work) if beta is None else beta
