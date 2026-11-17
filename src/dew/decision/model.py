@@ -31,6 +31,18 @@ def context_streams(context: ContextEncoder) -> tuple[tuple[str, Condition], ...
 
 
 @dataclass(frozen=True)
+class ContextTokens:
+    """A context stream's tokens as a window packs them: `tokens` `[B, C]`, each row's first `lengths` real,
+    and where a row packs several documents' contexts, each token's document (`segments`), at most
+    `max_segments` a row (`dew.nn.cross_attention.encode_context`)."""
+
+    tokens: jax.Array
+    lengths: jax.Array
+    segments: jax.Array | None = None
+    max_segments: int = 1
+
+
+@dataclass(frozen=True)
 class BackboneContext(BackboneEncoder[Sequence[int]]):
     """A stream of the model's own tokens its cross-attention reads (decision-inputs.md section 2), encoded
     by the model itself (`dew.nn.cross_attention.encode_context`): `table`, each token's row of its own
@@ -50,18 +62,6 @@ class BackboneContext(BackboneEncoder[Sequence[int]]):
 
     def recorded_fields(self) -> Mapping[str, object]:
         return {"encoder": self.encoder}
-
-
-@dataclass(frozen=True)
-class ContextTokens:
-    """A context stream's tokens as a window packs them: `tokens` `[B, C]`, each row's first `lengths` real,
-    and where a row packs several documents' contexts, each token's document (`segments`), at most
-    `max_segments` a row (`dew.nn.cross_attention.encode_context`)."""
-
-    tokens: jax.Array
-    lengths: jax.Array
-    segments: jax.Array | None = None
-    max_segments: int = 1
 
 
 @dataclass(frozen=True)
