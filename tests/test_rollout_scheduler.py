@@ -475,8 +475,13 @@ def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
     paged = layout(task)
     assert paged is not None and paged.page_size == 64
     assert layout(dataclasses.replace(task, n=2)) is None
-    # A policy searching beams, which a server over pages does not draw, is drawn whole.
+    # A policy searching beams, which a server over pages does not draw, is drawn whole, its model's own
+    # pages too.
     assert layout(dataclasses.replace(task, strategy=Beam(width=2))) is None
+    declared = dataclasses.replace(task, model=task.model.with_kv_cache(KVCache(page_size=8)))
+    declared_layout = layout(declared)
+    assert declared_layout is not None and declared_layout.page_size == 8
+    assert layout(dataclasses.replace(declared, strategy=Beam(width=2))) is None
 
 
 def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):
