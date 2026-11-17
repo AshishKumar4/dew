@@ -617,6 +617,13 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
             with _GUARD:
                 _UNCERTIFIED[key] = str(error)[:400]
             return None
+        except Untuned as error:
+            # A prepare without its devices (`for_devices`) meets an instruction of the launch alone no
+            # device run has tuned: certification reads no binary there, and the program's own compile says
+            # it untuned, by the program (`dew.training.ahead.CompiledAhead.untuned`).
+            with _GUARD:
+                _UNCERTIFIED[key] = str(error)[:400]
+            return None
         if stored is not None:
             tuning.store_verdict(device.device_kind, stored, kernels)
     found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None,
