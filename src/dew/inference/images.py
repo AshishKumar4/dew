@@ -906,6 +906,7 @@ class _ImagePass:
     images: int
     first: _Drawn | None = None
     held: int = 0
+    requests: int = 0
 
     def add(self, request: _Drawn) -> bool:
         if self.first is not None and (not self.first.alike(request)
@@ -913,7 +914,12 @@ class _ImagePass:
             return False
         self.first = self.first or request
         self.held += len(request.prompts)
+        self.requests += 1
         return True
+
+    def taken(self) -> int:
+        """Every request it holds: alike, they run as one batch."""
+        return self.requests
 
 
 @dataclass(frozen=True, eq=False)
