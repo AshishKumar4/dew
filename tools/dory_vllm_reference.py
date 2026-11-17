@@ -562,17 +562,28 @@ def invariance(directory: Path) -> None:
     under src/_dew_torch/precision.py's `float64`) on the sentence's prompt under every order of every
     batch (`symmetry`, `permute`), each order's largest distance from the identity's rows over their
     largest magnitude, which float64 rounding alone moves, `invariance-{loops}.npy` `[batches, ORDERS]`
-    float64 for each loop count, as many batches as any run is recorded under."""
+    float64 for each loop count, as many batches as any run is recorded under. Each order's rows are held
+    to the identity's within float64 rounding over the computation's longest chain of reductions (each
+    layer's hidden and token sums over the prompt at each loop, then the head's and the log-softmax's over
+    the vocabulary; `assert_computes_the_oracle`), as tools/rounding_orders.py's `symmetric` holds Dew's
+    orders: a permutation that breaks the symmetry moves the rows by orders of magnitude more, where the
+    distance alone, kept in the provenance, was judged nowhere."""
     import torch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tests'))
+    from reference_error import assert_computes_the_oracle
 
     from _dew_torch.precision import float64
 
     config, tensors = release()
     probe = np.load(directory / 'probe.npz')
+    text = config.get('text_config', config)
     with float64():
         for loops in LOOPS:
             model, rows = model_code(config, tensors, loops, 'per_loop', torch.float64)
             identity = rows(probe['sentence'], probe['sentence'][:0], prompt_rows=True)
+            roundings = (loops * text['num_hidden_layers'] * (text['hidden_size'] + len(probe['sentence']))
+                         + text['hidden_size'] + 2 * text['vocab_size'])
             batches = max(BATCHES.values())
             scale, apart = float(np.max(np.abs(identity))), np.zeros((batches, ORDERS))
             for batch in range(batches):
@@ -580,6 +591,8 @@ def invariance(directory: Path) -> None:
                     permute(model, config, symmetry(config, batch, index))
                     found = rows(probe['sentence'], probe['sentence'][:0], prompt_rows=True)
                     apart[batch, index] = float(np.max(np.abs(found - identity))) / scale
+                    assert_computes_the_oracle(found, identity, f'{loops} loops, order {batch}.{index}',
+                                               roundings=roundings)
                 print(f'{loops} loops, batch {batch}: worst {apart[batch].max():.2e}', flush=True)
             np.save(directory / f'invariance-{loops}.npy', apart)
             del model, rows
