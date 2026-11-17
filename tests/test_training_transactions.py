@@ -776,13 +776,23 @@ def test_a_skipped_step_applies_no_effect():
     assert not bool(finite) and float(advanced.variables["stats"]["seen"]) == 0.0
 
 
+class PushedOne(Objective):
+    """One weight pushed by each batch's inputs, its gradient their mean: a gradient whose norm is itself."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.zeros(())}}
+
+    def loss(self, variables, batch, step):
+        return jnp.mean(batch["x"]) * variables["params"]["w"], Aux({})
+
+
 def test_a_window_whose_summed_gradient_overflows_its_moments_is_dropped_whole():
     """An optimizer that holds updates back and sums its window (`optax.MultiSteps(..., use_grad_mean=False)`
-    of two) hands Adam the sum of two gradients of 1.5e19, whose square overflows its second moment: the
-    window's closing step is dropped whole, its state as it was, and reported not finite, as such an
-    optimizer's step always is read over its whole new state; its first step is taken."""
+    of two) hands Adam the sum of two gradients of 1.5e19, each of a finite norm, whose square overflows its
+    second moment: the window's closing step is dropped whole, its state as it was, and reported not
+    finite, as such an optimizer's step always is read over its whole new state; its first step is taken."""
     held = optax.MultiSteps(optax.adam(0.1), 2, use_grad_mean=False).gradient_transformation()
-    trainer = Trainer(Pushed(), held, key=jax.random.PRNGKey(0))
+    trainer = Trainer(PushedOne(), held, key=jax.random.PRNGKey(0))
     state = trainer.initial_state()
     batch = next(type("Fed", (Inputs,), {"value": 1.5e19})())
     step = trainer.compile(state, batch)
