@@ -13,7 +13,7 @@ from affine_run import FEATURES, Counting, dataset, raw_leaf
 from flax import linen as nn, struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from reference_error import as_given, assert_as_exact, dew_programs, widened
-from test_trainer import make_trainer
+from test_trainer import PoisonedThird, make_trainer
 
 from dew.batch import under
 from dew.checkpoints import Checkpoints
@@ -608,16 +608,6 @@ def test_a_local_step_one_process_wrote_reads_onto_the_host_and_onto_any_mesh(tm
     np.testing.assert_array_equal(host["params"]["w"], written)
     placed = Checkpoints(persistent, local_directory=local, local_every=1).variables(ema=False)
     np.testing.assert_array_equal(np.asarray(placed["params"]["w"]), written)
-
-
-class PoisonedThird(Counting):
-    """`Counting`'s batches, the third's features not finite: its loss and gradient are."""
-
-    def __next__(self):
-        batch = super().__next__()
-        if batch["index"][0] == 2:
-            batch = {**batch, "x": np.full_like(batch["x"], np.nan)}
-        return batch
 
 
 class SkippingThird(Counting):

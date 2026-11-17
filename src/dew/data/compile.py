@@ -1241,8 +1241,7 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
 
     def walk(pipeline: Pipeline, *, packed: bool, itself: bool = False) -> None:
         nonlocal unseen
-        # A window step of the objective's that lays its windows out (`LaysOutWindows`), after the pack, a
-        # memory read's packed plan or a source's own pack alike.
+        # A window step that lays its windows out (`LaysOutWindows`), after any pack, a plan's or a source's.
         itself = itself or any(isinstance(stage, Map) and isinstance(stage.step, LaysOutWindows)
                                for stage in pipeline.stages)
         for at, stage in enumerate(pipeline.stages):
@@ -2106,8 +2105,7 @@ class _Replayed:
     gives that element first, then reads on, its position the one before it until it is given."""
 
     def __init__(self, source: pygrain.DatasetIterator, first: Batch, before):
-        # The element and the position before it, until given: then let go, so the stream holds no batch
-        # past the one it gives.
+        # The element and the position before it, let go once given: the stream holds no batch past it.
         self._source, self._held = source, (first, before)
 
     def __iter__(self):
@@ -2190,8 +2188,7 @@ def native_loader(handed: Handed) -> Loader:
         replayed = [_Replayed(probe, first, before)]
 
         def train(partition: DataPartition) -> Iterator[Batch]:
-            source = replayed.pop() if replayed else iter(handed)
-            return _Shared(source, partition, held=False)
+            return _Shared(replayed.pop() if replayed else iter(handed), partition, held=False)
 
         return Loader(train=train, val=None, records=None, batch=rows_of(_present(first)))
     first = handed[0] if isinstance(handed, pygrain.MapDataset) else {

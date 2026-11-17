@@ -267,6 +267,17 @@ def signature_digest(signature: Hashable) -> str:
 
 
 
+def _custom_step_refusal(step, record: bool, inspection) -> None:
+    """Refuse what a custom step cannot serve (ValueError): records of its Steps, or an inspection of an
+    update it commits."""
+    if record and step is not None:
+        raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
+                         "build them with Step(record=True)")
+    if inspection is not None and step is not None:
+        raise ValueError("a custom step commits no update an inspection reads (Trainer(inspection=...)); "
+                         "summarize its arrays in the step's own report")
+
+
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
@@ -313,17 +324,16 @@ class Trainer(Generic[Loss, Effects]):
         (`Objective.optimizer`), made from it. `step` replaces the built-in transaction. A custom step then
         owns the clocks, the scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
         attempted-step counter; it passes a model that reads the run's progress it (`PassesProgress`).
-        `rollout` runs once per batch read, before the step and outside replay. A step with no loss scale
-        whose loss or gradient norm is not finite is taken as it is formed, and the run stops at its next
-        log naming the step and the value; `skip_nonfinite` skips such a step instead, taking its optimizer
-        one step of zero gradient (training.md, a step that is not finite). `layout` and `mesh` say where
-        the state lives: `mesh` a `MeshSpec` or a native `jax.sharding.Mesh` of any axes, which `layout`'s
-        rules name (`Layout.data_axes` its rows'). `microbatches` is how many a pipelined step feeds through
-        the mesh's stage axis, a multiple of its size; None feeds one a stage. `lower_for`, a CUDA generation,
-        lowers the first step for it in place of compiling it (`dew.training._lowering.Lowered`); `ahead`, a
-        step compiled ahead (`dew.training.ahead`), runs as the first step where it is that program, and
-        one compiled without its GPU kind's tuned choices (`AheadOfTime.tuned`) is not run: the run compiles
-        its step as without it, said once (`AheadOfTime.runnable`).
+        `rollout` runs once per batch read, before the step and outside replay. `skip_nonfinite` skips a step
+        not finite, which a run otherwise takes and stops at (training.md, a step that is not finite).
+        `layout` and `mesh` say where the state lives: `mesh` a `MeshSpec` or a native `jax.sharding.Mesh` of
+        any axes, which `layout`'s rules name (`Layout.data_axes` its rows'). `microbatches` is how many a
+        pipelined step feeds through the mesh's stage axis, a multiple of its size; None feeds one a stage.
+        `lower_for`, a CUDA generation, lowers the first step for it in place of compiling it
+        (`dew.training._lowering.Lowered`); `ahead`, a step compiled ahead (`dew.training.ahead`), runs as
+        the first step where it is that program, and one compiled without its GPU kind's tuned choices
+        (`AheadOfTime.tuned`) is not run: the run compiles its step as without it, said once
+        (`AheadOfTime.runnable`).
         `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its derived
         config. It measures each of Dew's own launches that declares variants to time (`KernelOp`: the
         kernel templates, `attention_impl="template"`, the norms, SwiGLU and decode attention); tokamax's
@@ -340,11 +350,10 @@ class Trainer(Generic[Loss, Effects]):
         layout = objective.placement(layout)  # as its models place their trees (a tier-3 plan, ledger 2777)
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
-        built = isinstance(optimizer, optax.GradientTransformation)
         # A config's groups take what the objective draws fresh, as a run's do (`OptimConfig.claiming`).
         self._config, self._optimizer = ((None, declaring(objective.optimizer(optimizer), self._boxed_axes))
-                                         if built else (optimizer.claiming(*objective.fresh_trained()), None))
-        self.skip_nonfinite = skip_nonfinite
+                                         if isinstance(optimizer, optax.GradientTransformation) else
+                                         (optimizer.claiming(*objective.fresh_trained()), None))
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
@@ -354,18 +363,14 @@ class Trainer(Generic[Loss, Effects]):
         self.split = split
         # How a resume treats its data (`DataResume`): relaxed starts it again where its plan differs.
         self.data_resume: DataResume = data_resume
+        self.skip_nonfinite = skip_nonfinite
         self._microbatches, self._loss_scale = microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         # A loss scale stated by a flag alone is a value a step's trace can be kept by (`_step_key`).
         self._scaled = dynamic_scale if isinstance(dynamic_scale, bool) else None
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
-        if record and step is not None:
-            raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
-                             "build them with Step(record=True)")
-        if inspection is not None and step is not None:
-            raise ValueError("a custom step commits no update an inspection reads (Trainer(inspection=...)); "
-                             "summarize its arrays in the step's own report")
+        _custom_step_refusal(step, record, inspection)
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
@@ -1351,10 +1356,7 @@ class Trainer(Generic[Loss, Effects]):
         with run.startup.phase("start", "tracing the state's start"):
             current, position, placed, abstract, fresh = self._starting(run, plan.dataset, initial, resume)
         run.last_checkpoint = time.perf_counter()
-        interval = Interval.resumed(run.stop_control, last_saved=(
-            current if checkpoints is not None and checkpoints.latest is not None else None),
-            # A scaled run drops an overflowing step as its scale backs off, which no run stops at.
-            skips_nonfinite=self.skip_nonfinite or self.dynamic_scale)
+        interval = self._interval(run, current, checkpoints)
         state, shardings, complete = self._opened(plan, run, interval, current, position, placed, abstract,
                                                   resumed=initial is None and interval.last_saved is not None,
                                                   fresh=fresh)
@@ -1460,6 +1462,13 @@ class Trainer(Generic[Loss, Effects]):
             if stopped:
                 break
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
+
+    def _interval(self, run: FitRun, current: int, checkpoints: Checkpoints | None) -> Interval:
+        """The fit's first interval, its clocks read off the run's control (`Interval.resumed`): a scaled
+        run, which drops an overflowing step as its scale backs off, stops at no single step not finite."""
+        return Interval.resumed(run.stop_control, last_saved=(
+            current if checkpoints is not None and checkpoints.latest is not None else None),
+            skips_nonfinite=self.skip_nonfinite or self.dynamic_scale)
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:

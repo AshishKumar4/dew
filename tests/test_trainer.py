@@ -2462,15 +2462,14 @@ def test_a_state_built_from_a_held_tree_steps_without_freeing_the_tree():
     assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(objective.variables))
 
 
-def poisoned_third_step(objective, optimizer):
-    """A step of its own (`Trainer(step=)`) that moves every parameter by 0.1, its third not finite: what a
-    save's refusal backs up, the built-in step writing nothing that is not finite."""
-    def step(state, batch):
-        moved = jax.tree.map(lambda leaf: jnp.where(state.updates == 2, jnp.nan, leaf - 0.1),
-                             state.variables["params"])
-        return (state.replace(variables={**state.variables, "params": moved}, microstep=state.microstep + 1,
-                              updates=state.updates + 1), jnp.zeros([], jnp.float32), Aux({}))
-    return step
+class PoisonedThird(Counting):
+    """`Counting`'s batches, the third's features not finite: its loss and gradient are."""
+
+    def __next__(self):
+        batch = super().__next__()
+        if batch["index"][0] == 2:
+            batch = {**batch, "x": np.full_like(batch["x"], np.nan)}
+        return batch
 
 
 @pytest.mark.parametrize("tier", ["persistent", "local",
@@ -2478,22 +2477,22 @@ def poisoned_third_step(objective, optimizer):
 def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path, tier):
     """A save that meets a state holding a non-finite value writes nothing and rotates nothing out, on either
     tier: the run stops there, and the checkpoint a resume finds is the last finite one, its parameters
-    finite (row 6699). A run whose third step is not finite (`poisoned_third_step`), checkpointed every
-    step and keeping two (`persistent`), saved its non-finite parameters at steps 3 and 4 and rotated its good
+    finite (row 6699). A run with no loss scale whose third batch is not finite, checkpointed every step
+    and keeping two (`persistent`), saved its non-finite parameters at steps 3 and 4 and rotated its good
     checkpoints out; one that writes a local copy every second step and a persistent one every tenth
     (`local`) wrote its step-4 local copy unchecked, and a resume restored it (train 901's review, F1); a
     DiLoCo run's replicas' inner copies, which its next meeting averages into the outer model, saved
     unchecked between meetings (`diloco`, train 904's review, F3)."""
     def trainer():
-        if tier == "local":
-            return local_trainer(tmp_path, step=poisoned_third_step)
-        # DiLoCo's two replicas meet every fourth step: the third update poisons their copies mid-period.
-        met = {} if tier == "persistent" else {"mesh": MeshSpec(diloco=2).build(jax.devices()[:2]),
-                                                "diloco": DiLoCo(every=4, rate=0.7, momentum=0.9)}
-        return make_trainer(tmp_path, step=poisoned_third_step, keep=2, **met)
+        if tier == "diloco":
+            # Two replicas meeting every fourth step: the third batch poisons their inner copies mid-period.
+            return make_trainer(tmp_path, keep=2, mesh=MeshSpec(diloco=2).build(jax.devices()[:2]),
+                                diloco=DiLoCo(every=4, rate=0.7, momentum=0.9))
+        return make_trainer(tmp_path, keep=2) if tier == "persistent" else local_trainer(tmp_path)
 
     with pytest.raises(RuntimeError):
-        trainer().fit(dataset(), steps=5, log_every=100, checkpoint_every=10 if tier == "local" else 1)
+        trainer().fit(dataset(PoisonedThird), steps=5, log_every=100,
+                      checkpoint_every=10 if tier == "local" else 1)
     resumed = trainer()
     assert resumed.checkpoints.latest == 2
     restored, *_ = resumed.checkpoints.restore(resumed.initial_state())

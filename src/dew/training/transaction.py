@@ -1251,6 +1251,17 @@ class Transaction:
         return dataclasses.replace(window, gradient=candidate.gradient, batch_statistics=held_stats,
                                    statistics_stamp=stamp)
 
+    def _finiteness(self, scale, holding: bool, pending, aux, gradient) -> tuple[bool, bool, jax.Array]:
+        """Whether the step is gated where it is not finite (no loss scale, `skip`, in its commit), whether
+        it is taken as it is formed (no loss scale, not `skip`), and its attempt's finiteness: one taken as
+        formed reads its loss alone, its gradient by its commit's norm; one gated its small trees too; a
+        scaled one, or one an optimizer holds back, its gradient besides."""
+        unscaled = scale is None and not holding
+        gated, taken_as_formed = unscaled and self.skip, unscaled and not self.skip
+        trees = (pending.effects, pending.qk, aux.variables, *(() if unscaled else (gradient,)))
+        read = (pending.loss,) if taken_as_formed else (pending.loss, *trees)
+        return gated, taken_as_formed, pending.local_finite & all_finite(read)
+
     def finish_attempt(self, state, batch, aux, pending, gradient, attempt, tokens, probed=None):
         """Commit the window when it is due, then advance the state's clocks.
 
@@ -1274,15 +1285,10 @@ class Transaction:
         """
         scale, previous = state.scale, state.accumulation
         effects, qk, loss = pending.effects, pending.qk, pending.loss
-        unscaled = scale is None and not holds_back(state.opt_state)
-        # A step with no loss scale skipped where it is not finite (`skip`, gated in its commit) reads its
-        # small trees; one taken as formed reads its loss alone, its gradient by its commit's norm.
-        gated, taken_as_formed = unscaled and self.skip, unscaled and not self.skip
-        finite = pending.local_finite & (jnp.isfinite(loss).all() if taken_as_formed else all_finite(
-            (loss, effects, qk, aux.variables, *(() if unscaled else (gradient,)))))
+        holding = holds_back(state.opt_state)
+        gated, taken_as_formed, finite = self._finiteness(scale, holding, pending, aux, gradient)
         # A step with no loss scale is gated in its commit (`commit`), but one whose optimizer holds updates
         # back is rejected whole, its optimizer state kept, as a scaled step's is.
-        holding = holds_back(state.opt_state)
         accepted = jnp.asarray(a=True) if scale is None and not holding else finite
         numerical = dataclasses.replace(state, variables=write_back(state.variables, aux.variables),
                                         microstep=state.microstep + 1)
