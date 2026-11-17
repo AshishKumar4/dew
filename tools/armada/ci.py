@@ -165,6 +165,11 @@ def check1_wire():
     stages log (STAGES). Loaded where a plan shards a site, so a checkout of the harness alone (a page
     generator's scratch copy) imports this file."""
     return _loaded(HERE.parents[1] / "tests" / "check1_wire.py")
+@functools.cache
+def tier_wire():
+    """The GPU tier's prepare-to-lane contract, its one owner (tests/tier_wire.py): the prepare's word and
+    unit, and where its truths and needs are filed. Loaded where a lane prepares, as `check1_wire` is."""
+    return _loaded(HERE.parents[1] / "tests" / "tier_wire.py")
 PARITY_STAGES = HERE.parents[1] / "src" / "dew" / "parity_stages.py"
 child_groups = _loaded(HERE / "child_groups.py")
 session = _loaded(HERE / "session.py")
@@ -1264,14 +1269,18 @@ def collect_entries(names: list[str], timings: dict, target: float) -> list[dict
             for index, held in enumerate(names[at::count] for at in range(count))]
 
 
-def stale_row(python: str, name: str, group: str, why: str, kind: str = grading.STALE) -> dict:
-    """Row `name` (in `group`'s group) not run, red as `kind`, saying `why`: `grading.STALE`, a kept row this
-    task did not find, graded and run again by the queue; "whole", a unit its lane cannot hold."""
-    said = (f"stale, not run: the plan kept it on a record this task did not find, {why}"
-            if kind == grading.STALE else why)
-    return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0, "output": said,
+KEPT_UNFOUND = "stale, not run: the plan kept it on a record this task did not find, "
+"""How a kept row this task did not find or could not run begins what it says (`stale_row`)."""
+
+
+def stale_row(python: str, name: str, group: str, why: str) -> dict:
+    """Row `name` (in `group`'s group) with no verdict of its tests (`grading.STALE`), not run, saying `why`:
+    a kept row this task did not find, which the queue runs again, or a unit its GPU lane cannot hold
+    (`gpu_lane`), which Platform's harness evidence says, never a red of a test nor its file's verdict (Main's
+    audit, row 7614: as a red of its own kind, the tier read it as its file's verdict and its tests' red)."""
+    return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0, "output": why,
             "tests": {}, "ynn_switched": [], "cells": {}, "timings": {row(python, name, ""): 0.0},
-            **grading.red_as(kind, [])}
+            **grading.red_as(grading.STALE, [])}
 
 
 def stale_cost(name: str, group: str, reading: Reading) -> float:
@@ -1297,7 +1306,8 @@ def afforded(python: str, tests: list[str], group: str, kept: Container[str],
     for name in tests:
         cost = stale_cost(name, group, reading)
         if name in kept and cost > left:
-            stale_rows.append(stale_row(python, name, group, f"its {cost:.0f} s past the {left:.0f} s left"))
+            stale_rows.append(stale_row(python, name, group,
+                                        f"{KEPT_UNFOUND}its {cost:.0f} s past the {left:.0f} s left"))
             continue
         fitting.append(name)
         left -= cost
@@ -1402,7 +1412,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
             # The task's deadline spent on the rows before it: this group is neither read nor run, stale as a
             # kept row the task could not run is (`tested`).
             rows.append(stale_row(python, name, group,
-                                  f"the task's {deadline:.0f} s spent before it was read"))
+                                  f"{KEPT_UNFOUND}the task's {deadline:.0f} s spent before it was read"))
             continue
         part = out.with_name(f"{out.name}.{index}")
         code = max(code, tested(python, [name], group, part, left, cache, grace, common, environ, coverage,
@@ -2011,30 +2021,29 @@ def lane_units(python: str, tests: list[str], within: float | None = None) -> di
     return units
 
 
-PREPARES = "prepares"
-"""The mark of a GPU test whose part's prepare runs it first, on the node's CPU (`gpu_prepared`)."""
-
-
 def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, deadline: float) -> int:
     """A GPU lane's prepare, on its node's CPU before its files' GPU run (`gpu_lane`) and with no GPU drawn:
-    each of `tests` that holds a test marked `PREPARES` run once in a process of its own on the CPU alone,
-    under the prepare's word (tests/tier_wire.py's PREPARE, which tests/conftest.py reads to skip every test
-    but those marked `PREPARES`, each of which then prepares rather than runs) and its unit's name (UNIT),
+    each of `tests` run once in a process of its own on the CPU alone, under the prepare's word
+    (tests/tier_wire.py's PREPARE, under which tests/conftest.py has each test prepare its check-1 sites'
+    truths and arms for the node's GPU rather than run, one that prepares none skipped) and its unit's name
+    (UNIT): every test of the part, so a site its run reaches never goes unprepared, and its run calls stored
+    executables and compiles nothing while it holds the GPU (Main, 2026-11-17: the day's GPU jobs left 2034
+    of 3238 held GPU-minutes idle, tracing and compiling on the host),
     at most `processes` at once, as its run will select and cut it (a group `<file>#G/N` holds in its prepare
     the tests it holds in its run: the same selection, the same weights, DEW_SPLIT_DURATIONS), so each such
     test computes what its run reads and must not compute while it holds the GPU, its float64 truths and
     its programs compiled for the GPU the node's topology names (DEW_NODE_TOPOLOGY), into the store its
     environment names (DEW_TIER_TRUTHS), which the run is given too. Their rows are written to `out` and
     nothing is recorded, no test having run to its end: a prepare that fails is said in its row, and its run
-    is red for what it lacks, never computing it on the GPU. A file with nothing to prepare starts no
-    process; a file's process under other flags (`lane_units`) prepares apart, under them, as it runs. First
+    is red for what it lacks, never computing it on the GPU. A file's process under other flags
+    (`lane_units`) prepares apart, under them, as it runs. First
     the pinned fixtures the tests read offline are fetched, as the run fetches them
     (tools/fetched_fixtures.py), so the run finds each whole and waits on no download with the GPU held.
     `deadline` is the whole prepare's: each process is given what is left of it as its turn comes, its own
     end's allowance kept back, so the prepare ends within it however many files and waves it holds, and a
     file it leaves no time is a red row of its own, never started (review: a deadline a process let five
     files outlast the job's own prepare bound, whose session then ended the job and every file's prepare
-    with it); its fetch and its collections are within it too."""
+    with it); its fetch and its collection are within it too."""
     began = time.monotonic()
 
     def left() -> float:
@@ -2043,9 +2052,7 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
     subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch"], check=True,
                    timeout=max(1.0, left()))
     units = lane_units(python, tests, max(1.0, left()))
-    holding = collected(python, PREPARES, sorted({file for file, _, _ in units.values()}), max(1.0, left()))
-    verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(units)
-                if units[name][0] in holding}
+    verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(units)}
     threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
 
     def prepared(name: str, verdict: Path) -> int:
@@ -2058,8 +2065,8 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
                 "output": "not prepared: its lane's prepare had no time left for it"}]}))
             return 0
         return tested(python, [file], group, verdict, mine, "off", session.GRACE, "",
-                      {"JAX_PLATFORMS": "cpu", gpu_measures.wire().PREPARE: "1", "OMP_NUM_THREADS": threads,
-                       **(VARIANTS[variant][1] if variant else {}), gpu_measures.wire().UNIT: name},
+                      {"JAX_PLATFORMS": "cpu", tier_wire().PREPARE: "1", "OMP_NUM_THREADS": threads,
+                       **(VARIANTS[variant][1] if variant else {}), tier_wire().UNIT: name},
                       recorded=False, variant=variant)
 
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
@@ -2159,7 +2166,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     tests = list(units)
 
     measures = lane_measures(python, units, held, token)
-    prepared = gpu_measures.prepared_needs(python, tests)  # Each no less than its prepared programs' need.
+    prepared = gpu_measures.prepared_needs(python, tests, tier_wire())  # No less than its programs' need.
     unheld = gpu_measures.unschedulable(prepared, budget, float(WHOLE_GPU) * total, held)  # Nor below it.
     tests = [name for name in tests if name not in unheld]
     needed = {name: gpu_needs(measures[name], budget, prepared.get(name, 0.0)) for name in tests}
@@ -2194,7 +2201,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                 del running[future]
     rows = [{**verdict, "output": f"{short[name]}\n{verdict.get('output', '')}"} if name in short else verdict
             for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
-    rows += [stale_row(python, file, varied(group, variant), unheld[name], "whole")
+    rows += [stale_row(python, file, varied(group, variant), unheld[name])
              for name, (file, group, variant) in units.items() if name in unheld]
     out.write_text(json.dumps({"rows": rows}))
     return 0
