@@ -1626,15 +1626,21 @@ def _carried(serialized: bytes, decoded: bool = False) -> list[Binary]:
     return found
 
 
-def launched_kernels(executable: jax.stages.Compiled) -> list[tuple[str, int]]:
-    """Every custom kernel `executable` launches, by the name its thunk gives it, with the shared bytes its
-    launch asks for (`custom_kernel`): a Pallas-Triton call's whatever its name (`binaries` keeps a
-    template launch's), and XLA's own custom kernels, read from its serialized form as `binaries`."""
+def custom_kernels(executable: jax.stages.Compiled) -> list[tuple[str, bytes, int]]:
+    """Every custom kernel `executable` launches, by the name its thunk gives it, with its cubin and the
+    shared bytes its launch asks for (`custom_kernel`): a Pallas-Triton call's whatever its name (`binaries`
+    keeps a template launch's), and XLA's own custom kernels, read from its serialized form as `binaries`."""
     runtime = executable.runtime_executable()
     if runtime is None:
         raise ValueError("a compiled program with no runtime executable launches no kernel to read")
-    return [(name, kernel[1]) for name, proto in _thunk_protos(runtime.serialize())
+    return [(name, *kernel) for name, proto in _thunk_protos(runtime.serialize())
             if (kernel := custom_kernel(proto)) is not None]
+
+
+def launched_kernels(executable: jax.stages.Compiled) -> list[tuple[str, int]]:
+    """Every custom kernel `executable` launches (`custom_kernels`), by its name, with the shared bytes its
+    launch asks for."""
+    return [(name, shared) for name, _, shared in custom_kernels(executable)]
 
 
 def _thunk_protos(serialized: bytes) -> list[tuple[str, bytes]]:
@@ -1781,9 +1787,9 @@ def disassembler() -> Path | None:
     return None if found is None else Path(found)
 
 
-def sass_findings(elf: bytes) -> tuple[str, ...] | None:
-    """What the machine code of the cubin `elf` breaks of the SASS rules (`sass_findings_of`, nvdisasm's
-    listing of it); None where no disassembler is installed (`disassembler`), the rules unread."""
+def sass_listing(elf: bytes) -> str | None:
+    """nvdisasm's listing of the machine code of the cubin `elf`; None where no disassembler is installed
+    (`disassembler`)."""
     tool = disassembler()
     if tool is None:
         return None
@@ -1791,7 +1797,14 @@ def sass_findings(elf: bytes) -> tuple[str, ...] | None:
         cubin.write(elf)
         cubin.flush()
         listing = subprocess.run([str(tool), "-c", cubin.name], capture_output=True, text=True, check=True)
-    return sass_findings_of(listing.stdout)
+    return listing.stdout
+
+
+def sass_findings(elf: bytes) -> tuple[str, ...] | None:
+    """What the machine code of the cubin `elf` breaks of the SASS rules (`sass_findings_of`, its listing,
+    `sass_listing`); None where no disassembler is installed, the rules unread."""
+    listing = sass_listing(elf)
+    return None if listing is None else sass_findings_of(listing)
 
 
 _INSTRUCTION = re.compile(r"/\*([0-9a-f]{4,})\*/\s+(.*?)\s*;")
