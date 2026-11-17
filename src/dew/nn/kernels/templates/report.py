@@ -225,7 +225,7 @@ Refused = tuple[str, tuple[str, ...] | None]
 """A kernel a compile refused, by its name, and the roles its spill stood in where the compile read them
 (`Binary.spilled_in`: `()` read and spilling none, its warpgroup MMAs serialized alone; None unread): one
 record of both, a kernel once a refusal (`_record` joins its roles), so whatever keys, copies or hands on a
-refusal (`derivation_inputs`, `_proposing`, `refused_launches`) carries what a launch's ladder steps by."""
+refusal (`derivation_inputs`, `_proposing`, `refusal_entries`) carries what a launch's ladder steps by."""
 
 
 @dataclasses.dataclass
@@ -914,19 +914,26 @@ def _unit_cotangent(out: jax.Array) -> jax.Array | np.ndarray:
 
 
 @generation.traced_fact
-def refused_launches() -> tuple[tuple[str, Hashable, frozenset[Refused]], ...]:
+def refusal_entries() -> tuple[tuple[str, Hashable, frozenset[Refused]], ...]:
     """Every (launch identity, config, spilled kernels with their roles, `Refused`) refused in this context (a
     `refusals` scope's or the process's), ordered. A validated plan can hand them to another process
     explicitly, the roles with them (`refuse` within `refusals`); a shared compilation cache alone must not
     transfer them between programs. A trace after a refusal derives the next config, so a program kept after
-    one is another than a process without it traces (`traced_fact`)."""
+    one is another than a process without it traces (`traced_fact`): a trace's key holds them, roles and
+    all (`options.held_context`)."""
     with _GUARD:
         return tuple(sorted(((identity, config, kernels)
                              for (identity, config), kernels in _registry().refused.items()), key=repr))
 
 
+def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
+    """`refusal_entries`, each launch's spilled kernels by their names: what a plan's record lists
+    (`dew.training.planning.refusal_record`)."""
+    return tuple((identity, config, names(kernels)) for identity, config, kernels in refusal_entries())
+
+
 def refuse(entries) -> None:
-    """Each `(identity, config, kernels)` of `entries` (`refused_launches`', its kernels with their roles,
+    """Each `(identity, config, kernels)` of `entries` (`refusal_entries`', its kernels with their roles,
     `Refused`, or a pair a decoded record gives as a list; a kernel by its name alone states none) refused in
     this context, as a compile's spill refuses it. A handed plan seeds these inside its own `refusals` scope,
     not unioned with unrelated decisions that the receiving process already holds."""
@@ -1091,10 +1098,10 @@ def compiled_at_once(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.Com
     turn keep: a program lowered before an earlier one's refusals committed is lowered again past them and
     compiled in turn, as it would have been lowered after them. At most `COMPILE_THREADS` compile at once."""
     firsts = attempts([(lowered, options) for lowered, options, _ in programs])
-    held = refused_launches()
+    held = refusal_entries()
     kept_programs = []
     for (lowered, options, relower), first in zip(programs, firsts, strict=True):
-        if refused_launches() != held:
+        if refusal_entries() != held:
             lowered, first = relower(), None
         kept_programs.append(compiled(lowered, options, relower=relower, first=first))
     return kept_programs

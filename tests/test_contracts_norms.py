@@ -2,11 +2,13 @@
 precision seams and default-precision calls, the fused norms and products, and the declared derivative
 (`dew.nn.derivatives.surrogate`; ledger 2641; the harness is tests/contract_support.py)."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, OWN_FORWARD_ORDERS, REVERSE_ONLY, assert_contract, normal_draw
+from contract_support import EDGES, OWN_FORWARD_ORDERS, REVERSE_ONLY, assert_contract, normal_draw, on_a_tpu
 
 from dew.nn import ngpt, precision
 from dew.nn.activations import exact_gelu, gated_product
@@ -31,6 +33,30 @@ def test_an_exact_gelu_holds_every_order(edge):
 
     assert_contract(exact_gelu, (x,), (direction,), cotangent, f"an exact gelu {edge}", truth_fn=plain,
                     plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_silu_holds_every_order(edge):
+    """`precision.silu` (`x / (1 + e^-x)`, its exp the most accurate and a true division, its tangent
+    declared, row 7062): every order finite wherever float64 is a normal float32 and JAX's silu is."""
+    (x,) = normal_draw(2671, (4, 7), scale=EDGES[edge])
+    (direction,) = normal_draw(2672, x.shape, scale=EDGES[edge])
+    (cotangent,) = normal_draw(2673, x.shape)
+    assert_contract(precision.silu, (x,), (direction,), cotangent, f"silu {edge}",
+                    truth_fn=jax.nn.silu, plain_fn=jax.nn.silu)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_accurate_exp_holds_every_order(edge):
+    """`precision.accurate_exp` as a TPU takes it (Dew's own exp, `e^x` and `2^x`, its tangent declared, row
+    7062), traced for an assumed v5e: every order finite wherever float64 is a normal float32 and JAX's exp
+    is."""
+    (x,) = normal_draw(2681, (4, 7), scale=EDGES[edge])
+    (direction,) = normal_draw(2682, x.shape, scale=EDGES[edge])
+    (cotangent,) = normal_draw(2683, x.shape)
+    for base2, plain in ((False, jnp.exp), (True, jnp.exp2)):
+        assert_contract(on_a_tpu(functools.partial(precision.accurate_exp, base2=base2)), (x,), (direction,),
+                        cotangent, f"{plain.__name__} {edge}", truth_fn=plain, plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", EDGES)

@@ -71,6 +71,7 @@ from .precision import (
     compensated_sum,
     float32_dot_general,
     l2norm,
+    silu,
 )
 from .sharding import (
     HEADS,
@@ -210,7 +211,7 @@ def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, seg
     windows = short_conv.preactivation([read(tap) for tap in range(K)], [taps[:, tap] for tap in range(K)],
                                        None if bias is None else bias.astype(wide))
     if activation:
-        windows = nn.silu(windows)
+        windows = silu(windows)
     if valid is not None:
         windows = jnp.where(valid[:, :, None], windows, 0)
     return conv_pieces(windows, parts, dtype)
@@ -283,7 +284,7 @@ def entered_conv1d(x, kernel, valid, documents, held, entered, *, bias=None, par
                                        [taps[:, tap] for tap in range(taps_count)],
                                        None if bias is None else bias.astype(wide))
     if activation:
-        windows = nn.silu(windows)
+        windows = silu(windows)
     windows = jnp.where(real[:, :, None], windows, 0)
     return conv_pieces(windows, parts, dtype)
 

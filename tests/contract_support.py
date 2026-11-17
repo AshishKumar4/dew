@@ -15,11 +15,15 @@ wrong length), and each of its leaves is finite wherever the same order's float6
 public call."""
 
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from float64_terms import float64_signed_sums
 from reference_error import widened
+
+from dew.nn.kernels import generation
 
 LEAST = float(np.finfo(np.float32).tiny)
 """Float32's least normal value: a held position's truth is at least it (testing.md's derivative
@@ -174,6 +178,17 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
 EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.0**-63}
 """The draws' scales: unit values, and values whose products (a squared distance, a second derivative's
 pairs) reach float32's largest or its least normal."""
+
+
+def on_a_tpu(fn):
+    """`fn` traced as for a TPU (an assumed v5e, `generation.assumed`): the forms Dew takes there, its own
+    where a TPU's backend is not accurate enough (`precision.accurate_exp`), run on this host."""
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        with generation.assumed("v5e"):
+            return fn(*args, **kwargs)
+
+    return run
 
 
 def normal_draw(seed, *shapes, scale: float = 1.0, dtype=jnp.float32) -> tuple:
