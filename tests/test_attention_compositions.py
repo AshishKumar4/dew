@@ -85,6 +85,42 @@ def test_forgetting_attention_holds_check_1_against_its_logits_written_out(packe
                     seeds=SEEDS)
 
 
+LARGE_PREFIX = -2.0 ** 30
+"""A first document's forget gate a token (its log sigmoid): a row's whole running sum after it rounds every
+later prefix to it."""
+
+FIRST = 40
+"""The first packed document's tokens, `LENGTH - FIRST` the second's."""
+
+
+def _after_a_large_prefix(seed: int):
+    """`_gated`'s draw with each row's first document's forget logits at `LARGE_PREFIX`."""
+    query, key, value, gates, cotangent = _gated(HEADS, KV_HEADS)(seed)
+    return query, key, value, gates.at[:, :FIRST].set(LARGE_PREFIX), cotangent
+
+
+@pytest.mark.parametrize("implementation", ["template", "auto"])
+def test_a_packed_fox_document_after_a_large_prefix_is_the_document_alone(implementation):
+    """FoX over packed documents after a first one whose gates are -2^30 a token: each document's output and
+    every operand's gradient on par with the document taken alone (check 1, from float64), its gate's prefix
+    its own (`forget_prefix`): summed across the row, every later prefix rounded to -2^30 and the second
+    document's `G_i - G_j` to 0, its attention uniform where alone it decays (train 1009's F1, row 7609's
+    arithmetic)."""
+    segment_ids = jnp.repeat(jnp.asarray([[1] * FIRST + [2] * (LENGTH - FIRST)]), ROWS, axis=0)
+
+    def packed(query, key, value, gates):
+        return forgetting_attention(query, key, value, gates, segment_ids=segment_ids,
+                                    implementation=implementation)
+
+    def alone(query, key, value, gates):
+        return jnp.concatenate([forgetting_attention(*(t[:, start:stop] for t in (query, key, value, gates)),
+                                                     implementation="reference")
+                                for start, stop in ((0, FIRST), (FIRST, LENGTH))], axis=1)
+
+    assert_as_exact(jax.jit(with_gradients(packed)), jax.jit(with_gradients(alone)), _after_a_large_prefix,
+                    f"forgetting attention after a large prefix {implementation}", seeds=SEEDS)
+
+
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 def test_forgetting_attention_by_default_runs_the_template_holding_no_written_out_bias(generation_name):
     """FoX by default ('auto') lowered for a GPU without warpgroup MMA (an A100's) and with it (an H100's):
