@@ -553,3 +553,32 @@ def test_epochs_of_a_memory_read_that_packs_after_a_draw_or_a_cache_are_passes_o
     assert (loader.epochs, loader.pass_examples, loader.examples) == (2, 10, 20)
     state = Trainer(_pulled(Twice()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
     assert int(state.consumed) == 20
+
+
+def test_a_splits_epoch_cadence_is_the_runs_own_under_a_batch_ramp(tmp_path):
+    """A split validated each epoch (`--val-every '{"val": "epoch"}'`) and the run's own validation at
+    `epoch` (`eval_every`) resolve to the same steps under a batch ramp, which reads fewer records a step
+    early, so a pass takes more steps than the unramped run's: both read the loader the ramp reads. The
+    split's was resolved before the ramp, at the unramped pass's steps, so it validated mid-epoch (train
+    1012's review)."""
+    import dataclasses
+
+    from run_kinds import lm
+
+    from dew.data.dataset import Ramp
+
+    run = lm(tmp_path, drawn=False)
+
+    def readied(ramp: Ramp | None):
+        """The run's trainer, loader and suites as it trains, under `ramp`."""
+        trainer = dataclasses.replace(run.trainer, checkpoint_dir=str(tmp_path / "runs"), epochs=2,
+                                      eval_every="epoch", multi_host=False, batch_ramp=ramp)
+        prepared = dataclasses.replace(run, trainer=trainer, val_every={"val": "epoch"}).prepare()
+        sized, loader, _, suites, _ = prepared.run.readied(prepared.objective, prepared.dataset,
+                                                           prepared.validation, (), "ramped")
+        return sized.trainer, loader, suites
+
+    trainer, loader, suites = readied(Ramp(start=4, increment=4, samples=16))
+    flat, flat_loader, flat_suites = readied(None)
+    assert suites["val"].every == trainer.eval_interval(loader)
+    assert flat_suites["val"].every == flat.eval_interval(flat_loader) != trainer.eval_interval(loader)
