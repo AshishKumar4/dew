@@ -314,3 +314,23 @@ def test_a_probe_on_this_gpus_twin_states_the_memory_and_the_peaks_buffers_its_o
     # The twin states this GPU's memory, every admission on it reading its allocator's limit: within the 2 MiB
     # this GPU's own allocator rounds its limit up by (`allocator_limit`).
     assert 0 <= device.memory_stats()["bytes_limit"] - device_memory(double)["bytes_limit"] < 2**21
+
+
+def test_a_fresh_state_placed_on_a_gpu_is_bitwise_its_draws_under_jaxs_default_lowering():
+    """A fresh run's state placed on the GPU (`Trainer.place`, its start program drawn through loops over
+    threefry's rounds, `dew.training.distributed.drawing`) is bit for bit the state its initializer draws
+    jitted under JAX's default lowering, every round unrolled: the looped draw changes the start program's
+    compile alone (row 6740)."""
+    import optax
+
+    from dew import models
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+
+    model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
+                         mlp_features=64, max_seq_len=16)
+    trainer = Trainer(LMObjective(model, 15), optax.adam(1e-3), key=jax.random.key(3))
+    placed = trainer.place()[0]
+    drawn = jax.jit(lambda key: trainer.initial_state(None, key))(trainer.key)
+    for mine, theirs in zip(jax.tree.leaves(placed.variables), jax.tree.leaves(drawn.variables), strict=True):
+        assert np.array_equal(np.asarray(mine), np.asarray(theirs))

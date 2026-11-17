@@ -5,6 +5,7 @@ is `dew.distributed.placement`'s."""
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -18,6 +19,7 @@ from typing import Any, Concatenate, Protocol
 import jax
 import numpy as np
 from flax import linen as nn
+from jax._src import config as jax_config
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P, Sharding
 
 from dew._coordination import from_every_process
@@ -417,8 +419,30 @@ def taking_over[Held, Result](program: OuterProgram, taken: Held, kept: Held
                               ) -> Callable[[jax.Array], Result]:
     """The start's `program` (`StartBuild.program`) over the held tree `placed_held` splits: `taken`
     donated, for the outputs to take its buffers over, and `kept` not, as no output takes those and JAX only
-    warns of a donation it cannot use. They are freed as the caller drops them."""
-    return functools.partial(program, _held_leaves(taken), _held_leaves(kept))
+    warns of a donation it cannot use. They are freed as the caller drops them. Its draws lowered as a
+    fresh state's are (`drawing`)."""
+
+    def taken_over(key: jax.Array) -> Result:
+        with drawing():
+            return program(_held_leaves(taken), _held_leaves(kept), key)
+
+    return taken_over
+
+
+def drawing() -> contextlib.AbstractContextManager[None]:
+    """Where a fresh state's program is lowered, wherever it is (`placed_start`, `start_compiled`,
+    `start_compiling`): on a GPU, JAX's threefry draws as rolled loops over their rounds
+    (`jax_threefry_rolled_lowering`, Dew's JAX build's from post100), in place of each draw's twenty rounds
+    unrolled. The draws are the same bits; the program is what an init is, a draw for nearly every leaf, and
+    unrolled it is mostly hash arithmetic whose code generation is its compile: a 142M DiT's start compiled
+    on a GH200 in 23.8 s, 4.9 s rolled, and placed its state in 26.7 s where it now takes 7.6 s (a 4x1024
+    MoE decoder's, 26.5 s and 5.4 s; placed in 41.5 s and 20.2 s; M-MC-13, row 6740).
+    Rolled, a draw's rounds no longer fuse into the leaf it makes, which costs one round's state a leaf,
+    partitioned as the leaf is (a 1 GB draw over eight GPUs held one shard of temporaries, and no
+    collective, where JAX's threefry kernel, unpartitioned, held 6.44 GB). The setting is in JAX's trace
+    context and jit key, so every site of the program enters it alike; a step, whose draws fuse into what
+    reads them, keeps JAX's default."""
+    return jax_config.threefry_rolled_lowering(new_val=True)
 
 
 def _held_leaves(tree) -> list:
@@ -506,7 +530,8 @@ def start_compiled(start: StartBuild, initializer: Initializer, key: jax.ShapeDt
     Dew's compile point over the shapes of its arguments (`held_shapes`, `key`'s): what a run compiled ahead
     compiles of its start, whose devices compile none of it (`dew.training.ahead.AheadOfTime.starts`)."""
     program, arguments = _start_shapes(start, initializer, abstract, shardings, mesh)
-    return program.compiled(*arguments, key)
+    with drawing():
+        return program.compiled(*arguments, key)
 
 
 def start_compiling(start: StartBuild, initializer: Initializer, key: jax.ShapeDtypeStruct,
@@ -516,7 +541,8 @@ def start_compiling(start: StartBuild, initializer: Initializer, key: jax.ShapeD
     where `start_compiled` lowers it (`attempting`). A Qwen3.5-4B's start took 97 s to compile for an
     H100 after its step's 110 s."""
     program, arguments = _start_shapes(start, initializer, abstract, shardings, mesh)
-    return compiling(program, *arguments, key)
+    with drawing():
+        return compiling(program, *arguments, key)
 
 
 def _start_shapes(start: StartBuild, initializer: Initializer, abstract: TrainState,

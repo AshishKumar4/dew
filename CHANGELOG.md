@@ -80,6 +80,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   file edited in place, or a wheel rebuilt at the same version, which it states by its version) ran its
   stale program by default.
 
+- A fresh state's program draws on a GPU as rolled loops over threefry's rounds
+  (`jax_threefry_rolled_lowering`, Dew's JAX build's, at its lowering alone, `dew.training.distributed.drawing`)
+  in place of each draw's rounds unrolled: the same bits, and the program, a draw for nearly every leaf,
+  compiles on a GH200 in 4.9 s where it took 23.8 s (a 142M DiT; a 4x1024 MoE decoder's, 5.4 s where it took
+  26.5 s), its state placed in 7.6 s where it took 26.7 s (20.2 s where 41.5 s). A step keeps JAX's default,
+  its draws fused into what reads them.
+
 - A run refused before it takes its start, whose start program still compiles in its own thread, exits with
   its refusal's status once that compile ends: JAX's exit cleanup and the C runtime's exit tore XLA down under
   the running compile, and 12 of 48 such exits ended by a segmentation fault
