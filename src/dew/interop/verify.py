@@ -52,17 +52,16 @@ from flax import traverse_util as flax_traverse
 
 from dew import _records
 from dew._cache import package_digest
+from dew._isolated import Isolated, prepared_script
 from dew.interop import (
     codecs,
     decoder_config,
     decoder_parts,
     hf_decoders as decoders,
-    isolated,
     parts,
     sources,
 )
 from dew.interop.decoder_families import ENTRIES
-from dew._isolated import Isolated
 from dew.interop.probe import BATCH, LENGTH, probe_ids
 from dew.nn.blocks import padded_row
 from dew.nn.kernels.options import owned_program
@@ -1202,7 +1201,7 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
                 weights = {key: value.detach().cpu().numpy() for key, value in reference.state_dict().items()}
                 if registered is not None and any(kind.__module__ == '__main__' for kind in registered):
                     # The script that defines the type's classes, imported there as spawn imports it.
-                    twin.call(multiprocessing.spawn.prepare, isolated.main())
+                    twin.call(multiprocessing.spawn.prepare, prepared_script())
                 # The config as it serializes, without the implementations a build resolved onto it (its
                 # experts', its attention's), which the twin's process resolves for itself.
                 twin.call(_twin_built, source, type(config), config.to_dict(), weights, registered)

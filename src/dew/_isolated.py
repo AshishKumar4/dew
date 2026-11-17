@@ -6,7 +6,7 @@ whose build sets torch's defaults process-wide, and a host's measurement of NCCL
 (`dew.communicators`), whose GPUs' memory the caller has not yet opened.
 
 The process imports what the caller imports (that process's `sys.path`), so a class a module defines, sent
-by reference, is found there. It imports the caller's script itself only where it is asked to (`main`): a
+by reference, is found there. It imports the caller's script itself only where it is asked to (`prepared_script`): a
 class the script defines is found there as `multiprocessing`'s spawn finds it, the script run as
 `__mp_main__`, its `if __name__ == "__main__":` block skipped, which any other load leaves unrun; and a call
 inside a daemon process (a pool's worker) starts it, which a `multiprocessing` child of a daemon may not.
@@ -69,9 +69,9 @@ class Isolated:
         return value
 
 
-def main() -> dict:
+def prepared_script() -> dict:
     """The load's script as `multiprocessing`'s spawn reads it to import it in another process, which
-    `Isolated.call(multiprocessing.spawn.prepare, main())` imports there: all but the process's
+    `Isolated.call(multiprocessing.spawn.prepare, prepared_script())` imports there: all but the process's
     authentication key, which no process but spawn's own child may be sent (an `AuthenticationString`
     refuses to pickle elsewhere) and which this process, connecting to none, has no use for."""
     import multiprocessing.spawn
