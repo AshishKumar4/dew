@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import json
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -26,6 +27,7 @@ from flax import linen as nn
 from dew import _records
 from dew.batch import Variables
 from dew.diffusion.process import Process
+from dew.diffusion.schedules.flow import FlowMatchingScheduler
 from dew.diffusion.schedules.source import Origin, SourceGrid, SourceSchedule
 from dew.inference.loading import place
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
@@ -400,8 +402,7 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
         components.update(safety_configs)
     schedule = SourceSchedule.from_config(_component_config(directory, "scheduler"))
     components["scheduler"] = dict(schedule.config)
-    patch = denoiser.patch * autoencoder.downscale_factor
-    tokens = (height // patch) * (width // patch)
+    tokens = latent_tokens(height, width, denoiser.patch * autoencoder.downscale_factor)
     task = SourceTask(min(policy.steps, schedule.train_steps),
                       CFG(policy.guidance) if policy.guided and policy.guidance > 1 else None,
                       SourceGrid(dict(schedule.config), tokens, denoiser.origin))
@@ -715,6 +716,65 @@ def _square(config: Mapping[str, object], default: int | None = None) -> tuple[i
     side = _records.integer(config["sample_size"] if default is None else config.get("sample_size", default),
                            "sample_size")
     return side, side
+
+
+def latent_tokens(height: int, width: int, patch: int) -> int:
+    """The latent tokens a denoiser reads of a `height` x `width` sample, each token `patch` pixels a side
+    (its patch times its autoencoder's downscale): the count a source grid's resolution shift reads
+    (`SourceGrid.tokens`)."""
+    return (height // patch) * (width // patch)
+
+
+def resized(inputs: InputSpec, process: Process, grid: SourceGrid | None, autoencoder: AutoEncoder | None,
+            size: tuple[int, ...]) -> tuple[InputSpec, Process, SourceGrid | None]:
+    """A pipeline's inputs, process and grid bound at the sample `size` (an image's height and width, a
+    clip's frames before them), as `assemble` binds a published pipeline's at its size: the sample and a
+    mask at it, the autoencoder refusing a size it does not encode (`AutoEncoder.latent_shape`), a published
+    composition's size conditioning at it (`DiffusionConditioner.time_id_values`), and the grid's tokens at
+    it (`latent_tokens`, each token's pixels the grid's tokens at the sample's own size state), with the
+    process's resolution shift where it is the grid's (`FlowShift.base`). A run's own resolution shift,
+    whose constants its process does not keep, stays as the run trained it; a preset a run names sets its
+    own at its size (`DiffusionRunConfig.derived_preset`)."""
+    sample = inputs.sample
+    if len(size) != len(sample.shape) - 1 or any(type(extent) is not int or extent < 1 for extent in size):
+        raise ValueError(f"a sample of shape {sample.shape[:-1]} resizes to as many positive extents, not "
+                         f"{size}")
+    if tuple(size) == sample.shape[:-1]:
+        return inputs, process, grid
+    (before, after), (height, width) = sample.shape[-3:-1], size[-2:]
+    shaped = replace(sample, shape=(*size, sample.shape[-1]))
+    if autoencoder is not None:
+        autoencoder.latent_shape(shaped.shape)
+    conditions = {keyword: replace(condition, encoder=replace(condition.encoder, height=height, width=width))
+                  if isinstance(condition.encoder, DiffusionConditioner) else condition
+                  for keyword, condition in inputs.conditions.items()}
+    mask = None if inputs.mask is None else replace(inputs.mask, shape=(height, width, inputs.mask.shape[-1]))
+    inputs = replace(inputs, sample=shaped, conditions=conditions, mask=mask)
+    if grid is None or grid.tokens is None:
+        return inputs, process, grid
+    patch = math.isqrt(before * after // grid.tokens)
+    if patch < 1 or latent_tokens(before, after, patch) != grid.tokens:
+        raise ValueError(f"the grid's {grid.tokens} tokens at {before} x {after} state no token's pixels a "
+                         "side, which its tokens at another size read")
+    tokens = latent_tokens(height, width, patch)
+    return inputs, _shifted(process, grid, tokens), replace(grid, tokens=tokens)
+
+
+def _shifted(process: Process, grid: SourceGrid, tokens: int) -> Process:
+    """`process` at `tokens` latent tokens (`resized`): a schedule whose shift is the grid's resolution shift
+    at the grid's tokens takes its shift at `tokens`, every other control kept; any other is kept."""
+    flow = grid.schedule.policy.flow
+
+    def at(schedule):
+        if (flow is None or not flow.dynamic or not isinstance(schedule, FlowMatchingScheduler)
+                or not schedule.dynamic or schedule.shift != flow.base(grid.tokens)):
+            return schedule
+        return FlowMatchingScheduler(shift=flow.base(tokens), logit_mean=schedule.logit_mean,
+                                     logit_std=schedule.logit_std, density=schedule.density,
+                                     mode_scale=schedule.mode_scale, dynamic=True)
+
+    return replace(process, schedule=at(process.schedule),
+                   sampling=None if process.sampling is None else at(process.sampling))
 
 
 def _geometry(index: Mapping[str, object], size: tuple[int, int]) -> tuple[int, int]:

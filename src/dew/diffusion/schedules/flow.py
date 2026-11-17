@@ -95,7 +95,7 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler, RectifiedFlow):
         self.dynamic = dynamic
         self.logit_mean = logit_mean
         self.logit_std = logit_std
-        self.density = density
+        self.density: Density = density
         self.mode_scale = mode_scale
 
     def shift_timesteps(self, t) -> jax.Array:

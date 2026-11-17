@@ -238,14 +238,16 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
     kernel.
 
     A run of another task, a revision of a directory, and `text=False`, which the restore of a run's
-    tree cannot skip, are refused, as is a kernel other than `auto` for a denoiser that takes none. So
-    is a `size` other than the run's own, whose conditioning, grid and process are bound to its size
-    (ledger 2792). A run that tuned its autoencoder (`end_to_end`) is started from with its tuned
-    autoencoder, which the started run records and holds (`TunedAutoEncoder`, ledger 2791)."""
+    tree cannot skip, are refused, as is a kernel other than `auto` for a denoiser that takes none. A
+    `size` other than the run's own binds its inputs, conditioning, grid and process at it, as a published
+    pipeline's are bound (`pipeline_assembly.resized`, ledger 2792). A run that tuned its autoencoder
+    (`end_to_end`) is started from with its tuned autoencoder, which the started run records and holds
+    (`TunedAutoEncoder`, ledger 2791)."""
     from dew._records import record
     from dew.diffusion.schedules.source import SourceGrid
     from dew.inference.images import ImageSettings, TextToImage, restored_tree
     from dew.inference.tasks import saved_settings
+    from dew.interop.pipeline_assembly import resized
     from dew.objectives.diffusion.objective import without_loss_heads
 
     if not samples_images(run):
@@ -270,11 +272,6 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
         # The starting run's own tree, which holds the task's published form.
         task = TextToImage.from_saved(run, dtype=dtype, variables=variables, published=True)
         tree = variables
-    sample = task.inputs.sample
-    if size is not None and tuple(size) != sample.shape[:-1]:
-        raise ValueError(f"{checkpoint} trained on {sample.key} of shape {sample.shape[:-1]}, to which its "
-                         f"conditioning, grid and process are bound, and this run's data is {tuple(size)}; "
-                         "train on data of the run's size")
     model = task.model
     if "attention_impl" in {field.name for field in fields(model)}:
         model = model.clone(attention_impl=attention_impl)
@@ -283,8 +280,12 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
                          "is its run's")
     # The grid as its record states it, the one `from_saved` built the task's from.
     grid = None if settings.grid is None else from_record(SourceGrid, record(settings.grid, "grid"))
-    return RunPipeline(model, tree, task.process, task.inputs, task.autoencoder, task.solver, task.steps,
-                       task.guidance, grid)
+    inputs, process = task.inputs, task.process
+    if size is not None:
+        # At the size the run's data has, as a published pipeline binds its own (ledger 2792).
+        inputs, process, grid = resized(inputs, process, grid, task.autoencoder, tuple(size))
+    return RunPipeline(model, tree, process, inputs, task.autoencoder, task.solver, task.steps, task.guidance,
+                       grid)
 
 
 def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema: bool | None = None,
