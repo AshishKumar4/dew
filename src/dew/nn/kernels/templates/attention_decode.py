@@ -33,7 +33,7 @@ import jax.numpy as jnp
 from jax.extend import core as jaxpr_core
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, report
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, emission, report
 from dew.nn.kernels.templates.attention import (
     Hooks,
     Initial,
@@ -42,8 +42,10 @@ from dew.nn.kernels.templates.attention import (
     grouped_rows,
     prescale,
     prologues_taken,
+    spans as key_spans,
     ungrouped_rows,
 )
+from dew.nn.kernels.templates.cost import Work
 
 
 def packable(hooks: Hooks | None) -> bool:
@@ -271,6 +273,50 @@ def planned(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             return None, rows, row_spans, whole
         work[walk] = found
     return work, rows, row_spans, whole
+
+
+def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: int, heads: int,
+                kv_heads: int, width: int, dtype, page_size: int | None = None) -> Work:
+    """A decode step's work as `attend` launches it on `target` (a server's choice between a dense and a paged
+    cache, row 7420): `rows` rows of `queries` query positions, `heads` query heads over `kv_heads` key heads
+    `width` wide in `dtype`, over `keys` keys of a dense cache or, with `page_size`, of a paged pool's pages
+    that long. Each Mosaic launch's work as its emission counts it (`emission.work_of`), the launches in
+    sequence (their spans summed), and a split step's merge its slices' fp32 states read and its output
+    written, one kernel more."""
+    query = jax.ShapeDtypeStruct((rows, queries, heads, width), dtype)
+    spans = key_spans(queries, keys, rows)
+    pages = None if page_size is None else -(-keys // page_size)
+    key = (jax.ShapeDtypeStruct((rows, keys, kv_heads, width), dtype) if pages is None
+           else jax.ShapeDtypeStruct((kv_heads, rows * pages, page_size, width), dtype))
+    table = None if pages is None else jax.ShapeDtypeStruct((rows, pages), jnp.int32)
+    with generation.assumed(target):
+        work, *_ = planned(query, key, key, spans, Hooks(), table=table)
+        if work is None:
+            raise NotImplementedError(f"the template's decode derives no config on {target}")
+        traced = jax.make_jaxpr(lambda q, k, v, t: attend(q, k, v, spans, table=t))(query, key, key, table)
+    launches = [found for kernel in _kernels(traced.jaxpr) if (found := emission.work_of(kernel)) is not None]
+    priced = dataclasses.replace(sum(launches, Work()), span=sum(each.span for each in launches))
+    if max(plan.slices for plan in work.values()) > 1:
+        slices = max(plan.slices for plan in work.values())
+        states = slices * rows * queries * heads * (width + 2) * 4
+        written = rows * queries * heads * width * jnp.dtype(dtype).itemsize
+        priced = priced + Work(device_bytes=states + written, kernels=1)
+    return priced
+
+
+def _kernels(jaxpr) -> list:
+    """Every kernel equation (`pallas_call`, `mpmd_map`) of `jaxpr` and of the jaxprs within it, in order."""
+    found = []
+    for equation in jaxpr.eqns:
+        if equation.primitive.name in ("pallas_call", "mpmd_map"):
+            found.append(equation)
+            continue
+        for value in equation.params.values():
+            for inner in value if isinstance(value, (tuple, list)) else (value,):
+                held = getattr(inner, "jaxpr", inner)
+                if hasattr(held, "eqns"):
+                    found.extend(_kernels(held))
+    return found
 
 
 @overload
