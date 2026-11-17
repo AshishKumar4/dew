@@ -430,31 +430,37 @@ def test_documents_entering_their_own_states_scan_as_each_alone():
     assert_as_exact(mine, theirs, documents_draw, "the TPU kernel's forked call", seeds=24)
 
 
-def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does():
-    """A forked call's entry write (`Chunk.entry_key`) weighed before its outer products, in the TPU kernel
-    and its adjoint: keys and values of 2^80 under a weight of 2^-100 enter 2^60, which the unweighted
-    product, 2^160, took past fp32 to inf (base review 200f6ca65 F1). Every document's read of it through unit
-    readers, no writes and no decay, and every gradient under cotangents of 2^-100, finite wherever the
-    float64 scan's is a float32."""
-    def edge(seed):
-        (x, b, c, a, given, key, value, weight), (out, final) = documents_draw(seed)
-        key, value = (jnp.zeros_like(t).at[:, :, 0].set(2.0 ** 80) for t in (key, value))
-        operands = (jnp.zeros_like(x), b, jnp.ones_like(c), jnp.zeros_like(a), jnp.zeros_like(given), key,
-                    value, jnp.full_like(weight, 2.0 ** -100))
-        return operands, (2.0 ** -100 * out, 2.0 ** -100 * final)
+@pytest.mark.parametrize(("key", "value", "weight", "final"), [(80, 80, -100, -100), (-80, 100, -100, 0),
+                                                            (-40, 100, -40, 56)],
+                         ids=["overflowing pair", "underflowing pair", "overflowing adjoint"])
+def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, value, weight, final):
+    """A forked call's entry write (`Chunk.entry_key`) and its adjoint in the TPU kernel, at powers of two (a
+    key, a value and a weight of 2^`key`, 2^`value`, 2^`weight` on one term, the final memory's cotangent
+    2^`final`, the outputs' none): every output and gradient float64's exactly wherever float64's is a normal
+    float32 (each a sum of equal powers of two, no rounding), through unit readers, no writes and no decay.
+    Formed in one order, a partial product left fp32's range where the whole is in it: keys and values of
+    2^80 under a weight of 2^-100 wrote inf where the write is 2^60, keys of 2^-80 under the same weight zero
+    where it is 2^-80, and a value of 2^100 against a memory's gradient of 2^56 gave the keys' and the
+    weight's gradients inf (base reviews 200f6ca65, 7047162e7)."""
+    (x, b, c, a, given, keys, values, weights), (out, last) = documents_draw(0)
+    keys, values = (jnp.zeros_like(t).at[:, :, 0].set(2.0 ** e) for t, e in ((keys, key), (values, value)))
+    operands = (jnp.zeros_like(x), b, jnp.ones_like(c), jnp.zeros_like(a), jnp.zeros_like(given), keys,
+                values, jnp.full_like(weights, 2.0 ** weight))
+    seeded = (jnp.zeros_like(out), jnp.full_like(last, 2.0 ** final))
 
     def run(scan):
         return lambda operands, seeded: with_gradients(lambda *o: scan(*o))(*operands, seeded)
 
-    operands, seeded = edge(0)
     mine = jax.tree.leaves(without_ynn(run(documents_on_the_kernel))(operands, seeded))
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda t: jnp.asarray(t, jnp.float64), (operands, seeded))
         exact = jax.tree.leaves(jax.jit(run(documents_one_by_one))(*wide))
-    largest = float(jnp.finfo(jnp.float32).max)
+    finfo = jnp.finfo(jnp.float32)
     for ours, theirs in zip(mine, exact, strict=True):
-        representable = np.abs(np.asarray(theirs)) <= largest
-        assert np.isfinite(np.asarray(ours))[representable].all()
+        theirs = np.asarray(theirs)
+        size = np.abs(theirs)
+        normal = (size == 0) | ((size >= float(finfo.tiny)) & (size <= float(finfo.max)))
+        np.testing.assert_array_equal(np.asarray(ours, np.float64)[normal], theirs[normal])
 
 
 @pytest.mark.tpu(reason="the recurrence matrix's TPU cells run on the TPU tier's own TPU")
