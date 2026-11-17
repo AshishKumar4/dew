@@ -1956,7 +1956,7 @@ SOFTPLUS_SITE = ("import jax\n"
      ("src/sparx/nn/derivatives.py", "import jax\n@jax.custom_vjp\ndef rule(x): return x\n")),
     ("SLOP030", SOFTPLUS_SITE, ("nn", "rl", "objectives"), (5, 6, 7),
      ("src/sparx/nn/precision.py", "import jax\nfine = jax.nn.softplus(1.0)\n")),
-], ids=["outer program", "custom derivative"])
+], ids=["outer program", "custom derivative", "softplus"])
 def test_a_construct_built_outside_its_owner_module_is_reported(tmp_path, code, site, packages, lines, owner):
     """SLOP025, SLOP026 and SLOP030: a construct one module of `src/<package>` owns (the compile point's
     `OuterProgram`, JAX's custom derivatives, softplus) is reported wherever its site builds it in any

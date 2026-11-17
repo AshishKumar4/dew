@@ -242,12 +242,13 @@ def test_a_sqrt_softplus_routers_gradient_is_finite_where_softplus_underflows():
 
 def test_the_sqrt_softplus_score_is_the_formula_and_its_tail():
     """`moe.sqrt_softplus` is the plain `sqrt(softplus(logits))` bit for bit wherever `exp(logits)` is
-    above float32's epsilon, and below it the formula's tail `exp(logits / 2)`, the formula's to within
-    that epsilon: an expert down the tail keeps a positive score where the plain formula's is zero."""
-    from dew.nn import moe
+    above float32's epsilon, Dew's one softplus (`precision.softplus`), and below it the formula's tail
+    `exp(logits / 2)`, the formula's to within that epsilon: an expert down the tail keeps a positive score
+    where the plain formula's is zero."""
+    from dew.nn import moe, precision
 
     logits = jnp.asarray([-170.0, -110.0, -40.0, -16.0, -15.0, 0.0, 30.0], jnp.float32)
-    scores, plain = np.asarray(moe.sqrt_softplus(logits)), np.asarray(jnp.sqrt(jax.nn.softplus(logits)))
+    scores, plain = np.asarray(moe.sqrt_softplus(logits)), np.asarray(jnp.sqrt(precision.softplus(logits)))
     above = np.asarray(logits) >= np.log(np.finfo(np.float32).eps)
     np.testing.assert_array_equal(scores[above], plain[above])
     assert np.all(scores > 0) and not np.all(plain > 0)
