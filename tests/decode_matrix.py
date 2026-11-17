@@ -170,6 +170,7 @@ CASES = (
     ('sm90', 'dense', 'mha-8', 'plain', 'float32', '64', 'decode'),
     ('sm80', 'dense', 'gqa-16-8', 'softcap', 'float32', '128', 'template'),
     ('sm90', 'paged', 'gqa-16-8', 'sinks', 'bfloat16', '64', 'triton'),
+    ('v5e', 'paged', 'mha-8', 'plain', 'bfloat16', '128', 'tpu'),
     ('sm80', 'paged', 'mha-8', 'sinks', 'float16', '64', 'template'),
     ('sm90', 'dense', 'gqa-16-8', 'sinks', 'float16', '128', 'decode'),
     ('sm80', 'dense', 'mha-8', 'plain', 'bfloat16', '64', 'cudnn'),
