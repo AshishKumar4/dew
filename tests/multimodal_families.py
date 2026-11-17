@@ -14,10 +14,12 @@ FAMILIES = {
 (tools/multimodal_reference.py float64), and the checkpoint they were written from."""
 
 PROCESSOR_OPTIONS = {"gemma3": {"backend": "pil"}}
-"""The options each family's processor loads under, the ones its source fixture's were written under
-(tools/multimodal_reference.py) and Dew's own processor takes (`dew.interop.processors`): gemma3's image
-processor PIL's, whose pixels a torchvision one's differ from (a drawn site's truth recomputed on PIL pixels
-against a recording made on torchvision's: its sketch 0.733 away)."""
+"""The options each family's reference processor loads under, its source fixtures'
+(tools/multimodal_reference.py) and its drawn site's worker's (tools/multimodal_worker.py) alike: gemma3's
+image processor PIL's, whose pixels a torchvision one's differ from (a drawn site's truth recomputed on PIL
+pixels against a recording made on torchvision's: its sketch 0.733 away). Dew's own processor loads gemma3
+under PIL's too (`dew.interop.processors`), library code no test tool imports; the drawn site holds the two
+alike, its recorded truth recomputed on Dew's pixels."""
 
 OUTPUTS = ("logits", "loss", "pixel_gradient", "updated_logits")
 """The leaves a family's numerics give: its valid logits, its summed next-token loss, its pixel gradient
