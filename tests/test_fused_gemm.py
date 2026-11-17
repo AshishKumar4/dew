@@ -267,16 +267,18 @@ def test_a_named_gate_projection_is_its_launchs_residual_and_its_backward_recomp
 @pytest.mark.parametrize(("hidden", "width", "rows", "taken"),
                          [(1024, 4096 + 512 + 512, 12288, ("sm80", "sm90")),
                           (1024, 2 * 3584, 12288, ("sm80", "sm90")),
-                          (1024, 2048, 12288, ()), (2560, 9216, 24576, ("sm90",))],
-                         ids=["q/k/v", "gate/up", "unmeasured", "4B gate/up"])
+                          (1024, 2048, 12288, ()), (2560, 9216, 24576, ("sm90",)),
+                          (2560, 2 * 9216, 4096, ("sm90",)), (4096, 2 * 14336, 12288, ("sm90",))],
+                         ids=["q/k/v", "gate/up", "unmeasured", "4B up", "4B gate/up", "8B gate/up"])
 def test_a_normed_projection_takes_the_template_where_a_receipt_timed_it(hidden, width, rows, taken, gpu):
     """An RMS norm feeding a bf16 projection of 4 x 3072 rows of 1024 on an A100 or an H100 (its program
     through the algebra's pass, which recognizes the norm as the product's prologue): at the widths M-EM-65
     timed (Qwen3.5-0.8B's joined q/k/v and gate/up, `grouped_matmul.NORMED_08B`) the product's launch is the
     template's and the norm its prologue, as the receipt measured faster than the norm kernel then XLA's
-    dot; a formed projection at a matrix another receipt timed (the 4B's, M-EM-36 on wgmma) its cell's, as
-    the projection unnormed (train 977 F1); at a width none timed, XLA's dot as every dense cell's of their
-    families (DENSE1)."""
+    dot, and on an H100 at the 4B's and the 8B's normed widths M-EM-67 timed (`NORMED_4B_8B`: an A100's lost
+    there); a formed projection at a matrix another receipt timed (the 4B's up, M-EM-36 on wgmma) its
+    cell's, as the projection unnormed (train 977 F1); at a width none timed, XLA's dot as every dense
+    cell's of their families (DENSE1)."""
     from dew import algebra
 
     def normed(x, scale, w):
