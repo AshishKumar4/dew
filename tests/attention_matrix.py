@@ -153,8 +153,9 @@ compiles a module once a process, for one architecture."""
 
 def _certified_route(call: tuple[tuple[str, str], ...]):
     """`_route` as a run takes it: the backward's config certified (`KernelOp.taken`: its derived config, or
-    the next where that one spills as the GPU assembles it alone) on a compile-only GPU of the call's
-    generation, and the two launches' pin only where it holds there too, in that generation's own process."""
+    the next where that one spills as the GPU assembles it alone; declined where none holds) on a
+    compile-only GPU of the call's generation, and the two launches' pin only where it holds there too, in
+    that generation's own process."""
     name = dict(call)["generation"]
     if name not in _CERTIFYING:
         _CERTIFYING[name] = concurrent.futures.ProcessPoolExecutor(
@@ -173,8 +174,13 @@ def _certified_in_process(call: tuple[tuple[str, str], ...]):
             return True, None, None
         two = attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2 if case["width"] == "256" else 1,
                                              family=WGMMA, **FED)
+        config = op.taken(ba)
+        if config is None:
+            # Certification refuses every config the derivation offers: the route takes another mainloop
+            # before the call (`Template.holds`), as where the backward declines it.
+            return True, None, None
         held = op.legal(ba, two, target) and report.certified(op, ba, two) == ()
-        return False, op.taken(ba), two if held else None
+        return False, config, two if held else None
 
 
 def pin_of(case: dict[str, str], *, certified: bool = False) -> attention_mosaic.BackwardTiles | None:
