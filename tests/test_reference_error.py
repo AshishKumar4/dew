@@ -546,7 +546,7 @@ def test_a_reference_compiled_with_options_of_its_own_runs_as_given():
     """A reference compiled with compiler options of its own (a trainer step's, `as_a_step`) runs as
     given: the gate would nest it in its own jit, which a jit with options of its own refuses (row
     1800)."""
-    from reference_error import _arms
+    from arm_forms import _arms
 
     own = jax.jit(lambda x: {"y": x * 2}, compiler_options={"xla_cpu_enable_fast_math": False})
     def doubled(x):
@@ -570,7 +570,8 @@ def test_an_arm_compiled_outside_the_gates_policy_is_refused():
     as the gate would compile it. A plain jit is nested under the gate's own compile, whose options
     apply; a jit with options of its own refuses that nesting itself (row 1800). Every other arm kind
     runs: plain, as given, a window loop's."""
-    from reference_error import _arms, over_windows, without_ynn
+    from arm_forms import _arms
+    from reference_error import over_windows, without_ynn
 
     def doubled(x):
         return {"y": jnp.asarray(x) + jnp.asarray(x)}
@@ -627,7 +628,8 @@ def test_an_arm_of_dew_programs_compiles_them_as_the_gate_compiles_its_other_arm
     seam holding WITHOUT_YNN open (`compiled_with`), so a program it compiles through the seam
     (`dew.nn.kernels.options.program`) carries the option, and beside an arm `as_given` it runs as it
     is; the seam adds nothing once the arm returns, and a run's own XLA flag for an option wins."""
-    from reference_error import WITHOUT_YNN, _arms, as_given, dew_programs
+    from arm_forms import WITHOUT_YNN, _arms
+    from reference_error import as_given, dew_programs
 
     from dew.nn.kernels import options
 

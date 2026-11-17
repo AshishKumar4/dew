@@ -6,6 +6,7 @@ bits of significand, bfloat16's), and a second product of the rounded values. Tw
 first product summed whole, or in two halves of its depth) round about one of its 16,384 values apart a draw,
 each a quantum of the grid, which no float64 truth that rounds for itself can hold both arms to."""
 
+import arm_forms
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -75,12 +76,10 @@ def product(x, w):
 
 def decided_apart(one, other, seeds: int) -> int:
     """How many of `seeds` draws two arms round some value of otherwise, each compiled and run as the gate
-    compiles and runs a site's arms (`reference_error._arms`, `_ynn_decided`, `summed_as_run`)."""
-    import reference_error
-
-    first, second = reference_error._arms(one, other)
+    compiles and runs a site's arms (`arm_forms._arms`, `_ynn_decided`, `summed_as_run`)."""
+    first, second = arm_forms._arms(one, other)
     with summed_as_run():
-        reference_error._ynn_decided("decided apart", [first, second], draw(0))
+        arm_forms._ynn_decided("decided apart", [first, second], draw(0))
         return sum(not np.array_equal(*(np.asarray(arm(*draw(seed)).decisions["q"])
                                         for arm in (first, second))) for seed in range(seeds))
 

@@ -77,8 +77,7 @@ import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import FORMATTED, Truth, rounds_nothing, summed_as_run, unrewritten, widened
 from arm_forms import (
-    WITHOUT_YNN as WITHOUT_YNN,
-    _arms as _arms,
+    _arms,
     _arms_with,
     _declared,
     _given,
@@ -90,7 +89,7 @@ from arm_forms import (
     _varies,
     _window_count,
     _Windowed,
-    _ynn_decided as _ynn_decided,
+    _ynn_decided,
     as_given as as_given,
     dew_path as dew_path,
     dew_programs as dew_programs,
