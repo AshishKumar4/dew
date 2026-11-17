@@ -618,18 +618,16 @@ class OuterProgram:
         """`jitted`'s trace of a call, its program the algebra pass's (`algebra.rewritten_program`), so its
         lowering, its trace, its executable and every relowering read one program (docs/design/algebra.md
         §6.7): the pass reads the trace jit made, which lowers as it is where no rule changes it; a program
-        a rule changes is traced afresh from its rewritten program (`program.replaying`). Its switch is in
-        JAX's trace context, so a held program traces afresh as it changes. A program called within the
-        trace is part of this one, which the pass reads whole (`_nested`)."""
+        a rule changes lowers from its rewritten program, never traced again (`program.traced_as`). Its
+        switch is in JAX's trace context, so a held program traces afresh as it changes. A program called
+        within the trace is part of this one, which the pass reads whole (`_nested`)."""
         token = _PASSING.set(True)
         try:
             traced = jitted.trace(*args, **kwargs)
             rewritten = algebra.rewritten_program(traced.jaxpr)
             if rewritten is traced.jaxpr:
                 return traced
-            replay = algebra.program.replaying(rewritten, jax.tree.structure(traced.out_info), self.numbers,
-                                               self.names)
-            return jax.jit(functools.wraps(self.function)(replay), **self.arguments).trace(*args, **kwargs)
+            return algebra.program.traced_as(traced, rewritten)
         finally:
             _PASSING.reset(token)
 
