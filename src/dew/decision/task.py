@@ -25,7 +25,7 @@ from PIL import Image
 from dew import _records
 from dew._files import write_atomically
 from dew._records import JSON, json_value, record
-from dew.batch import Batch, SegmentBound, Variables
+from dew.batch import Batch, SegmentBound, Variables, part, thaw
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.mixing import CorpusCounts
@@ -54,11 +54,10 @@ from dew.decision.layout import (
     Layout,
     Specials,
     per_question,
-    reader_of,
     render,
     with_context,
 )
-from dew.decision.model import DecisionModel, context_weights
+from dew.decision.model import DecisionModel
 from dew.decision.questions import (
     KINDS,
     Answer,
@@ -537,7 +536,7 @@ class Decide(SavedRunTask, InItsForm):
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
         context = None if settings.context is None else Condition.bound(
-            settings.context, params=context_weights(variables))
+            settings.context, params=thaw(part(variables, "context"))["params"])
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
                               settings.context_encoder, context)
         if settings.tokenizer is None:
@@ -1051,8 +1050,9 @@ class Decide(SavedRunTask, InItsForm):
 
     @property
     def context_reader(self) -> "Tokenizer | ContextReader":
-        """What a request's context is tokenized by (`dew.decision.layout.reader_of`)."""
-        return reader_of(self.tokenizer, self.model.context_reader)
+        """What a request's context is tokenized by (`dew.decision.layout.context_tokens`)."""
+        reader = self.model.context_reader
+        return self.tokenizer if reader is None else reader
 
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None,
@@ -1185,9 +1185,9 @@ class Decide(SavedRunTask, InItsForm):
             played = {}
             for name, options in playing.items():
                 parts = -(-len(options) // group)
-                for part in range(parts):
-                    chosen = options[part * len(options) // parts:(part + 1) * len(options) // parts]
-                    played[f"{name}/{part}"] = _restricted(questions[name], chosen)
+                for piece in range(parts):
+                    chosen = options[piece * len(options) // parts:(piece + 1) * len(options) // parts]
+                    played[f"{name}/{piece}"] = _restricted(questions[name], chosen)
             answers = self._played(state, played, questions)
             remaining |= {name: [_choice(answers[key]) for key in played if key.rsplit("/", 1)[0] == name]
                           for name in playing}
@@ -1223,8 +1223,8 @@ class Decide(SavedRunTask, InItsForm):
         finalists: dict[str, list[str]] = {}
         for name, groups in wide.items():
             kept = []
-            for part in range(len(groups)):
-                answer = answers[f"{name}/{part}"]
+            for piece in range(len(groups)):
+                answer = answers[f"{name}/{piece}"]
                 assert isinstance(answer, ChoiceAnswer)
                 seen = dict(zip(answer.options, map(float, answer.probabilities), strict=True))
                 first[name] |= seen
@@ -1765,7 +1765,6 @@ def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -
     whole (`inference_projections`). A run that held some of them frozen packs as its export does,
     its whole tree's groups, each frozen where all its members were (ledger 2439). An adapter binds
     and an export writes the model's own tree (`unpacked`)."""
-    from dew.batch import part
     from dew.nn.projections import inference_projections, packed_owned
 
     pack = packed_owned if owned else inference_projections
@@ -1776,7 +1775,6 @@ def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -
 def _context_part(model: DecisionModel, variables: Variables) -> dict[str, Variables]:
     """A configured context encoder's weights (`DecisionModel.context`), which a task's trees carry
     beside the backbone's and the head's; none for the backbone's own."""
-    from dew.batch import part
 
     return {} if model.context is None else {"context": part(variables, "context")}
 
@@ -1786,7 +1784,7 @@ def trained_tree(model: DecisionModel, variables: Variables) -> Variables:
     to serve (`_served`), split back (`unpacked`, ledger 2299), so a run trains, and its resume builds,
     one tree wherever it runs: a trunk held frozen splits back frozen (ledger 2439). A task that holds
     no weights (a scoring task's, `Decide.scoring`) has none to split."""
-    from dew.batch import FROZEN, part
+    from dew.batch import FROZEN
     from dew.nn.projections import unpacked
 
     backbone = part(variables, "backbone")
