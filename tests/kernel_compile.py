@@ -94,7 +94,7 @@ class Report:
     compiles a module once a process, so a later compile of it prints no PTX of its own; the digest its name
     carries, its kernel's identity within the launch that traced it (`report.named`), or None; ptxas's notes
     of a performance loss it fails for (`ptxas_read`, `LOSSES`); and what its machine code breaks of the SASS
-    rules (`report.sass_findings`, read where nvdisasm is installed)."""
+    rules (`report.sass_findings_of`, read where nvdisasm is installed)."""
     kernel: str
     shared: int | None
     tmem: int | None
@@ -109,11 +109,14 @@ class Report:
     """The digest of the launch that traced it (`report.Binary.launched`), None where no binary carries it."""
     binary_registers: int | None = None
     binary_frame: int | None = None
-    binary_threads: int | None = None
-    binary_decreased: int | None = None
-    binary_raised: int | None = None
     """Its registers a thread and stack frame's bytes as its executable's binary carries them
     (`report.Binary`): this process's assembly, which `inherited` reads where no PTX of it was dumped."""
+    threads: int | None = None
+    decreased: int | None = None
+    raised: int | None = None
+    """Its threads a block, the registers its producer lowers to and its consumers raise to, as its binary
+    states them (`report.Binary`: its `.nv.info` and its machine code's USETMAXREG), its program's facts
+    whatever assembler made it; None where it states none (a launch of no producer, or no disassembler)."""
     cap: int | None = None
     """The registers its launch runs a thread at, as its compile states them (`_compiled_here`'s), None where
     unstated."""
@@ -181,9 +184,9 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
             launched=binary.launched if binary is not None else None,
             binary_registers=binary.registers if binary is not None else None,
             binary_frame=binary.frame if binary is not None else None,
-            binary_threads=binary.threads if binary is not None else None,
-            binary_decreased=binary.decreased if binary is not None else None,
-            binary_raised=binary.raised if binary is not None else None))
+            threads=binary.threads if binary is not None else None,
+            decreased=binary.decreased if binary is not None else None,
+            raised=binary.raised if binary is not None else None))
     return found_reports
 
 
@@ -753,13 +756,6 @@ def assemblers(generation: str) -> tuple[Path, ...]:
     12.9 held (rows 5671, 5759 and 5761)."""
     return tuple(ptxas_of(build) for build in generation_builds(generation))
 
-RAISED = re.compile(r"setmaxnreg\.inc\.sync\.aligned\.u32 (\d+);")
-"""A raise's registers (`setmaxnreg.inc`'s), as a kernel record states them (`raised`)."""
-DECREASED = re.compile(r"setmaxnreg\.dec\.sync\.aligned\.u32 (\d+);")
-"""A producer's decrease's registers, as a kernel record states them (`decreased`)."""
-
-THREADS = re.compile(r"\.maxntid (\d+),")
-"""A kernel's threads a block (`.maxntid`'s first), as a kernel record states them (`threads`)."""
 PROGRAMS = re.compile(r"\.minnctapersm (\d+)")
 """The programs a multiprocessor holds of a kernel at once (`.minnctapersm`, Mosaic's `min_blocks_per_sm`), as
 ptxas bounds its registers by them (`cap`)."""
@@ -845,26 +841,12 @@ def _compiled_here(cases, generation: str) -> list[dict]:
                 name = report.launch_name(kernel["kernel"], kernel["launch"])
                 if kernel["module"] is not None and name in printed:
                     PTX[kernel["module"]] = printed[name]
-                # The registers its consumers raise to, as its PTX states (`setmaxnreg.inc`); None where they
-                # raise none or no PTX was printed for it.
                 ptx = printed.get(name, PTX.get(kernel["module"], ""))
-                # Where no PTX of it was dumped (its module compiled before the gate's), its executable's
-                # binary's: its threads and register reconfiguration are its program's, whatever assembler
-                # made the binary (row 7105).
-                kernel["raised"] = (int(raise_.group(1)) if (raise_ := RAISED.search(ptx))
-                                    else None if ptx else kernel["binary_raised"])
-                # The registers its producer lowers to, as its PTX states (`setmaxnreg.dec`); None likewise.
-                kernel["decreased"] = (int(lower.group(1)) if (lower := DECREASED.search(ptx))
-                                       else None if ptx else kernel["binary_decreased"])
-                # Its threads a block, as its PTX states (`.maxntid`); None likewise. A record compiled in a
-                # process of its own (`compiled_apart`) carries it where this process's `PTX` holds none.
-                kernel["threads"] = (int(threads.group(1)) if (threads := THREADS.search(ptx))
-                                     else None if ptx else kernel["binary_threads"])
                 # Whether this process dumped its PTX: none where its module compiled before the gate's.
                 kernel["dumped"] = bool(ptx)
                 # The registers its launch runs a thread at, as its compile states them: its consumers' raise
                 # where it raises, else its threads' share of the multiprocessor's registers at the programs
-                # it is launched to hold (`resources.thread_share`); None where no PTX states its threads.
+                # it is launched to hold (`resources.thread_share`); None where its binary states no threads.
                 programs = int(held.group(1)) if (held := PROGRAMS.search(ptx)) else 1
                 with assumed(gpu_target(generation)):
                     kernel["cap"] = (kernel["raised"] if kernel["raised"] is not None
