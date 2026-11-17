@@ -75,6 +75,25 @@ def fewer_rows(family: mosaic.Family) -> tuple[int, ...]:
                  if family.role_rows % rows == 0 and family.specialized(rows, rows) != family)
 
 
+_TILE_SHAPES = {Kind.HEAD: (), Kind.QUERY: (8, 1), Kind.KEY: (1, 8), Kind.TILE: (8, 8)}
+"""A score hook's parameter of each kind as a tile of 8 queries by 8 keys reads it (the reference's,
+`attention._per_head`)."""
+
+
+@functools.lru_cache(maxsize=1024)
+def reads_places(score_mod, kinds: tuple[Kind, ...] = ()) -> bool:
+    """Whether `score_mod(s, q_pos, k_pos, *params)`, its parameters of `kinds`, reads its query's place: its
+    traced program uses the argument, traced once a hook (the template's analyses of a hook are kept for its
+    one function)."""
+    scores = jax.ShapeDtypeStruct((8, 8), jnp.float32)
+    places = jax.ShapeDtypeStruct((8, 8), jnp.int32)
+    params = [jax.ShapeDtypeStruct(_TILE_SHAPES[kind], jnp.float32) for kind in kinds]
+    traced = jax.make_jaxpr(score_mod)(scores, places, places, *params)
+    used = {var for eqn in traced.jaxpr.eqns for var in eqn.invars if isinstance(var, jax_core.Var)}
+    used |= {var for var in traced.jaxpr.outvars if isinstance(var, jax_core.Var)}
+    return traced.jaxpr.invars[1] in used
+
+
 def scopes_products(family: mosaic.Family) -> bool:
     """Whether `family`'s issuer keeps its products' accumulators in scratch a launch scopes
     (`Issuer.product_scratch`: tcgen05's chunks' and rows'), asked of a program with a product of each kind

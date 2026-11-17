@@ -30,7 +30,6 @@ from typing import Literal, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
-from jax.extend import core as jaxpr_core
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, report
@@ -44,6 +43,7 @@ from dew.nn.kernels.templates.attention import (
     prologues_taken,
     ungrouped_rows,
 )
+from dew.nn.kernels.templates.attention_mosaic_program import reads_places
 
 
 def packable(hooks: Hooks | None) -> bool:
@@ -54,7 +54,7 @@ def packable(hooks: Hooks | None) -> bool:
         return True
     if hooks.score_params or hooks.output_mod is not None or hooks.drop is not None:
         return False
-    return hooks.score_mod is None or not _reads_places(hooks.score_mod)
+    return hooks.score_mod is None or not reads_places(hooks.score_mod)
 
 
 def serves(query: jax.Array, key: jax.Array, hooks: Hooks | None, *, natural: bool,
@@ -72,16 +72,6 @@ def serves(query: jax.Array, key: jax.Array, hooks: Hooks | None, *, natural: bo
     batch, positions, _, width = query.shape
     rows = jax.ShapeDtypeStruct((batch, positions * (heads // kv_heads), kv_heads, width), query.dtype)
     return attention_mosaic.streams(rows, target)
-
-def _reads_places(score_mod) -> bool:
-    """Whether `score_mod(s, q_pos, k_pos)` reads its query's place: its traced program uses the argument."""
-    scores = jax.ShapeDtypeStruct((8, 8), jnp.float32)
-    places = jax.ShapeDtypeStruct((8, 8), jnp.int32)
-    traced = jax.make_jaxpr(score_mod)(scores, places, places)
-    used = {var for eqn in traced.jaxpr.eqns for var in eqn.invars if isinstance(var, jaxpr_core.Var)}
-    used |= {var for var in traced.jaxpr.outvars if isinstance(var, jaxpr_core.Var)}
-    return traced.jaxpr.invars[1] in used
-
 
 def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | None = None
            ) -> tuple[jax.Array, KeySpans, Initial | None]:
