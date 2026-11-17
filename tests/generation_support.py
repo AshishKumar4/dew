@@ -21,9 +21,14 @@ INTERPRETS = pytest.mark.skipif(jax.default_backend() != "cpu",
                                 reason="interprets the Mosaic GPU kernels, which a CPU process alone does")
 COMPILES_ON_CPU = pytest.mark.skipif(
     jax.default_backend() != "cpu",
-    reason="reads ptxas's reports of kernels a CPU process compiles for a compile-only device; a GPU "
-           "process's read 0 registers (ET-A05A08-TEST6-h100)")
-"""A mark skipping a resource gate (`kernel_compile.mosaic_failures`) where the process has its own GPU."""
+    reason="compiles kernels ahead for compile-only GPUs, a CPU process's work (bible §8: no GPU is held "
+           "for host compiles), judging each by every CUDA build's ptxas, whose nvcc wheels the CPU "
+           "environment alone installs; a GPU process's Mosaic prints a module's PTX at its first compile "
+           "alone, so the gate's re-run of a module it compiled for its own device reads none (EM-GAC, rows "
+           "7355/7356, 29b3c8921)")
+"""A mark placing a resource gate (`kernel_compile.mosaic_failures`) of kernels compiled ahead for
+compile-only GPUs in a CPU process, where its every build's ptxas is installed and each module's PTX is
+printed for it."""
 SUMS_IN_IEEE = pytest.mark.skipif(
     jax.default_backend() != "cpu",
     reason="compares sums bit for bit as a CPU's IEEE fp32 dots give them, which a GPU's tensor cores, "
