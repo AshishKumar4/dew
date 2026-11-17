@@ -78,12 +78,17 @@ FORMED = [
     recurrence.Hooks(decay='scalar', scale=0.25),
     recurrence.Hooks(decay='vector', l2norm=True, scale=0.25),
     recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True, output=NORMS[1]),
+    recurrence.Hooks(decay='vector', delta=False, reads='before', own_weight=True),
+    recurrence.Hooks(decay='scalar', reads='before'),
+    recurrence.Hooks(decay='vector', delta=False, write_gate=True, own_weight=True),
 ]
 """The launch's other prologue values: Mamba2's step gates clipped with the skip, the gated delta rule's
-gates with a clipped step, a scale without the l2 norm and one under it, and a rated decay with the
-skip and the norm (`recurrence_chunk.chunk`'s SSD)."""
+gates with a clipped step, a scale without the l2 norm and one under it, a rated decay with the
+skip and the norm (`recurrence_chunk.chunk`'s SSD), and the readout's timing and its own write's weight
+(`Hooks.reads`, `Hooks.own_weight`): RWKV6's (a decay a key dimension read before the update, its bonus),
+the delta rule read before its update, and a write gate's own write weighed in a readout after it."""
 
-FORMED_SEEDS = dict(zip(FORMED, (8, 16, 8, 8, 16), strict=True))
+FORMED_SEEDS = dict(zip(FORMED, (8, 16, 8, 8, 16, 16, 16, 16), strict=True))
 """The formed sites' seeds, sized independently by `seeds_for` on armada (2026-10-21)."""
 
 BF16_SEEDS = {HOOKS[0]: 8, HOOKS[-1]: 16}
@@ -140,6 +145,8 @@ def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32,
             given['log_decay'] = -jnp.abs(normal(rows, VALUE_HEADS, key_width, scale=0.2))
         if hooks.gated_write:
             given['beta'] = jax.nn.sigmoid(normal(rows, VALUE_HEADS))
+    if hooks.own_weight:
+        given['own'] = normal(VALUE_HEADS, key_width, scale=0.5)
     if hooks.skip:
         given['skip'] = normal(VALUE_HEADS)
     if hooks.output is not None:

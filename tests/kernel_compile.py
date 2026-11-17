@@ -109,6 +109,9 @@ class Report:
     """The digest of the launch that traced it (`report.Binary.launched`), None where no binary carries it."""
     binary_registers: int | None = None
     binary_frame: int | None = None
+    binary_threads: int | None = None
+    binary_decreased: int | None = None
+    binary_raised: int | None = None
     """Its registers a thread and stack frame's bytes as its executable's binary carries them
     (`report.Binary`): this process's assembly, which `inherited` reads where no PTX of it was dumped."""
     cap: int | None = None
@@ -177,7 +180,10 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
             sass=tuple(binary.sass or ()) if binary is not None else (),
             launched=binary.launched if binary is not None else None,
             binary_registers=binary.registers if binary is not None else None,
-            binary_frame=binary.frame if binary is not None else None))
+            binary_frame=binary.frame if binary is not None else None,
+            binary_threads=binary.threads if binary is not None else None,
+            binary_decreased=binary.decreased if binary is not None else None,
+            binary_raised=binary.raised if binary is not None else None))
     return found_reports
 
 
@@ -537,9 +543,10 @@ class Gated(str):
 
 def stated_outputs(lowered: jax.stages.Lowered, target: str | None = None) -> list[tuple[int, list | None]]:
     """Each custom call of `lowered` (of the call target `target`, every one where None), in the order JAX
-    lowered them: the outputs it defines (its results less those aliasing an operand, a ref it writes in
-    place) and the dimensions it states them by (`outputs.OUTPUT_DIMS`, parsed; None where it states none),
-    as XLA's compiler reads its frontend attribute."""
+    lowered them, a call no run reaches among them (`_read`'s `unrun`: XLA compiles it all the same): the
+    outputs it defines (its results less those aliasing an operand, a ref it writes in place) and the
+    dimensions it states them by (`outputs.OUTPUT_DIMS`, parsed: a list an output, its every dimension's
+    `[operand, axis]` pairs; None where it states none), as XLA's compiler reads its frontend attribute."""
     from jax.extend.mlir import ir
 
     from dew.nn.kernels import lowered as reading
@@ -553,7 +560,7 @@ def stated_outputs(lowered: jax.stages.Lowered, target: str | None = None) -> li
         stated = reading._frontend(operation.attributes).get(OUTPUT_DIMS)
         return len(operation.results) - aliased, None if stated is None else json.loads(stated)
 
-    return [call for call, _ in reading._read_calls(lowered, read)]
+    return [call for call, _ in reading._read_calls(lowered, read, unrun=True)]
 
 def gate_generations(dtype=jnp.bfloat16, *, stated: bool = False, scoped: bool = False, tpu: bool = False,
                      needs: Callable[[Any, Any], bool] | None = None) -> tuple[Gated, ...]:
@@ -841,12 +848,18 @@ def _compiled_here(cases, generation: str) -> list[dict]:
                 # The registers its consumers raise to, as its PTX states (`setmaxnreg.inc`); None where they
                 # raise none or no PTX was printed for it.
                 ptx = printed.get(name, PTX.get(kernel["module"], ""))
-                kernel["raised"] = int(raise_.group(1)) if (raise_ := RAISED.search(ptx)) else None
+                # Where no PTX of it was dumped (its module compiled before the gate's), its executable's
+                # binary's: its threads and register reconfiguration are its program's, whatever assembler
+                # made the binary (row 7105).
+                kernel["raised"] = (int(raise_.group(1)) if (raise_ := RAISED.search(ptx))
+                                    else None if ptx else kernel["binary_raised"])
                 # The registers its producer lowers to, as its PTX states (`setmaxnreg.dec`); None likewise.
-                kernel["decreased"] = int(lower.group(1)) if (lower := DECREASED.search(ptx)) else None
+                kernel["decreased"] = (int(lower.group(1)) if (lower := DECREASED.search(ptx))
+                                       else None if ptx else kernel["binary_decreased"])
                 # Its threads a block, as its PTX states (`.maxntid`); None likewise. A record compiled in a
                 # process of its own (`compiled_apart`) carries it where this process's `PTX` holds none.
-                kernel["threads"] = int(threads.group(1)) if (threads := THREADS.search(ptx)) else None
+                kernel["threads"] = (int(threads.group(1)) if (threads := THREADS.search(ptx))
+                                     else None if ptx else kernel["binary_threads"])
                 # Whether this process dumped its PTX: none where its module compiled before the gate's.
                 kernel["dumped"] = bool(ptx)
                 # The registers its launch runs a thread at, as its compile states them: its consumers' raise

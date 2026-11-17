@@ -1,0 +1,10 @@
+{
+ "bytes": 1095692,
+ "license": "Apache-2.0",
+ "origin": "github",
+ "path": "bfd1149c09ae0c8df0a91fd921d3531932a85268dab32b117f5e6f7fc1bd6074.npz",
+ "reference": "huggingface/transformers 5.16.1",
+ "repo": "AshishKumar4/dew-fixtures",
+ "revision": "store-1",
+ "sha256": "bfd1149c09ae0c8df0a91fd921d3531932a85268dab32b117f5e6f7fc1bd6074"
+}

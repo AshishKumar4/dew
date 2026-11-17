@@ -450,6 +450,16 @@ def kernel_path(layer) -> tuple:
     return tuple(jax.tree_util.DictKey(name) for name in ('params', *layer.scope.path, 'kernel'))
 
 
+def extents(lhs_shape: tuple[int, ...], rhs_shape: tuple[int, ...], dimension_numbers) -> tuple[int, int]:
+    """A layer's product's depth and width as matrices (`jax.lax.dot_general`'s `dimension_numbers` over
+    operands of these shapes), the extents a recipe reads (`recipe_refusal`), `recipe_general`'s and a
+    wrapped product's refusal's alike (`dew.nn.dense`): the depth the product of the left operand's
+    contracting axes, the width the product of the kernel's free axes, neither contracting nor batch."""
+    (contracted, against), (_, batched_rhs) = (tuple(map(tuple, pair)) for pair in dimension_numbers)
+    return (math.prod(lhs_shape[axis] for axis in contracted),
+            math.prod(rhs_shape[axis] for axis in range(len(rhs_shape)) if axis not in against + batched_rhs))
+
+
 def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype) -> jax.Array | None:
     """A layer's product (`jax.lax.dot_general`'s `dimension_numbers`) in the run's low-precision recipe
     (`recipe_projection`), as matrices: a dense projection's free rows against its kernel's contracted
@@ -467,8 +477,7 @@ def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype)
     free_rhs = [axis for axis in range(rhs.ndim) if axis not in against + batched_rhs]
     groups = math.prod(lhs.shape[axis] for axis in batched)
     count = math.prod(lhs.shape[axis] for axis in free)
-    depth = math.prod(lhs.shape[axis] for axis in contracted)
-    width = math.prod(rhs.shape[axis] for axis in free_rhs)
+    depth, width = extents(lhs.shape, rhs.shape, dimension_numbers)
     rows = jnp.transpose(lhs, (*batched, *free, *contracted)).reshape(groups * count, depth)
     matrices = jnp.transpose(rhs, (*batched_rhs, *against, *free_rhs)).reshape(groups, depth, width)
     out = (recipe_projection(rows, matrices, jnp.full((groups,), count, jnp.int32), out_dtype=out_dtype)

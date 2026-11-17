@@ -714,6 +714,44 @@ def _occupancy_unsaved(template, metadata):
     return template.with_window(dataclasses.replace(template.window, fill=None))
 
 
+def _clip_pooled_unsaved(template, metadata):
+    """A restore's `template`, a train state's, whose QK-Clip states hold their held microsteps' pooled
+    maxima (`dew.optim.QKClipState.pooled`), where the checkpoint was saved before the state held them:
+    each such leaf made as no microstep held back (zero), which every such checkpoint's run held none of
+    (its trainer refused a clip under a held update), so the restore keeps it as made. The one translation
+    of that form at the restore boundary (CONTRIBUTING), deleted at 1.0. Any other template as it is."""
+    from dew.optim import QKClipState, clips_qk
+    from dew.state import TrainState
+
+    if not isinstance(template, TrainState) or not clips_qk(template.opt_state):
+        return template
+    if not _clip_states_unpooled(metadata.get("opt_state")):
+        return template
+
+    def made(leaf):
+        held = jnp.zeros(leaf.shape, leaf.dtype)
+        return held if leaf.sharding is None else jax.device_put(held, leaf.sharding)
+
+    def unpooled(state):
+        if not isinstance(state, QKClipState):
+            return state
+        return state._replace(pooled={key: made(leaf) for key, leaf in state.pooled.items()})
+
+    return dataclasses.replace(template, opt_state=jax.tree.map(
+        unpooled, template.opt_state, is_leaf=lambda node: isinstance(node, QKClipState)))
+
+
+def _clip_states_unpooled(tree) -> bool:
+    """Whether a checkpoint's optimizer-state metadata `tree` holds a QK-Clip state of the form before its
+    pooled maxima: its steps and rescales with no `pooled` beside them, as Orbax names a NamedTuple's
+    fields."""
+    if isinstance(tree, Mapping):
+        if {"steps", "rescales"} <= tree.keys() and "pooled" not in tree:
+            return True
+        return any(_clip_states_unpooled(value) for value in tree.values())
+    return isinstance(tree, list | tuple) and any(_clip_states_unpooled(value) for value in tree)
+
+
 @dataclasses.dataclass(frozen=True)
 class _ArrayFacts:
     """An array of a step's item metadata as a holder hands it to a process that lost its copy: its shape
@@ -2068,7 +2106,7 @@ class Checkpoints:
         stored = metadata.keys()
         _check_template(template, metadata, stored, mapping=mapping)
         placed = template
-        template = _occupancy_unsaved(template, metadata)
+        template = _clip_pooled_unsaved(_occupancy_unsaved(template, metadata), metadata)
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None
         if template is None:

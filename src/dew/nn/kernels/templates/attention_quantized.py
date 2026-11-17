@@ -31,8 +31,8 @@ def owner():
     """The Qwix rule that owns this call's products, a quantized model's matching `dot_general` at the
     calling module (`precision.products_quantized`, `qwix.pallas.get_current_rule`), or None. A model's
     interception installs its rule inside the trace, where a call's function states it; a rule that
-    encloses a whole call (a program called within Qwix's interception) is this process's, which a kept
-    program is held to (`traced_fact`)."""
+    encloses a whole call (a program called within Qwix's interception) is this process's, a fact a trace
+    reads (`traced_fact`), which the program it lowers to states."""
     if not products_quantized():
         return None
     from qwix import pallas as qwix_pallas

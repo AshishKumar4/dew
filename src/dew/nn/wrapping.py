@@ -138,6 +138,10 @@ class DecoderWrapper(nn.Module):
         return self._decoder.fork_refusal(train)
 
     @nn.nowrap
+    def prefix_sharing_refusal(self, train: bool = False) -> str | None:
+        return self._decoder.prefix_sharing_refusal(train)
+
+    @nn.nowrap
     def block_chunks(self) -> tuple[int | None, ...]:
         """The decoder's trunk layers that read blocks, by their attention chunk (`BlockReading`); the
         wrapper's own modules read none."""

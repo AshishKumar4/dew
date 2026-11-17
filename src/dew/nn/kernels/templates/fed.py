@@ -10,7 +10,7 @@ from jax.experimental import pallas as pl
 from dew.nn.kernels.templates import mosaic, resources
 from dew.nn.kernels.templates.handoffs import Role, Schedule
 from dew.nn.kernels.templates.mosaic import RingFamily
-from dew.nn.kernels.templates.rings import Ring, drain, loaded_once
+from dew.nn.kernels.templates.rings import Ring, drain, loaded_once, stepped_in
 
 
 @dataclasses.dataclass(frozen=True)
@@ -42,9 +42,9 @@ class Feed:
         return min((ring.stages for ring in self.rings.values()), default=1)
 
     def load(self, index) -> None:
-        for name, ring in self.rings.items():
-            view = ring.viewed(self.views[name], index - self.origin)
-            ring.load(ring.turn(index - self.first), view)
+        # A joined pair's slot freed once and its members copied into it (`rings.stepped_in`).
+        stepped_in(self.rings, lambda name, ring: ring.turn(index - self.first),
+                   lambda name, ring: ring.viewed(self.views[name], index - self.origin))
 
     def primed(self) -> None:
         """The walk's first steps, a slot each, loaded."""
