@@ -1443,12 +1443,15 @@ def assert_backward_witnessed(lane: Lane, heads: int = 1) -> None:
     wide = draw(0, "mild", heads=heads, dtype=jnp.float32)
     forms = ((operands, True), (operands, False), (wide, True))
     runs = [(x, delta, recorded(*x, delta=delta)) for x, delta in forms]
-    for back in (recorded_backward(x, delta=delta, run=run) for x, delta, run in runs if run.trained):
+    backs = [recorded_backward(x, delta=delta, run=run) for x, delta, run in runs if run.trained]
+    for back in backs:
         held = back_witnessed(back, lane)
         for name, inside in held.items():
             assert np.all(inside), (back.run.write, back.run.held, name, np.mean(inside))
-    back = recorded_backward(operands)
-    other = recorded_backward(operands, seed=1)
+    # The bf16 delta rule's backward witnessed above (the first form, which every device trains), its
+    # records claimed for another draw's gradients; recorded again, it took a quarter of the witness.
+    back = backs[0] if runs[0][2].trained else recorded_backward(operands, run=runs[0][2])
+    other = recorded_backward(operands, seed=1, run=runs[0][2])
     claimed = back._replace(dh=other.dh, dh0=other.dh0, records=other.records)
     refused = back_witnessed(claimed, lane)
     for name, share in CARRIED_GRADIENT_SHARES.items():

@@ -213,7 +213,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # forms' three parts, whose solve no sm90 thread holds, past the fast ones the selector gave it).
         epilogue = hooks.output is not None or dtype != jnp.result_type(query, key, value)
         wide_out = hooks.skip or epilogue
-        rounded = chunk_rounding(hooks.delta, jnp.result_type(query, key, value))
+        rounded = chunk_rounding(hooks.delta, jnp.result_type(query, key, value), released=simple_gla(hooks))
         skip = given['skip'] if hooks.skip else None
         # Without the delta rule the template takes the skip, its output wide where an epilogue or the
         # caller reads it so (`chunk_forward.forward`).
@@ -1523,10 +1523,23 @@ def fast_rounding(dtype) -> bool:
     return rounds_products()
 
 
-def chunk_rounding(delta: bool, dtype) -> bool:
+def simple_gla(hooks: recurrence.Hooks) -> bool:
+    """Whether a form is fla's simple GLA: a decay a head, no delta rule, write gate, gates, skip or output
+    epilogue (lightning attention's, `dew.nn.mixers.lightning.LIGHTNING`; fla 0.5.2's `chunk_simple_gla`,
+    which its `chunk_lightning_attn` calls at a fixed decay, ops/lightning_attn/chunk.py:73-84)."""
+    return hooks.decay == 'scalar' and not (hooks.delta or hooks.write_gate or hooks.rated or hooks.gates
+                                            or hooks.skip or hooks.output)
+
+
+def chunk_rounding(delta: bool, dtype, *, released: bool = False) -> bool:
     """Whether a call of `dtype` on the delta rule's route (`chunk`, `port_kernel`) takes the run's fast
-    forms' numbers (`fast_rounding`): the delta rule's alone, whose bar is fla's (TF32 products in an fp32
-    call). A form without the delta rule has no port, its bar the portable math at full fp32: an fp32 call's
+    forms' numbers (`fast_rounding`): a form whose upstream release is its bar (docs/design/testing.md) at
+    that release's rounding, the delta rule's, fla's (TF32 products in an fp32 call), and fla's simple GLA
+    without it (`released`, `simple_gla`): its states and scores bf16 at each product, its sums fp32 (fla
+    0.5.2 ops/common/chunk_h.py:84-151, chunk_o.py:88-139), where held whole in fp32's three parts lightning
+    attention ran 4.9 times fla's forward and 2.6 times its training on a GH200 (row 6823, M-JS-129); under
+    the accurate forms it keeps them whole, its bar the recurrence a token at a time. A form no release
+    holds has no port, its bar the portable math at full fp32: an fp32 call's
     two bf16 parts put its training step 30 to 69 times the portable math's distance from float64 on every
     leaf, interpreted and on a GH200 alike (row 184's write gate cell, jsf-cellcpu, M-JS-9), and its forward
     57 to 77 times (test_recurrence_mosaic's hooks7, hooks12 and hooks26 and the step-gated packed cell), so
@@ -1537,7 +1550,7 @@ def chunk_rounding(delta: bool, dtype) -> bool:
     forms' two bf16 parts, 26 times (the stability suite's scalar write), and Mamba-3's bf16 layer's output
     and final state 46 and 29 times (jsf-theme4-head at 269dc1a2a1a, audit A5): no fast form of these is
     as exact as the portable math, so the fast forms leave them whole."""
-    return fast_rounding(dtype) and delta
+    return fast_rounding(dtype) and (delta or released)
 
 
 def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_size: int,

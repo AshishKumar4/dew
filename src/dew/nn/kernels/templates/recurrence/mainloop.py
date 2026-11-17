@@ -138,7 +138,7 @@ def block_of(family: mosaic.Family) -> int:
 
 
 
-@dataclasses.dataclass(frozen=True, repr=False)
+@dataclasses.dataclass(frozen=True)
 class Tiles:
     """A forward's tiles, the recurrence template's config, derived from the call's shape and the device's
     and its bundle's facts (`templates.recurrence.template.Mosaic.derived`): the value block the states
@@ -163,14 +163,6 @@ class Tiles:
     """The most programs a multiprocessor holds of its launches where a compile found them spilling with
     their producers' ladders run out (`template.Mosaic._fewer`), every other launch's as many as its plan
     holds."""
-
-    def __repr__(self) -> str:
-        # Its fields as a dataclass names them, its residents only where a rung set them: a config's repr is
-        # its identity in every store (its certification's program, `report._compiled_launch`; the kernels'
-        # names, `report.named`), which a config without them keeps as it was before they were a field.
-        fields = [field for field in dataclasses.fields(self)
-                  if field.name != "residents" or self.residents.held_to]
-        return f"{type(self).__name__}({', '.join(f'{f.name}={getattr(self, f.name)!r}' for f in fields)})"
 
     @property
     def output_block(self) -> int:
@@ -268,15 +260,14 @@ class Operand:
         return jax.ShapeDtypeStruct((self.parts * self.rows, columns), self.stored)
 
     def split(self, x):
-        """`x` `[rows, columns]` in its dtype as its stacked parts."""
+        """`x` `[rows, columns]` in its dtype as its stacked parts (`product.stacked`)."""
         if self.parts == 1:
             return x.astype(self.dtype)
-        return jnp.concatenate(product.formed(x.astype(jnp.float32), self.parts), 0)
+        return product.stacked(x, self.parts)
 
     def joined(self, x):
-        """Its stacked parts `x` as the value `[rows, columns]` they sum to, fp32 (`split`'s inverse,
-        `product.whole`)."""
-        return product.whole(list(x.reshape(self.parts, -1, x.shape[-1])))
+        """Its stacked parts `x` as the value `[rows, columns]` they sum to, fp32 (`product.joined`)."""
+        return product.joined(x, self.parts)
 
 
 @dataclasses.dataclass(frozen=True)

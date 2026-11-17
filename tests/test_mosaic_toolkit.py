@@ -327,23 +327,30 @@ def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_c
 @pytest.mark.parametrize("generation_name", gate_generations(
     needs=lambda family, architecture: architecture.multiprocessor.register_raises is not None))
 def test_a_spilled_launchs_producer_steps_down_its_ladder_from_its_top(generation_name):
-    """A derivation's rung (`resources.Producers.stepped`): a spilled launch's producer to its top first (its
-    program's entry share), then a setmaxnreg step lower each time; every other launch's left where it was;
-    none at the ladder's foot, a step above the least, so the derivation steps its tiles down instead; a top
-    past setmaxnreg's most bounded at it."""
+    """A derivation's rung (`resources.Producers.stepped`): a spilled launch's producer from the least to its
+    stated cap where it has one (its consumers' statement's share), else to its top (its program's entry
+    share), then from the stated cap to its top, then a setmaxnreg step lower each time, past the stated cap,
+    asked already; every other launch's left where it was; none at the ladder's foot, a step above the least,
+    so the derivation steps its tiles down instead; a top past setmaxnreg's most bounded at it."""
     from dew.nn.kernels.templates import resources
 
     with generation.assumed(generation_name):
         steps = resources.facts().raises()
         top = steps.lowest + 13 * steps.step
-        first = resources.Producers().stepped({"states": top})
-        second = first.stepped({"states": top, "scan": top})
+        first = resources.Producers().stepped({"states": top}, {})
+        second = first.stepped({"states": top, "scan": top}, {})
         assert (first.of("states"), first.of("scan")) == (top, None)
         assert (second.of("states"), second.of("scan")) == (top - steps.step, top)
+        stated = {"states": top - 2 * steps.step}
+        rungs, rung = [], resources.Producers()
+        for _ in range(4):
+            rung = rung.stepped({"states": top}, stated)
+            rungs.append(rung.of("states"))
+        assert rungs == [top - 2 * steps.step, top, top - steps.step, top - 3 * steps.step]
         foot = resources.Producers((("states", steps.lowest + steps.step),))
-        assert foot.stepped({"states": top}) is None
-        assert resources.Producers().stepped({"states": steps.lowest}) is None
-        assert resources.Producers().stepped({"states": steps.highest + steps.step}).of("states") == (
+        assert foot.stepped({"states": top}, {}) is None
+        assert resources.Producers().stepped({"states": steps.lowest}, {}) is None
+        assert resources.Producers().stepped({"states": steps.highest + steps.step}, {}).of("states") == (
             steps.highest)
 
 
