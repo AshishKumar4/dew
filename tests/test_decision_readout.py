@@ -24,7 +24,7 @@ from dew.batch import part, thaw
 from dew.decision import Choice
 from dew.decision.head import LabelReadout, SlotReadout
 from dew.decision.inputs import DecisionInputs
-from dew.decision.layout import Labels, StateFirstLayout
+from dew.decision.layout import Labels, SegmentLayout
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.interop import Pretrained
@@ -37,7 +37,7 @@ LLAMA = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
 
 LABELS = Labels(variants=("{}",))
 """Labels a byte vocabulary spells as one token each: the bare letter."""
-LAYOUT = StateFirstLayout(max_len=128, labels=LABELS)
+LAYOUT = SegmentLayout.state_first_row(max_len=128, labels=LABELS)
 QUESTION = Choice("Which team?", ["billing", "technical", "sales"])
 READOUT_SEEDS = 8
 """Check 1's declared seeds for each readout site."""

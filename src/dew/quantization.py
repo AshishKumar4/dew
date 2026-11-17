@@ -231,6 +231,10 @@ class Quantization:
         """
         return _qwix_wrapped(model, _providers()[0](_rules(self, training=True)), self)
 
+    def keeps_products_linear(self, train: bool) -> bool:
+        """Never: its products round their operands (`dew.registry.Wrapper.keeps_products_linear`)."""
+        return False
+
 
 @runtime_checkable
 class QuantizedClass(Protocol):
@@ -961,6 +965,11 @@ class InputQuantization:
         frozen = unboxed(frozen)
         return unflatten_dict({(*site.split("/"), leaf): value for site in self.frozen_fp8
                                for leaf, value in frozen_fp8_leaves(_site_kernel(frozen, site)).items()})
+
+    def keeps_products_linear(self, train: bool) -> bool:
+        """Never: its sites round their inputs or multiply by FP8 codes
+        (`dew.registry.Wrapper.keeps_products_linear`)."""
+        return False
 
     def apply(self, model: nn.Module) -> nn.Module:
         """Return `model` quantizing each Linear's input to its declared format

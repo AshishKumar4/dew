@@ -79,10 +79,10 @@ def forked(decoder: CausalTransformer, train: bool = False, *, joint: bool = Fal
     own row does, or None (`dew.nn.protocols.ForkedCalls`): a bidirectional decoder, whose shared prefix
     reads each branch's tokens; in training, dropout, which draws each row's masks apart where a shared
     prefix draws them once; its mixture's block routing or capacity (`Mixture.fork_refusal`), or a layer
-    whose mixer reads no forks (`MixerBase.fork_refusal`). Attention, the recurrent mixers, engram's n-gram
-    hashes (over each chain, `dew.nn.engram._forked_lookback`) and tokenwise layers read each document
-    from its ancestors alone; a learned position embedding reads the places forks give each
-    token; cross-attention reads each tree's own context (`Forks.trees`), a context a tree."""
+    whose mixer reads no forks (`MixerBase.fork_refusal`). Attention, the recurrent mixers, the in-context
+    memories, engram's n-gram hashes (over each chain, `dew.nn.engram._forked_lookback`) and tokenwise
+    layers read each document from its ancestors alone; a learned position embedding reads the places forks
+    give each token; cross-attention reads each tree's own context (`Forks.trees`), a context a tree."""
     if not decoder.causal:
         return "a bidirectional decoder reads each token's later tokens, which a fork's branches hold apart"
     # A joint tree is one row, its masks drawn once for it as its own row draws them (`Forks.joint`).
@@ -92,6 +92,32 @@ def forked(decoder: CausalTransformer, train: bool = False, *, joint: bool = Fal
     if decoder.mixture is not None and (refusal := decoder.mixture.fork_refusal()) is not None:
         return refusal
     return _layer(decoder, lambda mixer, _: mixer.fork_refusal())
+
+
+def prefix_sharing(decoder: CausalTransformer, train: bool = False) -> str | None:
+    """Why rows that begin alike should not be packed over their shared prefixes, or None
+    (`dew.nn.protocols.ForkedCalls.prefix_sharing_refusal`): a call over forks the decoder would not compute
+    as each document's own row does (`forked`), or a layer that computes one at more work than the rows
+    laid whole (`MixerBase.fork_sharing_refusal`: an in-context memory off its shared recurrence, its own
+    configuration's or under a wrapper whose products are not linear)."""
+    if (refusal := forked(decoder, train)) is not None:
+        return refusal
+    linear = _keeps_products_linear(decoder, train)
+    return _layer(decoder, lambda mixer, _: mixer.fork_sharing_refusal(linear))
+
+
+def _keeps_products_linear(decoder: CausalTransformer, train: bool) -> bool:
+    """Whether every wrapper of the decoder's products keeps them linear in a call, a training one where
+    `train` (`dew.registry.Wrapper.keeps_products_linear`): its wrapper classes' records
+    (`dew.registry.wrapper_layers`) and the quantization a served model computes under, which records no
+    wrapper class (`dew.quantization.QuantizedClass`)."""
+    from dew.quantization import QuantizedClass
+    from dew.registry import wrapper_layers
+
+    wrappers = [layer._dew_wrapper() for layer in wrapper_layers(type(decoder))[1]]
+    if isinstance(decoder, QuantizedClass):
+        wrappers.append(type(decoder)._dew_quantization)
+    return all(wrapper.keeps_products_linear(train) for wrapper in wrappers)
 
 
 def _layer(decoder: CausalTransformer, refused: Callable[[MixerBase, MixerContext], str | None]

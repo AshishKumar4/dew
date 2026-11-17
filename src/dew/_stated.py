@@ -1,9 +1,9 @@
 """One statement of a user's code and the values it reads, as plain data equal in every process that holds an
-equal value (`stated`): what a traced program's identity holds of its function and call
-(`dew.training.identity`) and what holds a data step's own code (`dew.data.plan.StepIdentity`), which reads no
-training module. A function or a class of the user's own code (`dew._sources.own_source`) is its name with
-what it reads, walked through every function, class and module of the user's it reaches; anything else by
-its type and value, or refused (`Unestablished`).
+equal value (`stated`): what a rung record's key holds of a model (`dew.training.rungs`), a program's trees as
+its digest states them (`dew.nn.kernels.options.program_digest`) and what holds a data step's own code
+(`dew.data.plan.StepIdentity`), which reads no training module. A function or a class of the user's own code
+(`dew._sources.own_source`) is its name with what it reads, walked through every function, class and module of
+the user's it reaches; anything else by its type and value, or refused (`Unestablished`).
 
 This module is the boundary where Dew reads values it has no type for: any object a call names, any module a
 process loaded. Its private readers ask each what Python's object model says of it (its module, its name, its
@@ -31,13 +31,13 @@ from dew.algebra import terms
 
 
 class Unestablished(ValueError):
-    """A value a call's identity cannot state without tracing the call (`stated`): what a save leaves
-    out, naming it (`dew.training.ahead.Keeping.refused`), and a handing compiles as without its file."""
+    """A value with no stated form (`stated`): a program whose trees hold one is one a save leaves out,
+    naming it (`dew.training.ahead.Keeping.refused`), and a handing compiles as without its file."""
 
 
 def _coded(module: str | None, at: str) -> str:
-    """`module`, the module a class or function at `at` is defined in, where its code is a file a process
-    record digests or a version states (`Process`): refused where it has none (a notebook's or a shell's
+    """`module`, the module a class or function at `at` is defined in, where its code is a file or a version
+    states it: refused where it has none (a notebook's or a shell's
     `__main__`), as its code could change with nothing to show it."""
     # A module with no file of its own is its nearest package's (an extension module's submodule).
     names = (module or "").split(".")
@@ -86,7 +86,7 @@ def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
     """`value` as an identity states it: a JSON value equal in every process that holds an equal value.
 
     A class, a module's function or any object its module holds under its own name is that name (`_named`:
-    its code is the process record's, `Process`), and one of a user's own code with what it reads (`_own`);
+    its code named by where it is defined), and one of a user's own code with what it reads (`_own`);
     a function no module holds (a lambda, a local one) is its code (`_code`) with what it reads (`reads`); a
     dataclass its type and fields; a number its type and bits, an array of NumPy's its dtype, shape and
     bytes; a mapping's pairs and a set's members in the order it holds them, which a trace may read; a
@@ -94,7 +94,7 @@ def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
     a mesh, a sharding and a partition as the algebra's structural key states them
     (`dew.algebra.terms.parameter_key`, the one owner of a placement as plain data); JAX's other values of
     a call's key (an abstract value, a tree's structure node by node, a format, a device) by their parts. A
-    value among `known` (by its `id`) is what its caller says of it (`call_identity`).
+    value among `known` (by its `id`) is what its caller says of it.
 
     Refused, naming `at` and the value's type, for anything else, an array of JAX's among them (a constant
     of the program, which its executable cannot serialize): an object with no such form could differ
@@ -237,10 +237,12 @@ def traceback_frames(traceback) -> list[str]:
 
 def _frame_module(file: str) -> str:
     """The module a frame's `file` is, by the longest import path entry it lies under (`a/b.py` under it is
-    `a.b`), else its file's name: no directory where the run is installed."""
+    `a.b`), each entry as Python reads it (`''` the working directory, as under `-c`, a REPL or a notebook),
+    else its file's name: no directory where the run is installed, and one module however Python was
+    launched."""
     real = os.path.realpath(file)
-    roots = [root for entry in sys.path if entry
-             and real.startswith(root := os.path.join(os.path.realpath(entry), ""))]
+    roots = [root for entry in sys.path
+             if real.startswith(root := os.path.join(os.path.realpath(entry or os.curdir), ""))]
     if not roots:
         return os.path.basename(file)
     relative = os.path.splitext(real[len(max(roots, key=len)):])[0]

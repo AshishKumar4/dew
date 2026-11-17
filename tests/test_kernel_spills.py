@@ -187,33 +187,22 @@ argv[1] names: each program it lowered by name, and each Mosaic GPU kernel lower
 text."""
 
 
-def _launch_config(name: str) -> tuple[tuple[str, bool], str]:
-    """A certification program's launch and direction, and its config, by its name
-    (`jit(certified_<op>_l<launch>_c<config>[_reverse])`)."""
-    stem = name.removeprefix("jit(").removesuffix(")")
-    reverse = stem.endswith("_reverse")
-    launch, config = stem.removesuffix("_reverse").rsplit("_c", 1)
-    return (launch, reverse), config
-
-
 @pytest.mark.parametrize("target", [pytest.param("sm90", marks=lowers("sm90")),
                                     pytest.param("sm100", marks=lowers("sm100"))])
 def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target):
     """A one-layer decoder of the 4B's gated delta net, its step compiled ahead for a compile-only H100 and a
-    compile-only B200 (`RECURRENT_AHEAD`), twice over one cache: at its derived tiles its output launch spills
-    (8 bytes at 128 registers under the cuda12 build's ptxas), and each process lowers the step once.
-    Certification compiles a launch with its outputs live, as a step reads them, so it refuses the spilling
-    config and steps the launch's producer down at trace, each rung compiled alone; and a later process reads
-    the verdicts stored, compiling nothing to certify. Certification that dropped the outputs never compiled
-    the output launch, and the program's compile stepped it down a whole-step relowering a rung, again in
-    every process (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm). Each certification's program is
-    named by its launch, direction and config (`certified_<op>_l<launch>_c<config>[_reverse]`), so a start's
-    events tell its rungs apart: the cold process lowers each once, two configs of one launch in one direction
-    among them, and the warm one none. Each kernel is lowered afresh once in the cold process: the step's
-    kernels certification lowered are the lowerings it made (a launch's trace held, `tuning.lowered_once`,
-    bound into the step as certification traced it, under the step's own mesh), where the step lowered its
-    kernels again, each a cache miss, 34 of a 4B's 36 kernels on a B200 the ones certification had made
-    (FS-CERTSPLIT4: 27 s of its lowering)."""
+    compile-only B200 (`RECURRENT_AHEAD`), twice over one cache: each process lowers the step once, the cold
+    one certifies each launch's configs once each (whatever its walk takes: a config refused steps the
+    launch's producer down at trace, each rung compiled alone with its outputs live, as a step reads them),
+    and the warm one reads the verdicts stored, certifying nothing. Certification that dropped the outputs
+    never compiled the output launch, and the program's compile stepped it down a whole-step relowering a
+    rung, again in every process (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm). Each
+    certification's program is named by its launch, direction and config
+    (`certified_<op>_l<launch>_c<config>[_reverse]`), so a start's events tell each apart. Each kernel is
+    lowered afresh once in the cold process: the step's kernels certification lowered are the lowerings it
+    made (a launch's trace held, `tuning.lowered_once`, bound into the step as certification traced it,
+    under the step's own mesh), where the step lowered its kernels again, each a cache miss, 34 of a 4B's 36
+    kernels on a B200 the ones certification had made (FS-CERTSPLIT4: 27 s of its lowering)."""
     cache = tmp_path / "cache"
     runs = [fresh(RECURRENT_AHEAD, target, cache_dir=cache) for _ in range(2)]
     cold, warm = (run["events"] for run in runs)
@@ -221,12 +210,7 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target):
     assert len(set(modules)) == len(modules), collections.Counter(modules).most_common(3)
     assert [run.count("jit(step)") for run in (cold, warm)] == [1, 1], (cold, warm)
     certified = [name for name in cold if name.startswith("jit(certified_")]
-    assert len(set(certified)) == len(certified), certified
-    configs = collections.defaultdict(set)
-    for name in certified:
-        launch, config = _launch_config(name)
-        configs[launch].add(config)
-    assert max(len(each) for each in configs.values()) >= 2, certified
+    assert certified and len(set(certified)) == len(certified), certified
     assert not [name for name in warm if name.startswith("jit(certified_")], warm
 
 
@@ -1156,6 +1140,47 @@ def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read
     (found,) = kc.reports({}, [unread])
     assert "machine code" in found.unread
     assert found.failure(232448, 0) is not None
+
+
+class SpillingFirst(Uncounted):
+    """`Uncounted` with the grouped forward's own candidates, its space the tile its derivation takes and a
+    paired product's widest, 128 x 256 at two stages, which spills in every compile (two accumulators of 128
+    registers a thread): a launch whose tuner meets a spilling candidate beside one that holds."""
+
+    def candidate(self, ba, config, target):
+        return super(Uncounted, self).candidate(ba, config, target)
+
+    def _get_autotuning_configs(self, ba):
+        return {ba.heuristics_config, widest(ba.heuristics_config)}
+
+
+def widest(derived):
+    """`derived`'s paired product at its widest, 128 x 256 at two stages (`SpillingFirst`)."""
+    columns = derived.grid_block_n * derived.block_n
+    return dataclasses.replace(derived, block_n=256, grid_block_n=columns // 256, stages=2)
+
+
+@lowers("sm90")
+def test_a_tuner_times_no_candidate_the_gpus_assembler_refuses():
+    """The configs a measuring tuner times (`tuning._candidates`) are those its launch's certification holds
+    (`report.certified`, as a run's derivation certifies its config): a paired launch's widest tile, which
+    spills in every compile, is never timed nor chosen, where uncertified it was timed as slow as its spills
+    and could be picked; the tile its derivation takes, which holds, is."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    op = SpillingFirst()
+    operands = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
+        ((ROWS, FEATURES), jnp.bfloat16), ((EXPERTS, FEATURES, WIDTH), jnp.bfloat16),
+        ((EXPERTS,), jnp.int32))]
+    with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]), report.refusals():
+        bound = op.bind(*operands, paired=jax.ShapeDtypeStruct((EXPERTS, FEATURES, WIDTH), jnp.bfloat16),
+                        out_dtype="bfloat16", trans_rhs=False, interpret=False,
+                        hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u))
+        derived = bound.heuristics_config
+        # The widest is a config a pin may name, which uncertified the tuner timed.
+        assert op.pinnable(bound, widest(derived))
+        assert tuning._candidates(op, bound) == [derived]
 
 
 RECONFIGURING_PTX = """

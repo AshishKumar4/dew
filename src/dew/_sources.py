@@ -1,7 +1,7 @@
 """Where a process's code comes from: the file a loaded module is code of, whether a module is a user's own
 code (loaded from a file no installed distribution versions and outside the interpreter's standard library)
-or an installed distribution's, which its version states. One statement, which a traced program's identity
-(`dew.training.identity`) and a data plan's step identity (`dew.data.plan`) both read."""
+or an installed distribution's, which its version states. One statement, which a data plan's step identity
+(`dew.data.plan`) and a rung record's key (`dew._stated`) read."""
 
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ def file_of(name: str) -> Path:
 
 def own_source(name: str | None) -> bool:
     """Whether the module `name` is a user's own code: loaded from a file no distribution versions and
-    Dew's digest does not hold (`dew.training.identity.Process.sources`), or the script the process runs.
+    Dew's digest does not hold, or the script the process runs.
     Read once a loaded module (`_OWN`): a module loaded again is read again."""
     if name == "__main__":
         return vars(sys.modules[name]).get("__file__") is not None
@@ -161,8 +161,7 @@ def function_reads(function: types.FunctionType) -> tuple[dict, dict]:
     has filled yet), and each name its code or the code nested in it reads (`names_read`) that its globals
     hold or that is a loaded module of the user's (one its body imports). A name is every use of it, an
     attribute's among them, so more is read than is used, never less. The one statement of what a function
-    reads, which a traced program's identity (`dew.training.identity`) and a data step's held code
-    (`dew.data.plan`) both walk."""
+    reads, which a stated value (`dew._stated`) and a data step's held code (`dew.data.plan`) walk."""
     code = function.__code__
     cells = {}
     for name, cell in zip(code.co_freevars, function.__closure__ or (), strict=True):

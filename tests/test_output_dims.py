@@ -1,10 +1,10 @@
 """A kernel call's outputs stated as its operands' axes (`dew.nn.kernels.templates.outputs`), read back off
-its lowered call (`generation_support.declared_outputs`): what a compile's live buffers read of Dew's own
+its lowered call (`kernel_compile.stated_outputs`): what a compile's live buffers read of Dew's own
 kernels. The toolkit's own launch's is in tests/test_mosaic_toolkit.py beside the walks it lowers."""
 
 import jax
 import jax.numpy as jnp
-from generation_support import declared_outputs
+from kernel_compile import stated_outputs
 
 from dew.nn.kernels import gemm, generation
 
@@ -18,6 +18,6 @@ def test_a_gemms_output_states_its_rows_and_width_as_its_operands_axes():
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
         lowered = jax.jit(lambda a, b: gemm.gemm(a, b, None, out_dtype=jnp.bfloat16)).trace(x, w).lower(
             lowering_platforms=("cuda",))
-    ((stated,),) = declared_outputs(lowered)
+    ((_, (stated,)),) = stated_outputs(lowered)
     rows, width = stated
     assert rows == [[0, 0]] and [operand for operand, _ in width] == [1], stated

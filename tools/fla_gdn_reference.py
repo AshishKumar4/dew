@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The fixture tests hold the recurrence template's gated delta rule to: fla-core's own
-`chunk_gated_delta_rule` and `chunk_kda` (its Triton kernels) on a CUDA GPU, forward and every gradient, at
-each site tests/fla_sites.py names, over the tests' own seeded draws.
+`chunk_gated_delta_rule`, `chunk_kda` and `chunk_rwkv6` (its Triton kernels) on a CUDA GPU, forward and every
+gradient, at each site tests/fla_sites.py names, over the tests' own seeded draws.
 
     PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla> <unit> <site>...
     PYTHONPATH=src:tests:tools python tools/fla_gdn_reference.py --merge <unit>...
@@ -15,9 +15,11 @@ truth's sketch, which Dew's float64 token recurrence is held to.
 
 fla runs at its defaults (an fp32 call's products TF32, as the fast forms' bar is). Packed documents run as
 fla runs them, one flattened row of sequences (`cu_seqlens`), a row's first taking its entering memory
-unless a document starts it. The oracle is fla's own reference, `naive_recurrent_gated_delta_rule` and
-`naive_recurrent_kda` (fla/ops/*/naive.py), on each sequence in torch float64 (`_dew_torch.precision.float64`,
-which widens their fp32 casts) on the GPU, held at every seed to Dew's float64 token recurrence.
+unless a document starts it. The oracle is fla's own reference, `naive_recurrent_gated_delta_rule`,
+`naive_recurrent_kda` and `naive_recurrent_rwkv6` (fla/ops/*/naive.py, rwkv6/recurrent_naive.py), on each
+sequence in torch float64 (`_dew_torch.precision.float64`, which widens their fp32 casts) on the GPU, held at
+every seed to Dew's float64 token recurrence. RWKV6's sites (an own weight `own`, fla's `u`, and no write
+gate) take its `chunk_rwkv6(r, k, v, w, u)`, its naive reference laid `[B, H, T, K]` as it reads them.
 """
 
 import itertools
@@ -31,6 +33,9 @@ import numpy as np
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "fla" / "gdn_seeded.npz"
 GRADIENTS = ("q", "k", "v", "g", "beta", "h0")
+"""The delta rules' differentiated operands; RWKV6's take its own weight in the write gate's place."""
+
+OWN_GRADIENTS = ("q", "k", "v", "g", "own", "h0")
 
 
 def sequences(arrays) -> list[tuple[int, int, int, bool]]:
@@ -57,37 +62,55 @@ def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: b
     import torch
 
     wide = dtype == torch.float64
+    owned = "own" in arrays
+    differentiated = OWN_GRADIENTS if owned else GRADIENTS
     tensors = {name: torch.tensor(np.asarray(value, np.float64 if wide else np.float32), device=device)
                for name, value in arrays.items() if name != "starts"}
     inputs = {name: tensors[name].to(dtype if name in ("q", "k", "v", "beta") else
                                      (torch.float64 if wide else torch.float32)).requires_grad_()
-              for name in GRADIENTS}
+              for name in differentiated}
     spans = sequences(arrays)
     group = inputs["v"].shape[2] // inputs["q"].shape[2]
 
     def piece(name, row, start, end):
+        # Each value head its key head's queries and keys where the rule reads one a value head: fla's
+        # naive references, and RWKV6's chunk, which takes no grouped heads.
         x = inputs[name][row:row + 1, start:end]
-        return x.repeat_interleave(group, dim=2) if per_sequence and name in ("q", "k") else x
+        return x.repeat_interleave(group, dim=2) if (per_sequence or owned) and name in ("q", "k") else x
+
+    def called(q, k, v, g, fifth, state, **flat):
+        """The site's rule on one sequence's operands, or the flattened row's (`flat`: `cu_seqlens`):
+        RWKV6's (`own` its `u`, the naive reference reading `[B, H, T, K]`), the KDA's or the gated delta
+        rule's."""
+        if owned:
+            if per_sequence:
+                out, final = rule(*(x.transpose(1, 2) for x in (q, k, v, g)), fifth, scale=scale,
+                                  initial_state=state, output_final_state=True)
+                return out.transpose(1, 2), final
+            return rule(q, k, v, g, fifth, scale=scale, initial_state=state, output_final_state=True, **flat)
+        if kda:
+            return rule(q, k, v, g, fifth, scale=scale, initial_state=state, output_final_state=True, **flat)
+        return rule(q, k, v, fifth, g, scale=scale, initial_state=state, output_final_state=True, **flat)
 
     states = [inputs["h0"][row:row + 1] if entering else torch.zeros_like(inputs["h0"][:1])
               for row, _, _, entering in spans]
     if per_sequence:
         outs, finals = [], []
         for (row, start, end, _), state in zip(spans, states, strict=True):
-            q, k, v, g, beta = (piece(name, row, start, end) for name in ("q", "k", "v", "g", "beta"))
-            out, final = (rule(q, k, v, g, beta, scale=scale, initial_state=state, output_final_state=True)
-                          if kda else rule(q, k, v, beta, g, scale=scale, initial_state=state,
-                                           output_final_state=True))
+            q, k, v, g = (piece(name, row, start, end) for name in ("q", "k", "v", "g"))
+            fifth = inputs["own"] if owned else piece("beta", row, start, end)
+            out, final = called(q, k, v, g, fifth, state)
             outs.append(out)
             finals.append(final)
         out = torch.cat(outs, dim=1)
     else:
-        q, k, v, g, beta = (torch.cat([piece(name, row, start, end) for row, start, end, _ in spans], dim=1)
-                            for name in ("q", "k", "v", "g", "beta"))
+        q, k, v, g = (torch.cat([piece(name, row, start, end) for row, start, end, _ in spans], dim=1)
+                      for name in ("q", "k", "v", "g"))
+        fifth = inputs["own"] if owned else torch.cat([piece("beta", row, start, end)
+                                                       for row, start, end, _ in spans], dim=1)
         lengths = [end - start for _, start, end, _ in spans]
         cu_seqlens = torch.tensor(np.cumsum([0, *lengths]), device=device, dtype=torch.long)
-        out, final = rule(q, k, v, g, beta, scale=scale, initial_state=torch.cat(states, dim=0),
-                          output_final_state=True, cu_seqlens=cu_seqlens)
+        out, final = called(q, k, v, g, fifth, torch.cat(states, dim=0), cu_seqlens=cu_seqlens)
         finals = list(final.split(1, dim=0))
     rows = inputs["v"].shape[0]
     out = out.reshape(rows, -1, *out.shape[2:])
@@ -96,10 +119,10 @@ def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: b
     if not gradients:
         return {name: value.detach().to(torch.float64).cpu().numpy()
                 for name, value in (("out", out), ("final", final))}
-    grads = torch.autograd.grad((out, final), tuple(inputs[name] for name in GRADIENTS),
+    grads = torch.autograd.grad((out, final), tuple(inputs[name] for name in differentiated),
                                 (tensors["dy"].to(out.dtype), tensors["dfinal"].to(final.dtype)),
                                 allow_unused=True)
-    found = dict(zip(("out", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0"), (out, final, *grads),
+    found = dict(zip(("out", "final", *(f"d{name}" for name in differentiated)), (out, final, *grads),
                      strict=True))
     return {name: (np.zeros(arrays[name[1:]].shape) if value is None else
                    value.detach().to(torch.float64).cpu().numpy())
@@ -117,6 +140,8 @@ def serve() -> None:
     from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
     from fla.ops.kda import chunk_kda
     from fla.ops.kda.naive import naive_recurrent_kda
+    from fla.ops.rwkv6 import chunk_rwkv6
+    from fla.ops.rwkv6.recurrent_naive import naive_recurrent_rwkv6
     from reference_releases import require
 
     from _dew_torch.precision import float64
@@ -133,7 +158,7 @@ def serve() -> None:
         dtype, kind, leaves = (str(arrays.pop(name)) for name in ("dtype", "kind", "leaves"))
         scale = float(arrays.pop("scale"))
         kda, gradients = kind == "kda", leaves == "all"
-        rule = chunk_kda if kda else chunk_gated_delta_rule
+        rule = {"kda": chunk_kda, "gdn": chunk_gated_delta_rule, "rwkv6": chunk_rwkv6}[kind]
         began = time.perf_counter()
         reference = run(arrays, kda=kda, scale=scale, rule=rule, dtype=getattr(torch, dtype), device="cuda",
                         per_sequence=False, gradients=gradients)
@@ -141,7 +166,8 @@ def serve() -> None:
         # The truth in float64 on the GPU: on the CPU its token loop and autograd took most of a site's
         # 1432 s for 320 draws (fla-record3-h100-f8fbb058d, the worker at a core's whole time).
         with float64():
-            naive = naive_recurrent_kda if kda else naive_recurrent_gated_delta_rule
+            naive = {"kda": naive_recurrent_kda, "gdn": naive_recurrent_gated_delta_rule,
+                     "rwkv6": naive_recurrent_rwkv6}[kind]
             truth = run(arrays, kda=kda, scale=scale, rule=naive, dtype=torch.float64, device="cuda",
                         per_sequence=True, gradients=gradients)
         print(f"timed fla {referenced - began:.3f} s truth {time.perf_counter() - referenced:.3f} s",
@@ -179,7 +205,8 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
         def fla(arrays, dtype=dtype, kda=kda, scale=site.hooks.scale, leaves=leaves):
             request = {key: np.asarray(value, np.float32) if key != "starts" else value
                        for key, value in arrays.items()}
-            options = {"dtype": dtype, "kind": "kda" if kda else "gdn", "scale": scale, "leaves": leaves}
+            kind = "rwkv6" if "own" in arrays else "kda" if kda else "gdn"
+            options = {"dtype": dtype, "kind": kind, "scale": scale, "leaves": leaves}
             request |= {name: np.asarray(value) for name, value in options.items()}
             return arms(worker.ask(request))
 
