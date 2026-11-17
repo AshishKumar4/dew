@@ -152,3 +152,15 @@ def walked(work: Work, target: generation.GpuTarget) -> float:
     its algebra does not change."""
     return max(*units(work, rates(target, device=False))[0],
                spanned(work, step_latency(target, device=False))[0])
+
+
+def seconds(work: Work, target: generation.GpuTarget) -> float:
+    """The seconds a step of launches one after another spends on `work` on `target` by the work-span model:
+    its units' work overlapped at the whole device's rates (`units`), or its span at an in-kernel step's
+    latency where longer (`spanned`), and each of its kernels' launch (`GpuTarget.launch_seconds`, none
+    where unmeasured): a server's price of a step (`attention_decode.priced_step`), where `walked` is one
+    program's."""
+    launch = target.launch_seconds or 0.0
+    worked = max(*units(work, rates(target, device=True))[0],
+                 spanned(work, step_latency(target, device=False))[0])
+    return worked + work.kernels * launch
