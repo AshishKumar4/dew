@@ -5,23 +5,20 @@ device by check 1 from float64, its split step moving none of its operands betwe
 layer intends (`sharded.assert_kernel_runs_per_shard`). Each family states its kernels' cells
 (`per_shard(choice, kernel)`, through the layer objects its production path calls); which kernels must have
 one is read from production: every kernel a model flow's programs launch split over two devices
-(tests/model_flows.py, `split_routes`). A cell runs where its kernel runs: on the CPU's devices where they
+(tests/split_flows.py, `split_routes`). A cell runs where its kernel runs: on the CPU's devices where they
 interpret it as its generation, on a GPU's (an emulated mesh's among them) where its generation is a GPU's,
 on a TPU's where a TPU's."""
 
+import functools
 import importlib
 import re
 
 import jax
-import numpy as np
 import pytest
 from kernel_matrix import CELLS
-from model_flows import FLOWS, KINDS, flow_flags, flow_named, generic_kernels
+from model_flows import FLOWS, flow_flags, flow_named
 from sharded import Shard, assert_kernel_runs_per_shard, interprets
-
-GENERATIONS = ("sm80", "sm90")
-"""The GPU generations the model flows run on (an A100's, a GH200's: tests/gpu_flow.py's tiers), whose
-split programs name the kernels that must run per shard."""
+from split_flows import SPLIT_ROUTES
 
 
 def kernels() -> list[tuple[str, str, str]]:
@@ -32,9 +29,11 @@ def kernels() -> list[tuple[str, str, str]]:
             for choice, named in importlib.import_module(module).KERNELS.items() for kernel in sorted(named)]
 
 
+@functools.cache
 def stated(module: str, choice: str, kernel: str) -> dict[str, Shard]:
     """The family's per-shard cells of `kernel` (`per_shard`): none where the family states none, a family
-    whose kernels no production path runs per shard."""
+    whose kernels no production path runs per shard. Built once a process: its layers' cells take 20 s for
+    every family (row 6846), which collection's parameters and each flow's check both read."""
     per_shard = getattr(importlib.import_module(module), "per_shard", None)
     return {} if per_shard is None else per_shard(choice, kernel)
 
@@ -86,47 +85,6 @@ def test_a_kernel_runs_per_shard(module, choice, kernel, label):
     if not held:
         pytest.skip(f"{choice} {kernel} runs as {shard.target} on its own devices, not on this {platform}")
     assert_kernel_runs_per_shard(choice, kernel, shard)
-
-
-SPLIT_ROUTES = """import json, sys
-import dew  # before jaxlib loads, so XLA_FLAGS' flags are proven held (`dew._devices.flags_hold`)
-import test_per_shard
-print(json.dumps(test_per_shard.split_routes(sys.argv[1])))
-"""
-"""A flow's split routes' process (`split_routes`, `test_a_kernel_every_split_flow_launches_has_a_cell`)."""
-
-
-def split_routes(name: str) -> list[list[str]]:
-    """The kernels off the reference path (`generic_kernels`) that flow `name`'s programs (`KINDS`: its
-    training step, its decode loop) launch traced as each of `GENERATIONS`, their rows split over a run's
-    two-device data axis under a run's layout (`placing`), at the flow's matmul precision, as a run traces
-    them: each `[choice, kernel]`."""
-    from dew.distributed.placement import Layout, MeshSpec
-    from dew.nn.kernels import generation
-    from dew.nn.sharding import placing
-
-    flow = flow_named(name)
-    generic = generic_kernels()
-    mesh = MeshSpec().build(jax.devices()[:2])
-    model = flow.model
-    params = jax.tree.map(
-        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=jax.NamedSharding(
-            mesh, jax.sharding.PartitionSpec())),
-        jax.eval_shape(lambda: model.init(jax.random.key(0), np.zeros((flow.rows, flow.length), np.int32)))[
-            "params"])
-    ids = jax.ShapeDtypeStruct((flow.rows, flow.length), np.int32,
-                               sharding=jax.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
-    found = set()
-    for target in GENERATIONS:
-        for kind in KINDS:
-            # At the flow's own matmul precision (`Flow.precision`), which a kernel's legality may read (an
-            # fp32 SSD's Triton port takes the default precision alone), as its run multiplies.
-            with (generation.assumed(target), jax.default_matmul_precision(flow.precision),
-                  jax.set_mesh(mesh), placing(Layout()), generation.routes() as routes):
-                jax.jit(getattr(flow, kind)(model)).trace(params, ids)
-            found |= {(str(route.choice), route.kernel) for route in routes
-                      if route.kernel not in generic[str(route.choice)]}
-    return sorted(map(list, found))
 
 
 @pytest.mark.parametrize("flow", [flow.name for flow in FLOWS])
