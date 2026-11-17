@@ -463,9 +463,17 @@ NATIVE_FLOAT16 = _Need('float16', lambda case: (case.dtype != np.dtype(np.float1
                                                  or generation.gpu_target().float16),
                        "the TPU computes in no float16, so its Mosaic lowers no float16 load the kernel "
                        "issues (`generation.Architecture.float16`: a v5e, rows 6993, 7227)", row=INHERENT)
-"""A Mosaic TPU kernel's capability, splash's and the template's on a TPU: float16 only where the TPU
-computes in it. A capability, so a call that names its kernel is refused too (`selection.KernelRefused`)
-rather than failing its compile."""
+"""Splash's capability on a TPU: float16 only where the TPU computes in it. A capability, so a call that names
+its kernel is refused too (`selection.KernelRefused`) rather than failing its compile."""
+
+PACKED_HEADS = _Need('packed_heads', lambda case: (np.dtype(case.dtype).itemsize > 2
+                                                   or generation.gpu_target().packed_slices),
+                      "the TPU's Mosaic slices no one head of a 16-bit block, its heads on a tile's "
+                      "packed sublanes (`generation.Architecture.packed_slices`: a v5e, rows 6993, 7227)",
+                      row=INHERENT)
+"""The template's capability on a TPU: 16-bit operands only where its Mosaic slices one head of a packed
+tile, which its per-head blocks take. A capability, so a call that names it is refused rather than failing
+its compile."""
 
 TPU_BACKEND = _Need('backend', lambda case: generation.backend() == 'tpu', "it runs on a TPU", row=INHERENT,
                     kind='measured')
@@ -664,7 +672,7 @@ TEMPLATE_SUPPORTS = (
     _Need('dtype', lambda case: case.dtype in TEMPLATE_DTYPES and case.key_dtype == case.dtype,
           lambda case: f"the query is {case.dtype} and the keys are {case.key_dtype}, where the template "
                        "takes one dtype of fp32, bf16 and fp16 on its operands", row=INHERENT),
-    NATIVE_FLOAT16,
+    PACKED_HEADS,
     _Need('mask', lambda case: not case.mask,
           "the call has an arbitrary mask, which the template reads as spans and never as a mask",
           row=INHERENT),

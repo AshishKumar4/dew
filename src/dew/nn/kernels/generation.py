@@ -381,6 +381,10 @@ class Architecture:
     """Whether the device computes in float16: a v5e does not, so its Mosaic lowers no float16 load a TPU
     kernel issues (a sublane-masked load, or a one-head slice, of a 16-bit (8,128)(2,1)-tiled block), where
     bf16 at the same shapes compiles (rows 6993, 7227)."""
+    packed_slices: bool = True
+    """Whether its Mosaic slices one row of a 16-bit tile's packed sublane pair, as a one-head block of a
+    16-bit `[..., heads, width]` array is: a v5e's does not ("Offsets along tiled dimensions must be aligned
+    to tiles", the unit subtile 2 on the heads; bf16 and fp16 alike, rows 6993, 7227)."""
     mixed_highest: bool = True
     """Whether its matrix unit takes an fp32-precision product of an fp32 operand with a bf16 one, which a
     default matmul precision of 'highest' asks of a kernel's fp32 weights and bf16 values: a v5e's MXU does
@@ -453,7 +457,8 @@ _BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
 _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
-                             vmem_bytes=128 * 2 ** 20, float16=False, mixed_highest=False),
+                             vmem_bytes=128 * 2 ** 20, float16=False, packed_slices=False,
+                             mixed_highest=False),
          'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20)}
 
@@ -608,6 +613,12 @@ class GpuTarget:
     def float16(self) -> bool:
         """Whether the device computes in float16 (`Architecture.float16`)."""
         return self.architecture.float16
+
+    @property
+    def packed_slices(self) -> bool:
+        """Whether its Mosaic slices one row of a 16-bit tile's sublane pair
+        (`Architecture.packed_slices`)."""
+        return self.architecture.packed_slices
 
     @property
     def mixed_highest(self) -> bool:
