@@ -74,6 +74,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import arm_arithmetic
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -1112,7 +1113,8 @@ def _of_float64(label: str, truth_fn, inputs, truth) -> None:
     # A window loop's truth is traced on a window, as its loop calls it.
     wide = widened(jax.tree.map(lambda leaf: leaf[0], inputs) if windowed else inputs)
     # The branch of a platform's choice that the truth's run keeps: on the device its evaluation runs on.
-    with jax.enable_x64(new_val=True), evaluated_on(jax.tree.leaves(wide)) as device:
+    with (jax.enable_x64(new_val=True), arm_arithmetic.on_float64_device(),
+          evaluated_on(jax.tree.leaves(wide)) as device):
         program = lowered(trace(*wide).jaxpr).jaxpr
     lowering = programs.lowering_platform(device)
     count = len(program.outvars)
@@ -1176,7 +1178,7 @@ def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None, scale=None) -> 
         inputs = draw(seed)
         with summed_as_run():
             ran_here = jax.device_get(ran_fn(*inputs))
-        with jax.enable_x64(new_val=True):
+        with jax.enable_x64(new_val=True), arm_arithmetic.on_float64_device():
             return ran_here, jax.device_get((true_fn or unrewritten(ran_fn))(*widened(inputs)))
 
     return Conditioning(scale_of, heavy_masks(map(ran_and_true, seeds)))
@@ -1189,13 +1191,13 @@ def _truth_and_terms(truth_fn, terms_fn, inputs):
     evaluated op by op (`float64_terms`)."""
     truth_fn = unrewritten(truth_fn)
     if terms_fn is None or isinstance(terms_fn, _SiteTerms):
-        with jax.enable_x64(new_val=True):
+        with jax.enable_x64(new_val=True), arm_arithmetic.on_float64_device():
             truth = truth_fn(*widened(inputs))
         if terms_fn is None:
             return truth, None
-        with jax.enable_x64(new_val=True):
+        with jax.enable_x64(new_val=True), arm_arithmetic.on_float64_device():
             return truth, terms_fn.of(truth, *widened(inputs))
-    with jax.enable_x64(new_val=True):
+    with jax.enable_x64(new_val=True), arm_arithmetic.on_float64_device():
         return terms_fn(*widened(inputs))
 
 
@@ -1387,7 +1389,7 @@ def _cancelling_terms(draw, truth, program=None):
     # The draw as every seed's is drawn, outside float64, then widened (under x64 a draw's own defaults
     # would draw float64 values the arms never see).
     inputs = widened(draw(0))
-    with jax.enable_x64(new_val=True):
+    with jax.enable_x64(new_val=True), arm_arithmetic.on_float64_device():
         leaves = [*map(np.asarray, jax.tree.leaves(run(*inputs)))]
         zero_leaves = [index for index, leaf in enumerate(leaves)
                        if np.any(_LaidTruths.of([leaf]).sizes == 0)]
