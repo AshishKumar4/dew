@@ -34,6 +34,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.algebra import scan
 from dew.batch import document_firsts, real_bounds
 from dew.mesh import LayoutRefused
 from dew.nn import rope
@@ -99,18 +100,10 @@ def _angles(dt, theta, continues):
     and its gradients to 2.1 times, where a double-float angle and its rotation of it (`rotated`'s
     `residual`) hold them under (row 7402)."""
     rates = jnp.broadcast_to(jnp.asarray(theta, dt.dtype), (*dt.shape, theta.shape[-1]))
-    step = two_product(jnp.broadcast_to(dt[..., None], rates.shape), rates)
-
-    def combine(left, right):
-        # A segmented sum: a token that begins a document drops what came before it.
-        (*sum_left, keep_left), (*sum_right, keep_right) = left, right
-        summed = compensated_add(tuple(sum_left), tuple(sum_right))
-        kept = tuple(jnp.where(keep_right, s, r) for s, r in zip(summed, sum_right, strict=True))
-        return *kept, keep_left & keep_right
-
-    keep = jnp.broadcast_to(continues[:, :, None, None], step[0].shape)
-    *summed, _ = jax.lax.associative_scan(combine, (*step, keep), axis=1)
-    return _wrapped(tuple(summed))
+    high, low = two_product(jnp.broadcast_to(dt[..., None], rates.shape), rates)
+    # A segmented sum: a token that begins a document drops what came before it.
+    restarts = jnp.broadcast_to(~continues[:, :, None, None], high.shape)
+    return _wrapped(scan.compensated(high, low=low, axis=1, restarts=restarts))
 
 
 def _turned_by(angles, entering):

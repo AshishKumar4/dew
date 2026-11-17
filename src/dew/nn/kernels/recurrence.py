@@ -19,13 +19,13 @@ stage every row of it shares, the decay's prefix within each chunk (`cumulated`)
 
 import dataclasses
 import functools
-from typing import Literal
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from dew._hashing import fmix32
+from dew.algebra.scan import Reads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels import launches
 from dew.nn.precision import (
@@ -43,10 +43,6 @@ from dew.nn.precision import (
 from ..sharding import explicit_spec, grouped_heads, manual_map
 from . import chunked_launch, short_conv
 from .generation import linear_tangent
-
-Readout = Literal["after", "before", "apart"]
-"""What a token's readout reads (`Hooks.reads`): the state after its update, the state entering it, or the
-state after its update less its own write (`'apart'`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -124,7 +120,7 @@ class Hooks:
     skip: bool = False
     output: OutputNorm | None = None
     write_bound: float | None = None
-    reads: Readout = 'after'
+    reads: Reads = 'after'
     own_weight: bool = False
     ranks: int = 1
     """The op's tokens a token's writes take, its ranks laid in turn (mamba_ssm's Mamba-3 MIMO), whose
@@ -200,7 +196,7 @@ def salted_bf16(state, key, value):
     return stochastic_bf16(state, fmix32(bits ^ salt))
 
 
-def update(state, query, key, value, decay, write, *, delta: bool, reads: Readout = 'after', own=None):
+def update(state, query, key, value, decay, write, *, delta: bool, reads: Reads = 'after', own=None):
     """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` its decay per key dimension `[...,
     Dk]` or a head's `[..., 1]` (`exp(g)`) and `write` the write gate `[..., 1]`, a head's one: its output
     `[..., Dv]` and the updated state `S' = g S + (beta k) c^T`, `c = v - (g k)^T S` the delta rule's
