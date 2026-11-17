@@ -18,7 +18,7 @@ from model_support import flat_tree
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, widened, without_ynn
 
-from dew.batch import FROZEN, thaw, unboxed
+from dew.batch import FROZEN, part, thaw, unboxed
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example
@@ -516,11 +516,20 @@ def test_a_configured_context_encoders_bundle_carries_it_and_its_trained_weights
     trained = {**drawn, "params": {**drawn["params"], "context": jax.tree.map(
         lambda leaf: leaf + 1.0, drawn["params"]["context"])}}
     task = Decide(objective.model, trained, layout, tokenizer, objective.specials, processor=source.processor)
-    again = Decide.released(PretrainedDecision.of(task))
+    bundle = PretrainedDecision.of(task)
+    again = Decide.released(bundle)
     for context in ("a first note", "ten"):
         np.testing.assert_array_equal(
             np.asarray(again("one two three", QUESTION, context=context)["pick"].probabilities),
             np.asarray(task("one two three", QUESTION, context=context)["pick"].probabilities))
+    # A load's transform of the bundle's trees (`map_variables`: a placement, a cast, shapes alone) reaches
+    # the encoder's weights as the backbone's and the head's, which the task declared again reads: they were
+    # left as they were (row 7471).
+    halved = Decide.released(bundle.map_variables(lambda tree: jax.tree.map(lambda leaf: leaf / 2, tree)))
+    for name in ("backbone", "head", "context"):
+        for got, want in zip(jax.tree.leaves(part(halved.variables, name)),
+                             jax.tree.leaves(part(again.variables, name)), strict=True):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want) / 2)
 
 
 def test_a_configured_context_encoder_beside_a_schema_read_in_context_is_refused():
