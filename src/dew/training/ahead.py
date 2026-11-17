@@ -194,6 +194,48 @@ def topology_memory(serialized: bytes) -> int | None:
     return stated[0] if len(stated) == 1 and isinstance(stated[0], int) and stated[0] > 0 else None
 
 
+def twin(devices: Sequence) -> tuple:
+    """Compile-only GPUs standing for `devices`, as many: XLA compiles a program over them as over `devices`,
+    autotuning skipped and no device touched, and it runs nowhere. Their target is this process's own GPUs'
+    of `devices` (`xla_client.get_topology_for_devices`: their SKU's memory, clocks and multiprocessors), the
+    memory every admission on them reads that target's (`topology_memory`), their topology one of
+    `len(devices)` GPUs, as `compile_only_gpus` states any count. A plan probes its layouts on them
+    (`probed`). Refused for GPUs of more than one kind, or none of this process's."""
+    devices = tuple(devices)
+    kinds = {device.device_kind for device in devices}
+    if len(kinds) != 1:
+        raise ValueError(f"a twin stands for GPUs of one kind, not {sorted(kinds)}")
+    own = [device for device in devices if device.process_index == jax.process_index()]
+    if not own:
+        raise ValueError("a twin's target is read from this process's GPUs, and it holds none of these")
+    return _twin(tuple(own), len(devices))
+
+
+@functools.cache
+def _twin(own: tuple, count: int) -> tuple:
+    """`twin`'s devices: `count` compile-only GPUs of `own`'s target, one topology a target and count."""
+    stated = xla_client.get_topology_for_devices(list(own))
+    devices = tuple(topologies.get_topology_desc("dew-twin", "cuda", target_config=stated.target_config,
+                                                 topology=f"1x1x{count}").devices)
+    memory = topology_memory(stated.serialize())
+    if memory is not None:
+        COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
+    return devices
+
+
+EARLY_EXIT = {"xla_gpu_experimental_early_exit": "EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT"}
+"""A GPU compile stopped after buffer assignment (Dew's JAX build's early exit, from post98): no code
+emitted, no kernel assembled, its memory analysis and the buffers live at its peak the whole compile's."""
+
+
+def probed(lowered: jax.stages.Lowered) -> jax.stages.Compiled:
+    """`lowered`, a GPU program, compiled as far as its buffer assignment (`EARLY_EXIT`): its
+    `memory_analysis()` and `peak_live()` (each buffer live at its peak: bytes, shape, dtype, parameter,
+    output or temporary, its instruction and op_name) are those its whole compile states, in a fraction of
+    its time, and it runs nowhere."""
+    return report.xla_compiled(lowered, EARLY_EXIT)
+
+
 @dataclasses.dataclass(frozen=True)
 class HeldTraceback:
     """A traceback a program's trees hold, as its file holds it: its frames as text. A checkified program's

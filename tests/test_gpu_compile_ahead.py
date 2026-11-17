@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from ahead_programs import arguments, programs
 
+from dew._devices import pool_share
 from dew.nn.kernels.generation import assumed, built_target
 from dew.nn.kernels.options import owned_program
 from dew.training.ahead import BuildTarget, compiled_in, dumps
@@ -245,10 +246,13 @@ def test_a_run_compiled_ahead_for_this_gpu_compiles_nothing_on_it_and_is_refused
     for name, text in (("quiet_build.py", QUIET_BUILD), ("quiet.py", QUIET), ("refused.py", TRAIN_REFUSED)):
         (tmp_path / name).write_text(text)
     environment = environment_of(tmp_path)
-    # Its memory stated as the GPU's allocator limit: a plan for no more than the GPU holds, which it loads.
+    # Its memory stated as the GPU's own (`CompileAhead.memory`, a capacity), which the build takes its pool's
+    # share of as the GPU's allocator does: the attached GPU's allocator limit (`own.memory`) is that share
+    # already, so the GPU's memory is it over the share (row 6717: stated as the limit, the build planned
+    # for the share of the share, 2.0 GB of an 80 GB GPU at the tier's fraction).
     assert own.memory is not None
     build = [sys.executable, str(tmp_path / "quiet_build.py"), own.generation, str(tmp_path / "step.dew-aot"),
-             str(own.multiprocessors), str(own.memory)]
+             str(own.multiprocessors), str(round(own.memory / pool_share()))]
     subprocess.run(build, env={**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}, check=True)
     subprocess.run([sys.executable, str(tmp_path / "quiet.py"), str(tmp_path / "step.dew-aot")],
                    env=environment, check=True)
@@ -284,3 +288,29 @@ def test_a_deviceless_compile_stores_nothing_a_device_run_reads(tmp_path):
     # The GPU hidden as well: a process that sees one of the topology's own compiles through it, tuned.
     assert ran("compile", generation, JAX_PLATFORMS="cpu", CUDA_VISIBLE_DEVICES="") == {"read": 0}
     assert ran("run") == {"read": 0}
+
+
+def test_a_probe_on_this_gpus_twin_states_the_memory_and_the_peaks_buffers_its_own_compile_does():
+    """A program probed on this GPU's twin (`twin`: compile-only, of this GPU's own target, its autotuning
+    skipped; `probed`: stopped after buffer assignment) states the temporaries this GPU's own whole compile
+    of it does, and the same buffers live at its peak, by size, shape, dtype and kind: a plan's probe of a
+    layout reads the memory its run takes."""
+    from test_compile_ahead import two_products
+
+    from dew._devices import device_memory
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import probed, twin
+
+    def buffers(compiled: jax.stages.Compiled) -> list:
+        live = compiled.peak_live()
+        assert live, live
+        return sorted((buffer.bytes, buffer.shape, buffer.dtype, buffer.kind) for buffer in live)
+
+    (device,) = jax.devices()[:1]
+    (double,) = twin([device])
+    own, probe = report.xla_compiled(two_products(device), None), probed(two_products(double))
+    assert probe.memory_analysis().temp_size_in_bytes == own.memory_analysis().temp_size_in_bytes
+    assert buffers(probe) == buffers(own)
+    # The twin states this GPU's memory, every admission on it reading its allocator's limit: within the 2 MiB
+    # this GPU's own allocator rounds its limit up by (`allocator_limit`).
+    assert 0 <= device.memory_stats()["bytes_limit"] - device_memory(double)["bytes_limit"] < 2**21

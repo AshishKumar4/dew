@@ -412,14 +412,17 @@ def local_devices(mesh: Mesh) -> list:
 
 
 class FirstRunFailed(RuntimeError):
-    """A newly compiled step's first run its devices refused: the record of the check that said it fits
-    (`fitted`, `memory_record`) and what this process's devices of its mesh hold now (`now`), each GPU's
-    bytes free outside XLA's pool (`outside_pool`) among it."""
+    """A newly compiled step's first run its devices refused: what they said (`refusal`, the error it is
+    raised from, its text first in its own, so a reader of its message alone tells an out-of-memory from
+    any other failure), the record of the check that said it fits (`fitted`, `memory_record`) and what this
+    process's devices of its mesh hold now (`now`), each GPU's bytes free outside XLA's pool
+    (`outside_pool`) among it."""
 
-    def __init__(self, step: int, fitted: JSON, now: list[JSON]):
+    def __init__(self, step: int, refusal: BaseException, fitted: JSON, now: list[JSON]):
         self.fitted, self.now = fitted, now
         super().__init__(
-            f"the training step compiled for step {step} failed on its first run. It was checked to fit: "
+            f"the training step compiled for step {step} failed on its first run: "
+            f"{type(refusal).__name__}: {refusal}. It was checked to fit: "
             f"{json.dumps(fitted)}; the devices now hold {json.dumps(now)}. 'outside' is a GPU's bytes free "
             "outside XLA's pool, whose limit is its bytes_limit (XLA_PYTHON_CLIENT_MEM_FRACTION of the GPU): "
             "a collective's communicators (NCCL) take their buffers there, beside cuBLAS's workspaces and "
@@ -439,7 +442,7 @@ def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> dict[str,
                             **{key: value for key, value in (device.memory_stats() or {}).items()
                                if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
                            for device in devices]
-        raise FirstRunFailed(step, fitted, now) from error
+        raise FirstRunFailed(step, error, fitted, now) from error
     read = () if fitted is None else listed(record(fitted, "fitted")["devices"], "devices", read=record,
                                             what="each device's memory as the fit check read it")
     checked = {integer(device["id"], "id"): outside for device in read
@@ -555,12 +558,12 @@ def temporaries_factor(mesh: Mesh) -> int:
 @dataclasses.dataclass(frozen=True)
 class MemoryMiss:
     """What a compile of the step at `split` microbatches that did not fit says of the splits above it,
-    every number its own: its temporaries (`scaled`, every one taken as scaled by a microbatch's rows, which
-    errs toward a split too coarse, which its compile refuses, never one too fine, which every step would pay
-    for: XLA states no live set of a GPU compile to Python, its memory statistics carrying sizes alone) and
-    the bytes it was short (`shortfall`, its stranding counted, `factor`). A split above it holds its share
-    of them; the next program is XLA's to fuse and schedule again, so the compile at the split this names
-    is its judge."""
+    every number its own: the bytes a microbatch's rows scale (`scaled`: those its live set states descend
+    from a batch row axis, with those it states no provenance of, `LiveSet`; every temporary where it states
+    no live set, which errs toward a split too coarse, which its compile refuses, never one too fine, which
+    every step would pay for) and the bytes it was short (`shortfall`, its stranding counted, `factor`). A
+    split above it holds its share of them; the next program is XLA's to fuse and schedule again, so the
+    compile at the split this names is its judge."""
 
     split: int
     scaled: int
@@ -572,6 +575,59 @@ class MemoryMiss:
         `scaled * self.split / split`."""
         saved = self.scaled - self.scaled * self.split // split
         return self.factor * saved >= self.shortfall
+
+
+LIMIT_EXIT = "xla_gpu_memory_limit_early_exit_bytes"
+"""A GPU compile's limit (Dew's JAX build's, from post99): past it, the arguments, new outputs and
+temporaries XLA assigns (argument + output - alias + temp), the compile stops after buffer assignment, its
+executable stating its memory and its live set and refusing to run; within it, it compiles whole. Each
+attempt of a plan is one compile, whole where the step can fit and stopped where it cannot."""
+
+
+def compile_limit(devices: Sequence, held: int, built: int) -> int | None:
+    """The bytes past which no step fits `devices` (`LIMIT_EXIT`), as XLA sums a step (its arguments, its
+    outputs that write over none of them and its temporaries): the fit check's own arithmetic
+    (`step_headroom`) solved for that sum. The check places the step's temporaries and new outputs beside
+    its arguments, `built` of them not yet resident, and the `held` bytes the loop keeps beside it, `built`
+    among them, all in the least allocator limit among `devices`; so the most a fitting step's sum reaches
+    is that limit less what is held beside the step outside its arguments (`held - built`: the prefetched
+    batches), where the devices hold nothing but its arguments. A step XLA stops past it fits nowhere the
+    check admits; one within it is compiled whole and the fit check judges it. Row 5805's lab step: the
+    limit less all of `held`, the arguments it builds among it counted twice, stopped a step the check
+    admitted, which its first run then refused. None where a device states no limit."""
+    limits = [limit for device in devices if (limit := device_memory(device).get("bytes_limit")) is not None]
+    if not limits or len(limits) < len(devices):
+        return None
+    return min(limits) - (held - built)
+
+
+@dataclasses.dataclass(frozen=True)
+class LiveSet:
+    """What a compile's live set at its peak (`jax.stages.Compiled.peak_live`: each buffer's dimensions'
+    provenance among the step's arguments) says of the step: the bytes of the buffers a microbatch's rows
+    scale (`scaled`: a dimension descends from a batch argument's row axis), and those whose provenance no
+    op states (`unknown`: an opaque kernel's). An argument's buffer (the state, the batch) is neither: no
+    split changes it."""
+
+    scaled: int
+    unknown: int
+
+    @staticmethod
+    def of(executable: jax.stages.Compiled, rows: frozenset[tuple[int, int]]) -> LiveSet | None:
+        """The live set of `executable`, `rows` the (argument, axis) pairs of the batch's rows; None where
+        the backend states none."""
+        live = executable.peak_live()
+        if live is None:
+            return None
+        scaled = unknown = 0
+        for buffer in live:
+            if buffer.kind == "parameter":
+                continue
+            if any(dimension is None for dimension in buffer.dims):
+                unknown += buffer.bytes
+            elif any(dimension is not None and dimension & rows for dimension in buffer.dims):
+                scaled += buffer.bytes
+        return LiveSet(scaled, unknown)
 
 
 def pooled_headroom(headroom: int | None) -> int | None:

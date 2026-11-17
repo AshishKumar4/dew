@@ -794,8 +794,11 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
                                                                              plan["head_fused"])
 
 
-def test_a_fused_tiled_head_compiles_its_offloaded_frontier(tmp_path, monkeypatch):
-    """A fused tiled head compiles its offloaded sibling and restores the admitted plan."""
+def test_a_fused_tiled_heads_plan_compiled_ahead_with_its_frontier_restores_the_admitted_plan(tmp_path,
+                                                                                              monkeypatch):
+    """A fused tiled head's plan compiled ahead with its frontier (`FitSearch.above`, which moves the
+    objective up the ladder and to its offloaded sibling) leaves the objective at the admitted plan: its
+    remat, its head's tile and whether it is fused, the trainer's plan the one compiled ahead."""
     from dew.training.ahead import compile_ahead
     from dew.training.memory import head_fused_of, head_tile_of, recompute_record
 
@@ -824,6 +827,7 @@ def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_
     from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.options import compiler_options
     from dew.nn.kernels.templates.report import AUTOTUNE_CACHE_READ, CUB_NO_FALLBACK, for_devices, targeted
+    from dew.training.memory import LIMIT_EXIT
     from dew.training.planning import FitSearch
 
     monkeypatch.setenv("XLA_FLAGS", without_flags(os.environ.get("XLA_FLAGS", ""),
@@ -854,8 +858,17 @@ def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_
     search = FitSearch(lower=None, options=lambda candidate: compiler_options(*objective.towers()) or None,
                        objective=objective, mesh=deviceless, xla_defaults=False, narrow=False, base=None,
                        resumed=None)
-    assert search.compiled_options(None) == search.required == (compiler_options(*objective.towers()) or None)
-    assert dataclasses.replace(search, xla_defaults=True).compiled_options(None) == search.required
+    assert search.options(None) == search.required == (compiler_options(*objective.towers()) or None)
+    # Its compile's stop past the devices' limit is no option of its program's: the ladder asks no rung of
+    # XLA's defaults beside each place, the same program (train 993's F3), and does where its options differ.
+    start = search.rung_now()
+
+    def twins(chosen) -> list:
+        search.chosen = chosen
+        return [rung for rungs in search.ladder(start, narrow=False) for rung in rungs if rung.xla_defaults]
+
+    assert not twins({**(search.required or {}), LIMIT_EXIT: 2**30})
+    assert twins({**(search.required or {}), "xla_gpu_enable_triton_gemm": True, LIMIT_EXIT: 2**30})
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ['XLA_FLAGS']} --xla_gpu_autotune_level=2")
     assert targeted(lowered(deviceless), None) is None
 
@@ -1335,7 +1348,8 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     the facts its launches derived for are that GPU's, so a GPU of 114 runs it and the canonical one is
     refused; the rung its plan recorded is that GPU's, which a second build for it reuses, apart from the
     canonical build's beside it in one record directory. Its runs score no split midway, whose programs a
-    build compiles too (row 4752), so its three builds are their steps' alone (row 3981)."""
+    build compiles too (row 4752), so its three builds are their steps' alone (row 3981); the first alone
+    inspects, so compiles a sampled step, which no rung record's key holds."""
     import dataclasses
 
     from run_kinds import lm
@@ -1349,7 +1363,7 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
 
     builds = iter(range(3))
 
-    def compiled(*stated: str) -> AheadOfTime:
+    def compiled(*stated: str, inspected: bool = False) -> AheadOfTime:
         root = tmp_path / f"run{next(builds)}"
         root.mkdir()
         path = root / "step.dew-aot"
@@ -1358,14 +1372,14 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
                                "--trainer.compile-ahead.devices", "1",
                                "--trainer.compile-ahead.path", str(path),
                                "--trainer.compile-ahead.capacity-gib", "0.0007",
-                               "--trainer.inspection.every", "1", "--trainer.eval-every", "None",
-                               "--trainer.checkpoint-every", "None", *stated],
+                               *(["--trainer.inspection.every", "1"] if inspected else []),
+                               "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None", *stated],
                               default=lm(root, drawn=False))
         with pytest.raises(CompiledAhead):
             run.run()
         return AheadOfTime.load(path)
 
-    pcie = compiled("--trainer.compile-ahead.multiprocessors", "114")
+    pcie = compiled("--trainer.compile-ahead.multiprocessors", "114", inspected=True)
     again = compiled("--trainer.compile-ahead.multiprocessors", "114")
     canonical = compiled()
     assert (pcie.built.multiprocessors, pcie.target.multiprocessors) == (114, 114)
