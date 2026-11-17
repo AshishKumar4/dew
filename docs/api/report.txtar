@@ -593,8 +593,8 @@ dew.config.trainer.TrainerConfig
   restore_best: bool = False
   cooldowns: Annotated[Cooldowns, tyro.conf.subcommand('cooldowns')] | None = None
   log_every: Annotated[int | str, _cadence_argument(timed=False)] = 100
-  eval_every: Annotated[int | str | None, _cadence_argument(timed=False)] = 'epoch'
-  checkpoint_every: Annotated[int | str | datetime.timedelta | None, _cadence_argument()] = 'epoch'
+  eval_every: Annotated[int | str | None, _cadence_argument(timed=False)] = 'passes'
+  checkpoint_every: Annotated[int | str | datetime.timedelta | None, _cadence_argument()] = 'passes'
   checkpoint_final: bool = True
   local_directory: str | None = None
   local_every: int | str | None = None
