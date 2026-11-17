@@ -536,6 +536,27 @@ def test_a_mapping_of_class_records_reads_from_one_flag_and_round_trips_its_reco
     assert parse(_Schedules, []).schedules == {}
 
 
+def test_a_source_directory_trusted_by_a_bare_name_is_no_module_to_import(tmp_path, monkeypatch):
+    """`--trust lfm3_vl`, a source directory in the working directory named as a package would be, which
+    no module path holds (a console script's `sys.path` has no working directory), trusts the directory's
+    code where a load reads it, as it did before trusting a package imported it: only a name that names an
+    importable module is imported (`import_trusted`)."""
+    import sys
+    import types
+
+    from dew.registry import import_trusted, trusts_source
+
+    (tmp_path / "lfm3_vl").mkdir()
+    monkeypatch.chdir(tmp_path)
+    # A console script's path, which holds no working directory.
+    monkeypatch.setattr(sys, "path", [entry for entry in sys.path if entry not in ("", ".", str(tmp_path))])
+    import_trusted(None, ("lfm3_vl",))
+    assert trusts_source("lfm3_vl") and trusts_source(str(tmp_path / "lfm3_vl"))
+    # A module the process holds without an import spec (installed by hand) is imported as it is.
+    monkeypatch.setitem(sys.modules, "users_installed", types.ModuleType("users_installed"))
+    import_trusted(None, ("users_installed",))
+
+
 def test_a_python_runs_trust_holds_while_its_file_builds_it(tmp_path):
     """`--trust` holds before a Python run's file runs (`run_named`), whether or not its chain is
     recorded: a source the file loads while it builds the run (a source directory beside it, which
