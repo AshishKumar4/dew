@@ -22,7 +22,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, short_conv, tuning
 from dew.nn.kernels.templates import mosaic, scan
-from dew.nn.precision import compensated_add, compensated_sum, logistic_value
+from dew.nn.precision import compensated_add, compensated_sum, logistic_and_slope, logistic_value
 
 TOKENS = 64
 """The most tokens a program walks: a backward program computes K-1 past them, `(K - 1) / TOKENS` extra."""
@@ -335,7 +335,7 @@ def _backward_walk(piece: _Piece, dy_ref, outs, exchanged, *, head: int | None, 
                          else scan.summed(unit * grad, exchanged, interpret=interpret))
             grad = scale * (grad - projected * unit)
         if gate is not None:
-            grad = grad * gate + (grad * pre) * (gate * (1.0 - gate))
+            grad = grad * gate + (grad * pre) * logistic_and_slope(pre)[1]
         return grad
 
     def turn(i, carry):

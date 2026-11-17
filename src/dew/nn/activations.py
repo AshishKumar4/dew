@@ -116,6 +116,14 @@ HIDDEN_ACT: dict[str, Activation] = {'gelu': gelu_exact, 'gelu_pytorch_tanh': ge
 """The activations Hugging Face's `hidden_act` names, as Dew computes them."""
 
 
+def gate_activation(name: str) -> Activation:
+    """A gated norm's gate activation by its name, 'silu' or 'sigmoid' (`precision.activation_and_slope`'s
+    names), as JAX differentiates it: Dew's one logistic and its silu, their tangents declared, where a
+    kernel's body takes their arithmetic (`precision.activation_and_slope`), whose derivative JAX's autodiff
+    makes no number where `e^-x` overflows."""
+    return {'silu': silu, 'sigmoid': logistic}[name]
+
+
 def activation(name: str) -> Activation:
     """The activation Hugging Face's `hidden_act` `name` computes (`HIDDEN_ACT`)."""
     return HIDDEN_ACT[name]

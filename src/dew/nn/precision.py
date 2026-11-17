@@ -181,32 +181,33 @@ def rms_statistics(x: jax.Array, epsilon: float, *, axis=-1, keepdims: bool = Tr
 
 
 def activation_and_slope(gate, activation: str) -> tuple[jax.Array, jax.Array]:
-    """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid', its sigmoid the one logistic's
-    arithmetic (`logistic_value`), as a kernel's body takes it.
+    """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid', its sigmoid and its slope the
+    one logistic's arithmetic (`logistic_and_slope`), as a kernel's body takes them; a gate differentiated by
+    JAX takes Dew's one logistic itself (`activations.gate_activation`), whose tangent is declared.
 
-    silu's derivative `s + g s (1 - s)`, with `s = sigmoid(g)`, cancels to
-    zero near g = -1.28; formed as the product rule forms it, `s + g (s (1 - s))`,
-    its worst element there is half `(g s)(1 - s) + s`'s, as XLA's is."""
-    sigmoid = logistic_value(gate)
-    slope = sigmoid * (1.0 - sigmoid)
+    silu's derivative `s + g s s(-g)`, with `s = sigmoid(g)`, cancels to
+    zero near g = -1.28; formed as the product rule forms it, `s + g (s s(-g))`,
+    its worst element there is half `(g s) s(-g) + s`'s, as XLA's is."""
+    sigmoid, slope = logistic_and_slope(gate)
     if activation == 'sigmoid':
         return sigmoid, slope
     return gate * sigmoid, sigmoid + gate * slope
 
 
 def rms_weighted(x: jax.Array, inverse: jax.Array, *, weight: jax.Array | None = None,
-                 gate: jax.Array | None = None, activation: str = 'silu',
+                 gate: jax.Array | None = None, activation: str | None = 'silu',
                  rounded: Callable[[jax.Array], jax.Array] | None = None, weight_first: bool = False
                  ) -> jax.Array:
-    """An RMS norm's arithmetic past its statistics: `x` times its rows' `inverse` RMS (`rms_statistics`'s,
-    or a kernel's own), times `weight`, times `activation(gate)` (`activation_and_slope`: Qwen3-Next's gated
-    norm), in that order and in `x`'s dtype, which the caller widens (at least fp32) and rounds once after;
-    with `weight_first`, the weight folded into the inverse before the rows (Flax's `nn.RMSNorm`,
-    `x * (inverse * weight)`). `rounded` rounds the normalized rows, before any weight multiplies them
-    (Llama's and Qwen3's cast first, `RMSNorm.scale_after_cast`; a norm computing in its input's dtype),
-    which a weight folded first has none of. The fused norm kernel, the recurrence's gated output norm, the
-    portable norm and the portable gated norm compute it alike, each keeping its own statistics, memory
-    schedule and derivative."""
+    """An RMS norm's arithmetic past its statistics: `x` times its rows' `inverse` RMS (`rms_statistics`'s, or
+    a kernel's own), times `weight`, times `activation(gate)` (`activation_and_slope`: Qwen3-Next's gated
+    norm; `gate` itself for `activation` None, a gate JAX differentiates activated by Dew's one logistic,
+    `activations.gate_activation`), in that order and in `x`'s dtype, which the caller widens (at least fp32)
+    and rounds once after; with `weight_first`, the weight folded into the inverse before the rows (Flax's
+    `nn.RMSNorm`, `x * (inverse * weight)`). `rounded` rounds the normalized rows, before any weight
+    multiplies them (Llama's and Qwen3's cast first, `RMSNorm.scale_after_cast`; a norm computing in its
+    input's dtype), which a weight folded first has none of. The fused norm kernel, the recurrence's gated
+    output norm, the portable norm and the portable gated norm compute it alike, each keeping its own
+    statistics, memory schedule and derivative."""
     if weight is not None and weight_first:
         if rounded is not None:
             raise ValueError("a weight folded into the inverse leaves no normalized rows to round first")
@@ -215,7 +216,9 @@ def rms_weighted(x: jax.Array, inverse: jax.Array, *, weight: jax.Array | None =
         y = x * inverse if rounded is None else rounded(x * inverse)
         if weight is not None:
             y = y * weight
-    return y if gate is None else y * activation_and_slope(gate, activation)[0]
+    if gate is None:
+        return y
+    return y * (gate if activation is None else activation_and_slope(gate, activation)[0])
 
 
 def weighted_total(x: jax.Array, weights: jax.Array, axis=None) -> tuple[jax.Array, jax.Array]:
@@ -503,9 +506,18 @@ def accurate_exp(x, *, base2: bool = False) -> jax.Array:
 def logistic_value(x) -> jax.Array:
     """`1 / (1 + e^-x)` in at least float32, its exp accurate (`accurate_exp`) and a true division: the one
     logistic's arithmetic, which `activations.logistic` declares its tangent over and a kernel's body, which
-    differentiates nothing, calls as it is (`activation_and_slope`, the recurrence step's and conv's)."""
+    differentiates nothing, calls as it is (`activation_and_slope`, the recurrence step's and conv's). JAX's
+    derivative of it is no number where `e^-x` overflows (below x near -88 in fp32): what JAX differentiates
+    takes `activations.logistic`."""
     work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
     return 1.0 / (1.0 + accurate_exp(-work))
+
+
+def logistic_and_slope(x) -> tuple[jax.Array, jax.Array]:
+    """The one logistic's value `s(x)` and derivative `s(x) s(-x)` (`logistic_value`), as a kernel's body
+    differentiates it by hand, `activations.logistic`'s declared tangent alike: `s (1 - s)` reads the rounded
+    `s(x)`, one past x near 17 in fp32, its derivative then zero where float64's is 4.1e-8."""
+    return logistic_value(x), logistic_value(x) * logistic_value(-jnp.asarray(x))
 
 
 def softplus_series(x) -> jax.Array:
