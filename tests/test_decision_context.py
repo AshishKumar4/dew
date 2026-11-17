@@ -24,7 +24,7 @@ from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example
 from dew.decision.images import Images
 from dew.decision.inputs import DecisionInputs
-from dew.decision.layout import Specials
+from dew.decision.layout import SegmentLayout, Specials
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.questions import ChoiceAnswer
@@ -455,12 +455,11 @@ def test_a_request_with_images_reads_its_context_beside_them():
     from PIL import Image
 
     from dew.data.text import HFTokenizer
-    from dew.decision import JointLayout
 
     directory = LLAMA.parent / "qwen38-dense-tiny"
     source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
     tokenizer = HFTokenizer(str(directory), local_files_only=True)
-    layout = JointLayout(max_len=1024)
+    layout = SegmentLayout.joint_row(max_len=1024)
     objective = DecisionObjective(source.with_cross_attention(CrossAttention((0,), 32), key=0),
                                   tokenizer=tokenizer, layout=layout)
     variables = objective.init(jax.random.key(0))
@@ -496,13 +495,12 @@ def test_a_context_reading_tasks_bundle_carries_its_cross_attention_and_refuses_
     its release, which no family writes, is refused as it is written (row 4776's review: the bundle was
     refused as it was made, and a run from such a run's native release could not start)."""
     from dew.data.text import HFTokenizer
-    from dew.decision import JointLayout
     from dew.decision.sources import PretrainedDecision
 
     directory = LLAMA.parent / "qwen38-dense-tiny"
     source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
     tokenizer = HFTokenizer(str(directory), local_files_only=True)
-    layout = JointLayout(max_len=1024)
+    layout = SegmentLayout.joint_row(max_len=1024)
     objective = DecisionObjective(source.with_cross_attention(CrossAttention((0,), 32), key=0),
                                   tokenizer=tokenizer, layout=layout, context_encoder="backbone")
     task = Decide(objective.model, opened(objective.init(jax.random.key(0))), layout, tokenizer,

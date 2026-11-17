@@ -307,6 +307,21 @@ def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
     assert cheaper_spliced(_shared_products, *operands_)
 
 
+def test_a_program_the_pass_rewrites_is_traced_once_at_the_compile_point():
+    """The compile point (`options.program`) lowers a program the pass rewrites from the rewritten program
+    itself, never traced again (row 6977: its replay was a whole second trace of every rewritten step), and
+    what it runs is that program's: two sums the pass joins, as the rewritten function computes them."""
+    from dew.telemetry.compiles import Compiles
+
+    operands = rows(3, (64, 128), (64, 128), (64, 128))
+    compiled = options.program(two_sums)
+    with Compiles("two_sums") as heard:
+        traced = compiled.trace(*operands)
+    assert [found.kind for found in heard.programs].count("traced") == 1
+    np.testing.assert_array_equal(traced.lower().compile()(*operands),
+                                  jax.jit(algebra.rewritten(two_sums))(*operands))
+
+
 def test_two_sums_join_into_one_where_the_model_prices_it_cheaper():
     """Two sums of bounded values (`sum(tanh(x)) + sum(tanh(y))`): the model reads each operand once either
     way and counts one reduction's operations and one addition fewer joined, so the pass splices a form it
@@ -683,6 +698,25 @@ def test_an_fp8_product_is_priced_in_the_tensor_mode_its_gpu_runs_it_in(generati
 
     # Exact: each mode's price is the same FLOPs over the same facts, its rate a power of two apart.
     assert seconds(jnp.float8_e4m3fn) == seconds(jnp.bfloat16) / speedup
+
+
+@pytest.mark.parametrize("target_name", ["v5e", "v6e"])
+def test_an_fp32_product_on_a_tpu_is_its_matrix_units_bf16_passes(target_name):
+    """An fp32 product priced for a TPU is its matrix units' bfloat16 passes (`jax.lax.Precision`'s: one at
+    the default precision, three at HIGH, six at HIGHEST), a bf16 product's work that many times, all of it
+    work the TPU's rates price (row 7201: counted as CUDA-core operations, which a TPU states no rate of,
+    every product of a scan's chunk forms priced at nothing)."""
+    tpu = generation.TARGETS[target_name]
+
+    def work(dtype, precision):
+        with program.passes(target=target_name):
+            made = cost.product_work(1024, 1024, 1024, dtype=dtype, precision=precision)
+        assert not any(kernel_cost.units(made, kernel_cost.rates(tpu, device=True))[1])
+        return made.flops
+
+    bf16 = work(jnp.bfloat16, None)
+    assert [work(jnp.float32, precision) for precision in ("default", "high", "highest")] == [
+        bf16, 3 * bf16, 6 * bf16]
 
 
 def test_xlas_schedule_prices_each_kernel_its_parts_fixed_latency():

@@ -321,3 +321,33 @@ def test_a_walks_guards_on_its_steps_parity_count_one_branch_a_step():
     bound = jax.ShapeDtypeStruct((), jnp.int32)
     counted = _emitted(walk, _ROW, bound, bound)
     assert [(role.step(_exponentials), role.fixed.exponentials) for role in counted.roles] == [(128, 0)] * 2
+
+
+@pytest.mark.parametrize("reduced", [jnp.prod, jnp.all, jnp.any], ids=lambda f: f.__name__)
+def test_a_product_or_a_masks_reduction_counts_one_operation_an_input_element_as_a_sum_does(reduced):
+    """A row value of a [64, 128] tile reduced by a product, or a mask's all or any, counts one operation an
+    input element, as a sum does (`emission._REDUCTIONS`): a producer scaling its rows by their product
+    (`x * prod(x, axis=1)`, a fused prologue's row value) is counted, where it was refused unpriced (base
+    review of 045f07e31, F1)."""
+    tile = jax.ShapeDtypeStruct((64, 128), jnp.float32)
+
+    def counted(reduce):
+        masked = reduced in (jnp.all, jnp.any)
+        return _emitted(lambda x: reduce(x > 0 if masked else x, axis=1), tile).roles[0]
+
+    assert counted(reduced).fixed.operations == counted(jnp.sum).fixed.operations, counted(reduced).fixed
+
+
+@pytest.mark.parametrize("move", [
+    lambda x: lax.concatenate([x[:, 64:], x[:, :64]], 1), lambda x: lax.dynamic_slice(x, (0, 0), (1, 64)),
+    lambda x: lax.dynamic_update_slice(x, x[:, :64], (0, 64)), lambda x: lax.split(x, [64, 64], axis=1)[1],
+    lambda x: lax.stack([x], axis=0), lambda x: lax.tile(x, (1, 2)),
+    lambda x: lax.unstack(x[None], axis=0)[0]],
+    ids=["concatenate", "dynamic_slice", "dynamic_update_slice", "split", "stack", "tile", "unstack"])
+def test_a_layout_move_counts_nothing_as_a_slice_does(move):
+    """Each layout move the Pallas fuser tiles, alone in a body over a [1, 128] row (its slices free beside
+    it), counts no operation of any unit, as a slice does (`emission._FREE`): a fused prologue's stage
+    holding one is priced, never refused unpriced (rows 7260, 7261)."""
+    role = _emitted(move, jax.ShapeDtypeStruct((1, 128), jnp.float32)).roles[0]
+    assert role.fixed == Work(), role.fixed
+

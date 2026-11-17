@@ -26,6 +26,7 @@ from token_support import token_rows
 from dew.batch import FROZEN, merge
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
+from dew.decision.layout import SegmentLayout
 from dew.distributed.batches import shard_batch
 from dew.lora import Adapter, LoRA
 from dew.nn.backbones.decoder_stack import stacked_rows
@@ -405,13 +406,14 @@ def test_a_headed_or_actor_critic_objectives_decoders_keep_their_runs_stage_loca
     each device is spared what each decoder's run spares it as an LM's decoder, where they held every
     layer whole on every stage, silently."""
     from dew.data.text import ByteTokenizer
-    from dew.decision import DecisionObjective, Specials, StateFirstLayout
+    from dew.decision import DecisionObjective, Specials
     from dew.objectives.rl.ppo import PPOObjective, ValueHead
 
     if kind == "decision":
         objective = DecisionObjective(decoder(vocab_size=260, max_seq_len=32), tokenizer=ByteTokenizer(),
                                       specials=Specials(None, 10, 0, "\x00", 255),
-                                      layout=StateFirstLayout(max_len=32, head_max_len=24, option_tokens=6))
+                                      layout=SegmentLayout.state_first_row(max_len=32, head_max_len=24,
+                                                                           option_tokens=6))
         decoders = [decoder(vocab_size=260, max_seq_len=32)]
     else:
         objective = PPOObjective(decoder(), SEQ, critic=ValueHead(decoder()))

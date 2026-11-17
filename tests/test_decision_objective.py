@@ -35,9 +35,9 @@ from dew.decision import (
     RankedProbability,
     Specials,
     Spherical,
-    StateFirstLayout,
     Weights,
 )
+from dew.decision.layout import SegmentLayout
 from dew.decision.model import DecisionModel
 from dew.decision.task import usage_of
 from dew.lora import LoRA
@@ -123,7 +123,7 @@ def test_aurc_merges_a_pass_without_copying_its_answers_until_it_finalizes():
 
 TOKENIZER = ByteTokenizer()
 SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
-LAYOUT = StateFirstLayout(max_len=96, head_max_len=48, option_tokens=8)
+LAYOUT = SegmentLayout.state_first_row(max_len=96, head_max_len=48, option_tokens=8)
 INTENT = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
 EXAMPLES = [Example(state, {"team": INTENT}, {"team": label})
             for state, label in (("charged twice", "billing"), ("site is down", "technical"),
@@ -210,7 +210,7 @@ def test_a_training_reads_draws_lay_a_row_out_to_no_fewer_tokens_than_it_states(
     draw is shorter, and the draws reach it. Over rows of one question, and joint rows of two whose right
     options are long and whose states run past the window by less than, and more than, what one of them
     gives back: the state refills the room one replaced option frees, but not what both free."""
-    from dew.decision import JointLayout, JointSchemaHead
+    from dew.decision import JointSchemaHead
     from dew.decision.rows import ConfigureLayout, QuestionRows
 
     rate = 0.9 if joint else 0.5
@@ -220,7 +220,7 @@ def test_a_training_reads_draws_lay_a_row_out_to_no_fewer_tokens_than_it_states(
     answers = {"team": "billing", "urgency": "high"}
     examples = ([Example("x" * length, {"team": team, "urgency": urgency}, answers)
                  for length in range(0, 1200, 20)] if joint else EXAMPLES)
-    layout = JointLayout(max_len=1536) if joint else LAYOUT
+    layout = SegmentLayout.joint_row(max_len=1536) if joint else LAYOUT
     heads = {"head": JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)}
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout, none_of_the_above=rate,
@@ -479,7 +479,7 @@ def test_a_joint_head_trains_on_the_rows_of_a_head_no_one_matrix_is(head, tmp_pa
     its factors update; and with the head's kernel frozen in FP8 under an adapter, its codes
     decoded, updated where the adapter targets it: each as `merge` folds them into one matrix. A
     step through the head moves the head and the backbone's part the rows come from."""
-    from dew.decision import JointLayout, JointSchemaHead
+    from dew.decision import JointSchemaHead
     from dew.lora import unadapted
     from dew.nn.kernels.generation import device_generation
     from dew.quantization import InputQuantization
@@ -507,7 +507,7 @@ def test_a_joint_head_trains_on_the_rows_of_a_head_no_one_matrix_is(head, tmp_pa
     np.testing.assert_array_equal(backbone.apply(held, method="vocabulary_rows"), expected)
 
     objective = DecisionObjective(given, variables=joined({"backbone": held}), tokenizer=TOKENIZER,
-                                  specials=SPECIALS, layout=JointLayout(max_len=1536),
+                                  specials=SPECIALS, layout=SegmentLayout.joint_row(max_len=1536),
                                   head=JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2,
                                                        feedforward=32))
     data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
@@ -558,7 +558,6 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
     from PIL import Image
 
     from dew.data.text import HFTokenizer
-    from dew.decision import JointLayout
     from dew.interop import Pretrained
 
     directory = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
@@ -570,7 +569,7 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
         for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
             shutil.copyfile(directory / name, tokenizer_directory / name)
     tokenizer = HFTokenizer(str(tokenizer_directory), local_files_only=True)
-    layout = JointLayout(max_len=1024)
+    layout = SegmentLayout.joint_row(max_len=1024)
     base = DecisionObjective(source, tokenizer=tokenizer, layout=layout)
     task = Decide(base.model, nn.unbox(base.init(jax.random.key(0))), layout, tokenizer, base.specials,
                   processor=source.processor)
@@ -632,9 +631,9 @@ def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_pat
 def test_a_saved_one_question_head_refuses_multi_question_requests(tmp_path):
     """A joint layout may train and batch many one-question rows, but neither the live
     nor the saved task may read several question types as one question's embedding."""
-    from dew.decision import DecisionHead, JointLayout, Score
+    from dew.decision import DecisionHead, Score
 
-    layout = JointLayout(max_len=1024)
+    layout = SegmentLayout.joint_row(max_len=1024)
     pick = Choice("x", ["0", "1"])
     examples = [Example(state, {"q0": pick}, {"q0": label})
                 for state, label in (("first", "0"), ("second", "1"))]
@@ -745,7 +744,7 @@ def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
 
 def test_diffusion_gemma_reads_each_row_once_whole_and_reloads_from_the_run(tmp_path):
     """DiffusionGemma is a backbone like any other: its causal encoder reads
-    each clean row once (`hidden_states`), so a StateFirstLayout is chosen
+    each clean row once (`hidden_states`), so a state-first row is chosen
     for it, and the saved run rebuilds it with identical probabilities."""
     from dew.interop import diffusion_gemma
 
@@ -754,7 +753,7 @@ def test_diffusion_gemma_reads_each_row_once_whole_and_reloads_from_the_run(tmp_
     model = diffusion_gemma.build({"model_type": "diffusion_gemma", "canvas_length": 4, "text_config": text},
                                   dtype="float32", attention_impl="xla")
     chosen = DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS).layout
-    assert isinstance(chosen, StateFirstLayout)
+    assert (isinstance(chosen, SegmentLayout) and chosen.form == 'state_first')
     objective = DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
     data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path), keep=1)
@@ -770,22 +769,21 @@ def test_a_joint_run_cuts_its_state_to_the_state_budget_and_a_layout_refuses_a_b
     """--max-state-tokens reaches a fresh joint layout, whose rows keep that much
     state under a `max_len` sized for their schema; a layout refuses a budget it
     has no field for, a row per question the state's and a joint row a question's."""
-    from dew.decision import JointLayout
     from dew.decision.config import _fresh_layout
 
     layout = _fresh_layout(causal=True, one_question=False, budgets={"max_len": 3072, "max_state_tokens": 16})
-    assert layout == JointLayout(max_len=3072, max_state_tokens=16)
+    assert layout == SegmentLayout.joint_row(max_len=3072, max_state_tokens=16)
     # A budget of no state tokens is a budget, which a run's unset options leave alone.
     bare = _fresh_layout(causal=True, one_question=False,
                          budgets={"max_len": 3072, "max_state_tokens": 0, "option_tokens": None})
-    assert bare == JointLayout(max_len=3072, max_state_tokens=0)
+    assert bare == SegmentLayout.joint_row(max_len=3072, max_state_tokens=0)
     (stateless,) = bare.rows(TOKENIZER, SPECIALS, "x" * 500, {"team": INTENT})
     assert stateless.state_kept == 0
     for budgets in ({"max_state_tokens": -1}, {"max_len": 0}):
         with pytest.raises(ValueError):
             _fresh_layout(causal=True, one_question=False, budgets=budgets)
     (row,) = layout.rows(TOKENIZER, SPECIALS, "x" * 500, {"team": INTENT})
-    (whole,) = JointLayout(max_len=3072).rows(TOKENIZER, SPECIALS, "x" * 500, {"team": INTENT})
+    (whole,) = SegmentLayout.joint_row(max_len=3072).rows(TOKENIZER, SPECIALS, "x" * 500, {"team": INTENT})
     assert row.state_kept == 16 and len(whole.tokens) - len(row.tokens) == whole.state_kept - 16
     with pytest.raises(ValueError):
         _fresh_layout(causal=True, one_question=False, budgets={"max_len": 3072, "head_max_len": 96})
@@ -830,10 +828,10 @@ def test_a_head_reads_none_of_its_rows_padding(joint):
     """A batch's rows of unequal length pad the shorter: Laya's head and the joint head give the same
     logits whatever states the backbone leaves on that padding, NaN included, as a padded or diverged
     row's can be."""
-    from dew.decision import DecisionInputs, JointLayout, JointSchemaHead
+    from dew.decision import DecisionInputs, JointSchemaHead
     from dew.objectives.base import part
 
-    layout = JointLayout(max_len=1024) if joint else StateFirstLayout(max_len=512)
+    layout = SegmentLayout.joint_row(max_len=1024) if joint else SegmentLayout.state_first_row(max_len=512)
     head = JointSchemaHead(hidden_size=32, width=32, routing_layers=1, layers=1, heads=2,
                            feedforward=64) if joint else None
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
@@ -859,9 +857,9 @@ def test_a_head_reads_none_of_its_rows_padding(joint):
 def test_the_abstract_state_draws_a_missing_head_at_the_shapes_init_draws(joint):
     """A missing head drawn in a trace of the state (the abstract state a restore builds) has the
     shapes a concrete init gives it. The joint head reads the backbone's output table as well."""
-    from dew.decision import JointLayout, JointSchemaHead
+    from dew.decision import JointSchemaHead
 
-    layout = JointLayout(max_len=96) if joint else LAYOUT
+    layout = SegmentLayout.joint_row(max_len=96) if joint else LAYOUT
     head = JointSchemaHead(hidden_size=32, width=32, routing_layers=1, layers=1, heads=2,
                            feedforward=64) if joint else None
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
@@ -887,6 +885,7 @@ def test_the_joint_heads_bfloat16_cosine_is_an_fp32_cosine_in_every_process_on_a
 import json
 import jax, jax.numpy as jnp, numpy as np
 from dew.nn.norms import cosine
+from dew.decision.layout import SegmentLayout
 shape = (32, 128, 24)
 z = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
 fields, options = (jnp.asarray(np.sin(z) * 2, jnp.bfloat16), jnp.asarray(np.cos(z) * 2, jnp.bfloat16))

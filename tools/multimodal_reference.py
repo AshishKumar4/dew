@@ -33,7 +33,7 @@ from transformers import (
 from transformers.models.gemma3.image_processing_pil_gemma3 import Gemma3ImageProcessorPil
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-from multimodal_families import DRAWN, FAMILIES, LEARNING_RATE
+from multimodal_families import DRAWN, FAMILIES, LEARNING_RATE, PROCESSOR_OPTIONS
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 
@@ -309,7 +309,7 @@ def gemma3_processor(destination: Path):
     processor = Gemma3Processor(
         Gemma3ImageProcessorPil(size={"height": 28, "width": 28}), tokenizer, image_seq_length=4)
     processor.save_pretrained(destination)
-    return AutoProcessor.from_pretrained(destination, local_files_only=True, backend="pil")
+    return AutoProcessor.from_pretrained(destination, local_files_only=True, **PROCESSOR_OPTIONS["gemma3"])
 
 
 def write_gemma3_native() -> None:

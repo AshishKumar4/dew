@@ -25,18 +25,8 @@ import tyro
 from dew import Trainer
 from dew.checkpoints import Checkpoints
 from dew.config import TrainerConfig
-from dew.decision import (
-    AURC,
-    ECE,
-    Accuracy,
-    Brier,
-    Decide,
-    DecisionObjective,
-    Example,
-    LogLoss,
-    StateFirstLayout,
-    decisions,
-)
+from dew.decision import AURC, ECE, Accuracy, Brier, Decide, DecisionObjective, Example, LogLoss, decisions
+from dew.decision.layout import SegmentLayout
 from dew.interop import Pretrained
 from dew.lora import LoRA
 from dew.optim import OptimConfig
@@ -98,7 +88,7 @@ def main(options: Options) -> None:
         # The adapter keeps Qwen's weights frozen, so they load where the trainer's start keeps them.
         placement = TrainerConfig().source_placement(frozen=True)
         qwen = Pretrained.load(QWEN[0], revision=QWEN[1], **placement).adapt(adapter, key=0)
-        layout = StateFirstLayout(max_len=512, head_max_len=448, option_tokens=12)
+        layout = SegmentLayout.state_first_row(max_len=512, head_max_len=448, option_tokens=12)
         objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier(), layout=layout)
 
     checkpoints = Checkpoints(options.run, keep=1)

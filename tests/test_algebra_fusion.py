@@ -230,6 +230,19 @@ def normed_from_float32_twice(x, w):
     return rows @ w, rows @ w[:, ::-1]
 
 
+def test_a_projection_whose_forced_prologue_refuses_is_fused_without_it():
+    """A float32 row normalized to bfloat16 and read by two projections, on an H100 whose call names the
+    template and its prologue: the prologue's stage refuses before the analysis reaches the launch, so the
+    launch is undecided and each region is weighed again without its prologue, its product the template's
+    (the region dropped when only a launch reached and found XLA's rules it out, train 965's F2)."""
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.float32), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", gemm_prologue="fused"), \
+            generation.routes() as found:
+        jax.jit(algebra.rewritten(normed_from_float32_twice, kernels=True)).trace(*shapes)
+    assert {route.kernel for route in found if route.choice == "grouped_matmul"} == {"mosaic"}, [
+        (route.choice, route.kernel) for route in found]
+
+
 def test_a_prologue_the_template_refuses_leaves_the_rows_computed_once():
     """A float32 row normalized to bfloat16 and read by two projections, under the pass on an H100 whose
     template a call names: the template refuses the prologue, so each region is weighed without it, each
