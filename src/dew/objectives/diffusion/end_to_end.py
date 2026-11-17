@@ -76,12 +76,26 @@ class TunedAutoEncoder(AutoEncoder):
     norm's epsilon, the scale REPA-E's `SiT.extract_latents_stats` gives its sampling to denormalize
     with. The statistics are data, not constants of a compiled walk: one frozen autoencoder's tuned
     copies are equal, so every publication of a run, each with its own statistics, samples through
-    the program the first compiled."""
+    the program the first compiled. A run that starts from a tuned run records it (`recorded_fields`) and
+    rebinds it around its tree's `autoencoder` collection (`bound_arguments`, ledger 2791)."""
+
+    parameter_collections = (TUNED_WEIGHTS,)
 
     def __init__(self, autoencoder: AutoEncoder, params: Variables):
         self.autoencoder = autoencoder
         self.model = autoencoder.model
         self.params = params
+
+    def recorded_fields(self) -> dict:
+        """The record a run keeps of this autoencoder: the one it wraps, by that one's own record, never
+        the tuned weights or the statistics, which the run's tree holds (`bound_arguments`)."""
+        return {"autoencoder": self.autoencoder}
+
+    @classmethod
+    def bound_arguments(cls, fields: Mapping[str, object], params: Variables) -> Mapping[str, object]:
+        """The autoencoder it wraps, rebuilt from its record in `fields` around the tuned weights of
+        `params`, its tree's `autoencoder` collection (`AutoEncoder.bound`)."""
+        return {"autoencoder": AutoEncoder.bound(fields["autoencoder"], params=params[TUNED_WEIGHTS])}
 
     def __eq__(self, other) -> bool:
         return isinstance(other, TunedAutoEncoder) and other.autoencoder is self.autoencoder

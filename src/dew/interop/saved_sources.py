@@ -239,14 +239,13 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
 
     A run of another task, a revision of a directory, and `text=False`, which the restore of a run's
     tree cannot skip, are refused, as is a kernel other than `auto` for a denoiser that takes none. So
-    are a run that tuned its autoencoder (`end_to_end`), whose tuned autoencoder a run started from it
-    records nothing of (ledger 2791), and a `size` other than the run's own, whose conditioning, grid
-    and process are bound to its size (ledger 2792)."""
+    is a `size` other than the run's own, whose conditioning, grid and process are bound to its size
+    (ledger 2792). A run that tuned its autoencoder (`end_to_end`) is started from with its tuned
+    autoencoder, which the started run records and holds (`TunedAutoEncoder`, ledger 2791)."""
     from dew._records import record
     from dew.diffusion.schedules.source import SourceGrid
     from dew.inference.images import ImageSettings, TextToImage, restored_tree
     from dew.inference.tasks import saved_settings
-    from dew.objectives.diffusion.objective import without_loss_heads
 
     if not samples_images(run):
         raise ValueError(f"{checkpoint} is a {run.objective.__name__} run, which Pretrained.load reads; a "
@@ -257,14 +256,16 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
         raise ValueError(f"{checkpoint} is a saved run, whose tree restores its text encoder with its "
                          "denoiser; text=False skips none of it")
     settings = saved_settings(run.record, ImageSettings)
-    if settings.end_to_end is not None:
-        raise ValueError(f"{checkpoint} tuned its autoencoder end to end, which a run started from it "
-                         "records nothing of; resume it under its name (--trainer.resume), or serve it "
-                         "(TextToImage.from_run)")
-    # The tree as the checkpoint holds it, not as the task reads it whole, its loss heads the run's own.
-    tree = (without_loss_heads(restored_tree(run, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype))
-            if variables is None else variables)
-    task = TextToImage.from_saved(run, dtype=dtype, variables=tree)
+    if variables is None:
+        # The tree as the checkpoint holds it, then as the task publishes it: its loss heads the run's own
+        # and dropped, a tuned autoencoder's weights and statistics under `autoencoder` (`EndToEnd.tuned`).
+        task = TextToImage.from_saved(run, dtype=dtype, variables=restored_tree(
+            run, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype))
+        tree = task.variables
+    else:
+        # The starting run's own tree, which holds the task's published form.
+        task = TextToImage.from_saved(run, dtype=dtype, variables=variables, published=True)
+        tree = variables
     sample = task.inputs.sample
     if size is not None and tuple(size) != sample.shape[:-1]:
         raise ValueError(f"{checkpoint} trained on {sample.key} of shape {sample.shape[:-1]}, to which its "
