@@ -2259,18 +2259,30 @@ NORMED_08B = ((1024, 4096 + 512 + 512), (1024, 2 * 3584))
 """Qwen3.5-0.8B's normed projections M-EM-65 timed (`M_EM_65`): the attention input norm before the joined
 query (doubled by its output gate), key and value, and the MLP's norm before gate and up, `[in, out]`."""
 
+NORMED_4B_8B = ((2560, 8192 + 1024 + 1024), (2560, 2 * 9216), (4096, 4096 + 1024 + 1024), (4096, 2 * 14336))
+"""Qwen3.5-4B's and Llama-3.1-8B's normed projections M-EM-67 timed (`M_EM_67`): each's joined query (the
+4B's doubled by its output gate), key and value, and its gate and up, `[in, out]`."""
+
+M_EM_67 = ("M-EM-67-gh200 (a GH200, main 27bc19ccba3, rounds.py's two arms interleaved 5 rounds, fresh "
+           "caches an arm, 2 x 2048 and 4 x 3072 rows of bf16, a training step's forward and backward): the "
+           "norm in the template's prologue against the fused norm kernel then XLA's dot, 0.562x to 0.624x "
+           "at every projection, ranges apart; an A100 1.041x to 1.100x, so no A100 cell")
 M_EM_65 = ("M-EM-65-a100 and M-EM-65-gh200 (an A100 and a GH200, main 99c7334e2, rounds.py's two arms "
            "interleaved 5 rounds, CUPTI medians, 4 x 3072 rows of bf16, a training step's forward and "
            "backward): the norm in the template's prologue against the fused norm kernel then XLA's dot, "
            "0.955x and 0.619x at the attention norm + q/k/v, 0.971x and 0.533x at the MLP norm + gate/up, "
            "ranges apart")
-MEASURED: dict[tuple[str | None, Made, bool], Timed] = {
-    **{(family, made, False): Timed(frozenset(FOUR_B), 24576, 49152) for family in ('wgmma', 'tcgen05')
+MEASURED: dict[tuple[str | None, Made, bool], tuple[Timed, ...]] = {
+    **{(family, made, False): (Timed(frozenset(FOUR_B), 24576, 49152),) for family in ('wgmma', 'tcgen05')
        for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT)},
-    **{(family, made, True): Timed(frozenset(NORMED_08B), 12288, 12288) for family in ('mma.sync', 'wgmma')
+    **{('mma.sync', made, True): (Timed(frozenset(NORMED_08B), 12288, 12288),)
+       for made in (Made.FORWARD, Made.KERNEL_GRADIENT)},
+    **{('wgmma', made, True): (Timed(frozenset(NORMED_08B), 12288, 12288),
+                               Timed(frozenset(NORMED_4B_8B), 4096, 12288))
        for made in (Made.FORWARD, Made.KERNEL_GRADIENT)}}
 """The dense products each instruction family's receipts timed, by what the product makes: one of them is a
-cell of its own (`Kind.matrix`), which its receipt's winner holds; every other product its kind's. The
+cell of its own (`Kind.matrix`), which its receipt's winner holds, each receipt its own matrices and rows;
+every other product its kind's. The
 receipts timed 24,576 tokens (M-EM-36, M-EM-52, em35d); the 4B step's 49,152 (four rows) held the same
 cells at parity with cuBLASLt (M-EM-54, interleaved in one session: 3,418.7 against 3,416.9 ms)."""
 
@@ -2289,6 +2301,8 @@ DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str
     **{(family, Kind(dense=True, made=made, matrix=matrix, formed=True)): (MOSAIC, M_EM_65)
        for family in ('mma.sync', 'wgmma') for made in (Made.FORWARD, Made.KERNEL_GRADIENT)
        for matrix in NORMED_08B},
+    **{('wgmma', Kind(dense=True, made=made, matrix=matrix, formed=True)): (MOSAIC, M_EM_67)
+       for made in (Made.FORWARD, Made.KERNEL_GRADIENT) for matrix in NORMED_4B_8B},
     ('mma.sync', Kind(dense=True, made=Made.FORWARD)):
         (XLA, "DENSE1 (A100, a55c8ffb2, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
              "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens; M-FS-9 (RTX PRO 6000, "
@@ -2397,8 +2411,8 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     family = generation.family(call.target.generation)
 
     def timed(*, formed: bool) -> bool:
-        measured = MEASURED.get((family, made, formed))
-        return matrix is not None and measured is not None and measured.holds(matrix, rows)
+        return matrix is not None and any(timed.holds(matrix, rows)
+                                          for timed in MEASURED.get((family, made, formed), ()))
 
     formed = options['hooks'].prologue is not None and timed(formed=True)
     kind = Kind(bool(options['dense']), made, fp8=fp8, gathered=gathered, scattered=scattered,
