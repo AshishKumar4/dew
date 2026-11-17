@@ -1920,15 +1920,18 @@ SOFTPLUS_OWNER = "nn/precision.py"
 """The module of `src/<package>` that forms softplus (SLOP030), by its own series, past a backend's log1p."""
 
 SOFTPLUS = frozenset({"jax.nn.softplus", "flax.linen.softplus", "flax.linen.activation.softplus",
-                      "jax._src.nn.functions.softplus"})
-"""JAX's and Flax's softplus, by their public paths, which SLOP030 reports outside `SOFTPLUS_OWNER`."""
+                      "jax._src.nn.functions.softplus", "jax.nn.log_sigmoid", "flax.linen.log_sigmoid",
+                      "flax.linen.activation.log_sigmoid", "jax._src.nn.functions.log_sigmoid"})
+"""JAX's and Flax's softplus and log-sigmoid (`-softplus(-x)`), by their public paths, which SLOP030 reports
+outside `SOFTPLUS_OWNER`."""
 
 OWNED = (
     ("SLOP026", DERIVATIVE_OWNER, CUSTOM_DERIVATIVES,
      "applies {named} itself; declare it with its kind through `dew.nn.derivatives` (`declared_derivative`, "
      "`declared_tangent` or `surrogate`)"),
     ("SLOP030", SOFTPLUS_OWNER, SOFTPLUS,
-     "calls {named}, its log1p the backend's; call `dew.nn.precision.softplus`, its series past it"),
+     "calls {named}, its log1p the backend's; call `dew.nn.precision.softplus` (a log-sigmoid its "
+     "`-softplus(-x)`), its series past it"),
 )
 """The constructs one module of `src/<package>` owns, each its rule, its owner, its names and its finding:
 JAX's custom derivatives (SLOP026: applied by a site, its derivative is a call the algebra pass cannot tell a
