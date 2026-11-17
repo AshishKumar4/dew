@@ -673,6 +673,28 @@ def test_a_decode_step_launches_only_kernels_its_certification_held():
     assert record["modules"] and record["modules"].items() <= record["certified"].items(), record
 
 
+@COMPILES_ON_CPU
+def test_a_decode_step_prepared_for_devices_no_run_tuned_is_certified():
+    """The public decode step (`attention_route.attend`, the cell above's) lowered in a prepare for devices no
+    run has tuned (`report.for_devices`, a compile ahead's) on a compile-only H100: its launch certified there
+    as anywhere, its launch alone compiled to be read (`report.read_offline`), where XLA's want of a tuned
+    result for the launch's own fusions ended its certification (`report.Untuned`)."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.templates import attention_route
+
+    query = jax.ShapeDtypeStruct((1, 1, 4, 128), jnp.float16)
+    key = jax.ShapeDtypeStruct((1, 1024, 2, 128), jnp.float16)
+    spans = template.spans(1, 1024, 1, causal=False)
+    before = report.uncertified()
+    with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]), report.for_devices():
+        lowered_for(lambda q, k, v: attention_route.attend(q, k, v, spans, natural=False), (query, key, key),
+                    "sm90")
+    assert not set(report.uncertified()) - set(before), report.uncertified()
+    assert any(found.op == "MosaicForward" for found in report.certifications()), report.certifications()
+
+
 @pytest.mark.parametrize("slices", [1, 3, 7])
 def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices):
     """Slices of a row's keys, each its output normalized, its maximum and its denominator, a slice of no

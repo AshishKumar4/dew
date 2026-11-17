@@ -617,12 +617,6 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
             with _GUARD:
                 _UNCERTIFIED[key] = str(error)[:400]
             return None
-        except Untuned as error:
-            # Or, deviceless, XLA holds no tuned result for its fusions (`Untuned`), which the program's
-            # compile states (`dew.training.ahead.CompiledAhead.untuned`).
-            with _GUARD:
-                _UNCERTIFIED[key] = str(error)[:400]
-            return None
         if stored is not None:
             tuning.store_verdict(device.device_kind, stored, kernels)
     found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None,
@@ -780,8 +774,11 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
                                        kernel_bodies(call for call in calls if call.kind == "triton").items()}
     if not modules:
         return {}
-    return {name: (modules[name], binary)
-            for binary in binaries(xla_compiled(lowered, None))
+    # Compiled to be read, never run (`read_offline`): its kernels' binaries are what it states, so a prepare
+    # for devices no run has tuned (`for_devices`) certifies as any compile does, its fusions untuned.
+    with read_offline():
+        compiled = xla_compiled(lowered, None)
+    return {name: (modules[name], binary) for binary in binaries(compiled)
             if (name := launch_name(binary.kernel, binary.launch)) in modules}
 
 
