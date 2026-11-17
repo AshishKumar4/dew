@@ -168,45 +168,6 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
     assert stored, "its run's rows are recorded as any lane's"
 
 
-def test_a_lanes_files_ask_beside_their_reports_and_a_follow_up_hands_each_the_asks_and_reuses_no_row(
-        ci, tmp_path, monkeypatch, cache_worker):
-    """Each file a GPU lane runs writes its sites' asks for their later units (check 1's LATER) beside its
-    report, where its receipt carries them; a follow-up lane given those asks (`asked`, check 1's ASKED) hands
-    them to each file's process, and its run reuses no row the test cache holds: a follow-up judges what the
-    run it follows left undecided, never a green earned before (Main,
-    2026-11-14; train 859's review: one channel, the LATER asks)."""
-    url, stored, _ = cache_worker
-    gpu_lane_at(tmp_path, monkeypatch, url, 0)
-    interpreter(tmp_path, "3.12")
-    fetcher(tmp_path)
-    wire = load("check1_wire", "tests")
-    (tmp_path / "tests/test_flows.py").write_text(
-        "import json, os\n"
-        "def test_flow():\n"
-        "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
-        f"    with open(f'{{kind}}.log', 'a') as log:\n"
-        f"        log.write(str(os.environ.get('{wire.ASKED}')) + chr(10))\n"
-        f"    if kind == 'ran':\n"
-        f"        with open(os.environ['{wire.LATER}'], 'a') as asks:\n"
-        "            asks.write(json.dumps({'site': 'sinks: train', 'from': 64, 'to': 256}) + chr(10))\n")
-    out = tmp_path / "verdict.json"
-    assert ci.gpu_lane("3.12", ["tests/test_flows.py"], out, cache="on", processes=1, deadline=600.0) == 0
-    assert (tmp_path / "ran.log").read_text().split() == ["None"]
-    asks = ci.later_asks(out.with_name(f"{out.name}.0"))
-    assert asks.parent == out.parent and json.loads(asks.read_text()) == {"site": "sinks: train", "from": 64,
-                                                                            "to": 256}
-    # Its rows recorded, so a lane with the cache on would reuse them; a follow-up runs its files again, its
-    # asks handed to each, and its own asks start from none.
-    assert stored
-    asked = tmp_path / "asked.jsonl"
-    asked.write_text(asks.read_text())
-    assert ci.gpu_lane("3.12", ["tests/test_flows.py"], out, cache="on", processes=1, deadline=600.0,
-                       asked=asked) == 0
-    assert (tmp_path / "ran.log").read_text().split() == ["None", str(asked)]
-    assert len(asks.read_text().splitlines()) == 1
-    assert ci.asked_environment(None) == {} and ci.asked_environment(asked) == {wire.ASKED: str(asked)}
-
-
 def test_a_file_that_does_not_collect_is_its_own_red_row_and_the_lanes_other_files_run(
         ci, tmp_path, monkeypatch, cache_worker):
     """A lane reads which of its files hold tests for another process by collecting them: a file that does

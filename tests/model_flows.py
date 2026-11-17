@@ -29,9 +29,7 @@ import jax
 import jax.numpy as jnp
 import kernel_matrix
 import numpy as np
-from check1_wire import ASKED
 from gpu_flow import Cell, run_cells
-from map_judge import site_id
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact
 from truths_ahead import compiled_memory, compiled_truths
@@ -525,7 +523,7 @@ def prepare(flow: Flow) -> bool:
         reference, found = _compiled(named, "reference", target)
     reference.save(directory / "reference.programs")
     held_reference(flow, [route for kind in KINDS for route in found[kind]])
-    for kind in kinds_of(flow):
+    for kind in KINDS:
         judge(flow, {}, kind, target)
     programs = need(dew, reference, directory / "truths")
     (directory / NEED).write_text(json.dumps(programs))
@@ -631,30 +629,13 @@ def judge(flow: Flow, programs: Mapping[str, Callable], kind: str, target=None) 
                         f"{flow.name}: {kind}", seeds=flow.seeds[kind], truth_fn=truth)
 
 
-def asked() -> frozenset[str]:
-    """The sites (`map_judge.site_id`) a follow-up job draws the second stage of (`check1_wire.ASKED`, its
-    first run's asks merged), none for a job that is no follow-up."""
-    path = os.environ.get(ASKED)
-    return frozenset() if not path else frozenset(
-        json.loads(line)["site"] for line in Path(path).read_text().splitlines() if line.strip())
-
-
-def kinds_of(flow: Flow) -> tuple[str, ...]:
-    """The flow's programs a job judges: every one, in a follow-up (`asked`) every one of a flow it was asked
-    a site of and none of another. A flow's cells fail as one (`gpu_flow.CellsFailed`) and its case is
-    waived for its asks alone, so a follow-up judges the flow's decided cells again beside its asked one: a
-    red of theirs comes back in its receipt."""
-    later = asked()
-    return KINDS if not later or any(site_id(f"{flow.name}: {kind}") in later for kind in KINDS) else ()
-
-
 def run(flow: Flow) -> int:
     """The flow on this GPU from its prepared programs and truths: check 1 of each program its run judges
-    (`kinds_of`), each a cell (`gpu_flow.run_cells`, which reports the cells that ran); its device's peak
+    (`KINDS`), each a cell (`gpu_flow.run_cells`, which reports the cells that ran); its device's peak
     bytes after them, which the test reports."""
     programs = loaded(flow)
     run_cells([Cell(f"{flow.name}: {kind}", functools.partial(judge, flow, programs, kind))
-               for kind in kinds_of(flow)])
+               for kind in KINDS])
     return int((jax.devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0))
 
 
