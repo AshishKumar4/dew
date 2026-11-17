@@ -688,7 +688,8 @@ def test_a_hosts_measurement_reaches_its_parent_whatever_the_measuring_process_p
     last line as the record, and NCCL_DEBUG=INFO's log there refused a 2xH100 training start (row 6497).
     Measured over two host devices, whose memory the measurement reads as none."""
     (tmp_path / "sitecustomize.py").write_text(
-        "import atexit, os\natexit.register(lambda: os.write(1, b'node:1:2 [0] NCCL INFO comm 0x1 done\\n'))\n")
+        "import atexit, os, sys\natexit.register(lambda: (sys.stdout.flush(),\n"
+        "                          os.write(1, b'node:1:2 [0] NCCL INFO comm 0x1 done\\n')))\n")
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(tmp_path), *sys.path]))
     monkeypatch.setenv("JAX_PLATFORMS", "cpu")
