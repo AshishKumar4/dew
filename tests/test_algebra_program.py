@@ -307,6 +307,21 @@ def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
     assert cheaper_spliced(_shared_products, *operands_)
 
 
+def test_a_program_the_pass_rewrites_is_traced_once_at_the_compile_point():
+    """The compile point (`options.program`) lowers a program the pass rewrites from the rewritten program
+    itself, never traced again (row 6977: its replay was a whole second trace of every rewritten step), and
+    what it runs is that program's: two sums the pass joins, as the rewritten function computes them."""
+    from dew.telemetry.compiles import Compiles
+
+    operands = rows(3, (64, 128), (64, 128), (64, 128))
+    compiled = options.program(two_sums)
+    with Compiles("two_sums") as heard:
+        traced = compiled.trace(*operands)
+    assert [found.kind for found in heard.programs].count("traced") == 1
+    np.testing.assert_array_equal(traced.lower().compile()(*operands),
+                                  jax.jit(algebra.rewritten(two_sums))(*operands))
+
+
 def test_two_sums_join_into_one_where_the_model_prices_it_cheaper():
     """Two sums of bounded values (`sum(tanh(x)) + sum(tanh(y))`): the model reads each operand once either
     way and counts one reduction's operations and one addition fewer joined, so the pass splices a form it
