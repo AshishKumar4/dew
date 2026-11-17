@@ -527,39 +527,39 @@ def dreamer_fit(directory, objective, rollout, steps, **options):
                        **options)
 
 
+@pytest.mark.parametrize("checkpointed", [False, True], ids=["steps", "replay"])
 @pytest.mark.parametrize("given", ["prefilled", "supplied"])
-def test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike(tmp_path,
-                                                                                                  given):
+def test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike(
+        tmp_path, given, checkpointed):
     """A DreamerV3 run on targets, stopped at its second update and resumed by a fresh rollout: the
     checkpoint holds the environment steps it took, so the resumed rollout takes, update by update, the
     steps the uninterrupted one did, its environments and replay begun again (its prefill taken again);
     with `checkpointed_replay` it also holds the replay (the prefill's, or one the rollout was given, of
     another capacity), the targets mid episode and their returns, so the resumed run takes the very steps
-    and its last state is the uninterrupted run's, every leaf bit for bit."""
+    and its last state is the uninterrupted run's, every leaf bit for bit. Each checkpoint's runs a test of
+    their own, where a case's two took 136 s (train 609, row 4273)."""
     supplied = None
     if given == "supplied":
         seed = DreamerRollout(DreamerV3Objective(tiny()), Batched(TimeLimit(Target(), episode_length=20), 8),
                               capacity=300, batch=8, length=16, train_ratio=32.0, prefill=24)
         dreamer_fit(None, seed.objective, seed, 1)
         supplied = seed.held_replay
-    for checkpointed in (False, True):
-        objective = DreamerV3Objective(tiny())
+    objective = DreamerV3Objective(tiny())
 
-        def made(objective=objective, checkpointed=checkpointed):
-            replay = None if supplied is None else jax.tree.map(jnp.copy, supplied)
-            return dreamer_targets(objective, checkpointed=checkpointed, replay=replay)
+    def made():
+        replay = None if supplied is None else jax.tree.map(jnp.copy, supplied)
+        return dreamer_targets(objective, checkpointed=checkpointed, replay=replay)
 
-        uninterrupted = made()
-        whole = dreamer_fit(None, objective, uninterrupted, 4)
-        dreamer_fit(tmp_path / f"stopped-{checkpointed}", objective, made(), 2)
-        resumed = made()
-        again = dreamer_fit(tmp_path / "stopped-True" if checkpointed else tmp_path / "stopped-False",
-                            objective, resumed, 4)
-        prefilled = 0 if checkpointed or supplied is not None else 24 * 8
-        assert resumed.environment_steps == uninterrupted.environment_steps + prefilled
-        if checkpointed:
-            for one, other in zip(bits(whole), bits(again), strict=True):
-                np.testing.assert_array_equal(one, other)
+    uninterrupted = made()
+    whole = dreamer_fit(None, objective, uninterrupted, 4)
+    dreamer_fit(tmp_path / "stopped", objective, made(), 2)
+    resumed = made()
+    again = dreamer_fit(tmp_path / "stopped", objective, resumed, 4)
+    prefilled = 0 if checkpointed or supplied is not None else 24 * 8
+    assert resumed.environment_steps == uninterrupted.environment_steps + prefilled
+    if checkpointed:
+        for one, other in zip(bits(whole), bits(again), strict=True):
+            np.testing.assert_array_equal(one, other)
 
 
 def test_a_dreamer_rollouts_step_counts_past_32_bits_come_back_from_its_checkpoint(tmp_path):
