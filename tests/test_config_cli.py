@@ -146,10 +146,20 @@ def test_a_python_run_whose_chain_is_unrecorded_trains_from_dew_train(tmp_path):
 
 def profiled(report_file: Path) -> dict:
     """A profile's report, held to the capture it names: the steps the capture's training annotations
-    hold are exactly the two after its warmup of two, the steps its log covers."""
+    hold are exactly the two after its warmup of two, the steps its log covers; its kernels the plan's
+    record of the program its window ran, the run's latest compiled before it (rows 6665, 6715); its
+    losses at most three of the step's shares, disjoint, largest first: where the capture holds a device
+    track, the device's own idle shares in place of the loop's input wait (row 6714)."""
     from dew.training.profiling import traced_steps
 
     report = json.loads(report_file.read_text())
+    (records,) = Path(report["directory"]).glob("*/tracking/records.jsonl")
+    compiled = [entry for entry in map(json.loads, records.read_text().splitlines())
+                if entry["type"] == "StepCompiled" and entry["step"] <= 3]
+    assert report["kernels"] == (compiled[-1]["value"]["plan"] or {}).get("kernels")
+    values = [value for _, value in report["losses"]]
+    assert len(values) <= 3 and values == sorted(values, reverse=True) and all(value > 0 for value in values)
+    assert len({name for name, _ in report["losses"]}) == len(values)
     assert traced_steps(Path(report["capture"])) == (2, 3) and tuple(report["traced"]) == (2, 3)
     assert (report["steps"], report["warmup"]) == (2, 2)
     assert report["step_ms"] > 0 and report["input_wait_ms"] >= 0 and report["compile_s"] > 0
@@ -534,6 +544,27 @@ def test_a_mapping_of_class_records_reads_from_one_flag_and_round_trips_its_reco
                                 "delay": Exponential(init_value=10.0, end_value=1.0, every=4)}
     assert _Schedules.from_dict(json.loads(json.dumps(config.to_dict()))) == config
     assert parse(_Schedules, []).schedules == {}
+
+
+def test_a_source_directory_trusted_by_a_bare_name_is_no_module_to_import(tmp_path, monkeypatch):
+    """`--trust lfm3_vl`, a source directory in the working directory named as a package would be, which
+    no module path holds (a console script's `sys.path` has no working directory), trusts the directory's
+    code where a load reads it, as it did before trusting a package imported it: only a name that names an
+    importable module is imported (`import_trusted`)."""
+    import sys
+    import types
+
+    from dew.registry import import_trusted, trusts_source
+
+    (tmp_path / "lfm3_vl").mkdir()
+    monkeypatch.chdir(tmp_path)
+    # A console script's path, which holds no working directory.
+    monkeypatch.setattr(sys, "path", [entry for entry in sys.path if entry not in ("", ".", str(tmp_path))])
+    import_trusted(None, ("lfm3_vl",))
+    assert trusts_source("lfm3_vl") and trusts_source(str(tmp_path / "lfm3_vl"))
+    # A module the process holds without an import spec (installed by hand) is imported as it is.
+    monkeypatch.setitem(sys.modules, "users_installed", types.ModuleType("users_installed"))
+    import_trusted(None, ("users_installed",))
 
 
 def test_a_python_runs_trust_holds_while_its_file_builds_it(tmp_path):

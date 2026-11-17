@@ -57,7 +57,7 @@ from .linear import (
     split_delta_rule,
 )
 from .mixer_base import MixerBase, MixerContext
-from .precision import at_least_fp32, float32_dot_general
+from .precision import at_least_fp32, float32_dot_general, softplus
 from .residuals import DELTA_RULE_RESIDUALS
 from .sharding import LogicalAxes, sequence_shards
 
@@ -169,7 +169,9 @@ class KimiDeltaAttention(nn.Module):
         rate = jnp.exp(self.A_log)[None, None, :, None]
         if self.lower_bound is not None:
             return self.lower_bound * nn.sigmoid(rate * gate)
-        return -rate * jnp.where(gate > 20.0, gate, jnp.log1p(jnp.exp(jnp.minimum(gate, 20.0))))
+        # torch's softplus, Dew's one (its value past 20 the gate's within float32's rounding, as torch's
+        # threshold returns it).
+        return -rate * softplus(gate)
 
     @nn.nowrap
     def cache_spec(self, rows: int) -> dict[str, Opened]:

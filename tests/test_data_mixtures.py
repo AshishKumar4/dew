@@ -2386,13 +2386,17 @@ def test_phases_batched_outside_themselves_read_as_they_did():
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-def test_a_mix_ends_after_its_first_exhausted_members_last_record_whatever_its_read(read):
+@pytest.mark.parametrize("short", ["one row", "a hundred taken to one"])
+def test_a_mix_ends_after_its_first_exhausted_members_last_record_whatever_its_read(read, short):
     """A mix's rows do not depend on how it is read: it ends at the position after its first exhausted
     member's last record, as Grain's map mix does (data.md §3). Corpora of 100 rows and 1 at weights 2
-    and 1 read A, A, B, and end; a streamed read went on to A, A, until B's second pull failed (spec
-    alignment 2026-11-15, data.md's first finding)."""
+    and 1 read A, A, B, and end, the one row a corpus of one or a hundred taken to one (`Pipeline.take`,
+    counted as an epoch is, `dew.data.epochs.held_records`); a streamed read went on to A, A, until B's
+    second pull failed (spec alignment 2026-11-15, data.md's first finding), and past a member a take
+    bounds (train 898's review, row 6701)."""
     many = Memory([{"id": index} for index in range(100)])
-    one = Memory([{"id": 1000}])
+    one = (Memory([{"id": 1000}]) if short == "one row"
+           else Pipeline(Memory([{"id": 1000 + index} for index in range(100)])).take(1))
     passed = held(mix([many, one], weights=[2, 1]).batch(1).read(read).loading(READ))(DataPartition())
     try:
         read_ids = [value for batch in ids(passed) for value in batch]
@@ -2412,5 +2416,52 @@ def test_a_streamed_training_read_of_a_mix_reads_each_member_on_without_end():
                      loading=READ).train(DataPartition())
     try:
         assert [int(batch["id"][0]) for batch in itertools.islice(reader, 6)] == [0, 1, 1000, 2, 3, 1000]
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_an_unseeded_mix_of_indexed_files_ends_at_its_share_spans_whatever_its_read(tmp_path, read):
+    """An unseeded mix of JSON-lines files indexed by their provisioned offsets, 100 rows and 1 at weights 2
+    and 1, ends at its members' share-spans, A, A, B, read by index or streamed: a streamed read counts each
+    indexed member's rows at the start, from its offset index, where it read on to A, A until the short
+    file's next pull failed (train 921's review, F3)."""
+    sources = []
+    for name, count, first in (("many", 100, 0), ("one", 1, 1000)):
+        rows = "".join(f'{{"id": {first + index}}}\n' for index in range(count))
+        (tmp_path / f"{name}.jsonl").write_text(rows)
+        source = Files(str(tmp_path / f"{name}.jsonl"), format="jsonl")
+        source.provision()
+        sources.append(Pipeline(source))
+    many, one = sources
+    passed = held(mix([many, one], weights=[2, 1]).batch(1).read(read).loading(READ))(DataPartition())
+    try:
+        read_ids = [value for batch in ids(passed) for value in batch]
+    finally:
+        passed.close()
+    assert read_ids == [0, 1, 1000]
+
+
+def test_a_streamed_unseeded_mix_of_a_file_with_no_length_is_refused_or_provisioned(tmp_path):
+    """An unseeded mix ends at its members' share-spans, so its streamed read requires each member's length
+    (data.md §10's length rule): a JSON-lines file with no provisioned index is refused, naming the
+    preparation, where it read on to a different end than its indexed read; provisioned, as a pass read
+    once and `fit` provision it, the mix reads to its share-spans."""
+    for name, count, first in (("many", 100, 0), ("one", 1, 1000)):
+        rows = "".join(f'{{"id": {first + index}}}\n' for index in range(count))
+        (tmp_path / f"{name}.jsonl").write_text(rows)
+
+    def chain():
+        many, one = (Pipeline(Files(str(tmp_path / f"{name}.jsonl"), format="jsonl"))
+                     for name in ("many", "one"))
+        return mix([many, one], weights=[2, 1]).batch(1)
+
+    with pytest.raises(ValueError):
+        compile(Pipeline(Memory([{"id": 0}])).repeat().batch(1), validation=chain(), read="streamed",
+                loading=READ)
+    # A pass read once provisions what its read needs, as `fit` does.
+    reader = held(chain().read("streamed").loading(READ))(DataPartition())
+    try:
+        assert [value for batch in ids(reader) for value in batch] == [0, 1, 1000]
     finally:
         reader.close()

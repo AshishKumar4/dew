@@ -333,7 +333,7 @@ def test_every_piece_is_encoded_an_empty_one_too():
     from dew.decision.layout import context_tokens
 
     assert render([Chunk(""), Chunk(ids=()), Chunk("a")], Marked(), "pieces").tokens == (7, 7, 97)
-    assert list(context_tokens(Marked(), "", 8)) == [7]
+    assert list(context_tokens(Marked(), "")) == [7]
 
 
 def test_the_renderer_is_its_own_module_beside_the_value_renderer():

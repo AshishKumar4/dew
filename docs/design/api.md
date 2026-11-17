@@ -85,7 +85,8 @@ Each kind (`models`, `mixers`, `objectives`, ...) has one table. Dew's own class
 each mapped to its import path and imported only when it is read, so `import dew.registry` imports no feature
 package. A user's class joins the same table under a name of its own through the table's decorator as its
 module is imported, `@dew.register("my_model")` for a model and `@mixers.register("my_mixer")` for any other
-kind, and then builds by that name from a config, a record or the command line as Dew's own do (the owner,
+kind, and then builds by that name from a config, a record or the command line as Dew's own do, the command
+line once it trusts the module's package (`--trust users_models`, which imports it, `import_trusted`) (the owner,
 2026-11-16: "I want really good DX. if decorators could also be a supported way, I would like it."). The
 decorator refuses a name another class holds and a class not of the kind. It is one table with two ways
 in, not a second registry. A record names every class by its import path, a user's registered one too, so a

@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn import categorical
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, softplus
 
 
 def symlog(x: jax.Array) -> jax.Array:
@@ -98,7 +98,7 @@ def normal_entropy(std: jax.Array) -> jax.Array:
 def tanh_log_jacobian(raw: jax.Array) -> jax.Array:
     """Each coordinate's log(1 - tanh(`raw`)^2), the log-Jacobian of squashing `raw` by tanh, in its stable
     form 2 (log 2 - raw - softplus(-2 raw)), finite where tanh(raw) rounds to one."""
-    return 2 * (math.log(2.0) - raw - jax.nn.softplus(-2 * raw))
+    return 2 * (math.log(2.0) - raw - softplus(-2 * raw))
 
 
 def onehot_sample(key: jax.Array | None, log_probs: jax.Array, *,

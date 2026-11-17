@@ -1935,6 +1935,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         """The model a saved step's record names (`inference_record`): the objective's own."""
         return self.model
 
+    def run_tokenizer(self) -> Tokenizer | None:
+        """The tokenizer the objective's task encodes text with (its processor's), which a checkpoint holds
+        in the run (`dew.inference.tasks.hold_tokenizer`); None where it has none."""
+        from dew.inference.tasks import RunProcessor
+
+        return self.processor.tokenizer if isinstance(self.processor, RunProcessor) else None
+
     def inference_record(self) -> JSON:
         """Return the model and task settings that let a saved step be rebuilt.
 

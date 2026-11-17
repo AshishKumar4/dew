@@ -3,20 +3,23 @@
 Replay and effect commits are Dew transaction policies; Optax and Flax oracle their arithmetic.
 """
 
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import raw_leaf
+from affine_run import FEATURES, Counting, dataset, raw_leaf
 from flax import linen as nn, struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from reference_error import as_given, assert_as_exact, dew_programs, widened
+from test_trainer import PoisonedThird, make_trainer
 
 from dew.batch import under
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
 from dew.objectives import Aux, EMASpec, Objective, Ratio
+from dew.optim import OptimConfig
 from dew.training import Trainer
 
 
@@ -605,3 +608,233 @@ def test_a_local_step_one_process_wrote_reads_onto_the_host_and_onto_any_mesh(tm
     np.testing.assert_array_equal(host["params"]["w"], written)
     placed = Checkpoints(persistent, local_directory=local, local_every=1).variables(ema=False)
     np.testing.assert_array_equal(np.asarray(placed["params"]["w"]), written)
+
+
+class SkippingThird(Counting):
+    """`Counting`'s batches without the third."""
+
+    def __next__(self):
+        batch = super().__next__()
+        return super().__next__() if batch["index"][0] == 2 else batch
+
+
+@pytest.mark.parametrize("optimizer", ["sgd", "adam"])
+def test_a_run_that_skips_a_step_not_finite_leaves_the_parameters_as_they_were(optimizer):
+    """A run that skips steps not finite (`skip_nonfinite`), with no loss scale: a step whose gradient is not
+    finite leaves the parameters, the update count and the EMA as they were, and its optimizer takes one
+    step of zero gradient (training.md, a step that is not finite): under SGD, which holds no state, the run
+    lands bit for bit where the run that never read that batch does; under Adam its parameters stay finite,
+    its moments having decayed a step."""
+    solver = optax.sgd(0.1) if optimizer == "sgd" else optax.adam(0.1)
+    state = make_trainer(optimizer=solver, skip_nonfinite=True).fit(dataset(PoisonedThird), steps=5,
+                                                                    log_every=100)
+    assert int(state.updates) == 4
+    assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(state.variables))
+    if optimizer == "sgd":
+        skipped = make_trainer(optimizer=solver).fit(dataset(SkippingThird), steps=4, log_every=100)
+        pairs = zip(jax.tree.leaves(state.variables), jax.tree.leaves(skipped.variables), strict=True)
+        for got, want in pairs:
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def test_a_run_stops_at_the_first_step_not_finite_and_saves_none_of_it(tmp_path):
+    """By default a step not finite is taken as it is formed, read by its loss and gradient norm alone, and
+    the run stops at its next log, before the next step, its last checkpoint the last finite step's
+    (training.md, a step that is not finite: the owner's ruling of 2026-11-16, as torchtitan stops). A run
+    that skips such steps reads on past it."""
+    trainer = make_trainer(tmp_path)
+    with pytest.raises(RuntimeError):
+        trainer.fit(dataset(PoisonedThird), steps=5, log_every=1, checkpoint_every=1)
+    trainer.checkpoints.wait()
+    assert trainer.checkpoints.latest == 2
+    assert int(make_trainer(skip_nonfinite=True).fit(dataset(PoisonedThird), steps=5, log_every=1).step) == 5
+
+
+@pytest.mark.parametrize("skip", [True, False], ids=["skipped", "taken"])
+def test_a_step_whose_loss_is_finite_and_its_gradient_not_is_reported_not_finite(skip):
+    """A step with no loss scale whose loss is finite and its gradient not (a square root's derivative at
+    zero) is reported not finite by its gradient's norm, so the run stops at it, or, skipping such steps, its
+    streak counts it: a skipped one trains nothing. It was reported finite, by its loss, and the streak reset
+    on it (the theme's head review, F2)."""
+    stepper = Trainer(Tiny(), optax.sgd(0.1), key=jax.random.PRNGKey(9), skip_nonfinite=skip)
+    state = stepper.initial_state()
+    bad = batches()[1]
+    step = stepper.compile(state, bad)
+    # The step consumes the state.
+    before = np.asarray(state.variables["params"]["w"])
+    advanced, loss, _, finite, _, committed = step(state, bad)
+    assert bool(jnp.isfinite(loss)) and not bool(finite)
+    if skip:
+        assert int(committed.count) == 0
+        np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), before)
+
+
+class Overflowing(Objective):
+    """A weight's square, its batch statistic the exponential of its inputs' mean: a finite loss and gradient
+    beside a collection that overflows where the inputs are large."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.ones(())}, "stats": {"seen": jnp.zeros(())}}
+
+    def loss(self, variables, batch, step):
+        w = variables["params"]["w"]
+        return w * w, Aux({}, variables={"stats": {"seen": jnp.exp(jnp.mean(batch["x"]))}})
+
+
+def test_a_skipped_step_whose_collection_overflows_moves_no_weight_and_writes_no_collection():
+    """A run that skips steps not finite, with no loss scale: a step whose loss and gradient are finite and
+    whose forward's collection is not (an exponential past float32) is not finite as a whole: its weight,
+    its update count and its collection stay as they were, and it reports not finite. Its collection was kept
+    while its weight and update count moved (the round-2 review's F3)."""
+    rows = jax.device_count()
+    stepper = Trainer(Overflowing(), optax.sgd(0.1), key=jax.random.PRNGKey(0), skip_nonfinite=True)
+    state = stepper.initial_state()
+    batch = {"x": jnp.full((rows,), 100.0, jnp.float32)}
+    step = stepper.compile(state, batch)
+    before = jax.tree.map(np.asarray, state.variables)
+    advanced, _, _, finite, _, _ = step(state, batch)
+    assert not bool(finite) and int(advanced.updates) == 0
+    for got, want in zip(jax.tree.leaves(advanced.variables), jax.tree.leaves(before), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), want)
+
+
+class Pushed(Objective):
+    """A weight pushed by each batch's inputs, its loss the mean of their products with it, its gradient
+    the inputs' mean: finite however large they are."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.zeros((FEATURES,))}}
+
+    def loss(self, variables, batch, step):
+        return jnp.mean(batch["x"] @ variables["params"]["w"]), Aux({})
+
+
+class Inputs(Counting):
+    """`Counting`'s batches, every input `value`."""
+
+    value = 1e20
+
+    def __next__(self):
+        batch = super().__next__()
+        return {**batch, "x": np.full_like(batch["x"], self.value)}
+
+
+class ClampedOutside(Pushed):
+    """`Pushed`, its weight starting at 2, outside a param group's clamp of [0, 1]."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.full((FEATURES,), 2.0)}}
+
+
+def test_a_skipped_steps_weights_are_kept_by_its_post_step_effects():
+    """A skipped step (inputs not finite) of a param group clamped to [0, 1] keeps its weight of 2 outside the
+    clamp, the clamp's count stepping with the zero gradient's step. The clamp acted on a rejected step's
+    weights (the round-3 head review's F7)."""
+    from dew.optim import ParamGroup
+    clamped = OptimConfig(optimizer="adam", learning_rate=1e-3,
+                          param_groups=(ParamGroup("all", ("*",), bounds=(0.0, 1.0)),))
+    trainer = Trainer(ClampedOutside(), clamped, key=jax.random.PRNGKey(0), skip_nonfinite=True)
+    trainer.scheduled(1)
+    state = trainer.initial_state()
+    batch = next(type("Fed", (Inputs,), {"value": np.nan})())
+    advanced, _, _, finite, _, _ = trainer.compile(state, batch)(state, batch)
+    assert not bool(finite) and np.all(np.asarray(advanced.variables["params"]["w"]) == 2.0)
+
+
+class CountingEffects(Pushed):
+    """`Pushed`, counting each update it commits in its own collection, a post-step effect (`Aux.effects`)."""
+
+    def fresh_variables(self, key, held):
+        return {**super().fresh_variables(key, held), "stats": {"seen": jnp.zeros(())}}
+
+    def loss(self, variables, batch, step):
+        loss, _ = super().loss(variables, batch, step)
+        return loss, Aux({}, effects=jnp.asarray(1.0))
+
+    def apply_effects(self, variables, effects):
+        return {"stats": {"seen": variables["stats"]["seen"] + effects}}
+
+
+def test_a_skipped_step_applies_no_effect():
+    """A skipped step (inputs not finite) moves nothing by its objective's effects: its count stays zero.
+    The effects were gated on the gradient alone and counted the rejected step (the round-4 head review's
+    F5)."""
+    trainer = Trainer(CountingEffects(), optax.sgd(0.1), key=jax.random.PRNGKey(0), skip_nonfinite=True)
+    state = trainer.initial_state()
+    batch = next(type("Fed", (Inputs,), {"value": np.nan})())
+    advanced, _, _, finite, _, _ = trainer.compile(state, batch)(state, batch)
+    assert not bool(finite) and float(advanced.variables["stats"]["seen"]) == 0.0
+
+
+class PushedOne(Objective):
+    """One weight pushed by each batch's inputs, its gradient their mean: a gradient whose norm is itself."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.zeros(())}}
+
+    def loss(self, variables, batch, step):
+        return jnp.mean(batch["x"]) * variables["params"]["w"], Aux({})
+
+
+def test_a_window_whose_summed_gradient_overflows_its_moments_is_dropped_whole():
+    """An optimizer that holds updates back and sums its window (`optax.MultiSteps(..., use_grad_mean=False)`
+    of two) hands Adam the sum of two gradients of 1.5e19, each of a finite norm, whose square overflows its
+    second moment: the window's closing step is dropped whole, its state as it was, and reported not
+    finite, as such an optimizer's step always is read over its whole new state; its first step is taken."""
+    held = optax.MultiSteps(optax.adam(0.1), 2, use_grad_mean=False).gradient_transformation()
+    trainer = Trainer(PushedOne(), held, key=jax.random.PRNGKey(0))
+    state = trainer.initial_state()
+    batch = next(type("Fed", (Inputs,), {"value": 1.5e19})())
+    step = trainer.compile(state, batch)
+    state, _, _, first, _, _ = step(state, batch)
+    before = jax.tree.map(np.asarray, (state.variables, state.opt_state))
+    state, _, _, second, _, _ = step(state, batch)
+    assert bool(first) and not bool(second)
+    for got, want in zip(jax.tree.leaves((state.variables, state.opt_state)), jax.tree.leaves(before),
+                         strict=True):
+        np.testing.assert_array_equal(np.asarray(got), want)
+
+
+def test_a_skipping_trainer_after_a_taking_one_of_one_config_skips_by_its_own_policy():
+    """Two trainers of one optimizer config in one process, the first taking steps not finite and the
+    second skipping them: the first stops at its poisoned step; the second, whose fit could read the first's
+    step from the process's cache of steps (`_candidates.candidate_for`), skips it, its four updates
+    finite. The policy keyed no step, so the second took the first's (the rebuild's head review, F1)."""
+    config = OptimConfig(optimizer="optax:sgd", learning_rate=0.1)
+    with pytest.raises(RuntimeError):
+        make_trainer(optimizer=config).fit(dataset(PoisonedThird), steps=5, log_every=1)
+    state = make_trainer(optimizer=config, skip_nonfinite=True).fit(dataset(PoisonedThird), steps=5,
+                                                                     log_every=1)
+    assert int(state.updates) == 4
+    assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(state.variables))
+
+
+class SecondGroupPoisoned(Counting):
+    """`Counting`'s batches, the second's latter half of rows not finite: one DiLoCo group's of two."""
+
+    def __next__(self):
+        batch = super().__next__()
+        if batch["index"][0] == 1:
+            batch["x"][len(batch["x"]) // 2:] = np.nan
+        return batch
+
+
+def test_a_diloco_step_not_finite_in_one_group_alone_stops_the_run():
+    """A DiLoCo run of two groups whose second group's batch is not finite at step 2, the first's finite:
+    the step is not finite, as every group's flag says, and the run stops at it. The flag was the first
+    group's, so the run read on with the second group's weights poisoned (the rebuild's head review, F2)."""
+    from dew.training import DiLoCo, MeshSpec
+
+    trainer = make_trainer(mesh=MeshSpec(diloco=2).build(jax.devices()[:2]),
+                           diloco=DiLoCo(every=4, rate=0.7, momentum=0.9))
+    with pytest.raises(RuntimeError):
+        trainer.fit(dataset(SecondGroupPoisoned), steps=3, log_every=1)
+
+
+def test_a_run_whose_optimizer_holds_updates_back_reads_on_past_one_step_not_finite():
+    """A run whose optimizer holds updates back (`optax.MultiSteps` of two) drops a window a step not finite
+    falls in whole, by default, and reads on to its end, its weights finite, as a scaled run does: such a
+    run stops only at five in a row. It stopped at the first (the rebuild's head review, F3)."""
+    held = optax.MultiSteps(optax.adam(0.1), 2).gradient_transformation()
+    state = make_trainer(optimizer=held).fit(dataset(PoisonedThird), steps=6, log_every=1)
+    assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(state.variables))

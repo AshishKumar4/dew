@@ -10,13 +10,14 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.attention import AttentionImpl, SeparableBias, scaled_dot_product_attention
+from dew.nn.precision import softplus
 
 
 def forget_prefix(forget_logits: jax.Array) -> jax.Array:
     """`G` `[B, H, S]`: each head's cumulative log forget gate, `cumsum(log sigmoid(forget_logits))` along the
     sequence of `forget_logits` `[B, S, H]`, in fp32 at least (fp64 for fp64 gates)."""
     wide = forget_logits.astype(jnp.promote_types(forget_logits.dtype, jnp.float32))
-    return jnp.cumsum(jax.nn.log_sigmoid(wide), axis=1).transpose(0, 2, 1)
+    return jnp.cumsum(-softplus(-wide), axis=1).transpose(0, 2, 1)
 
 
 def forgetting_attention(query: jax.Array, key: jax.Array, value: jax.Array, forget_logits: jax.Array, *,
