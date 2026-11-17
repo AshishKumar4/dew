@@ -7,6 +7,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A launch whose derived config spills certifies its ladder's rungs one after another and takes the first
+  that holds, where it certified them in threaded rounds as wide as the host's cores: a rung's certification
+  is its launch's trace and Mosaic GPU lowering, Python under the GIL, so a round of 13 rungs cost 13 rungs'
+  work and every rung past the one that held was spent for nothing (a 4B decision step's cold start on a
+  GH200, M-MC-18). `report.certified_together`, `report.rung_round` and `Certification.round` are gone.
+
 - A decision's context is an ordinary condition of its objective's inputs (`DecisionObjective.inputs`), and a
   run may configure its encoder as any registered condition encoder (`--context-text.encoder`,
   `--context-text.checkpoint`, as a diffusion run's text condition), in place of the backbone's own token table
