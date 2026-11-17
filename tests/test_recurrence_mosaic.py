@@ -277,7 +277,7 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     wide = hooks.output is not None or (hooks.skip and hooks.delta)
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=wide, bound=hooks.inverse_bound, rounded=rounded,
-                                skip=None if hooks.delta else given.skip)
+                                skip=None if hooks.delta else given.skip, apart=hooks.apart)
 
 
 def refuses_its_gradient(fn, *drawn) -> None:
@@ -788,6 +788,26 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
     assert_as_exact(dew, reference, functools.partial(hooked_draw, hooks, packed),
                     f'the mosaic forward, {hooks} packed={packed} under the {forms} forms',
                     seeds=HOOK_SEEDS[hooks, packed])
+
+
+GROUPED = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, reads='apart', ranks=2)
+"""A readout apart from its token's two ranks' writes (Mamba-3 MIMO's, `recurrence.Hooks.ranks`)."""
+
+
+def test_a_readout_apart_from_its_tokens_ranks_is_on_par_with_the_portable_math_interpreted():
+    """The chunked op of a call whose tokens' writes take two op tokens each, its readout apart from them
+    (`GROUPED`), on the template, which keeps the pairs of later tokens alone (`algebra._later_groups`,
+    mamba_ssm's MIMO `i // R > j // R`), output and final memory on par with the portable math's from
+    float64 (check 1; the portable math's read of the state entering a token, less its group's earlier
+    writes, exact in float64, row 7402), one sequence of a value head a key head, under the run's forms."""
+    forms = generation.numerics().forms
+    dew = jax.jit(formed(forms, functools.partial(chunk_on, 'mosaic_gpu', GROUPED)))
+    reference = jax.jit(functools.partial(chunk_on, 'xla', GROUPED))
+
+    def one_sequence(seed):
+        return hooked_draw(GROUPED, packed=False, seed=seed, value_heads=1)
+
+    assert_as_exact(dew, reference, one_sequence, f'{GROUPED} on the template', seeds=32)
 
 
 HOOK_CELLS = [(hooks, packed) for hooks in TAKEN for packed in (False, True)]
