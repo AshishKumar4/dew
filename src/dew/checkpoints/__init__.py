@@ -1323,6 +1323,14 @@ class Checkpoints:
             return f"{holder} (a replica)"
         return self.local_path
 
+    def _hold(self, artifact: JSON, tokenizer: Tokenizer | None) -> None:
+        """The run holding `tokenizer`, where given, as `artifact`, a step's inference declaration, states
+        it (`dew.inference.tasks.hold_tokenizer`)."""
+        if tokenizer is not None:
+            from dew.inference.tasks import hold_tokenizer
+
+            hold_tokenizer(artifact, self.directory, tokenizer)
+
     def save(
         self,
         step: int,
@@ -1382,11 +1390,8 @@ class Checkpoints:
         mapping = isinstance(state, Mapping)
         if not mapping:
             self._identify_run()
-            if tokenizer is not None:
-                # A run's trainer hands its objective's (`Trainer`); a direct save holds none, as before.
-                from dew.inference.tasks import hold_tokenizer
-
-                hold_tokenizer(artifact, self.directory, tokenizer)
+            # A run's trainer hands its objective's tokenizer (`Trainer`); a direct save holds none.
+            self._hold(artifact, tokenizer)
         if mapping:
             if (saved is not None or share is not None or weights_only or rung is not None
                     or artifact is not None or rollout is not None or tokenizer is not None):
