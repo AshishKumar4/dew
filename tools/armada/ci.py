@@ -2016,15 +2016,18 @@ def lane_units(python: str, tests: list[str], within: float | None = None) -> di
     return units
 
 
-PREPARES = "prepares"
-"""The mark of a GPU test whose part's prepare runs it first, on the node's CPU (`gpu_prepared`)."""
+PREPARES = "prepares or gpu"
+"""The marks of the GPU tests a part's prepare runs first, on the node's CPU (`gpu_prepared`): a flow's (`prepares`)
+and every other GPU test's (`gpu`), whose check-1 truths and arms compile there for the node's GPU, so its run
+calls stored executables and compiles nothing while it holds the GPU (Main, 2026-11-17: the day's GPU jobs left
+2034 of 3238 held GPU-minutes idle, tracing and compiling on the host)."""
 
 
 def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, deadline: float) -> int:
     """A GPU lane's prepare, on its node's CPU before its files' GPU run (`gpu_lane`) and with no GPU drawn:
-    each of `tests` that holds a test marked `PREPARES` run once in a process of its own on the CPU alone,
+    each of `tests` that holds a test `PREPARES` selects run once in a process of its own on the CPU alone,
     under the prepare's word (tests/tier_wire.py's PREPARE, which tests/conftest.py reads to skip every test
-    but those marked `PREPARES`, each of which then prepares rather than runs) and its unit's name (UNIT),
+    but those, each of which then prepares rather than runs) and its unit's name (UNIT),
     at most `processes` at once, as its run will select and cut it (a group `<file>#G/N` holds in its prepare
     the tests it holds in its run: the same selection, the same weights, DEW_SPLIT_DURATIONS), so each such
     test computes what its run reads and must not compute while it holds the GPU, its float64 truths and
