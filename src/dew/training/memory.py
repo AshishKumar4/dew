@@ -595,7 +595,8 @@ def compile_limit(devices: Sequence, held: int, built: int) -> int | None:
     among them, all in the least allocator limit among `devices`; so the most a fitting step's sum reaches
     is that limit less what is held beside the step outside its arguments (`held - built`: the prefetched
     batches), where the devices hold nothing but its arguments. A step XLA stops past it fits nowhere the
-    check admits; one within it is compiled whole and the fit check judges it. Row 5805's lab step: the
+    check admits; one within it is compiled whole and the fit check judges it. A 4.8B multimodal
+    transformer's step on a GH200 (row 5805): the
     limit less all of `held`, the arguments it builds among it counted twice, stopped a step the check
     admitted, which its first run then refused. None where a device states no limit."""
     limits = [limit for device in devices if (limit := device_memory(device).get("bytes_limit")) is not None]

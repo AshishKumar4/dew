@@ -18,9 +18,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   of its misses (a fine-tune's copied sources let go). A decoder whose layers scan keeps, with no rung or the
   one recomputing the delta rule's memory, the products and `minimal_with_scan_and_conv`'s residuals (with its
   layers updating in the backward, those residuals), where the recomputing rung kept every value, more than no
-  rung. `dew.training.ahead.twin(devices)` gives compile-only GPUs of the attached GPUs' own target, and
-  `probed(lowered)` compiles a program for them as far as its buffer assignment: what a plan reads of a
-  layout without compiling it whole.
+  rung.
 
 - Programs a process keeps (`dew.training.ahead.keeping`) are kept and handed by their fingerprint: the
   digest of the lowered program, its trees and its arguments' types under the XLA options it compiled

@@ -1214,14 +1214,17 @@ recomputation on an A100 and an H100, where the one-layer, sixteen-token decoder
 HALVED_BATCH = {"text": jnp.asarray((np.arange(ROWS * 257).reshape(ROWS, 257) * 7) % 64, jnp.int32)}
 
 
-def a_step_that_fits_once_its_delta_rule_recomputes_its_memory_plans_at_that_rung(monkeypatch):
-    """With room for four microbatches when a delta rule recomputes its memory alone, which no
-    recomputation needs more than, the plan is four at that rung ('all_but_delta_memory', the ladder's
-    first above none): the lightest rung seen to fit, no compile asked twice. The decoder's
-    delta rule holds a share of the step the rung saves (`HALVED`), which the cell checks first. The delta
-    rule runs its port (`port_support.row_names_port`), whatever the generation's row names: the rung
-    recomputes the memory the port names (`checkpoint_name`), and the portable route, an A10's, names
-    none."""
+def a_step_under_its_room_without_recomputation_plans_a_step_that_fits_there(monkeypatch):
+    """With room for four microbatches when the delta rule recomputes its memory, less than four need
+    without recomputation (the premise, checked first), the plan the walk derives fits that room by its own
+    compile's figures (its probe's headroom), keeps the walk's contract (`assert_searched`: the batch whole
+    asked first, no compile asked twice, none skipped at its rung below it that fit), and steps. Which plan
+    is the device's to derive: a CPU's XLA fits no finer split
+    without recomputation, and plans four microbatches at 'all_but_delta_memory'; a GH200's fits a finer
+    one at none (M-MC-19, row 6720). The delta rule runs its port (`port_support.row_names_port`), whatever
+    the generation's row names: the rung recomputes the memory the port names (`checkpoint_name`), and the
+    portable route, an A10's, names none. What a split or the rung computes is check 1's at their own sites
+    (test_memory_composition's recomputed delta memory, test_algebra_carry's split sums)."""
     rung = "all_but_delta_memory"
     with row_names_port("gated_delta_rule", "fla"):
         def measured(**fields) -> int:
@@ -1232,11 +1235,13 @@ def a_step_that_fits_once_its_delta_rule_recomputes_its_memory_plans_at_that_run
         assert room < measured(), "the rung saves memory at four microbatches"
         free(monkeypatch, room)
         trainer = lm(**HALVED)
-        state, _, _ = trainer.place()
-        trials = Trials(state, HALVED_BATCH)
-        trainer.compile(state, HALVED_BATCH, trials)
-    assert trainer.objective.model.remat == REMAT_POLICIES[rung], (room, trainer.plan["probes"])
-    assert_searched(trainer, (4, rung))
+        state = trained(trainer, steps=1, batch=HALVED_BATCH)
+    plan = trainer.plan
+    chosen = (plan["split"], plan["remat"])
+    own = [probe for probe in plan["probes"] if probe["fits"] and (probe["split"], probe["remat"]) == chosen]
+    assert own and all(probe["headroom"] >= 0 for probe in own), (room, plan["probes"])
+    assert_searched(trainer, chosen)
+    assert int(state.step) == 1
 
 
 LONG = 64
@@ -1250,14 +1255,19 @@ H100 = 2 ** 40
 
 def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of) -> tuple[list, int, tuple, tuple]:
     """A census shape's step at four microbatches on `target` ('cpu', its devices' memory stated through
-    `free`; 'h100', a compile-only H100 compiled ahead, what a GPU start plans for): its need at each place
-    of the fit ladder in its order (`recompute_more`: at each remat rung its head's rungs, then the next),
-    each place's step compiled with room past all; the room `room_of` the needs by remat at the run's own
-    head; the place the start's climb settles in that room, its rung unstated; and the first place of the
-    ladder whose step, compiled in that room, fits: an exhaustive walk. XLA schedules a GPU's program to
+    `free`; 'h100', a compile-only H100 compiled ahead, what a GPU start plans for): the places of the fit
+    ladder in its order (`recompute_more`: at each remat rung its head's rungs, then the next), as the
+    objective states each (`rung_record`); the room `room_of` the needs by remat at the run's own head, each
+    such place's step compiled with room past all (no other place's need is read); the place the start's
+    climb settles in that room, its rung unstated; and the first place of the ladder whose step, compiled in
+    that room, fits: an exhaustive walk. XLA schedules a GPU's program to
     the memory its target states, so a place's need in that room is its compile there, not its need with
     room past all. A place is its head's tile, whether that head is fused, and its remat."""
-    from dew.training.memory import recompute_more
+    from dew.training.memory import recompute_more, rung_record
+
+    def described(objective) -> tuple:
+        record = rung_record(objective, xla_defaults=False, narrow=False)
+        return (record["head_tile"], record["head_fused"], record["remat"], False)
 
     def placed(trainer) -> tuple:
         plan = trainer.plan
@@ -1288,14 +1298,16 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of) -> tup
 
     room_past = LIMIT if target == "cpu" else H100
     ladder = lm(split=4, **fields).objective
-    places = 1
+    places = [described(ladder)]
     while recompute_more(ladder):
-        places += 1
-    need = []
-    for moves in range(places):
-        trainer = planned(moves, room_past)
-        need.append((placed(trainer), room_past - trainer.plan["probes"][0]["headroom"]))
-    whole = {remat: held for (tile, _, remat, _), held in need if tile is None}
+        places.append(described(ladder))
+    # The needs at the run's own head alone, by remat, each compiled with room past all.
+    whole = {}
+    for moves, (tile, _, remat, _) in enumerate(places):
+        if tile is None:
+            trainer = planned(moves, room_past)
+            assert placed(trainer)[:3] == places[moves][:3], (placed(trainer), places[moves])
+            whole[remat] = room_past - trainer.plan["probes"][0]["headroom"]
     room = room_of(whole)
     def fits(moves: int) -> bool:
         # The place's own step compiled in the room, its first compile the judge: where it misses, the
@@ -1305,8 +1317,8 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of) -> tup
         except PlanRefused as refused:
             return refused.probes[0].fits
 
-    lightest = next((place for moves, (place, _) in enumerate(need) if fits(moves)), None)
-    return need, room, placed(planned(0, room)), lightest
+    lightest = next((place for moves, place in enumerate(places) if fits(moves)), None)
+    return places, room, placed(planned(0, room)), lightest
 
 
 CENSUS = {
@@ -1333,10 +1345,10 @@ def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(
     for one seen to miss settled a heavier plan than one that fits."""
     fields, batch, room_of = CENSUS[shape]
     with row_names_port("gated_delta_rule", "fla"):
-        need, room, plan, lightest = climbed(monkeypatch, target, fields, batch, room_of)
-    places = [place[:3] for place, _ in need]
-    assert lightest is not None and places.index(plan[:3]) <= places.index(lightest[:3]), (need, room, plan)
-    assert plan[3] or plan == lightest, (need, room, plan, lightest)
+        ladder, room, plan, lightest = climbed(monkeypatch, target, fields, batch, room_of)
+    places = [place[:3] for place in ladder]
+    assert lightest is not None and places.index(plan[:3]) <= places.index(lightest[:3]), (ladder, room, plan)
+    assert plan[3] or plan == lightest, (ladder, room, plan, lightest)
 
 
 def test_a_plan_made_before_the_state_is_placed_is_searched_again_where_the_placed_devices_cover_a_miss(
@@ -1391,7 +1403,8 @@ def test_a_decoder_that_fits_split_asks_its_splits_at_no_recomputation(monkeypat
 
 def test_a_step_the_fit_check_admits_is_within_the_limit_its_compile_stops_at():
     """The bytes past which a plan's GPU compile stops (`compile_limit`) are the fit check's own arithmetic
-    solved for XLA's sum (arguments, outputs that write over none, temporaries): row 5805's lab step, its
+    solved for XLA's sum (arguments, outputs that write over none, temporaries): a 4.8B multimodal
+    transformer's step (row 5805), its
     arguments 63.1 GB with 22.0 GB of them built on its first call, held beside it, its temporaries 18.9 GB,
     which the check admitted on a GH200's 96.4 GB, compiles whole within it, where the limit, its
     allocator's less all it held, counted the built arguments twice, stopped its compile at 74.4 GB and its
@@ -1787,30 +1800,3 @@ def test_each_probe_of_a_held_plan_states_its_own_headroom(monkeypatch):
     probes = trainer.plan["probes"]
     assert trainer.plan["split"] == 4 and [probe["split"] for probe in probes if not probe["fits"]][-1] == 2
     assert all((probe["headroom"] >= 0) is probe["fits"] for probe in probes), probes
-
-
-def two_products(device) -> jax.stages.Lowered:
-    """`tanh(x @ w) @ w` over two 512 x 512 bfloat16 operands on `device`, lowered: at its second product's
-    peak its parameters and the first product's value are live."""
-    placed = jax.sharding.SingleDeviceSharding(device)
-    tile = jax.ShapeDtypeStruct((512, 512), jnp.bfloat16, sharding=placed)
-    return jax.jit(lambda x, w: jnp.tanh(x @ w) @ w).trace(tile, tile).lower()
-
-
-def test_a_probe_states_the_memory_and_the_peaks_buffers_its_whole_compile_does():
-    """A program compiled for a compile-only H100 as far as its buffer assignment (`probed`, Dew's JAX
-    build's early exit, no code emitted) states the temporaries its whole compile does and the same buffers
-    live at its peak (`Compiled.peak_live`), its two parameters among them: what a plan reads of a layout
-    it probes is the compile's own."""
-    from dew.nn.kernels.generation import compile_only_gpus
-    from dew.nn.kernels.templates import report
-    from dew.training.ahead import probed
-
-    (device,) = compile_only_gpus("sm90", 1, 40 * 2**30)
-    lowered = two_products(device)
-    whole, probe = report.xla_compiled(lowered, None), probed(lowered)
-    assert probe.memory_analysis().temp_size_in_bytes == whole.memory_analysis().temp_size_in_bytes
-    live = whole.peak_live()
-    assert live is not None and probe.peak_live() == live
-    assert [(buffer.shape, buffer.dtype) for buffer in live if buffer.kind == "parameter"] == [
-        ((512, 512), "bf16")] * 2, live

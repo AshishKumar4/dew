@@ -290,32 +290,6 @@ def test_a_deviceless_compile_stores_nothing_a_device_run_reads(tmp_path):
     assert ran("run") == {"read": 0}
 
 
-def test_a_probe_on_this_gpus_twin_states_the_memory_and_the_peaks_buffers_its_own_compile_does():
-    """A program probed on this GPU's twin (`twin`: compile-only, of this GPU's own target, its autotuning
-    skipped; `probed`: stopped after buffer assignment) states the temporaries this GPU's own whole compile
-    of it does, and the same buffers live at its peak, by size, shape, dtype and kind: a plan's probe of a
-    layout reads the memory its run takes."""
-    from test_compile_ahead import two_products
-
-    from dew._devices import device_memory
-    from dew.nn.kernels.templates import report
-    from dew.training.ahead import probed, twin
-
-    def buffers(compiled: jax.stages.Compiled) -> list:
-        live = compiled.peak_live()
-        assert live, live
-        return sorted((buffer.bytes, buffer.shape, buffer.dtype, buffer.kind) for buffer in live)
-
-    (device,) = jax.devices()[:1]
-    (double,) = twin([device])
-    own, probe = report.xla_compiled(two_products(device), None), probed(two_products(double))
-    assert probe.memory_analysis().temp_size_in_bytes == own.memory_analysis().temp_size_in_bytes
-    assert buffers(probe) == buffers(own)
-    # The twin states this GPU's memory, every admission on it reading its allocator's limit: within the 2 MiB
-    # this GPU's own allocator rounds its limit up by (`allocator_limit`).
-    assert 0 <= device.memory_stats()["bytes_limit"] - device_memory(double)["bytes_limit"] < 2**21
-
-
 def test_a_fresh_state_placed_on_a_gpu_is_bitwise_its_draws_under_jaxs_default_lowering():
     """A fresh run's state placed on the GPU (`Trainer.place`, its start program drawn through loops over
     threefry's rounds, `dew.training.distributed.drawing`) is bit for bit the state its initializer draws
