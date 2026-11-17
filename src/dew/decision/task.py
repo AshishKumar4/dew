@@ -1546,12 +1546,13 @@ class PassPlan:
     def taken(self) -> tuple[int, ...]:
         """Which of its rows, by the order they were added, the pass runs now (`ScoringServer`): all of
         them, or, where they fill every window of the declared count below their shape's and overrun it,
-        those in that count's windows, the rest left to a pass of its own shape, where the two passes
-        compute fewer tokens (each costed by its shape, `Decide._shape`). The counts are powers of 8, so a
-        pass that overruns one by a little took the next count whole: a server's last pass of 512 requests
-        held 29% of its 32 windows' tokens, a fifth of every pass's tokens padding (row 3330). One count
-        below and one pass after, so a pass splits once and a server's passes stay few: its next pass
-        plans the rest afresh."""
+        those in that count's windows, the rest left to a pass of its own shape, of fewer windows than
+        theirs, where the two passes compute fewer tokens (each costed by its shape, `Decide._shape`). The
+        counts are powers of 8, so a pass that overruns one by a little took the next count whole: a
+        server's last pass of 512 requests held 29% of its 32 windows' tokens, a fifth of every pass's
+        tokens padding (row 3330). One count below and one pass after, its windows fewer, so a pass splits
+        once and a server's passes stay few: a rest that takes the whole pass's count again would only
+        shorten its length, a pass more for each row it left, so it runs whole."""
         rows, decide = self.rows, self.decide
         everything = tuple(range(len(rows)))
         if not rows or not self.alive:
@@ -1566,7 +1567,7 @@ class PassPlan:
         first = decide._shape([rows[index] for index in inner])
         rest = decide._shape([row for index, row in enumerate(rows) if index not in inner])
         split = first.rows * first.length + rest.rows * rest.length
-        return inner if split < whole.rows * whole.length else everything
+        return inner if rest.rows < whole.rows and split < whole.rows * whole.length else everything
 
     def shape(self) -> PassShape:
         """The pass's shape: of the shortest length that holds its rows, the fewest windows declared that
