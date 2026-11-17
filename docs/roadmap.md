@@ -20,7 +20,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Splash's training step on a v5e is not finite in its value gradient. [7226]
 - Splash in float16 does not compile on a v5e. [7227]
 - JAX's paged decode at width 64 does not lower on a v5e. [7228]
-- The template decode pins its derived config uncertified. [7259]
 - A first sm80 accurate-form attention backward with a bias pays 3-4 minutes of certification compiles before its route falls back to another mainloop. [7279]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]

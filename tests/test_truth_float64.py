@@ -11,6 +11,8 @@ from arm_arithmetic import float64_held, stored_as
 from check1_judge import STAGES_LOG
 from reference_error import NarrowTruth, as_given, assert_as_exact, over_windows, windows
 
+from dew.parity import GateFailure
+
 WEIGHT = np.random.default_rng(5430).normal(size=(64, 8)).astype(np.float32)
 """A parameter the arms close over, as a model's variables are."""
 
@@ -209,6 +211,26 @@ def test_a_truth_that_computes_in_float64_is_judged(name):
     is judged as before, its arm on par with itself."""
     arm, draw, truth = NULL[name]
     assert_as_exact(arm, arm, draw, name, seeds=8, truth_fn=truth)
+
+
+def multiplied(x, weight):
+    """Each row's first eight values times the weight's first row, elementwise: no product sums them."""
+    return x[:, :8] * weight[0]
+
+
+def off_in_its_imaginary_part(x, weight):
+    """`multiplied` with each value's imaginary part a thousandth too large, its real part exact."""
+    out = multiplied(x, weight)
+    return out + jnp.complex64(1j) * (jnp.imag(out) * jnp.float32(1e-3))
+
+
+def test_an_error_in_a_complex_values_imaginary_part_alone_fails():
+    """A complex output is judged by its values' magnitudes: an arm whose real parts are the reference's
+    and whose imaginary parts are a thousandth off fails, where reading the real parts alone passes it.
+    Elementwise: a complex product under JAX's F32_F32_F32 preset, which check 1 runs CPU arms under
+    (`summed_as_run`), loses its imaginary part in both arms (row 7191)."""
+    with pytest.raises(GateFailure):
+        assert_as_exact(off_in_its_imaginary_part, multiplied, turned, "off in its imaginary part", seeds=8)
 
 
 @pytest.mark.parametrize("name", INJECTED)

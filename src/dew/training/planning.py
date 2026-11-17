@@ -38,7 +38,15 @@ from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
-from dew.nn.kernels.options import OuterProgram, compiler_options, held, hold, owned_program, program_key
+from dew.nn.kernels.options import (
+    OuterProgram,
+    compiler_options,
+    held,
+    hold,
+    owned_program,
+    program_key,
+    unhold,
+)
 from dew.nn.kernels.templates import report
 from dew.objectives.base import RECORD, Objective, Pooled
 from dew.state import TrainState, apart, together
@@ -739,10 +747,13 @@ class FitSearch[LossT, EffectsT]:
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
     is that program (`AheadOfTime.taken`), lowered as its own compile lowered it (`handed`: within its
     refusals, for its GPU, `fits_here`)."""
-    """Each executable this search, or one before it over the same candidates, compiled, by its program and
-    its options (`compiled_key`): one a search before the state was placed compiled is taken
-    here in place of compiling it again (`dew.training.compiler.StepCompiler.planned_unplaced`), judged on
-    these devices as one compiled here is."""
+    provisional: bool = False
+    """Whether the search judges devices other than the ones the step runs on as they will stand: before
+    the state is placed (`unplaced`) or off the loop while an earlier phase holds them
+    (`dew.training.ahead.LaterPlans`). It holds every executable it compiles (`dew.nn.kernels.options.hold`),
+    one that missed among them, for the plan made on the devices as they stand to judge again in place of
+    compiling it; a search that is not holds those that fit alone, and drops a held one that misses on its
+    devices, which no plan after it asks for."""
     unplaced: int | None = None
     """The bytes a device holds of the state the search plans over that the devices hold none of yet, None
     where they hold it (`dew.training.compiler.StepCompiler.planned_unplaced`): each candidate is judged with
@@ -925,11 +936,14 @@ class FitSearch[LossT, EffectsT]:
                                                  first=firsts[0])
                 candidate = relowered.candidate(candidate)
             fit, headroom = self.fitting(executable, candidate)
-            if relowered is not None and executable is not None and fit:
-                # One that fits, which a run may step on, under the program it compiled: the relowered one
-                # past a spill, which a plan after it lowers directly, the spill's refusal held for the
-                # process. One that misses is no step's, its device code held for nothing.
-                hold(self.compiled_key(candidate.lowered, options), executable)
+            key = self.compiled_key(candidate.lowered, options)
+            if relowered is not None and executable is not None and (fit or self.provisional):
+                # Under the program it compiled: the relowered one past a spill, which a plan after it lowers
+                # directly, the spill's refusal held for the process. One that misses on the devices the
+                # step runs on is no step's, its device code held for nothing.
+                hold(key, executable)
+            elif kept is not None and executable is kept and not fit and not self.provisional:
+                unhold(key)
             self.sampled = None
             if fit and candidate.sampled is not None:
                 if ahead is not None and ahead.sampled is not None:

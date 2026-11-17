@@ -2447,7 +2447,7 @@ if mode == "keep":
         tokens = served()
     saved = programs.save(path)
     # Each kept program by its function's name.
-    found = {"kept": sorted({program.call["function"][2] for program in saved.kept.values()}),
+    found = {"kept": sorted({program.called.rsplit(".", 1)[-1] for program in saved.kept.values()}),
              "refused": sorted(programs.refused.values())}
 else:
     with kept(path), Compiles(None) as compiles:
@@ -2464,14 +2464,14 @@ print(json.dumps({"tokens": tokens, **found}))
 
 def test_a_text_server_serving_under_keeping_keeps_every_program_it_compiles(tmp_path):
     """A text server built and serving within `keeping` keeps each program it compiles and refuses none: the
-    server's own context, its stack and sequences whole (`dew.nn.sharding.whole`), is part of what each
-    call's identity states, its formats' chosen layouts too, and its checks' tracebacks are held as their
-    frames (`HeldTraceback`). A fresh process handed them serves the same tokens compiling none of them,
-    the step that chooses its state's layout among them (`OuterProgram.handed`)."""
+    programs' formats' chosen layouts are part of what each lowers to, and its checks' tracebacks are held
+    as their frames (`HeldTraceback`). A fresh process handed them, with no persistent cache, serves the
+    same tokens compiling none of them, the step that chooses its state's layout among them, which its
+    tuned lowering finds by its fingerprint."""
     import process_support
 
     path = str(tmp_path / "text.dew-aot")
     keep = process_support.fresh(KEPT_TEXT, "keep", path)
     assert keep["refused"] == [] and keep["kept"]
-    take = process_support.fresh(KEPT_TEXT, "take", path)
+    take = process_support.fresh(KEPT_TEXT, "take", path, variables={"JAX_ENABLE_COMPILATION_CACHE": "false"})
     assert not set(take["compiled"]) & set(keep["kept"]) and take["tokens"] == keep["tokens"]
