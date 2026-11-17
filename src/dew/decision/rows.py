@@ -91,7 +91,8 @@ class Encoding:
         fewest = self.none_of_the_above_options
 
         def laid(drop: bool, names: Collection[str] | None = None, held: "FittedRow" = row) -> int:
-            return _with_none(self.layout, self.tokenizer, self.specials, held, fewest, drop, names)[0]
+            return _with_none(self.layout, self.tokenizer, self.specials, held, fewest, drop, names,
+                              self.context_length)[0]
 
         if len(row.names) == 1:
             return min(row.length, laid(drop=False), laid(drop=True))
@@ -117,6 +118,13 @@ class Encoding:
         )
         return self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders,
                                 tokens=None if tokens is None else tokens.tolist(), request=example.questions)
+
+    def _contexted(self, example: Example, rows: Sequence[Encoded]) -> list[Encoded]:
+        """`rows` with the context their backbone reads (`with_context`): the example's own, after a schema
+        read as the row's context where the row reads one there; none where the backbone reads none, which
+        leaves the example's context unread."""
+        return with_context(rows, self.tokenizer, None if self.context_length is None else example.context,
+                            self.context_length)
 
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None,
                  tokens: np.ndarray | None = None, group_of: "GroupOf | None" = None,
@@ -152,7 +160,7 @@ class Encoding:
             asked[name] = question
             if gold is not None:
                 golds[name] = gold
-        rows = self._rows(example, asked, rng, tokens)
+        rows = self._contexted(example, self._rows(example, asked, rng, tokens))
         if dropped and (len(rows) != 1 or any(drawn_refusal(self.layout, row, self.context_length, admitted)
                                               is not None for row in rows)):
             # The added option made a row no run trains on (`Layout.refusal`: unfit, or options a
@@ -161,14 +169,11 @@ class Encoding:
             asked = {name: example.questions[name] for name in names}
             golds = {name: example.distribution(name) for name in names if name in labels}
             dropped = {}
-            rows = self._rows(example, asked, rng, tokens)
+            rows = self._contexted(example, self._rows(example, asked, rng, tokens))
         if len(rows) != 1:
             # A row over one state that its options' drawn order splits, their lines read as other tokens
             # (`SegmentLayout.shared_state`), is laid out in their own order, as Fit admitted it.
-            rows = self._rows(example, asked, None, tokens)
-        # A run over a backbone that reads no context leaves an example's own context unread.
-        rows = with_context(rows, self.tokenizer, None if self.context_length is None else example.context,
-                            self.context_length)
+            rows = self._contexted(example, self._rows(example, asked, None, tokens))
         if len(rows) != 1:
             raise ValueError(f"an encoding lays out one row, and the layout gave {len(rows)}")
         encoded = rows[0]
@@ -331,16 +336,19 @@ class FittedRow:
 
 def drawn_refusal(layout: Layout, row: Encoded, context_length: int | None,
                   admitted: Mapping[str, int] | None) -> str | None:
-    """Why a training read declines the "none of the above" it drew for `row`: the layout refuses the row
-    (`Layout.refusal`), or the option's line cuts more of the state than the row was `admitted` with
-    (`state_cut`), which its data report counted (`FittedRow.cuts`); None where the row stands as drawn.
-    The option's own line under a declared question budget is the budget's (`options_alike` where it
-    leaves two alike)."""
+    """Why a training read declines the "none of the above" it drew for `row`, its context resolved
+    (`with_context`): the layout refuses the row (`Layout.refusal`), or the option's line cuts more of the
+    state (`state_cut`) or, lengthening a schema read as the row's context, more of the context after it
+    (`context_cut`) than the row was `admitted` with, which its data report counted (`FittedRow.cuts`);
+    None where the row stands as drawn. The option's own line under a declared question budget is the
+    budget's (`options_alike` where it leaves two alike)."""
     refused = layout.refusal(row, context_length)
     if refused is not None or admitted is None:
         return refused
-    deeper = any(row.cuts.get(kind, 0) > admitted.get(kind, 0) for kind in ("state", "state_characters"))
-    return "state_cut" if deeper else None
+    for kinds, reason in ((("state", "state_characters"), "state_cut"), (("context",), "context_cut")):
+        if any(row.cuts.get(kind, 0) > admitted.get(kind, 0) for kind in kinds):
+            return reason
+    return None
 
 
 def _cuts(rows: Iterable[FittedRow]) -> dict[str, tuple[int, int]]:
@@ -489,6 +497,12 @@ class Fit(pygrain.MapTransform):
         if len(laid) != 1:
             # A row over one state its added options leave no room in (`SegmentLayout.shared_state`).
             return "unfit"
+        refused = self.layout.refusal(laid[0], self.context_length)
+        if refused is not None:
+            return refused
+        if self.context_length is not None:
+            # Its context as the encoding lays it out, a schema the option lengthens cutting more of it.
+            laid = with_context(laid, self.tokenizer, example.context, self.context_length)
         return drawn_refusal(self.layout, laid[0], self.context_length, row.cuts)
 
     def _apart(self, grouped: GroupedExamples) -> Batch | Rejected:
@@ -532,7 +546,7 @@ class Fit(pygrain.MapTransform):
             return row.length, row.context
         sizes = [(row.length, row.context),
                  *(_with_none(self.layout, self.tokenizer, self.specials, row, self.none_of_the_above_options,
-                              drop) for drop in (False, True))]
+                              drop, context_length=self.context_length) for drop in (False, True))]
         return max(tokens for tokens, _ in sizes), max(context for _, context in sizes)
 
     def _unit(self, grouped: GroupedExamples) -> Batch | Rejected:
@@ -574,11 +588,14 @@ class Fit(pygrain.MapTransform):
 
 
 def _with_none(layout: Layout, tokenizer: Tokenizer, specials: Specials, row: FittedRow, fewest: int,
-               drop: bool, names: Collection[str] | None = None) -> tuple[int, int]:
+               drop: bool, names: Collection[str] | None = None,
+               context_length: int | None = None) -> tuple[int, int]:
     """The tokens and context tokens `row` lays out to with a "none of the above" (`Encoding`) beside each
     of its answered choices' options that draws one (`draws_none`, `fewest`), or in place of its right
     option where `drop`: each such question of `names` where given, of the row's every one otherwise. A
-    schema read as the row's context lengthens as its row does; an example's context does not change."""
+    schema read as the row's context lengthens as its row does, the example's context after it in the room
+    the schema leaves under `context_length` (`with_context`); an example's context alone does not
+    change."""
     example = row.example
     labels = example.labels()
     asked = {name: (_none_of_the_above(question, labels[name], drop=drop)[0]
@@ -587,6 +604,8 @@ def _with_none(layout: Layout, tokenizer: Tokenizer, specials: Specials, row: Fi
              for name in row.names for question in (example.questions[name],)}
     laid = layout.rows(tokenizer, specials, example.state, asked, tokens=row.tokens.tolist(),
                        request=example.questions)
+    if context_length is not None and all(len(each.context or ()) <= context_length for each in laid):
+        laid = with_context(laid, tokenizer, example.context, context_length)
     schemas = sum(len(each.context or ()) for each in laid if each.spans_in_context)
     return sum(len(each.tokens) for each in laid), schemas or row.context
 
