@@ -18,6 +18,7 @@ import jax
 from flax import linen as nn
 
 from ..kv_cache import CacheSpec, stacked_spec
+from ..rope import LongRopeScaling
 from ..sharding import pipeline_stages
 from .decoder_stack import StackView, stored_by_stage
 from .layer_names import stored_layers
@@ -93,3 +94,17 @@ def _banked_runs(model: CausalTransformer) -> tuple[tuple[int, int], ...] | None
     if not banked or stored_by_stage(model.variables) or pipeline_stages() > 1:
         return None
     return model.groups
+
+
+def rebuild_position(decoder: CausalTransformer) -> int | None:
+    """Where LongRoPE's factors switch from short to long, past which cached keys go stale: the
+    original length of every trunk layer's LongRoPE, its kind's or the model's (`kind_of`), None
+    where no layer takes LongRoPE. Kinds that switch at different lengths are refused, since a cache
+    rebuilds at one."""
+    originals = {kind.rope_scaling.original_max_position_embeddings
+                 for kind in map(decoder.kind_of, set(decoder.per_layer_types))
+                 if isinstance(kind.rope_scaling, LongRopeScaling)}
+    if len(originals) > 1:
+        raise ValueError(f"layer kinds switch LongRoPE's factors at {sorted(originals)} tokens; a cache "
+                         "rebuilds its keys at one")
+    return next(iter(originals), None)
