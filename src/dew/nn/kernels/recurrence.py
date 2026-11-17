@@ -28,6 +28,7 @@ from dew._hashing import fmix32
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels import launches
 from dew.nn.precision import (
+    accurate_exp,
     at_least_fp32,
     compensated_add,
     l2norm,
@@ -197,7 +198,7 @@ def _held(updated, key, value, dtype):
 
 def _gated_decay(gate, log_a, bias):
     """The gates' log decay `-exp(log_a) softplus(gate + bias)`, in the operands' dtype."""
-    return -jnp.exp(log_a) * softplus(gate + bias)
+    return -accurate_exp(log_a) * softplus(gate + bias)
 
 
 def gated(gates: Gates, gate, log_a, bias, beta):
@@ -209,7 +210,7 @@ def gated(gates: Gates, gate, log_a, bias, beta):
     step = softplus(gate + bias)
     if gates.limit is not None:
         step = jnp.clip(step, *gates.limit)
-    return -jnp.exp(log_a) * step, step if gates.write == 'step' else jax.nn.sigmoid(beta)
+    return -accurate_exp(log_a) * step, step if gates.write == 'step' else jax.nn.sigmoid(beta)
 
 
 def gated_rms(out, z, weight, norm: OutputNorm):

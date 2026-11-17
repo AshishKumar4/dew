@@ -52,7 +52,7 @@ from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
 from dew.nn.derivatives import Protected, contracted
 from dew.nn.nested import nested
-from dew.nn.precision import at_least_fp32, compensated_add, vanishing
+from dew.nn.precision import accurate_exp, at_least_fp32, compensated_add, vanishing
 from dew.nn.programs import read_by
 
 Axes = tuple[str, ...]
@@ -1013,5 +1013,4 @@ def _exp(base2: bool, x):
     on a CPU and its layer cell past transformers' bound, where at most accurate the scan is 1.25 times, its
     layer's training step unchanged (20.922 ms against 20.927 over five rounds, M-JS-134, row 7062); a CPU's
     is the default's bit for bit."""
-    # Exempt from the run's forms: the bound needs it, and it costs nothing measured (M-JS-134).
-    return (lax.exp2 if base2 else lax.exp)(jnp.asarray(x), accuracy=lax.AccuracyMode.HIGHEST)
+    return accurate_exp(x, base2=base2)

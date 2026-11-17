@@ -430,6 +430,16 @@ def rounds_products() -> bool:
     return numerics().forms == "fast" and asks_default_precision(None, configured=True)
 
 
+def accurate_exp(x, *, base2: bool = False) -> jax.Array:
+    """`e^x` (`2^x` where `base2`) at the backend's most accurate (`jax.lax.AccuracyMode.HIGHEST`) in every
+    form, not the run's (`Numerics.forms`): the recurrences' decays (a scan's, `A = -exp(A_log)`, the
+    softplus's), where an fp32 default path must meet its upstream's bound. A v5e's default fp32 exp is 1.5e-6
+    from float64: through them it held Mamba-2's layer cell at 5.5 times its CPU float32, at most accurate 3.5
+    times, its training step unchanged (M-JS-134, row 7062); a CPU's is the default's bit for bit."""
+    # Exempt from the run's forms: the bound needs it, and it costs nothing measured (M-JS-134).
+    return (jax.lax.exp2 if base2 else jax.lax.exp)(jnp.asarray(x), accuracy=jax.lax.AccuracyMode.HIGHEST)
+
+
 def softplus_series(x) -> jax.Array:
     """`jax.nn.softplus(x)`'s value, `log(1 + exp(x))`, as its larger part plus `log1p` of the smaller's
     exponential `y` in (0, 1], the `log1p` by its series in `s = y / (2 + y)`, at most a third, `2 (s + s^3 /
@@ -439,7 +449,7 @@ def softplus_series(x) -> jax.Array:
     dtype; its derivative the logistic, as JAX's."""
     given = jnp.asarray(x)
     x = given.astype(at_least_fp32(given.dtype))
-    y = jnp.exp(-jnp.abs(x))
+    y = accurate_exp(-jnp.abs(x))
     s = y / (2.0 + y)
     square = s * s
     series = jnp.zeros_like(s)
