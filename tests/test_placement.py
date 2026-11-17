@@ -225,3 +225,28 @@ def test_a_pipelines_frozen_language_tower_is_split_as_its_draw_declares(tmp_pat
     tower = [sharding for path, sharding in jax.tree_util.tree_leaves_with_path(placed.variables)
              if "text_encoder" in jax.tree_util.keystr(path)]
     assert tower and any(TENSOR_AXIS in mesh_axes(entry) for sharding in tower for entry in sharding.spec)
+
+
+def test_a_fresh_starts_program_for_a_gpu_draws_through_rolled_loops():
+    """A fresh run's start program compiled for a GPU (`start_compiled`, as a run compiled ahead and a run
+    starting compile it) draws through threefry's rounds as loops (`dew.training.distributed.drawing`), a
+    loop for each draw, the start program's contract (docs/design/training.md), where every draw's twenty
+    rounds were unrolled into hash arithmetic, the program's whole compile (row 6740: a 142M DiT's start
+    compiled on a GH200 in 23.8 s, 4.9 s rolled, M-MC-13). Its bits are the default lowering's
+    (`test_gpu_compile_ahead`'s fresh state on a GPU)."""
+    from jax.extend import xla
+    from test_compile_ahead import fine_tune, gpus
+
+    from dew.nn.kernels.options import shapes_of
+    from dew.training import MeshSpec
+    from dew.training.distributed import start_compiled
+
+    trainer = fine_tune(MeshSpec().build(gpus("sm90")))
+    start = trainer._started()
+    compiled = start_compiled(start.placing, start.initializer, shapes_of(start.key), start.abstract,
+                              start.shardings, trainer.device_mesh)
+    # Its optimized module's instructions, read through XLA's own schema.
+    (module,) = compiled.runtime_executable().hlo_modules()
+    loops = sum(1 for instruction in xla.instructions(module) if instruction.opcode == "while")
+    drawn = sum(1 for leaf in jax.tree.leaves(start.abstract.variables["params"]) if leaf.ndim > 1)
+    assert loops >= drawn > 0, (loops, drawn)
