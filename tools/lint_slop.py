@@ -1916,29 +1916,6 @@ CUSTOM_DERIVATIVES = frozenset({"jax.custom_vjp", "jax.custom_jvp", "jax.custom_
 """JAX's custom derivatives, by their public paths, which SLOP026 reports outside `DERIVATIVE_OWNER`."""
 
 
-def custom_derivatives(module: Module) -> Iterator[Finding]:
-    """SLOP026: a custom derivative of JAX's (`CUSTOM_DERIVATIVES`), its name read through the imports of its
-    scope, anywhere in `src/<package>` but `DERIVATIVE_OWNER`: applied by a site, its derivative is a call
-    the algebra pass cannot tell a kernel's glue from a rule its numerics need as written."""
-    for node, named in _outside_owner(module, DERIVATIVE_OWNER, CUSTOM_DERIVATIVES):
-        yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP026",
-                      f"applies {named} itself; declare it with its kind through `dew.nn.derivatives` "
-                      "(`declared_derivative`, `declared_tangent` or `surrogate`)")
-
-
-def _outside_owner(module: Module, owner: str, names: frozenset[str]) -> Iterator[tuple[ast.AST, str]]:
-    """Each node of `module` naming one of `names`, read through the imports of its scope, and that name,
-    where `module` is of `src/<package>` but not its `owner`: a construct one module owns (SLOP026,
-    SLOP030)."""
-    prefix = f"src/{module.package}/"
-    if not module.relative.startswith(prefix) or module.relative.removeprefix(prefix) == owner:
-        return
-    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
-        named = isinstance(node, (ast.Name, ast.Attribute)) and scopes.resolved(node, table)
-        if named in names:
-            yield node, named
-
-
 SOFTPLUS_OWNER = "nn/precision.py"
 """The module of `src/<package>` that forms softplus (SLOP030), by its own series, past a backend's log1p."""
 
@@ -1946,15 +1923,33 @@ SOFTPLUS = frozenset({"jax.nn.softplus", "flax.linen.softplus", "flax.linen.acti
                       "jax._src.nn.functions.softplus"})
 """JAX's and Flax's softplus, by their public paths, which SLOP030 reports outside `SOFTPLUS_OWNER`."""
 
+OWNED = (
+    ("SLOP026", DERIVATIVE_OWNER, CUSTOM_DERIVATIVES,
+     "applies {named} itself; declare it with its kind through `dew.nn.derivatives` (`declared_derivative`, "
+     "`declared_tangent` or `surrogate`)"),
+    ("SLOP030", SOFTPLUS_OWNER, SOFTPLUS,
+     "calls {named}, its log1p the backend's; call `dew.nn.precision.softplus`, its series past it"),
+)
+"""The constructs one module of `src/<package>` owns, each its rule, its owner, its names and its finding:
+JAX's custom derivatives (SLOP026: applied by a site, its derivative is a call the algebra pass cannot tell a
+kernel's glue from a rule its numerics need as written) and softplus (SLOP030: JAX's and Flax's log1p is the
+backend's, on a v5e 1.4e-4 from float64, row 7062)."""
 
-def softplus_calls(module: Module) -> Iterator[Finding]:
-    """SLOP030: JAX's or Flax's softplus (`SOFTPLUS`), its name read through the imports of its scope,
-    anywhere in `src/<package>` but `SOFTPLUS_OWNER`: its log1p is the backend's, on a v5e 1.4e-4 from
-    float64 (row 7062)."""
-    for node, named in _outside_owner(module, SOFTPLUS_OWNER, SOFTPLUS):
-        yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP030",
-                      f"calls {named}, its log1p the backend's; call `dew.nn.precision.softplus`, its series "
-                      "past it")
+
+def owned_constructs(module: Module) -> Iterator[Finding]:
+    """SLOP026 and SLOP030 (`OWNED`): a construct one module owns, its name read through the imports of its
+    scope, anywhere in `src/<package>` but its owner."""
+    prefix = f"src/{module.package}/"
+    if not module.relative.startswith(prefix):
+        return
+    within = module.relative.removeprefix(prefix)
+    rules = [(code, names, finding) for code, owner, names, finding in OWNED if within != owner]
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        named = isinstance(node, (ast.Name, ast.Attribute)) and scopes.resolved(node, table)
+        for code, names, finding in rules:
+            if named in names:
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, code,
+                              finding.format(named=named))
 
 
 GATE = frozenset({"tests/reference_error.py", "src/dew/parity.py", "tests/op_certificates.py",
@@ -2254,7 +2249,7 @@ def derivative_contracts(module: Module) -> Iterator[Finding]:
 
 
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,
-                  pallas_launches, custom_derivatives, derivative_contracts, softplus_calls)
+                  pallas_launches, owned_constructs, derivative_contracts)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
 
 
