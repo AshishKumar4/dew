@@ -771,7 +771,7 @@ class RolloutScheduler:
         from dew.inference.serving import Server, paged_layout
 
         return Server.from_task(policy, slots=slots, capacity=capacity,
-                                kv_cache=paged_layout(policy.model, page_size))
+                                kv_cache=paged_layout(policy.model, capacity, page_size))
 
     @classmethod
     def episodes(cls, policy: EpisodeInference, environment: EnvironmentFactory, verifier: Verifier, *,
@@ -788,7 +788,8 @@ class RolloutScheduler:
         from dew.inference.serving import paged_layout
         from dew.inference.tasks import TextGeneration
 
-        layout = paged_layout(policy.model) if isinstance(policy, TextGeneration) and policy.n == 1 else None
+        layout = (paged_layout(policy.model, max_prompt_tokens + max_new_tokens)
+                  if isinstance(policy, TextGeneration) and policy.n == 1 else None)
         collector = EpisodeCollector(policy, environment, verifier, max_prompt_tokens, max_new_tokens,
                                      max_turns, sampling, record, journal, kv_cache=layout)
         return cls(Synchronous(collector), groups=groups, credit=credit, log=log, scorer=objective)

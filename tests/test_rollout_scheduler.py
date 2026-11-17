@@ -422,8 +422,8 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
 def test_a_served_rollouts_server_shares_its_prompts_pages_by_default():
     """A served rollout's server (`RolloutScheduler.serve`) that names no page size pages its cache where
     paging computes what the model computes, its prefix cache on as a paged server keeps one, so a group's
-    samples of one prompt prefill it once (row 5375); a model whose LongRoPE rebuilds a crossing request
-    keeps each row's cache whole."""
+    samples of one prompt prefill it once (row 5375); a model whose LongRoPE rebuilds a crossing request,
+    and one whose max_seq_len holds no row in whole pages, keeps each row's cache whole."""
     from model_support import serving_task
 
     from dew.nn.rope import LongRopeScaling
@@ -435,6 +435,7 @@ def test_a_served_rollouts_server_shares_its_prompts_pages_by_default():
                               original_max_position_embeddings=16)
     rebuilding = dataclasses.replace(task, model=task.model.clone(rope_scaling=scaling))
     assert not RolloutScheduler.serve(rebuilding, slots=4, capacity=64).reuses_prefixes
+    assert not RolloutScheduler.serve(serving_task(capacity=12), slots=4, capacity=8).reuses_prefixes
 
 
 def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
