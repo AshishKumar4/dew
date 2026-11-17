@@ -1080,7 +1080,7 @@ def _image_start(autoencoder, process, shape, params, samples, keys, encode_key,
 def _encoded(encoders, params, tokens):
     """The conditions' encodings of `tokens` (`encode_conditions`), each row's where its rows sit."""
     # A task without conditions holds no encoder weights.
-    return encode_conditions(encoders, params["encoders"] if encoders else {}, tokens)
+    return encode_conditions(encoders, params["encoders"] if encoders else {}, tokens, path="TextToImage")
 
 
 def _encoder(rows: jax.sharding.NamedSharding | None, encoders):

@@ -636,6 +636,20 @@ def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time():
                           "an expert stack, one expert at a time")
 
 
+
+def scaled_stack_draw(scales: list[float], embed: int, mlp: int):
+    """A draw of a stack of `len(scales)` [embed, mlp] matrices and its gradient, one matrix at each of
+    `scales`: each normalized alone takes optax's update for that matrix alone, where normalizing the stack
+    as one would share a scale among them."""
+    scaled = np.asarray(scales, np.float32)[:, None, None]
+
+    def draw(seed):
+        grad = np.asarray(jax.random.normal(jax.random.key(seed), (embed, mlp)))
+        return (np.asarray(jax.random.normal(jax.random.key(seed + (1 << 20)), (len(scales), embed, mlp))),
+                scaled * grad)
+
+    return draw
+
 class ExpertByExpert(typing.NamedTuple):
     """`transform` stepping each matrix of an expert stack, its leading axis, alone: the reference of a
     stack Muon steps one expert at a time."""
@@ -659,15 +673,10 @@ def test_an_expert_stack_placed_over_the_mesh_is_orthogonalized_one_expert_at_a_
     step compiled there. The experts' gradients are one matrix at four
     scales, so each normalized alone takes optax's update for that matrix
     alone, where normalizing the stack as one would share a scale among them."""
-    experts, embed, mlp = 4, 8, 16
+    embed, mlp = 8, 16
     mesh = MeshSpec(**spec).build(jax.devices()[:4])
     placement = NamedSharding(mesh, P("expert", "fsdp" if "fsdp" in spec else None, None))
-    scales = np.asarray([1.0, 16.0, 0.25, 2.0], np.float32)[:, None, None]
-
-    def draw(seed):
-        grad = np.asarray(jax.random.normal(jax.random.key(seed), (embed, mlp)))
-        return (np.asarray(jax.random.normal(jax.random.key(seed + (1 << 20)), (experts, embed, mlp))),
-                scales * grad)
+    draw = scaled_stack_draw([1.0, 16.0, 0.25, 2.0], embed, mlp)
 
     solver = muon_solver()
 
@@ -701,6 +710,51 @@ def test_a_matrix_declared_with_no_axis_named_is_orthogonalized_as_one_matrix():
     params = {'params': {'layers_0': {'altup': {'prediction_coefs': {'kernel': jnp.zeros((16, 4))}}}}}
     path = ('params', 'layers_0', 'altup', 'prediction_coefs', 'kernel')
     assert_updates_as(muon_solver(), optax.contrib.muon(LR), params, [path], "an undeclared AltUp matrix")
+
+
+@pytest.mark.parametrize("declared", [("embed", None), (None, "embed")], ids=["output-whole", "input-whole"])
+def test_a_matrix_declared_on_one_side_is_orthogonalized_as_one_matrix(declared):
+    """A projection declared on one side alone, ('embed', None) or (None, 'embed'), a final projection or a
+    shared expert's gate whose rules shard one side and leave the other whole, is the matrix its two
+    dimensions make: Muon steps it as optax steps that undeclared matrix (row 6746: it was refused, so
+    a mixture of experts, Gemma 3n, the image transformers and JEPA could not train under Muon)."""
+    path = ('params', 'layers_0', 'proj', 'kernel')
+    drawn = {'params': {'layers_0': {'proj': {'kernel': nn.LogicallyPartitioned(jnp.zeros((16, 8)),
+                                                                                    declared)}}}}
+    with drawn_axes(drawn):
+        assert_updates_as(muon_solver(), optax.contrib.muon(LR), unboxed(drawn), [path],
+                          f"a matrix declared {declared}")
+
+
+@pytest.mark.parametrize("declared", [('groups', 'embed', 'mlp'), ('groups', 'attention', None)],
+                         ids=["two sides", "one side"])
+def test_a_group_stack_is_orthogonalized_one_group_at_a_time(declared):
+    """A block-diagonal kernel's groups, declared ('groups', 'embed', 'mlp') or on one side
+    ('groups', 'attention', None) as DeepSeek V4's grouped output projection is, are stacked matrices, as
+    an expert stack's are: Muon steps each group's matrix alone, where reading the groups as part of a side
+    would orthogonalize one [groups * embed, mlp] matrix, and a one-sided group stack was refused (row
+    6746)."""
+    embed, mlp = 8, 16
+    path = ('params', 'layers_0', 'o_a_proj', 'kernel')
+    draw = scaled_stack_draw([1.0, 16.0, 0.25], embed, mlp)
+
+    solver = muon_solver()
+
+    def tree(value):
+        return {'params': {'layers_0': {'o_a_proj': {'kernel': value}}}}
+
+    def stepped(params, grads):
+        with boxed({path: declared}):
+            updates, _ = solver.update(tree(grads), solver.init(tree(params)), tree(params))
+        return np.asarray(node(updates, path))
+
+    alone = ExpertByExpert(optax.contrib.muon(LR))
+
+    def reference(params, grads):
+        return alone.update(grads, alone.init(params), params)[0]
+
+    assert_as_exact(as_given(stepped), reference, draw, "a group stack", seeds=UPDATE_SEEDS,
+                    truth_fn=reference)
 
 
 def test_the_router_gate_takes_the_adamw_update():
@@ -1971,3 +2025,68 @@ def test_adams_default_first_moment_keeps_its_promoted_dtype():
     state = transform.init(params)
     _, state = transform.update({"w": jnp.full((8,), 1 / 3, jnp.float32)}, state, params)
     assert state.mu["w"].dtype == jnp.float32
+
+
+def test_lambs_trust_ratio_is_finite_where_the_update_is_tiny_beside_the_parameters():
+    """LAMB's trust ratio scales a layer's update to its parameters' norm: an update of 1e-22 beside
+    parameters of 5e18 (norm 1e19) is scaled to that norm, each element 5e18, finite, as `(u / |u|) |p|`,
+    where a backend keeps the update's subnormal squares (its norm near 2e-22), and the quotient of the two
+    norms, 5e40, formed first, passed float32 and made the update infinite; where a backend flushes them,
+    the norm is zero and the layer keeps its update (XLA:CPU does)."""
+    from dew.nn.sharding import layer_norms
+    from dew.optim import scale_by_trust_ratio
+
+    params = {"w": jnp.full((4,), 5e18, jnp.float32)}
+    updates = {"w": jnp.full((4,), 1e-22, jnp.float32)}
+    scaled, _ = scale_by_trust_ratio().update(updates, scale_by_trust_ratio().init(params), params)
+    kept = float(layer_norms(updates["w"], 0, 0.0).max()) == 0.0
+    if kept:
+        np.testing.assert_array_equal(np.asarray(scaled["w"]), np.asarray(updates["w"]))
+    else:
+        # Finite, every element alike, the layer's norm that of its parameters.
+        moved = np.asarray(scaled["w"])
+        assert np.all(np.isfinite(moved)) and np.all(moved == moved[0]) and moved[0] > 1e18
+
+
+def test_a_rate_injected_inside_an_injected_factory_reports_the_factorys():
+    """An injected factory of a rate (`inject_hyperparams(f)(learning_rate=s)`) whose chain injects its
+    solver's rate in turn holds two equal rates on one path: the reported rate is the factory's, the
+    outermost, as main read it, where two were read and none was reported (train 936's review, F2)."""
+    def factory(learning_rate):
+        return optax.chain(optax.inject_hyperparams(optax.adamw)(learning_rate=learning_rate))
+
+    schedule = optax.linear_schedule(1e-2, 1e-3, 10)
+    wrapped = optax.inject_hyperparams(factory)(learning_rate=schedule)
+    params = {"w": jnp.ones(3)}
+    state = wrapped.init(params)
+    for _ in range(2):
+        _, state = wrapped.update({"w": jnp.ones(3)}, state, params)
+    # The rate the second update stepped at: the schedule after one update.
+    np.testing.assert_array_equal(np.asarray(learning_rate(state)), np.asarray(schedule(1)))
+
+
+def test_a_layers_norm_is_finite_where_its_values_squares_pass_float32():
+    """A layer's norm (`layer_norms`, LAMB's and AGC's) is finite where every value is and their squares
+    pass float32: parameters of 1e20 hold a norm of 2e20, where their squares made it infinite and LAMB's
+    update with it (the head review's F5)."""
+    from dew.nn.sharding import layer_norms
+    from dew.optim import scale_by_trust_ratio
+
+    params = {"w": jnp.full((4,), 1e20, jnp.float32)}
+    assert float(layer_norms(params["w"], 0)[0]) == float(np.float32(2e20))
+    scaled, _ = scale_by_trust_ratio().update({"w": jnp.full((4,), 1e-3, jnp.float32)},
+                                              scale_by_trust_ratio().init(params), params)
+    assert np.all(np.isfinite(np.asarray(scaled["w"])))
+
+
+def test_a_muon_config_builds_inside_a_trace():
+    """A Muon config built where a trace is open (an injected factory builds its solver as its state is
+    made): its state is made and its update steps. A build that read its Newton-Schulz coefficients as
+    numbers failed on them as an array of the trace (the round-3 head review's F10)."""
+    params = {"w": jnp.ones((8, 4)), "b": jnp.ones((4,))}
+    wrapped = optax.inject_hyperparams(
+        lambda gain: optax.chain(OptimConfig(optimizer="muon", learning_rate=2e-2).build(10),
+                                 optax.scale(gain)))(gain=1.0)
+    state = jax.jit(wrapped.init)(params)
+    updates, _ = jax.jit(wrapped.update)(params, state, params)
+    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(updates))

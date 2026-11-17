@@ -68,13 +68,15 @@ FORMED = [
     recurrence.Hooks(decay='scalar', delta=False),
     recurrence.Hooks(decay='vector', delta=False, reads='before', own_weight=True),
     recurrence.Hooks(decay='scalar', reads='before', scale=KEY_WIDTH ** -0.5, write_bound=1.0),
+    recurrence.Hooks(decay='vector', delta=False, write_gate=True, own_weight=True),
 ]
 """The prologue's and epilogue's hooks: the gated delta rule's gates and l2 norm, Mamba2's step gates
 clipped with the skip, the gated RMS norm after the l2 norm and after a plain scale, Mamba2's SSD as
 `chunk_ssd` hands it over (a rated decay, the step its write gate), with its gated norm, a rated decay
 under the delta rule and the l2 norm, the norm after the skip, a decay without any write gate, and the
 readout of the memory entering its token (`Hooks.reads`): RWKV6's, a decay a key dimension with its own
-write weighed (`Hooks.own_weight`), and the delta rule's."""
+write weighed (`Hooks.own_weight`), and the delta rule's; and a write gate's own write weighed in a readout
+after it, its own weight added to the query's read of the write, as the decode step adds it."""
 
 PACKED = (False, True)
 
@@ -142,7 +144,7 @@ def chunk_on(kernel: str, hooks, *args, **kwargs):
 """A row of one sequence, and of packed documents."""
 
 SEEDS = dict(zip(((hooks, packed) for hooks in HOOKS + FORMED for packed in PACKED), (
-    8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 64, 64, 16, 16, 16, 16, 8, 8, 64, 64, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 64, 64, 16, 16, 16, 16, 8, 8, 64, 64, 8, 8, 8, 8, 8, 8,
     64, 64, 128, 128, 16, 8, 16, 16, 64, 64, 32, 32, 32, 32, 8, 8, 16, 16, 16, 16, 16, 16), strict=True))
 """Each site's declared seeds (hooks in `HOOKS` then `FORMED` order, one sequence then packed), sized
 independently by `seeds_for` on armada (2026-10-21), on the draw with a memory entering and a
@@ -279,18 +281,24 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
 
 def release(hooks: recurrence.Hooks) -> str | None:
     """The upstream library a form's family has a release of, whose own code is its oracle (testing.md): fla's
-    for the delta rule, mamba_ssm's for the rated scan; None for a write gate without the delta rule, whose
-    oracle is the recurrence a token at a time (`token_by_token`)."""
-    return "fla" if hooks.delta else "mamba_ssm" if hooks.rated else None
+    for the delta rule and for its simple GLA (lightning attention's, `recurrence_chunk.simple_gla`),
+    mamba_ssm's for the rated scan; None for a write gate without the delta rule, whose oracle is the
+    recurrence a token at a time (`token_by_token`)."""
+    if hooks.delta or recurrence_chunk.simple_gla(hooks):
+        return "fla"
+    return "mamba_ssm" if hooks.rated else None
 
 
 def oracle(hooks: recurrence.Hooks, dtype) -> str | None:
     """A cell's independent oracle at `dtype` (testing.md): its form's release (`release`) where the run's
     declaration admits that release's products for the dtype (`recurrence_chunk.upstream_precision`: fp32's
-    TF32 at no more than the default), else None, the recurrence a token at a time: no run of the release
-    computes the call's numbers there."""
+    TF32 at no more than the default) and its route takes the release's numbers (a simple GLA's under the
+    fast forms alone, `recurrence_chunk.chunk_rounding`), else None, the recurrence a token at a time: no run
+    of the release computes the call's numbers there."""
     found = release(hooks)
-    return found if found is not None and recurrence_chunk.upstream_precision(dtype) else None
+    taken = hooks.delta or hooks.rated or recurrence_chunk.chunk_rounding(delta=False, dtype=dtype,
+                                                                          released=True)
+    return found if found is not None and taken and recurrence_chunk.upstream_precision(dtype) else None
 
 
 def against_the_portable_math(label: str, dew_fn, portable_fn, draw, truth_fn, seeds: int) -> str | None:

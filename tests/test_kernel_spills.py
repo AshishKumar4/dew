@@ -258,7 +258,7 @@ from dew.training.ahead import AheadOfTime, handed
 
 step = AheadOfTime.load(sys.argv[1])
 identity, config, names = step.refusals[0]
-foreign = (identity, config, frozenset({"another kernel"}))
+foreign = (identity, config, frozenset({("another kernel", None)}))
 report.refuse([foreign])
 with assumed(step.target), handed(step):
     within = report.refused_launches()
@@ -1126,6 +1126,39 @@ def test_the_compile_gate_fails_a_kernel_above_the_register_cap_its_launch_runs_
     assert held.failure(232448, 512) is None
     over = dataclasses.replace(held, registers=192)
     assert "above its launch's 168" in over.failure(232448, 512)
+
+
+CONSUMERS_SPILL_LISTING = """
+.text.recurrence_scores_back_mosaic_gpu_kernel:
+        /*0000*/                   LDC R1, c[0x0][0x28] ;
+        /*0e60*/               @P2 BRA `(.L_x_0) ;
+.L_x_1:
+        /*0e80*/                   USETMAXREG.TRY_ALLOC.CTAPOOL UP0, 0xe8 ;
+        /*0ea0*/              @!P1 BRA `(.L_x_1) ;
+        /*27b0*/                   LDS.64 R192, [R25+0xa4a0] ;
+        /*27c0*/                   STL [R1], R173 ;
+        /*3950*/                   LDL.LU R203, [R1] ;
+        /*9a30*/               @P1 BRA `(.L_x_13) ;
+        /*9a50*/                   USETMAXREG.DEALLOC.CTAPOOL 0x18 ;
+        /*9a60*/                   S2R R4, SR_CTAID.X ;
+"""
+"""An H100's write-gated scores' backward at its producer's least (the termwise sums' 47b93b22f; its listing
+cut to its roles' setmaxnreg and a spill's store and load): its consumers raised to 232 registers, its
+16-byte spill in their code, before the producer's drop to 24."""
+
+
+def test_a_spills_roles_are_read_from_where_its_setmaxnreg_places_it():
+    """A kernel's spill stands in the role whose setmaxnreg precedes it in nvdisasm's listing (row 6744): the
+    write-gated scores' backward's after its consumers' raise, its consumers'; the same store and load after
+    the producer's drop, as a B200's decayed keys spilled (row 6747), its producer's; both where each role
+    spills; neither role's in a prologue before either setmaxnreg."""
+    spill = ("        /*27c0*/                   STL [R1], R173 ;\n"
+             "        /*3950*/                   LDL.LU R203, [R1] ;\n")
+    after_drop = CONSUMERS_SPILL_LISTING.replace(spill, "") + spill
+    assert report.spilled_roles(CONSUMERS_SPILL_LISTING) == (report.CONSUMERS,)
+    assert report.spilled_roles(after_drop) == (report.PRODUCER,)
+    assert report.spilled_roles(CONSUMERS_SPILL_LISTING + spill) == (report.CONSUMERS, report.PRODUCER)
+    assert report.spilled_roles(spill + CONSUMERS_SPILL_LISTING.replace(spill, "")) == ()
 
 
 def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read():

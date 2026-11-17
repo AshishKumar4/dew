@@ -31,6 +31,7 @@ from dataclasses import asdict, dataclass, replace
 
 import jax
 
+from dew._records import JSON, listed, record as read_record
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Route
 from dew.nn.kernels.lowered import KernelCall, kernel_launches
@@ -53,7 +54,7 @@ class KernelReport:
     calls: tuple[tuple[KernelCall, float], ...]
     """Each kernel call the lowered program makes, once, with the times it runs (`kernel_launches`)."""
 
-    def record(self) -> dict:
+    def record(self) -> KernelRecord:
         """Its JSON: each distinct route with its count, each kernel's launches, configs, stated FLOPs
         (None where any of its launches states none) and `padded`, the share of its launches' tile grids
         their tails pad, over its calls (`report.Launch.padded`; None where any states none), and
@@ -93,12 +94,25 @@ class KernelReport:
                                       if not sizes(call.kind, call.flops)))}
 
     def summary(self) -> str:
-        """One line for the run log: each kernel's launches, and the dispatches off their preferred kernel."""
-        launches = ", ".join(f"{entry['name']} x{'?' if entry['calls'] is None else entry['calls']}"
-                             for entry in self.record()["launches"])
-        off = sorted({f"{route.choice}: {route.kernel} not {route.preferred}" for route in self.routes
-                      if route.kernel != route.preferred})
-        return f"kernels: {launches or 'none'}" + (f"; off their preferred: {'; '.join(off)}" if off else "")
+        """One line for the run log (`kernel_summary`)."""
+        return kernel_summary(self.record())
+
+
+KernelRecord = dict[str, JSON]
+"""A lowered program's kernels as a run records them (`KernelReport.record`): `routes`, each distinct route
+with its count; `launches`, each kernel's launches; `unsized`, the launches the FLOP count cannot size."""
+
+
+def kernel_summary(record: KernelRecord) -> str:
+    """One line of a program's kernels from its record (`KernelReport.record`), as the run log and a
+    profile's report print it: each kernel's launches, and the dispatches off their preferred kernel."""
+    entries, routes = (listed(record[name], name, read=read_record, what=f"kernel {name}")
+                       for name in ("launches", "routes"))
+    launches = ", ".join(f"{entry['name']} x{'?' if entry['calls'] is None else entry['calls']}"
+                         for entry in entries)
+    off = sorted({f"{route['choice']}: {route['kernel']} not {route['preferred']}"
+                  for route in routes if route["kernel"] != route["preferred"]})
+    return f"kernels: {launches or 'none'}" + (f"; off their preferred: {'; '.join(off)}" if off else "")
 
 
 def _known(count: float) -> int | None:

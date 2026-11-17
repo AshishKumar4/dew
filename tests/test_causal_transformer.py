@@ -725,10 +725,10 @@ def test_a_post_norm_block_is_residual_plus_normed_sublayer_output(rng):
     block's output is checked against that equation computed from its own
     sublayers, and against the pre-norm block on the same weights, which
     normalises the input instead and lands elsewhere."""
-    from dew.nn.backbones.causal_transformer import RMSNorm
     from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
     from dew.nn.mixers import AttentionMixer, MixerContext
     from dew.nn.mlp import GatedMLP
+    from dew.nn.norms import RMSNorm
 
     features, ids = 32, tokens(rng)
     x = jax.random.normal(rng, (*ids.shape, features)) * 3
@@ -1180,7 +1180,7 @@ def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
     two agree at fp32, to the bit, and differ under bf16, and the HF
     translation picks per family."""
     from dew.interop.hf_decoders import translate_config
-    from dew.nn.backbones.causal_transformer import RMSNorm
+    from dew.nn.norms import RMSNorm
 
     x = jax.random.normal(rng, (2, 4, 32), jnp.bfloat16) * 3
     variables = {"params": {"scale": jax.random.uniform(rng, (32,), minval=0.5, maxval=1.5)}}

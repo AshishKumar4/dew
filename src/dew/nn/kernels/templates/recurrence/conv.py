@@ -45,6 +45,28 @@ def _unrolled(steps: int) -> int:
     return next(unrolled for unrolled in (UNROLLED, 4, 2, 1) if steps % unrolled == 0)
 
 
+def backward_unrolled(lanes_: int, count: int, head: int | None, family: mosaic.Family) -> int:
+    """The tokens a backward walk's turn reads at once (`_backward_walk`): `UNROLLED`'s widest power of two
+    whose turn's live values a thread holds within its registers (`resources.live_registers`, a thread's
+    `lanes_ // THREADS` channels a value): the turn's tokens' inputs and output gradients, two a token; the
+    walk's carry, its window's `count - 1` inputs and later tokens' `count - 1` gradients, its compensated
+    tap and bias sums (two each of `count + 1`) and its `count` taps; and a token's gradient's own values in
+    flight (the pre-activation, the activation and its gate, the gradient, its input's gradient and a window
+    product; a normalised head's scale, unit and projection beside them). Capped at eight channel-tokens a
+    thread, two 16-bit channels a thread walked four tokens a turn, the GH200's and A100's backward 6.5% and
+    2.2% slower than at eight (M-JS-130b), which hold."""
+    from dew.nn.kernels.templates import resources
+
+    value = (1, lanes_, jnp.float32)
+    walk = 2 * (count - 1) + 2 * (count + 1) + count
+    flight = 6 + (3 if head is not None else 0)
+    budget = resources.facts().thread_registers
+    for unrolled in (UNROLLED, 4, 2):
+        if resources.live_registers(family, [value] * (2 * unrolled + walk), [value] * flight) <= budget:
+            return unrolled
+    return 1
+
+
 def lanes(parts, dtype) -> int:
     """The channels a program of a conv of `parts` (`(width, head)` each) of `dtype` takes, a vector of
     `lanes // THREADS` a thread: the narrowest whose warp's transfer fills an L1 line (`scan.LINE`: two
@@ -280,7 +302,8 @@ def _backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation:
                 piece = _Piece(found, first=first, local=(program - lo) * lanes_, length=length,
                                count=count, tokens=tokens, lanes_=lanes_)
                 _backward_walk(piece, dy_ref, (dx_ref, dw_ref, db_ref), exchanged, head=head,
-                               activation=activation, eps=eps, tokens=tokens, interpret=interpret)
+                               activation=activation, eps=eps, tokens=tokens, interpret=interpret,
+                               family=family)
 
     # The input's gradient `x`'s axes; the taps' and bias's partials a program's rows by its token spans
     # (`x`'s tokens over `tokens`), the taps' count and the channels.
@@ -305,7 +328,7 @@ def pieces(parts):
 
 
 def _backward_walk(piece: _Piece, dy_ref, outs, exchanged, *, head: int | None, activation: bool, eps: float,
-                   tokens: int, interpret: bool):
+                   tokens: int, interpret: bool, family: mosaic.Family):
     """A program's tokens' gradients, walked from its block's last and the K-1 past it which the next block
     owns, carrying the pre-activation gradients of the K-1 tokens after a token: its input's gradient written
     once at its channels (`piece.columns`), its tap and bias gradients summed over its own tokens compensated
@@ -316,13 +339,9 @@ def _backward_walk(piece: _Piece, dy_ref, outs, exchanged, *, head: int | None, 
     block = lax.axis_index("tokens")
     zero = jnp.zeros((piece.lanes,), jnp.float32)
     group = _group(head, piece.lanes)
-    # The walk's tokens a whole number of turns: those past the block's last K-1 add only to tokens no
-    # program here owns. A turn's tokens hold their inputs and output gradients a vector each beside the
-    # walk's compensated tap and bias sums (two vectors each), so fewer a wider vector, `UNROLLED` channels
-    # a thread at most: eight tokens of eight channels spilled 2140 bytes a thread, and two of eight beside
-    # the compensated sums 24 and 36 bytes on a B200 and 16 on an sm120, where one of eight holds every
-    # training case in 250 to 255 registers on sm90, sm100 and sm120 (the conv's resource gate).
-    unrolled = max(1, UNROLLED // (piece.lanes // scan.THREADS))
+    # The walk's tokens a whole number of turns (`backward_unrolled`): those past the block's last K-1 add
+    # only to tokens no program here owns.
+    unrolled = backward_unrolled(piece.lanes, count, head, family)
     steps = -(-(tokens + count - 1) // unrolled) * unrolled
     last = piece.start + steps - 1
 

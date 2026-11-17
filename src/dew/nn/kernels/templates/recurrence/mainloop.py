@@ -138,7 +138,7 @@ def block_of(family: mosaic.Family) -> int:
 
 
 
-@dataclasses.dataclass(frozen=True, repr=False)
+@dataclasses.dataclass(frozen=True)
 class Tiles:
     """A forward's tiles, the recurrence template's config, derived from the call's shape and the device's
     and its bundle's facts (`templates.recurrence.template.Mosaic.derived`): the value block the states
@@ -163,14 +163,6 @@ class Tiles:
     """The most programs a multiprocessor holds of its launches where a compile found them spilling with
     their producers' ladders run out (`template.Mosaic._fewer`), every other launch's as many as its plan
     holds."""
-
-    def __repr__(self) -> str:
-        # Its fields as a dataclass names them, its residents only where a rung set them: a config's repr is
-        # its identity in every store (its certification's program, `report._compiled_launch`; the kernels'
-        # names, `report.named`), which a config without them keeps as it was before they were a field.
-        fields = [field for field in dataclasses.fields(self)
-                  if field.name != "residents" or self.residents.held_to]
-        return f"{type(self).__name__}({', '.join(f'{f.name}={getattr(self, f.name)!r}' for f in fields)})"
 
     @property
     def output_block(self) -> int:
@@ -268,15 +260,14 @@ class Operand:
         return jax.ShapeDtypeStruct((self.parts * self.rows, columns), self.stored)
 
     def split(self, x):
-        """`x` `[rows, columns]` in its dtype as its stacked parts."""
+        """`x` `[rows, columns]` in its dtype as its stacked parts (`product.stacked`)."""
         if self.parts == 1:
             return x.astype(self.dtype)
-        return jnp.concatenate(product.formed(x.astype(jnp.float32), self.parts), 0)
+        return product.stacked(x, self.parts)
 
     def joined(self, x):
-        """Its stacked parts `x` as the value `[rows, columns]` they sum to, fp32 (`split`'s inverse,
-        `product.whole`)."""
-        return product.whole(list(x.reshape(self.parts, -1, x.shape[-1])))
+        """Its stacked parts `x` as the value `[rows, columns]` they sum to, fp32 (`product.joined`)."""
+        return product.joined(x, self.parts)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -305,6 +296,13 @@ class Call:
     """Whether its solve holds the chunk inverse at fp32's range: a 16-bit delta rule whose form proves no
     bound on the inverse's entries (`recurrence.Hooks.inverse_bound`), its merges in bf16 parts
     (`_merging`)."""
+    values_gated: bool = False
+    """Whether a call without the delta rule whose values pass between launches in their 16-bit dtype gates
+    its write on the values, as fla's simple GLA does (its route's, `recurrence_chunk.simple_gla`: each
+    token's value times its decay to the chunk's end, rounded before `k^T v`, `chunk_fwd_kernel_h`), not on
+    the keys' rows, as mamba_ssm's SSD does (`gated_keys`). The two part at fp32's edge: a key of 2^64 and a
+    value of (145/128) 2^64 decayed by exp(-0.1268) write (16385/16384) 2^128 rounded on the key, past
+    fp32's largest, and (255/256) 2^128 on the value (base review 3ee9253c9 F1)."""
     producers: resources.Producers = dataclasses.field(default_factory=resources.Producers)
     """Its tiles' (`Tiles.producers`)."""
     residents: resources.Residents = dataclasses.field(default_factory=resources.Residents)
@@ -328,8 +326,9 @@ class Call:
         `prepared`), the values themselves then held and the gate scaling the keys' rows, the scores' columns
         and their gradients in fp32 before their products round, as mamba_ssm places its `dt`: gating the
         values, `x dt` rounded put a token's write one rounding past mamba_ssm's (B = 1, x = 129/128,
-        dt = 129/256: 130/256 against 16641/32768)."""
-        return not self.delta and self.held.parts == 1
+        dt = 129/256: 130/256 against 16641/32768). A call that gates its values instead (`values_gated`,
+        fla's simple GLA) does not."""
+        return not self.delta and self.held.parts == 1 and not self.values_gated
 
     @property
     def gates(self) -> Operand:

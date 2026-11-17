@@ -716,13 +716,21 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         walked = walked and chunk_forward.walks_once(dtype, per_key=g.ndim == 4, family=family, keeps=False)
         chunk = tiles.chunk
 
-        def kept(*x, starts=starts):
-            return jax.jit(lambda *x: chunk_forward.kept_forward(
-                *x, tiles=tiles, starts=starts, max_segments=max_segments, scale=scale,
-                delta=delta, rounded=rounded, family=family, keeps=not walked,
-                interpret=generation.backend() != "gpu"))(*x)
+        # One program for the call and each of its chunks' leaving memories (`through`), traced once.
+        kept = jax.jit(lambda *x, starts: chunk_forward.kept_forward(
+            *x, tiles=tiles, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
+            rounded=rounded, family=family, keeps=not walked, interpret=generation.backend() != "gpu"))
 
-        kept_o, kept_final, (a, (w, h, c, _)) = kept(*operands)
+        def through(last: int) -> tuple:
+            """The call's operands and documents with every token past `last` the identity (no decay, key,
+            value or write, no document begun), at the call's own shape: its walk past `last` leaves the
+            memory as it was, bit for bit (`S 1 + 0`), so its final memory is the one leaving token `last`."""
+            past = np.arange(q.shape[1]) > last
+            held_ = [jnp.where(past.reshape(1, -1, *([1] * (x.ndim - 2))), jnp.zeros_like(x), x)
+                     for x in operands[:5]]
+            return (*held_, h0), None if starts is None else starts & ~past[None]
+
+        kept_o, kept_final, (a, (w, h, c, _)) = kept(*operands, starts=starts)
         for native, own in ((o, kept_o), (final, kept_final)):
             assert np.array_equal(np.asarray(native).view(np.uint8), np.asarray(own).view(np.uint8)), \
                 "the certify build is the production program"
@@ -730,11 +738,12 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         key_width = k.shape[-1]
         table = laid_chunks(length, starts, max_segments, chunk)
         chunks = len(table)
-        # Each chunk's leaving memory: the final memory of the call over the tokens up to its last, the
-        # document it ends then the row's last.
-        ends = [kept(*(x[:, :first + count] for x in operands[:5]), h0,
-                     starts=None if starts is None else starts[:, :first + count])[1]
-                for first, count in table[:-1]] if carried else []
+        # Each chunk's leaving memory: the final memory of the call through its last token (`through`), the
+        # document it ends then the row's last; over the tokens up to it alone, a prefix a chunk, each was
+        # a shape of its own, a compile of the whole template each (67 of a GPU tier's 762 traces).
+        ends = [kept(*prefixed, starts=documents)[1]
+                for prefixed, documents in (through(first + count - 1) for first, count in table[:-1])
+                ] if carried else []
     # The chunks the launches lay out (a packed call's every sequence's, its worst case's), of which the
     # call's come first.
     if walked:
@@ -1443,12 +1452,15 @@ def assert_backward_witnessed(lane: Lane, heads: int = 1) -> None:
     wide = draw(0, "mild", heads=heads, dtype=jnp.float32)
     forms = ((operands, True), (operands, False), (wide, True))
     runs = [(x, delta, recorded(*x, delta=delta)) for x, delta in forms]
-    for back in (recorded_backward(x, delta=delta, run=run) for x, delta, run in runs if run.trained):
+    backs = [recorded_backward(x, delta=delta, run=run) for x, delta, run in runs if run.trained]
+    for back in backs:
         held = back_witnessed(back, lane)
         for name, inside in held.items():
             assert np.all(inside), (back.run.write, back.run.held, name, np.mean(inside))
-    back = recorded_backward(operands)
-    other = recorded_backward(operands, seed=1)
+    # The bf16 delta rule's backward witnessed above (the first form, which every device trains), its
+    # records claimed for another draw's gradients; recorded again, it took a quarter of the witness.
+    back = backs[0] if runs[0][2].trained else recorded_backward(operands, run=runs[0][2])
+    other = recorded_backward(operands, seed=1, run=runs[0][2])
     claimed = back._replace(dh=other.dh, dh0=other.dh0, records=other.records)
     refused = back_witnessed(claimed, lane)
     for name, share in CARRIED_GRADIENT_SHARES.items():

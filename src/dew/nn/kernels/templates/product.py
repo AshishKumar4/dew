@@ -206,6 +206,18 @@ def whole(parts: Sequence[jax.Array]) -> jax.Array:
     return found
 
 
+def stacked(x: jax.Array, count: int) -> jax.Array:
+    """fp32 `x` `[rows, ...]` as its `count` bf16 parts (`formed`) stacked along its first axis `[count *
+    rows, ...]`, the largest first: an operand as a launch reads its parts."""
+    return jnp.concatenate(formed(x.astype(jnp.float32), count), 0)
+
+
+def joined(x: jax.Array, count: int) -> jax.Array:
+    """`stacked`'s inverse: the value `[rows, ...]` its `count` stacked parts sum to (`whole`)."""
+    parts = x.astype(jnp.float32).reshape(count, x.shape[0] // count, *x.shape[1:])
+    return whole(list(parts))
+
+
 def terms(left: int, right: int) -> list[tuple[int, int]]:
     """The pairs `(i, j)` of two operands' parts (`formed`, `left` and `right` of them) a product of them
     issues, smallest first: those whose orders sum under the larger count, each part's bits beside the

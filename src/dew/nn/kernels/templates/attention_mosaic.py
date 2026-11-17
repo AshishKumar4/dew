@@ -62,7 +62,6 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _forward_allocations,
     _plain_forward,
     _trained_forward,
-    _whole,
     certified_walk,
     forward_products,
     logits_ahead,
@@ -210,6 +209,19 @@ def _least_keys(family: mosaic.Family, rows: int) -> int:
     call of fewer keys pads to them (a 3-query call's 16-row tile over its 3 keys derived only 32-key tiles,
     each refused)."""
     return WARPGROUP_WARPS * 16 if rows < family.role_rows else 1
+
+
+def _fewer_hooked(score_mod, reads_queries: bool, family: mosaic.Family) -> bool:
+    """Whether a backward of `score_mod` takes fewer rows a consumer than a role's on `family` (`fewer_rows`):
+    a call of no score hook, or one whose family reads its products' fragments from registers
+    (`Family.operands_in_registers`, mma.sync's) under a hook reading no query's place (`reads_queries`,
+    `MosaicBackward.score_reads`' first, its builder's reading of the hook). An sm80 accurate-form backward
+    under a score hook held its keys 32 a tile (q64 x k32: a key bias's dQ kernel 251 registers, a tile
+    bias's, its columns in two, 255, spilling nothing) where every tile of a role's rows spilled (et-k32;
+    rows 7279, 7280); a row-indexed hook's term of its query places (`q_pos[:, :1]`) found no layout at 32
+    rows on sm80, sm86 and sm89 (et-fewer-stack), as the forward's did before it held them in the
+    accumulator's layout (row 5279)."""
+    return score_mod is None or (family.operands_in_registers and not reads_queries)
 
 
 def _sides(rows: int, family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
@@ -490,7 +502,7 @@ class MosaicForward(_Mainloop[Tiles]):
         # A call some row of which can be scaled (`algebra.may_scale`) launches the scaled op's kernels (its
         # own config, `scaled`), every other call, every ordinary input's, this op's unscaled ones, bit for
         # bit the scaled walk's there.
-        may = algebra.may_scale(_whole(value, self.parts), keys_axis=1,
+        may = algebra.may_scale(product.joined(value, self.parts), keys_axis=1,
                                 initial=None if initial is None else initial.acc,
                                 amplified=1.0 if drop is None else drop.bound)
         arguments = (query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
@@ -1175,7 +1187,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         # output fp32, the call's. Its fold's logits a difference of raw products scaled after it
         # (`MosaicForward.subtracted`): no reach, so no natural rewalk, whose guarded walk of parts held no
         # registers at width 64 (8 bytes spilled on an H100, et-fp32regs7).
-        query, key, value = (jnp.concatenate(product.formed(x, parts), axis=0) for x in (query, key, value))
+        query, key, value = (product.stacked(x, parts) for x in (query, key, value))
         out_dtype = jnp.float32 if out_dtype is None else out_dtype
         subtracted = True
     op = MosaicForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
@@ -1411,10 +1423,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # summed in their order in XLA.
         if config.fused and deterministic_ops_requested():
             return False
-        if (self.score_mod is not None and family is not None
-                and min(config.block_q, config.block_k) < family.role_rows):
-            # A score hook's tiles at a role's rows (`derived`'s fewer rows a consumer): a hooked call's tiles
-            # of fewer fail to lower.
+        if (family is not None and min(config.block_q, config.block_k) < family.role_rows
+                and not _fewer_hooked(self.score_mod, self.score_reads[0], family)):
+            # A score hook's tiles at a role's rows (`derived`'s fewer rows a consumer) where its family
+            # takes none fewer (`_fewer_hooked`): a hooked call's tiles of fewer fail to lower there.
             return False
         if config.shared_keys:
             # Every consumer's share of the keys whole rows of a swizzle the exchange stages them at
@@ -1576,7 +1588,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             lambda config: fits(config) and self.resident(ba, config, target) >= 2]
         for wanted in (*residing, fits):
             for columns in (1, 2, 4):
-                for rows in (None, *(fewer_rows(dq) if self.score_mod is None else ())):
+                fewer = fewer_rows(dq) if _fewer_hooked(self.score_mod, self.score_reads[0], dq) else ()
+                for rows in (None, *fewer):
                     walks = extents if rows is None else functools.partial(_sides, rows)
                     for staged in (False, True):
                         def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged

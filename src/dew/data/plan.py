@@ -78,13 +78,13 @@ class ReadsEarlier(Protocol):
 def earlier_readers(steps: Sequence[object]) -> tuple[Callable[[JSON], JSON], ...]:
     """The readers of earlier descriptions the live `steps` hold (`ReadsEarlier`): a stage's own, its step's
     and a configured step's factory's, each class's once."""
-    from dew.data.pipeline import Configured, FlatMap, Map
+    from dew.data.pipeline import Configured, FlatMap, Map, RandomMap
 
     # Each reader once, however many steps' classes share it.
     held: dict[Callable[..., JSON], Callable[[JSON], JSON]] = {}
     for stage in steps:
         match stage:
-            case Map(step=inner) | FlatMap(step=inner) | Configured(factory=inner):
+            case Map(step=inner) | RandomMap(step=inner) | FlatMap(step=inner) | Configured(factory=inner):
                 candidates = (stage, inner)
             case _:
                 candidates = (stage,)
