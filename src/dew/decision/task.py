@@ -972,20 +972,21 @@ class Decide(SavedRunTask, InItsForm):
 
     def planned_shapes(self, rows: Sequence[Encoded]) -> tuple[PassShape, ...]:
         """The shapes the passes over `rows` take, in a server's order (`dew.inference.scoring.
-        ScoringServer`): each pass growing over them while its plan holds them (`planned`), a row it
-        refuses opening the next, and a row no plan holds a pass of its own; each shape once, in
-        `pass_shapes`' order."""
+        ScoringServer`): each pass growing over them while its plan holds them (`planned`), running as
+        many as it takes (`PassPlan.taken`), the rest opening the next, and a row no plan holds a pass of
+        its own; each shape once, in `pass_shapes`' order."""
         taken: set[PassShape] = set()
-        passing: list[Encoded] = []
-        plan = self.planned()
-        for row in rows:
-            if not plan.add(row) and passing:
-                taken.add(self._shape(passing))
-                passing, plan = [], self.planned()
-                plan.add(row)
-            passing.append(row)
-        if passing:
+        waiting = list(rows)
+        while waiting:
+            plan, passing = self.planned(), []
+            for row in waiting:
+                if not plan.add(row) and passing:
+                    break
+                passing.append(row)
+            # As many as the plan runs now (`PassPlan.taken`), the rest first in the next pass.
+            passing = passing[:max(plan.taken(), 1)]
             taken.add(self._shape(passing))
+            waiting = waiting[len(passing):]
         return tuple(shape for shape in self.pass_shapes if shape in taken)
 
     @functools.cached_property
@@ -1529,6 +1530,34 @@ class PassPlan:
             self.rows.append(row)
         return bool(held)
 
+    def taken(self) -> int:
+        """How many of its rows, first added first, the pass runs now (`ScoringServer`): all of them, or
+        fewer where the rest in a pass of their own compute fewer tokens. A pass whose rows overrun a
+        declared window count by a little takes the next count whole (the counts are powers of 8): a
+        server's last pass of 512 requests held 29% of its 32 windows' tokens, a fifth of every pass's
+        tokens padding (row 3330); the rows that fill the windows of the count below run now, the rest
+        in a pass of their own shape. Each split is costed by the shapes the two passes would take
+        (`Decide._shape`), the rows kept a prefix, so each request's rows stay in order."""
+        rows, decide = self.rows, self.decide
+        if not rows or not self.alive:
+            return len(rows)
+
+        def cost(part: Sequence[Encoded]) -> int:
+            shape = decide._shape(part)
+            return shape.rows * shape.length
+
+        length = self.alive[0]
+        windows = self.placing[length].windows
+        kept, least = len(rows), cost(rows)
+        for shape in decide.pass_shapes:
+            if shape.length != length or shape.rows > max(windows):
+                continue
+            # The longest prefix whose rows all lie in the count's windows.
+            prefix = next((index for index, window in enumerate(windows) if window >= shape.rows), len(rows))
+            if 0 < prefix < len(rows) and (split := cost(rows[:prefix]) + cost(rows[prefix:])) < least:
+                kept, least = prefix, split
+        return kept
+
     def shape(self) -> PassShape:
         """The pass's shape: of the shortest length that holds its rows, the fewest windows declared that
         hold them."""
@@ -1609,15 +1638,15 @@ class _WirePlan:
         self.decide = decide
         self.text = decide.planned()
         self.seen: list[_Row] = []
-        self.taken = 0
+        self.texts = 0
 
     def add(self, row: _Row) -> bool:
         if row.media is None:
             if self.seen:
                 return False
-            self.taken += 1
+            self.texts += 1
             return self.text.add(row.encoded)
-        if self.taken:
+        if self.texts:
             return False
         first = self.seen[0] if self.seen else row
         assert first.media is not None
@@ -1628,6 +1657,10 @@ class _WirePlan:
             return False
         self.seen.append(row)
         return True
+
+    def taken(self) -> int:
+        """Its text rows as their plan runs them now (`PassPlan.taken`), or its rows of images, all."""
+        return self.text.taken() if self.texts else len(self.seen)
 
 
 @dataclass(frozen=True)
