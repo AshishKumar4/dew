@@ -7,7 +7,7 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import FORMATTED, rounds_nothing
+from arm_arithmetic import FORMATTED, on_float64_host, rounds_nothing
 from float64_terms import evaluated_on, lowered, walked
 from jax.extend.core import primitives
 from reference_error import _floating, as_given, equations
@@ -95,7 +95,7 @@ def _without_x64(value):
 def _walked(graph, native) -> list:
     """`graph`'s replay (`Replay`) on `native`, its arguments at their traced dtypes: every value held widened
     from the start (`Replay.held`), the program's constants and arguments too."""
-    return walked(graph.jaxpr, [_widened(value) for value in graph.consts],
+    return walked(graph.jaxpr, [_widened(value) for value in on_float64_host(graph.consts)],
                   [_widened(value) for value in native], REPLAY)
 
 

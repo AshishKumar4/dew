@@ -13,7 +13,7 @@ from typing import Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import unrewritten
+from arm_arithmetic import float64_host, on_float64_host, unrewritten
 from jax.extend.core import primitives
 from jax.interpreters import partial_eval as pe
 
@@ -147,14 +147,14 @@ def _termed(fn, args, *, power: int):
     """`fn(*args)`'s outputs' tree, their values and each one's terms summed at `power` (`POWER`: their
     squares, or their magnitudes), the evaluation `float64_terms` describes."""
     closed, tree = _traced(fn, args)
-    leaves = jax.tree.leaves(args)
+    leaves, consts = on_float64_host((jax.tree.leaves(args), closed.consts))
     token = POWER.set(power)
     try:
         with evaluated_on(leaves):
             if _static(closed.jaxpr):
-                values, energies = _compiled(closed.jaxpr)(closed.consts, leaves)
+                values, energies = _compiled(closed.jaxpr)(consts, leaves)
             else:
-                values, energies = _evaluated(closed.jaxpr, closed.consts, leaves, compiling=True)
+                values, energies = _evaluated(closed.jaxpr, consts, leaves, compiling=True)
         return tree, values, [np.asarray(_or_size(energy, value))
                               for energy, value in zip(energies, values, strict=True)]
     finally:
@@ -207,10 +207,14 @@ def evaluated_on(leaves):
     `rounding_bound.rounding_scale`): the device it runs on, as jit would run them, the first committed
     array's, else JAX's default device (its `jax_default_device`, else its first), so a branch its
     platform picks is that device's (`_platform`) and every compiled evaluation is keyed by it
-    (`_target`)."""
+    (`_target`); on a process whose float64 computes on its host (`arm_arithmetic.float64_host`), the
+    host's."""
     committed = next((leaf for leaf in leaves if isinstance(leaf, jax.Array) and leaf.committed), None)
     default = jax.config.jax_default_device
-    if committed is not None:
+    host = float64_host()
+    if host is not None:
+        device = host
+    elif committed is not None:
         device = min(committed.devices(), key=lambda device: device.id)
     elif default is None or isinstance(default, str):
         device = jax.devices(default)[0]
@@ -218,7 +222,10 @@ def evaluated_on(leaves):
         device = default
     token = PLACED.set(device)
     try:
-        yield device
+        # A process whose float64 computes on its host (`float64_host`, a TPU's) evaluates there, every
+        # value it makes placed there.
+        with contextlib.nullcontext() if host is None else jax.default_device(host):
+            yield device
     finally:
         PLACED.reset(token)
 

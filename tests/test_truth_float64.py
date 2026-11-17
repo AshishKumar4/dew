@@ -278,3 +278,32 @@ def test_a_judgement_logs_whether_its_reference_equalled_the_truth(tmp_path, mon
     assert_as_exact(product, product, drawn, "a product that rounds", seeds=8)
     logged = {entry["label"]: entry["exact"] for entry in map(json.loads, log.read_text().splitlines())}
     assert logged == {"whole numbers": True, "a product that rounds": False}
+
+
+def hypotenuse(x, y):
+    """Each pair's hypotenuse, scaled by the larger first, so no square passes float32's range."""
+    larger = jnp.maximum(jnp.abs(x), jnp.abs(y))
+    held = jnp.where(larger > 0, larger, 1)
+    return larger * jnp.sqrt(jnp.square(x / held) + jnp.square(y / held))
+
+
+def squared_out(x, y):
+    """The hypotenuse as written, its squares near 1e50: float64's, past float32's range."""
+    return jnp.sqrt(jnp.square(x) + jnp.square(y))
+
+
+def far(seed):
+    """Pairs of float32 values near 1e25, whose squares float32 cannot hold."""
+    rng = np.random.default_rng(seed)
+    return tuple(np.asarray(rng.uniform(0.5, 2.0, (64, 128)) * 1e25, np.float32) for _ in range(2))
+
+
+@pytest.mark.tpu(reason="a TPU emulates float64 within float32's range; its truths compute on its host")
+def test_a_tpus_truth_is_float64s_past_float32s_range():
+    """A truth whose intermediates pass float32's range (squares near 1e50) on a TPU, whose float64 is pairs
+    of float32s within float32's range: its truth is IEEE float64's, computed on the host
+    (`arm_arithmetic.float64_host`), so a hypotenuse its arms scale on the TPU is on par; computed on the TPU
+    its squares overflowed and every seed's truth was infinite (row 7226: a splash cell's dV, NaN on 40
+    seeds)."""
+    assert_as_exact(jax.jit(hypotenuse), jax.jit(hypotenuse), far, "a hypotenuse past float32's squares",
+                    truth_fn=squared_out)
