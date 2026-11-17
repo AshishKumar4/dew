@@ -421,12 +421,14 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
                for rollout in watched.rollouts if int(rollout.task) % 5 == 1)
 
 
-def test_a_server_shares_its_prompts_pages_by_default():
-    """A server that names no layout (`Server.from_task`'s `kv_cache`) pages its cache wherever a server
-    over pages keeps a prefix cache, as a served rollout's and the native GRPO backend's do, so a group's
-    samples of one prompt prefill it once (row 5375); a model whose LongRoPE rebuilds a crossing request,
-    one whose loop shares a cache its later passes rewrite, which shares no prompt over pages, and one
-    whose max_seq_len holds no row in whole pages keep each row's cache whole."""
+def test_a_server_whose_requests_repeat_prompts_shares_their_pages():
+    """A server whose caller says its requests repeat prompts (`Server.from_task`'s `kv_cache='shared'`), as a
+    served rollout's group of samples does, pages its cache wherever a server over pages keeps a prefix
+    cache, so a group's samples of one prompt prefill it once (row 5375); one that names no layout keeps the
+    model's own whole rows, which serve prompts no two of which share faster (M-IG-12); a model whose
+    LongRoPE rebuilds a crossing request, one whose loop shares a cache its later passes rewrite, which
+    shares no prompt over pages, and one whose max_seq_len holds no row in whole pages keep each row's cache
+    whole."""
     from model_support import serving_task
 
     from dew.inference.serving import PAGE_SIZE, PagedRows
@@ -434,7 +436,8 @@ def test_a_server_shares_its_prompts_pages_by_default():
     from dew.nn.rope import LongRopeScaling
 
     task = serving_task(capacity=2 * PAGE_SIZE)
-    server = Server.from_task(task, slots=2, capacity=2 * PAGE_SIZE)
+    assert not isinstance(Server.from_task(task, slots=2, capacity=2 * PAGE_SIZE).rows, PagedRows)
+    server = Server.from_task(task, slots=2, capacity=2 * PAGE_SIZE, kv_cache="shared")
     assert server.reuses_prefixes
     prompt = [1 + index % 11 for index in range(PAGE_SIZE + 6)]
     server([prompt, prompt], 2, key=0)
@@ -445,9 +448,10 @@ def test_a_server_shares_its_prompts_pages_by_default():
                               original_max_position_embeddings=16)
     looped = task.model.clone(loop=Loop(steps=2, shared_cache=True))
     for model in (task.model.clone(rope_scaling=scaling), looped):
-        whole = Server.from_task(dataclasses.replace(task, model=model), slots=2, capacity=2 * PAGE_SIZE)
+        whole = Server.from_task(dataclasses.replace(task, model=model), slots=2, capacity=2 * PAGE_SIZE,
+                                 kv_cache="shared")
         assert not isinstance(whole.rows, PagedRows) and not whole.reuses_prefixes
-    short = Server.from_task(serving_task(capacity=12), slots=2, capacity=8)
+    short = Server.from_task(serving_task(capacity=12), slots=2, capacity=8, kv_cache="shared")
     assert not isinstance(short.rows, PagedRows)
 
 
@@ -507,7 +511,7 @@ def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):
     assert not Server.from_task(task, slots=4, capacity=64, kv_cache=served.page_size).reuses_prefixes
     # A model that declares pages of its own is served whole all the same.
     paged = dataclasses.replace(task, model=task.model.with_kv_cache(KVCache(page_size=8)))
-    assert Server.from_task(paged, slots=4, capacity=64).reuses_prefixes
+    assert Server.from_task(paged, slots=4, capacity=64, kv_cache="shared").reuses_prefixes
     assert not Server.from_task(paged, slots=4, capacity=64, kv_cache="whole").reuses_prefixes
     config.save(str(tmp_path / "whole"))
     assert LMRunConfig.load(str(tmp_path / "whole")).rollout == config.rollout
