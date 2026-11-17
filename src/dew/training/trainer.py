@@ -1405,7 +1405,7 @@ class Trainer(Generic[Loss, Effects]):
                 batch = device = None
                 if run.first_step is None:
                     loss.block_until_ready()
-                    run.first_step = time.perf_counter() - run.started
+                    run.first_step = run.startup.first_step(run.started)
             # The step row is complete once its scope exits; the window's last step closes it before the work
             # after it, whose evaluations, saves and cooldowns run outside it (`FitRun.outside_window`).
             if run.tracing and profile is not None:
@@ -2303,7 +2303,7 @@ class Trainer(Generic[Loss, Effects]):
         read, elapsed = reading
         scalars = {**logged_scalars(read, taken.counts, elapsed, self.device_mesh.devices.size,
                                     rollout=self.rollout is not None, update_flops=run.update_flops),
-                   **run.startup.scalars(run.first_step)}
+                   **run.startup.scalars()}
         if run.unworked and elapsed > 0 and taken.counts.waited > elapsed / 2:
             # Said once: a per-share stream read in the process starves the step.
             run.unworked = False
@@ -2333,7 +2333,7 @@ class Trainer(Generic[Loss, Effects]):
                     wall = time.perf_counter() - run.started
                     # A run that logged no step reports its start here (`Startup.scalars`).
                     scalars = {**goodput(wall, run.first_step, run.other),
-                               **run.startup.scalars(run.first_step)}
+                               **run.startup.scalars()}
                     self._display.summary(run.current, wall, scalars,
                                           None if run.loss is None else float(jax.device_get(run.loss)))
                     if self.tracker is not None:

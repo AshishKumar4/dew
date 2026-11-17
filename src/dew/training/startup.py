@@ -42,6 +42,11 @@ class Startup:
     seconds: dict[str, float] = dataclasses.field(default_factory=dict)
     overlapped: bool | None = None
     reported: bool = False
+    began: float = dataclasses.field(default_factory=time.perf_counter)
+    """When the fit's start began, its plan's first phase (`dew.training.trainer.Trainer._fit_plan`)."""
+    stepped: float | None = None
+    """When its first step's result came (`perf_counter`), None before: with `began`, the one window every
+    phase lies in."""
 
     @contextlib.contextmanager
     def phase(self, name: str, doing: str, *, when: bool = True) -> Iterator[None]:
@@ -60,17 +65,22 @@ class Startup:
             self.seconds[name] = self.seconds.get(name, 0.0) + took
             _log.info("%s took %.1f s", doing, took)
 
-    def scalars(self, first_step: float | None) -> dict[str, float]:
-        """Each phase's seconds as `startup/<name>_seconds`, the seconds of the `first_step` (from the fit's
-        start to its first step's result, None before one) no phase holds as `startup/other_seconds`, and
+    def first_step(self, started: float) -> float:
+        """Mark the first step's result as come now (`stepped`), and give its seconds since `started`."""
+        self.stepped = time.perf_counter()
+        return self.stepped - started
+
+    def scalars(self) -> dict[str, float]:
+        """Each phase's seconds as `startup/<name>_seconds`, the seconds from the start's beginning to its
+        first step's result (`began`, `stepped`) no phase holds as `startup/other_seconds`, and
         `startup/start_overlapped` 1 where the start took the lowering begun beside its step's compile (its
         algebra passed once) and 0 where it lowered again, the first time they are asked for; none after."""
         if self.reported:
             return {}
         self.reported = True
         phases = {f"startup/{name}_seconds": seconds for name, seconds in self.seconds.items()}
-        if first_step is not None:
-            phases["startup/other_seconds"] = max(first_step - sum(self.seconds.values()), 0.0)
+        if self.stepped is not None:
+            phases["startup/other_seconds"] = self.stepped - self.began - sum(self.seconds.values())
         if self.overlapped is None:
             return phases
         return {**phases, "startup/start_overlapped": float(self.overlapped)}
