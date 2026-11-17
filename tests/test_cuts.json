@@ -1533,9 +1533,6 @@
 "tests/test_diffusion_run_sources.py::test_diffusion_run_source_refuses_unsupported_source_transformations_before_weights",
 "tests/test_diffusion_run_sources.py::test_flow_grpo_trains_from_the_run_config_on_a_registered_reward"
 ],
-"tests/test_disk_banks.py": [
-"tests/test_disk_banks.py::test_disk_moe_logits_and_cached_decode_equal_resident[False-None]"
-],
 "tests/test_distillation.py": [
 "tests/test_distillation.py::test_a_wrapped_student_averages_on_the_runs_progress_as_it_does_alone"
 ],
@@ -1892,9 +1889,6 @@
 ],
 "tests/test_imports.py": [
 "tests/test_imports.py::test_a_module_imports_its_own_domain_alone[dew.config]"
-],
-"tests/test_in_backward.py": [
-"tests/test_in_backward.py::test_a_scanned_step_holds_no_more_than_a_layer_at_a_time[sm90-float32]"
 ],
 "tests/test_indexer_training.py": [
 "tests/test_indexer_training.py::test_padding_the_model_inputs_mask_leaves_out_counts_no_query[sparse-4]"
@@ -3168,6 +3162,9 @@
 "tests/test_samplers.py::test_heun_walks_edms_algorithm_2_with_its_churn[deterministic]",
 "tests/test_samplers.py::test_solver_matches_diffusers_latents_and_gradient[deis.3_short]"
 ],
+"tests/test_saved_models.py": [
+"tests/test_saved_models.py::test_a_jepa_run_exports_and_loads_as_its_encoder"
+],
 "tests/test_saved_runs.py": [
 "tests/test_saved_runs.py::test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_from_its_record[decision]",
 "tests/test_saved_runs.py::test_a_diffusion_runs_release_stores_its_encoders_parameters_in_the_dtype_a_load_asks[495ef4e0eacb-diffusion]",
@@ -3424,6 +3421,9 @@
 "tests/test_slot_sources.py::test_a_slot_release_reads_the_labels_its_layout_states_in_their_order",
 "tests/test_slot_sources.py::test_a_slot_release_states_the_window_and_the_prompt_its_layout_accepted[slot_lm]"
 ],
+"tests/test_source_schedulers.py": [
+"tests/test_source_schedulers.py::test_source_config_rebuilds_its_scheduler_trajectory_and_gradient[kdpm2.default]"
+],
 "tests/test_speculative.py": [
 "tests/test_speculative.py::test_a_longrope_crossing_reseeds_the_drafter_as_a_prefill_of_its_history_does[depth]",
 "tests/test_speculative.py::test_a_trees_tokens_are_drawn_as_the_target_draws_them",
@@ -3666,11 +3666,11 @@
 "tests/test_wan_source.py::test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone",
 "tests/test_wan_source.py::test_pipeline_walk_matches_the_source[streamed]"
 ],
+"tests/test_wan_vae.py": [
+"tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
+],
 "tests/test_weighed_check.py": [
 "tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
-],
-"tests/test_weighed_recording.py": [
-"tests/test_weighed_recording.py::test_a_weighed_site_is_judged_from_its_evidence_alone_as_from_its_outputs[rows]"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",
