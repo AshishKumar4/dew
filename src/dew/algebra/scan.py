@@ -1007,11 +1007,11 @@ def _scanned(values, *, reverse: bool = False) -> jax.Array:
 
 
 def _exp(base2: bool, x):
-    """A scan's decays, `2^x` or `e^x`, at the backend's most accurate (`lax.AccuracyMode.HIGHEST`) under every
-    form, not the run's (`precision.Numerics.forms`): the default path must meet its upstream's bound, and a
-    v5e's default fp32 exp, 1.5e-6 from float64, held Mamba-2's portable scan at 12.8 times its float32 on a
-    CPU and its layer cell past transformers' bound, where at most accurate the scan is 1.25 times, its layer's
-    training step unchanged (20.922 ms against 20.927 over five rounds, M-JS-134, row 7062); a CPU's is the
-    default's bit for bit."""
+    """A scan's decays, `2^x` or `e^x`, at the backend's most accurate (`lax.AccuracyMode.HIGHEST`) under
+    every form, not the run's (`precision.Numerics.forms`): the default path must meet its upstream's bound,
+    and a v5e's default fp32 exp, 1.5e-6 from float64, held Mamba-2's portable scan at 12.8 times its float32
+    on a CPU and its layer cell past transformers' bound, where at most accurate the scan is 1.25 times, its
+    layer's training step unchanged (20.922 ms against 20.927 over five rounds, M-JS-134, row 7062); a CPU's
+    is the default's bit for bit."""
     # Exempt from the run's forms: the bound needs it, and it costs nothing measured (M-JS-134).
     return (lax.exp2 if base2 else lax.exp)(jnp.asarray(x), accuracy=lax.AccuracyMode.HIGHEST)
