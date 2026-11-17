@@ -220,6 +220,15 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     normal = np.random.default_rng([seed, 1]).standard_normal
     width = value_width or (VALUE_WIDTH if hooks.output is None else NORMED_WIDTH)
     key_order, value_order = rng.permutation(KEY_WIDTH), rng.permutation(width)
+    turned = {}
+    if hooks.turns:
+        # A turned state's symmetry: its turned pairs permuted among themselves, each pair's keys adjacent
+        # and its turn moved with it, the unturned keys among themselves; a turn of up to 3 radians a token.
+        pairs = rng.permutation(hooks.turns)
+        key_order = np.concatenate([np.stack([2 * pairs, 2 * pairs + 1], axis=-1).reshape(-1),
+                                    2 * hooks.turns + rng.permutation(KEY_WIDTH - 2 * hooks.turns)])
+        turn = rng.uniform(-3.0, 3.0, (ROWS, length, value_heads, hooks.turns))
+        turned = {'turn': hosted(turn[..., pairs])}
     query = normal((ROWS, length, KEY_HEADS, KEY_WIDTH))[..., key_order]
     key = unit(normal((ROWS, length, KEY_HEADS, KEY_WIDTH)))[..., key_order]
     value = normal((ROWS, length, value_heads, width))[..., value_order]
@@ -251,7 +260,7 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
     return (Chunk(hosted(query), hosted(key), hosted(value), log_decay=hosted(log_decay) if plain else None,
                   beta=hosted(beta) if reads_beta else None, skip=hosted(skip) if hooks.skip else None,
-                  state=hosted(state), starts=starts, **gates, **epilogue, **own),)
+                  state=hosted(state), starts=starts, **gates, **epilogue, **own, **turned),)
 
 
 def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
@@ -276,7 +285,7 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
             state, query=query[:, t], key=key[:, t], value=operands.value[:, t],
             log_decay=at(operands.log_decay), gate=at(operands.gate), log_a=operands.log_a,
             bias=operands.bias, beta=at(operands.beta), skip=operands.skip, z=at(operands.z),
-            weight=operands.weight, rate=operands.rate, own=operands.own)
+            weight=operands.weight, rate=operands.rate, own=operands.own, turn=at(operands.turn))
         out, _, state = recurrence.step_reference(hooks, token)
         return state, out
 
@@ -338,6 +347,32 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(draw, hooks, packed), f'{hooks} packed={packed}',
                     seeds=SEEDS[hooks, packed])
+
+
+TURNED = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, skip=True, turns=KEY_WIDTH // 2 - 2)
+"""Mamba-3's form: a decay a head's, a write gate, the skip, and the state's first key pairs turned each token
+(`Hooks.turns`), two pairs unturned."""
+
+
+@pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
+def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(packed):
+    """A state that turns its key pairs (`Hooks.turns`, Mamba-3's rotating basis) through `chunk`'s portable
+    math in `CHUNK`-token chunks against the same recurrence a token at a time: output, final memory and
+    every operand's gradient, the turns' among them, from float64 (check 1). A turn's gradient is the
+    replay's, of the state entering its token and the cotangent leaving it (row 7419: a turn read as an
+    angle summed over a document cancelled across its tokens to 120 times the recurrence's error)."""
+    def turned(operands, starts=None):
+        return chunk_on('xla', TURNED, dataclasses.replace(operands, starts=starts), chunk_size=CHUNK)
+
+    def tokens(operands, starts=None):
+        return token_by_token(TURNED, dataclasses.replace(operands, starts=starts))
+
+    def drawn(seed):
+        (operands,) = draw(TURNED, packed=False, seed=seed)
+        return operands, cotangents(operands, seed)
+
+    assert_packed_on_par(turned, tokens, drawn, f'{TURNED}', packed=packed, documents=((0, 23, 40), (9, 48)),
+                         length=LENGTH, seeds=32)
 
 
 DOCUMENTS = ((0, 23, 40), (0, 9, 48))
