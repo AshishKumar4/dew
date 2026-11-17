@@ -76,6 +76,7 @@ from dew.inference.tasks import (
     SavedRun,
     SavedRunTask,
     length_ladder,
+    saved_component,
     shape_bucket,
     traced_in_its_form,
 )
@@ -532,9 +533,12 @@ class Decide(SavedRunTask, InItsForm):
         width, head_dtype = DecisionModel.head_size(backbone)
         head = Head.from_record(settings.head, width)
         # The head computes in the dtype it recorded, or as a fresh head over
-        # the backbone would where the caller overrides the compute dtype.
+        # the backbone would where the caller overrides the compute dtype, and a configured context
+        # encoder in that dtype too (`saved_component`), as a diffusion task's encoders do.
         context = None if settings.context is None else Condition.bound(
-            settings.context, params=thaw(part(variables, "context"))["params"])
+            {**settings.context, "encoder": saved_component(record(settings.context["encoder"], "encoder"),
+                                                            dtype)},
+            params=thaw(part(variables, "context"))["params"])
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
                               settings.context_encoder, context)
         if settings.tokenizer is None:

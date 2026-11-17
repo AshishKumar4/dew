@@ -849,7 +849,8 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
     text condition is, a pretrained tower (`clip_text`) among them, and trains a step with it frozen; an
     encoder that reads no text into the states context layers read (an audio tower, a denoiser's
     conditioner) and a diffusion run's field or unconditional text are refused. The run built the tower in
-    float32 and took any registered encoder, which failed at its first trace (theme 22's review)."""
+    float32 and took any registered encoder, which failed at its first trace (theme 22's review). Its task
+    loaded computes its encoder as the run did, or in the dtype the load asks for."""
     from run_kinds import decision, trained
     from test_text_encoders import TINY
 
@@ -863,8 +864,14 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
                               model=ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     objective = run.prepare().objective
     assert jnp.dtype(objective.model.context.encoder.dtype) == jnp.dtype("bfloat16")
-    state, _ = trained(run, tmp_path, "clip")
+    state, _ = trained(run, tmp_path, "clip", trainer={"checkpoint_final": True})
     assert "context" in state.variables[FROZEN] and "context" not in state.variables["params"]
+    # Loaded, the task's encoder computes as the run's did, or in the dtype the load asks for, as its
+    # backbone does: a load's dtype bound the backbone and head alone (row 7611).
+    for asked, computed in ((None, "bfloat16"), ("float32", "float32")):
+        loaded = Decide.from_run(str(tmp_path / "runs" / "clip"), dtype=asked)
+        assert jnp.dtype(loaded.model.context.encoder.dtype) == jnp.dtype(computed)
+        assert jnp.dtype(loaded.model.backbone.dtype) == jnp.dtype(computed)
     # A character table is taken; one differing from it in its declarations alone (`reads_captions`,
     # `keyword`) is refused, as an audio tower and a denoiser's conditioner are.
     table = TextCondition(encoder="char_table", checkpoint="char_table")
