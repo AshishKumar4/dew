@@ -39,6 +39,7 @@ from dew.inference.tasks import Processor as TaskProcessor, RunProcessor
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
+from dew.mesh import LogicalAxes
 from dew.nn import categorical
 from dew.nn.backbones.looping import exit_objective
 from dew.nn.cross_attention import ContextEncoder, crosses_alone
@@ -503,6 +504,16 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         loaded = any("backbone" in collection for collection in held.values())
         drawn = loaded and not any("head" in collection for collection in held.values())
         return self._fresh_backbone + (("head",) if drawn else ())
+
+    def tower_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
+        """A configured context encoder's table (`ConditionEncoder.parameter_axes`) under its `context` part,
+        in the collection the run holds it in (`context_trained`, `complete_variables`): its weights are no
+        module's draw, so the layout reads their axes here, where a tensor-split mesh replicated them."""
+        if self.model.context is None:
+            return {}
+        held = "params" if self.context_trained else FROZEN
+        return {(held, "context", *path): axes
+                for path, axes in self.model.context.encoder.parameter_axes().items()}
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Draw whichever of the backbone and the head `tree` does not hold."""
