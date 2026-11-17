@@ -834,7 +834,7 @@ class SegmentLayout(Layout):
         return tuple(encoder.encode(rendered(state, self._state_render, specials), add_special_tokens=False))
 
     @property
-    def _state_render(self) -> Render:
+    def _state_render(self) -> "Render":
         """How the layout renders its state where a row reads the request's tokens of it (`state`): a joint
         row's sorted compact JSON, a question row's text."""
         return "compact" if self.joint else "question"
