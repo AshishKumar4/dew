@@ -23,7 +23,7 @@ from dew._files import write_atomically
 from dew.decision.calibration import Calibration, Temperatures
 from dew.decision.formats import beyond_temperatures
 from dew.decision.head import DecisionHead
-from dew.decision.layout import Layout, MarkerLayout, QuestionLayout
+from dew.decision.layout import Layout, SegmentLayout, per_question
 from dew.decision.questions import KINDS
 from dew.interop.decoder_parts import Packed, layout_tensors, packed_layouts
 from dew.interop.release_record import RELEASE_FILE
@@ -88,7 +88,7 @@ LAYA_REQUIRED = ("encoder", "head_layers")
 
 LAYA_BUDGETS = {"head_max_len": 192, "option_tokens": 48}
 """The question budgets Laya's release declares where its config states none: the tokens its question
-and options share, and the most one option keeps (`QuestionLayout.head_max_len`, `option_tokens`)."""
+and options share, and the most one option keeps (`SegmentLayout.head_max_len`, `option_tokens`)."""
 
 
 TEMPERATURE_TYPES = tuple(question.kind for question in KINDS)
@@ -154,7 +154,7 @@ class LayaConfig:
         return values
 
     @classmethod
-    def of(cls, layers: int, layout: QuestionLayout, calibration: Calibration,
+    def of(cls, layers: int, layout: SegmentLayout, calibration: Calibration,
            encoder: str | None) -> "LayaConfig":
         """The config of a head of `layers` over `layout`, its `calibration`'s temperatures held within their
         bounds as the task applies them, so that a reader which does not hold them answers as it does."""
@@ -168,7 +168,7 @@ class LayaConfig:
                    temperature=tuple(applied.types.get(kind, applied.default) for kind in TEMPERATURE_TYPES),
                    temperature_by_options=dict(applied.buckets))
 
-    def layout(self) -> MarkerLayout:
+    def layout(self) -> SegmentLayout:
         """The layout this config states, which Laya's readers lay rows out by: a spelled value Laya spells
         none of (the release's file named in its place) reads as its first spelling's."""
         laid = {}
@@ -176,7 +176,7 @@ class LayaConfig:
             if "laid" in held.metadata:
                 value, spelled = getattr(self, held.name), held.metadata.get("spelled")
                 laid[held.metadata["laid"]] = value if spelled is None else value == spelled[True]
-        return MarkerLayout(**laid)
+        return SegmentLayout.marker_row(**laid)
 
     def temperatures(self) -> Temperatures:
         """The temperatures this config states, by type (`TEMPERATURE_TYPES`) or one over every type, and
@@ -210,8 +210,9 @@ def head_files(bundle: "PretrainedDecision") -> HeadFiles:
     answers unlike the task with nothing saying so."""
     head = from_record(DecisionHead, bundle.head)
     layout = bundle.layout
-    if not isinstance(layout, QuestionLayout):
-        raise ValueError(f"Laya's head reads rows a QuestionLayout lays out, not a {type(layout).__name__}")
+    if not per_question(layout):
+        raise ValueError("Laya's head reads rows a question (SegmentLayout.marker_row or state_first_row), "
+                         f"not {layout!r}")
     config = LayaConfig.of(head.layers, layout, bundle.calibration, published_encoder(bundle))
     # What Laya's file states of a layout, read as its readers read it; a layout that names Laya's own
     # order, question first, lays rows out as one that names none.

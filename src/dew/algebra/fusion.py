@@ -101,12 +101,18 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     for found in _regions(index):
         if held & set(found.places):
             continue
-        # A region its prologue keeps from fusing is weighed without it: its product and its epilogue.
-        for region in (found, _bare(jaxpr, found)) if found.prologue else (found,):
-            identities[region] = _identity(jaxpr, region)
-            if _decided(identities[region], lambda region=region: _takes(fused_gemm, jaxpr, region)):
-                break
-            del identities[region]
+        identity = _identity(jaxpr, found)
+        weighed = _decided(identity, lambda found=found: _takes(fused_gemm, jaxpr, found))
+        if weighed.taken:
+            identities[found] = identity
+        elif found.prologue and weighed.launchable:
+            # A region its prologue keeps from fusing is weighed without it, its product and its epilogue:
+            # unless its launch is XLA's for a reason no prologue enters (`_xla_whatever_its_prologue`, the
+            # call's naming it), on which the region without it fails too, a second analysis wasted.
+            bare = _bare(jaxpr, found)
+            identity = _identity(jaxpr, bare)
+            if _decided(identity, lambda bare=bare: _takes(fused_gemm, jaxpr, bare)).taken:
+                identities[bare] = identity
     products = list(identities)
     # A norm a product's prologue replays is the product's (`_prologue`), as an epilogue's norm is.
     held |= {place for region in products for place in region.replayed}
@@ -387,7 +393,18 @@ def _shapes(variables: Sequence[jcore.Var]) -> list[jax.ShapeDtypeStruct]:
             if isinstance(var.aval, ShapedArray)]
 
 
-_held: collections.OrderedDict[Hashable, bool] = collections.OrderedDict()
+class RegionDecision(NamedTuple):
+    """A product region's weighing (`_takes`): whether it is fused, and whether its product's launch may be
+    the template's without its prologue, so the region without it could be (`fused_program`): unless its
+    launch is XLA's for a reason no prologue enters (`_xla_whatever_its_prologue`). A launch XLA's because the
+    prologue's resources refused the template, or one no analysis reached (a stage refused first,
+    `fused_gemm.Analysis.refused`), may be."""
+
+    taken: bool
+    launchable: bool
+
+
+_held: collections.OrderedDict[Hashable, RegionDecision] = collections.OrderedDict()
 
 
 def choice_context() -> Hashable:
@@ -411,22 +428,22 @@ def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
                                          [jaxpr.eqns[place] for place in region.replayed]))
 
 
-def _decided(identity: Hashable, decide: Callable[[], bool]) -> bool:
+def _decided(identity: Hashable, decide: Callable[[], RegionDecision]) -> RegionDecision:
     """A region's decision (`decide`), weighed once for its structure (`_identity`) in the context a kernel
     is chosen in (`choice_context`), held (`holding`)."""
-    def weighed() -> bool:
+    def weighed() -> RegionDecision:
         # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
         with generation.routes(alone=True):
             return decide()
     return _cache.holding(_held, (identity, choice_context()), weighed, DECISIONS_HELD)
 
 
-def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
+def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
     """Whether the region is fused (`fused_gemm.analysis`): its product's launch the template's (its
     selector's choice, or a call's, `generation.chosen`), its prologue and epilogue the kernel's, nothing
-    refused, and
-    its fused seconds less than its unfused ones. The prices are a roofline on the part's rates (each
-    stage's units overlapped, plus the fixed launch), not the derived tile's walk: on a cell where the
+    refused, and its fused seconds less than its unfused ones; and whether its launch may be the template's
+    without its prologue (`RegionDecision`). The prices are a roofline on the part's rates
+    (each stage's units overlapped, plus the fixed launch), not the derived tile's walk: on a cell where the
     launch measured slower than XLA's dot (`grouped_matmul.DECLARED`, every dense cell: DENSE1, 1.05 to 2.9
     times XLA's) they favour fusion more than measurement does, so a region whose launch the selector gives
     XLA is never fused by price alone; a call naming the template (an A/B's arm) fuses it."""
@@ -436,17 +453,31 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
     wide = any(shape.dtype.itemsize == 8 for shape in (*inputs, *_shapes(region.outputs)))
     with jax.enable_x64(new_val=wide):
         found = fused_gemm.analysis(_replayed(jaxpr, region, fused_gemm), *inputs)
+    def kernel(route) -> bool:
+        return route is not None and route.refusal is None and route.kernel != "xla"
+
+    launchable = not _xla_whatever_its_prologue(found.launch)
     routes = [found.launch, *([found.prologue] if region.prologue else [])]
-    if found.epilogue is None:
-        # No epilogue to weigh (a bare product, a kernel gradient's): its launch's selector decides alone,
-        # and its prologue's where it has one.
-        return all(route is not None and route.refusal is None and route.kernel != "xla" for route in routes)
+    if found.epilogue is None and not region.prologue:
+        # No stage to weigh (a bare product, a kernel gradient's): its launch's selector decides alone.
+        return RegionDecision(all(map(kernel, routes)), launchable)
     # A prologue the template refuses (a row normalized from float32 to bfloat16, `dtype_changes`) is no
-    # region's: the region without it is weighed instead (`fused_program`).
-    taken = all(route is not None and route.refusal is None and route.kernel != "xla"
-                for route in (*routes, found.epilogue))
-    return (taken and found.fused_seconds is not None and found.unfused_seconds is not None
-            and found.fused_seconds < found.unfused_seconds)
+    # region's: the region without it is weighed instead (`fused_program`). Each stage it holds is weighed by
+    # price, a prologue's as an epilogue's (`fused_gemm.priced`: the operand formed in the launch, not
+    # written whole and read back).
+    stages = (*routes, *([found.epilogue] if found.epilogue is not None else []))
+    priced = found.fused_seconds is not None and found.unfused_seconds is not None
+    return RegionDecision(all(map(kernel, stages)) and priced and found.fused_seconds < found.unfused_seconds,
+                          launchable)
+
+
+def _xla_whatever_its_prologue(launch) -> bool:
+    """Whether a product's `launch` (a `generation.Route`) is XLA's for a reason its region's prologue does
+    not enter: the call's naming XLA's. A cell's measurement is no such reason: a product's cell is keyed by
+    whether its prologue forms its operand (`grouped_matmul`'s formed cells), so the product without it may
+    be another cell's, the template's (a 4B normed projection's on an H100: its formed call XLA's, the call
+    without its prologue FOUR_B's Mosaic, train 977's F1)."""
+    return launch is not None and launch.kernel == "xla" and launch.forced == "xla"
 
 
 class _Trace(NamedTuple):

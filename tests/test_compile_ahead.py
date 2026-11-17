@@ -8,7 +8,6 @@ a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 
 import contextlib
 import dataclasses
-import enum
 import functools
 import itertools
 import json
@@ -124,290 +123,9 @@ def test_a_program_compiled_ahead_runs_in_place_of_compiling():
     assert [program.kind for program in compiles.programs].count("compiled") == 1
 
 
-KEPT_MODULE = '''
-import dataclasses
-import os
-
-import jax.numpy as jnp
-
-from dew.nn.kernels.generation import traced_fact
-
-OFFSET = 0
-
-
-@dataclasses.dataclass(frozen=True)
-class Scale:
-    by: int
-
-
-def scaled(scale, values):
-    return jnp.tanh(values) * scale.by
-
-
-def shifted(values):
-    return values + OFFSET
-
-
-def chosen(flag, values):
-    return values + (1 if flag is None else 2)
-
-
-def _by(values):
-    return values * OFFSET
-
-
-def helped(values):
-    return _by(values)
-
-
-def nested(values):
-    return (lambda held: held - OFFSET)(values)
-
-
-@dataclasses.dataclass(frozen=True)
-class Factor:
-    factor = 1
-
-    def __call__(self, values):
-        return values * self.factor
-
-
-def applied(factor, values):
-    return factor(values)
-
-
-@traced_fact
-def kept_fact():
-    return os.environ.get("KEPT_FACT")
-'''
-"""The module the kept programs' functions and their static argument's class are defined in
-(tests/kept_programs_worker.py), which each test writes beside its file: a user's own, outside any installed
-distribution, with a setting its code changes at run time (`OFFSET`) and a fact of the process it declares
-its traces read (`kept_fact`)."""
-
-
-def kept_worker(directory, mode: str, scale: int = 2, offset: int = 1,
-                environment=None) -> subprocess.CompletedProcess:
-    """tests/kept_programs_worker.py in a fresh process: `mode` over the programs file in `directory` at
-    `scale` and `offset`, `kept_module` read from `directory`, with `environment`'s variables beside this
-    process's."""
-    path = os.pathsep.join((str(directory), str(process_support.REPO_ROOT / "src"),
-                            str(process_support.REPO_ROOT / "tests")))
-    return subprocess.run(
-        [sys.executable, str(process_support.REPO_ROOT / "tests" / "kept_programs_worker.py"), mode,
-         str(directory / "programs.dew-aot"), str(scale), str(offset)],
-        env={**os.environ, "PYTHONPATH": path, **(environment or {})}, capture_output=True, text=True,
-        cwd=process_support.REPO_ROOT)
-
-
-def kept_answer(run: subprocess.CompletedProcess) -> dict:
-    assert run.returncode == 0, run.stderr[-3000:]
-    return json.loads(run.stdout.splitlines()[-1])
-
-
-def kept_in(directory, scale: int = 2, offset: int = 1) -> dict:
-    """What a fresh process keeping its programs in `directory` at `scale` and `offset` answers and keeps."""
-    directory.mkdir(exist_ok=True)
-    (directory / "kept_module.py").write_text(KEPT_MODULE)
-    return kept_answer(kept_worker(directory, "keep", scale, offset))
-
-
-def test_a_program_one_process_kept_runs_in_another_that_traces_nothing(tmp_path):
-    """A process keeps the executable of each program it compiles at Dew's compile point
-    (`dew.training.ahead.keeping`) and saves them; a later process of the same target, code and settings,
-    handed the file (`dew.training.ahead.kept`), answers every call exactly as the first did and needs no
-    trace and no compile of any of them. Each program is kept for its own call alone: a static argument
-    that is None and one that is an empty tuple, and two functions written on one line that differ in a
-    constant, each answer as their own. A call that differs in what its trace reads is another call,
-    which the handed process compiles and answers as a process compiling it does: at another static
-    argument, and at another value of a global its function names, a function of the user's it calls
-    names or code nested in it names, or of a class attribute a static argument's `__call__` reads, each
-    of which its module's code changed at run time. With `verify` each handed call also lowers its
-    own program and finds the kept one's. A CPU's file states its host's processor; a function that
-    reads an array outside its arguments, and a
-    call made inside one of Dew's own contexts, have no identity a file can state and are named as not
-    kept (row 5265: a warm scoring server paid its programs' traces)."""
-    saved = kept_in(tmp_path / "kept")
-    answers = saved["answers"]
-    # Every answered call kept, and the calls of no identity the worker makes besides, those alone, named
-    # as not.
-    assert saved["kept"] == len(answers)
-    refused = sorted(name.rsplit(" (", 1)[0] for name in saved["refused"])
-    assert refused == saved["unidentified"], saved["reasons"]
-    assert (saved["cpu"] is not None) == (jax.default_backend() == "cpu")
-    assert answers["none"] != answers["empty"] and answers["one"] != answers["two"]
-    assert kept_answer(kept_worker(tmp_path / "kept", "take")) == {"answers": answers, "needed": []}
-    assert kept_answer(kept_worker(tmp_path / "kept", "verify"))["answers"] == answers
-    other = kept_answer(kept_worker(tmp_path / "kept", "take", scale=3, offset=4))
-    assert other["needed"] == ["applied", "helped", "nested", "scaled", "shifted"]
-    compiled = kept_in(tmp_path / "other", scale=3, offset=4)["answers"]
-    assert other["answers"] == compiled
-    differing = {name for name in answers if answers[name] != compiled[name]}
-    assert differing == {"applied", "helped", "nested", "scaled", "shifted"}
-
-
-@pytest.mark.parametrize(("changed", "process", "target"), [
-    ("source", ["source kept_module"], []), ("environment", ["environment DEW_KEPT_PROGRAMS_TEST"], []),
-    ("fact", ["fact kept_module.kept_fact"], []), ("setting", ["setting jax_default_prng_impl"], []),
-    ("flags", [], ["flags"]), ("target", [], ["host"])])
-def test_programs_kept_under_other_code_settings_or_target_are_refused_by_name(tmp_path, changed, process,
-                                                                                target):
-    """A file of kept programs is refused before any call where the process handed it is not the one that
-    kept it, and its records name what differs (`Process.differences`, `BuildTarget.differences`): a
-    module's source edited since (the functions' own, a user's module no installed distribution
-    versions), an environment variable of Dew's, a fact of the process its code declares its traces read
-    (`traced_fact`), a setting of JAX's that a trace reads and JAX's own trace context does not hold (the
-    default PRNG implementation), an XLA flag that decides what a program computes (deterministic ops,
-    which Dew's kernels' routes read), or a target that is not this host's. A kept executable is run for
-    nothing but the call, code and settings it was compiled from."""
-    from dew.training.ahead import AheadPrograms
-
-    kept_in(tmp_path)
-    flags = f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_deterministic_ops=true".strip()
-    environment = {"environment": {"DEW_KEPT_PROGRAMS_TEST": "1"}, "fact": {"KEPT_FACT": "another"},
-                   "setting": {"JAX_DEFAULT_PRNG_IMPL": "rbg"}, "flags": {"XLA_FLAGS": flags}}.get(changed)
-    if changed == "source":
-        (tmp_path / "kept_module.py").write_text(KEPT_MODULE.replace("jnp.tanh(values)", "jnp.sin(values)"))
-    elif changed == "target":
-        path = tmp_path / "programs.dew-aot"
-        programs = AheadPrograms.load(path)
-        dataclasses.replace(programs, target=dataclasses.replace(programs.target, host="another")).save(path)
-    assert kept_worker(tmp_path, "take", environment=environment).returncode != 0
-    assert kept_answer(kept_worker(tmp_path, "differences", environment=environment)) == {
-        "process": process, "target": target}
-
-
-CHECKED_MODULE = '''
-import jax.numpy as jnp
-from jax.experimental import checkify
-
-
-def _doubled(values):
-    checkify.check(jnp.all(values > 0), "the values must be positive")
-    return values * 2
-
-
-def checked(values):
-    return checkify.checkify(_doubled)(values)
-'''
-"""A program whose check a run keeps (`checked`): its error tree holds the check's traceback."""
-
-CHECKED_RUN = """
-import json, sys
-import jax.numpy as jnp
-from jax.experimental import checkify
-import checked_module
-from dew.nn.kernels.options import owned_program
-from dew.training.ahead import keeping, kept
-
-mode, path = sys.argv[1], sys.argv[2]
-program = owned_program(checked_module.checked)
-
-
-def refused():
-    error, _ = program(-jnp.ones(3))
-    try:
-        error.throw()
-    except checkify.JaxRuntimeError as raised:
-        return [type(raised).__name__, str(raised)]
-    return None
-
-
-if mode == "keep":
-    with keeping() as programs:
-        program(jnp.ones(3))
-    programs.save(path)
-    print(json.dumps({"refused": refused(), "kept": len(programs.kept)}))
-else:
-    with kept(path):
-        print(json.dumps({"refused": refused()}))
-"""
-"""A process that keeps a checked program, or is handed it, and reports what its failed check raises."""
-
-
-class Side(enum.Enum):
-    """Two labels of no plain form a program's results may carry."""
-
-    LEFT = "left"
-    RIGHT = "right"
-
-
-@jax.tree_util.register_pytree_node_class
-@dataclasses.dataclass(frozen=True)
-class Labelled:
-    """Results and their labels, the labels a node's static data (`Side`), as a tree of results states which
-    leaf is which."""
-
-    values: tuple
-    labels: tuple
-
-    def tree_flatten(self):
-        return self.values, self.labels
-
-    @classmethod
-    def tree_unflatten(cls, labels, values):
-        return cls(tuple(values), labels)
-
-
-DIGESTED = """
-import json
-import jax.numpy as jnp
-import checked_module
-from dew.nn.kernels.options import owned_program, program_digest
-
-print(json.dumps({"digest": program_digest(owned_program(checked_module.checked).lower(jnp.ones(3)))}))
-"""
-"""A process printing the digest of the checked program's lowering (`program_digest`)."""
-
-
-def test_a_programs_digest_is_one_in_every_process_and_its_trees_part_programs(tmp_path):
-    """A program's digest (`program_digest`) states its trees node by node: a checkified program, whose error
-    tree holds a traceback JAX prints by its address and whose frames name where its code is installed,
-    digests the same in two processes of the code installed in two places, as its lowered text is the same,
-    its frames stated by module, line and function (`dew._stated.traceback_frames`), and apart from one
-    whose check sits a line further down, which a kept program's failing check would report;
-    and two programs of one text whose trees differ (a mapping of other keys, or of one
-    enumeration's members labelling its results the other way round) digest apart, since an executable
-    takes and gives its leaves by its trees."""
-    from dew.nn.kernels.options import owned_program, program_digest
-
-    places = [tmp_path / "one", tmp_path / "other" / "install", tmp_path / "moved"]
-    # The third's check a line further down its file.
-    texts = [CHECKED_MODULE, CHECKED_MODULE, CHECKED_MODULE.replace("def _doubled", "\ndef _doubled")]
-    for place, text in zip(places, texts, strict=True):
-        place.mkdir(parents=True)
-        (place / "checked_module.py").write_text(text)
-    first, second, moved = (process_support.fresh(DIGESTED, cwd=place)["digest"] for place in places)
-    assert first == second != moved
-    values = jnp.ones(3)
-    one = owned_program(lambda tree: tree["a"] * 2).lower({"a": values})
-    other = owned_program(lambda tree: tree["b"] * 2).lower({"b": values})
-    assert program_digest(one) != program_digest(other)
-    # One text, its results labelled by a node's data of no plain form the other way round: a handed
-    # executable gives its results in its own tree, so the labels are part of the program.
-    first = owned_program(lambda x: Labelled((x * 2, x * 3), (Side.LEFT, Side.RIGHT))).lower(values)
-    swapped = owned_program(lambda x: Labelled((x * 2, x * 3), (Side.RIGHT, Side.LEFT))).lower(values)
-    assert program_digest(first) != program_digest(swapped)
-
-
-def test_a_kept_programs_failed_check_raises_where_handed_as_where_kept(tmp_path):
-    """A checked program kept by one process (its error tree's tracebacks held as their frames,
-    `HeldTraceback`) and handed to another raises its failed check there as the keeping process does, the
-    check's own error and message, not an error of the held traceback's."""
-    import process_support
-
-    (tmp_path / "checked_module.py").write_text(CHECKED_MODULE)
-    path = str(tmp_path / "checked.dew-aot")
-    # The module beside the file, on the path as a user's own.
-    found = {"PYTHONPATH": os.pathsep.join((str(tmp_path), str(process_support.REPO_ROOT / "src"),
-                                            str(process_support.REPO_ROOT / "tests")))}
-    keep = process_support.fresh(CHECKED_RUN, "keep", path, variables=found)
-    take = process_support.fresh(CHECKED_RUN, "take", path, variables=found)
-    assert keep["kept"] == 1 and keep["refused"] is not None
-    assert take["refused"] == keep["refused"]
-
-
 ORPHANED_START = """
+import atexit
+import os
 import threading
 
 import jax
@@ -417,7 +135,7 @@ from dew.nn.kernels import options
 from dew.nn.kernels.templates import report
 
 # A start's compile, XLA's own, of a program long enough to compile that it is in flight when the run is
-# refused: its thread is shown to have entered XLA's compile, and not to have left it.
+# refused: its thread is shown to have entered XLA's compile.
 begun, ended = threading.Event(), threading.Event()
 compiled = report.attempted
 
@@ -431,6 +149,11 @@ def attempted(lowered, held):
 
 
 report.attempted = attempted
+# Registered before the compile begins, so the exit runs it after its wait for the compile and before JAX's
+# own cleanup: 3 where the compile had ended by then, 5 where the exit went on with it running, and 4 where
+# it had ended before the refusal, whose exit then says nothing of the wait.
+early = threading.Event()
+atexit.register(lambda: os._exit(4 if early.is_set() else 3 if ended.is_set() else 5))
 
 
 def long(x):
@@ -441,20 +164,21 @@ def long(x):
 
 options.compiling(jax.jit(long), jnp.ones(2))
 begun.wait()
-# Refused before its start was taken, with an exit status of its own, its compile still running (else the
-# exit's timing says nothing of it, and the run says so by another status).
-raise SystemExit(4 if ended.wait(0.5) else 3)
+# Refused before its start was taken, its compile still running (else the exit's timing says nothing of it,
+# and the exit hook says so by its own status).
+if ended.wait(0.5):
+    early.set()
+raise SystemExit(1)
 """
 """A run that begins its start's compile beside its planning and is refused before it takes the start."""
 
 
-@pytest.mark.parametrize("run", range(8))
-def test_a_run_refused_before_its_start_is_taken_exits_with_its_refusal_while_its_compile_runs(run):
+def test_a_run_refused_before_its_start_is_taken_exits_once_its_compile_ends():
     """A run whose start's compile is begun beside its planning (`options.compiling`) and which is refused
-    before it takes the start, its compile still running, exits with its refusal's status once that compile
-    ends (`_exit_waits`): JAX's exit cleanup and the C runtime's exit tore XLA down under it, and 12 of 48
-    such exits ended by a segmentation fault (row 6837). A status of 4 says the compile ended before the
-    refusal, and the cell then proves nothing."""
+    before it takes the start, its compile still running, exits once that compile ends, saying it waits:
+    JAX's exit cleanup and the C runtime's exit tore XLA down under the running compile, and 12 of 48 such
+    exits ended by a segmentation fault (row 6837). The child's own exit hook, run after the wait and before
+    JAX's cleanup, states whether the compile had ended: deterministically, where a crash came 1 in 4."""
     import process_support
 
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(process_support.REPO_ROOT / "src"),
@@ -524,146 +248,42 @@ def test_a_begun_compile_is_not_taken_by_a_call_over_another_layout():
         np.testing.assert_array_equal(np.asarray(program(other)), values * 2)
 
 
-# Its import is read only as a call of `run` traces.
-LAZY_FRONT = "def run(x):\n    import lazy_impl\n\n    return lazy_impl.add(x)\n"
-"""An installed module whose function imports another installed module inside its body."""
+def counting_state(values: jax.Array):
+    """The state of an optimizer whose factory makes its state's class at each call (`counting`), begun for
+    `values`: a program whose results' tree no file of programs states."""
+    from optim_support import counting
+
+    return counting(1e-2).init(values)
 
 
-LAZY_KEPT = """
-import json
-import site
-import sys
+def test_a_program_whose_trees_no_file_states_compiles_where_programs_are_handed_and_is_kept_by_none(
+        tmp_path):
+    """A program whose results are an optimizer's state of a class its factory makes (`counting`), a node
+    no process names, is one no file of programs holds: a block that keeps programs refuses it, and a block
+    handed a file, or programs compiled ahead, compiles and runs it; a training step over that state
+    compiled ahead is refused (`Unestablished`, which names it). The keeping block pickled the class's
+    tree before stating it, and raised on Python 3.12 (train 964)."""
+    from optim_support import counting
 
-site.USER_SITE = sys.argv[3]
-sys.path.insert(0, sys.argv[3])
-import front
-import jax.numpy as jnp
-import numpy as np
-
-from dew.nn.kernels.options import owned_program
-from dew.training.ahead import NotTheKeptProgram, keeping, kept
-
-run = owned_program(front.run)
-if sys.argv[1] == "keep":
-    with keeping() as programs:
-        np.asarray(run(jnp.ones(2)))
-    programs.save(sys.argv[2])
-    print(json.dumps({"kept": len(programs.kept)}))
-else:
-    try:
-        with kept(sys.argv[2]):
-            print(json.dumps({"answer": np.asarray(run(jnp.ones(2))).tolist()}))
-    except NotTheKeptProgram as refused:
-        print(json.dumps({"refused": type(refused).__name__}))
-"""
-"""A process keeping `front.run`'s program (`keep`), whose trace imports `lazy_impl`, or handed it from the
-kept file by `kept`'s default (`take`): the call's answer, or the refusal."""
-
-
-def test_kepts_default_refuses_a_program_whose_code_changed_since_it_was_kept(tmp_path):
-    """A kept program of an installed distribution's code, handed by `kept`'s default in a later process,
-    the dependency it calls changed in place since (`x + 1` to `x + 2`), its version and RECORD as they
-    were: the default lowers the call's own program and holds it to the kept one's digest, so the stale
-    program is refused (`NotTheKeptProgram`), where the default trusted the identity alone, which states an
-    installed distribution by its version, and ran `x + 1`."""
-    from wheels import installed
-
-    site_packages = tmp_path / "site"
-    installed(site_packages, "front", {"front/__init__.py": LAZY_FRONT})
-    installed(site_packages, "lazy-impl", {"lazy_impl.py": "def add(x):\n    return x + 1\n"})
-    path = tmp_path / "lazy.dew-aot"
-    kept = process_support.fresh(LAZY_KEPT, "keep", str(path), str(site_packages), cwd=tmp_path)
-    assert kept == {"kept": 1}
-    (site_packages / "lazy_impl.py").write_text("def add(x):\n    return x + 2\n")
-    taken = process_support.fresh(LAZY_KEPT, "take", str(path), str(site_packages), cwd=tmp_path)
-    assert taken == {"refused": "NotTheKeptProgram"}
-
-
-def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):
-    """`kept(path)` lowers each handed call's own program and holds it to the kept one's
-    digest: a file whose program for a call is another program (here its recorded digest changed) is
-    refused at that call (`NotTheKeptProgram`), where the same file handed without verifying runs. And a
-    file of programs compiled ahead by name, none kept by its call, is refused as it is handed."""
-    from dew.training.ahead import AheadProgram, AheadPrograms, kept
-
-    answers = kept_in(tmp_path)["answers"]
-    path = tmp_path / "programs.dew-aot"
-    programs = AheadPrograms.load(path)
-    other = {digest: dataclasses.replace(each, program=AheadProgram("0" * 64, each.program.executable))
-             for digest, each in programs.kept.items()}
-    dataclasses.replace(programs, kept=other).save(path)
-    assert kept_answer(kept_worker(tmp_path, "take")) == {"answers": answers, "needed": []}
-    assert kept_answer(kept_worker(tmp_path, "verify")) == {"refused": "NotTheKeptProgram"}
-    AheadPrograms(programs.target, {}).save(path)
-    with pytest.raises(ValueError), kept(path):
-        pass
-
-
-@dataclasses.dataclass(frozen=True, eq=False)
-class Factor:
-    """A static argument whose field holds a NumPy scalar or a 0-d array of one value."""
-    value: np.generic | np.ndarray
-
-
-def by_factor_kind(held: Factor, values: jax.Array) -> jax.Array:
-    """`values` twice where the static argument holds a scalar, three times where it holds an array."""
-    return values * (2 if isinstance(held.value, np.generic) else 3)
-
-
-def test_a_program_kept_over_a_numpy_scalar_is_not_handed_for_a_0d_array_of_its_value(tmp_path):
-    """A static argument's record holding `np.float32(1)` and one holding `np.array(1, np.float32)` state
-    the same bytes, and a trace may branch on which it holds: a program kept over the scalar is not handed
-    to a call over the array, which runs its own trace (main gave the scalar's executable back, 2 * x for
-    3 * x)."""
-    from dew.nn.kernels.options import owned_program
-    from dew.training.ahead import keeping, kept
+    from dew._stated import Unestablished
+    from dew.nn.kernels.options import owned_program, taking
+    from dew.training.ahead import compile_ahead, keeping, kept
 
     values = jnp.ones(3)
     path = tmp_path / "programs.dew-aot"
-    fresh = functools.partial(owned_program, by_factor_kind, static_argnums=(0,))
     with keeping() as programs:
-        assert fresh()(Factor(np.float32(1)), values).tolist() == [2.0] * 3
+        owned_program(counting_state)(values)
     programs.save(path)
+    assert len(programs.refused) == 1 and programs.kept == {}
     with kept(path):
-        assert fresh()(Factor(np.array(1, np.float32)), values).tolist() == [3.0] * 3
-
-
-@dataclasses.dataclass(frozen=True, eq=False)
-class Scales:
-    """A static argument whose field holds dictionaries through NumPy's storage of pointers."""
-    table: np.ndarray | np.void
-
-
-def scaled_by_table(held: Scales, values: jax.Array) -> jax.Array:
-    """`values` times the scale the static argument's first dictionary holds as the call traces."""
-    entry = held.table["entry"] if held.table.dtype.names else held.table[0]
-    return values * entry["scale"]
-
-
-@pytest.mark.parametrize("holder", ["array", "structured"])
-def test_a_program_over_numpys_pointers_runs_what_they_point_to_when_its_handed(tmp_path, holder):
-    """A static argument holding a dictionary through an array of objects, or a structured scalar with an
-    object field, states nothing of the dictionary (its storage is the pointer, the same after the
-    dictionary changes): its call is not kept, and a fresh program called where the file is handed after
-    the dictionary changed runs the scale it holds then, not the executable of the one it held before."""
-    from dew.nn.kernels.options import owned_program
-    from dew.training.ahead import keeping, kept
-
-    dictionary = {"scale": 2}
-    table = np.empty(1, dtype=object)
-    table[0] = dictionary
-    if holder == "structured":
-        table = np.array([(dictionary,)], dtype=[("entry", object)])[0]
-    values = jnp.ones(3)
-    path = tmp_path / "programs.dew-aot"
-    # A fresh program at each call, as a fresh process makes it.
-    fresh = functools.partial(owned_program, scaled_by_table, static_argnums=(0,))
-    with keeping() as programs:
-        assert fresh()(Scales(table), values).tolist() == [2.0] * 3
-    programs.save(path)
-    dictionary["scale"] = 3
-    with kept(path):
-        assert fresh()(Scales(table), values).tolist() == [3.0] * 3
+        assert int(owned_program(counting_state)(values).steps) == 0
+    with taking({}):
+        assert int(owned_program(counting_state)(values).steps) == 0
+    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER)
+    trainer = Trainer(LMObjective(model, SEQ_LEN), counting(1e-2), key=jax.random.key(0),
+                      mesh=MeshSpec().build(gpus("sm80")))
+    with pytest.raises(Unestablished):
+        compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
 
 
 def test_a_program_called_over_shapes_while_collecting_compiles_there_and_runs_where_handed():

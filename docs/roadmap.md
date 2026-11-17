@@ -17,6 +17,10 @@ This page is generated from the maintainers' findings ledger as each change land
 - Splash's float32 forward at width 256 does not compile on a v5e. [6992]
 - The attention template's Mosaic TPU forward does not compile for a v5e training step at width 64, full, float16. [6993]
 - Paged decode on a v5e does not compile. [6994]
+- Splash's training step on a v5e is not finite in its value gradient. [7226]
+- Splash in float16 does not compile on a v5e. [7227]
+- JAX's paged decode at width 64 does not lower on a v5e. [7228]
+- A first sm80 accurate-form attention backward with a bias pays 3-4 minutes of certification compiles before its route falls back to another mainloop. [7279]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -31,6 +35,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
 - The sm100 training backward runs Ampere's mma.sync two-launch backward at 32x32 tiles where the template holds a certified tcgen05 backward it does not route. [6918]
 - finished_merged's derivative as to a slice of zero total is 0 where the merge formula's is (o - out) e^(m - M) / W. [7124]
+- The kernel gate reads no resource report of a fp32 decode's plain-forward kernels. [7263]
+- The Mosaic attention backward on sm80 spills at every tile it offers for the accurate form with a bias (key-bias width 64 bf16, tile-bias width 128 fp16 GQA…. [7280]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -43,6 +49,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Block-selected attention's other selections as mixers. [6301]
 - Mosaic has no float32 forward at width 256 on Hopper. [6508]
 - The attention backward's derivation proposes a spilling attention_dkv_fused at width 64 on sm100 and sm80. [6944]
+- CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
@@ -91,7 +98,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
-- The in-context memory reads no forks. [6969]
 
 ## Algebra
 

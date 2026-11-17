@@ -24,9 +24,9 @@ from dew.decision.layout import (
     Labels,
     OptionLines,
     Segment,
+    SegmentLayout,
     Specials,
     State,
-    StateFirstLayout,
     Text,
 )
 from dew.decision.model import DecisionModel
@@ -47,7 +47,7 @@ SEGMENTS = (Text("STATE:\n"), State(), Instructions({"choice": "{}"}, stream="co
             AnswerCue(template="\nAnswer:", many="\nAnswer:"))
 """A lettered row with its question read through cross-attention: the state and the cue in the
 row, the question and its lettered options in the context."""
-LAYOUT = StateFirstLayout(labels=LABELS, segments=SEGMENTS, max_len=96)
+LAYOUT = SegmentLayout.state_first_row(labels=LABELS, segments=SEGMENTS, max_len=96)
 QUESTIONS = (Choice("Which team handles it?", ["cards", "loans", "fraud"]),
              Choice("Which way is it?", ["up", "down", "left", "right"]))
 STATES = ["my card is lost", "a loan request", "a strange charge", "it went up", "turn left", "down below",
@@ -227,4 +227,4 @@ def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(t
     assert decide("my card is lost", {"q": asked})["q"].choice in asked.options
     marked = (*SEGMENTS[:3], dataclasses.replace(SEGMENTS[3], marker="after"), SEGMENTS[4])
     with pytest.raises(ValueError):
-        StateFirstLayout(segments=marked)
+        SegmentLayout.state_first_row(segments=marked)

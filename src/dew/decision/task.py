@@ -50,8 +50,8 @@ from dew.decision.layout import (
     Encoded,
     Laid,
     Layout,
-    QuestionLayout,
     Specials,
+    per_question,
     render,
     with_context,
 )
@@ -255,12 +255,19 @@ def _head_changes(first: Mapping[str, object], other: Mapping[str, object]) -> l
     return [f"head.{name}" for name in registry.computing_differences(
         registry.imported(str(first["class"])), *stated, kept=(_records.NUMBERS,))]
 
+def _tokenizer_files(settings: "DecideSettings") -> Mapping[str, str] | str | None:
+    """What a run's text tokenizer is, which runs compare by: its files' hashes (`tokenizer_files`, which a
+    run's load states where its record did not, `dew.inference.tasks.tokenizer_here`), else its name (`byte`,
+    which has no files), else None."""
+    return settings.tokenizer_files if settings.tokenizer_files is not None else settings.tokenizer
+
+
 @dataclass(frozen=True)
 class DecideSettings:
     """What a decision run records beside its backbone, and its task is built with
     (`Decide.from_run`): the head's record (`Head.record`), the layout (by import path, its
-    segments with it), the special tokens, the text tokenizer's name, and an image processor's
-    source, or None."""
+    segments with it), the special tokens, where the text tokenizer is found (its name, a hub snapshot as
+    its repo and commit) and what it is (its files' hashes), and an image processor's source, or None."""
 
     head: Mapping[str, object]
     """The head's class record (`Head.record`), which `Head.from_record` builds over the backbone it reads,
@@ -279,6 +286,10 @@ class DecideSettings:
     which a pass of its task pads each question to (`Budget.options`); None where the run recorded
     none, as before it did. A pass's question slots are its windows' (`Decide.pass_shapes`), so the
     run records no count of questions (an earlier run's `questions` is read past, `saved_settings`)."""
+    tokenizer_files: Mapping[str, str] | None = field(default=None, metadata={_records.ADDED: True})
+    """What the text tokenizer is: each of its files' hash (`dew.inference.tasks.recorded_files`), which a
+    load holds the files it finds to and runs compare by; None where a run recorded none, as runs before
+    it did."""
 
 
 CALIBRATIONS = "calibrations"
@@ -375,18 +386,18 @@ class Decide(SavedRunTask, InItsForm):
     which a release of it names again; None for a task read from none."""
     derives_sharing: bool = field(default=True, repr=False, compare=False)
     """Whether the task states how a request's questions share a state where its layout states none
-    (`QuestionLayout.shared_for`), as a task built in code does; one read from a release or a run lays its
+    (`SegmentLayout.shared_for`), as a task built in code does; one read from a release or a run lays its
     rows out as they were declared (`released`, `_recorded`), a layout that states none a question a row."""
 
     sharing: tuple[int | None, int | None] | None = field(default=None, repr=False, compare=False)
-    """The sharing (`QuestionLayout.shared_state`) the layout the task was given states, and the sharing the
+    """The sharing (`SegmentLayout.shared_state`) the layout the task was given states, and the sharing the
     task states for it (`layout`), carried by a task that replaces its layout but not its sharing
     (`dataclasses.replace`); None until the task reads its layout."""
 
     def __post_init__(self) -> None:
         # A request's questions are scored over one copy of its state where the backbone and head read each
-        # question as its own row (`QuestionLayout.shared_for`).
-        if isinstance(self.layout, QuestionLayout) and self.derives_sharing:
+        # question as its own row (`SegmentLayout.shared_for`).
+        if per_question(self.layout) and self.derives_sharing:
             from dew.decision.shared_state import shared_for
 
             given = self.layout.shared_state
@@ -403,7 +414,7 @@ class Decide(SavedRunTask, InItsForm):
         """The layout as the task was given it, its sharing as stated (`sharing`): what a run trained from
         the task lays its rows out by under a data plan before they shared a state
         (`DecisionObjective.stated`)."""
-        if not isinstance(self.layout, QuestionLayout) or self.sharing is None:
+        if not per_question(self.layout) or self.sharing is None:
             return self.layout
         return replace(self.layout, shared_state=self.sharing[0])
 
@@ -482,11 +493,12 @@ class Decide(SavedRunTask, InItsForm):
         # Its rows laid out as the run recorded them: a layout that states no sharing, from a run saved
         # before rows shared a state (data plan version 12), a question a row as it trained. One
         # that states its sharing, saved under such a plan, trained its rows in streams
-        # (`QuestionLayout.streamed`, which the plan's version states and no record holds) and is laid
+        # (`SegmentLayout.streamed`, which the plan's version states and no record holds) and is laid
         # here as documents continuing the shared part: the same tokens at the same positions, each
         # question reading the shared part and itself (with siblings, the questions before it), so the
         # same function, each held to its questions' own rows (tests/test_decision_state_once.py).
-        return cls(model, variables, settings.layout, tokenizer_for(settings.tokenizer), settings.specials,
+        tokenizer = tokenizer_for(settings.tokenizer, files=settings.tokenizer_files, held=directory)
+        return cls(model, variables, settings.layout, tokenizer, settings.specials,
                    name=str(epath.Path(directory).name), weights=weights, processor=processor, budget=budget,
                    derives_sharing=False)
 
@@ -599,11 +611,15 @@ class Decide(SavedRunTask, InItsForm):
         settings = [saved_settings(saved, DecideSettings) for saved in recorded]
         # A setting its data derives (its padding, `metadata["derived"]`) may differ between the runs, and
         # their heads by how they run or train alone (`_head_changes`).
-        for directory, own in zip(runs, settings, strict=True):
+        # Their tokenizers by what they are, their files' hashes, wherever each found it (`_tokenizer_files`).
+        tokenizers = [_tokenizer_files(own) for own in settings]
+        for directory, own, held in zip(runs, settings, tokenizers, strict=True):
             differing = [entry.name for entry in fields(DecideSettings)
-                         if entry.metadata.get("derived") != "data" and entry.name != "head"
+                         if entry.metadata.get("derived") != "data"
+                         and entry.name not in ("head", "tokenizer", "tokenizer_files")
                          and getattr(own, entry.name) != getattr(settings[0], entry.name)]
             differing += _head_changes(settings[0].head, own.head)
+            differing += ["tokenizer"] if held != tokenizers[0] else []
             if differing:
                 raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
                                  f"{', '.join(differing)}, so their weights are not one task's to average")
@@ -705,6 +721,7 @@ class Decide(SavedRunTask, InItsForm):
         import optax
 
         from dew.decision.objective import DecisionObjective
+        from dew.inference.tasks import hold_tokenizer
         from dew.interop.saved_sources import with_release_sources
         from dew.state import TrainState
 
@@ -723,6 +740,7 @@ class Decide(SavedRunTask, InItsForm):
                 # The releases of saved runs its paths lie within mapped to the runs they hold, as a
                 # trainer's checkpoint carries them (`with_release_sources`).
                 record = with_release_sources(DecisionObjective(self).inference_record())
+            hold_tokenizer(record, checkpoints.directory)
             checkpoints.save(self.weights.step, state, artifact=record, weights_only=True)
             checkpoints.wait()
 
@@ -1758,7 +1776,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
     holding at most the rows its read declares (`tokens_bound`, `SegmentBound`: the most a window
     of the read holds, which it measured), else `max_segments` (the objective's bound), the questions'
     spans in each row's context where
-    `spans_in_context` (`JointLayout.spans_in_context`), each row's block the whole row where
+    `spans_in_context` (`SegmentLayout.spans_in_context`), each row's block the whole row where
     `whole_blocks` (`whole_blocks_of`), its rows read in their streams as their layout's `attention`
     says (`Layout.attention`), its documents' chains at most `fork_depth` long and each row's read
     together where `joint_forks` (`dew.decision.shared_state.fork_depth`, `Forks.joint`)."""
@@ -1787,8 +1805,8 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
 
 
 def whole_blocks_of(layout: Layout) -> bool:
-    """Whether `layout`'s rows are each one block of the whole row (`QuestionLayout.split` 'whole')."""
-    return isinstance(layout, QuestionLayout) and layout.blocks and layout.split == "whole"
+    """Whether `layout`'s rows are each one block of the whole row (`SegmentLayout.split` 'whole')."""
+    return per_question(layout) and layout.blocks and layout.split == "whole"
 
 
 def _near_equal(options: Sequence[str], group: int) -> list[list[str]]:

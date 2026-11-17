@@ -34,7 +34,7 @@ from .formats import decision_format, decision_plan
 from .head import DecisionHead, Head, JointSchemaHead
 from .joint_checkpoint import HEAD_CONFIG, HEAD_WEIGHTS, _path, _shaped
 from .laya import CONFIG_FILE, IN_PROJ, LAYA_BUDGETS, LayaConfig, _head_path, _token
-from .layout import JointLayout, Layout, QuestionLayout, Specials
+from .layout import Layout, SegmentLayout, Specials
 from .model import DecisionModel
 from .release import released_decision
 from .task import Decide
@@ -198,7 +198,7 @@ class DecisionSource(SourceKind):
             calibration = Calibration(config.temperatures())
             # The layout and calibration the release states, over those Laya's own file derives.
             derived = layout
-            layout, calibration = released_decision(directory, layout, calibration, kind=QuestionLayout)
+            layout, calibration = released_decision(directory, layout, calibration, joint=False)
             assumed = assumed if layout is derived else frozenset()
             tokenizer_folder, strict_specials, named = laya.tokenizer_folder, True, config.encoder
         elif (directory / HEAD_CONFIG).is_file():
@@ -213,7 +213,8 @@ class DecisionSource(SourceKind):
                                                           "fields": fields}, "head"),
                                       _path, IN_PROJ, HEAD_WEIGHTS,
                                       partial(_shaped, fields["hidden_size"]))
-            layout, calibration = released_decision(directory, JointLayout(), Calibration(), kind=JointLayout)
+            layout, calibration = released_decision(directory, SegmentLayout.joint_row(), Calibration(),
+                                                          joint=True)
             assumed = frozenset()
             tokenizer_folder, strict_specials, named = decision_format("joint").tokenizer_folder, False, None
         else:

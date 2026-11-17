@@ -222,20 +222,23 @@ def test_an_eager_initial_state_of_a_held_tree_copies_it_by_transfer():
     caller makes before stepping one by hand) takes buffers of its own for the arrays it moves, made by the
     transfer (`distributed.transferred_copy`), as a placed state's are: no copy program compiles, where each
     held array's `copy()` compiled one (train 957's F4), and the state shares no buffer of the objective's
-    moving arrays. Its run keeps no EMA, whose first copy of the parameters is a program of its own."""
+    moving arrays; its EMA's first copy of the parameters is a transfer too, where `jnp.copy` compiled a
+    program per shape (train 961's F6)."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.telemetry.compiles import Compiles
 
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1, mlp_features=16,
                               max_seq_len=8)
     weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
-    objective = LMObjective(model, seq_len=4, variables=weights, ema_decay=None)
+    objective = LMObjective(model, seq_len=4, variables=weights, ema_decay=0.999)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                       layout=Layout(min_shard=1, tolerance=1.0), mesh=MeshSpec())
     trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
     with Compiles(None) as compiles:
         state = trainer.initial_state()
     compiled = [program.name for program in compiles.programs if program.kind == "compiled"]
-    assert "jit(copy)" not in compiled, compiled
+    assert not [name for name in compiled if "copy" in name], compiled
     held = {leaf.unsafe_buffer_pointer() for leaf in jax.tree.leaves(objective.variables["params"])}
-    assert not held & {leaf.unsafe_buffer_pointer() for leaf in jax.tree.leaves(state.variables["params"])}
+    moving = {leaf.unsafe_buffer_pointer() for leaf in jax.tree.leaves(state.variables["params"])}
+    averaged = {leaf.unsafe_buffer_pointer() for leaf in jax.tree.leaves(state.ema)}
+    assert averaged and not held & moving and not averaged & (held | moving)

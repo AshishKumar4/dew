@@ -47,6 +47,7 @@ from jax.custom_derivatives import zero_from_primal
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
+from jax.extend.core import primitives
 
 from dew import _cache, algebra
 from dew.algebra import cost as algebra_cost
@@ -192,6 +193,22 @@ class Region:
     chain: cost.Work
     captured_bytes: float
     output_bytes: float
+    formed: "Formed | None" = None
+    """Its left operand's producer as the kernel's prologue takes it (`Formed`); None where XLA forms the
+    operand before the launch either way."""
+    consumed: bool = True
+    """Whether consumers follow the product (its epilogue's); without, its outputs are the product's."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Formed:
+    """A prologue's priced parts (`priced`): its element stage's work on the whole operand, which the kernel's
+    prologue does tile by tile (`stage`), the work XLA does whole for the row or depth values it reads beside
+    (`sides`, a norm's statistics), and the bytes those values hold (`side_bytes`)."""
+
+    stage: cost.Work
+    sides: cost.Work
+    side_bytes: float
 
 
 _PRICED: contextvars.ContextVar[list | None] = contextvars.ContextVar('fused_gemm_priced', default=None)
@@ -202,8 +219,11 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     """`region`'s seconds on `target`, fused and unfused, from one model (`templates.cost`): the launch's
     units overlapped at the whole device's rates (its products in their tensor mode, its operands, captured
     arrays and outputs in device memory), plus its fixed launch (`GpuTarget.launch_seconds`), with its
-    consumers' work in it; and the plain launch writing the product at its result dtype, then XLA's fusion
-    of the consumers reading it (`algebra.cost.fused`). None where the target states no tensor rate."""
+    producer's element stage and its consumers' work in it, beside XLA's fusion of the producer's row or
+    depth values where it has a prologue (a norm's statistics, reading the operand's base); and unfused, XLA's
+    fusion forming the operand whole (reading its base, writing it), the plain launch writing the product at
+    its result dtype, then XLA's fusion of the consumers reading it (`algebra.cost.fused`). None where the
+    target states no tensor rate."""
     rates = cost.rates(target, device=True)
     if rates[0] is None:
         return None, None
@@ -212,26 +232,38 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     operands = region.operand_bytes
     written = region.rows * region.width * jnp.dtype(region.result).itemsize
     launch = target.launch_seconds or 0.0
+    xla = algebra_cost.fused(target)
 
     def launched(work: cost.Work) -> float:
         return max(cost.units(work, rates)[0]) + launch
 
-    fused_seconds = launched(product + region.chain + cost.Work(
+    # The operand's base, the rows a prologue forms the operand from (its bytes the operand's).
+    formed, base = region.formed, region.rows * region.depth * jnp.dtype(region.operands).itemsize
+    prologue, forming, sides = cost.Work(), 0.0, 0.0
+    if formed is not None:
+        prologue = formed.stage + cost.Work(device_bytes=formed.side_bytes)
+        forming = xla(formed.sides + formed.stage + cost.Work(device_bytes=2 * base, kernels=1.0))
+        sides = xla(formed.sides + cost.Work(device_bytes=base + formed.side_bytes, kernels=1.0))
+    fused_seconds = sides + launched(product + region.chain + prologue + cost.Work(
         device_bytes=operands + region.captured_bytes + region.output_bytes))
-    chain = region.chain + cost.Work(device_bytes=written + region.captured_bytes + region.output_bytes,
-                                     kernels=1.0)
-    unfused_seconds = (launched(product + cost.Work(device_bytes=operands + written))
-                       + algebra_cost.fused(target)(chain))
+    unfused_seconds = forming + launched(product + cost.Work(device_bytes=operands + written))
+    if region.consumed:
+        unfused_seconds += xla(region.chain + cost.Work(
+            device_bytes=written + region.captured_bytes + region.output_bytes, kernels=1.0))
     return fused_seconds, unfused_seconds
 
 
 def _chain(consumer, values, acc) -> cost.Work:
-    """The consumers' elementwise work on the whole product: each equation of their program an operation an
-    element of its result, one the special-function units evaluate on them (the algebra's declaration of
-    it, `dew.algebra.terms.Operation.exponential`), a conversion's apart."""
-    closed = jax.make_jaxpr(consumer)(values, acc)
+    """The consumers' elementwise work on the whole product (`_work` of their program)."""
+    return _work(jax.make_jaxpr(consumer)(values, acc).jaxpr.eqns)
+
+
+def _work(eqns) -> cost.Work:
+    """`eqns`' elementwise work: each equation an operation an element of its result, one the special-function
+    units evaluate on them (the algebra's declaration of it, `dew.algebra.terms.Operation.exponential`), a
+    conversion's apart."""
     work = cost.Work()
-    for eqn in closed.jaxpr.eqns:
+    for eqn in eqns:
         elements = float(sum(math.prod(shape) for var in eqn.outvars
                              if (shape := getattr(var.aval, 'shape', None)) is not None))
         spoken = algebra.terms.OPERATIONS.get(eqn.primitive)
@@ -248,41 +280,53 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     precision, out_dtype = declared
     *operand_fusions, out_fusion = fusions
     lhs_fusion, *rest_fusions = operand_fusions
-    lhs, prologue = _prologue(lhs_fusion)
+    lhs, prologue, formed = _prologue(lhs_fusion)
     rhs, *rest = (fusion() for fusion in rest_fusions)
     group_sizes = None if dense else rest[0]
-    if out_fusion is None:
-        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
-                         precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
     width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
     acc = jax.ShapeDtypeStruct((lhs.shape[0], width), out_dtype)
+    operand_bytes = float(sum(operand.size * operand.dtype.itemsize for operand in (lhs, rhs)))
+    collected = _PRICED.get()
+    if out_fusion is None:
+        # A product with no producer the prologue takes and no consumer has nothing fused to price.
+        if collected is not None and formed is not None:
+            collected.append(Region(lhs.shape[0], lhs.shape[-1], width, jnp.dtype(lhs.dtype),
+                                    jnp.dtype(out_dtype), precision, operand_bytes, cost.Work(), 0.0,
+                                    float(math.prod(acc.shape) * acc.dtype.itemsize), formed, consumed=False))
+        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
+                         precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
+    # The program's names lifted first (`_named`): the algebra's rewriting reads a name as an identity.
+    named_consumer = consumer
+    consumer, names = _named(consumer, values, acc)
     consumer = _rewritten_consumer(consumer, values, acc)
     leaves, treedef = jax.tree.flatten(values)
-    if (collected := _PRICED.get()) is not None:
-        depth = lhs.shape[-1]
+    if collected is not None:
         outs = jax.tree.leaves(jax.eval_shape(consumer, values, acc))
         collected.append(Region(
-            lhs.shape[0], depth, width, jnp.dtype(lhs.dtype), jnp.dtype(out_dtype), precision,
-            float(sum(operand.size * operand.dtype.itemsize for operand in (lhs, rhs))),
-            _chain(consumer, values, acc), float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
-            float(sum(math.prod(out.shape) * out.dtype.itemsize for out in outs))))
+            lhs.shape[0], lhs.shape[-1], width, jnp.dtype(lhs.dtype), jnp.dtype(out_dtype), precision,
+            operand_bytes, _chain(consumer, values, acc),
+            float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
+            float(sum(math.prod(out.shape) * out.dtype.itemsize for out in outs)), formed))
     axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
                   if prefetch else _axes(consumer, values, acc))
     if axes is None:
         summed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
                            precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
-        return consumer(values, summed)
+        return _rewritten_consumer(named_consumer, values, acc)(values, summed)
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
     value_types = tuple(jax.typeof(leaf) for leaf in leaves)
     epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc)
     dtypes = tuple(leaf.dtype for leaf in out_leaves)
     several = len(dtypes) > 1
+    # Each value the program names (`checkpoint_name`) an output of the launch's, a residual of its
+    # derivative under that name (`gemm`'s `named`), the consumer's outputs then the named values (`_named`).
+    outputs = len(out_leaves) - len(names)
     consumed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
                          epilogue_operands=tuple(zip(leaves, axes, strict=True)),
                          out_dtype=dtypes[0], out_dtypes=dtypes if several else None, precision=precision,
-                         interpret_on_cpu=interpret_on_cpu, **prologue)
-    return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))
+                         interpret_on_cpu=interpret_on_cpu, named=(None,) * outputs + names, **prologue)
+    return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))[0]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -326,22 +370,22 @@ PROLOGUE_AXES = ('rows', 'depth')
 """The prologue's launch axes, in a tile's order."""
 
 
-def _prologue(fusion) -> tuple[jax.Array, dict]:
-    """The left operand's base array and the template's prologue arguments that give the operand from it
-    (the module's docstring), or the operand itself and none where the kernels cannot take its producer,
-    each reported ('gemm_prologue')."""
+def _prologue(fusion) -> tuple[jax.Array, dict, Formed | None]:
+    """The left operand's base array, the template's prologue arguments that give the operand from it (the
+    module's docstring) and its producer as priced (`Formed`), or the operand itself, none and None where the
+    kernels cannot take its producer, each reported ('gemm_prologue')."""
     producer, values, prefetch = fuser.get_fusion_values(fusion)
     split = (Refusal('scalar_prefetch', "the producer reads scalar prefetch") if prefetch
              else _split(producer, values))
     # An operand as given has no producer to fuse, and no stage to choose.
     if isinstance(split, Refusal) and split.code == 'no_producer':
-        return fusion(), {}
+        return fusion(), {}, None
     stage = _stage(PROLOGUE, split)
     if stage is None:
-        return fusion(), {}
-    base, function, sides, axes, jvp = stage
+        return fusion(), {}, None
+    base, function, sides, axes, jvp, formed = stage
     return base, {'prologue': function, 'prologue_operands': tuple(zip(sides, axes, strict=True)),
-                  'prologue_jvp': jvp}
+                  'prologue_jvp': jvp}, formed
 
 
 def _rewritten_consumer(consumer, values, acc):
@@ -357,6 +401,36 @@ def _rewritten_consumer(consumer, values, acc):
         return jax.tree.unflatten(structure, jax_core.jaxpr_as_fun(closed)(*jax.tree.leaves((values, acc))))
 
     return rewritten
+
+
+def _named(consumer, values, acc):
+    """`consumer` with the values its program names (`checkpoint_name`, a gate's projection before its
+    SwiGLU) as outputs after its own, unnamed in it, and their names in order: `consumer(values, acc)` gives
+    `(outputs, named)`. A launch's body runs no name (Mosaic's lowering has no rule for one); the launch's
+    derivative names its outputs (`gemm`'s `named`), so a remat policy keeping a name keeps that output and
+    the reverse pass recomputes no product (row 7131)."""
+    closed, shapes = jax.make_jaxpr(consumer, return_shape=True)(values, acc)
+    jaxpr = closed.jaxpr
+    aliases, eqns, names, kept = {}, [], [], []
+    for eqn in jaxpr.eqns:
+        invars = [aliases.get(var, var) if isinstance(var, jax_core.Var) else var for var in eqn.invars]
+        if eqn.primitive is primitives.name_p:
+            aliases[eqn.outvars[0]] = invars[0]
+            names.append(eqn.params['name'])
+            kept.append(invars[0])
+            continue
+        eqns.append(eqn.replace(invars=invars))
+    if not names:
+        return (lambda values, acc: (consumer(values, acc), ())), ()
+    outvars = [aliases.get(var, var) if isinstance(var, jax_core.Var) else var for var in jaxpr.outvars]
+    unnamed = closed.replace(jaxpr=jaxpr.replace(eqns=eqns, outvars=[*outvars, *kept]))
+    structure = jax.tree.structure(shapes)
+
+    def renamed(values, acc):
+        flat = jax_core.jaxpr_as_fun(unnamed)(*jax.tree.leaves((values, acc)))
+        return jax.tree.unflatten(structure, flat[:len(outvars)]), tuple(flat[len(outvars):])
+
+    return renamed, tuple(names)
 
 
 def _split(producer, values):
@@ -411,7 +485,11 @@ def _split(producer, values):
     function = functools.partial(_prologue_tile, whole, tuple(jax.typeof(array) for array in arrays), axes)
     places = tuple(given.get(var) for var in (base, *sides))
     jvp = functools.partial(_whole_jvp, flat, tuple(leaves), places, tuple(array.shape for array in arrays))
-    return arrays[0], function, squeezed, named, jvp
+    # Priced (`Formed`): the element stage the prologue runs, the rest XLA runs whole for its sides.
+    staged = {id(eqn) for eqn in stage}
+    formed = Formed(_work(stage), _work(eqn for eqn in jaxpr.eqns if id(eqn) not in staged),
+                    float(sum(array.size * array.dtype.itemsize for array in squeezed)))
+    return arrays[0], function, squeezed, named, jvp, formed
 
 
 def _whole_jvp(flat, leaves: tuple, places: tuple, shapes: tuple, base, *sides):

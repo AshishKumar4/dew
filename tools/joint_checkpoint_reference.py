@@ -13,7 +13,7 @@ and again in float64, and writes to tests/fixtures/joint_checkpoint/tiny:
 - joint_head_config.json and joint_head.safetensors, the head as the
   release stores it;
 - layouts.json: each request's token ids, and each question's instruction
-  span, option spans and option ids, which Dew's `JointLayout` must
+  span, option spans and option ids, which Dew's `SegmentLayout.joint_row` must
   reproduce exactly;
 - states.npz: the backbone's fp32 last hidden states per request, which the
   head-alone references read;

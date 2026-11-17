@@ -54,13 +54,13 @@ class Dataset()  [dew.data.pipeline]
   .elastic(self) -> Pipeline
   .facts(self) -> Mapping[str, object]
   .filter(self, predicate: Callable[[Batch], bool], *, reason: str | None = None, identity: str | None = None) -> Pipeline
-  .filter_map(self, *steps: RecordStep, identity: str | None = None) -> Pipeline
-  .flat_map(self, step: ExpandStep | ColumnStep, *, batched: bool = False, batch_size: int = 1000, identity: str | None = None) -> Pipeline
+  .filter_map(self, *steps: RecordStep, identity: str | None = None, pool: PoolKind | None = None) -> Pipeline
+  .flat_map(self, step: ExpandStep | ColumnStep, *, batched: bool = False, batch_size: int = 1000, identity: str | None = None, pool: PoolKind | None = None) -> Pipeline
   .grain(self, function: Callable[[pygrain.MapDataset | pygrain.IterDataset], pygrain.MapDataset | pygrain.IterDataset], *, identity: str | None = None) -> Pipeline
   .holdout(self, fraction: float | None = None, *, key: str | None = None, records: int | None = None, split: str | tuple[str, ...] | None = None, tokens: float | None = None, fields: tuple[str, ...] = ('text',), **named: float) -> tuple[Dataset, ...]
   .interleave(self, cycle_length: int = 16) -> Pipeline
   .loading(self, loading: Loading) -> Pipeline
-  .map(self, *steps: RecordStep | Configured | HostStep, batched: bool = False, batch_size: int = 1000, identity: str | None = None) -> Pipeline
+  .map(self, *steps: RecordStep | Configured | HostStep, batched: bool = False, batch_size: int = 1000, identity: str | None = None, pool: PoolKind | None = None) -> Pipeline
   .map_with_index(self, step: Callable[[int, Batch], Batch | Rejected], *, identity: str | None = None) -> Pipeline
   .named(self, name: str) -> Pipeline
   .pack(self, seq_len: int, *, fields: tuple[str, ...] = ('text',), bins: int = 32, policy: Literal['first-fit', 'best-fit', 'concat'] = 'first-fit', segments: int | None = None, along: tuple[tuple[str, int], ...] = (), overlap: int = 0) -> Pipeline

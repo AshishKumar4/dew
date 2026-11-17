@@ -22,7 +22,8 @@ from dew.config.jepa import JepaRunConfig
 from dew.data import TFDS, Memory, images as image_steps, presets
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
-from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
+from dew.decision import Choice, DecisionObjective, Example, Specials
+from dew.decision.layout import SegmentLayout
 from dew.diffusion.discrete import MDLM
 from dew.diffusion.presets import Flow, MeanFlow, Shortcut
 from dew.inputs import Field, InputSpec, TextCondition
@@ -115,7 +116,8 @@ def decision():
                 for text, label in (("charged twice", 0), ("site down", 1))] * 2
     objective = DecisionObjective(decoder(), tokenizer=ByteTokenizer(),
                                   specials=Specials(None, 10, 0, "\x00", 255),
-                                  layout=StateFirstLayout(max_len=32, head_max_len=24, option_tokens=6))
+                                  layout=SegmentLayout.state_first_row(max_len=32, head_max_len=24,
+                                                                       option_tokens=6))
     return objective, next(decision_rows(examples, 2, objective=objective.data()).train(DataPartition()))
 
 

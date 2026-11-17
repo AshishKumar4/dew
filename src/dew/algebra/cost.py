@@ -26,7 +26,7 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost as kernel_cost
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.product import eight, half
-from dew.nn.precision import asks_default_precision
+from dew.nn.precision import asks_default_precision, effective_precision, precision_names
 
 
 def target(named: str | None = None) -> generation.GpuTarget:
@@ -124,13 +124,20 @@ _MODES = {"16bit": "flops", "tf32": "tf32_flops", "8bit": "fp8_flops", "fp32": "
 """The `Work` field a product's mode's FLOPs are told in (`generation.Architecture`'s modes; IEEE fp32 is
 the CUDA cores')."""
 
+TPU_PASSES = {"DEFAULT": 1, "HIGH": 3, "HIGHEST": 6}
+"""The bfloat16 passes a TPU's matrix units multiply fp32 operands in, by precision (`jax.lax.Precision`'s own
+statement: "On TPU: performs float32 computations in bfloat16", "in 3 bfloat16 passes", "in 6 bfloat16")."""
+
+
 def _mode(precision, lhs_dtype, rhs_dtype) -> tuple[str, int]:
     """The mode a product of operands of those dtypes at `precision` multiplies in, and its passes: where
     `precision` names a dot algorithm, that algorithm's as JAX lowers it (`programs.dot_arithmetic`: TF32's,
     a 16-bit or an 8-bit precision's whatever the operands' storage, each over its primitive operations, an
     X3's three; any other on the CUDA cores); else the operands': 16-bit operands' 16-bit mode, FP8
-    operands' 8-bit mode (`product.eight`), fp32 operands' TF32 at the default precision (the product
-    declaration's, `product.declared`) and IEEE fp32 above it; any other operand's on the CUDA cores."""
+    operands' 8-bit mode (`product.eight`), fp32 operands' on a TPU priced for (`target`) its matrix units'
+    bfloat16 passes (`TPU_PASSES`, a pair of precisions at its higher's), elsewhere TF32 at the default
+    precision (the product declaration's, `product.declared`) and IEEE fp32 above it; any other operand's
+    on the CUDA cores."""
     arithmetic = programs.dot_arithmetic(precision, lhs_dtype, rhs_dtype)
     if arithmetic is not None:
         bits = set(arithmetic.operand_bits)
@@ -141,6 +148,9 @@ def _mode(precision, lhs_dtype, rhs_dtype) -> tuple[str, int]:
         return "16bit", 1
     if all(eight(dtype) for dtype in dtypes):
         return "8bit", 1
+    if dtypes == {jnp.dtype(jnp.float32)} and generation.tpu(target()):
+        named = precision_names(effective_precision(precision)) or {"DEFAULT"}
+        return "16bit", max(TPU_PASSES[name] for name in named)
     if dtypes == {jnp.dtype(jnp.float32)} and asks_default_precision(precision, configured=True):
         return "tf32", 1
     return "fp32", 1

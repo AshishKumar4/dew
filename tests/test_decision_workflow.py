@@ -61,7 +61,10 @@ LONG = Choice("Which intent does the customer's message express? " + "Read the m
 MAX_LEN = {"joint": 3072, "question": 2048, "letters": 2048}
 """Each head's window: a joint row lays both questions' options out in one schema, a question row one."""
 
-OPTION_TOKENS, BATCH = 10, 8
+OPTION_TOKENS, BATCH = 10, 4
+"""A question row's option budget, and the rows a step reads: four, whose joint cell over a context trains
+in a fresh process peaking at 5.7 GiB on CPU, its rows' attention scores dense over 3072 tokens, where eight
+peaked at 9.3 GiB and a CI task of 10 GiB was killed."""
 CONTEXT_LAYERS = "0"
 SHARE = 0.5
 

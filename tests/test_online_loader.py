@@ -4,6 +4,9 @@ import collections
 import gzip
 import hashlib
 import itertools
+import os
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Mapping
@@ -19,6 +22,7 @@ from process_support import serving
 from dew.batch import VALID_ROWS
 from dew.data import Files, Loading, Memory, Rejected, images, video
 from dew.data.compile import compile, iterate
+from dew.data.concurrent import Pool
 from dew.data.dataset import DataPartition
 from dew.data.images import DecodeImage, Resize
 from dew.data.pipeline import Pipeline
@@ -597,3 +601,333 @@ def test_a_web_video_flow_decodes_frames_from_fetched_bytes(tmp_path):
         greys = [round(int(frame[8, 8, 0]) / GREY_STEP) for frame in frames]
         assert greys == list(range(greys[0], greys[0] + 8)) and greys[-1] < CLIP_FRAMES
     assert dropped["undecodable"] > 0
+
+
+def ran_where(row: Mapping) -> dict:
+    """The record, its id squared, beside the process and thread its step ran in."""
+    where = {"pid": os.getpid(), "thread": threading.current_thread().name}
+    return {**row, "square": int(row["id"]) ** 2, **where}
+
+
+def _alive(pid: int) -> bool:
+    """Whether process `pid` still runs."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def ran_expanded(row: Mapping) -> list[dict]:
+    """The record twice, each beside where its step ran (`ran_where`)."""
+    return [ran_where(row), {**ran_where(row), "id": int(row["id"]) + 1000}]
+
+
+@pytest.mark.parametrize("stage", ["map", "flat_map"])
+@pytest.mark.parametrize("pool", ["threads", "processes"])
+@pytest.mark.parametrize("read", ["streamed", "indexed", "memory"])
+def test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes(read, pool, stage):
+    """A record stage declaring its pool (data.md §10's offline execution contract) runs its step there,
+    on the stage's threads or in processes other than the reader's, and the read delivers what the
+    in-process stage delivers, in its order, its plan the same but where an indexed read is cut per share on
+    the pool's account; in a streamed or indexed read a position
+    saved part way restores to the same remaining records; and a closed reader leaves no thread of its pool
+    and no process (each ended as the reader closes, `Running.stop`). An indexed read on a pool read every
+    record again past a restore and every share the whole order (the head review of theme 16, F1)."""
+    catalog = Memory([{"id": index} for index in range(23)], shard_rows=23)
+
+    def built(declared):
+        chain = Pipeline(catalog)
+        chain = (chain.map(ran_where, pool=declared) if stage == "map"
+                 else chain.flat_map(ran_expanded, pool=declared))
+        return compile(chain.batch(2), read=read, loading=READ)
+
+    def ids(batches):
+        return [int(value) for batch in batches for value in batch["id"]]
+
+    data = built(pool)
+    # An indexed read through a pool is cut per share, which its plan states (a one-to-one map's read is cut
+    # so on the pool's account alone); any other read's plan is the same.
+    assert data.plan.identity() == built(None).plan.identity() or (read, stage) == ("indexed", "map")
+    plain = built(None).train(DataPartition())
+    reader = data.train(DataPartition())
+    try:
+        expected = ids(next(plain) for _ in range(8))
+        first = [next(reader) for _ in range(3)]
+        saved = reader.get_state()
+        rest = [next(reader) for _ in range(5)]
+    finally:
+        reader.close()
+        plain.close()
+    assert ids([*first, *rest]) == expected
+    where = [(int(pid), str(thread)) for batch in [*first, *rest]
+             for pid, thread in zip(batch["pid"], batch["thread"], strict=True)]
+    if pool == "processes":
+        assert all(pid != os.getpid() for pid, _ in where)
+        assert not [pid for pid in {pid for pid, _ in where} if _alive(pid)]
+    else:
+        assert all(pid == os.getpid() and thread.startswith("dew-step") for pid, thread in where)
+    assert not [thread for thread in threading.enumerate() if thread.name.startswith("dew-step")]
+    if read != "memory":
+        resumed = data.train(DataPartition())
+        try:
+            resumed.set_state(saved)
+            assert ids(next(resumed) for _ in range(5)) == ids(rest)
+        finally:
+            resumed.close()
+
+
+@pytest.mark.parametrize("read", ["streamed", "memory"])
+def test_a_process_stage_whose_step_does_not_pickle_is_refused_before_it_reads(read):
+    """A stage declaring processes whose step no process can be handed (a lambda) is refused as it is
+    declared, before any read; on threads it reads."""
+    catalog = Memory([{"id": index} for index in range(4)])
+
+    def reader(pool):
+        chain = Pipeline(catalog).map(lambda row: {**row, "id": int(row["id"]) + 1}, pool=pool).batch(2)
+        return compile(chain, read=read, loading=READ).train(DataPartition())
+
+    with pytest.raises(ValueError):
+        reader("processes")
+    threaded = reader("threads")
+    try:
+        assert [int(value) for value in next(threaded)["id"]] == [1, 2]
+    finally:
+        threaded.close()
+
+
+def test_an_offline_pass_runs_a_declared_process_stage_on_its_pool():
+    """A finite record pass for publication (`iterate`) runs a stage declaring processes in processes
+    other than its own, the records in their order."""
+    chain = Pipeline(Memory([{"id": index} for index in range(9)])).map(ran_where, pool="processes")
+    rows = list(iterate(chain))
+    assert [int(row["id"]) for row in rows] == list(range(9))
+    assert [int(row["square"]) for row in rows] == [index * index for index in range(9)]
+    assert all(int(row["pid"]) != os.getpid() for row in rows)
+
+
+@pytest.mark.parametrize("batched", ["batched", "after batch"])
+def test_a_pool_is_declared_on_a_record_step_alone(batched):
+    """A pool runs a record step; a batched step, or one after `batch`, which runs where its read runs,
+    is refused one."""
+    chain = Pipeline(Memory([{"id": index} for index in range(4)]))
+    with pytest.raises(ValueError):
+        if batched == "batched":
+            chain.map(lambda columns: columns, batched=True, pool="threads")
+        else:
+            chain.batch(2).map(lambda batch: batch, pool="threads")
+
+
+@pytest.mark.parametrize("read", ["streamed", "indexed", "memory"])
+def test_a_stage_on_processes_before_a_cache_is_refused_and_one_on_threads_fills_it(tmp_path, read):
+    """A stage declaring processes before a cache is refused as the read is compiled: a cache fills in its
+    reading process, writing each input as its steps make it, so the processes would be unread; after the
+    cache it reads. One declaring threads, which run in the reading process, fills the cache there, several
+    inputs at once, a streamed read's fill among them (train 977's review, F4). The
+    fill ran the step in the reading process, the declared pool unread (the head review of theme 16, F5),
+    and then threads were refused too (train 967's review, F5)."""
+    catalog = Memory([{"id": index} for index in range(9)], shard_rows=9)
+
+    def first(chain):
+        reader = compile(chain.batch(3), read=read, loading=READ).train(DataPartition())
+        try:
+            return next(reader)
+        finally:
+            reader.close()
+
+    with pytest.raises(ValueError):
+        compile(Pipeline(catalog).map(ran_where, pool="processes", identity="ran_where@1")
+                .cache(str(tmp_path / "a")).batch(3), read=read, loading=READ)
+    after = first(Pipeline(catalog).cache(str(tmp_path / "b")).map(ran_where, pool="processes"))
+    assert [int(value) for value in after["id"]] == [0, 1, 2]
+    ACTIVE.update(now=0, most=0)
+    filled = first(Pipeline(catalog).map(overlapping, pool="threads", identity="overlapping@1")
+                   .cache(str(tmp_path / "c")))
+    assert [int(value) for value in filled["id"]] == [0, 1, 2]
+    assert all(int(pid) == os.getpid() for pid in filled["pid"])
+    # Several inputs filled at once, as the declared threads run them, where one thread read each in turn.
+    assert ACTIVE["most"] > 1
+
+
+ACTIVE = {"now": 0, "most": 0}
+"""How many `overlapping` steps run at once in this process, and the most that ran at once."""
+ACTIVE_LOCK = threading.Lock()
+
+
+def overlapping(row: Mapping) -> dict:
+    """The record beside its process, counted among the steps running at once (`ACTIVE`) while it waits a
+    moment, as a step that waits on IO does."""
+    with ACTIVE_LOCK:
+        ACTIVE["now"] += 1
+        ACTIVE["most"] = max(ACTIVE["most"], ACTIVE["now"])
+    time.sleep(0.2)
+    with ACTIVE_LOCK:
+        ACTIVE["now"] -= 1
+    return {**row, "pid": os.getpid()}
+
+
+def first_where(row: Mapping) -> dict:
+    """The record beside the process its first step ran in."""
+    return {**row, "first": os.getpid()}
+
+
+def second_where(row: Mapping) -> dict:
+    """The record beside the process its second step ran in."""
+    return {**row, "second": os.getpid()}
+
+
+@pytest.mark.parametrize("read", ["streamed", "indexed"])
+def test_adjacent_stages_declaring_one_pool_run_each_record_on_one_process_of_one_pool(read):
+    """Two adjacent stages declaring processes run as one run on one pool: each record crosses to a process
+    once and both steps run there, and the read delivers the records in their order. Each stage ran on a
+    pool of its own, a record crossing processes once a step (train 967's review, F4)."""
+    catalog = Memory([{"id": index} for index in range(12)], shard_rows=12)
+    chain = Pipeline(catalog).map(first_where, pool="processes").map(second_where, pool="processes")
+    reader = compile(chain.batch(3), read=read, loading=READ).train(DataPartition())
+    try:
+        batches = [next(reader) for _ in range(4)]
+    finally:
+        reader.close()
+    assert [int(value) for batch in batches for value in batch["id"]] == list(range(12))
+    assert all(int(first) == int(second) != os.getpid() for batch in batches
+               for first, second in zip(batch["first"], batch["second"], strict=True))
+
+
+def test_a_fetch_on_threads_of_its_own_runs_alone_whatever_pool_the_stage_after_it_shares():
+    """A fetch with threads of its own runs alone on them, whatever pool it declares besides: the stage
+    after it declaring processes runs in processes of its own, not on the fetch's threads in the reader.
+    The two fused into one run, which the fetch's threads ran (theme 18's head review)."""
+    handle = Slow()
+    with serving(handle) as address:
+        catalog = Memory([{"url": f"http://{address}/{index}", "id": index} for index in range(6)],
+                         shard_rows=6)
+        chain = (Pipeline(catalog).filter_map(images.fetch(to="bytes", threads=2), pool="processes")
+                 .map(second_where, pool="processes").batch(2))
+        reader = compile(chain, read="streamed", loading=READ).train(DataPartition())
+        try:
+            batches = [next(reader) for _ in range(3)]
+        finally:
+            reader.close()
+    assert [int(value) for batch in batches for value in batch["id"]] == list(range(6))
+    assert all(int(pid) != os.getpid() for batch in batches for pid in batch["second"])
+
+
+BUILT: collections.Counter[str] = collections.Counter()
+"""How many times this process rebuilt a `BuiltOnce` from its pickle."""
+
+
+class BuiltOnce:
+    """A step that reports how many times its process rebuilt it from a pickle, beside the process."""
+
+    def __reduce__(self):
+        return rebuilt, ()
+
+    def __call__(self, row: Mapping) -> dict:
+        return {**row, "built": BUILT["step"], "pid": os.getpid()}
+
+
+def rebuilt() -> BuiltOnce:
+    """A `BuiltOnce` unpickled in this process, counted."""
+    BUILT["step"] += 1
+    return BuiltOnce()
+
+
+def test_a_process_stage_hands_each_process_its_step_once():
+    """A stage declaring processes hands each process its step once, as the process starts, and each record
+    alone after: every record's process rebuilt the step once. The step was pickled with every record and
+    rebuilt for each (train 967's review, F3)."""
+    # Many records a process, whatever the host's count of processes, so each process is handed several.
+    count = 8 * Pool.declared("processes").size
+    rows = list(iterate(Pipeline(Memory([{"id": index} for index in range(count)])).map(BuiltOnce(),
+                                                                                        pool="processes")))
+    assert [int(row["id"]) for row in rows] == list(range(count))
+    assert {int(row["built"]) for row in rows} == {1}
+    assert all(int(row["pid"]) != os.getpid() for row in rows)
+
+
+DECLARED_IN_MAIN = """import multiprocessing
+
+from dew.data.pipeline import Pipeline
+from dew.data.sources import Memory
+
+
+def step(row):
+    return row
+
+
+try:
+    Pipeline(Memory([{"id": 0}])).map(step, pool="processes")
+except ValueError:
+    print("refused")
+Pipeline(Memory([{"id": 0}])).map(step, pool="threads")
+print("threads")
+# The declaration fixed no start method, which the process may still choose.
+multiprocessing.set_start_method("spawn")
+print("chosen")
+"""
+
+DIES = """import os
+
+
+def dies(row):
+    os._exit(3)
+"""
+
+READ_DYING = """import concurrent.futures.process
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from dying import dies
+
+from dew.data.compile import compile
+from dew.data.dataset import DataPartition, Loading
+from dew.data.pipeline import Pipeline
+from dew.data.sources import Memory
+
+chain = Pipeline(Memory([{"id": index} for index in range(4)])).map(dies, pool="processes").batch(2)
+reader = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+try:
+    next(reader)
+except concurrent.futures.process.BrokenProcessPool:
+    print("raised")
+finally:
+    reader.close()
+"""
+
+
+def test_a_process_stage_no_process_can_rebuild_is_refused_and_a_lost_record_raises(tmp_path):
+    """A step defined in a `__main__` no process started afresh can import (`python -c`, a notebook's cell)
+    is refused on processes as it is declared, and read on threads; and a record whose process dies raises
+    in the read, never waits. Such a step passed the declaration, its process died unpickling it and the
+    read waited forever (train 967's review, F1); and the declaration leaves the process's start method
+    unchosen, which asking spawn chose (train 977's review, F3)."""
+    declared = subprocess.run([sys.executable, "-c", DECLARED_IN_MAIN], capture_output=True, text=True,
+                              check=False, timeout=300)
+    assert declared.returncode == 0, declared.stderr[-3000:]
+    assert declared.stdout.split() == ["refused", "threads", "chosen"]
+    (tmp_path / "dying.py").write_text(DIES)
+    read = subprocess.run([sys.executable, "-c", READ_DYING, str(tmp_path)], capture_output=True, text=True,
+                          check=False, timeout=300)
+    assert read.returncode == 0, read.stderr[-3000:]
+    assert read.stdout.split()[-1:] == ["raised"]
+
+
+def test_an_elastic_read_runs_a_pooled_map_on_its_pool():
+    """An elastic read's map on processes runs on its pool, in processes other than the reader's, and the
+    read delivers what the in-process map delivers. The elastic read ran a trailing map inline in its
+    reader, the declared pool unread (the head review of theme 16, F4)."""
+    catalog = Memory([{"id": index} for index in range(8)], shard_rows=8)
+
+    def reader(pool):
+        chain = Pipeline(catalog).map(ran_where, pool=pool).batch(2).elastic()
+        return compile(chain, read="streamed", loading=READ).train(DataPartition())
+
+    pooled, plain = reader("processes"), reader(None)
+    try:
+        batches, expected = [next(pooled) for _ in range(3)], [next(plain) for _ in range(3)]
+    finally:
+        pooled.close()
+        plain.close()
+    assert [int(value) for batch in batches for value in batch["id"]] == [
+        int(value) for batch in expected for value in batch["id"]]
+    assert all(int(pid) != os.getpid() for batch in batches for pid in batch["pid"])
