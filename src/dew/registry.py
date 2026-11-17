@@ -261,13 +261,23 @@ def import_trusted(record: JSON | Mapping[str, object], trust: Sequence[str]) ->
     _TRUSTED.update(trust)
     trust_sources(trust)
     for package in trust:
-        if package.replace(".", "").isidentifier():
+        # A name shaped as a package may name a source directory alone (`trusts_source`), which no module
+        # path holds: only a module the process can import is imported.
+        if package.replace(".", "").isidentifier() and _importable(package):
             importlib.import_module(package)
     # Only JSON a record holds (`json_value` refuses any other), its every string read once.
     for named in strings_of(json_value(record, "record")):
         module, colon, name = named.partition(":")
         if colon and name and module.split(".")[0] in trust and module.replace(".", "").isidentifier():
             importlib.import_module(module)
+
+
+def _importable(name: str) -> bool:
+    """Whether the module `name` is one the process can import: its package's, then its own, found on the
+    module path (`importlib.util.find_spec`)."""
+    parts = name.split(".")
+    return all(importlib.util.find_spec(".".join(parts[:end])) is not None
+               for end in range(1, len(parts) + 1))
 
 
 class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
