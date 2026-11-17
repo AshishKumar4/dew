@@ -352,11 +352,15 @@ def gated_draw(seed):
             jnp.asarray(rng.uniform(0.05, 0.95, TOKENS), jnp.float32))
 
 
-def gated_tokenwise(update_fn):
+def gated_tokenwise(update_fn, reads: str = "after"):
+    """A gated rule `update_fn` token by token, its outputs and final state, each token reading the state
+    after its update or, `reads` "apart", after its decay before its own write (`Scan.reads` at a group of
+    one: `exp(g) h`, each key's row by its own decay where `g` is a key's)."""
     def run(q, k, v, g, beta):
         def one(h, token):
+            decayed = jnp.reshape(jnp.exp(token[3]), (-1, 1)) * h
             h = update_fn(h, *token)
-            return h, gated_readout(h, *token)
+            return h, gated_readout(h if reads == "after" else decayed, *token)
 
         final, outputs = jax.lax.scan(one, jnp.zeros((KEY, VALUE), q.dtype), (q, k, v, g, beta))
         return outputs, final
@@ -901,13 +905,14 @@ def assert_adjoint(forms, tokenwise_fn, names: tuple[str, ...], chunked, draw_fn
     assert_as_exact(jax.jit(as_derived), jax.jit(as_tokens), draw_with_cotangents, label, seeds=seeds)
 
 
-def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16) -> None:
-    """`forms`' chunk adjoint of the delta rule `update_fn`, on par with its token scan's
-    (`assert_adjoint`)."""
+def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16,
+                         reads: str = "after") -> None:
+    """`forms`' chunk adjoint of the delta rule `update_fn`, on par with its token scan's, each token reading
+    as `reads` (`gated_tokenwise`, `assert_adjoint`)."""
     def chunked(values, index):
         return {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
 
-    assert_adjoint(forms, gated_tokenwise(update_fn), ("q", "k", "v", "g", "beta"), chunked, draw_fn,
+    assert_adjoint(forms, gated_tokenwise(update_fn, reads), ("q", "k", "v", "g", "beta"), chunked, draw_fn,
                    ((TOKENS, VALUE), (KEY, VALUE)), label, seeds)
 
 
@@ -1245,3 +1250,23 @@ def test_a_group_beside_a_readout_that_reads_none_of_it_is_refused(reads):
     forms = scan.derive_scan(dataclasses.replace(DECLARED, reads=reads, group=2), saturation=SATURATION)
     with pytest.raises(scan.Refused):
         forms.prepare(chunk_of(operands(*draw(0)), 0))
+
+
+@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
+    (gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)], ids=["gated_delta", "kimi_delta"])
+def test_a_delta_rule_reading_apart_from_its_own_write_reads_its_decayed_entering_state(update_fn, operands,
+                                                                                       draw_fn):
+    """The gated delta rule and Kimi's delta attention, each token reading the state after its decay before
+    its own corrected write (`Scan.reads` "apart", a group of one: a single-rank Mamba-3 under the delta
+    rule, row 7608): their chunks walked and their adjoint walked back on par with the token-by-token scan
+    reading `exp(g) h`, outputs, final state and every operand's gradient, against the float64 truth (check
+    1); a group of two beside the correction is refused."""
+    declared = scan.Scan(update_fn, gated_readout, operands, walked="time", state=((KEY, VALUE), jnp.float32),
+                         reads="apart")
+    forms = scan.derive_scan(declared, saturation=SATURATION)
+    assert_as_exact(jax.jit(gated_walk(forms, operands)), jax.jit(gated_tokenwise(update_fn, "apart")),
+                    draw_fn, f"{update_fn.__name__} apart", seeds=16)
+    assert_delta_adjoint(forms, update_fn, draw_fn, f"{update_fn.__name__} apart adjoint", reads="apart")
+    grouped = scan.derive_scan(dataclasses.replace(declared, group=2), saturation=SATURATION)
+    with pytest.raises(scan.Refused):
+        gated_walk(grouped, operands)(*draw_fn(0))
