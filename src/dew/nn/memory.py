@@ -84,7 +84,7 @@ from flax.linen.transforms import lift_direct_transform
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.batch import prefix_sum, valid_order
+from dew.batch import Coordinates, prefix_sum, valid_order
 from dew.newton_schulz import NEWTON_SCHULZ, newton_schulz
 from dew.nn import linear
 from dew.nn.dense import Dense
@@ -288,7 +288,8 @@ class InContextMemory(LinearProducts):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
-    reads: ClassVar[frozenset[str]] = frozenset()
+    reads: ClassVar[frozenset[str]] = frozenset({"forks"})
+    """A call's forks, which its shared recurrence reads (`_recurrent`) and its general path refuses."""
 
     def __post_init__(self):
         if self.chunk < 1:
@@ -422,22 +423,31 @@ class InContextMemory(LinearProducts):
         steps = _Steps(query.astype(wide), key.astype(wide), value.astype(wide), theta, mu, a, real, places,
                        self._keys(x))
         hooks, segments = self._route(), tokens.max_segments
+        if tokens.forks is not None and hooks is None:
+            raise ValueError(
+                "an in-context memory reads a call over forks on its shared recurrence alone, whose state "
+                "and W_0 share a fork's document continues from its parent (`InContextMemory._recurrence`); "
+                "this call's heads compute off it (`_route`: a quantized or nonlinear product), whose "
+                "general path steps each document's weights from its own start")
         # A cached call's tokens at their places in the row's document, which the cache counts, and its
         # rounding stream from the row's key where the call brings none (`_cached`).
         cached, counted = self._cached(steps) if call.decode else (None, None)
         if cached is not None and self._recurrence() is not None:
             # A linear memory's cache holds the recurrence's state on either route: the route may change
             # between the calls one cache serves, as an adapter's dropout does with the dropout stream.
-            read = self._recurrent_decoded(hooks, heads, steps._replace(keys=cached.keys), log_kept, segments)
+            read = self._recurrent_decoded(hooks, heads, steps._replace(keys=cached.keys), log_kept, segments,
+                                           tokens)
         elif hooks is not None:
-            read = self._recurrent(hooks, heads, steps, log_kept, max_segments=segments)[0]
+            read = self._recurrent(hooks, heads, steps, log_kept, max_segments=segments,
+                                   coordinates=tokens)[0]
         elif cached is not None:
             read = self._decoded(heads, cached)
         elif tokens.max_segments > 1:
             read = self._stepped(heads, steps)[0]
         else:
             read = self._chunked(heads, steps)
-        if counted is not None:
+        # A call over forks leaves the cache as it was, its count too (`_recurrent`).
+        if counted is not None and tokens.forks is None:
             counted()
         # In the dtype its projections compute in: the layer's, or its query's (an unprojected one's the
         # stream's).
@@ -474,6 +484,12 @@ class InContextMemory(LinearProducts):
         hooks = self._recurrence()
         return (*(DELTA_RESIDUALS if hooks is not None and hooks.delta else ()), *MEMORY_RESIDUALS)
 
+    @property
+    def recurrent(self) -> bool:
+        """Whether its configuration is a row of the shared linear recurrence (`_recurrence`), the one path
+        of it that reads a call's forks; a call's wrappers may still take its heads off it (`_route`)."""
+        return self._recurrence() is not None
+
     def _route(self) -> recurrence.Hooks | None:
         """This call's row of the shared linear recurrence (`_recurrence`), or None where its
         configuration is none or a head computes other than the linear map of its input by the kernel
@@ -507,14 +523,18 @@ class InContextMemory(LinearProducts):
 
     def _recurrent(self, hooks: recurrence.Hooks, heads: tuple[_Head, ...], steps: _Steps,
                    log_kept: jax.Array, *, max_segments: int, held: jax.Array | None = None,
-                   kept: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
+                   kept: jax.Array | None = None,
+                   coordinates: Coordinates | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
         """The readouts `[B, S, H, F]` of a linear memory through the shared recurrence, its state after
         them `[B, H, F, F]` and each token's log of the share of W_0 its document keeps `[B, S, H]`: the
         recurrence's chunked op, or its decode step for a cached call of one token, continuing the state
         `held` and the share `kept` `[B, H]` a cache holds. The recurrence starts each document from
         zero, so W_0 enters as its own term (the module docstring), each head's network at its W_0 over
         a token's views: an adapter's branch on its kernel included, which the recurrence's state never
-        holds."""
+        holds. A call over forks (`coordinates`' `Forks`) runs each document from the state its parent's
+        tokens leave and its share past theirs, a root from the row's (`held` and `kept`, else zero), as
+        its own row of its ancestors and itself runs (`linear.forked_scan`, `_forked_shares`); it leaves
+        the cache as it was, its state after `held`."""
         real = steps.real
         # A padding token neither steps nor decays the memory.
         beta = jnp.where(real[..., None], steps.theta, 0.0)
@@ -528,6 +548,21 @@ class InContextMemory(LinearProducts):
 
         value = steps.value - read_w0(steps.key, GRADIENT) if hooks.delta else steps.value
         begins, continued = _documents(steps)
+        wide = at_least_fp32(self.dtype)
+        if coordinates is not None and coordinates.forks is not None:
+            def forked_rule(views, *, valid, starts, state, loads, stores, held):
+                queries, keys, values = views
+                return recurrence_chunk.chunk(hooks, recurrence_chunk.Chunk(
+                    queries, keys, values, log_decay=jnp.where(valid[..., None], log_decay, 0.0),
+                    beta=jnp.where(valid[..., None], beta, 0.0), state=state, starts=starts, loads=loads,
+                    stores=stores, held=held), max_segments=max_segments)
+
+            features = steps.key.shape[-1]
+            start = linear.fork_start(held, (real.shape[0], self.heads, features, features), wide)
+            out = linear.forked_scan((steps.query, steps.key, value), forked_rule, coordinates, start)
+            share = _forked_shares(log_decay, real, begins, coordinates,
+                                   jnp.zeros((real.shape[0], self.heads), wide) if kept is None else kept)
+            return out.astype(wide) + jnp.exp(share)[..., None] * read_w0(steps.query, READ), start, share
         if held is not None and real.shape[1] == 1:
             # The shared decode dispatch: its step kernel where it takes the state, else the portable
             # step in the memory's own precision.
@@ -542,11 +577,10 @@ class InContextMemory(LinearProducts):
         share = within_documents(log_decay, begins)
         if kept is not None:
             share = share + jnp.where(continued[..., None], kept[:, None], 0.0)
-        wide = at_least_fp32(self.dtype)
         return out.astype(wide) + jnp.exp(share)[..., None] * read_w0(steps.query, READ), state, share
 
     def _recurrent_decoded(self, hooks: recurrence.Hooks | None, heads: tuple[_Head, ...], steps: _Steps,
-                           log_kept: jax.Array, max_segments: int) -> jax.Array:
+                           log_kept: jax.Array, max_segments: int, coordinates: Coordinates) -> jax.Array:
         """A linear memory's cached call, the cache holding the recurrence's state (`STATE`) and the log
         of W_0's share each row's document keeps (`KEPT`), zero for a fresh row, on either route: the
         recurrence's (`_recurrent`), or, where this call takes a head off it (`hooks` None), the
@@ -562,9 +596,11 @@ class InContextMemory(LinearProducts):
             reads, state, share = self._stepped_from_recurrence(heads, steps, log_kept, held, share_kept)
         else:
             reads, state, share = self._recurrent(hooks, heads, steps, log_kept, max_segments=max_segments,
-                                                  held=held, kept=share_kept)
+                                                  held=held, kept=share_kept, coordinates=coordinates)
         kept(cache[STATE], state, STATE)
-        kept(cache[KEPT], _at_last(share, steps.real, share_kept), KEPT)
+        # A call over forks leaves the cache as it was (`_recurrent`): no document's share is the row's.
+        kept(cache[KEPT], (share_kept if coordinates.forks is not None
+                           else _at_last(share, steps.real, share_kept)), KEPT)
         return reads
 
     def _stepped_from_recurrence(self, heads: tuple[_Head, ...], steps: _Steps, log_kept: jax.Array,
@@ -898,6 +934,25 @@ def _documents(steps: _Steps) -> tuple[jax.Array, jax.Array]:
     every one up to its second document's first: in a cached call, the document its row holds."""
     begins = steps.real & (steps.places == 0)
     return begins, prefix_sum(begins, dtype=jnp.int32) <= 1
+
+
+def _forked_shares(log_decay: jax.Array, real: jax.Array, begins: jax.Array, coordinates: Coordinates,
+                   start: jax.Array) -> jax.Array:
+    """Each token's log of the share of W_0 its document keeps `[B, S, H]` in a call over forks
+    (`Coordinates.forks`): its own document's log decays `log_decay` `[B, S, H]` up to it from its first
+    real token (`begins` `[B, S]`), past every real token of each document its chain continues
+    (`Forks.ancestors`), whole, and the row's start's share `start` `[B, H]` (a cached call's kept share,
+    zero in an uncached one), as the token's own row of its ancestors and itself keeps it."""
+    forks = coordinates.forks
+    assert forks is not None and coordinates.segments is not None
+    documents = jnp.asarray(coordinates.segments, jnp.int32)
+    rows = jnp.arange(documents.shape[0])[:, None]
+    # Each document's whole log decay, by its number (0, padding, none), and each one's entering share.
+    totals = jnp.zeros((documents.shape[0], forks.count + 1, log_decay.shape[-1]), log_decay.dtype).at[
+        rows, documents].add(jnp.where(real[..., None], log_decay, 0.0)).at[:, 0].set(0.0)
+    entering = start[:, None] + jnp.sum(totals[rows[..., None], forks.ancestors()], axis=2)
+    return (within_documents(log_decay, begins)
+            + jnp.take_along_axis(entering, jnp.maximum(documents - 1, 0)[..., None], axis=1))
 
 
 def _at_last(values: jax.Array, real: jax.Array, held: jax.Array) -> jax.Array:

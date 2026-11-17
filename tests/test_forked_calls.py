@@ -27,6 +27,9 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.engram import Engram, PLELayer
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.inputs import MixerCall
+from dew.nn.memory import Gate, InContextMemory, LinearMemory, Objective
+from dew.nn.mixers import AttentionMixer
+from dew.nn.mixers.memory import InContextMemoryMixer
 from dew.objectives.lm.objective import LMObjective
 
 VOCAB = 37
@@ -57,9 +60,14 @@ RECURRENT = {
     "mamba2": {"num_heads": 16, "head_dim": 8, "state_size": 8, "n_groups": 1, "chunk_size": 4},
     "short_conv": {"conv_L_cache": 3},
     "lightning_attention": {"block_size": 4},
-    "mamba3": {"head_dim": 8, "state_size": 8, "chunk_size": 4}}
+    "mamba3": {"head_dim": 8, "state_size": 8, "chunk_size": 4},
+    "memory": {"memory": InContextMemory(network=LinearMemory(), objective=Objective("dot"),
+                                         retention=Gate(bias=-2.0), heads=2, head_features=8, chunk=4,
+                                         normalize=True, learning_rate=Gate(scale=0.1))}}
 """The mixers holding row state that read forks, at toy size: Qwen3.5's gated delta net, Kimi's delta
-attention, Mamba-1, -2 and -3, LFM2's gated short convolution and MiniMax's lightning attention."""
+attention, Mamba-1, -2 and -3, LFM2's gated short convolution, MiniMax's lightning attention and an
+in-context memory on the shared recurrence, gated linear attention's (a linear memory on the dot objective
+with a retention gate: its state and the share of W_0 it keeps, each carried over a fork)."""
 
 MLA = {"q_lora_rank": 8, "kv_lora_rank": 8, "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8}
 """DeepSeek's latent attention at toy size, dense (no indexer), as Kimi Linear's full-attention layers
@@ -182,6 +190,41 @@ def test_rows_whose_shared_prefix_needs_more_documents_than_a_window_holds_are_l
         tokens = np.asarray(forks.tokens).reshape(-1)
         for number, row in enumerate(rows):
             assert list(tokens[np.asarray(forks.index[number, :len(row)])]) == row
+
+
+def test_a_memory_whose_products_a_wrapper_makes_nonlinear_lays_its_rows_whole():
+    """An in-context memory on its shared recurrence reads forks (`RECURRENT`'s), but a wrapper whose
+    products are not linear takes its heads off the recurrence (`InContextMemory._route`), the one path
+    of it that reads them (`dew.registry.Wrapper.keeps_products_linear`, `MixerBase.wrapped_fork_refusal`):
+    a quantized training's decoder lays its rows whole (`shares_prefixes`) and its call over forks is
+    refused, as a served quantization's decoder and a parallel layer's memory branch are; an adapter
+    reads them but in training under its dropout, as the decoder unwrapped runs them."""
+    pytest.importorskip("qwix")
+    from dew.lora import LoRA
+    from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
+    from dew.quantization import Quantization, quantize_for_serving
+
+    forks, ones = ForkedRows.pack(ROWS, WIDTH), jnp.ones((1, WIDTH), jnp.int32)
+    model = hybrid_model("memory")
+    params = model.init(jax.random.key(0), ones)
+    quantizing = Quantization(patterns=(r"(.*/)?head_\d+/.*",))
+    quantized = quantizing.apply(model)
+    assert LMObjective(model, WIDTH - 1).shares_prefixes(train=True)
+    assert not LMObjective(quantized, WIDTH - 1).shares_prefixes()
+    model.apply(params, forks.tokens, coordinates=forks.coordinates)
+    with pytest.raises(ValueError):
+        quantized.apply(quantized.init(jax.random.key(0), ones), forks.tokens, coordinates=forks.coordinates)
+    served, _ = quantize_for_serving(model, params, quantizing, ones)
+    assert served.fork_refusal() is not None
+    memory = InContextMemoryMixer(RECURRENT["memory"]["memory"])
+    parallel = hybrid_model("memory").clone(kinds={"linear_attention": LayerKind(mixer=ParallelMixer(
+        branches=(ParallelBranch("memory", memory), ParallelBranch("attention", AttentionMixer()))))})
+    assert parallel.fork_refusal() is None
+    assert quantizing.apply(parallel).fork_refusal() is not None
+    for dropout, refused in ((0.0, False), (0.1, True)):
+        adapted = LoRA(rank=2, modules=("o_proj",), dropout=dropout).apply(model, params, key=0).model
+        assert adapted.fork_refusal() is None
+        assert (adapted.fork_refusal(train=True) is not None) == refused, dropout
 
 
 def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():

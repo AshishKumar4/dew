@@ -21,13 +21,28 @@ class InContextMemoryMixer(MixerBase):
     memory: InContextMemory
 
     def fork_refusal(self) -> str | None:
-        """Why the layer reads no forks (`MixerBase.fork_refusal`): no path of the memory continues a
-        fork's document from its parent. On the shared recurrence (`InContextMemory._recurrence`) that
-        is the recurrence's state through the forks' table (`dew.nn.linear.forked_scan`, as lightning's)
-        and the share of W_0 the parent's tokens kept, which no path carries over a fork yet; on the
-        general path each document's weights step from its own start, its chunks counted per document."""
-        return ("an in-context memory continues no fork's document from its parent: neither its recurrence's "
-                "state and W_0 share nor its general path's weights are carried over forks")
+        """Why the layer reads no forks (`MixerBase.fork_refusal`), None where it does: a memory on the
+        shared recurrence (`InContextMemory.recurrent`) continues a fork's document from the state its
+        parent's tokens leave, through the forks' table (`dew.nn.linear.forked_scan`, as lightning's), and
+        from the share of W_0 they kept; the general path steps each document's weights from its own
+        start, its chunks counted per document, which no fork continues. A call's wrappers that take a
+        recurrent memory's heads off the recurrence (a quantized or nonlinear product) are refused where
+        the call reads forks (`InContextMemory.__call__`)."""
+        if self.memory.recurrent:
+            return None
+        return ("an in-context memory off its shared recurrence continues no fork's document from its "
+                "parent: its general path steps each document's weights from its own start")
+
+    def wrapped_fork_refusal(self) -> str | None:
+        """Why the layer reads no forks under a wrapper whose products are not linear
+        (`MixerBase.wrapped_fork_refusal`): a quantized kernel, a rounded input or an adapter's dropout
+        takes the memory's heads off its shared recurrence (`InContextMemory._route`), the one path of it
+        that reads them, wherever its sites reach the heads, which only the bound model's scopes tell
+        (`dew.quantization.Quantization.rule_for`); so the decoder lays its rows whole under any such
+        wrapper, a correct run that shares no prefix."""
+        return ("a wrapper whose products are not linear (a quantization's, an adapter's dropout in "
+                "training) may take an in-context memory's heads off its shared recurrence, the one path of "
+                "it that reads forks")
 
     def marks(self) -> tuple[str, ...]:
         """The residuals of every path the memory's configuration can take (`InContextMemory.residuals`):
