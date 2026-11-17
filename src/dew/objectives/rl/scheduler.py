@@ -594,11 +594,6 @@ class Scorer(Protocol):
     def shares_prefixes(self, train: bool = False) -> bool: ...
 
 
-PAGE_SIZE = 16
-"""The slots a page of a served rollout's cache holds where neither the run nor the model's layout names
-one (`RolloutScheduler.serve`): vLLM's default block, small beside a prompt so a group shares most of it."""
-
-
 class RolloutScheduler:
     """Admits complete groups of rollouts from `acquisition` and packs them into the trainer's batches.
 
@@ -770,23 +765,13 @@ class RolloutScheduler:
     @staticmethod
     def serve(policy: TextGeneration, *, slots: int, capacity: int, page_size: int | None = None) -> Server:
         """The server a served rollout draws `policy`'s completions from (`served`): `slots` rows of
-        `capacity` slots, its cache in pages of `page_size` slots, or of the model's own layout's or
-        `PAGE_SIZE` where none is named and paging computes what the model computes (`serves_paged`), its
-        prefix cache then on as a paged server keeps one by default wherever the model admits it, so a
-        group's samples of one prompt prefill it once (row 5375); each row's cache whole where the model
-        does not page."""
-        from dew.inference.serving import Server, serves_paged
-        from dew.nn.kv_cache import KVCache
-        from dew.nn.protocols import Layered
+        `capacity` slots, its cache paged as `paged_layout` lays it, in pages of `page_size` slots where
+        given and wherever the model pages where not, so a group's samples of one prompt prefill it once
+        (row 5375); each row's cache whole where the model does not page."""
+        from dew.inference.serving import Server, paged_layout
 
-        # The policy's own cache layout, its format kept.
-        declared = policy.model.kv_cache if isinstance(policy.model, Layered) else KVCache()
-        if page_size is None:
-            if not serves_paged(policy.model):
-                return Server.from_task(policy, slots=slots, capacity=capacity)
-            page_size = declared.page_size or PAGE_SIZE
         return Server.from_task(policy, slots=slots, capacity=capacity,
-                                kv_cache=dataclasses.replace(declared, page_size=page_size))
+                                kv_cache=paged_layout(policy.model, page_size))
 
     @classmethod
     def episodes(cls, policy: EpisodeInference, environment: EnvironmentFactory, verifier: Verifier, *,
@@ -796,9 +781,16 @@ class RolloutScheduler:
                  log: Callable[[SchedulerRecord], None] | None = None) -> RolloutScheduler:
         """Collect `groups` tool episodes of each `task_id` row at every call, in lock step under the
         step's variables, and train `objective` on them (`EpisodeCollector`; truncated episodes are
-        masked), a group's prompt packed once where it shares (`scorer`)."""
+        masked), a group's prompt packed once where it shares (`scorer`). A `TextGeneration` policy
+        drawing one row a prompt, whose model pages (`paged_layout`), serves its cohort's turns over a
+        paged cache (`EpisodeCollector.kv_cache`): each turn prefills only what follows its row's history,
+        where the policy drawn whole prefilled every turn's history again (row 5374)."""
+        from dew.inference.serving import paged_layout
+        from dew.inference.tasks import TextGeneration
+
+        layout = paged_layout(policy.model) if isinstance(policy, TextGeneration) and policy.n == 1 else None
         collector = EpisodeCollector(policy, environment, verifier, max_prompt_tokens, max_new_tokens,
-                                     max_turns, sampling, record, journal)
+                                     max_turns, sampling, record, journal, kv_cache=layout)
         return cls(Synchronous(collector), groups=groups, credit=credit, log=log, scorer=objective)
 
     @property

@@ -605,10 +605,25 @@ def _unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bool = Fa
     return None
 
 
-def serves_paged(model: nn.Module) -> bool:
-    """Whether a server paging its cache computes what `model` computes (`_unserved_modes`): a caller that
-    names no layout of its own pages where it does (`dew.objectives.rl.RolloutScheduler.serve`)."""
-    return _unserved_modes(model, paged=True) is None
+PAGE_SIZE = 16
+"""The slots a page holds where neither a caller nor the model's layout names a page size
+(`paged_layout`): vLLM's default block, small beside a prompt so the requests sharing it share most of
+it."""
+
+
+def paged_layout(model: nn.Module, page_size: int | None = None) -> KVCache | None:
+    """The paged cache layout a server takes for `model` where its caller names no layout of its own (a
+    served rollout's, `dew.objectives.rl.RolloutScheduler.serve`, and an episode cohort's,
+    `RolloutScheduler.episodes`): the model's own layout, its format kept, in pages of `page_size` slots;
+    where none is named, of the layout's own page size or `PAGE_SIZE`, and None, the rows kept whole, where
+    paging would change what the model computes (`_unserved_modes`). Its prefix cache on as a paged server
+    keeps one by default, the requests over one prompt prefill it once (rows 5374, 5375)."""
+    declared = model.kv_cache if isinstance(model, Layered) else KVCache()
+    if page_size is None:
+        if _unserved_modes(model, paged=True) is not None:
+            return None
+        page_size = declared.page_size or PAGE_SIZE
+    return dataclasses.replace(declared, page_size=page_size)
 
 
 def _served_mesh(task: TextGeneration) -> Mesh | None:
