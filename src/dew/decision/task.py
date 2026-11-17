@@ -1552,6 +1552,8 @@ class _Admitted:
 
     questions: dict[str, Question]
     rows: tuple[Encoded, ...]
+    context_tokens: int = 0
+    """The tokens of the body's own context, whole, which its answer states beside those it read."""
 
 
 @dataclass(frozen=True)
@@ -1699,11 +1701,13 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
                                  f"{decide.layout.max_len} tokens, without cutting its {cut}")
         with self.counting:
             self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
-        return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
+        return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows),
+                                                      usage.context_tokens))
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
-        return self.decide._wire_response(payload.questions,
-                                          *self.decide._replied(payload.questions, payload.rows, outputs),
+        answers, usage = self.decide._replied(payload.questions, payload.rows, outputs)
+        return self.decide._wire_response(payload.questions, answers,
+                                          replace(usage, context_tokens=payload.context_tokens),
                                           details=self.details)
 
 
