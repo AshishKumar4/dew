@@ -1513,9 +1513,9 @@ def _held(found: list, program: jax.stages.Lowered) -> None:
             tuning.store_verdict(device.device_kind, key, kernels)
 
 
-def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashable], str]]
-             ) -> list[tuple[tuple[str, Hashable], str]]:
-    """Each of `refusals` (a launch's identity and config, and its spilling kernel's name) that `program`,
+def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashable], Refused]]
+             ) -> list[tuple[tuple[str, Hashable], Refused]]:
+    """Each of `refusals` (a launch's identity and config, and its spilling kernel, `Refused`) that `program`,
     relowered under them, launches again: its launch's derivation did not read the refusal. Each is logged,
     so the launch whose rule ignores its refusals is named."""
     from dew.nn.kernels.lowered import kernel_calls
@@ -1524,7 +1524,7 @@ def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashab
     launched = {(launch.identity, launch.config) for call in kernel_calls(program, unrun=True)
                 if (launch := called(call)) is not None}
     untaken = [(refusal, kernel) for refusal, kernel in refusals if refusal in launched]
-    for (_, config), kernel in untaken:
+    for (_, config), (kernel, _) in untaken:
         _log.warning("kernel %s's refusal at %s did not take: the program relowered under it launches it "
                      "again, its launch's derivation not reading it", kernel, config)
     return untaken
