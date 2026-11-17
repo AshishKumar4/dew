@@ -64,6 +64,18 @@ def _threads(stages: Sequence[Stage]) -> int | None:
     return max(pools, default=None)
 
 
+def declared_pool(stage: Stage) -> PoolKind | None:
+    """The pool a record stage declares its step runs on (`Map.pool`, `FlatMap.pool`); None where it
+    declares none."""
+    return stage.pool if isinstance(stage, (Map, FlatMap)) else None
+
+
+def fetches_on_own_threads(stage: Stage) -> bool:
+    """Whether `stage` is a fetch with threads of its own (`Fetch.threads`), which runs alone on them,
+    whatever pool it declares besides (`lowering._run`)."""
+    return _threads((stage,)) is not None
+
+
 def pooled(stage: Stage) -> bool:
     """Whether `stage` runs its records on a pool of its own (`pool_of`): a fetch with threads of its own,
     or a record stage that declares its pool."""
@@ -73,7 +85,8 @@ def pooled(stage: Stage) -> bool:
 def pool_of(stages: Sequence[Stage]) -> Pool | None:
     """The pool a run of `stages` runs its records on, several at once (`Pool`): a fetch's threads
     (`Fetch.threads`), or the pool a record stage declares (`Map.pool`, `FlatMap.pool`), sized by the host;
-    None where none runs on one. Such a stage runs alone (`lowering._run`)."""
+    None where none runs on one. A fetch runs alone on its threads, and adjacent stages declaring one pool
+    run on one (`lowering._run`)."""
     threads = _threads(stages)
     if threads is not None:
         return Pool("threads", threads)

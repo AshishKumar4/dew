@@ -84,7 +84,9 @@ from dew.data.handoff import (
     _Spread,
     _Ungrouped,
     _Unspread,
+    declared_pool,
     draws_after_expansion,
+    fetches_on_own_threads,
     pool_of,
     record_stage_of,
 )
@@ -512,8 +514,9 @@ def _run(
     The run's one random stage draws from the rng Grain hands its operator, keyed by the record's
     place in what that operator reads, as it would lowered alone: so a stage before it that drops
     records (counted out by `Accepted`, unless they go on `marked`) or expands them ends the run,
-    as does a second random stage. A stage on a pool of its own (a fetch's threads, a declared pool,
-    `pool_of`) runs alone on it.
+    as does a second random stage. A fetch with threads of its own runs alone on them (`pool_of`); a run
+    of stages that declare one pool (`Map.pool`) runs on one pool of it, each record crossing to it once,
+    and a stage that declares none, or another, ends it.
     Over `indexed` rows the steps before an expansion run by index, on the read's threads, and the
     expansion and the steps after it read them as a stream (`_expanded`)."""
     run: list[RecordStage] = []
@@ -521,8 +524,10 @@ def _run(
     for stage in stages[start:stop]:
         if not record_stage_of(stage):
             break
-        if pool_of((stage,)) is not None:
+        if fetches_on_own_threads(stage):
             return tuple(run) or (stage,)
+        if run and declared_pool(stage) != declared_pool(run[0]):
+            break
         if isinstance(stage, RandomMap):
             if drawn or counted:
                 break
@@ -1522,13 +1527,9 @@ class _Build:
             kept = (_as_iter(single, self.loading) if marked
                     else Accepted(_as_iter(single, self.loading), _name(pipeline), _label(pipeline)))
             return kept, cache + 1, None
-        # A stage on a thread pool of its own among the cached steps reads that many inputs at once (a
-        # process pool before an indexed read's cache is refused as the read is analyzed).
-        pooled = prefix.pool
-        threads = max(self.loading.threads, 0 if pooled is None else pooled.size)
-        read = dataclasses.replace(self.loading, threads=threads,
-                                   read_buffer=max(self.loading.read_buffer, threads))
-        flat = gx.FlatMapIterDataset(_as_iter(view, read), _CachedOutputs())
+        # A stage on a thread pool of its own among the cached steps reads that many inputs at once, as the
+        # read's threads do (`dew.data.compile._build`).
+        flat = gx.FlatMapIterDataset(_as_iter(view, self.loading), _CachedOutputs())
         return (flat if marked else Accepted(flat, _name(pipeline), _label(pipeline))), cache + 1, None
 
     @property

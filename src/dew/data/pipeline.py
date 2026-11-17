@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import io
 import itertools
 import math
 import pickle
@@ -708,9 +709,11 @@ class Map:
 
 
 def _pooled(steps: Sequence[_Step], pool: PoolKind | None) -> None:
-    """Refuse, as the stage is declared, a pool its steps cannot run on: a process pool for a step that
-    does not pickle, which no process could be handed (a configuration that cannot run), or any pool for a
-    cut into chunks, whose counts the reading process keeps (`Chunked`), or a configured step."""
+    """Refuse, as the stage is declared, a pool its steps cannot run on: a process pool for a step no process
+    it starts could be handed (a configuration that cannot run): one that does not pickle, or one that
+    pickles by a name in `__main__` where that is no module a process started afresh can import (a
+    notebook's cell, `python -c`: `_main_named`); or any pool for a cut into chunks, whose counts the
+    reading process keeps (`Chunked`), or a configured step."""
     from dew.data.text import Chunks
 
     if pool is None:
@@ -720,11 +723,50 @@ def _pooled(steps: Sequence[_Step], pool: PoolKind | None) -> None:
             raise ValueError(f"{_named_step(step)} runs where its read runs; it takes no pool")
         if pool == "processes":
             try:
-                pickle.dumps(step)
+                named = _main_named(step)
             except (pickle.PicklingError, TypeError, AttributeError) as error:
                 raise ValueError(f"{_named_step(step)} runs on processes (pool='processes'), and it does not "
                                  f"pickle ({error}); run it on threads (pool='threads'), or define it at a "
                                  "module's top level") from error
+            if named and not _main_importable():
+                raise ValueError(f"{_named_step(step)} runs on processes (pool='processes'), and it reaches "
+                                 f"{named} of __main__, which no process it starts can import (a notebook's "
+                                 "cell, python -c); define them in a module, or run it on threads "
+                                 "(pool='threads')")
+
+
+class _MainNames(pickle.Pickler):
+    """A pickler noting each class and function it pickles by its name in `__main__` (`named`), which a
+    process unpickling it imports `__main__` to find."""
+
+    def __init__(self, file: io.BytesIO):
+        super().__init__(file)
+        self.named: list[str] = []
+
+    def persistent_id(self, pickled) -> None:
+        # Every object pickled passes here first; None pickles it as pickle would.
+        if isinstance(pickled, type | types.FunctionType) and pickled.__module__ == "__main__":
+            self.named.append(pickled.__qualname__)
+
+
+def _main_named(step: _Step) -> list[str]:
+    """The classes and functions of `__main__` that `step` pickles by name (`_MainNames`)."""
+    pickler = _MainNames(io.BytesIO())
+    pickler.dump(step)
+    return pickler.named
+
+
+def _main_importable() -> bool:
+    """Whether a process started afresh imports this one's `__main__` (by its file or its module's name, as
+    `multiprocessing.spawn` prepares a child), which a notebook, `python -c` and a package's `__main__`
+    run with `-m` give it none of. A name defined only under `if __name__ == "__main__":` passes here and
+    fails the read as its process dies (`dew.data.concurrent._Processes`)."""
+    import multiprocessing.spawn
+
+    prepared = multiprocessing.spawn.get_preparation_data("dew")
+    # A main run as a package's `__main__` (`python -m package`) is one spawn does not import again.
+    named = str(prepared.get("init_main_from_name", "__main__"))
+    return "init_main_from_path" in prepared or not (named == "__main__" or named.endswith(".__main__"))
 
 
 def examples_bound(stages: Sequence[object]) -> int | None:
