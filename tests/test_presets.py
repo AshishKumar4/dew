@@ -85,7 +85,7 @@ def test_an_undecodable_image_is_skipped_counted_and_read_by_its_epochs_pass():
     from test_example_counts import counted, read_whole
 
     records = [*jpegs(11), {"image": b"not an image", "label": 0}]
-    chain = Memory(records).shuffle(0).repeat().pipe(presets.images, 16, batch=4)
+    chain = Memory(records).shuffle(0).repeat().pipe(presets.images, 16, batch=8)
     loader = compile(chain, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1), epochs=2)
     assert loader.pass_examples == 12
     assert read_whole(loader, "image")[1] == 24
