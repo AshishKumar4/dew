@@ -226,22 +226,32 @@ class Usage:
     state_kept: int
     cut: Mapping[str, tuple[int, int]] = field(default_factory=dict)
     context_tokens: int = 0
-    """The tokens of the request's own context, whole (`context_tokens`), of which its rows read
-    `context_kept`."""
+    """The tokens of the request's own context, whole (`context_tokens`)."""
+    context_kept: int = 0
+    """Its first tokens, those every row read: the whole less the most any row cut (`Encoded.context_cut`),
+    each row cutting the one context alike (`contexted`)."""
 
     @property
     def truncated(self) -> bool:
         return self.state_kept < self.state_tokens
 
     @property
-    def context_kept(self) -> int:
-        """The tokens of the request's context its rows read, its first, the rest a `context` cut."""
-        return self.context_tokens - self.cut.get("context", (0, 0))[1]
+    def context_cut(self) -> bool:
+        """Whether its rows read less than the request's context."""
+        return self.context_kept < self.context_tokens
 
     @property
     def trimmed(self) -> bool:
         """Whether a row's declared budgets cut a question's instructions or options."""
         return "instructions" in self.cut or "options" in self.cut
+
+
+def contexted(usage: Usage, rows: Sequence[Encoded], given: int) -> Usage:
+    """`usage` with the request's context of `given` tokens and those its rows read: every row reads the one
+    context, each cutting it alike where it cuts it, so the most any row cut is the context's cut, which a
+    sum over rows (`cut_counts`) would count once a row (train 986's review)."""
+    return replace(usage, context_tokens=given,
+                   context_kept=given - max((row.context_cut for row in rows), default=0))
 
 
 def usage_of(rows: Sequence[Encoded]) -> Usage:
@@ -1552,8 +1562,8 @@ class _Admitted:
 
     questions: dict[str, Question]
     rows: tuple[Encoded, ...]
-    context_tokens: int = 0
-    """The tokens of the body's own context, whole, which its answer states beside those it read."""
+    admitted: Usage | None = None
+    """What admission read of the body's context (`contexted`), which its answer states."""
 
 
 @dataclass(frozen=True)
@@ -1688,27 +1698,27 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
             with self.counting:
                 self.counts.dropped(Rejected(refused.reason))
             raise
-        # The request's context, whole, which its answer states it read part of where its rows cut it.
-        usage = replace(usage_of([row.encoded for row in rows]),
-                        context_tokens=len(context_tokens(decide.tokenizer, context)))
-        if self.whole and (usage.truncated or usage.trimmed):
+        usage = contexted(usage_of([row.encoded for row in rows]), [row.encoded for row in rows],
+                          len(context_tokens(decide.tokenizer, context)))
+        if self.whole and (usage.truncated or usage.trimmed or usage.context_cut):
             # Counted as a run counts a row it refused: its reason and the tokens its cut removed.
             removed = {kind: tokens for kind, (_, tokens) in usage.cut.items()}
             with self.counting:
                 self.counts.dropped(Rejected("cut", cut=removed))
-            cut = "state" if usage.truncated else "instructions or options"
+            cut = ("state" if usage.truncated else "context" if usage.context_cut
+                   else "instructions or options")
             raise Refused("cut", f"the request does not fit the maximum context length, max_len="
                                  f"{decide.layout.max_len} tokens, without cutting its {cut}")
         with self.counting:
             self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
-        return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows),
-                                                      usage.context_tokens))
+        return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows), usage))
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
         answers, usage = self.decide._replied(payload.questions, payload.rows, outputs)
-        return self.decide._wire_response(payload.questions, answers,
-                                          replace(usage, context_tokens=payload.context_tokens),
-                                          details=self.details)
+        if payload.admitted is not None:
+            usage = replace(usage, context_tokens=payload.admitted.context_tokens,
+                            context_kept=payload.admitted.context_kept)
+        return self.decide._wire_response(payload.questions, answers, usage, details=self.details)
 
 
 def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -> Variables:

@@ -557,8 +557,10 @@ def test_a_backbone_encoded_context_is_the_backbones_own_pass_over_it():
 def test_a_context_past_its_cross_attentions_room_is_cut_and_its_caller_told():
     """A context of more tokens than the cross-attention reads keeps its first ones, as a context beside a
     schema does (one policy, `with_context`): a task answers from them, a served answer states the
-    request's context tokens and those it read, and a run's data counts the cut (`data/cut/.../context`).
-    It was refused, and refused a run's data inside its fitting (train 985's review, F5)."""
+    request's context tokens and those it read, whatever rows its questions take, and a run's data counts
+    the cut (`data/cut/.../context`). It was refused, and refused a run's data inside its fitting (train
+    985's review, F5); a served answer of three question rows summed their cuts, reporting 12 kept where
+    every row read 16, and one that forbids cuts answered from a cut context (train 986's review)."""
     from dew.decision.rows import Fit
 
     objective = conditioned(16, (0,))
@@ -570,9 +572,13 @@ def test_a_context_past_its_cross_attentions_room_is_cut_and_its_caller_told():
     assert whole.context == cut.context and cut.cuts == {"context": 2}
     assert task("one two", QUESTION, context=over)["pick"].probabilities.tolist() == task(
         "one two", QUESTION, context=exact)["pick"].probabilities.tolist()
-    wire = {"pick": {"type": "choice", "instructions": "Which one?", "criteria": ["a", "b", "c"]}}
+    wire = {name: {"type": "choice", "instructions": "Which one?", "criteria": ["a", "b", "c"]}
+            for name in ("pick", "other", "third")}
     served = task.systemone({"state": "one two", "questions": wire, "context": over})
     assert (served["usage"]["context_tokens"], served["usage"]["context_kept"]) == (18, 16)
+    # A caller that forbids every cut is refused one of its context, as one of its state.
+    with pytest.raises(ValueError):
+        task.systemone({"state": "one two", "questions": wire, "context": over}, whole=True)
     fit = Fit(objective.layout, objective.tokenizer, objective.specials, objective.model.head,
               objective.context_length)
     fitted = fit.map({"example": Example("one two", QUESTION, {"pick": "a"}, context=over)})
