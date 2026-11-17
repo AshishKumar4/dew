@@ -270,10 +270,11 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
                 plan = task.planned() if plan is None else plan
                 if not plan.add(request.scored.rows[request.taken]) and any(placed):
                     return self._kept(placed, plan)
-                # A request runs from its first row's pass on; one cancelled before it leaves the queue,
-                # and a plan of its row alone with it, so the next request, perhaps another task's after
-                # a reload, starts a plan of its own.
-                if request.taken == 0:
+                # A request runs from its first row's pass on (one whose first row a pass left to the next,
+                # `_kept`, is running already); one cancelled before it leaves the queue, and a plan of its
+                # row alone with it, so the next request, perhaps another task's after a reload, starts a
+                # plan of its own.
+                if request.taken == 0 and not request.future.running():
                     if not request.future.set_running_or_notify_cancel():
                         self._waiting.queue.remove(request)
                         plan, placed = (plan, [*placed, None]) if any(placed) else (None, [])
