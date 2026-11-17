@@ -1212,10 +1212,12 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def towers(self) -> tuple[Held, ...]:
         """Every network this objective's programs run, whose quantization the options they compile
-        with read (`dew.nn.kernels.options.compiler_options`): the modules `program_key` names, and
-        an objective whose steps also call frozen towers (a condition's encoder, an autoencoder)
-        adds them."""
-        return tuple(entry.module for entry in self.program_key())
+        with read (`dew.nn.kernels.options.compiler_options`): the modules `program_key` names and its
+        inputs' condition encoders (`InputSpec.encoders`: a diffusion run's text towers, a decision
+        run's configured context encoder), and an objective whose steps call further towers (an
+        autoencoder) adds them."""
+        encoders = () if self.inputs is None else tuple(encoder for _, encoder in self.inputs.encoders)
+        return (*(entry.module for entry in self.program_key()), *encoders)
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         """Replace the modules `program_key` names, one per entry in its order."""
