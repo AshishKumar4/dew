@@ -450,7 +450,7 @@ def _agree(phase: str, error: BaseException | None, word: str) -> list[str]:
     context = f"Process phase {phase} failed on rank {failed[0]}: {words[failed[0]][2:]}"
     if error is not None:
         error.add_note(context)
-        _HEARD.append(error)
+        vars(error)[HEARD] = True
         raise error
     raise PeerFailure(context, phase=phase, rank=failed[0])
 
@@ -558,9 +558,11 @@ def withdraw_failure() -> bool:
     return True
 
 
-_HEARD: list[BaseException] = []
-"""The errors this process raised at an agreement its peers heard (`_agree`), which leaving the program on
-one (`end_pool_on_failure`) publishes no more: the pool knows it, and its service may be gone."""
+HEARD = "dew_pool_heard"
+"""The mark an error this process raised at an agreement its peers heard carries (`_agree`, in its
+`__dict__`), which leaving the program on it (`end_pool_on_failure`) reads to publish it no more: the pool
+knows it, and its service may be gone. On the error itself, so no list keeps errors and their tracebacks
+alive."""
 
 
 def stop_at_exit(thread: threading.Thread, stop: Callable[[], None], *,
@@ -607,8 +609,8 @@ def end_pool_on_failure(grace: float | None = None) -> None:
     def leave(kind: type[BaseException], value: BaseException,
               trace: types.TracebackType | None) -> None:
         previous(kind, value, trace)
-        # An error an agreement's peers heard (`_HEARD`) ends them already, and its service may be gone.
-        if not any(value is heard for heard in _HEARD):
+        # An error an agreement's peers heard (`HEARD`) ends them already, and its service may be gone.
+        if not vars(value).get(HEARD):
             publish_failure(value, "the program")
         sys.stdout.flush()
         sys.stderr.flush()
