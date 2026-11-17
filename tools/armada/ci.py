@@ -2017,10 +2017,10 @@ def lane_units(python: str, tests: list[str], within: float | None = None) -> di
 
 
 PREPARES = "prepares or gpu"
-"""The marks of the GPU tests a part's prepare runs first, on the node's CPU (`gpu_prepared`): a flow's (`prepares`)
-and every other GPU test's (`gpu`), whose check-1 truths and arms compile there for the node's GPU, so its run
-calls stored executables and compiles nothing while it holds the GPU (Main, 2026-11-17: the day's GPU jobs left
-2034 of 3238 held GPU-minutes idle, tracing and compiling on the host)."""
+"""The marks of the GPU tests a part's prepare runs first, on the node's CPU (`gpu_prepared`): a flow's
+(`prepares`) and every other GPU test's (`gpu`), whose check-1 truths and arms compile there for the node's
+GPU, so its run calls stored executables and compiles nothing while it holds the GPU (Main, 2026-11-17: the
+day's GPU jobs left 2034 of 3238 held GPU-minutes idle, tracing and compiling on the host)."""
 
 
 def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, deadline: float) -> int:
