@@ -253,13 +253,10 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                 out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
                                       max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
             else:
-                size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
-                launch = functools.partial(_portable_launch, hooks, Tiles(size), starts=starts, firsts=firsts,
-                                           scale=scale, dtype=work, forked=carried,
-                                           own=given['own'] if hooks.own_weight else None)
-                out, final = _turned_or_plain(launch, query, key, wide, g, beta, state, None, turn,
-                                              starts=starts, forked=carried, scale=scale,
-                                              group=hooks.ranks if hooks.reads == 'apart' else 1)
+                out, final = _on_portable(hooks, query, key, wide, g, beta, state, turn, starts=starts,
+                                          firsts=firsts, forked=carried, scale=scale, dtype=work,
+                                          own=given['own'] if hooks.own_weight else None,
+                                          chunk_size=chunk_size)
             out = out.astype(work)
             return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
 
@@ -1276,6 +1273,17 @@ def _on_template(query, key, value, g, beta, state, skip, turn, *, starts, first
                                apart=apart, **options)
     return _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, starts=starts,
                             forked=forked, scale=scale, group=max(apart, 1))
+
+
+def _on_portable(hooks: recurrence.Hooks, query, key, value, g, beta, state, turn, *, starts, firsts, forked,
+                 scale: float, dtype, own, chunk_size: int):
+    """The chunked op's `(output, final memory)` on the portable math (`_portable`, its chunk `held_chunk`'s
+    under the delta rule; a turned call's through `_turned_or_plain`)."""
+    size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
+    launch = functools.partial(_portable_launch, hooks, Tiles(size), starts=starts, firsts=firsts,
+                               scale=scale, dtype=dtype, forked=forked, own=own)
+    return _turned_or_plain(launch, query, key, value, g, beta, state, None, turn, starts=starts,
+                            forked=forked, scale=scale, group=hooks.ranks if hooks.reads == 'apart' else 1)
 
 
 def _portable_launch(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta, state, skip, entry, *,
