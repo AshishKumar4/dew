@@ -1226,20 +1226,24 @@ parallel recurrent state, requests alone or mixed mid-flight, speculative blocks
 form (packed, quantized, adapted, reloaded) is none of them: served and lone run the same weights. A
 quantized cache (`KVCache.quantized`), which rounds every step's attention operands, has cells of its own
 (`QUANTIZED_CACHES`)."""
-ARITHMETIC_SEEDS = {"sampled": 256, "several-steps-over-pages": 64, "a-parallel-hybrid": 128,
-                    "speculative-blocks": 64}
+ARITHMETIC_SEEDS = {"sampled": 256, "several-steps-over-pages": 64, "a-parallel-hybrid": 128}
 PREFILL_MESH_SEEDS = 64
 """Each cell's declared seeds and the prefill mesh's, sized paired by `seeds_for` on armada's CPUs
-(2026-11-12, eg-serving-cells at 6d599746e47)."""
+(2026-11-12, eg-serving-cells at 6d599746e47); the speculative blocks' 64 their mark's, their sites drawn
+in armada's map tasks of 32 (`check1_shards`: whole, CI's took 158 s, train 1003 at de27b8e32, row 7446)."""
 
 
-@pytest.mark.parametrize("cell", list(ARITHMETIC))
-def test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic(cell):
+@pytest.mark.parametrize("cell", [
+    *ARITHMETIC_SEEDS,
+    pytest.param("speculative-blocks", id="speculative-blocks",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32))])
+def test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic(cell, request):
     """Each cell of `ARITHMETIC`: every request draws what the lone task draws, and its likelihoods are on
     par with a full forward's from the float64 twin (check 1)."""
     bound, serving, requests, budget = ARITHMETIC[cell]
+    seeds = ARITHMETIC_SEEDS[cell] if cell in ARITHMETIC_SEEDS else marked_seeds(request)
     assert_served_as_exact(bound(), requests, f"served arithmetic: {cell}", serving=serving, budget=budget,
-                           seeds=(ARITHMETIC_SEEDS[cell],) * 2)
+                           seeds=(seeds,) * 2)
 
 
 QUANTIZED_CACHES = {
