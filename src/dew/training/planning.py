@@ -44,6 +44,7 @@ from dew.nn.kernels.options import (
     held,
     hold,
     owned_program,
+    program_digest,
     program_key,
     unhold,
 )
@@ -189,11 +190,18 @@ class Relowered:
 
 
 class SampledStep(NamedTuple):
-    """A step that also summarizes what the run inspects (`Candidate.sampled`): the program it compiled
-    from (its lowering) and its executable."""
+    """A step that also summarizes what the run inspects (`Candidate.sampled`): the digest of the program it
+    compiled from (`program_digest`, which a run compiled ahead names it by) and its executable. Its
+    lowering is not kept: JAX holds every executable compiled from a lowering while the lowering lives,
+    and a plan the run steps by would keep the sampled module resident through the run (base review of
+    2ffc61c8c, F2)."""
 
-    lowered: jax.stages.Lowered
+    digest: str
     executable: jax.stages.Compiled
+
+    @classmethod
+    def of(cls, lowered: jax.stages.Lowered, executable: jax.stages.Compiled) -> SampledStep:
+        return cls(program_digest(lowered), executable)
 
 
 def whole_step_program[L, E](objective: Objective[L, E]) -> OuterProgram:
@@ -966,7 +974,7 @@ class FitSearch[LossT, EffectsT]:
                     # (`handed`), which its target compiles none of.
                     with handed(ahead):
                         sampled = candidate.sampled()
-                    self.sampled = SampledStep(sampled, ahead.sampled.taken(sampled, jax.devices()))
+                    self.sampled = SampledStep.of(sampled, ahead.sampled.taken(sampled, jax.devices()))
                 else:
                     # The one compiled beside the step's, but where the step was lowered afresh past a spill,
                     # which its sampled step is then too, as one lowered after the step's compile would be.
@@ -983,7 +991,7 @@ class FitSearch[LossT, EffectsT]:
                     compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled,
                                                    first=None if beside is None else firsts[1])
                     self.sampled = (None if compiled is None
-                                    else SampledStep(lowered[-1], compiled))
+                                    else SampledStep.of(lowered[-1], compiled))
                 # Admitted by the plan whichever compiled it, ahead or here (training.md: the sampled step is
                 # admitted by the same memory plan).
                 fit, headroom = self.fitting(None if self.sampled is None else self.sampled.executable,
