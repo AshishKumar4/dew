@@ -611,7 +611,9 @@ def test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_d
     own = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
     height, width = own.inputs.sample.shape[-3:-1]
     config = DiffusionRunConfig(
-        pretrained=str(directory), data=images_of("tfds://oxford_flowers102", height), val_metrics=(),
+        pretrained=str(directory), data=images_of("tfds://oxford_flowers102", height), preset=None,
+        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32", "attention_impl": "xla"}),
+        val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         objective=ObjectiveConfig("diffusion", {"steps": 2, "ema_decay": None}))
     saved_after_one_step(config, lambda task: batch_for(task, 4), tmp_path / "run", 1e-2)
