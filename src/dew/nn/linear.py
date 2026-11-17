@@ -207,13 +207,40 @@ def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, seg
         before = jnp.pad(segments, ((0, 0), (K - 1, 0)))[:, tap:tap + length]
         return jnp.where((before == segments)[..., None], window, 0)
 
+    spread_bias = None if bias is None else conv_bias(bias.astype(wide), x.shape[:2])
     windows = short_conv.preactivation([read(tap) for tap in range(K)], [taps[:, tap] for tap in range(K)],
-                                       None if bias is None else bias.astype(wide))
+                                       spread_bias)
     if activation:
         windows = nn.silu(windows)
     if valid is not None:
         windows = jnp.where(valid[:, :, None], windows, 0)
     return conv_pieces(windows, parts, dtype)
+
+
+def conv_bias(bias: jax.Array, leading: tuple[int, ...]) -> jax.Array:
+    """A conv's bias `[C]` added at every row and token of `leading` `[B, S]` (`_spread_bias`): its gradient
+    the wide pre-activation cotangent summed over them in one compensated reduction, rounded once, the one
+    rule of a conv's bias, XLA's conv's and the kernels' (`short_conv`'s partials, the split conv's
+    shards)."""
+    return _spread_bias((*leading, bias.shape[0]))(bias)
+
+
+@functools.cache
+def _spread_bias(shape: tuple[int, ...]) -> Callable:
+    """A conv's bias spread over the rows and tokens of `shape` `[B, S, C]`, differentiated at every order
+    (`generation.linear_tangent`): reverse mode sums its tokens' cotangents in one compensated reduction
+    rounded once (`compensated_sum`), forward mode takes the broadcast's own tangent. XLA's float32 sum of a
+    conv's bias gradient over its tokens left it 1.6 to 2.4 times as far from float64 as the sum rounded once
+    (armada's CPU and an A100 and a GH200, row 1710), past what a split conv's shards (`_shards_summed`) and
+    the kernels' partials (`short_conv`) add to it."""
+    def spread(values: jax.Array) -> jax.Array:
+        return jnp.broadcast_to(values, shape)
+
+    return contracted("test_a_convs_bias_holds_every_order")(
+        generation.linear_tangent(lambda values: (spread(values), None),
+                                  lambda saved, operands, cotangent: (
+                                      compensated_sum(cotangent, tuple(range(len(shape) - 1))),),
+                                  spread, kind=Protected()))
 
 
 def conv_pieces(convolved, parts, dtype):
@@ -281,7 +308,7 @@ def entered_conv1d(x, kernel, valid, documents, held, entered, *, bias=None, par
     taps = kernel.astype(wide)
     windows = short_conv.preactivation([read(tap) for tap in range(taps_count)],
                                        [taps[:, tap] for tap in range(taps_count)],
-                                       None if bias is None else bias.astype(wide))
+                                       None if bias is None else conv_bias(bias.astype(wide), x.shape[:2]))
     if activation:
         windows = nn.silu(windows)
     windows = jnp.where(real[:, :, None], windows, 0)
