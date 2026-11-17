@@ -812,13 +812,11 @@ class SegmentLayout(Layout):
         _streamed(self.written, self.reads)
 
     @property
-    def written(self) -> "tuple[QuestionSegment, ...]":
-        """The row's parts in order: its own `segments`, which its checks hold to a question row's parts
-        (`QUESTION_KINDS`, `__post_init__`), or the layout's built-in row (`built_in`)."""
+    def written(self) -> "tuple[RowSegment, ...]":
+        """The row's parts in order: its own `segments`, which its checks hold to its row's parts
+        (`QUESTION_KINDS`, `JOINT_KINDS`, `__post_init__`), or the layout's built-in row (`built_in`)."""
         if self.segments is not None:
-            return tuple(segment for segment in self.segments
-                         if isinstance(segment, (Text, Special, State, Instructions, OptionLines, AnswerCue,
-                                                 RequestSummary, Again)))
+            return tuple(self.segments)
         return built_in(self.labels, self.order or ("state_first" if self._state_first else "question_first"))
 
     @property
@@ -831,11 +829,15 @@ class SegmentLayout(Layout):
         return next(segment for segment in self.written if isinstance(segment, OptionLines))
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
-        """Return the state's tokens, which every question of a request shares."""
-        if self.joint:
-            return self._joint_state(encoder, specials, state)
-        text = render(state).replace(specials.marker_text, " ")
-        return tuple(encoder.encode(text, add_special_tokens=False))
+        """Return the state's tokens, which every question of a request shares: as the row renders its
+        state (`_state_render`)."""
+        return tuple(encoder.encode(rendered(state, self._state_render, specials), add_special_tokens=False))
+
+    @property
+    def _state_render(self) -> Render:
+        """How the layout renders its state where a row reads the request's tokens of it (`state`): a joint
+        row's sorted compact JSON, a question row's text."""
+        return "compact" if self.joint else "question"
 
     def row_questions(self, questions: int) -> int:
         """As many of them as one row asks over one state: all of them in the joint row, else as many as
@@ -860,9 +862,7 @@ class SegmentLayout(Layout):
     def spans_in_context(self) -> bool:
         """Whether its row writes its question to its context (`Instructions.stream`), a joint row its
         schema (`Schema.stream`)."""
-        if self.joint:
-            return self._joint_spans_in_context()
-        return any(isinstance(segment, Instructions) and segment.stream == "context"
+        return any(isinstance(segment, Instructions | Schema) and segment.stream == "context"
                    for segment in self.written)
 
     @property
@@ -871,26 +871,25 @@ class SegmentLayout(Layout):
         (`streamed`, `dew.decision.shared_state.stream_reads`)."""
         from dew.decision.shared_state import stream_reads
 
-        if self.joint:
-            return self._joint_attention()
         return stream_reads(self) if self.streamed else streamed_attention(self.reads, self.written)
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None, media: Sequence[int] = (),
              tokens: Sequence[int] | None = None, request: Mapping[str, Question] | None = None
              ) -> list[Encoded]:
-        if self.joint:
-            return self._joint_rows(encoder, specials, state, questions, orders=orders, media=media,
-                                    tokens=tokens, request=request)
-        if media:
-            raise ValueError(f"a {self.form} row has no place for images")
+        if media and not any(isinstance(segment, Media) for segment in self.written):
+            raise ValueError(f"a {self.form} row of these segments has no place for images")
         if tokens is None and self._unit == "pieces":
             # The request's questions share its state, encoded once for them all.
             tokens = self.state(encoder, specials, state)
-        own = [self._written(encoder, specials, question, (orders or {}).get(name), name, state=state,
-                             tokens=tokens, conversation=_conversation(state),
-                             request=questions if request is None else request)
-               for name, question in questions.items()]
+        # Its rows' groups of questions: every question in the one joint row, which its schema writes, else
+        # each in a row of its own, which its question segments write.
+        groups = ([dict(questions)] if self.joint
+                  else [{name: question} for name, question in questions.items()])
+        asking = questions if request is None else request
+        own = [self._written(encoder, specials, group, orders or {}, state=state, tokens=tokens,
+                             conversation=_conversation(state), request=asking, media=media)
+               for group in groups]
         from dew.decision.shared_state import over_one_state
 
         return over_one_state(own, self)
@@ -907,42 +906,42 @@ class SegmentLayout(Layout):
         if any(isinstance(segment, RequestSummary) for segment in self.written):
             raise ValueError("a layout with a summary of the request lays its rows by `rows`, which holds "
                              "every question of the request; `encode` has one")
-        return self._written(encoder, specials, question, order, name, state=_UNREAD, tokens=state,
-                             conversation=conversation)
+        return self._written(encoder, specials, {name: question}, {} if order is None else {name: order},
+                             state=_UNREAD, tokens=state, conversation=conversation)
 
-    def _written(self, encoder: Tokenizer, specials: Specials, question: Question,
-                 order: Sequence[int] | None, name: str, *, state: JSON | _Unread,
-                 tokens: Sequence[int] | None, conversation: bool,
-                 request: Mapping[str, Question] | None = None) -> Encoded:
-        """A row of `question` written by its parts (`written`), framed by `framing` and encoded by
-        `unit` (`dew.decision.renderer`), read at its markers or at its last token under labels.
+    def _written(self, encoder: Tokenizer, specials: Specials, questions: Mapping[str, Question],
+                 orders: Mapping[str, Sequence[int]], *, state: JSON | _Unread, tokens: Sequence[int] | None,
+                 conversation: bool, request: Mapping[str, Question] | None = None,
+                 media: Sequence[int] = ()) -> Encoded:
+        """A row of `questions` (`rows`: every question of a joint row, a question row's one) written by its
+        parts (`written`), framed by `framing` and encoded by `unit` (`dew.decision.renderer`): the one
+        render of every layout's row. A question row's question is written by its question segments and
+        read at its markers or at its last token under labels; a joint row's questions by its schema
+        (`Schema`), each read at its own marks.
 
         The question's declared budgets cut its pieces as Laya's release does (`_budgeted`); the state
         takes what the rest of the row leaves of `max_len`, each copy cut as its `State` keeps it, and a
         row that no cut fits is left to `fits`. A single copy rendered as the layout's own state reads
         the request's precomputed `tokens` where it gives them. The built-in row is written piece by
         piece, unframed, as a release writes it; `unit` and `framing` are a row of segments' own."""
-        segments, labels, lines, unit = self.written, self.labels, self._lines, self._unit
-        request = {name: question} if request is None else request
-        described = list(zip(question.options, question.descriptions, strict=True))
-        slots = (_slots(len(described), order) if order is not None
-                 else [1, 0] if isinstance(question, Noul) and lines.noul_first == "true"
-                 else list(range(len(described))))
-        names = labels.names_for(len(slots)) if labels is not None else ("",) * len(slots)
-        texts = self.options(question)
+        segments, labels, unit = self.written, self.labels, self._unit
+        request = dict(questions) if request is None else request
+        slots = {name: self._slots_of(question, orders.get(name)) for name, question in questions.items()}
+        # A question row's one question, which its question segments write.
+        asked = None if self.joint else _Asked.of(self, *next(iter(questions.items())), slots, specials)
         split = self.split or ("question" if self.segments is None else "part")
         parts = [segment for segment in segments if isinstance(segment, (State, Instructions))]
         question_first = bool(parts) and isinstance(parts[0], Instructions) and any(
             isinstance(segment, State) for segment in parts)
         opening = (("suffix", 0),) if self.blocks and split == "part" else ()
         chunks: list[Chunk | State] = []
-        # A question written to the row's context (`Instructions.stream`) is its own chunks, which the
-        # row's cross-attention reads, its spans the context's.
+        # A question written to the row's context (`Instructions.stream`, `Schema.stream`) is its own
+        # chunks, which the row's cross-attention reads, its spans the context's.
         context: list[Chunk | State] = []
         copies = [_kept_by(segment, conversation) for segment in segments if isinstance(segment, State)]
         # A copy rendered as the layout renders its state reads the request's precomputed tokens where it
         # gives them, under pieces; any other renders the state's text (`written_state`).
-        reads = [tokens is not None and unit == "pieces" and copy.render == "question"
+        reads = [tokens is not None and unit == "pieces" and copy.render == self._state_render
                  and copy.values == Values() and copy.turns is None for copy in copies]
         if isinstance(state, _Unread) and not all(reads):
             raise ValueError("a row of its state's tokens alone holds copies of it rendered as the layout "
@@ -956,10 +955,10 @@ class SegmentLayout(Layout):
                         else len(encoder.encode(text, add_special_tokens=False)) if text else 0
                         for text, read in zip(state_texts, reads, strict=True)), default=0)
 
-        head_at, cue_at, line_at, labelled = self._chunked(chunks, context, question, specials, described,
-                                                           slots, names, texts,
+        head_at, cue_at, line_at, labelled = self._chunked(chunks, context, asked, specials,
                                                            opening if not question_first else (),
-                                                           request=request, name=name, size=longest)
+                                                           request=request, size=longest, encoder=encoder,
+                                                           questions=questions, slots=slots, media=media)
         in_context = self.spans_in_context
         # A question in the context shares no budget with the row's cue.
         instructions_cut, options_cut, alike = self._question_cut(
@@ -1000,48 +999,68 @@ class SegmentLayout(Layout):
             whole = len(tokens)
             held = [(whole, 0)]
         row_tokens = laid.tokens
-        # The question's spans are those of the stream it is written to; the readout is the row's last
-        # token, its cue.
+        # The questions' spans are those of the stream they are written to; a question row's readout is
+        # its last token, its cue.
         # A question's context holds its own segments' chunks, never a state's placeholder.
         written = [chunk for chunk in context if isinstance(chunk, Chunk)]
         assert len(written) == len(context), "a question's context holds no state"
-        asked = (rendered_chunks(written, _Pieces(encoder) if unit == "pieces" else encoder, unit)
-                 if in_context else laid)
-        spans = [asked.marks[("option", index)] for index in range(len(slots))]
-        row = Laid(name, kind_of(question), asked.marks["question"], tuple(spans), tuple(slots),
-                   readout=len(row_tokens) - 1 if labels is not None else None,
-                   label_ids=labels.ids(encoder, len(slots)) if labels is not None else None)
-        positions, option_slots = (_parallel(_option_groups(laid, len(slots)), len(row_tokens))
+        marked = (rendered_chunks(written, _Pieces(encoder) if unit == "pieces" else encoder, unit)
+                  if in_context else laid)
+        rows = tuple(Laid(name, kind_of(question), marked.marks[(name, INSTRUCTIONS_MARK)],
+                          tuple(marked.marks[(name, number)] for number in range(len(slots[name]))),
+                          tuple(slots[name]), readout=len(row_tokens) - 1 if labels is not None else None,
+                          label_ids=labels.ids(encoder, len(slots[name])) if labels is not None else None)
+                     for name, question in questions.items())
+        positions, option_slots = (_parallel(_option_groups(laid, len(rows[0].slots)), len(row_tokens))
                                    if self.parallel else (None, None))
         # A cut of a row encoded whole is its characters (`_cut`); of a row of pieces, its own tokens.
         retokenized = unit == "whole" and bool(copies)
         streams = (token_streams(laid.points, len(row_tokens), self.written)
                    if self.reads is not None else None)
-        encoded = Encoded(row_tokens, (row,), positions, option_slots, whole, state_kept,
+        if streams is not None and media:
+            raise ValueError("a row whose streams say what each token reads holds no images, whose tokens "
+                             "read each other whole; send the request without them")
+        encoded = Encoded(row_tokens, rows, positions, option_slots, whole, state_kept,
+                          laid.marks.get(MEDIA_MARK),
                           state_cut=0 if retokenized else sum(own - kept for own, kept in held),
                           state_characters_cut=characters, instructions_cut=instructions_cut,
                           options_cut=options_cut, options_alike=alike,
-                          context=asked.tokens if in_context else None, spans_in_context=in_context,
+                          context=marked.tokens if in_context else None, spans_in_context=in_context,
                           streams=streams)
         if not self.blocks:
             return encoded
         # The prefix is the tokens that end at or before the suffix's first character (serve.patch
         # `token_layout`).
-        boundary = (laid.points["suffix"] if split == "part" else row.span[0] if split == "question"
+        boundary = (laid.points["suffix"] if split == "part" else rows[0].span[0] if split == "question"
                     else len(row_tokens))
         return _blocked(encoded, boundary)
 
-    def _chunked(self, chunks: "list[Chunk | State]", context: "list[Chunk | State]", question: Question,
-                 specials: Specials, described: Sequence[tuple[str, JSON]], slots: Sequence[int],
-                 names: Sequence[str], texts: Sequence[str], opening: Sequence[Point], *,
-                 request: Mapping[str, Question], name: str, size: Callable[[], int]
+    def _slots_of(self, question: Question, order: Sequence[int] | None) -> list[int]:
+        """The option each of `question`'s slots shows: the order a request gives, else the row's own: a
+        joint row's (a choice's by key, a noul's true first, `_joint_order`), a question row's (a noul's
+        true first where its lines say so, else the question's)."""
+        count = len(_joint_options(question) if self.joint else question.options)
+        if order is not None:
+            return _slots(count, order)
+        if self.joint:
+            return _joint_order(question)
+        if isinstance(question, Noul) and self._lines.noul_first == "true":
+            return [1, 0]
+        return list(range(count))
+
+    def _chunked(self, chunks: "list[Chunk | State]", context: "list[Chunk | State]", asked: "_Asked | None",
+                 specials: Specials, opening: Sequence[Point], *, request: Mapping[str, Question],
+                 size: Callable[[], int], encoder: Tokenizer, questions: Mapping[str, Question],
+                 slots: Mapping[str, Sequence[int]], media: Sequence[int]
                  ) -> tuple[int | None, int | None, list[int], list[tuple[str, str]]]:
-        """Append the row's segments' chunks to `chunks`, its question's to `context` where they stream
-        there (`Instructions.stream`), each state a placeholder: where its instructions, answer cue and
-        option lines stand in the list they went to, and each line's label text (`_option_chunks`), the
-        question's header opening at `opening`. `request` holds every question the request asks, this
-        row's `name` among them (`RequestSummary`), and `size` the tokens of its state's longest copy before a
-        cut, which a repetition conditioned on it reads (`Again.over`)."""
+        """Append the row's segments' chunks to `chunks`, its questions' to `context` where they stream
+        there (`Instructions.stream`, `Schema.stream`), each state a placeholder: where a question row's
+        instructions, answer cue and option lines stand in the list they went to, and each line's label
+        text (`_option_chunks`), the question's header opening at `opening`. `asked` is a question row's
+        one question, which its question segments write; a joint row's `questions` are its schema's, each
+        option in its `slots`, and `media` its images' place (`Media`). `request` holds every question the
+        request asks (`RequestSummary`), and `size` the tokens of the state's longest copy before a cut,
+        which a repetition conditioned on it reads (`Again.over`)."""
         head_at, cue_at, line_at, labelled = None, None, [], []
         current = "row"
         for segment in self.written:
@@ -1057,23 +1076,37 @@ class SegmentLayout(Layout):
                     chunks.append(Chunk(ids=ids))
             elif isinstance(segment, State):
                 chunks.append(segment)
+            elif isinstance(segment, Media):
+                # The images' place, empty in a request that has none.
+                chunks.append(Chunk(ids=tuple(media), marks=((MEDIA_MARK, 0, len(media)),) if media else ()))
+            elif isinstance(segment, Schema):
+                # Every question of the row, its pieces encoded apart as one piece of ids, its marks theirs.
+                schema = rendered_chunks(_schema_chunks(questions, slots), _Pieces(encoder), "pieces")
+                written = Chunk(ids=schema.tokens,
+                                marks=tuple((key, *span) for key, span in schema.marks.items()))
+                if segment.stream == "context":
+                    context.append(written)
+                    chunks.append(Chunk(ids=()))
+                else:
+                    chunks.append(written)
+            elif asked is None:
+                continue
             elif isinstance(segment, Instructions):
                 # The question's header opens the second part, where it follows the state.
                 head_at = _instruction_chunks(context if segment.stream == "context" else chunks, segment,
-                                              question, specials, opening)
+                                              asked.question, specials, opening, name=asked.name)
             elif isinstance(segment, OptionLines):
                 lines_in = segment_stream(segment, self.written)
                 line_at, labelled = self._option_chunks(context if lines_in == "context" else chunks,
-                                                        segment, question, described, slots, names, texts,
-                                                        specials)
+                                                        segment, asked, specials)
             elif isinstance(segment, AnswerCue):
-                template = segment.template if len(names) <= segment.at else segment.many
+                template = segment.template if len(asked.names) <= segment.at else segment.many
                 cue_at = len(chunks)
-                chunks.append(Chunk(template.format(labels=segment.join.join(names))))
+                chunks.append(Chunk(template.format(labels=segment.join.join(asked.names))))
             elif isinstance(segment, RequestSummary):
-                chunks.append(Chunk(self._summary(segment, request, name, specials)))
+                chunks.append(Chunk(self._summary(segment, request, asked.name, specials)))
             elif isinstance(segment, Again) and size() >= segment.over:
-                self._again(chunks, segment, question, specials, described, slots, names, texts)
+                self._again(chunks, segment, asked, specials)
         if self.reads:
             # What follows the segments, a conversation's close, is the row's own.
             stream_point(chunks, "row", current)
@@ -1095,25 +1128,21 @@ class SegmentLayout(Layout):
                 instructions=rendered(asked.instructions, segment.render, specials, segment.values)))
         return segment.join.join(lines)
 
-    def _again(self, chunks: "list[Chunk | State]", segment: "Again", question: Question, specials: Specials,
-               described: Sequence[tuple[str, JSON]], slots: Sequence[int], names: Sequence[str],
-               texts: Sequence[str]) -> None:
+    def _again(self, chunks: "list[Chunk | State]", segment: "Again", asked: "_Asked", specials: Specials
+               ) -> None:
         """Append the question's `segment.parts` to `chunks` once more, written as the row's own
         instructions and option lines write them and marked as none of them: text alone, so the row's
         spans, markers, option groups and budgets are those of the parts it writes once."""
         for part in segment.parts:
             if part == "instructions":
-                asked = next(each for each in self.written if isinstance(each, Instructions))
-                _instruction_chunks(chunks, asked, question, specials, (), marked=False)
+                instructions = next(each for each in self.written if isinstance(each, Instructions))
+                _instruction_chunks(chunks, instructions, asked.question, specials, (), marked=False)
             else:
-                self._option_chunks(chunks, self._lines, question, described, slots, names, texts, specials,
-                                    marked=False)
+                self._option_chunks(chunks, self._lines, asked, specials, marked=False)
 
     @staticmethod
-    def _option_chunks(chunks: "list[Chunk | State]", segment: "OptionLines", question: Question,
-                       described: Sequence[tuple[str, JSON]], slots: Sequence[int], names: Sequence[str],
-                       texts: Sequence[str], specials: Specials, marked: bool = True
-                       ) -> tuple[list[int], list[tuple[str, str]]]:
+    def _option_chunks(chunks: "list[Chunk | State]", segment: "OptionLines", asked: "_Asked",
+                       specials: Specials, marked: bool = True) -> tuple[list[int], list[tuple[str, str]]]:
         """Append each option slot's chunks to `chunks`: its line, under its marker where the options
         carry one, joined by `segment.join`; each slot's group opening at its first chunk (`group`),
         the last closing the options (`options_end`), its span its marker's or its line's. Return where
@@ -1121,6 +1150,8 @@ class SegmentLayout(Layout):
         (`_label_text`), as the template it was written by (`line`, or `bare`) writes them. Unmarked
         (`Again`), the lines alone: no marker, span or group, and none returned."""
         line_at, labelled = [], []
+        question, described, slots, names, texts = (asked.question, asked.described, asked.slots, asked.names,
+                                                     asked.texts)
         for index, (label, slot) in enumerate(zip(names, slots, strict=True)):
             key, description = described[slot]
             option = (segment.level.format(key) if isinstance(question, Score)
@@ -1141,13 +1172,13 @@ class SegmentLayout(Layout):
                 continue
             final = index == len(slots) - 1
             opened = ((("group", index), 0),)
-            marker = Chunk(ids=(specials.marker,), marks=((("option", index), 0, 1),),
+            marker = Chunk(ids=(specials.marker,), marks=(((asked.name, index), 0, 1),),
                            points=(opened if segment.marker == "before" else ())
                            + ((("options_end", 1),) if final and segment.marker == "after" else ()))
             if segment.marker == "before":
                 chunks.append(marker)
             line_at.append(len(chunks))
-            chunks.append(Chunk(line, marks=((("option", index), 0, len(line)),) if segment.marker == "none"
+            chunks.append(Chunk(line, marks=(((asked.name, index), 0, len(line)),) if segment.marker == "none"
                                 else (),
                                 points=(opened if segment.marker != "before" else ())
                                 + ((("options_end", len(line)),) if final and segment.marker != "after"
@@ -1191,7 +1222,8 @@ class SegmentLayout(Layout):
         if not copies:
             return built([]), []
         rest = len(built([()] * len(copies)).tokens)
-        counts = allocated([len(own) for own in ids], copies, self.max_len - rest)
+        # A joint row caps every copy that states no budget of its own (`max_state_tokens`).
+        counts = allocated([len(own) for own in ids], copies, self.max_len - rest, self.max_state_tokens)
         kept = [_kept(own, count, copy.keep) for own, count, copy in zip(ids, counts, copies, strict=True)]
         return built(kept), [(len(own), len(held)) for own, held in zip(ids, kept, strict=True)]
 
@@ -1221,7 +1253,7 @@ class SegmentLayout(Layout):
         offsets = [encoder.offsets(text) if text else ([], [], []) for text in texts]
         rest = len(built([""] * len(copies)).tokens)
         lengths = [len(own) for own, _, _ in offsets]
-        kept = allocated(lengths, copies, self.max_len - rest)
+        kept = allocated(lengths, copies, self.max_len - rest, self.max_state_tokens)
 
         def piece(at: int, count: int | None = None) -> str:
             # A copy's first (or last) `count` tokens, at the character boundary their offsets give.
@@ -1281,7 +1313,10 @@ class SegmentLayout(Layout):
                      and (self.framing.chat_template is not None or bool(encoder.tokenizer.chat_template)))
         if not templated:
             before, after = self.framing.around(encoder)
-            return [Chunk(before), *chunks, Chunk(after)]
+            framed = [Chunk(before), *chunks, Chunk(after)]
+            # A joint row reads the turn's markup and the text beside it as one piece each, as the joint
+            # release writes its turn.
+            return _joined_text(framed) if self.joint else framed
         content, marks, points, at = "", [], [], 0
         for chunk in chunks:
             marks.extend((key, at + start, at + end) for key, start, end in chunk.marks)
@@ -1356,13 +1391,6 @@ class SegmentLayout(Layout):
         return cls(**{"max_len": 16384, "segments": JOINT_SEGMENTS, "framing": Framing(), **fields,
                       "form": "joint"})
 
-    @property
-    def _joint_segments(self) -> "tuple[Segment, ...]":
-        """The joint row's segments: its own, which its checks hold to the joint row's parts
-        (`JOINT_KINDS`, `_joint_post_init`), or `JOINT_SEGMENTS` where it states none."""
-        segments = JOINT_SEGMENTS if self.segments is None else self.segments
-        return tuple(segment for segment in segments if isinstance(segment, (Text, Media, State, Schema)))
-
     def _joint_post_init(self) -> None:
         """The joint row's own checks (`joint_row`): its question-row fields refused, its turn's segments and
         framing given where it states none."""
@@ -1392,124 +1420,6 @@ class SegmentLayout(Layout):
             raise ValueError("a joint row writes its state as sorted compact JSON (State(render='compact')); "
                              "its turns and values are a question row's")
         _streamed((self.segments or ()), self.reads)
-
-    def _joint_spans_in_context(self) -> bool:
-        """Whether the row's schema is its context (`Schema.stream`), its spans the context's."""
-        return any(isinstance(segment, Schema) and segment.stream == "context"
-                   for segment in self._joint_segments)
-
-    def _joint_attention(self) -> "tuple[tuple[tuple[int, ...], ...], int] | None":
-        """Its rows' reads over their streams (`streamed_attention`)."""
-        return streamed_attention(self.reads, self._joint_segments)
-
-    def _joint_state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
-        return tuple(encoder.encode(_compact(state), add_special_tokens=False))
-
-    def _joint_rows(self, encoder: Tokenizer, specials: Specials, state: JSON,
-                    questions: Mapping[str, Question], *, orders: Mapping[str, Sequence[int]] | None = None,
-                    media: Sequence[int] = (), tokens: Sequence[int] | None = None,
-                    request: Mapping[str, Question] | None = None
-             ) -> list[Encoded]:
-        """The request's one row, rendered as chunks (`dew.decision.renderer`, piece by piece as the
-        joint release encodes it): each run of text between the turn's other parts one chunk, the
-        images, each copy of the state and the schema chunks of ids, and each question's and option's
-        tokens the marks its chunks carry. Its row holds no summary of the request (`JOINT_KINDS`),
-        whose `request` it reads none of."""
-        pieces = _Pieces(encoder)
-        if media and not any(isinstance(segment, Media) for segment in self._joint_segments):
-            raise ValueError("this joint layout's segments have no place for images")
-        schema = rendered_chunks(self._joint_schema(questions, orders), pieces, "pieces")
-        state_ids = tuple(self._joint_state(encoder, specials, state) if tokens is None else tokens)
-        whole = len(state_ids)
-        # The turn's markup and the text beside it are read as one piece each, as the turn writes them.
-        before, after = (self.framing or Framing()).around(encoder)
-        parts: list[str | Segment] = [before, *self._joint_segments, after]
-        laid_out: list[tuple[Segment | None, Chunk]] = []
-        for part in parts:
-            if isinstance(part, (str, Text)):
-                text = part if isinstance(part, str) else part.text
-                if laid_out and laid_out[-1][0] is None and laid_out[-1][1].ids is None:
-                    laid_out[-1] = (None, Chunk(laid_out[-1][1].text + text))
-                else:
-                    laid_out.append((None, Chunk(text)))
-                continue
-            if isinstance(part, Schema) and not self.spans_in_context:
-                chunk = Chunk(ids=schema.tokens,
-                              marks=tuple((key, *span) for key, span in schema.marks.items()))
-            elif isinstance(part, Media) and media:
-                chunk = Chunk(ids=tuple(media), marks=((MEDIA_MARK, 0, len(media)),))
-            else:
-                # A state's place, filled once its copies share the room left (below); the schema read as
-                # the row's context; the images' place in a request that has none.
-                assert isinstance(part, (State, Schema, Media)), part
-                chunk = Chunk(ids=())
-            laid_out.append((part, chunk))
-        # The row without its state, each copy a chunk of no ids, rendered as the row is.
-        room = self.max_len - len(rendered_chunks([chunk for _, chunk in laid_out], pieces, "pieces").tokens)
-        copies = [segment for segment, _ in laid_out if isinstance(segment, State)]
-        counts = iter(allocated([whole] * len(copies), copies, room, self.max_state_tokens))
-        conversation = _conversation(state)
-        chunks = [Chunk(ids=_kept(state_ids, next(counts), _kept_by(segment, conversation).keep))
-                  if isinstance(segment, State) else chunk for segment, chunk in laid_out]
-        # A row without a state segment keeps none of the state.
-        kept_count = min((len(chunk.ids or ()) for (segment, _), chunk in zip(laid_out, chunks, strict=True)
-                          if isinstance(segment, State)), default=0)
-        # Where the row turns to another of its streams, its tokens are marked there (`Reads`).
-        streams = [segment_stream(segment, self._joint_segments) if segment is not None else "row"
-                   for segment, _ in laid_out]
-        row = rendered_chunks(streamed_chunks(chunks, streams) if self.reads is not None else chunks,
-                              pieces, "pieces")
-        marks = schema.marks if self.spans_in_context else row.marks
-        laid = tuple(Laid(name, kind_of(question), marks[(name, INSTRUCTIONS_MARK)],
-                          tuple(marks[(name, number)] for number in range(len(slots))), tuple(slots))
-                     for (name, question), slots in zip(questions.items(),
-                                                        self._joint_slots(questions, orders), strict=True))
-        held = [len(chunk.ids or ()) for (segment, _), chunk in zip(laid_out, chunks, strict=True)
-                if isinstance(segment, State)]
-        # A row of no State segment holds none of the state: all of it is cut.
-        state_cut = sum(whole - kept for kept in held) if held else whole
-        tokens_streams = (token_streams(row.points, len(row.tokens), self._joint_segments)
-                          if self.reads is not None else None)
-        if tokens_streams is not None and media:
-            raise ValueError("a row whose streams say what each token reads holds no images, whose tokens "
-                             "read each other whole; send the request without them")
-        if self.spans_in_context:
-            # The schema is the row's context, its spans the context's own positions.
-            return [Encoded(row.tokens, laid, None, None, whole, kept_count, row.marks.get(MEDIA_MARK),
-                            context=schema.tokens, spans_in_context=True, state_cut=state_cut,
-                            streams=tokens_streams)]
-        return [Encoded(row.tokens, laid, None, None, whole, kept_count, row.marks.get(MEDIA_MARK),
-                        state_cut=state_cut, streams=tokens_streams)]
-
-    def _joint_slots(self, questions: Mapping[str, Question],
-               orders: Mapping[str, Sequence[int]] | None) -> list[list[int]]:
-        """Each question's option slots: the order a request gives (`orders`), else the joint order."""
-        return [_slots(len(_joint_options(question)), (orders or {})[name]) if name in (orders or {})
-                else _joint_order(question) for name, question in questions.items()]
-
-    def _joint_schema(self, questions: Mapping[str, Question],
-                orders: Mapping[str, Sequence[int]] | None) -> list[Chunk]:
-        """The schema's chunks (`Schema`), each a piece the joint release encodes alone, each
-        question's instructions marked `(name, INSTRUCTIONS_MARK)` and the option it shows n-th
-        `(name, n)`."""
-        chunks = [Chunk("\n\nSCHEMA FIELDS:\n")]
-        slotted = zip(questions.items(), self._joint_slots(questions, orders), strict=True)
-        for index, ((name, question), slots) in enumerate(slotted):
-            instructions = _compact(question.instructions)
-            chunks += [Chunk(f"\nFIELD {index + 1}\nID: {name}\nTYPE: {question.kind}\nINSTRUCTION: "),
-                       Chunk(instructions, marks=(((name, INSTRUCTIONS_MARK), 0, len(instructions)),)),
-                       Chunk("\nALLOWED OPTIONS:\n")]
-            described = _joint_options(question)
-            for number, slot in enumerate(slots):
-                key, description = described[slot]
-                semantics: dict[str, JSON] = {"option_id": key}
-                if description is not None:
-                    semantics["description"] = description
-                text = _compact(semantics)
-                chunks += [Chunk(f"OPTION {number + 1}: "),
-                           Chunk(text, marks=(((name, number), 0, len(text)),)), Chunk("\n")]
-            chunks.append(Chunk("END FIELD\n"))
-        return chunks
 
     def _budgeted(self, head: list[int], options: list[list[int]], *, each: int, fixed: int
                   ) -> tuple[list[int], list[list[int]]]:
@@ -1800,7 +1710,8 @@ def _as_ids(chunk: "Chunk | State", ids: Sequence[int]) -> Chunk:
 
 
 def _instruction_chunks(chunks: "list[Chunk | State]", segment: "Instructions", question: Question,
-                        specials: Specials, points: Sequence[Point], marked: bool = True) -> int:
+                        specials: Specials, points: Sequence[Point], marked: bool = True,
+                        name: str = "") -> int:
     """Append `question`'s instructions under its kind's header to `chunks`, the header opening at
     `points`: one piece of both where the question's span is the header's (`Instructions.span`), else
     the header's halves around the instructions, the span the instructions'. Return where the piece the
@@ -1813,10 +1724,12 @@ def _instruction_chunks(chunks: "list[Chunk | State]", segment: "Instructions", 
         return len(chunks) - 1
     if segment.span == "header":
         text = head + instructions + tail
-        chunks.append(Chunk(text, marks=(("question", 0, len(text)),), points=tuple(points)))
+        marks = (((name, INSTRUCTIONS_MARK), 0, len(text)),)
+        chunks.append(Chunk(text, marks=marks, points=tuple(points)))
         return len(chunks) - 1
     chunks.extend([Chunk(head, points=tuple(points)),
-                   Chunk(instructions, marks=(("question", 0, len(instructions)),)), Chunk(tail)])
+                   Chunk(instructions, marks=(((name, INSTRUCTIONS_MARK), 0, len(instructions)),)),
+                   Chunk(tail)])
     return len(chunks) - 2
 
 
@@ -2228,6 +2141,65 @@ def written_state(value: JSON, segment: State, specials: Specials) -> str:
 JOINT_SEGMENTS: tuple[Segment, ...] = (Text("STATE:\n"), Media(), State(), Schema(), Text("\n"))
 """The joint row's user turn as the Laya joint release lays it out: the state's heading, the
 images, the state, the schema, and a line break before the turn's end."""
+
+
+@dataclass(frozen=True)
+class _Asked:
+    """A question row's one question as its question segments write it (`SegmentLayout._chunked`): its
+    `name`, its options' keys and descriptions (`described`), the option each slot shows (`slots`), each
+    slot's label (`names`) and option text (`texts`)."""
+
+    name: str
+    question: Question
+    described: tuple[tuple[str, JSON], ...]
+    slots: tuple[int, ...]
+    names: tuple[str, ...]
+    texts: tuple[str, ...]
+
+    @staticmethod
+    def of(layout: SegmentLayout, name: str, question: Question, slots: Mapping[str, Sequence[int]],
+           specials: Specials) -> _Asked:
+        shown = tuple(slots[name])
+        labels = layout.labels
+        return _Asked(name, question, tuple(zip(question.options, question.descriptions, strict=True)), shown,
+                      tuple(labels.names_for(len(shown))) if labels is not None else ("",) * len(shown),
+                      tuple(layout.options(question)))
+
+
+def _schema_chunks(questions: Mapping[str, Question], slots: Mapping[str, Sequence[int]]) -> list[Chunk]:
+    """A joint row's schema (`Schema`) as its pieces, each a piece the joint release encodes alone: every
+    question a field of its id, type, instructions and allowed options in its `slots` order, its
+    instructions marked `(name, INSTRUCTIONS_MARK)` and the option it shows n-th `(name, n)`."""
+    chunks = [Chunk("\n\nSCHEMA FIELDS:\n")]
+    for index, (name, question) in enumerate(questions.items()):
+        instructions = _compact(question.instructions)
+        chunks += [Chunk(f"\nFIELD {index + 1}\nID: {name}\nTYPE: {question.kind}\nINSTRUCTION: "),
+                   Chunk(instructions, marks=(((name, INSTRUCTIONS_MARK), 0, len(instructions)),)),
+                   Chunk("\nALLOWED OPTIONS:\n")]
+        described = _joint_options(question)
+        for number, slot in enumerate(slots[name]):
+            key, description = described[slot]
+            semantics: dict[str, JSON] = {"option_id": key}
+            if description is not None:
+                semantics["description"] = description
+            text = _compact(semantics)
+            chunks += [Chunk(f"OPTION {number + 1}: "), Chunk(text, marks=(((name, number), 0, len(text)),)),
+                       Chunk("\n")]
+        chunks.append(Chunk("END FIELD\n"))
+    return chunks
+
+
+def _joined_text(chunks: Sequence[Chunk]) -> list[Chunk]:
+    """`chunks` with each run of plain text (no ids, marks or points) one chunk, which pieces encode as one
+    piece: a joint row's turn, its markup and the text beside it (`SegmentLayout._framed`)."""
+    joined: list[Chunk] = []
+    for chunk in chunks:
+        plain = chunk.ids is None and not chunk.marks and not chunk.points
+        if plain and joined and joined[-1].ids is None and not joined[-1].marks and not joined[-1].points:
+            joined[-1] = Chunk(joined[-1].text + chunk.text)
+        else:
+            joined.append(chunk)
+    return joined
 
 
 def _joint_options(question: Question) -> tuple[tuple[str, JSON], ...]:
