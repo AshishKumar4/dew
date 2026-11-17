@@ -1943,9 +1943,11 @@ SOFTPLUS_SITE = ("import jax\n"
                  "a = jax.nn.softplus(1.0)\n"
                  "b = softplus(1.0)\n"
                  "c = nn.softplus(1.0)\n"
-                 "d = precision.softplus(1.0)\n")
-"""SLOP030's site: JAX's softplus by its module's path and imported by its own name, and Flax's (lines 5, 6,
-7); the package's own softplus, which it is not."""
+                 "d = precision.softplus(1.0)\n"
+                 "e = jax.nn.log_sigmoid(1.0)\n"
+                 "f = nn.log_sigmoid(1.0)\n")
+"""SLOP030's site: JAX's softplus by its module's path and imported by its own name, Flax's, and both's
+log-sigmoid (lines 5, 6, 7, 9, 10); the package's own softplus, which it is not."""
 
 
 @pytest.mark.parametrize(("code", "site", "packages", "lines", "owner"), [
@@ -1954,7 +1956,7 @@ SOFTPLUS_SITE = ("import jax\n"
       "from sparx.nn.kernels.options import OuterProgram\nfine = OuterProgram(None)\n")),
     ("SLOP026", DERIVATIVE_SITE, ("nn", "precision", "sampling"), (6, 8, 9, 11),
      ("src/sparx/nn/derivatives.py", "import jax\n@jax.custom_vjp\ndef rule(x): return x\n")),
-    ("SLOP030", SOFTPLUS_SITE, ("nn", "rl", "objectives"), (5, 6, 7),
+    ("SLOP030", SOFTPLUS_SITE, ("nn", "rl", "objectives"), (5, 6, 7, 9, 10),
      ("src/sparx/nn/precision.py", "import jax\nfine = jax.nn.softplus(1.0)\n")),
 ], ids=["outer program", "custom derivative", "softplus"])
 def test_a_construct_built_outside_its_owner_module_is_reported(tmp_path, code, site, packages, lines, owner):

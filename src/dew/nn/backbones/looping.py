@@ -27,7 +27,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.core.scope import DenyList
 
-from ..precision import at_least_fp32
+from ..precision import at_least_fp32, softplus
 from ..protocols import EXITS
 from .decoder_stack import WRITTEN, Loop, PassView, SharedPassView
 from .layer_names import group_layers
@@ -57,9 +57,9 @@ def exit_log_distribution(logits: Sequence[jax.Array]) -> jax.Array:
     rounds to one leaves the passes after it a finite log probability, whose gradient stays finite,
     where the probability's own log would be log 0; a loop of one pass exits there surely."""
     hazards = jnp.stack(logits)[:-1, ..., 0].astype(at_least_fp32(logits[0].dtype))
-    kept = jnp.cumsum(jax.nn.log_sigmoid(-hazards), axis=0)
+    kept = jnp.cumsum(-softplus(hazards), axis=0)
     before = jnp.concatenate([jnp.zeros_like(logits[0][None, ..., 0], kept.dtype), kept])
-    return before + jnp.concatenate([jax.nn.log_sigmoid(hazards), jnp.zeros_like(before[:1])])
+    return before + jnp.concatenate([-softplus(-hazards), jnp.zeros_like(before[:1])])
 
 
 EXIT_ENTROPY = 0.1
