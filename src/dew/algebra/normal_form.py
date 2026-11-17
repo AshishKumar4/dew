@@ -150,10 +150,11 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | No
 
 FOLDED = frozenset({jax.lax.iota_p, jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.transpose_p,
     jax.lax.squeeze_p, jax.lax.concatenate_p, jax.lax.slice_p, jax.lax.convert_element_type_p,
-    jax.lax.select_n_p, jax.lax.eq_p, jax.lax.ne_p, jax.lax.lt_p, jax.lax.le_p, jax.lax.gt_p, jax.lax.ge_p,
-    jax.lax.and_p, jax.lax.or_p, jax.lax.not_p, jax.lax.add_p, jax.lax.sub_p, jax.lax.mul_p, jax.lax.div_p,
-    jax.lax.max_p, jax.lax.min_p, jax.lax.neg_p, jax.lax.abs_p, jax.lax.reduce_sum_p, jax.lax.reduce_max_p,
-    jax.lax.reduce_min_p, jax.lax.integer_pow_p, jax.lax.square_p, jax.lax.sqrt_p, jax.lax.rsqrt_p})
+    jax.lax.select_n_p, jax.lax.clamp_p, jax.lax.eq_p, jax.lax.ne_p, jax.lax.lt_p, jax.lax.le_p,
+    jax.lax.gt_p, jax.lax.ge_p, jax.lax.and_p, jax.lax.or_p, jax.lax.not_p, jax.lax.add_p, jax.lax.sub_p,
+    jax.lax.mul_p, jax.lax.div_p, jax.lax.max_p, jax.lax.min_p, jax.lax.neg_p, jax.lax.abs_p,
+    jax.lax.reduce_sum_p, jax.lax.reduce_max_p, jax.lax.reduce_min_p, jax.lax.integer_pow_p,
+    jax.lax.square_p, jax.lax.sqrt_p, jax.lax.rsqrt_p})
 """The equations `_evaluated` computes where their operands are constants: those a mask, a divisor or a table
 is built from. Any other binds as traced, a collective or a program placed on a mesh among them, whose
 eager run needs devices a trace has not."""

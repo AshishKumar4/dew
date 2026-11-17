@@ -1596,14 +1596,12 @@ class RunConfig:
             saved = epath.Path(checkpoints.directory) / RUN_FILE
             recorded = recorded_param_groups(saved) if checkpoints.resumed(
                 self.trainer.resume) is not None and saved.exists() else None
-            if recorded and not named:
-                return to_record(recorded, tuple[ParamGroup, ...])
-            if recorded is not None and partitioned(named) == partitioned(recorded):
-                # The record's own groups named again (a saved run's config), fresh claims and all.
-                return to_record(named, tuple[ParamGroup, ...])
-            # A group named fresh claims what the run draws, or is refused where it draws none, as a
-            # `Trainer` given the config takes them (`OptimConfig.claiming`).
-            claimed = self.optim.claiming(*objective.fresh_trained())
+            # The record's own groups where the run names none, else its own; either claims what the run
+            # draws fresh, or is refused where it draws none, as a `Trainer` given the config takes them
+            # (`OptimConfig.claiming`), which then finds them claimed.
+            chosen = recorded if recorded and not named else named
+            claimed = dataclasses.replace(self.optim, param_groups=chosen).claiming(
+                *objective.fresh_trained())
             if recorded is not None and partitioned(claimed.param_groups) != partitioned(recorded):
                 raise ValueError(f"run {name!r} resumes an optimizer state partitioned by the groups "
                                  f"{partitioned(recorded)} (names, patterns and whether each is bounded), "
@@ -1661,7 +1659,8 @@ class RunConfig:
             dynamic_scale=(self.compute_dtype() == "float16" if trainer.dynamic_scale is None
                            else trainer.dynamic_scale), rollout=rollout,
             tune_kernels=trainer.tune_kernels, param_dtype=self.drawn_dtype(), inspection=trainer.inspection,
-            diloco=trainer.diloco, data_resume=trainer.data_resume, **{"links": trainer.links, **resources})
+            diloco=trainer.diloco, data_resume=trainer.data_resume, skip_nonfinite=trainer.skip_nonfinite,
+            **{"links": trainer.links, **resources})
 
     def compute_dtype(self) -> str:
         """The dtype the run's model computes in: the one its record states, else its numerics'

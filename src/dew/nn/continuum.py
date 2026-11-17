@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from dew.nn.backbones.decoder_stack import StackView
 
 Quantizers = Callable[[nn.Module], InputQuantizer | None]
-"""A model's checkpoint quantizer of a layer's input (`CausalTransformer._quantizer`), None for none."""
+"""A model's checkpoint quantizer of a layer's input (`decoder_head.quantizer`), None for none."""
 
 
 @dataclasses.dataclass(frozen=True)

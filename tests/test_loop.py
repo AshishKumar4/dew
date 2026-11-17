@@ -332,7 +332,7 @@ def _theta_method(module, ids):
         h = jax.lax.stop_gradient(h) if step == cut else h
         z = a + module.loop_theta * (h - a)
         h = module.stack(z, span=(first, end), **inputs) + (a - z)
-    return module._logits(module.norm(module.stack(h, span=(end, module.num_layers), **inputs)))
+    return module.logits_from_hidden(module.norm(module.stack(h, span=(end, module.num_layers), **inputs)))
 
 
 @pytest.mark.parametrize("name, steps, loop", [("two passes", 2, {}), ("three passes", 3, {}),
@@ -403,7 +403,7 @@ def _unrolled_passes(module, ids):
         held = jax.lax.stop_gradient(h) if cut is not None and step < cut else h
         out = module.norm(held if end == module.num_layers else
                           module.stack(held, span=(end, module.num_layers), **inputs))
-        logits.append(module._logits(out))
+        logits.append(module.logits_from_hidden(out))
         gates.append(module.early_exit_gate(out)[..., 0])
         if step + 1 < loop.steps:
             h = module.stack(jax.lax.stop_gradient(h) if step + 1 == cut else h, span=(first, end), **inputs)
@@ -514,7 +514,7 @@ def _passes_exiting(module, ids):
     out = module.stack(h, span=(end, module.num_layers), **inputs)
     for y, reached in reversed(leaving):
         out = jnp.where(reached[..., None], y, out)
-    return module._logits(module.norm(out))
+    return module.logits_from_hidden(module.norm(out))
 
 
 def test_a_loop_exits_each_token_at_its_threshold_through_each_passs_coda():

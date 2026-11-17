@@ -51,6 +51,7 @@ from dew.decision.layout import (
     Laid,
     Layout,
     Specials,
+    context_tokens,
     per_question,
     render,
     with_context,
@@ -224,15 +225,33 @@ class Usage:
     state_tokens: int
     state_kept: int
     cut: Mapping[str, tuple[int, int]] = field(default_factory=dict)
+    context_tokens: int = 0
+    """The tokens of the request's own context, whole (`context_tokens`)."""
+    context_kept: int = 0
+    """Its first tokens, those every row read: the whole less the most any row cut (`Encoded.context_cut`),
+    each row cutting the one context alike (`contexted`)."""
 
     @property
     def truncated(self) -> bool:
         return self.state_kept < self.state_tokens
 
     @property
+    def context_cut(self) -> bool:
+        """Whether its rows read less than the request's context."""
+        return self.context_kept < self.context_tokens
+
+    @property
     def trimmed(self) -> bool:
         """Whether a row's declared budgets cut a question's instructions or options."""
         return "instructions" in self.cut or "options" in self.cut
+
+
+def contexted(usage: Usage, rows: Sequence[Encoded], given: int) -> Usage:
+    """`usage` with the request's context of `given` tokens and those its rows read: every row reads the one
+    context, each cutting it alike where it cuts it, so the most any row cut is the context's cut, which a
+    sum over rows (`cut_counts`) would count once a row (train 986's review)."""
+    return replace(usage, context_tokens=given,
+                   context_kept=given - max((row.context_cut for row in rows), default=0))
 
 
 def usage_of(rows: Sequence[Encoded]) -> Usage:
@@ -255,11 +274,17 @@ def _head_changes(first: Mapping[str, object], other: Mapping[str, object]) -> l
     return [f"head.{name}" for name in registry.computing_differences(
         registry.imported(str(first["class"])), *stated, kept=(_records.NUMBERS,))]
 
-def _tokenizer_files(settings: "DecideSettings") -> Mapping[str, str] | str | None:
-    """What a run's text tokenizer is, which runs compare by: its files' hashes (`tokenizer_files`, which a
-    run's load states where its record did not, `dew.inference.tasks.tokenizer_here`), else its name (`byte`,
-    which has no files), else None."""
-    return settings.tokenizer_files if settings.tokenizer_files is not None else settings.tokenizer
+def _tokenizer_held(settings: "DecideSettings", run: str) -> Mapping[str, str] | str | None:
+    """What the text tokenizer of the run in `run` is, which runs compare by: the hashes of the files it
+    reads (`PinnedTokenizer.files`), whether its record states them or was saved before records did
+    (`dew.inference.tasks.saved_tokenizer`); the byte vocabulary, which has no files, by its name."""
+    from dew.data.text import HFTokenizer
+    from dew.inference.tasks import saved_tokenizer
+
+    if settings.tokenizer is None:
+        return None
+    found = saved_tokenizer(settings.tokenizer, settings.tokenizer_files, run)
+    return found.pinned.files if isinstance(found, HFTokenizer) else settings.tokenizer
 
 
 @dataclass(frozen=True)
@@ -474,8 +499,7 @@ class Decide(SavedRunTask, InItsForm):
                   weights: Weights, dtype: DTypeLike | None) -> Self:
         """The task a run's `record` describes over `backbone` and `variables`, the `weights` they are:
         its head, layout, tokenizer, special tokens and processor as the run recorded them."""
-        from dew.data.text import tokenizer_for
-        from dew.inference.tasks import saved_settings
+        from dew.inference.tasks import saved_settings, saved_tokenizer
         from dew.interop.pretrained import load_processor
 
         settings = saved_settings(record, DecideSettings)
@@ -497,7 +521,7 @@ class Decide(SavedRunTask, InItsForm):
         # here as documents continuing the shared part: the same tokens at the same positions, each
         # question reading the shared part and itself (with siblings, the questions before it), so the
         # same function, each held to its questions' own rows (tests/test_decision_state_once.py).
-        tokenizer = tokenizer_for(settings.tokenizer, files=settings.tokenizer_files, held=directory)
+        tokenizer = saved_tokenizer(settings.tokenizer, settings.tokenizer_files, directory)
         return cls(model, variables, settings.layout, tokenizer, settings.specials,
                    name=str(epath.Path(directory).name), weights=weights, processor=processor, budget=budget,
                    derives_sharing=False)
@@ -611,8 +635,8 @@ class Decide(SavedRunTask, InItsForm):
         settings = [saved_settings(saved, DecideSettings) for saved in recorded]
         # A setting its data derives (its padding, `metadata["derived"]`) may differ between the runs, and
         # their heads by how they run or train alone (`_head_changes`).
-        # Their tokenizers by what they are, their files' hashes, wherever each found it (`_tokenizer_files`).
-        tokenizers = [_tokenizer_files(own) for own in settings]
+        # Their tokenizers by what they are, their files' hashes, wherever each found it (`_tokenizer_held`).
+        tokenizers = [_tokenizer_held(own, run.directory) for own, run in zip(settings, pinned, strict=True)]
         for directory, own, held in zip(runs, settings, tokenizers, strict=True):
             differing = [entry.name for entry in fields(DecideSettings)
                          if entry.metadata.get("derived") != "data"
@@ -721,7 +745,6 @@ class Decide(SavedRunTask, InItsForm):
         import optax
 
         from dew.decision.objective import DecisionObjective
-        from dew.inference.tasks import hold_tokenizer
         from dew.interop.saved_sources import with_release_sources
         from dew.state import TrainState
 
@@ -740,8 +763,8 @@ class Decide(SavedRunTask, InItsForm):
                 # The releases of saved runs its paths lie within mapped to the runs they hold, as a
                 # trainer's checkpoint carries them (`with_release_sources`).
                 record = with_release_sources(DecisionObjective(self).inference_record())
-            hold_tokenizer(record, checkpoints.directory)
-            checkpoints.save(self.weights.step, state, artifact=record, weights_only=True)
+            checkpoints.save(self.weights.step, state, artifact=record, weights_only=True,
+                             tokenizer=self.tokenizer)
             checkpoints.wait()
 
     @overload
@@ -1391,6 +1414,9 @@ class Decide(SavedRunTask, InItsForm):
         """A Jev response body of a request's answers and usage."""
         gated = self.calibration.abstention is not None
         reported: dict[str, JSON] = {"input_tokens": usage.input_tokens, "output_tokens": 0}
+        if usage.context_tokens:
+            # Every caller whose context its rows cut is told so in its own answer, details or not.
+            reported.update(context_tokens=usage.context_tokens, context_kept=usage.context_kept)
         if details:
             reported.update(state_tokens=usage.state_tokens, state_kept=usage.state_kept,
                             truncated=usage.truncated,
@@ -1540,6 +1566,8 @@ class _Admitted:
 
     questions: dict[str, Question]
     rows: tuple[Encoded, ...]
+    admitted: Usage | None = None
+    """What admission read of the body's context (`contexted`), which its answer states."""
 
 
 @dataclass(frozen=True)
@@ -1674,23 +1702,27 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
             with self.counting:
                 self.counts.dropped(Rejected(refused.reason))
             raise
-        usage = usage_of([row.encoded for row in rows])
-        if self.whole and (usage.truncated or usage.trimmed):
+        usage = contexted(usage_of([row.encoded for row in rows]), [row.encoded for row in rows],
+                          len(context_tokens(decide.tokenizer, context)))
+        if self.whole and (usage.truncated or usage.trimmed or usage.context_cut):
             # Counted as a run counts a row it refused: its reason and the tokens its cut removed.
             removed = {kind: tokens for kind, (_, tokens) in usage.cut.items()}
             with self.counting:
                 self.counts.dropped(Rejected("cut", cut=removed))
-            cut = "state" if usage.truncated else "instructions or options"
+            cut = ("state" if usage.truncated else "context" if usage.context_cut
+                   else "instructions or options")
             raise Refused("cut", f"the request does not fit the maximum context length, max_len="
                                  f"{decide.layout.max_len} tokens, without cutting its {cut}")
         with self.counting:
             self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
-        return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
+        return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows), usage))
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
-        return self.decide._wire_response(payload.questions,
-                                          *self.decide._replied(payload.questions, payload.rows, outputs),
-                                          details=self.details)
+        answers, usage = self.decide._replied(payload.questions, payload.rows, outputs)
+        if payload.admitted is not None:
+            usage = replace(usage, context_tokens=payload.admitted.context_tokens,
+                            context_kept=payload.admitted.context_kept)
+        return self.decide._wire_response(payload.questions, answers, usage, details=self.details)
 
 
 def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -> Variables:
