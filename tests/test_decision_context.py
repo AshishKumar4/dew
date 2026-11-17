@@ -367,6 +367,87 @@ def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context():
     assert not np.array_equal(read[0].probabilities, read[1].probabilities)
 
 
+def test_a_decisions_context_is_its_inputs_condition_and_its_check_reads_it():
+    """A decision whose backbone reads a context holds it as its inputs' condition (`InputSpec`,
+    `DecisionModel.context_condition`): the backbone's token table as the run says, or its own pass where
+    rows read their schema in context; a batch missing its `context` field is refused by the check every
+    objective's batches meet (`InputSpec.check`); one whose backbone reads none holds none."""
+    from dew.decision.model import BackboneContext
+
+    for encoder in ("table", "backbone"):
+        held = conditioned(16, (0,), encoder).inputs.conditions
+        assert list(held) == ["context"] and held["context"].encoder == BackboneContext(encoder)
+    objective = conditioned(16, (0,))
+    batch = next(iter(decision_rows(examples(), 8, objective=objective.data()).train(DataPartition())))
+    objective.inputs.check(batch)
+    with pytest.raises(ValueError):
+        objective.inputs.check({name: value for name, value in batch.items() if name != "context"})
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    plain = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
+    assert dict(plain.inputs.conditions) == {}
+
+
+def configured(tokens: int = 12) -> DecisionObjective:
+    """A decision over the tiny Llama whose context is encoded by a configured encoder (`CharTable`, a
+    character table of 16 features) in place of the backbone's own, read by fresh cross-attention before
+    layer 0 at that width, one row a window."""
+    from dew.inputs import CharTable
+
+    table = CharTable.from_pretrained(tokens=tokens, features=16)
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    blocks = CrossAttention((0,), tokens, context_features=16)
+    return DecisionObjective(source.with_cross_attention(blocks, key=0), tokenizer=ByteTokenizer(),
+                             specials=SPECIALS, context_encoder=table, segments=1)
+
+
+def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly(tmp_path):
+    """A decision whose context a configured encoder reads (`CharTable`, any `ConditionEncoder`): its
+    rows carry the encoder's tokens of the context, its model reads the encoder's states, a step counts
+    the encoder's work; a run trains, saves, and its task loads the encoder from the run's record and
+    weights and answers as the trained task does, to the bit; a resume reads on exactly. A run's context
+    was only ever the backbone's own (6141)."""
+    from dew.checkpoints import Checkpoints
+    from dew.inputs import CharTable
+
+    objective = configured()
+    assert isinstance(objective.inputs.conditions["context"].encoder, CharTable)
+    data = decision_rows(examples(), 8, objective=objective.data())
+    batch = next(iter(data.train(DataPartition())))
+    codes = CharTable.from_pretrained(tokens=12, features=16).tokenize([note for *_, note in ROWS])
+    notes = {tuple(ids[mask != 0].tolist()) for ids, mask in zip(codes["input_ids"], codes["attention_mask"],
+                                                                  strict=True)}
+    lengths = np.asarray(batch["context_lengths"])
+    held = [tuple(row[:length].tolist()) for row, length in zip(np.asarray(batch["context"]), lengths,
+                                                               strict=True)]
+    assert held and set(held) <= notes
+    directory = str(tmp_path / "run")
+    trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(directory, keep=2))
+    state = trainer.fit(data, steps=2, log_every=1, checkpoint_every=1)
+    trainer.checkpoints.wait()
+    trained = objective.pipeline(state)
+    loaded = Decide.from_run(directory)
+    assert isinstance(loaded.model.context.encoder, CharTable)
+    for context in ("a first note", "ten"):
+        got = loaded("one two three", QUESTION, context=context)["pick"].probabilities
+        want = trained("one two three", QUESTION, context=context)["pick"].probabilities
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    resumed = Trainer(configured(), optax.adam(1e-3), key=0, checkpoints=Checkpoints(directory, keep=2),
+                      data_resume="exact").fit(data, steps=3, log_every=1, checkpoint_every=1)
+    assert int(resumed.step) == 3
+
+
+def test_a_configured_context_encoder_packs_one_row_a_window():
+    """A configured context encoder reads a window's context as one sequence, so it keeps no two rows'
+    contexts apart: a decision configured so with windows of several rows is refused, naming the fix."""
+    from dew.inputs import CharTable
+
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    blocks = CrossAttention((0,), 12, context_features=16)
+    with pytest.raises(ValueError):
+        DecisionObjective(source.with_cross_attention(blocks, key=0), tokenizer=ByteTokenizer(),
+                          specials=SPECIALS, context_encoder=CharTable.from_pretrained(tokens=12), segments=4)
+
+
 def test_the_context_layers_work_is_counted_in_a_conditioned_batch():
     """The objective's training work for a batch whose rows carry a context is the frozen backbone's,
     three passes of its cross-attention blocks over each row's real context tokens

@@ -25,7 +25,9 @@ from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
 
 import jax
 
-from dew._records import integer, number, record
+from dew._records import ADDED, integer, number, record
+from dew.inputs.condition import ConditionEncoder
+from dew.inputs.spec import TextCondition
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.pipeline import Dataset, cut_unit
 from dew.decision.data import SCHEDULE_MIXTURE, made_by
@@ -53,7 +55,7 @@ from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, SharedCrossAttention
-from dew.nn.protocols import RematChoosing
+from dew.nn.protocols import CountedCondition, RematChoosing
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig, class_record, from_record, import_path, record_argument
 from dew.state import TrainState
@@ -212,6 +214,11 @@ class DecisionRunConfig(DecoderRunConfig):
     """How a context becomes the states its cross-attention reads
     (`DecisionModel.context_encoder`): the backbone's token table, or the
     backbone's own pass over it. With `context_layers` alone."""
+    context_text: TextCondition | None = dataclasses.field(default=None, metadata={ADDED: True})
+    """A configured encoder of the context in place of the backbone's own (`DecisionModel.context`): any
+    registered condition encoder and its checkpoint, as a diffusion run's text condition names one, its
+    tokenization the context's, its states read by the cross-attention at its own width; one row a window
+    (`--objective.segments 1`). With `context_layers` alone."""
     context_form: Literal["idefics", "shared"] = "idefics"
     """The block each context layer runs: IDEFICS's gated block, an attention and a
     feed-forward of its own drawn beside the layer (`CrossAttention`), or the
@@ -259,6 +266,8 @@ class DecisionRunConfig(DecoderRunConfig):
                              "--context-layers")
         if self.context_encoder != "table" and self.context_layers is None:
             raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
+        if self.context_text is not None and self.context_layers is None:
+            raise ValueError("--context-text encodes the context context layers read; set --context-layers")
         if not self.context_frozen and self.context_layers is None:
             raise ValueError("--no-context-frozen says how context layers hold the backbone; set "
                              "--context-layers")
@@ -284,9 +293,10 @@ class DecisionRunConfig(DecoderRunConfig):
         attention_impl = self.source_attention()
         budgets = self._row_fields()
         self._refuse_unread_context()
-        derived = {}
+        derived: dict[str, object] = {}
+        configured = None if self.context_text is None else self.context_text.build(dtype=dtype).encoder
         if self.context_layers is not None:
-            derived["context_encoder"] = self.context_encoder
+            derived["context_encoder"] = self.context_encoder if configured is None else configured
         from dew.decision.slot_source import reads_blocks
         from dew.decision.sources import PretrainedDecision
 
@@ -313,7 +323,16 @@ class DecisionRunConfig(DecoderRunConfig):
         if self.context_layers is not None:
             # Drawn from a key of their own, apart from the adapter's and the head's.
             form = SharedCrossAttention if self.context_form == "shared" else CrossAttention
-            blocks = form(self.context_layers, self.context_length)
+            # A configured encoder's states at its own width (`ConditionWork.features`), else the backbone's.
+            if configured is None:
+                blocks = form(self.context_layers, self.context_length)
+            elif form is CrossAttention:
+                blocks = CrossAttention(self.context_layers, self.context_length,
+                                        context_features=_encoded_width(configured))
+            else:
+                raise ValueError("--context-form shared reads a context in the layer's own attention, at "
+                                 "the backbone's width, which a configured --context-text encoder's states "
+                                 "are not")
             start = start.with_cross_attention(blocks, key=jax.random.fold_in(
                 jax.random.key(self.trainer.key), 1), frozen=self.context_frozen)
         start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
@@ -517,3 +536,12 @@ def _budgeted(layout: Layout, budgets: Budgets) -> Layout:
 
 
 __all__ = ["DecisionRunConfig", "JointShape", "Letters"]
+
+
+def _encoded_width(encoder: ConditionEncoder) -> int:
+    """The width of the states a configured context encoder hands the cross-attention, as it declares its
+    work (`CountedCondition.conditioning_flops`, `ConditionWork.features`)."""
+    if not isinstance(encoder, CountedCondition):
+        raise ValueError(f"{type(encoder).__name__} declares no conditioning_flops, whose features are the "
+                         "width its states reach the context layers at")
+    return encoder.conditioning_flops(encoder.tokenize([""])).features

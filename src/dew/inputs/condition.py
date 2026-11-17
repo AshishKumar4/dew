@@ -123,9 +123,6 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
         weights (`from_pretrained`).
         """
         encoder, fields = component(ConditionEncoder, record)
-        if issubclass(encoder, BackboneEncoder):
-            # It holds no weights of its own: the model's own pass is its tower.
-            return encoder(**fields)
         checkpoint = fields.get("checkpoint")
         if not isinstance(checkpoint, str):
             raise ValueError(f"the {record['class']} record names no checkpoint to rebuild from")

@@ -24,12 +24,14 @@ from PIL import Image
 from dew import _records
 from dew._files import write_atomically
 from dew._records import JSON, json_value, record
-from dew.batch import Batch, SegmentBound, Variables
+from dew.batch import Batch, SegmentBound, Variables, part
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import Pack, Refused, Rejected, cut_counts, cut_unit
 from dew.data.text import Tokenizer
+from dew.inputs.condition import ConditionEncoder
+from dew.inputs.spec import Condition
 from dew.decision.calibration import (
     BUCKET_MINIMUM,
     TYPE_MINIMUM,
@@ -315,6 +317,10 @@ class DecideSettings:
     """What the text tokenizer is: each of its files' hash (`dew.inference.tasks.recorded_files`), which a
     load holds the files it finds to and runs compare by; None where a run recorded none, as runs before
     it did."""
+    context: Mapping[str, object] | None = field(default=None, metadata={_records.ADDED: True})
+    """The context's condition where the run configured its encoder (`DecisionModel.context`), as any
+    condition records (`dew.registry.to_record`), rebuilt over the run's `context` weights
+    (`Condition.bound`); None, the backbone's own (`context_encoder`)."""
 
 
 CALIBRATIONS = "calibrations"
@@ -507,8 +513,10 @@ class Decide(SavedRunTask, InItsForm):
         head = Head.from_record(settings.head, width)
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
+        context = None if settings.context is None else Condition.bound(
+            settings.context, params=part(variables, "context")["params"])
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
-                              settings.context_encoder)
+                              settings.context_encoder, context)
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
@@ -1018,6 +1026,12 @@ class Decide(SavedRunTask, InItsForm):
         """The most context tokens a request carries (`DecisionModel.context_length`)."""
         return self.model.context_length
 
+    @property
+    def context_reader(self) -> "Tokenizer | ConditionEncoder":
+        """What a request's context is tokenized by (`dew.decision.layout.context_tokens`): the model's
+        configured context encoder (`DecisionModel.context`), else its tokenizer."""
+        return self.tokenizer if self.model.context is None else self.model.context.encoder
+
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None,
                  request: Mapping[str, Question] | None = None,
@@ -1033,7 +1047,7 @@ class Decide(SavedRunTask, InItsForm):
             if self.layout.refusal(row, self.context_length) == "unfit":
                 raise Refused("unfit", f"the question needs {len(row.context or ())} context tokens, more "
                                        f"than the {self.context_length} the backbone's cross-attention reads")
-        rows = with_context(laid, self.tokenizer, context, self.context_length)
+        rows = with_context(laid, self.context_reader, context, self.context_length)
         self.model.head.validate_rows(rows)
         for laid in (laid for row in rows for laid in row.questions):
             count = len(questions[laid.name].options)
@@ -1703,7 +1717,7 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
                 self.counts.dropped(Rejected(refused.reason))
             raise
         usage = contexted(usage_of([row.encoded for row in rows]), [row.encoded for row in rows],
-                          len(context_tokens(decide.tokenizer, context)))
+                          len(context_tokens(decide.context_reader, context)))
         if self.whole and (usage.truncated or usage.trimmed or usage.context_cut):
             # Counted as a run counts a row it refused: its reason and the tokens its cut removed.
             removed = {kind: tokens for kind, (_, tokens) in usage.cut.items()}
@@ -1739,7 +1753,15 @@ def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -
 
     pack = packed_owned if owned else inference_projections
     return joined({"backbone": pack(model.backbone, part(variables, "backbone")),
-                   "head": part(variables, "head")})
+                   "head": part(variables, "head"), **_context_part(model, variables)})
+
+
+def _context_part(model: DecisionModel, variables: Variables) -> dict[str, Variables]:
+    """A configured context encoder's weights (`DecisionModel.context`), which a task's trees carry
+    beside the backbone's and the head's; none for the backbone's own."""
+    from dew.batch import part
+
+    return {} if model.context is None else {"context": part(variables, "context")}
 
 
 def trained_tree(model: DecisionModel, variables: Variables) -> Variables:
@@ -1753,7 +1775,8 @@ def trained_tree(model: DecisionModel, variables: Variables) -> Variables:
     backbone = part(variables, "backbone")
     if "params" not in backbone and FROZEN not in backbone:
         return variables
-    return joined({"backbone": unpacked(model.backbone, backbone), "head": part(variables, "head")})
+    return joined({"backbone": unpacked(model.backbone, backbone), "head": part(variables, "head"),
+                   **_context_part(model, variables)})
 
 
 def decoded_images(images: object) -> list[Image.Image]:

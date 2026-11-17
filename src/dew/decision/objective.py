@@ -20,7 +20,7 @@ from dew.decision.calibration import Temperatures
 from dew.decision.head import DecisionHead, Head
 from dew.decision.inputs import OPTION_TILE, DecisionInputs
 from dew.decision.layout import Bounds, Layout, Specials, default_layout, per_question
-from dew.decision.model import DecisionModel
+from dew.decision.model import BackboneContext, DecisionModel
 from dew.decision.questions import KINDS, Score
 from dew.decision.rows import (
     ConfigureLayout,
@@ -36,7 +36,7 @@ from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.shared_state import asked_over, fork_depth, joint, shared_for
 from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out, trained_tree, whole_blocks_of
 from dew.inference.tasks import Processor as TaskProcessor, RunProcessor
-from dew.inputs import Field, InputSpec
+from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
 from dew.nn import categorical
@@ -46,6 +46,7 @@ from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops
 from dew.nn.inputs import ModelInputs
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import (
+    CountedCondition,
     CountedDecisions,
     CountedLogits,
     CountedLogitsTraining,
@@ -211,7 +212,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         lengths = self.real_lengths(batch)
         return (sum(counted_flops(backbone, lengths) for backbone in self._reads(model))
                 + self._context_flops(model, batch) + self._cross_flops(self._exits(model), batch)
-                + self._heads(model) * self._head_flops(model, batch) + self._input_head_flops(model, batch))
+                + self._heads(model) * self._head_flops(model, batch) + self._input_head_flops(model, batch)
+                + self._encoder_flops(batch))
 
     def _exits(self, model: DecisionModel) -> DecisionModel:
         """`model` as the loss runs it: its backbone's every pass exiting where the loss weighs its passes
@@ -249,8 +251,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     def _context_lengths(self, batch: Batch) -> np.ndarray | None:
         """Each window row's context length where the backbone reads the context in a pass of its own,
-        as the stream its context is says (`DecisionModel.own_pass`: a schema in context always, a context
-        where its stream's encoder is the backbone's pass); None where it reads none."""
+        as its condition says (`DecisionModel.own_pass`: a schema in context always, a context whose
+        condition's encoder is the backbone's pass); None where it reads none."""
         passes = self.model.own_pass(self.spans_in_context)
         if not passes or "context_lengths" not in batch:
             return None
@@ -265,6 +267,20 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         contexts = np.asarray(batch["context_segments"])
         return np.concatenate([np.bincount(owned, minlength=int(window.max()) + 1)[1:]
                                for window, owned in zip(segments, contexts, strict=True)])
+
+    def _encoder_flops(self, batch: Batch) -> float:
+        """A configured context encoder's forward over each row's context (`DecisionModel.context`,
+        `ConditionEncoder.conditioning_flops`), as a diffusion run counts its conditions'; none where the
+        backbone encodes it, whose work `_context_flops` counts."""
+        condition = self.model.context_condition(self.spans_in_context)
+        if "context" not in batch or isinstance(condition.encoder, BackboneContext):
+            return 0.0
+        context, lengths = np.asarray(batch["context"]), np.asarray(batch["context_lengths"])
+        mask = (np.arange(context.shape[1])[None, :] < lengths[:, None]).astype(np.int32)
+        if not isinstance(condition.encoder, CountedCondition):
+            raise MissingFlopsCount(f"{type(condition.encoder).__name__} has no conditioning_flops(tokens)")
+        work = condition.encoder.conditioning_flops({"input_ids": context, "attention_mask": mask})
+        return float(work.flops)
 
     def _context_flops(self, model, batch: Batch) -> float:
         """The backbone's forward over each row's context, where it reads one in a pass of its own."""
@@ -308,7 +324,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         # The rows' passes (`_reads`): the decision pass, every exit where the loss weighs them, and the
         # second pass where `input_lm` reads them again (`input_terms`), trained as the first.
         reads, exits = self._reads(model), self._exits(model)
-        trained = 3 * (self._cross_flops(exits, batch) + self._heads(model) * self._head_flops(model, batch))
+        trained = 3 * (self._cross_flops(exits, batch) + self._heads(model) * self._head_flops(model, batch)
+                       + self._encoder_flops(batch))
         if isinstance(model.backbone, CountedTraining):
             # An adapter trains through the context's pass too.
             own = 0.0 if context is None else model.backbone.training_flops(context)
@@ -345,7 +362,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  head: Head | None = None, variables: Variables | None | Omitted = OMITTED,
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
-                 segments: int | None = 16, context_encoder: ContextEncoder | None = None,
+                 segments: int | None = 16, context_encoder: ContextEncoder | ConditionEncoder | None = None,
                  consistency: float = 0.0, context_window: int | None = None,
                  none_of_the_above_options: int = 3, input_lm: float = 0.0,
                  pass_weights: PassWeighting | None = None, exit_entropy: float | None = None):
@@ -360,7 +377,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                 held = trained_tree(model, backbone.variables)
                 self.image_processor = backbone.processor
                 head = head or model.head
-                context_encoder = context_encoder or model.context_encoder
+                context_encoder = context_encoder or (
+                    model.context_encoder if model.context is None else model.context.encoder)
                 # The layout as the task was given it, which a plan before rows shared a state reads.
                 layout = layout or backbone.declared
                 tokenizer = tokenizer or backbone.tokenizer
@@ -402,7 +420,17 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             # one its rows are laid out by, which names them where the layout names none.
             head, labels = head.labelled(layout.labels, tokenizer)
             layout = dataclasses.replace(layout, labels=labels)
-        self.model = DecisionModel(module, head, context_encoder or "table")
+        # A configured context encoder is the context's condition (`DecisionModel.context`); the backbone's
+        # own encodings are named by `context_encoder`, as a run records them.
+        match context_encoder:
+            case ConditionEncoder() as configured:
+                if segments is not None and segments > 1:
+                    raise ValueError(f"a configured context encoder ({type(configured).__name__}) reads a "
+                                     "window's context as one sequence, so it keeps no two rows' contexts "
+                                     "apart; set segments=1 (one row a window)")
+                self.model = DecisionModel(module, head, "table", Condition(configured, field="context"))
+            case _:
+                self.model = DecisionModel(module, head, context_encoder or "table")
         if layout is None:
             if not isinstance(module, TokenModel):
                 raise ValueError(
@@ -441,7 +469,13 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         # longer; none where its rows carry no context.
         self.context_window = (None if held_context is None
                                else context_window or max(self.layout.max_len, held_context))
-        self.inputs = InputSpec(sample=Field.indexing("tokens", (self.layout.max_len,), self.model))
+        # Its inputs as any objective's (`InputSpec`): its rows' tokens, and, where the backbone reads a
+        # context, the context's condition (`DecisionModel.context_condition`, decision-inputs.md section 2),
+        # whose encoder the model's read hands its tokens (`encode_conditions`).
+        conditions = ({} if held_context is None
+                      else {"context": self.model.context_condition(self.layout.spans_in_context)})
+        self.inputs = InputSpec(sample=Field.indexing("tokens", (self.layout.max_len,), self.model),
+                                conditions=conditions)
         self.pass_weights = self._passes_weighed(PassWeights.of(pass_weights))
         self.exit_entropy = self._exit_weighed(exit_entropy)
 
@@ -474,13 +508,16 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         tokens = jnp.zeros((1, self.layout.max_len), jnp.int32)
         parts = {
             name: part(tree, name)
-            for name in ("backbone", "head")
+            for name in ("backbone", "head", "context")
             if any(name in collection for collection in tree.values())
         }
         if "backbone" not in parts:
             parts["backbone"] = self.model.backbone.init(backbone_key, tokens)
         if "head" not in parts:
             parts["head"] = self.model.initialize_head(head_key, parts["backbone"], tokens)
+        if self.model.context is not None and "context" not in parts:
+            # A configured context encoder's weights, as it holds them (`ConditionEncoder.params`).
+            parts["context"] = {"params": self.model.context.encoder.params}
         return joined(parts)
 
     @property
@@ -832,13 +869,15 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def _data(self, layout: Layout, bounds: Bounds) -> ObjectiveData:
         """`data` as `layout` lays rows out within `bounds`."""
         grouped = bool(self.consistency)
+        configured = None if self.model.context is None else self.model.context.encoder
         training = ConfigureLayout(layout, self.tokenizer, self.specials, self.shuffle_options,
                                    self.none_of_the_above, train=True, context_length=self.context_length,
-                                   grouped=grouped, none_of_the_above_options=self.none_of_the_above_options)
+                                   grouped=grouped, none_of_the_above_options=self.none_of_the_above_options,
+                                   context_encoder=configured)
         evaluating = dataclasses.replace(training, train=False)
         fit = Fit(layout, self.tokenizer, self.specials, self.model.head, self.context_length, grouped,
                   bounds, self.none_of_the_above, self.context_window,
-                  none_of_the_above_options=self.none_of_the_above_options)
+                  none_of_the_above_options=self.none_of_the_above_options, context_encoder=configured)
         held = dataclasses.replace(fit, none_of_the_above=0.0, scored=True)
         # Rows a record spreads into: a layout of a question a row's, or grouped examples' apart.
         expand = (QuestionRows(),)
@@ -874,6 +913,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         from the source config; the decision record owns neither format.
         """
         from dew.inference.tasks import recorded_files, recorded_tokenizer
+        from dew.registry import to_record
 
         return DecideSettings(
             self.model.head.record(),
@@ -884,7 +924,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             else self.image_processor.source,
             self.model.context_encoder,
             self.options,
-            recorded_files(RunProcessor(self.tokenizer)))
+            recorded_files(RunProcessor(self.tokenizer)),
+            None if self.model.context is None else to_record(self.model.context))
 
     def recorded_model(self) -> nn.Module:
         """The backbone; the head is a task setting of its own."""
