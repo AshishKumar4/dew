@@ -29,7 +29,7 @@ import grain.python as grain
 import numpy as np
 from etils import epath
 
-from dew._files import staged
+from dew._files import is_uri, staged
 from dew.data.pipeline import TOKEN_FIELDS, Rejected
 from dew.data.tokens import chunk_table
 
@@ -343,8 +343,9 @@ class HFTokenizer:
                  held: str | None = None):
         self.name = name
         self.local_files_only = local_files_only
-        # The file hashes a record holds of the tokenizer it names, which its files must hash to here.
-        self.files = files
+        # The file hashes a record holds of the tokenizer it names, which its files must hash to here, each
+        # path confined to the tokenizer's directory before any file is read or written by it.
+        self.files = None if files is None else confined_files(files)
         # The run that holds a copy of it by those hashes (`held_place`), read in place of its name.
         self.held = held
 
@@ -966,12 +967,29 @@ def cached_tokenizer(source: epath.Path, files: Mapping[str, str], *, named: str
     return str(local)
 
 
+def confined_files(files: Mapping[str, str]) -> dict[str, str]:
+    """A record's tokenizer files (each path to its hash) whose paths all stand within the tokenizer's
+    directory: relative, in forward slashes, no part empty, `.` or `..`. Any other is refused (ValueError)
+    before a file is read or written by it: a saved run's record is outside input, and a path out of the
+    directory would copy into, or out of, an unrelated place (`copy_checked`)."""
+    for path in files:
+        parts = path.split("/")
+        if "\\" in path or ":" in parts[0] or any(part in ("", ".", "..") for part in parts):
+            raise ValueError(f"a recorded tokenizer file must be a path within its directory, not {path!r}")
+    return dict(files)
+
+
 def copy_checked(source: epath.Path, target: epath.Path, files: Mapping[str, str]) -> None:
     """Each of a tokenizer's `files` copied from the directory `source` into `target`, each read and checked
-    against its hash before it is written: a file missing, or whose bytes differ, is refused, naming it.
-    The one copier of a tokenizer's files, into a run (`dew.inference.tasks.hold_tokenizer`) and into this
-    host's cache (`cached_tokenizer`)."""
+    against its hash before it is written: a path out of the directory (`confined_files`), or a local file
+    a link takes out of it, is refused, and a file missing, or whose bytes differ, naming it. The one copier
+    of a tokenizer's files, into a run (`dew.inference.tasks.hold_tokenizer`) and into this host's cache
+    (`cached_tokenizer`)."""
+    files = confined_files(files)
     for path, digest in files.items():
+        local = not is_uri(str(source))
+        if local and not Path(source / path).resolve().is_relative_to(Path(source).resolve()):
+            raise ValueError(f"the tokenizer at {source} links {path} out of its directory")
         contents = (source / path).read_bytes()
         if hashlib.sha256(contents).hexdigest() != digest:
             raise ValueError(f"the tokenizer at {source} differs from its record in {path}")
