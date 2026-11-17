@@ -57,6 +57,7 @@ from .precision import (
     projection_role,
     recipe_role,
     rounded_operand,
+    softplus,
 )
 from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import declared
@@ -308,7 +309,7 @@ def sqrt_softplus(logits: jax.Array) -> jax.Array:
     logits its side takes, so neither's derivative is evaluated past its range."""
     tail = jnp.log(jnp.finfo(logits.dtype).eps)
     below = logits < tail
-    plain = jnp.sqrt(jax.nn.softplus(jnp.where(below, tail, logits)))
+    plain = jnp.sqrt(softplus(jnp.where(below, tail, logits)))
     return jnp.where(below, jnp.exp(jnp.minimum(logits, tail) / 2), plain)
 
 

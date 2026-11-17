@@ -91,6 +91,7 @@ from dew.nn.dense import Dense
 from dew.nn.documents import within_documents
 from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.kv_cache import ROUNDING_KEYS, Opened, cache_variables, kept, stated
+from dew.nn.precision import softplus
 from dew.nn.residuals import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
@@ -352,7 +353,7 @@ class InContextMemory(LinearProducts):
         logit = self._logit("retention", gate, x)
         # log(1 - s sigmoid(z)) = log((1 - s) + e^-z) - log(1 + e^-z): finite wherever s is at most one,
         # where the sigmoid rounds to one included.
-        log_kept = jnp.logaddexp(jnp.log1p(-gate.scale), -logit) - jax.nn.softplus(-logit)
+        log_kept = jnp.logaddexp(jnp.log1p(-gate.scale), -logit) - softplus(-logit)
         return 1 - gate.scale * jax.nn.sigmoid(logit), log_kept
 
     def _heads(self, features: int) -> tuple[_Head, ...]:

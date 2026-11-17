@@ -86,6 +86,11 @@ Scope is per rule, because the rules are not all about the same thing:
   name of exactly one test function of tests/test_contracts_*.py
   (`assert_contract`: every order finite against its float64 truth and an
   independent plain formula) (row 4411; `lint_derivatives`).
+- SLOP030 is about `src/<package>`: no module calls JAX's or Flax's softplus
+  (`SOFTPLUS`), by any name it is imported as, but `nn/precision.py`, whose
+  `softplus` forms its log1p by its own series: a backend's log1p is no part of
+  it, a v5e's 1.4e-4 from float64, which held a Mamba-2 layer at 143 times
+  its upstream's error (row 7062).
 - SLOP029 is about `tests`: no test's every assertion is that a process
   failed, read from its exit status alone (a `returncode`, `subprocess.call`
   or `os.system` unequal to 0, equal to 1, an uncaught error's, or tested for
@@ -1926,6 +1931,29 @@ def custom_derivatives(module: Module) -> Iterator[Finding]:
                           "(`declared_derivative`, `declared_tangent` or `surrogate`)")
 
 
+SOFTPLUS_OWNER = "nn/precision.py"
+"""The module of `src/<package>` that forms softplus (SLOP030), by its own series, past a backend's log1p."""
+
+SOFTPLUS = frozenset({"jax.nn.softplus", "flax.linen.softplus", "flax.linen.activation.softplus",
+                      "jax._src.nn.functions.softplus"})
+"""JAX's and Flax's softplus, by their public paths, which SLOP030 reports outside `SOFTPLUS_OWNER`."""
+
+
+def softplus_calls(module: Module) -> Iterator[Finding]:
+    """SLOP030: JAX's or Flax's softplus (`SOFTPLUS`), its name read through the imports of its scope,
+    anywhere in `src/<package>` but `SOFTPLUS_OWNER`: its log1p is the backend's, on a v5e 1.4e-4 from
+    float64 (row 7062)."""
+    prefix = f"src/{module.package}/"
+    if not module.relative.startswith(prefix) or module.relative.removeprefix(prefix) == SOFTPLUS_OWNER:
+        return
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        named = isinstance(node, (ast.Name, ast.Attribute)) and scopes.resolved(node, table)
+        if named in SOFTPLUS:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP030",
+                          f"calls {named}, its log1p the backend's; call `dew.nn.precision.softplus`, "
+                          "its series past it")
+
+
 GATE = frozenset({"tests/reference_error.py", "src/dew/parity.py", "tests/op_certificates.py",
                   "tests/certified.py",
                   "tests/residual_orders.py",
@@ -2223,7 +2251,7 @@ def derivative_contracts(module: Module) -> Iterator[Finding]:
 
 
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,
-                  pallas_launches, custom_derivatives, derivative_contracts)
+                  pallas_launches, custom_derivatives, derivative_contracts, softplus_calls)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
 
 

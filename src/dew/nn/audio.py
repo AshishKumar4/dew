@@ -21,7 +21,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.dense import Dense
 from dew.nn.inputs import sequence_blocks
-from dew.nn.precision import accumulated, at_least_fp32, capped_logits, float32_dot_general
+from dew.nn.precision import accumulated, at_least_fp32, capped_logits, float32_dot_general, softplus
 from dew.nn.rope import sinusoid_frequencies, sinusoids
 
 from .activations import activation
@@ -338,7 +338,7 @@ class Gemma3nAttention(nn.Module):
         query, key, value = projected
         per_dim = self.param("per_dim_scale", nn.initializers.zeros, (dim,), jnp.float32)
         query = query * jnp.asarray(dim ** -0.5 / math.log(2), query.dtype)
-        query = query * jax.nn.softplus(per_dim).astype(query.dtype)
+        query = query * softplus(per_dim).astype(query.dtype)
         left, right = cfg.conf_attention_context_left - 1, cfg.conf_attention_context_right
         positional = Gemma3nRelativePosition(cfg, dtype=self.dtype, precision=self.precision,
                                              name="relative_position_embedding")(query)
@@ -366,7 +366,7 @@ class Gemma4Attention(nn.Module):
         ]
         query, key, value = projected
         per_dim = self.param("per_dim_scale", nn.initializers.zeros, (dim,), jnp.float32)
-        query = query * (dim ** -0.5 / math.log(2)) * jax.nn.softplus(per_dim)
+        query = query * (dim ** -0.5 / math.log(2)) * softplus(per_dim)
         key = key * (math.log(1 + math.e) / math.log(2))
         chunk, left, right = (cfg.attention_chunk_size, cfg.attention_context_left - 1,
                               cfg.attention_context_right)
