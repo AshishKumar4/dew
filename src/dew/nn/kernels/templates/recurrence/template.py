@@ -81,7 +81,7 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: mosaic.
             max_segments: int | None = None, delta: bool = True, backward: bool = False,
             training_forward: bool = False,
             target: generation.GpuTarget | None = None,
-            rounded: bool = False, apart: bool = False, wide: bool = False, ranged: bool = False,
+            rounded: bool = False, apart: int = 0, wide: bool = False, ranged: bool = False,
             skip=None, forked: chunk_forward.ForkedTable | None = None) -> tuple[mainloop.Launch, ...]:
     """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `chunk_forward.forward`'s)
     runs at `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in
@@ -137,7 +137,7 @@ def holds(launches: tuple[mainloop.Launch, ...], family: mosaic.Family, shared: 
 
 def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: mosaic.Family,
                    target: generation.GpuTarget, starts=None, max_segments: int | None = None,
-                   delta: bool = True, rounded: bool = False, apart: bool = False, wide: bool = False,
+                   delta: bool = True, rounded: bool = False, apart: int = 0, wide: bool = False,
                    ranged: bool = False, skip=None,
                    forked: chunk_forward.ForkedTable | None = None) -> bool:
     """Whether the launches a fast backward runs (`mainloop_backward.gradients`'s and the forward it takes,
@@ -175,7 +175,7 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
              rounded: bool = False, wide: bool = False,
              ranged: bool = False, skip: jax.ShapeDtypeStruct | None = None,
              forked: chunk_forward.ForkedTable | None = None, training_forward: bool = False,
-             apart: bool = False) -> tuple[mainloop.Launch, ...]:
+             apart: int = 0) -> tuple[mainloop.Launch, ...]:
     """`planned` of a call over `shapes` (`jax.ShapeDtypeStruct`s or None) by `family`'s
     bundle on `target`, cached by the facts a plan reads of it (two targets of one family share no plan: an
     sm87's and an sm80's multiprocessors and shared memory differ), `PLANS_KEPT` of them. A ring's depth
@@ -224,7 +224,7 @@ def ranged(dtype, delta: bool, bound: float | None) -> bool:
 def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 max_segments: int | None = None, scale: float | None = None, delta: bool = True,
                 wide: bool = False, family=None, bound: float | None = None,
-                firsts=None, rounded: bool = False, apart: bool = False, skip=None, recomputed: bool = False,
+                firsts=None, rounded: bool = False, apart: int = 0, skip=None, recomputed: bool = False,
                 forked: chunked_launch.Forked | None = None):
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop (`chunk_forward.forward`): the
@@ -377,7 +377,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
              state: jax.Array | None = None, starts: jax.Array | None = None, *,
              firsts: jax.Array | None = None, max_segments: int | None = None, scale: float | None = None,
              delta: bool = True, wide: bool = False, bound: float | None = None,
-             rounded: bool = False, apart: bool = False, skip: jax.Array | None = None,
+             rounded: bool = False, apart: int = 0, skip: jax.Array | None = None,
              recomputed: bool = False,
              forked: chunked_launch.Forked | None = None, config: mainloop.Tiles,
              return_residuals: bool = False):

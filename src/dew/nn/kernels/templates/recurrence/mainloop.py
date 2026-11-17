@@ -295,11 +295,12 @@ class Call:
     """Whether its solve holds the chunk inverse at fp32's range: a 16-bit delta rule whose form proves no
     bound on the inverse's entries (`recurrence.Hooks.inverse_bound`), its merges in bf16 parts
     (`_merging`)."""
-    apart: bool = False
-    """Whether a token reads the state after its update less its own write (`recurrence.Hooks.reads`
-    'apart', mamba_ssm's Mamba-3, whose caller weighs the diagonal apart): its scores and their gradient
-    strictly lower (`algebra.chunk_scores`', `local_gradient`'s and `scores_gradient`'s `diagonal`), a decay
-    a head without the delta rule."""
+    apart: int = 0
+    """The tokens of a group whose readout reads the state after its update less the group's writes
+    (`recurrence.Hooks.reads` 'apart', a token's ranks `Hooks.ranks`, mamba_ssm's Mamba-3, whose caller
+    weighs them apart), zero where the readout reads the whole state: its scores and their gradient keep the
+    pairs of later groups alone (`algebra.chunk_scores`', `local_gradient`'s and `scores_gradient`'s
+    `apart`), a decay a head without the delta rule."""
     producers: resources.Producers = dataclasses.field(default_factory=resources.Producers)
     """Its tiles' (`Tiles.producers`)."""
     residents: resources.Residents = dataclasses.field(default_factory=resources.Residents)
@@ -2043,7 +2044,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
             # The chunk's own pairs' scores staged for its local product (`output_launch`'s first step's).
             scores = algebra.chunk_scores(queries.__getitem__, keyed.__getitem__, slices, gate, low,
                                           held.dtype, Issuer(call), laid=laid, column_scale=column_scale,
-                                          diagonal=not call.apart)
+                                          apart=call.apart)
             operands.staged(family, scores, scored)
             corrected = _scan_corrected(call, slots, tile, bv, state, (gate, low), betas, issue)
             # The memory the chunk enters, in its registers, staged as the memories' form for its product.

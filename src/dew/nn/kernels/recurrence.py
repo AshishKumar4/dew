@@ -126,6 +126,10 @@ class Hooks:
     write_bound: float | None = None
     reads: Readout = 'after'
     own_weight: bool = False
+    ranks: int = 1
+    """The op's tokens a token's writes take, its ranks laid in turn (mamba_ssm's Mamba-3 MIMO), whose
+    readout 'apart' reads none of them: its scores keep the pairs of later tokens alone (`i // R > j //
+    R`, `mamba3_mimo_fwd.py`)."""
 
     @property
     def inverse_bound(self) -> float | None:
@@ -152,6 +156,9 @@ class Hooks:
         if self.reads not in ('after', 'before', 'apart'):
             raise ValueError(f"a readout reads the state 'after' its token's update, 'before' it or 'apart' "
                              f"from its own write, not {self.reads!r}")
+        if self.ranks < 1 or (self.ranks > 1 and self.reads != 'apart'):
+            raise ValueError(f"a token's ranks are one or more, more only where its readout reads apart from "
+                             f"their writes, not {self.ranks} reading {self.reads!r}")
         if self.own_weight and self.delta:
             raise ValueError("a readout weighs a token's own write without the delta rule: the delta rule's "
                              "write is its corrected value, which reads the state its readout does not")

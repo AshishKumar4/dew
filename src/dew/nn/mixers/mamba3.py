@@ -60,10 +60,11 @@ CHUNK_SIZE = 64
 MAMBA3 = Hooks(decay='scalar', delta=False, write_gate=True, scale=1.0, reads='apart')
 """Mamba-3's chunked form on the recurrence template: a decay a head (`dt A`), no delta rule, an explicit
 write gate (each token's folded trapezoid weight, `chunk_mamba3`), its readout apart from its token's own
-write, which `_rank_terms` weighs at the token's own gate (mamba_ssm's strictly lower scores and `gamma q .
-k` apart, `mamba3_siso_fwd.py`): read whole, the op weighed it at the folded gate and its rank terms took
-the next token's share back off, which cancelled at a document's first token, its output there 22 times the
-recurrence's worst row from float64 (row 7402)."""
+writes, a rank an op token each (`Hooks.ranks`, a call's), which `_rank_terms` weighs at the token's own
+gate (mamba_ssm's strictly lower scores and `gamma q . k` apart, `mamba3_siso_fwd.py`, and its MIMO's `i //
+R > j // R`, `mamba3_mimo_fwd.py`): read whole, the op weighed them at the folded gate and its rank terms
+took the next token's share back off, which cancelled at a document's first token, its output there 22
+times the recurrence's worst row from float64 (row 7402)."""
 
 
 def _within(starts, length: int, batch: int):
@@ -161,21 +162,14 @@ def _ranked(t):
     return t.reshape(t.shape[0], -1, *t.shape[3:])
 
 
-def _rank_terms(queries, keys, own, x, gamma, following):
+def _rank_terms(own, x, gamma):
     """What a token's own writes add to each of its ranks' outputs past the chunked op's (`chunk_mamba3`, its
-    readout apart from each op token's own write): its rank `r` read its ranks before `r` at `gamma + delta`
-    (the next token's `delta`) and none from `r` on, where the recurrence reads all of them at `gamma` alone.
-    The earlier ranks' `delta` comes back off on `queries` and `keys` `[B, S, R, H, N]` as the op read them,
-    so the two cancel; the rest add at `gamma` on `own`, the token's queries and keys unturned `(C, B)` in
-    the working dtype (one angle a token: its ranks' overlaps are its turned ones', mamba_ssm's `qk_dot` on
-    `q_pre . k_pre`). `x` `[B, S, R, H, P]`, `gamma` and `following` `[B, S, H]`."""
-    rank = x.shape[2]
-    earlier = jnp.arange(rank)[None, :] < jnp.arange(rank)[:, None]
-    weighed = jnp.einsum('bsrhn,bsuhn->bshru', *own) * jnp.where(earlier, 0.0, gamma[..., None, None])
-    if rank > 1:
-        read = jnp.einsum('bsrhn,bsuhn->bshru', queries, keys)
-        weighed = weighed - read * jnp.where(earlier, following[..., None, None], 0.0)
-    return jnp.einsum('bshru,bsuhp->bsrhp', weighed, x)
+    readout apart from them, `MAMBA3`): every rank `u` of the token at `gamma`, as the recurrence reads them,
+    on `own`, the token's queries and keys unturned `(C, B)` `[B, S, R, H, N]` in the working dtype (one
+    angle a token: its ranks' overlaps are its turned ones', mamba_ssm's `qk_dot` on `q_pre . k_pre`). `x`
+    `[B, S, R, H, P]`, `gamma` `[B, S, H]`."""
+    overlap = jnp.einsum('bsrhn,bsuhn->bshru', *own) * gamma[..., None, None]
+    return jnp.einsum('bshru,bsuhp->bsrhp', overlap, x)
 
 
 def _trapezoid(delta, real, resets):
@@ -278,13 +272,13 @@ def _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, state, star
         entry_key, entry_value, entry_weight = entries(keys)
         table = {'loads': loads, 'stores': stores, 'held': held, 'entry_key': entry_key,
                  'entry_value': entry_value, 'entry_weight': entry_weight}
-    out, final = chunk(MAMBA3, Chunk(_ranked(queries), _ranked(keys), _ranked(jnp.asarray(x, operand)),
-                                     log_decay=_ranked(decay), beta=_ranked(gate), state=state,
-                                     starts=None if begins is None else _ranked(begins), **table),
+    out, final = chunk(dataclasses.replace(MAMBA3, ranks=rank),
+                       Chunk(_ranked(queries), _ranked(keys), _ranked(jnp.asarray(x, operand)),
+                             log_decay=_ranked(decay), beta=_ranked(gate), state=state,
+                             starts=None if begins is None else _ranked(begins), **table),
                        **({} if chunk_size is None else {'chunk_size': chunk_size}), dtype=work)
     own = tuple(_per_head(jnp.asarray(t, work), heads) for t in (C, B))
-    out = out.reshape(x.shape) + _rank_terms(queries.astype(work), keys.astype(work), own,
-                                             jnp.asarray(x, work), lam * dt, following)
+    out = out.reshape(x.shape) + _rank_terms(own, jnp.asarray(x, work), lam * dt)
     return out, final, keys
 
 

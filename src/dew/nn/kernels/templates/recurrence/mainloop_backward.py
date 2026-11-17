@@ -135,7 +135,7 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                   max_segments: int | None = None, scale: float | None = None,
                   family: mosaic.Family | None = None, interpret: bool = False,
                   inverse=None, kept=None, delta: bool = True,
-                  rounded: bool = False, apart: bool = False, ranged: bool = False,
+                  rounded: bool = False, apart: int = 0, ranged: bool = False,
                   skip=None,
                   forked: ForkedTable | None = None) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
@@ -375,7 +375,7 @@ def _local_back(q, k, do, hi, lo, taken, call: Call, *, scale: float):
                 functools.partial(block, "keys"), functools.partial(block, "queries"), width // call.block,
                 gate, low, lambda j: stream_tile(slots, "out", given, columns=pl.ds(j * vb, vb)),
                                    value_width // vb,
-                scale, call.held.dtype, issue, issue.summed, emit=stored, laid=laid, diagonal=not call.apart)
+                scale, call.held.dtype, issue, issue.summed, emit=stored, laid=laid, apart=call.apart)
             return carry, accumulators
 
         return mosaic.Walk(views, step, prologue=None if streamed else lambda: read(None))
@@ -778,7 +778,7 @@ def _query_key_views(call: Call, keyed: tuple, served: tuple, memory: tuple, *, 
 
 
 def _gradient_stored(call: Call, kind: str, block: int, grad, *, weights: Sequence, sums: dict, first,
-                     landing: dict, apart: bool = False) -> None:
+                     landing: dict, apart: int = 0) -> None:
     """`algebra.memory_gradients`' emit in `_query_key`: the weights' gradient (`kind` 'dw') in the
     operands' dtype to `weights` (its parts' views) as it is final, as fla's dqkwg writes it; the queries'
     and keys' ('dq', 'dk') to `sums[kind]` summed over the key head's value heads in fp32, stored at the
@@ -1160,7 +1160,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
                 functools.partial(value_column, "out", given), blocks, gate, low, scale,
                 grads.dtype if accumulated is None else jnp.float32, Issuer(call).summed, laid=laid,
                 column_scale=family.columns_of(beta_ref.at[h, span]) if call.gated_keys else None,
-                diagonal=not call.apart)
+                apart=call.apart)
             # The pairs' sum before the scores' gradient's store, so an fp32 call's parts form after the
             # pairs are gone.
             decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, column_sums)

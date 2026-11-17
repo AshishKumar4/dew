@@ -113,7 +113,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
             max_segments: int | None = None,
             scale: float | None = None, delta: bool = True, wide: bool = False,
             family: mosaic.Family | None = None, interpret: bool = False,
-            rounded: bool = False, apart: bool = False, ranged: bool = False, skip=None,
+            rounded: bool = False, apart: int = 0, ranged: bool = False, skip=None,
             forked: ForkedTable | None = None):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
     `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g`, a head's `[B, T, HV]` (the gated delta
@@ -164,7 +164,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  scale: float | None = None, delta: bool = True, wide: bool = False,
                  family: mosaic.Family | None = None, interpret: bool = False,
                  keeps: bool = True,
-                 rounded: bool = False, apart: bool = False, ranged: bool = False,
+                 rounded: bool = False, apart: int = 0, ranged: bool = False,
                  skip=None, forked: ForkedTable | None = None) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
     (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
@@ -287,7 +287,7 @@ def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool,
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
              firsts=None,
              inverse=None, kept=None, keeps: bool = True,
-             rounded: bool = False, apart: bool = False, ranged: bool = False, scans: bool = False,
+             rounded: bool = False, apart: int = 0, ranged: bool = False, scans: bool = False,
              forked=None,
              out_dtype=None, skipped: bool = False) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
@@ -336,9 +336,10 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     # rounded put the output 1.7 times and the final memory up to 540 times the portable math's distance from
     # float64).
     held = given if delta or rounded else Operand(rows, product.EXACT_PARTS, jnp.dtype(jnp.float32))
-    if apart and (delta or per_key):
-        raise NotImplementedError("the mainloop reads a token's state apart from its own write under a decay "
-                                  "a head without the delta rule alone: the portable math takes the rest")
+    if apart and (delta or per_key or tiles.chunk % apart):
+        raise NotImplementedError("the mainloop reads a token's state apart from its group's writes under a "
+                                  "decay a head without the delta rule alone, its chunk whole groups: the "
+                                  "portable math takes the rest")
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                 interpret, generation.gpu_target(), tiles.chunk, ranged=ranged, apart=apart,
                 producers=tiles.producers, residents=tiles.residents)

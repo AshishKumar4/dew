@@ -211,7 +211,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     # without the delta rule (`mainloop.Call.apart`); any other the portable math takes, as the decayed
     # query's read of the state entering the token, `(g q)^T S`, exactly the state after the update less
     # the token's write.
-    apart = hooks.reads == 'apart' and not hooks.own_weight and hooks.decay != 'vector' and not hooks.delta
+    apart = (hooks.ranks if hooks.reads == 'apart' and not hooks.own_weight and hooks.decay != 'vector'
+             and not hooks.delta else 0)
     if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None and readout:
         # Each of its routes adds the skip, the port in its kernels.
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, firsts, chunk_size,
@@ -269,6 +270,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                           scale=scale, delta=hooks.delta, dtype=work,
                                           bound=hooks.inverse_bound, forked=carried, reads=reads,
                                           own=given['own'] if hooks.own_weight else None)
+                if hooks.ranks > 1:
+                    out = out - scale * _group_read(query, key, wide, g, beta, hooks.ranks)
             out = out.astype(work)
             return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
 
@@ -294,8 +297,8 @@ class PortCase:
     its decay is a key dimension's
     (`per_key`), whether its documents enter earlier documents' finals (`forked`, `Chunk.loads`), and
     whether its readout reads the state after its token's update alone (`readout`: `Hooks.reads` 'after'
-    and no `Hooks.own_weight`) or after it less its own write (`apart`: 'apart', which the template forms
-    and no port's kernels do)."""
+    and no `Hooks.own_weight`) or after it less its group's writes (`apart`, the group's tokens: 'apart',
+    which the template forms and no port's kernels do; zero where it does not)."""
 
     varying: bool
     dtype: np.dtype
@@ -310,7 +313,7 @@ class PortCase:
     per_key: bool = False
     forked: bool = False
     readout: bool = True
-    apart: bool = False
+    apart: int = 0
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -488,7 +491,7 @@ class Templated(Protocol):
     def readout(self) -> bool: ...
 
     @property
-    def apart(self) -> bool: ...
+    def apart(self) -> int: ...
 
 
 TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
@@ -511,7 +514,7 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
                 "an fp32 product), which the template's whole products (its accurate parts, or a 16-bit "
                 "operand's own) do not compute; it rounds an fp32 product at the default alone, under the "
                 "run's fast forms (`fast_rounding`)", row=INHERENT, kind='handoff'),
-    Requirement('readout', lambda case: case.readout or case.apart, READOUT_HANDOFF, row='ledger 6128',
+    Requirement('readout', lambda case: case.readout or case.apart > 0, READOUT_HANDOFF, row='ledger 6128',
                 kind='handoff'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
@@ -984,7 +987,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                 scale: float | None = None, wide: bool = False,
                 bound: float | None = None, product: str = 'forward', report: bool = True, delta: bool = True,
                 decayed: bool = True, forked: Forked | None = None, skip=None, rounded: bool | None = None,
-                firsts=None, readout: bool = True, apart: bool = False) -> str:
+                firsts=None, readout: bool = True, apart: int = 0) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
     ('forward', 'training'), of the form `delta` and `decayed` state and the chunk inverse's `bound` its form
     proves (`recurrence.Hooks.inverse_bound`; `PortCase`), the template's
@@ -1008,6 +1011,37 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                     product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4,
                     forked=forked is not None, readout=readout, apart=apart)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
+
+
+def _group_read(query, key, value, g, beta, group: int) -> jax.Array:
+    """What each token of a group of `group` consecutive tokens (`recurrence.Hooks.ranks`) reads of its
+    group's earlier tokens' writes, `sum_{u < r} beta_u exp(G_{r-1} - G_u) (q_r . k_u) v_u` `[B, T, H, V]`
+    (`G` the log decays summed within the group; `query` decayed by its own token's already): the portable
+    math's readout 'apart' at a group of more than one token is its read of the state entering the token
+    (`Scan.reads` 'before') less this, which cancels the group's earlier writes at their whole gate, their
+    rounding the token's (row 7402's portable part, until the scan's derivation reads a group's entering
+    state). Heads of keys and values alike."""
+    batch, length, heads = value.shape[:3]
+    if key.shape[2] != heads:
+        raise NotImplementedError("a readout apart from a group of tokens reads keys a value head each")
+
+    def grouped(t):
+        return jnp.reshape(t, (batch, length // group, group, *t.shape[2:]))
+
+    q, k, v, b, logs = (grouped(t) for t in (query, key, value, beta, jnp.asarray(g, query.dtype)))
+    summed = jnp.cumsum(logs, axis=2)
+    earlier = jnp.arange(group)[:, None] > jnp.arange(group)[None, :]
+    # Each pair's decay from the writer through the reader's predecessor, its exponent masked before the
+    # exp so no later pair's overflows; a key dimension's a key each.
+    lag = (summed - logs)[:, :, :, None] - summed[:, :, None]
+    lag = jnp.where(earlier.reshape(1, 1, group, group, *(1,) * (lag.ndim - 4)), lag, 0.0)
+    between = jnp.moveaxis(accurate_exp(lag), 4, 2)
+    if g.ndim == query.ndim:
+        pairs = jnp.einsum('btrhk,btuhk,bthruk->bthru', q, k, between)
+    else:
+        pairs = jnp.einsum('btrhk,btuhk->bthru', q, k) * between
+    weighed = jnp.where(earlier, pairs * jnp.moveaxis(b, 2, -1)[..., None, :], 0.0)
+    return jnp.reshape(jnp.einsum('bthru,btuhv->btrhv', weighed, v), (batch, length, heads, -1))
 
 
 def _read_once(value, work) -> tuple[jax.Array, jax.Array]:
@@ -1511,7 +1545,7 @@ class ScanCase:
     product: str = 'forward'
     forked: bool = False
     readout: bool = True
-    apart: bool = False
+    apart: int = 0
 
     @property
     def cell(self) -> tuple[str | None, str]:
