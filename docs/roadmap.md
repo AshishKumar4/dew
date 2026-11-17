@@ -11,12 +11,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - finished_merged's mean is 0 where its slices' masses total past fp32's largest. [6904]
 - finished_merged's derivative along its denominators is NaN where (o - out) / W passes fp32 though its product with the tangent does not. [6905]
 - The flash fallback's packed documents on a TPU give wrong results. [6981]
-- Splash's float32 forward at width 256 does not compile on a v5e. [6992]
-- The attention template's Mosaic TPU forward does not compile for a v5e training step at width 64, full, float16. [6993]
-- Paged decode on a v5e does not compile. [6994]
 - Splash's training step on a v5e is not finite in its value gradient. [7226]
-- Splash in float16 does not compile on a v5e. [7227]
-- JAX's paged decode at width 64 does not lower on a v5e. [7228]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -34,6 +29,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The kernel gate reads no resource report of a fp32 decode's plain-forward kernels. [7263]
 - The row-indexed hooked attention backward compile nodes (test_attention_mosaic_compile spill-free, sm80/sm86/sm89 accurate, row-indexed hook) take 209-295 s…. [7360]
 - No test exercises the TPU paged decode (jax's pallas tpu paged_attention via kv_cache) on a v5e. [7385]
+- Tests/test_mamba3.py::test_the_chunked_form_is_as_exact_as_the_recurrence passes vacuously on main. [7401]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -69,7 +65,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
 - Stacks, scans and looped models. [1568]
-- One token layout, and every layout and placement trains and serves. [1710, 1903]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
 
 ## Training and parallelism
@@ -93,7 +88,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Training and serving efficiency. [3330, 1880, 5292]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
-- Mamba-1 and Mamba-2 refuse a decode step under a mesh sequence axis above one (nn/mixers/mamba.py and mamba2.py: LayoutRefused 'runs whole training sequences;…. [7400]
+- A served rollout's or episode cohort's server pages its cache wherever pages serve the policy as it draws (serving.served_layout, theme 15), at every prompt…. [7420]
 
 ## Algebra
 
@@ -106,6 +101,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 - Released checkpoints judged on GPUs. [1703]
 - Reference comparisons held by derived bounds. [1719, 2094]
+- One token layout, and every layout and placement trains and serves. [1903]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - Saved runs carried across. [2791, 2792]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]

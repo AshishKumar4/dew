@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from episode_support import environment as sandbox
+from episode_support import Harness, environment as sandbox
 from flax import linen as nn
 from recording import bits
 
@@ -27,10 +27,12 @@ from dew.data.dataset import Loader, replayed, tapped
 from dew.inference import NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kv_cache import KVCache
 from dew.objectives.rl import EnvironmentSource, EpisodeStatus, GRPOObjective, Observation
 from dew.objectives.rl.scheduler import Asynchronous, RolloutScheduler
 from dew.objectives.rl.sessions import Status, pack
 from dew.sampling import Sampling
+from dew.sampling.strategies import Beam
 from dew.training import Layout, Trainer
 
 VOCAB = 13
@@ -417,3 +419,75 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
         assert watched.results[sample].status is Status.CANCELLED and not watched.results[sample].calls
     assert all(rollout.status is Status.INFRA_ERROR and not rollout.calls
                for rollout in watched.rollouts if int(rollout.task) % 5 == 1)
+
+
+def test_a_served_rollouts_server_shares_its_prompts_pages_by_default():
+    """A served rollout's server (`RolloutScheduler.serve`) that names no page size pages its cache where
+    paging computes what the model computes, its prefix cache on as a paged server keeps one, so a group's
+    samples of one prompt prefill it once (row 5375); a model whose LongRoPE rebuilds a crossing request,
+    and one whose max_seq_len holds no row in whole pages, keeps each row's cache whole."""
+    from model_support import serving_task
+
+    from dew.nn.rope import LongRopeScaling
+
+    task = serving_task(capacity=64)
+    assert RolloutScheduler.serve(task, slots=4, capacity=64).reuses_prefixes
+    # Factors for each of a head's 8 widths' rotated pairs.
+    scaling = LongRopeScaling(short_factor=(1.0,) * 4, long_factor=(2.0,) * 4,
+                              original_max_position_embeddings=16)
+    rebuilding = dataclasses.replace(task, model=task.model.clone(rope_scaling=scaling))
+    assert not RolloutScheduler.serve(rebuilding, slots=4, capacity=64).reuses_prefixes
+    assert not RolloutScheduler.serve(serving_task(capacity=12), slots=4, capacity=8).reuses_prefixes
+
+
+def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
+    """An episode scheduler over a `TextGeneration` policy drawing one row a prompt by sampling, whose model
+    pages, serves its cohort's turns over a paged cache (`served_layout`, `EpisodeCollector.kv_cache`), so
+    each turn prefills only what follows its row's history where every turn prefilled it again (row 5374);
+    a policy drawing several rows a prompt, or searching beams, is drawn whole."""
+    from model_support import serving_task
+
+    from dew.objectives.rl import EpisodeCollector
+    from dew.objectives.rl.scheduler import Synchronous
+
+    task = serving_task(capacity=64)
+    objective = GRPOObjective(task.model, seq_len=7)
+
+    def layout(policy: TextGeneration):
+        """The cache layout the scheduler's collector serves its cohort's turns over."""
+        acquisition = RolloutScheduler.episodes(
+            policy, Harness(), lambda episode: 0.0, objective=objective, max_prompt_tokens=8,
+            max_new_tokens=4, max_turns=2, sampling=Sampling(eos_token_ids=(3,))).acquisition
+        assert isinstance(acquisition, Synchronous) and isinstance(acquisition.collector, EpisodeCollector)
+        return acquisition.collector.kv_cache
+
+    paged = layout(task)
+    assert paged is not None and paged.page_size == 64
+    assert layout(dataclasses.replace(task, n=2)) is None
+    # A policy searching beams, which a server over pages does not draw, is drawn whole.
+    assert layout(dataclasses.replace(task, strategy=Beam(width=2))) is None
+
+
+def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):
+    """A served rollout whose run names its page size 'whole' (`--rollout.served.page-size whole`,
+    `ServedRollout.page_size`) serves over each row's whole cache, no prompt page shared, where one naming
+    none pages wherever pages serve the policy (`RolloutScheduler.serve`, row 5375); the run records the
+    choice and loads with it."""
+    import rl_support
+    from model_support import serving_task
+
+    from dew.config.lm import LMRunConfig
+
+    config = rl_support.recorded_grpo_config(tmp_path, "--trainer.name", "whole", "--rollout.served.slots",
+                                             "8", "--rollout.served.page-size", "whole")
+    assert config.rollout is not None
+    served = config.rollout.served
+    assert served is not None and served.page_size == "whole"
+    task = serving_task(capacity=64)
+    assert not RolloutScheduler.serve(task, slots=4, capacity=64, page_size=served.page_size).reuses_prefixes
+    # A model that declares pages of its own is served whole all the same.
+    paged = dataclasses.replace(task, model=task.model.with_kv_cache(KVCache(page_size=8)))
+    assert RolloutScheduler.serve(paged, slots=4, capacity=64).reuses_prefixes
+    assert not RolloutScheduler.serve(paged, slots=4, capacity=64, page_size="whole").reuses_prefixes
+    config.save(str(tmp_path / "whole"))
+    assert LMRunConfig.load(str(tmp_path / "whole")).rollout == config.rollout

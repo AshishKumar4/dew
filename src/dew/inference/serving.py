@@ -605,6 +605,46 @@ def _unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bool = Fa
     return None
 
 
+PAGE_SIZE = 64
+"""The slots a page holds where neither a caller nor the model's layout names a page size
+(`paged_layout`). A served GRPO batch of 8 prompts x 8 samples at Qwen3-0.6B's config on a GH200 (M-IG-11,
+64 new tokens, medians of 5 rounds, each arm alone): pages of 64 took 0.453 s at 512-token prompts and
+0.615 s at 2048 against a dense cache's 0.439 and 1.154, and pages of 16 0.509 and 0.703."""
+
+
+type PageSize = int | Literal["whole"] | None
+"""A caller's page size for a server it builds (`served_layout`): pages of that many slots, each row's
+cache whole ('whole'), or None, paged where paging serves the task as it draws."""
+
+
+def served_layout(task: TextGeneration, capacity: int, page_size: PageSize = None) -> KVCache | None:
+    """The cache layout a server of `task`'s rows of `capacity` slots takes where its caller names a page size
+    at most (a served rollout's, `dew.objectives.rl.RolloutScheduler.serve`, and an episode cohort's,
+    `RolloutScheduler.episodes`): the model's own layout, its format kept, in pages of `page_size` slots;
+    unpaged, each row's cache whole, for 'whole' (None for a model of no layout to replace, whose rows are
+    whole); and where none is named, pages of the layout's own size or
+    `PAGE_SIZE` wherever a server over pages draws as the task draws, rows whole where not: the model's
+    layout replaceable (`Layered`), the task drawing by sampling (`Sample`; speculation and beams serve
+    whole rows), paging changing nothing the model computes (`_unserved_modes`) and its max_seq_len
+    holding a row in whole pages (`_served_layout`). Its prefix cache on as a paged server keeps one by
+    default, the requests over one prompt prefill it once (rows 5374, 5375)."""
+    model = task.model
+    if page_size == "whole":
+        # The model's own layout unpaged, its format kept, which replaces a layout of pages it declares.
+        return (dataclasses.replace(model.kv_cache, page_size=None, pages=None, groups=1)
+                if isinstance(model, Layered) else None)
+    if page_size is None:
+        if not isinstance(model, Layered) or not (task.strategy is None or isinstance(task.strategy, Sample)):
+            return None
+        page_size = model.kv_cache.page_size or PAGE_SIZE
+        ceiling = cache_ceiling(model)
+        if (_unserved_modes(model, paged=True) is not None or ceiling is None
+                or ceiling // page_size * page_size < capacity):
+            return None
+    declared = model.kv_cache if isinstance(model, Layered) else KVCache()
+    return dataclasses.replace(declared, page_size=page_size)
+
+
 def _served_mesh(task: TextGeneration) -> Mesh | None:
     """The mesh `task`'s weights lie on, which a server serves on."""
     return mesh_of(task.variables)

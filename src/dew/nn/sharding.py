@@ -778,9 +778,22 @@ def abstract[TreeT](fn: Callable[..., TreeT], *args) -> TreeT:
     """`fn(*args)` traced for shapes alone (`jax.eval_shape`), Flax's logical axis rules unbound: a draw
     read for its shapes and its boxes' names places nothing, so it asks no mesh for the axes its names
     map to (Flax's `param` constrains a box it draws under rules a trainer binds, and a mesh without
-    those axes refuses it)."""
+    those axes refuses it). A `jax.tree_util.Partial`'s bound arguments (`Objective.initializer`'s held
+    variables) are traced as its arguments, not closed over: a shape pass reads shapes, so a tree held as
+    shapes (`jax.ShapeDtypeStruct`, a resumed run's base) is read as the arrays it stands for, where it
+    was handed to the draw as the structs themselves, which have no array's methods (a head's start
+    reading the base's vocabulary table took `.T` of one)."""
     with nn.logical_axis_rules(()):
-        return jax.eval_shape(fn, *args)
+        match fn:
+            case jax.tree_util.Partial():
+                return jax.eval_shape(_called, fn, *args)
+            case _:
+                return jax.eval_shape(fn, *args)
+
+
+def _called[TreeT](fn: Callable[..., TreeT], *args) -> TreeT:
+    """`fn(*args)`, `fn` an argument of the trace (`abstract`)."""
+    return fn(*args)
 
 
 def drawn_axes(init: Callable[..., Mapping], *inputs) -> dict[Suffix, LogicalAxes]:

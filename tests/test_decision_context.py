@@ -387,7 +387,7 @@ def test_a_decisions_context_is_its_inputs_condition_and_its_check_reads_it():
     assert dict(plain.inputs.conditions) == {}
 
 
-def configured(tokens: int = 12) -> DecisionObjective:
+def configured(tokens: int = 12, *, trained: bool = False) -> DecisionObjective:
     """A decision over the tiny Llama whose context is encoded by a configured encoder (`CharTable`, a
     character table of 16 features) in place of the backbone's own, read by fresh cross-attention before
     layer 0 at that width, its windows packing rows as a decision's do."""
@@ -397,7 +397,7 @@ def configured(tokens: int = 12) -> DecisionObjective:
     source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
     blocks = CrossAttention((0,), tokens, context_features=16)
     return DecisionObjective(source.with_cross_attention(blocks, key=0), tokenizer=ByteTokenizer(),
-                             specials=SPECIALS, context_encoder=table)
+                             specials=SPECIALS, context_encoder=table, context_trained=trained)
 
 
 def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly(tmp_path):
@@ -406,6 +406,7 @@ def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly
     the encoder's work; a run trains, saves, and its task loads the encoder from the run's record and
     weights and answers as the trained task does, to the bit; a resume reads on exactly. A run's context
     was only ever the backbone's own (6141)."""
+    from dew.batch import FROZEN
     from dew.checkpoints import Checkpoints
     from dew.inputs import CharTable
 
@@ -437,7 +438,8 @@ def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly
     resumed = again.fit(dataclasses.replace(data, resume="exact"), steps=3, log_every=1, checkpoint_every=1)
     # Every weight, the encoder's among them, and the optimizer's state as a run of three steps leaves them.
     whole = Trainer(configured(), optax.adam(1e-3), key=0).fit(data, steps=3, log_every=1)
-    assert "context" in resumed.variables["params"]
+    # The encoder's weights held frozen, as a configured encoder's are unless trained (`context_trained`).
+    assert "context" in resumed.variables[FROZEN]
     for got, want in zip(jax.tree.leaves((resumed.variables, resumed.opt_state)),
                          jax.tree.leaves((whole.variables, whole.opt_state)), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
@@ -471,6 +473,11 @@ def test_a_clip_context_encoder_trains_serves_and_counts_each_rows_context_alone
         "attention_mask": (np.arange(77)[None, :] < np.sum(row == document)).astype(np.int32)}).flops
         for row in owners for document in set(row.tolist()) - {0})
     assert alone > 0 and objective._encoder_flops(batch) == alone
+    # Frozen, as it is unless trained, the tower runs forward alone: a step counts its work once where a
+    # trained one counts three passes.
+    trained = DecisionObjective(source.with_cross_attention(blocks, key=0), tokenizer=ByteTokenizer(),
+                                specials=SPECIALS, context_encoder=tower, context_trained=True)
+    assert trained.training_flops(None, batch) - objective.training_flops(None, batch) == 2 * alone
     state = Trainer(objective, optax.adam(1e-3), key=0).fit(data, steps=1, log_every=1)
     task = objective.pipeline(state)
     assert set(task("one two three", QUESTION, context="a first note")) == {"pick"}
@@ -796,3 +803,56 @@ def test_the_batched_engine_reads_a_requests_context():
     assert isinstance(with_context, dict) and isinstance(without, dict)
     assert with_context["answers"] != without["answers"]
     assert task._read_wire(bodies[0], strict=True)[3] is None
+
+
+def test_a_configured_context_encoder_is_frozen_unless_trained_and_counted_as_it_runs():
+    """A configured context encoder's weights are held frozen (`FROZEN`) and run forward alone, as a
+    diffusion run's text towers do: a step leaves them as drawn; trained (`context_trained=True`) they are
+    parameters a step moves. They trained always, their Adam state beside them (theme 22's review)."""
+    from dew.batch import FROZEN
+
+    for trained in (False, True):
+        objective = configured(trained=trained)
+        data = decision_rows(examples(), 8, objective=objective.data())
+        drawn = objective.model.context.encoder.params
+        # Two steps: the cross-attention's gate opens from zero on the first, so the second reaches the
+        # encoder.
+        state = Trainer(objective, optax.adam(1e-1), key=0).fit(data, steps=2, log_every=1)
+        held = state.variables["params" if trained else FROZEN]["context"]
+        moved = [bool(np.any(np.asarray(after) != np.asarray(before)))
+                 for after, before in zip(jax.tree.leaves(held), jax.tree.leaves(drawn), strict=True)]
+        assert any(moved) == trained
+        assert "context" not in state.variables.get(FROZEN if trained else "params", {})
+
+
+def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(tmp_path):
+    """A decision run's `--context-text` builds its encoder in the run's compute dtype, as a diffusion run's
+    text condition is, a pretrained tower (`clip_text`) among them, and trains a step with it frozen; an
+    encoder that reads no text into the states context layers read (an audio tower, a denoiser's
+    conditioner) and a diffusion run's field or unconditional text are refused. The run built the tower in
+    float32 and took any registered encoder, which failed at its first trace (theme 22's review)."""
+    from run_kinds import decision, trained
+    from test_text_encoders import TINY
+
+    from dew.batch import FROZEN
+    from dew.decision.config import encodes_text
+    from dew.inputs import CharTable
+    from dew.inputs.spec import TextCondition
+    from dew.interop.conditioners import DiffusionConditioner
+    from dew.interop.encoders import CLIPText, HFAudio
+    from dew.registry import ModelConfig
+
+    text = TextCondition(encoder="clip_text", checkpoint=str(TINY))
+    run = dataclasses.replace(decision(tmp_path, drawn=False), context_layers=(0,), context_length=32,
+                              context_text=text, calibrate=False,
+                              model=ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
+    objective = run.prepare().objective
+    assert jnp.dtype(objective.model.context.encoder.dtype) == jnp.dtype("bfloat16")
+    state, _ = trained(run, tmp_path, "clip")
+    assert "context" in state.variables[FROZEN] and "context" not in state.variables["params"]
+    for refused in (dataclasses.replace(text, field="caption"), dataclasses.replace(text, unconditional="x")):
+        with pytest.raises(ValueError):
+            dataclasses.replace(run, context_text=refused).prepare()
+    assert [encodes_text(kind) for kind in (CharTable, CLIPText, HFAudio, DiffusionConditioner)] == [
+        True, True, False, False]
+

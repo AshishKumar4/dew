@@ -84,9 +84,6 @@ def parser(pythons: Sequence[str], deadline: float) -> argparse.ArgumentParser:
     lane.add_argument("--cache", help="the test cache's policy (`policy`): every lane's but a prepare's")
     lane.add_argument("--processes", type=int, required=True, help="the most test files running at once")
     lane.add_argument("--deadline", type=float, default=3600.0, help="seconds a file may run")
-    lane.add_argument("--asked", type=Path,
-                      help="a follow-up's asks (check 1's ASKED: JSON lines of {site, from, to}), which each "
-                           "file's prepare draws and its run judges over every stage, no row reused")
     operations.add_parser("gangs")
     versions = operations.add_parser("pythons")
     versions.add_argument("--check", action="store_true",

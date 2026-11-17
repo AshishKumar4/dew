@@ -1264,13 +1264,14 @@ def collect_entries(names: list[str], timings: dict, target: float) -> list[dict
             for index, held in enumerate(names[at::count] for at in range(count))]
 
 
-def stale_row(python: str, name: str, group: str, why: str) -> dict:
-    """Kept row `name` (in `group`'s group) said stale, not run (`grading.STALE`), with `why`: a row armada
-    reads as not passed, so its run is graded, and the queue runs it again."""
-    return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0,
-            "output": f"stale, not run: the plan kept it on a record this task did not find, {why}",
+def stale_row(python: str, name: str, group: str, why: str, kind: str = grading.STALE) -> dict:
+    """Row `name` (in `group`'s group) not run, red as `kind`, saying `why`: `grading.STALE`, a kept row this
+    task did not find, graded and run again by the queue; "whole", a unit its lane cannot hold."""
+    said = (f"stale, not run: the plan kept it on a record this task did not find, {why}"
+            if kind == grading.STALE else why)
+    return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0, "output": said,
             "tests": {}, "ynn_switched": [], "cells": {}, "timings": {row(python, name, ""): 0.0},
-            **grading.red_as(grading.STALE, [])}
+            **grading.red_as(kind, [])}
 
 
 def stale_cost(name: str, group: str, reading: Reading) -> float:
@@ -2017,8 +2018,7 @@ PREPARING = {"DEW_TIER_PREPARE": "1", "JAX_PLATFORMS": "cpu"}
 marked `PREPARES`, each of which then prepares rather than runs (tests/model_flows.py), on the CPU alone."""
 
 
-def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, deadline: float,
-                 asked: Path | None = None) -> int:
+def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, deadline: float) -> int:
     """A GPU lane's prepare, on its node's CPU before its files' GPU run (`gpu_lane`) and with no GPU drawn:
     each of `tests` that holds a test marked `PREPARES` run once in a process of its own under `PREPARING`,
     at most `processes` at once, as its run will select and cut it (a group `<file>#G/N` holds in its prepare
@@ -2060,7 +2060,7 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
             return 0
         return tested(python, [file], group, verdict, mine, "off", session.GRACE, "",
                       {**PREPARING, "OMP_NUM_THREADS": threads, **(VARIANTS[variant][1] if variant else {}),
-                       **asked_environment(asked)}, recorded=False, variant=variant)
+                       gpu_measures.UNIT: name}, recorded=False, variant=variant)
 
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
         for done in [pool.submit(prepared, name, verdict) for name, verdict in verdicts.items()]:
@@ -2106,22 +2106,8 @@ def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str
             for name, (file, group, _) in units.items()}
 
 
-def asked_environment(asked: Path | None) -> dict[str, str]:
-    """What hands a GPU lane's files a follow-up's asks (`asked`, check 1's ASKED: the later units sites of an
-    earlier run asked for, check1_wire.LATER), which its prepare draws and its run judges over every stage;
-    nothing where it was asked for none."""
-    return {} if asked is None else {check1_wire().ASKED: str(asked)}
-
-
-def later_asks(verdict: Path) -> Path:
-    """Where a GPU lane's file whose verdict is `verdict` writes its sites' asks for their later units (check
-    1's LATER, `map_judge.ask_later`, a JSON line each), beside its JUnit report, so its receipt carries them
-    to a follow-up (dew-ops)."""
-    return verdict.with_name(f"{verdict.name}.later.jsonl")
-
-
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,
-             deadline: float, network: bool = False, asked: Path | None = None) -> int:
+             deadline: float, network: bool = False) -> int:
     """Run `tests` on this process's share of the one GPU it sees, each once, as a task of its own
     (`tested`), and write their verdict rows to `out`: a test file, or one group of one as CI names it
     (`<file>#G/N`, the Gth of N runs of the tests the file's collection here finds, split.py), whose row is
@@ -2155,11 +2141,10 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     the lane before any file runs."""
     subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch"], check=True)
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
-    # The memory the GPU gives a process: all of it less what its driver and firmware keep, the total XLA
-    # takes a pool's fraction of (within nvidia-smi's rounding to a MiB), and the one a node's session gave
-    # this lane its fraction of. Counted of the GPU's whole memory, a file's share was a pool short of it by
-    # what the driver keeps (2026-11-11: a GH200's 1,103 of 97,871 MiB made a 5.91 GiB share a 5.84 GiB pool,
-    # which ran out).
+    # The memory the GPU gives a process, less what its driver and firmware keep: the total XLA and a node's
+    # session take this lane's fraction of (within nvidia-smi's MiB). Of the GPU's whole memory, a share was
+    # a pool short by what the driver keeps (2026-11-11: a GH200's 1,103 of 97,871 MiB made a 5.91 GiB share
+    # a 5.84 GiB pool, which ran out).
     [total] = ((int(whole) - int(kept)) * 2 ** 20 for whole, kept in
                (answer.split(",") for answer in gpu_query("memory.total,memory.reserved")))
     # A job holding the whole GPU is given no fraction (a node sets one for a part of a GPU alone, dew-ops'
@@ -2174,18 +2159,14 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     tests = list(units)
 
     measures = lane_measures(python, units, held, token)
-    needed = {name: gpu_needs(measures[name], budget) for name in tests}
+    prepared = gpu_measures.prepared_needs(python, tests)  # Each no less than its prepared programs' need.
+    unheld = gpu_measures.unschedulable(prepared, budget, float(WHOLE_GPU) * total, held)  # Nor below it.
+    tests = [name for name in tests if name not in unheld]
+    needed = {name: gpu_needs(measures[name], budget, prepared.get(name, 0.0)) for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
-    # A file measured holding more than the lane's share is given all of it, and its row says so: what it
-    # was admitted at is the lane's reservation, not its need (2026-11-10: a 5.9 GiB need given a 4 GiB lane
-    # without a word, and its run out of memory read as the test's).
-    short = {name: f"admitted at {budget / 2 ** 30:.1f} GiB, below its measured need of "
-                   f"{need / 2 ** 30:.1f} GiB"
-             for name in tests
-             if math.isfinite(need := gpu_needs(measures[name], math.inf)[1]) and need > budget}
-    # Before any test writes under tests/, the inputs every file's key hashes.
-    common = lane_inputs(python)
+    short = gpu_measures.measured_short({name: measures[name] for name in tests}, budget)
+    common = lane_inputs(python)  # Before any test writes under tests/, the inputs every file's key hashes.
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
 
     waiting = sorted(tests, key=lambda name: -holds[name])
@@ -2202,14 +2183,10 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                            "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
                            "OMP_NUM_THREADS": threads}
                 file, group, variant = units[fits]
-                # A site's asks for its later units go beside the file's report; a follow-up of asks
-                # (`asked`) reuses no row: its run is another than theirs.
-                later_asks(verdicts[fits]).unlink(missing_ok=True)
-                running[pool.submit(tested, python, [file], group, verdicts[fits], deadline,
-                                    "off" if asked is not None else cache, session.GRACE, common,
-                                    {**environ, **(VARIANTS[variant][1] if variant else {}),
-                                     check1_wire().LATER: str(later_asks(verdicts[fits])),
-                                     **asked_environment(asked)}, None, network, variant=variant)] = fits
+                running[pool.submit(tested, python, [file], group, verdicts[fits], deadline, cache,
+                                    session.GRACE, common,
+                                    {**environ, **(VARIANTS[variant][1] if variant else {})}, None, network,
+                                    variant=variant)] = fits
                 continue
             done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
@@ -2217,6 +2194,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                 del running[future]
     rows = [{**verdict, "output": f"{short[name]}\n{verdict.get('output', '')}"} if name in short else verdict
             for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
+    rows += [stale_row(python, file, varied(group, variant), unheld[name], "whole")
+             for name, (file, group, variant) in units.items() if name in unheld]
     out.write_text(json.dumps({"rows": rows}))
     return 0
 
@@ -2398,12 +2377,12 @@ def lane_asked(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         if args.network or args.cache is not None:
             parser.error("gpu-lane --prepare names its --tests, and takes neither --network nor --cache")
         return gpu_prepared(PYTHONS[0], args.tests.split(), args.out, processes=args.processes,
-                            deadline=args.deadline, asked=args.asked)
+                            deadline=args.deadline)
     if args.cache is None:
         parser.error("gpu-lane names the test cache's policy (--cache)")
     tests = args.tests.split() if args.tests is not None else list(network_files(PYTHONS[0]))
     return gpu_lane(PYTHONS[0], tests, args.out, cache=args.cache, processes=args.processes,
-                    deadline=args.deadline, network=args.network, asked=args.asked)
+                    deadline=args.deadline, network=args.network)
 
 
 def main() -> int:
