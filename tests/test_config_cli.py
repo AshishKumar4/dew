@@ -542,6 +542,7 @@ def test_a_source_directory_trusted_by_a_bare_name_is_no_module_to_import(tmp_pa
     code where a load reads it, as it did before trusting a package imported it: only a name that names an
     importable module is imported (`import_trusted`)."""
     import sys
+    import types
 
     from dew.registry import import_trusted, trusts_source
 
@@ -551,6 +552,9 @@ def test_a_source_directory_trusted_by_a_bare_name_is_no_module_to_import(tmp_pa
     monkeypatch.setattr(sys, "path", [entry for entry in sys.path if entry not in ("", ".", str(tmp_path))])
     import_trusted(None, ("lfm3_vl",))
     assert trusts_source("lfm3_vl") and trusts_source(str(tmp_path / "lfm3_vl"))
+    # A module the process holds without an import spec (installed by hand) is imported as it is.
+    monkeypatch.setitem(sys.modules, "users_installed", types.ModuleType("users_installed"))
+    import_trusted(None, ("users_installed",))
 
 
 def test_a_python_runs_trust_holds_while_its_file_builds_it(tmp_path):

@@ -273,11 +273,13 @@ def import_trusted(record: JSON | Mapping[str, object], trust: Sequence[str]) ->
 
 
 def _importable(name: str) -> bool:
-    """Whether the module `name` is one the process can import: its package's, then its own, found on the
-    module path (`importlib.util.find_spec`)."""
+    """Whether the module `name` is one the process can import: its package's, then its own, each one the
+    process holds already (a module installed without a spec included) or one found on the module path
+    (`importlib.util.find_spec`)."""
     parts = name.split(".")
-    return all(importlib.util.find_spec(".".join(parts[:end])) is not None
-               for end in range(1, len(parts) + 1))
+    prefixes = (".".join(parts[:end]) for end in range(1, len(parts) + 1))
+    return all(sys.modules.get(prefix) is not None or importlib.util.find_spec(prefix) is not None
+               for prefix in prefixes)
 
 
 class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
