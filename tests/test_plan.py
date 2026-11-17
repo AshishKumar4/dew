@@ -1258,11 +1258,11 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of) -> tup
     `free`; 'h100', a compile-only H100 compiled ahead, what a GPU start plans for): the places of the fit
     ladder in its order (`recompute_more`: at each remat rung its head's rungs, then the next), as the
     objective states each (`rung_record`); the room `room_of` the needs by remat at the run's own head, each
-    such place's step compiled with room past all (no other place's need is read); the place the start's
-    climb settles in that room, its rung unstated; and the first place of the ladder whose step, compiled in
-    that room, fits: an exhaustive walk. XLA schedules a GPU's program to
-    the memory its target states, so a place's need in that room is its compile there, not its need with
-    room past all. A place is its head's tile, whether that head is fused, and its remat."""
+    such place's step compiled with room past all as it asks for it (no other place's need is compiled); the
+    place the start's climb settles in that room, its rung unstated; and the first place of the ladder whose
+    step, compiled in that room, fits: an exhaustive walk. XLA schedules a GPU's program to the memory its
+    target states, so a place's need in that room is its compile there, not its need with room past all. A
+    place is its head's tile, whether that head is fused, and its remat."""
     from dew.training.memory import recompute_more, rung_record
 
     def described(objective) -> tuple:
@@ -1301,14 +1301,15 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of) -> tup
     places = [described(ladder)]
     while recompute_more(ladder):
         places.append(described(ladder))
-    # The needs at the run's own head alone, by remat, each compiled with room past all.
-    whole = {}
-    for moves, (tile, _, remat, _) in enumerate(places):
-        if tile is None:
-            trainer = planned(moves, room_past)
-            assert placed(trainer)[:3] == places[moves][:3], (placed(trainer), places[moves])
-            whole[remat] = room_past - trainer.plan["probes"][0]["headroom"]
-    room = room_of(whole)
+    # The needs at the run's own head, by remat, each compiled with room past all as `room_of` reads it.
+    own = {remat: moves for moves, (tile, _, remat, _) in enumerate(places) if tile is None}
+
+    def need(remat) -> int:
+        trainer = planned(own[remat], room_past)
+        assert placed(trainer)[:3] == places[own[remat]][:3], (placed(trainer), places[own[remat]])
+        return room_past - trainer.plan["probes"][0]["headroom"]
+
+    room = room_of(need)
     def fits(moves: int) -> bool:
         # The place's own step compiled in the room, its first compile the judge: where it misses, the
         # search past it may find nothing more at a remat the run now states (`PlanRefused`).
@@ -1324,25 +1325,28 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of) -> tup
 CENSUS = {
     # Four attention layers over 64 tokens, room between what 'minimal' and no rung need.
     "decoder": ({"seq": LONG, "width": 32, "layers": 4}, LONG_BATCH,
-                lambda need: (need[None] + need["minimal"]) // 2),
+                lambda need: (need(None) + need("minimal")) // 2),
     # Two scanned gated delta net layers over 256 tokens, room for what 'minimal' needs.
-    "delta-scanned": ({**HALVED, "scan_layers": True}, HALVED_BATCH, lambda need: need["minimal"]),
+    "delta-scanned": ({**HALVED, "scan_layers": True}, HALVED_BATCH, lambda need: need("minimal")),
 }
 """The census shapes: their decoders' fields, batches, and the room each start is given of their needs by
-remat at their own head."""
+remat at their own head, each read as asked (`climbed`): no other rung's need is compiled."""
 
 
-@pytest.mark.parametrize("target", ["cpu", "h100"])
-@pytest.mark.parametrize("shape", list(CENSUS))
+@pytest.mark.parametrize(("shape", "target"),
+                         [("decoder", "cpu"), ("decoder", "h100"), ("delta-scanned", "h100")],
+                         ids=["decoder-cpu", "decoder-h100", "delta-scanned-h100"])
 def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target):
     """A start whose step does not fit at its own rung climbs the ladder in its order, each rung asked, and
     settles the first that fits: no later than the first place of the ladder an exhaustive walk compiles
     under the step's own options and finds fits in the same room, and that place where the plan is no rung
     of XLA's default options, which the walk does not compile (a GPU's step under them can fit a place
-    earlier: its Triton GEMM fusions hold fewer temporaries), on the census shapes, on the CPU and for a
-    compile-only H100. What a rung keeps orders its residuals, not XLA's peak (the scanned delta decoder
-    needed more recomputing its scans and convolutions too than not), so a search that passed over a rung
-    for one seen to miss settled a heavier plan than one that fits."""
+    earlier: its Triton GEMM fusions hold fewer temporaries), the decoder on the CPU and for a compile-only
+    H100, the scanned delta decoder for the H100, what a GPU start plans for: its CPU case walked its ladder
+    in 418 s of a train's call time past the train's bound (row 7414), and the CPU's walk is the decoder's.
+    What a rung keeps orders its residuals, not XLA's peak (the scanned delta decoder needed more recomputing
+    its scans and convolutions too than not), so a search that passed over a rung for one seen to miss
+    settled a heavier plan than one that fits."""
     fields, batch, room_of = CENSUS[shape]
     with row_names_port("gated_delta_rule", "fla"):
         ladder, room, plan, lightest = climbed(monkeypatch, target, fields, batch, room_of)

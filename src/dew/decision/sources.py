@@ -186,13 +186,12 @@ class PretrainedDecision(Pretrained):
 def _trained_context(task: Decide) -> Condition | None:
     """`task`'s configured context condition (`DecisionModel.context`) bound to its trained weights
     (`Condition.bound` over its record and the task's `context` module), which a bundle carries."""
-    from dew.decision.model import context_weights
     from dew.registry import to_record
 
     if task.model.context is None:
         return None
     held = _records.record(to_record(task.model.context, Condition), "context condition")
-    return Condition.bound(held, params=context_weights(task.variables))
+    return Condition.bound(held, params=thaw(part(task.variables, "context"))["params"])
 
 
 class DecisionSource(SourceKind):

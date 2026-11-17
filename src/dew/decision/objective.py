@@ -517,11 +517,14 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             parts["backbone"] = self.model.backbone.init(backbone_key, tokens)
         if "head" not in parts:
             parts["head"] = self.model.initialize_head(head_key, parts["backbone"], tokens)
-        if self.model.context is not None and "context" not in parts:
-            # A configured context encoder's weights, as it holds them (`ConditionEncoder.params`): trained
-            # where the run trains them (`context_trained`), else frozen, as a diffusion run's towers are.
+        if self.model.context is not None:
+            # A configured context encoder's weights, the tree's (a release's, a run's) or as it holds them
+            # (`ConditionEncoder.params`): trained where the run trains them (`context_trained`), else frozen,
+            # as a diffusion run's towers are.
             held = "params" if self.context_trained else FROZEN
-            parts["context"] = {held: self.model.context.encoder.params}
+            weights = (thaw(parts["context"])["params"] if "context" in parts
+                       else self.model.context.encoder.params)
+            parts["context"] = {held: weights}
         return joined(parts)
 
     @property
