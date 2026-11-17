@@ -795,22 +795,18 @@ def test_a_window_whose_summed_gradient_overflows_its_moments_is_dropped_whole()
         np.testing.assert_array_equal(np.asarray(got), want)
 
 
-@pytest.mark.parametrize("first", [False, True], ids=["taking first", "skipping first"])
-def test_trainers_of_one_config_and_opposite_skipping_each_step_by_their_own(first):
-    """Two trainers of one optimizer config, one skipping steps not finite and one not, built in either
-    order in one process: on a batch whose loss is finite and gradient not, the skipping one keeps its
-    weights and the other takes the step, each by its own policy. The policy keyed no step, so the second
-    reused the first's (the rebuild's head review, F1)."""
-    bad = batches()[1]
-    for skip in (first, not first):
-        config = OptimConfig(optimizer="adamw", learning_rate=0.1)
-        stepper = Trainer(Tiny(), config, key=jax.random.PRNGKey(9), skip_nonfinite=skip)
-        stepper.scheduled(1)
-        state = stepper.initial_state()
-        before = np.asarray(state.variables["params"]["w"])
-        advanced, _, _, finite, _, _ = stepper.compile(state, bad)(state, bad)
-        moved = np.asarray(advanced.variables["params"]["w"])
-        assert not bool(finite) and np.array_equal(moved, before) == skip
+def test_a_skipping_trainer_after_a_taking_one_of_one_config_skips_by_its_own_policy():
+    """Two trainers of one optimizer config in one process, the first taking steps not finite and the
+    second skipping them: the first stops at its poisoned step; the second, whose fit could read the first's
+    step from the process's cache of steps (`_candidates.candidate_for`), skips it, its four updates
+    finite. The policy keyed no step, so the second took the first's (the rebuild's head review, F1)."""
+    config = OptimConfig(optimizer="optax:sgd", learning_rate=0.1)
+    with pytest.raises(RuntimeError):
+        make_trainer(optimizer=config).fit(dataset(PoisonedThird), steps=5, log_every=1)
+    state = make_trainer(optimizer=config, skip_nonfinite=True).fit(dataset(PoisonedThird), steps=5,
+                                                                     log_every=1)
+    assert int(state.updates) == 4
+    assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(state.variables))
 
 
 class SecondGroupPoisoned(Counting):
