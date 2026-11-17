@@ -249,6 +249,10 @@ def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path,
     the route it took. Two builds, one holding Hopper's kernels and one Ampere's, stand in for the wheel
     ahead of any installed one."""
     path = list(sys.path)
+    # The process's own dew_cutlass, or none, back in sys.modules after the test: each stand-in build is
+    # imported in its place, never left there (a stand-in left stated no TARGETS, and every later test of
+    # the process that counted a program's kernel calls failed, train 991's red).
+    monkeypatch.setitem(sys.modules, "dew_cutlass", sys.modules.get("dew_cutlass"))
 
     def installed(minimum: tuple[int, int], built: str) -> dict:
         # Each build its own directory ahead of the installed packages, so no build's bytecode stands in
@@ -258,7 +262,7 @@ def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path,
         dispatch = f"return {built!r} if (major, minor) >= {minimum} else None"
         (wheel / "dew_cutlass.py").write_text(f"def architecture(major, minor):\n    {dispatch}\n")
         monkeypatch.setattr(sys, "path", [str(wheel), *path])
-        monkeypatch.delitem(sys.modules, "dew_cutlass", raising=False)
+        del sys.modules["dew_cutlass"]
         importlib.invalidate_caches()
         return generation.cutlass_built()
 
