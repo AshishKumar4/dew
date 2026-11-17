@@ -1045,7 +1045,8 @@ class _CachedIterator(grain.DatasetIterator):
                 self.writer.finish()
                 raise
             made = self.transform
-        value = _projected(self.writer.process((self.shard.id, ordinal), ordinal, value, made), self.transform)
+        outputs = self.writer.process((self.shard.id, ordinal), ordinal, value, made)
+        value = _projected(outputs, self.transform)
         if self.ordinal is not None:
             self.ordinal += 1
         return value
