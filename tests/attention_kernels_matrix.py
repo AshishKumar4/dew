@@ -153,7 +153,7 @@ CASES = (
     ('sm90', 'template', '64', 'mha', 'causal', 'bfloat16'),
     ('v5e', 'tpu', '128', 'mha', 'causal', 'bfloat16'),
     ('sm90', 'template', '64', 'mha', 'causal', 'float16'),
-    ('v5e', 'template', '64', 'mha', 'causal', 'bfloat16'),
+    ('v5e', 'template', '64', 'mha', 'causal', 'float32'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the op serves
 (`kernel_matrix.covering("attention_kernels")`, regenerated where the axes or the op's support change)."""
