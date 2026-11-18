@@ -6,7 +6,8 @@
 """What the chunked recurrences' launches share: the token spans of a call's sequences, packed
 documents each its own (`Sequences`, fla's `cu_seqlens`, `chunk_indices` and `chunk_offsets`), a
 chunk's place and its masked loads and stores, the tiles a launch takes (`Tiles`, `_Launch`), and a forked
-call's documents laid from chunks' edges (`Forked`, `AlignedDocuments`). The recurrence template's stages
+call's documents, each token's part in their walk (`Forked.tokens`) and their place on a packed call's
+chunks (`ForkedChunks`). The recurrence template's stages
 (`dew.nn.kernels.recurrence`), the ported kernels (`fla_gdn`, `fla_kda`, `mamba_ssd`) and the portable walk
 read them alike.
 """
@@ -23,7 +24,7 @@ from jax.experimental import pallas as pl
 from dew.batch import document_firsts
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.tables import Column, column, packed, unpacked
-from dew.nn.scatter import gather_positions
+from dew.nn.precision import aligned_sum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -182,6 +183,29 @@ def slots(spans: Sequences, batch: int, length: int, chunk: int = 64) -> int:
     packed, whose sequences take more chunks than the rows' own."""
     packed = spans.chunks.shape[0] != batch * -(-length // chunk)
     return _passing(batch, length, chunk, packed) + batch + packed
+
+
+def packed_sequences(starts, firsts, bound: int, *, chunk: int) -> Sequences:
+    """The spans (`sequences`) of a packed call's documents, `starts` `[B, T]` each one's first token,
+    `firsts` `[B, D]` where given, at most `bound` a row: the one form a packed call's chunks
+    (`templates.recurrence.chunk_forward`) and a forked call's (`ForkedChunks.spans`) take."""
+    from dew.nn.inputs import cu_seqlens
+
+    batch, length = starts.shape
+    return sequences(batch, length, cu_seqlens(starts, batch * (bound + 1), firsts), chunk=chunk)
+
+
+def entry_write(key, value, weight, *, values_first: bool = False) -> jax.Array:
+    """A forked document's entry write `weight sum_r key_r value_r^T` (`recurrence_chunk.Chunk.entry_key`):
+    `key` `[..., R, Dk]`, `value` `[..., R, Dv]`, the write `[..., Dk, Dv]`, or with `values_first` `value`
+    `[..., Dv, R]` and the write `[..., Dv, Dk]` (the TPU forked scan's layout); `weight` broadcast against
+    the write. Its terms summed aligned to the largest (`precision.aligned_sum`), so a sum in range is its
+    value though its terms leave fp32's range: the one form the portable walk's opening, the template's
+    chunks (`ForkedChunks.entries`) and the TPU forked scan take."""
+    rank = key.shape[-2]
+    if values_first:
+        return aligned_sum([(weight, value[..., :, r:r + 1], key[..., r:r + 1, :]) for r in range(rank)])
+    return aligned_sum([(weight, key[..., r, :, None], value[..., r, None, :]) for r in range(rank)])
 
 
 def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> Sequences:
@@ -347,15 +371,17 @@ def _span(span_ref, length: int, chunk: int, aligned: bool) -> Span:
 class Forked:
     """A forked call's documents as its walks read them (`recurrence_chunk.Chunk.loads`): each document's
     first slot (`firsts` `[B, D]`, `S` past a row's last), the table slot it enters and the stored slot it
-    leaves its final in (`loads`, `stores` `[B, D]`), the stored slots' count (`held`), and its entry write,
+    leaves its final in (`loads`, `stores` `[B, D]`), the stored slots' count (`held`), its entry write,
     where the call gives one (`entry`, its `[B, D, Hv, Dk, Dv]` never formed: each walk forms a chunk's
-    own)."""
+    own), and the second slot each document adds to the one it enters, where the call gives them (`adds`
+    `[B, D]`, `Chunk.adds`)."""
 
     firsts: jax.Array
     loads: jax.Array
     stores: jax.Array
     entry: tuple | None
     held: int = dataclasses.field(metadata={'static': True})
+    adds: jax.Array | None = None
 
     @classmethod
     def of(cls, operands, starts, firsts, work) -> "Forked":
@@ -371,21 +397,49 @@ class Forked:
         if operands.entry_key is not None:
             entry = tuple(jnp.asarray(t, work) for t in
                           (operands.entry_key, operands.entry_value, operands.entry_weight))
-        return cls(begins, loads, jnp.asarray(operands.stores, jnp.int32), entry, operands.held)
+        adds = None if operands.adds is None else jnp.asarray(operands.adds, jnp.int32)
+        return cls(begins, loads, jnp.asarray(operands.stores, jnp.int32), entry, operands.held, adds)
 
     @property
     def walked(self) -> tuple:
-        """The operands a walk takes beside the call's (`carrying`): the documents' slots and entry write."""
-        return (self.firsts, self.loads, self.stores, *(() if self.entry is None else self.entry))
+        """The operands a walk takes beside the call's (`carrying`): the documents' slots, their added slots
+        and entry write."""
+        return (self.firsts, self.loads, self.stores, *(() if self.adds is None else (self.adds,)),
+                *(() if self.entry is None else self.entry))
 
-    def carrying(self, firsts, loads, stores, *entry) -> "Forked":
+    def carrying(self, firsts, loads, stores, *rest) -> "Forked":
         """This call's documents from the operands a product's walk was handed (`walked`)."""
-        return Forked(firsts, loads, stores, entry or None, self.held)
+        adds, entry = (rest[0], rest[1:]) if self.adds is not None else (None, rest)
+        return Forked(firsts, loads, stores, entry or None, self.held, adds)
+
+    def tokens(self, length: int) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Each of a call's `length` tokens' part in its walk, `[B, S]` int each, the documents walked in
+        place (a document's memory taken up at its first token, mid-chunk wherever it falls): the table slot
+        a document's first token takes its memory up from (`Chunk.loads`' one-based, zero a zero memory; -1
+        at every other token), the stored slot its last token leaves its memory in (`Chunk.stores`'; zero
+        elsewhere), and the document a first token begins (its index into `loads`, the entry write's;
+        zero elsewhere). Its sizes are the tokens', none the documents' bound's."""
+        firsts = jnp.asarray(self.firsts, jnp.int32)
+        rows, documents = firsts.shape
+        held = firsts < length
+        lasts = jnp.concatenate([firsts[:, 1:], jnp.full_like(firsts[:, :1], length)], axis=1)
+        lasts = jnp.minimum(lasts, length) - 1
+        lines = jnp.arange(rows)[:, None]
+        began = jnp.where(held, firsts, length)
+        loads = jnp.full((rows, length), -1, jnp.int32).at[lines, began].set(
+            jnp.asarray(self.loads, jnp.int32), mode="drop")
+        stores = jnp.zeros((rows, length), jnp.int32).at[lines, jnp.where(held, lasts, length)].set(
+            jnp.asarray(self.stores, jnp.int32), mode="drop")
+        numbers = jnp.broadcast_to(jnp.arange(documents, dtype=jnp.int32), firsts.shape)
+        begun = jnp.zeros((rows, length), jnp.int32).at[lines, began].set(numbers, mode="drop")
+        return loads, stores, begun
 
 
 @dataclasses.dataclass(frozen=True)
 class AlignedDocuments:
-    """A forked call's documents laid from chunks' edges (`Forked`, its walks): each document's tokens moved
+    """Mamba-1's portable scan's alone (`dew.nn.mixers.mamba.selective_scan`, main's), until it walks a forked
+    call's documents in place as recurrence_chunk's walk does and this is deleted (row 7380). A forked call's
+    documents laid from chunks' edges (`Forked`, its walks): each document's tokens moved
     past the tokens before it to the next multiple of the chunk, the slots between tokens that leave the
     memory as it was (zero keys, values and write gates, a unit decay), so a walk takes up each document's
     memory at its first chunk's edge and leaves its final at its last chunk's. At most `chunk - 1` slots a
@@ -399,8 +453,6 @@ class AlignedDocuments:
     stores: jax.Array
     """The stored slot each aligned chunk leaves its memory in `[B, chunks]`
     (`recurrence_chunk.Chunk.stores`), zero for none."""
-    takes: jax.Array
-    """The document each aligned chunk takes up `[B, chunks]`, -1 for none."""
     length: int
     """The aligned grid's slots, the chunks' a row."""
 
@@ -427,11 +479,9 @@ class AlignedDocuments:
         lines = jnp.arange(rows)[:, None]
         first = jnp.where(held, opened // chunk, total)
         last = jnp.where(held, opened // chunk + chunks - 1, total)
-        numbers = jnp.broadcast_to(jnp.arange(documents, dtype=jnp.int32), firsts.shape)
-        takes = jnp.full((rows, total), -1, jnp.int32).at[lines, first].set(numbers, mode="drop")
         loads = jnp.full((rows, total), -1, jnp.int32).at[lines, first].set(forked.loads, mode="drop")
         stores = jnp.zeros((rows, total), jnp.int32).at[lines, last].set(forked.stores, mode="drop")
-        return cls(aligned.astype(jnp.int32), loads, stores, takes, total * chunk)
+        return cls(aligned.astype(jnp.int32), loads, stores, total * chunk)
 
     def laid(self, *operands):
         """The operands `[B, S, ...]` on the aligned grid `[B, length, ...]`, zero between documents."""
@@ -444,22 +494,79 @@ class AlignedDocuments:
         """`out` `[B, length, ...]` back at the call's slots `[B, S, ...]`."""
         return jax.vmap(lambda row, at: row[at])(out, self.slots)
 
-    def entries(self, forked: Forked, transposed: bool = False):
-        """Each aligned chunk's entry write (`recurrence_chunk.Chunk.entry_key`), the document it takes up's,
-        zero for none: `[B, chunks, Hv, Dk, Dv]` summed over its terms and weighed, `[Dv, Dk]` where
-        `transposed`; None where the call gives none. A chunk's own, formed once a chunk."""
+
+@dataclasses.dataclass(frozen=True)
+class ForkedChunks:
+    """A forked call's documents on the chunks a packed call's are laid on (`sequences` over its documents'
+    spans, fla's `chunk_indices`: each document from a chunk's edge, `ceil(B * S / C) + N` chunks), each row
+    walking its documents' chunks in turn: the table slot each chunk takes its memory up from (`loads` `[NC]`,
+    `Chunk.loads`' one-based, zero a zero memory; -1 but at a document's first chunk), the stored slot it
+    leaves its memory in (`stores` `[NC]`, zero but at a storing document's last chunk), the document a first
+    chunk begins (`taken` `[NC]`, `row * D + d`; -1 elsewhere), which its entry write reads, and the row each
+    chunk walks (`rows` `[NC]`; the last row's past every row's chunks)."""
+
+    loads: jax.Array
+    stores: jax.Array
+    taken: jax.Array
+    rows: jax.Array
+
+    @staticmethod
+    def spans(forked: Forked, batch: int, length: int, chunk: int) -> "Sequences":
+        """`forked`'s documents' spans, as a packed call of its documents' first tokens and `firsts` lays
+        them at a documents bound of its own (`Chunk.loads`' `D`; `packed_sequences`)."""
+        return packed_sequences(forked.tokens(length)[0] >= 0, forked.firsts, forked.loads.shape[1],
+                                chunk=chunk)
+
+    @classmethod
+    def of(cls, forked: Forked, batch: int, length: int, chunk: int) -> "ForkedChunks":
+        """`forked`'s documents on the chunks of `batch` rows of `length` tokens (`spans`)."""
+        spans = cls.spans(forked, batch, length, chunk)
+        span = unpacked(Span, lambda i: jnp.asarray(spans.spans)[:, i])
+        count = spans.chunks.shape[0]
+        live = span.tokens > 0
+        sizes = -(-span.tokens // chunk)
+        firsts = jnp.cumsum(sizes) - sizes
+        # Each sequence's document: the sequences are each row's documents in turn (`cu_seqlens`' order).
+        number = jnp.arange(span.first.shape[0], dtype=jnp.int32)
+        opening = jax.ops.segment_min(jnp.where(live, number, number.shape[0]), span.memory,
+                                      num_segments=batch)
+        documents = forked.loads.shape[1]
+        document = jnp.clip(number - opening[jnp.clip(span.memory, 0, batch - 1)], 0, documents - 1)
+        row = jnp.clip(span.memory, 0, batch - 1)
+        drop = jnp.where(live, 0, count)
+        loads = jnp.full((count,), -1, jnp.int32).at[firsts + drop].set(
+            jnp.asarray(forked.loads, jnp.int32)[row, document], mode="drop")
+        stores = jnp.zeros((count,), jnp.int32).at[firsts + sizes - 1 + drop].set(
+            jnp.asarray(forked.stores, jnp.int32)[row, document], mode="drop")
+        taken = jnp.full((count,), -1, jnp.int32).at[firsts + drop].set(row * documents + document,
+                                                                         mode="drop")
+        # Each chunk's row: its sequence's, a sequence's chunks following its first.
+        owner = jnp.clip(jnp.searchsorted(firsts + sizes, jnp.arange(count), side="right"), 0,
+                         row.shape[0] - 1)
+        return cls(loads, stores, taken, row[owner])
+
+    def added(self, forked: Forked) -> jax.Array | None:
+        """Each chunk's added slot (`recurrence_chunk.Chunk.adds`), the document it takes up's, zero for none:
+        `[NC]`; None where the call adds none."""
+        if forked.adds is None:
+            return None
+        return jnp.where(self.taken >= 0, jnp.asarray(forked.adds, jnp.int32).reshape(-1)[
+            jnp.maximum(self.taken, 0)], 0)
+
+    def entries(self, forked: Forked):
+        """Each chunk's entry write (`recurrence_chunk.Chunk.entry_key`), the document it takes up's, zero for
+        none: `[NC, Hv, Dk, Dv]` summed over its terms and weighed; None where the call gives none. A chunk's
+        own, formed once a chunk."""
         if forked.entry is None:
             return None
-        key, value, weight = forked.entry
-        taken = jnp.maximum(self.takes, 0)
-        key, value, weight = (gather_positions(x, taken) for x in (key, value, weight))
+        key, value, weight = (x.reshape(-1, *x.shape[2:]) for x in forked.entry)
+        taken = jnp.maximum(self.taken, 0)
+        key, value, weight = (x[taken] for x in (key, value, weight))
         group = value.shape[-2] // key.shape[-2]
         if group > 1:
             key = jnp.repeat(key, group, axis=-2)
         # The weight inside the contraction, so its gradient is one too (`dot_general`'s accumulation), not
         # an elementwise product summed after: the SSD port's weight gradient took 1.6 to 1.9 times the
         # error each document alone takes from float64 summed after (armada, 11-11).
-        live = self.takes >= 0
-        weighed = jnp.where(live[..., None], weight, 0)
-        spelled = 'bcrhv,bcrhk,bch->bchvk' if transposed else 'bcrhk,bcrhv,bch->bchkv'
-        return jnp.einsum(spelled, *((value, key) if transposed else (key, value)), weighed)
+        weighed = jnp.where((self.taken >= 0)[:, None], weight, 0)
+        return entry_write(jnp.moveaxis(key, 1, 2), jnp.moveaxis(value, 1, 2), weighed[..., None, None])

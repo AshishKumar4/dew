@@ -57,7 +57,13 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     walk_stores,
     whole_blocks,
 )
-from dew.nn.kernels.templates.recurrence.table import Table, returned_by, table_landing, table_returned
+from dew.nn.kernels.templates.recurrence.table import (
+    Table,
+    returned_by,
+    table_landing,
+    table_returned,
+    table_slots,
+)
 from dew.nn.kernels.templates.resources import largest_live_set
 from dew.nn.precision import compensated_sum
 
@@ -135,7 +141,8 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                   max_segments: int | None = None, scale: float | None = None,
                   family: mosaic.Family | None = None, interpret: bool = False,
                   inverse=None, kept=None, delta: bool = True,
-                  rounded: bool = False, values_gated: bool = False, ranged: bool = False,
+                  rounded: bool = False, values_gated: bool = False,
+                  unit_keys: bool = False, ranged: bool = False,
                   skip=None,
                   forked: ForkedTable | None = None) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
@@ -164,7 +171,8 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                                   "fp32 call's under the run's fast forms alone")
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
-                   firsts=firsts, rounded=rounded, values_gated=values_gated, ranged=ranged, forked=forked,
+                   firsts=firsts, rounded=rounded, values_gated=values_gated,
+                   unit_keys=unit_keys, ranged=ranged, forked=forked,
                    skipped=skip is not None)
     call = run.call
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
@@ -238,11 +246,10 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
 
 def _taken_up(run, taken):
     """The gradient of the memory each chunk takes up (`taken`, the reverse walk's, `[chunks * HV * Dk, Dv]`),
-    `[B, NC, HV, Dk, Dv]`, zero at a chunk that takes nothing up (which the walk wrote nothing to)."""
+    `[NC, HV, Dk, Dv]`, zero at a chunk that takes nothing up (which the walk wrote nothing to)."""
     call, table = run.call, run.table
-    taking = (table.loads >= 0).reshape(run.batch, -1)
-    taken = taken.reshape(*taking.shape, call.heads, call.width, call.value_width)
-    return jnp.where(taking[..., None, None, None], taken, 0.0)
+    taken = taken.reshape(-1, call.heads, call.width, call.value_width)
+    return jnp.where((table.loads >= 0)[:, None, None, None], taken, 0.0)
 
 
 def _tabled_gradients(run, grads: tuple, taken) -> tuple:
@@ -252,15 +259,18 @@ def _tabled_gradients(run, grads: tuple, taken) -> tuple:
     if taken is None:
         return grads
     table = run.table
-    loads = table.loads.reshape(run.batch, -1)
-    slots = jnp.arange(1, table.count + 1)
-    given = jnp.einsum("bcs,bchkv->bshkv", (loads[..., None] == slots).astype(jnp.float32),
-                       _taken_up(run, taken))
+    # Each chunk taking a given slot up adds to its row's slot (a stored slot's, its storing chunk's walk).
+    given = jnp.zeros((run.batch, table.count, *_taken_up(run, taken).shape[1:]), jnp.float32)
+    # A slot a chunk adds (`Table.adds`) takes the same gradient as the one it loads.
+    for slots in (table.loads, *(() if table.adds is None else (table.adds,))):
+        given_slot = (slots > 0) & (slots <= table.count)
+        given = given.at[table.rows, jnp.clip(slots - 1, 0, table.count - 1)].add(
+            jnp.where(given_slot[:, None, None, None], _taken_up(run, taken), 0.0), mode="drop")
     return (*grads[:5], given[..., :run.key_width, :run.value_width])
 
 
 def _entered_gradient(run, taken):
-    """A forked call's entry write's gradient `[B, NC, HV, Dk, Dv]` (`chunk_forward.ForkedTable.entries`): the
+    """A forked call's entry write's gradient `[NC, HV, Dk, Dv]` (`chunk_forward.ForkedTable.entries`): the
     memory's each chunk takes up, which its entry write adds to; None where the call gives none."""
     if taken is None or run.table.entries is None:
         return None
@@ -618,7 +628,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                 *refs, streams, staging, landing):
         skip_ref, refs = (refs[0], refs[1:]) if skips else (None, refs)
         entered_ref, refs = (refs[0], refs[1:]) if call.per_key else (None, refs)
-        table_refs, refs = refs[:2 * (table is not None)], refs[2 * (table is not None):]
+        taken = 0 if table is None else len(table_slots(table))
+        table_refs, refs = refs[:taken], refs[taken:]
         refs, returned_refs = refs[:len(refs) - returns], refs[len(refs) - returns:]
         dh_ref, dv_ref, dh0_ref, *gated_ref = refs
         j, s, h = at["blocks"], at["sequences"], at["heads"]
@@ -696,7 +707,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                                  table=table)(
         q, k, k if w is None else w, do, local, hi, lo, dht, sequences, k if v is None else v,
         hi if beta is None else beta, *(() if skip is None else (skip.astype(jnp.float32),)),
-        *(() if memory is None else (memory,)), *(() if table is None else (table.loads, table.stores)))
+        *(() if memory is None else (memory,)), *(() if table is None else table_slots(table)))
     # A forked call's stored slots' gathered gradients the walk alone reads.
     return launched[:-1] if returns == 2 else launched
 

@@ -1031,31 +1031,36 @@ def test_a_lazy_walks_dropped_weights_stay_within_fp16_interpreted():
 
 def _small_tier_draw(seed: int):
     """Draws of a bf16 call `[1, 128, 1, 64]` at its scale of 1/8 (the base review of 319e49cee's witness):
-    each query's first coordinate 8, the first 64 keys' 0 and the last 64's 10 but two drawn keys' -76 (their
-    logits so), every other coordinate within 1/64; values 0 but the 62 keys' first column and the two's
-    second, 2^125 to 2^126."""
-    streams = jax.random.split(jax.random.key(seed), 4)
-    query, key = (jax.random.uniform(stream, (1, 128, 1, 64), jnp.float32, -1 / 64, 1 / 64)
-                  for stream in streams[:2])
-    low = 64 + jax.random.choice(streams[2], 64, (2,), replace=False)
-    first = jnp.zeros(128).at[64:].set(10.0).at[low].set(-76.0)
-    query, key = (query.at[..., 0].set(8).astype(jnp.bfloat16),
-                  key.at[0, :, 0, 0].set(first).astype(jnp.bfloat16))
+    each query's first coordinate 8, the first 64 keys' 0 and the last 64's 10 but a drawn pair's -76, every
+    other coordinate 0 (their logits so, exactly); values 0 but the 62 keys' first column, one magnitude of
+    2^125 to 2^126 under the Thue-Morse signs (each key's the parity of its place's bits), so that column's
+    sums cancel exactly and stay within twice the magnitude in any order or stride a product sums them in,
+    and the pair's second column, 2^120 to 2^121. The pair's weights are normal at the row's maximum, so the
+    reference holds them (fp32's least normal is e^-87.3 of it), and below fp32's normals at the walk's scale
+    (`at_scale`)."""
+    streams = jax.random.split(jax.random.key(seed), 3)
+    low = 64 + 2 * jax.random.randint(streams[0], (), 0, 32) + jnp.arange(2)
     lows = jnp.zeros(128, bool).at[low].set(True)
-    scales = 2.0 ** 125 * jax.random.uniform(streams[3], (128,), jnp.float32, 1, 2)
-    value = (jnp.zeros((1, 128, 1, 64)).at[0, 64:, 0, 0].set(jnp.where(lows, 0.0, scales)[64:])
-             .at[0, :, 0, 1].set(jnp.where(lows, scales, 0.0)))
+    first = jnp.zeros(128).at[64:].set(10.0).at[low].set(-76.0)
+    query = jnp.zeros((1, 128, 1, 64)).at[..., 0].set(8).astype(jnp.bfloat16)
+    key = jnp.zeros((1, 128, 1, 64)).at[0, :, 0, 0].set(first).astype(jnp.bfloat16)
+    places = jnp.arange(64)
+    parity = sum((places >> bit) & 1 for bit in range(6)) % 2
+    magnitude = 2.0 ** 125 * jax.random.uniform(streams[1], (), jnp.float32, 1, 2)
+    signed = jnp.where(lows[64:], 0.0, magnitude * (1 - 2 * parity))
+    value = jnp.zeros((1, 128, 1, 64)).at[0, 64:, 0, 0].set(signed)
+    value = value.at[0, low, 0, 1].set(2.0 ** 120 * jax.random.uniform(streams[2], (2,), jnp.float32, 1, 2))
     return query, key, value.astype(jnp.bfloat16), jnp.zeros_like(query)
 
 
 @INTERPRETS
 def test_a_scaled_lazy_walks_small_weights_take_its_kept_anchor_interpreted():
     """A bf16 forward on wgmma, interpreted, whose second key tile's logits pass the first's by 10 (within
-    the lazy walk's margin, `algebra.lazy_margin`, so its anchor stays at 0) over values near 2^126, so it
+    the lazy walk's margin, `algebra.lazy_margin`, so its anchor stays at 0) over values near 2^125, so it
     walks scaled, two of its keys at -76 weighing in its small tier (`at_scale`): on par with the reference
-    (check 1), their column near 0.12. Its small tier took its weights at the tile's maximum, 10, against
-    its normal tier's kept anchor, the column e^-10 below its due, 5.6e-6 (the base review of 319e49cee,
-    F1)."""
+    (check 1), their column near 3e-3, the other columns 0. Its small tier took its weights at the tile's
+    maximum, 10, against its normal tier's kept anchor, the column e^-10 below its due (the base review of
+    319e49cee, F1)."""
     spans = template.spans(128, 128, 1)
     tiles = attention_mosaic.Tiles(64, 64, 2, 2, family=WGMMA)
 

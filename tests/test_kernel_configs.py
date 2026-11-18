@@ -25,7 +25,7 @@ from jax.sharding import PartitionSpec
 from kernel_compile import Uncounted, compile_kernels, failures, gate_generations
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
-from dew.nn.kernels.templates import bundles, report, resources
+from dew.nn.kernels.templates import bundles, report, resources, swizzling
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
 from dew.nn.kernels.templates.gemm.hooks import Hooks
 
@@ -1753,3 +1753,154 @@ def test_a_grouped_calls_walk_takes_every_column_tile_and_a_dense_ones_a_power_o
         tile = launch.derived(arguments, generation.gpu_target())
     columns = 768 // tile.block_n  # three or six: no power of two, so the two bands differ
     assert (tile.grid_block_n & (tile.grid_block_n - 1) == 0) if dense else tile.grid_block_n == columns, tile
+
+
+@lowers("sm80")
+def test_a_balanced_tail_of_two_by_two_warps_lowers_its_partials_for_an_a100():
+    """The 4B up projection's dense kernel gradient on an A100 at 128 x 128, one program a multiprocessor
+    (mma.sync's warps two by two, `MmaIssuer.specialized`; its tiles past the multiprocessors' walked by a
+    balanced tail, programs leaving fp32 partials in a workspace), compiled by Mosaic for a compile-only A100:
+    it lowers, each partial read in the accumulator's layout (`Family.fixed_up`), and spills no register (no
+    layout of the loaded partial satisfied the two-by-two accumulator's combine before)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    [(name, launch, args, options)] = [call for call in _gemm_forms(*GEMM_SHAPES["qwen3.5-4b up"])
+                                       if call[0] == "dense kernel gradient"]
+    with generation.assumed("sm80"):
+        ba = launch.bind(*args, **options)
+        tile = dataclasses.replace(launch.derived(ba, generation.gpu_target()), block_m=128, block_n=128,
+                                   stages=3, programs=1)
+        assert pricing.family_of(tile, jnp.bfloat16).specialized(128, 128).m_warps == 2
+        (record,) = compile_mosaic_kernels([KernelCase(name, lambda: launch.lowering(ba, tile))], "sm80")
+    assert not record.get("error"), record.get("error")
+    assert [kernel.get("spilled") for kernel in record["kernels"]] == [0]
+
+
+@pytest.mark.parametrize("shape", [(64, 128), (64, 64), (32, 64)], ids=lambda shape: f"{shape[0]}x{shape[1]}")
+def test_an_mma_sync_stage_takes_its_copies_and_ldmatrix_reads_in_one_pass_a_phase(shape):
+    """A 16-bit step stage an A100's cp.async copies in and mma.sync's ldmatrix reads, at the swizzle it
+    stages at (`swizzling.copied_swizzle`): each copy phase (8 lanes, 16 bytes each, a row's consecutive
+    chunks) and each ldmatrix phase (8 lanes, a 16-byte chunk of 8 consecutive rows at one column, its
+    transposed read's too) passes shared memory's banks once, by the staging's address arithmetic
+    (`swizzling.staged_address`)."""
+    swizzle = swizzling.copied_swizzle(shape, jnp.bfloat16)
+    row_bytes = shape[1] * 2
+    for row in range(0, shape[0], 8):
+        for chunk in range(0, row_bytes, 16 * 8 if row_bytes >= 128 else row_bytes):
+            copies = [swizzling.staged_address(row + (chunk + 16 * lane) // row_bytes,
+                                               (chunk + 16 * lane) % row_bytes, row_bytes, swizzle)
+                      for lane in range(8)]
+            assert swizzling.wavefronts(copies, 16) == 1, (row, chunk, swizzle)
+        for column in range(0, row_bytes, 16):
+            reads = [swizzling.staged_address(row + lane, column, row_bytes, swizzle) for lane in range(8)]
+            assert swizzling.wavefronts(reads, 16) == 1, (row, column, swizzle)
+
+
+@pytest.mark.parametrize(("shape", "dtype"), [((128, 64), jnp.bfloat16), ((128, 192), jnp.bfloat16),
+                                              ((64, 64), jnp.float32), ((16, 8), jnp.bfloat16)])
+def test_an_mma_sync_output_tile_stages_where_its_accumulators_stores_pass_the_banks_once(shape, dtype):
+    """An mma.sync output tile's staging (`Mma.stored_swizzle`): each warp store of its accumulator
+    fragment (an 8-row slab by 8 columns, two elements a lane) passes shared memory's banks the fewest times
+    at the staging chosen, once a phase where a swizzle's row fits its columns, by the staging's own address
+    arithmetic (`swizzling.staged_address`); plain, a 64-column slab's rows share their banks (row 5271's
+    dense kernel gradient's bank conflicts)."""
+    from dew.nn.kernels.templates import mosaic_sm80
+
+    family = mosaic_sm80.Mma(jnp.dtype(dtype))
+    itemsize = jnp.dtype(dtype).itemsize
+    row_bytes = shape[1] * itemsize
+
+    def passes(swizzle: int) -> int:
+        addresses = [swizzling.staged_address(lane // 4, (2 * (lane % 4)) * itemsize, row_bytes, swizzle)
+                     for lane in range(32)]
+        return swizzling.wavefronts(addresses, 2 * itemsize)
+
+    chosen = family.stored_swizzle(shape, dtype)
+    phases = 32 * 2 * itemsize // (swizzling.BANKS * 4)
+    if row_bytes % swizzling.NARROWEST_SWIZZLE_BYTES == 0:
+        assert chosen != swizzling.UNSWIZZLED and passes(chosen) == phases
+    else:
+        assert chosen == swizzling.UNSWIZZLED
+    if row_bytes == 128:
+        assert passes(swizzling.UNSWIZZLED) > phases
+
+
+def test_a_walk_ranks_the_qkv_input_gradients_as_a_gh200_ran_them():
+    """Each arm of a decoder's q/k/v step on a GH200 (M-EM-70d: each projection apart on the template, their
+    kernels joined, or side by side, `beside`, its input gradient three products chained through their fp32
+    output), priced as the walk prices each launch (`pricing.split_walk`, its output's store at its outputs'
+    and read operands' bytes an element) at the template's 128 x 256 tile, the joined arm's copies at the
+    memory's rate: side by side cheaper than joined where it ran faster (1 x 2048 rows of the 4B's and 8B's
+    widths), dearer where it ran slower (4 x 3072 of the 8B's), as measured (0.613 against 0.744 ms, 0.545
+    against 0.608, 2.877 against 2.694). Priced at its walks alone, the 8B's side by side priced under
+    joined: its chain's fp32 hand-offs, written and read back, were no part of it."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    tile = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
+    step = pricing.step_seconds(tile, target, (2, 2))
+
+    def launch(contraction: int, depth: int, width: int, stored: float) -> float:
+        walk = pricing.split_walk(tile, groups=1, rows=contraction, depth=depth, width=width,
+                                  itemsizes=(2, 2), stored=stored, multiprocessors=target.multiprocessors,
+                                  step_seconds=step,
+                                  bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
+        return walk.seconds(1) + target.launch_seconds
+
+    def arms(rows: int, hidden: int, widths: tuple[int, ...]) -> dict[str, float]:
+        total = sum(widths)
+        forward = launch(hidden, rows, total, 2)
+        grads = sum(launch(rows, hidden, width, 2) for width in widths)
+        # Side by side: the input gradient's products chained last first, each adding the last's fp32 sum.
+        chain = [launch(width, rows, hidden, 4 + 4 * bool(at) if at < len(widths) - 1 else 2 + 4)
+                 for at, width in enumerate(widths[::-1])]
+        copies = 2 * 2 * 2 * (hidden * total + rows * total) / target.memory_rate
+        return {"beside": forward + sum(chain) + grads,
+                "joined": forward + launch(total, rows, hidden, 2) + launch(rows, hidden, total, 2) + copies}
+
+    ran_faster = {(2048, 2560, (8192, 1024, 1024)): True, (2048, 4096, (4096, 1024, 1024)): True,
+                  (12288, 4096, (4096, 1024, 1024)): False}
+    for (rows, hidden, widths), beside_faster in ran_faster.items():
+        priced = arms(rows, hidden, widths)
+        assert (priced["beside"] < priced["joined"]) == beside_faster, (rows, hidden, priced)
+
+
+def test_a_walk_stores_each_output_and_reads_each_epilogue_operand_at_its_dtype():
+    """A decode step's 4096 x 4096 product on an H100 at the derived tile, as the launch prices its walk
+    (`MosaicGmm._contraction`, `pricing.walk_seconds`): its output stored at its dtype's bytes, a second
+    fp32 output's and an fp32 residual its epilogue reads adding theirs, each the walk's store of `rows` x
+    `width` elements at the memory's rate; and a kernel gradient split into fp32 partials stores its output
+    at the call's own bf16, half its fp32 partials' pass (`MosaicTgmm._walk`)."""
+    s = jax.ShapeDtypeStruct
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        launch = grouped_matmul.MosaicGmm()
+        rows, width = 16, 4096
+        tokens, kernel = s((rows, 4096), jnp.bfloat16), s((1, 4096, width), jnp.bfloat16)
+        sizes = s((1,), jnp.int32)
+        plain = launch.bind(tokens, kernel, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
+                            dense=True)
+        tile = launch.derived(plain, target)
+        residual = s((rows, width), jnp.float32)
+        added = launch.bind(tokens, kernel, sizes, (), (residual,), out_dtype="bfloat16", trans_rhs=False,
+                            interpret=False, dense=True,
+                            hooks=Hooks(epilogue=lambda acc, r: acc + r,
+                                        epilogue_axes=(("rows", "columns"),)))
+        two = launch.bind(tokens, kernel, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
+                          dense=True, hooks=Hooks(epilogue=lambda acc: (acc, acc),
+                                                  out_dtypes=("bfloat16", "float32")))
+        priced = {name: launch._contraction(ba, tile, target) for name, ba in
+                  (("plain", plain), ("added", added), ("two", two))}
+        assert [priced[name]["stored"] for name in ("plain", "added", "two")] == [2, 6, 6]
+        seconds = {name: pricing.walk_seconds(tile, contraction) for name, contraction in priced.items()}
+        assert seconds["plain"] < seconds["added"] == seconds["two"]
+
+        gradient = grouped_matmul.MosaicTgmm()
+        ba = gradient.bind(s((24576, 2560), jnp.bfloat16), s((24576, 1024), jnp.bfloat16), sizes,
+                           out_dtype="bfloat16", interpret=False, dense=True)
+        unsplit = gradient.derived(ba, target)
+        # The split's output stored as the unsplit call's (bf16), its fp32 partials' passes apart.
+        walks = {count: gradient._walk(ba, dataclasses.replace(unsplit, splits=count), target)
+                 for count in (1, 4)}
+        assert walks[4].stored == walks[1].stored
+        assert walks[4].stored * 2 == walks[4].passes
+

@@ -242,6 +242,12 @@ def _sides(rows: int, family: mosaic.Family, dtype, extent: int) -> tuple[int, .
     return tuple(side for side in walked_extents(family, dtype, extent) if side % rows == 0)
 
 
+def _query_walk(rows: int | None) -> Callable[..., tuple[int, ...]]:
+    """The query blocks a backward walks for a consumer of `rows` rows, largest first: a role's (None)
+    `extents`, fewer rows' (`fewer_rows`) `_sides`; its derivation's walk and its ladder's (`ladder`)."""
+    return extents if rows is None else functools.partial(_sides, rows)
+
+
 @dataclasses.dataclass(frozen=True)
 class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config]):
     """What this mainloop's launches share as Template implementations (`MosaicForward`, `MosaicBackward`):
@@ -1530,6 +1536,37 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                for step in steps] if queries is not None else []
         return next((config for config in (*fused, *two) if self.takes(ba, config, target)), None)
 
+    def ladder(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
+        # The query blocks its derivation walks below `config`'s for its consumer's rows (`_query_walk`) on
+        # the layout its derivation walks (`_named`'s, its warps not yet arranged for the consumer's rows as
+        # `bundle_of`'s are, mma.sync's at 32 rows two warps of 16, of which no fewer rows are), `config`'s
+        # other fields kept, within its register cap and residency, largest first.
+        if not self._typed(config):
+            return ()
+        target = generation.gpu_target()
+        query = ba.arguments["query"]
+        layout = self._named(target.generation, query.dtype, query.shape[1]).get(config.family)
+        if layout is None:
+            return ()
+        walk = _query_walk(config.block_k if config.block_k in fewer_rows(layout) else None)
+        regime = self._regime(ba, config, target)
+        smaller = (dataclasses.replace(config, block_q=block)
+                   for block in walk(layout, query.dtype, query.shape[1]) if block < config.block_q)
+        return tuple(rung for rung in smaller
+                     if self.takes(ba, rung, target) and self._regime(ba, rung, target) == regime)
+
+    def _regime(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget
+                ) -> tuple:
+        """The assembler's conditions at `config`: each launch's register cap and whether its program moves
+        registers, as its kernels' models state them (`resources.register_model` at the registers its
+        emission states, `_launch_registers`), and the launch's residency."""
+        dtype = ba.arguments["query"].dtype
+        dq, dkv = self._launch_registers(ba, config)
+        launches = ((config.dkv, dkv),) if config.fused else ((config, dq), (config.dkv, dkv))
+        models = [resources.register_model(bundle_of(tiles, dtype), tiles.consumers, registers)
+                  for tiles, registers in launches]
+        return (*((model.cap(1), model.moves) for model in models), self.resident(ba, config, target))
+
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
         """Its tiles from the facts (`_derived`): each dK/dV consumer a unit of keys, the query tile both
         launches walk the largest the block holds, its registers the assembler's to judge (`ranks_alone`: a
@@ -1664,7 +1701,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 for columns in (1, 2, 4):
                     fewer = fewer_rows(dq) if _fewer_hooked(self.score_mod, self.score_reads[0], dq) else ()
                     for rows in (None, *fewer):
-                        walks = extents if rows is None else functools.partial(_sides, rows)
+                        walks = _query_walk(rows)
                         for staged in (False, True):
                             def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged,
                                       apart=apart) -> BackwardTiles:

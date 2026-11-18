@@ -105,5 +105,11 @@ class Decided:
         return _rare(self.uniform(functools.reduce(operator.or_, published)) != 0)
 
 
+def verdicts(consumers: int) -> dict:
+    """The allocations of a `Decided` walk's verdicts where its program's `consumers` publish them: a word a
+    consumer and the barrier of their arrivals (`Transport.decided_scratch`)."""
+    return {"words": plgpu.SMEM((consumers,), jnp.int32), "barrier": plgpu.Barrier(num_arrivals=consumers)}
+
+
 _rare = derivatives.marked(derivatives.Rare(), lambda verdict: verdict)
 """A decided walk's verdict marked rare (`derivatives.Rare`)."""

@@ -290,6 +290,13 @@ class Ring:
         """The ring's slots: its allocation's leading dimension."""
         return int(self.smem.shape[0])
 
+    def issued_by(self, index: int, count: int) -> "Ring | None":
+        """The ring as load warp `index` of a producer's `count` issues into it: a ring's loads the first's
+        alone (one issuing thread arrives at a slot's load barrier and copies its step, None for the
+        others); a ring whose step spreads over them, each one's share (`gathered.Committed`)."""
+        del count
+        return self if index == 0 else None
+
     @property
     def block(self) -> tuple:
         """The block a slot holds."""

@@ -34,9 +34,12 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.templates import handoffs, mosaic, mosaic_sm90, persistent, resources, rings, swizzling
 from dew.nn.kernels.templates.rings import Ref
 
-ISSUING = (handoffs.Role("load", warp=True, weight=0), handoffs.Role("mma", warp=True, weight=0))
-"""The issuing warpgroup's roles after a template's own (`handoffs.Schedule`'s warp roles): its load warp's
-TMA copies and its product warp's MMAs."""
+PRODUCTS = handoffs.Role("mma", warp=True, weight=0)
+"""The issuing warpgroup's product warp: its MMAs."""
+ISSUING = (handoffs.Role("load", handoffs.WARPS - PRODUCTS.count, warp=True, weight=0), PRODUCTS)
+"""The issuing warpgroup's roles after a template's own (`handoffs.Schedule`'s warp roles): its load warps'
+TMA copies, every warp the product warp leaves (a ring's loads on the first alone, a gathered ring's
+step spread over them all, `rings.Ring.issued_by`), and its product warp's MMAs."""
 TMEM = plgpu.Layout.TCGEN05_TMEM_NATIVE
 """A tile's register layout as tensor memory loads it natively (a thread a row)."""
 STORED = plgpu.Layout.TCGEN05
@@ -767,12 +770,17 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                 persistent.tiled(tiles, schedule, visit, axis=axis, turns=windows)
                 plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-            def load():
-                loads = functools.partial(rings.loads, opened)
+            def load(index):
+                # The rings this load warp issues into, each its share (`rings.Ring.issued_by`).
+                count = roles.role("load").count
+                issued_here = {name: shared for name, ring in opened.items()
+                               if (shared := ring.issued_by(index, count)) is not None}
+                loads = functools.partial(rings.loads, issued_here)
                 loaded, _ = persistent.tiled(tiles, schedule, loads, axis=axis)
-                rings.drain(opened.values(), loaded)
+                rings.drain(issued_here.values(), loaded)
 
-            def issue_all():
+            def issue_all(index):
+                del index  # one product warp
                 _, computed = persistent.tiled(tiles, schedule, products, axis=axis, turns=windows)
                 tensor.drain(computed)
 

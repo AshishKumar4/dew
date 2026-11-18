@@ -647,6 +647,12 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             raise ValueError("a pipelined family's streams take their views where they open (its walk loads)")
         return Streams(allocated, views)
 
+    def stored_swizzle(self, shape: tuple[int, int], dtype) -> int:
+        """The swizzle an output tile of `shape` in `dtype` stages at (`output_staging`): plain where its
+        issuer states none (`Mma.stored_swizzle`)."""
+        del shape, dtype
+        return swizzling.UNSWIZZLED
+
     def stream(self, streams, views, lo, hi, *, again=None) -> None:
         # No producer role: a decided walk's consumers feed their second pass themselves.
         del streams, views, lo, hi, again
@@ -668,10 +674,16 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 plgpu.wait_gmem_to_smem(0)
 
             def copied(smem):
-                # The row-copy ladder needs strided layouts, not optimized-only transfers.
                 plgpu.store(smem, value.astype(smem.dtype), optimized=False)
-                stores.store_rows(smem, ref, *place, copy=swizzling.copied,
-                                  widest=resources.copied_rows(smem.shape[1], smem.dtype))
+                swizzle = swizzling.UNSWIZZLED if len(smem.shape) != 2 else self.stored_swizzle(smem.shape,
+                                                                                                   smem.dtype)
+                if interpret or swizzle == swizzling.UNSWIZZLED:
+                    # The row-copy ladder needs strided layouts, not optimized-only transfers.
+                    stores.store_rows(smem, ref, *place, copy=swizzling.copied,
+                                      widest=resources.copied_rows(smem.shape[1], smem.dtype))
+                else:
+                    # A swizzled tile's rows out by its threads, whole tiles read (`output_staging`).
+                    stores.swizzled_rows_out(smem, ref, *place[:4], swizzle=swizzle)
 
             pl.run_scoped(copied, staging[output])
             if not interpret:
@@ -790,6 +802,37 @@ class Mma(MmaIssuer, CpAsync):
     # spilled where the forward derived them (sm80 width 64, split residuals), and no GEMM derived them;
     # FlashAttention 2's rows come from one warpgroup's wider tiles, not a second warpgroup.
     consumers = 1
+
+    def output_staging(self, outputs: tuple, consumers: int) -> list:
+        # Each output tile staged at the swizzle its accumulator's stores pass the banks fewest times at
+        # (`stored_swizzle`), copied out a 16-byte piece a thread over whole tiles (`persist`'s store,
+        # `stores.swizzled_rows_out`).
+        del consumers
+        return [swizzling.staged(shape, dtype, self.stored_swizzle(shape, dtype)) if len(shape) == 2
+                else plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
+
+    def stored_swizzle(self, shape: tuple[int, int], dtype) -> int:
+        """The swizzle an output tile of `shape` in `dtype` stages at: of the swizzles its rows fill whole
+        (`swizzling.SWIZZLE_BYTES` down to the narrowest) and plain, the one its accumulator's stores pass
+        shared memory's banks fewest times at (`swizzling.wavefronts`, by the staging's address arithmetic),
+        the widest on a tie. A warp stores mma.sync's accumulator fragment an 8-row slab by 8 columns at a
+        time, lane `l` two adjacent elements of row `l // 4` at column `2 (l % 4)`: plain, 64 16-bit columns
+        put a slab's 8 rows in the same banks, 8 passes a store, where a 128-byte swizzle gives each row's
+        piece its own banks, one pass (row 5271: the A100's dense kernel gradient's 4x cuBLAS's bank
+        conflicts, FS-DW-NCU2)."""
+        rows, columns = shape
+        itemsize = jnp.dtype(dtype).itemsize
+        stagings = [swizzle for swizzle in (swizzling.SWIZZLE_BYTES, 64, swizzling.NARROWEST_SWIZZLE_BYTES)
+                    if (columns * itemsize) % swizzle == 0 and rows % swizzling.TILE_ROWS == 0]
+        stagings.append(swizzling.UNSWIZZLED)
+
+        def passes(swizzle: int) -> int:
+            return sum(swizzling.wavefronts(
+                [swizzling.staged_address(slab + lane // 4, (block + 2 * (lane % 4)) * itemsize,
+                                          columns * itemsize, swizzle) for lane in range(32)], 2 * itemsize)
+                for slab in range(0, rows, swizzling.TILE_ROWS) for block in range(0, columns, 8))
+
+        return min(stagings, key=lambda swizzle: (passes(swizzle), -swizzle))
 
 
 def _one(consumers: int, *, clustered: bool = False) -> None:

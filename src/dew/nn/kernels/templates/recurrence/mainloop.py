@@ -296,6 +296,13 @@ class Call:
     """Whether its solve holds the chunk inverse at fp32's range: a 16-bit delta rule whose form proves no
     bound on the inverse's entries (`recurrence.Hooks.inverse_bound`), its merges in bf16 parts
     (`_merging`)."""
+    unit_keys: bool = False
+    """Whether its keys are of unit norm (`recurrence.Hooks.l2norm`'s, or as `Hooks.write_bound` declares,
+    `Hooks.inverse_bound`'s contract): an own pair's decay may fold into its row before the key's product
+    (`recurrence_algebra.key_diagonal_bands`), all it loses below normal in the exact product too, as fla's
+    token-parallel diagonal folds it into the key (row 7299). Other keys keep the row times the key first;
+    the backward's terms keep theirs either way, a gradient's strip unbounded against a key's decayed
+    product."""
     values_gated: bool = False
     """Whether a call without the delta rule whose values pass between launches in their 16-bit dtype gates
     its write on the values, as fla's simple GLA does (its route's, `recurrence_chunk.simple_gla`: each

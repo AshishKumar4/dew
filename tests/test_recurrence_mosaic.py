@@ -582,6 +582,23 @@ def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(ta
         jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4))).trace(*operands).lower(lowering_platforms=("cuda",))
 
 
+@lowers("sm90")
+def test_a_forked_call_adding_a_slot_lowers_for_a_gpu_under_a_mesh():
+    """The gated delta rule's forked call whose documents add a second table slot (`Chunk.adds`), no entry
+    write, through the public chunked op on the template, lowered for an H100 under a mesh, as training runs
+    every call (`jax.set_mesh`): each operand its shard spec (`_template_launch`), where the added slots took
+    none and the specs' zip with the operands refused the call (base review 89250eb9c F1)."""
+    from test_recurrence_chunk import FORKED_TEMPLATE, entering_documents, narrowed_draw
+
+    hooks = FORKED_TEMPLATE[0]
+    # A 16-bit call, as the template trains it.
+    operands = entering_documents(narrowed_draw(hooks, 0)[0], added=True)
+    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(lambda given: chunk_on('mosaic_gpu', hooks, given)).trace(operands).lower(
+            lowering_platforms=("cuda",))
+
+
 def test_a_ranged_calls_inverse_states_the_fp32_parts_its_merges_issue():
     """A bf16 Kimi delta attention forward with no bound on its inverse, lowered for an H100: its chunk
     inverse's doubling merges in fp32 (`Call.ranged`), two bf16 parts on warpgroup products, which take no
@@ -1728,9 +1745,9 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
     """`name`'s 16-bit call over a forked call's three documents a row, entering a table of a given memory
     and two stored slots (`chunked_launch.Forked`), the gated delta net's with an entry write, at the
     template's derived tiles on `target` (a forward alone at its own, `_ran`), its forward or training pass
-    as a gate case (`KernelCase`): its operands laid from the chunks' edges and its table as the walks take it
-    (`template.forked_laid`). Returns the case (None where the template derives no tiles), the bound call, its
-    derived tiles and the same call unforked, bound."""
+    as a gate case (`KernelCase`): its documents laid as a packed call's and its table as the walks take
+    it (`template.forked_table`). Returns the case (None where the template derives no tiles), the bound
+    call, its derived tiles and the same call unforked, bound."""
     from fla_gdn_support import KernelCase
 
     facts = generation.gpu_target(target)
@@ -1751,25 +1768,27 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
         tiles = template.MOSAIC.derived(bound, facts)
     if tiles is None:
         return None, bound, tiles, unforked
-    laid, table = jax.eval_shape(lambda *x: template.forked_laid(*x, tiles.chunk)[:2], q, k, v, g, beta,
-                                 given, forked)
+    table, starts, firsts, _ = jax.eval_shape(
+        lambda given, forked: template.forked_table(given, forked, *q.shape[:2], tiles.chunk), given, forked)
+    segments = forked.loads.shape[1]
     formed = {key: value for key, value in _form(name, jnp.bfloat16).items() if key != 'wide' or not training}
-    cotangents = [jax.ShapeDtypeStruct(laid[2].shape, jnp.bfloat16), h0] if training else []
+    cotangents = [jax.ShapeDtypeStruct(v.shape, jnp.bfloat16), h0] if training else []
     tabled, laid_table = jax.tree.flatten(table)
 
     def call():
         def fn(*operands):
-            (q, k, v, g, beta), leaves, rest = (operands[:5], operands[5:5 + len(tabled)],
-                                                operands[5 + len(tabled):])
+            (q, k, v, g, beta, starts, firsts), leaves, rest = (operands[:7], operands[7:7 + len(tabled)],
+                                                                operands[7 + len(tabled):])
             *rest, fused = rest if skip else (*rest, None)
             forked = jax.tree.unflatten(laid_table, leaves)
+            documents = {'starts': starts, 'firsts': firsts, 'max_segments': segments}
             if training:
                 return mainloop_backward.gradients(q, k, v, g, beta, None, *rest, tiles=tiles, family=family,
-                                                   forked=forked, skip=fused, **formed)
+                                                   forked=forked, skip=fused, **documents, **formed)
             return chunk_forward.forward(q, k, v, g, beta, None, tiles=_ran(tiles, training=False),
-                                         family=family, forked=forked, skip=fused, **formed)
+                                         family=family, forked=forked, skip=fused, **documents, **formed)
 
-        return fn, (*laid, *tabled, *cotangents, *skip)
+        return fn, (q, k, v, g, beta, starts, firsts, *tabled, *cotangents, *skip)
 
     label = f"{name} bfloat16 {'training' if training else 'forward'} forked {_ran(tiles, training=training)}"
     return KernelCase(label, call), bound, tiles, unforked
