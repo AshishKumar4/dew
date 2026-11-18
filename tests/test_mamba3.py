@@ -7,6 +7,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import mamba3_sites
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, with_gradients
@@ -172,6 +173,17 @@ def test_a_rank_whose_chunk_cuts_its_groups_walks_whole_ones():
     reference = jax.jit(with_gradients(functools.partial(recurrent_mamba3, starts=None)))
     assert_as_exact(dew, reference, functools.partial(draw, 3), 'mamba3 rank=3', seeds=SEEDS[False, MIMO],
                     terms=RESET_TERMS)
+
+
+@pytest.mark.check1_shards(seeds=64, per_task=8)
+@pytest.mark.parametrize("site", list(mamba3_sites.sites()))
+def test_a_bf16_layers_chunked_form_is_as_exact_as_mamba_ssm(site):
+    """Mamba-3's chunked form on a bf16 layer's operands, as a layer runs it (each product's selected kernel:
+    the template's forward, the portable math's gradient), on par from float64 with mamba_ssm's own
+    `mamba3_siso_combined` recorded (`mamba3_sites`, tools/mamba3_reference.py): its output and every
+    operand's gradient, its parametrization's own (raw angles, trapezoid logits, `ADT` and `DT`), the truth
+    the recurrence a token at a time in float64 (check 1, docs/design/testing.md's upstream; row 7923)."""
+    mamba3_sites.the_chunked_form_is_as_exact_as_mamba_ssm(None, site)
 
 
 @pytest.mark.parametrize('route', NARROW_ROUTES)
