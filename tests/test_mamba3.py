@@ -204,10 +204,10 @@ def test_a_continuation_is_the_whole_call(rank):
 @pytest.mark.parametrize(("dtype", "edge"), [(jnp.float32, 120), (jnp.float64, 1000)],
                          ids=["fp32", "float64"])
 def test_a_tokens_turn_at_a_dtypes_edge_stays_its_exact_product(dtype, edge):
-    """One token's turn `dt theta` formed exactly (`two_product`) at its dtype's edge: `dt` 2^edge under
-    `theta` zero turns nothing, and the token writes `lambda dt x B = 0.5 [1, 0]` and reads it back, 0.5
-    (base reviews 9bc4326dd F1, 1fe546a10 F1). A Veltkamp split multiplies `dt` by `2^(p/2) + 1` first, inf
-    there, its residual NaN."""
+    """One token's turn `dt theta` at its dtype's edge: `dt` 2^edge under `theta` zero turns nothing, and
+    the token writes `lambda dt x B = 0.5 [1, 0]` and reads it back, 0.5 (base reviews 9bc4326dd F1,
+    1fe546a10 F1: its angle's exact product, a Veltkamp split multiplying `dt` by `2^(p/2) + 1` first, was
+    inf there, its residual NaN)."""
     with jax.enable_x64(new_val=dtype == jnp.float64):
         x = jnp.full((1, 1, 1, 1, 1), 2.0 ** -edge, dtype)
         dt = jnp.full((1, 1, 1), 2.0 ** edge, dtype)
