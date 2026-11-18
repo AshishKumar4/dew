@@ -652,11 +652,13 @@ def rated(seconds: float, steps: int, rows: int, hlo_flops, model_flops: float |
                                  "dense bf16 peak; custom image-mean model and frozen legacy API have no "
                                  "analytic count",
             "hlo_utilization_bf16_peak": rates.get(f"train/hfu{bound}"),
+            # What it is (`StepFlops.bound`): "_lower_bound" where a launch's work went uncounted
+            # (unsized_kernels_per_step), "_upper_bound" where a loop was counted at its stated bound,
+            # "_estimate" where both, "" the step's own count.
+            "hlo_utilization_bound": None if hlo_flops is None else bound,
             "unsized_kernels_per_step": None if hlo_flops is None else hlo_flops.unsized / steps,
-            "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; "
-                                 "a lower bound where unsized_kernels_per_step is not zero, an upper "
-                                 "bound where a loop was counted at its stated bound; "
-                                 "not an analytic real-token MFU"}
+            "utilization_scope": "optimized executable work, including padding, over dense bf16 peak, "
+                                 "bounded as hlo_utilization_bound names; not an analytic real-token MFU"}
 
 
 def device_idle(directory: str) -> dict[str, float]:

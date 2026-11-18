@@ -159,8 +159,9 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     except MissingFlopsCount:
         counted = None
     assert row["training_flops"] == counted
-    # The CPU step runs no launch its count leaves out; one that does is reported (row 3023).
-    assert row["unsized_kernels"] == 0
+    # The CPU step runs no launch its count leaves out, nor a loop counted at its bound: its count is the
+    # step's own; one that does is reported (row 3023).
+    assert (row["unsized_kernels"], row["utilization_bound"]) == (0, "")
 
 
 def test_the_tools_step_is_the_program_a_runs_first_step_compiles(monkeypatch):
@@ -199,17 +200,20 @@ def test_the_tools_step_is_the_program_a_runs_first_step_compiles(monkeypatch):
     assert lowered(timed) == lowered(fitted)
 
 
-def test_a_steps_count_some_launches_work_is_missing_from_reads_as_a_lower_bound():
-    """A row whose step runs launches no count sizes (`StepFlops.unsized`) shows its FLOPs and
-    utilization as the lower bounds they are, as the trainer names them train/hfu_lower_bound; a
-    complete count shows as it is (row 3023)."""
+def test_a_steps_count_reads_as_the_bound_it_is():
+    """A row's FLOPs and utilization show as the bound their count is (`StepFlops.bound`, `BOUND_MARKS`), as
+    the trainer names its train/hfu: at least the value where a launch's work went uncounted (row 3023), at
+    most it where a loop was counted at its stated bound, about it where both (train 1025's F3: the table
+    marked a bound from the uncounted launches alone, an upper bound shown as the count), the count itself
+    as it is; the MFU, the objective's own count, never marked."""
+    from dew.telemetry.instrumentation import BOUND_MARKS
+
     tool = load("benchmark_step")
     row = {"architecture": "causal_transformer", "flops_per_step": 2e9, "utilization": 0.25, "mfu": 0.2}
-    counted, uncounted = (tool.format_table([{**row, "unsized_kernels": unsized}]).splitlines()[-1].split()
-                          for unsized in (0.0, 2.0))
-    assert [cell for cell in counted if cell in ("2.0", "25.0", "20.0")] == ["2.0", "25.0", "20.0"]
-    assert [cell for cell in uncounted if cell.endswith(("2.0", "25.0", "20.0"))] == [
-        ">=2.0", ">=25.0", "20.0"]
+    for bound, mark in BOUND_MARKS.items():
+        cells = tool.format_table([{**row, "utilization_bound": bound}]).splitlines()[-1].split()
+        assert [cell for cell in cells if cell.endswith(("2.0", "25.0", "20.0"))] == [
+            f"{mark}2.0", f"{mark}25.0", "20.0"]
 
 
 def peak_row(tmp_path, platform: str, *arguments: str, settings: dict[str, str] | None = None) -> dict:

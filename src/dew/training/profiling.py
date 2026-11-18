@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from dew._coordination import agreed, from_every_process
 from dew.telemetry import profile as telemetry_profile
+from dew.telemetry.instrumentation import BOUND_MARKS, logged_utilization
 from dew.telemetry.records import ProfileTraced, Record
 from dew.training._lowering import KernelRecord, kernel_summary
 from dew.training.tracker import LocalTracker
@@ -322,6 +323,9 @@ class ProfileReport:
     """The device's idle gaps an input's arrival ended (`window_split`'s `idle_input`), a step."""
     host_idle_ms: float | None = None
     """The device's idle gaps no input ended, the host's own (`window_split`'s `idle_host`), a step."""
+    hfu_bound: str = ""
+    """What `hfu` is (`StepFlops.bound`, `BOUND_MARKS`), the name the trainer logged it under ending in it
+    (`instrumentation.logged_utilization`): "_upper_bound" where a loop was counted at its stated bound."""
 
     @classmethod
     def read(cls, directory: Path, name: str, window: Path, *, warmup: int, steps: int) -> "ProfileReport":
@@ -363,6 +367,7 @@ class ProfileReport:
         device = (f"the capture holds less than the window ran: {'; '.join(reasons)}" if reasons
                   else None if figures["device_window_ms"] is not None
                   else "the capture holds no device track (a CPU run, or its trace has none)")
+        hfu, hfu_bound = logged_utilization(logged, "hfu") or (None, "")
         report = cls(str(directory), steps, warmup, traced, str(capture), logged["train/step_time_ms"],
                      logged["train/data_wait_ms"], compiles[0] if compiles else None,
                      device_window_ms=figures["device_window_ms"], compute_ms=figures["compute_ms"],
@@ -371,8 +376,8 @@ class ProfileReport:
                      device_idle_ms=figures["device_idle_ms"], input_idle_ms=figures["input_idle_ms"],
                      host_idle_ms=figures["host_idle_ms"],
                      flops=logged.get("train/flops"), mfu=logged.get("train/mfu"),
-                     hfu=logged.get("train/hfu"), tokens_per_s=logged.get("train/tokens_per_s"),
-                     device=device, kernels=kernels)
+                     hfu=hfu, tokens_per_s=logged.get("train/tokens_per_s"), device=device, kernels=kernels,
+                     hfu_bound=hfu_bound)
         return dataclasses.replace(report, losses=report.step_losses())
 
     def step_losses(self) -> tuple[tuple[str, float], ...]:
@@ -419,7 +424,7 @@ class ProfileReport:
                          "(Supervised(work=...) declares them); no compiled count stands in")
         else:
             rated = "" if self.mfu is None else f", MFU {100 * self.mfu:.1f}%"
-            rated += "" if self.hfu is None else f", HFU {100 * self.hfu:.1f}%"
+            rated += "" if self.hfu is None else f", HFU {BOUND_MARKS[self.hfu_bound]}{100 * self.hfu:.1f}%"
             lines.append(f"  work          {self.flops / 1e12:10.4f} TFLOP a step{rated}")
         if self.tokens_per_s is not None:
             lines.append(f"  tokens        {self.tokens_per_s:10.1f} real tokens a second")
