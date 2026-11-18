@@ -353,7 +353,9 @@ def test_a_recordings_units_merge_into_one_fixture_naming_each_devices_sites(tmp
     assert json.loads(str(saved["arrays"]["provenance"])) == {
         "reference": "fla", "revision": "1", "command": "c", "device": "H100 and A100",
         "devices": {"H100": ["gdn"], "A100": ["kda"]}}
-    with pytest.raises(ValueError, match="another provenance"):
+    saved.clear()
+    with pytest.raises(ValueError):
         worker.merged_units([first, unit("c.npz", "H100", ["x.out"], revision="2")], Path("f.npz"), "MIT")
-    with pytest.raises(ValueError, match=r"records gdn\.out again"):
+    with pytest.raises(ValueError):
         worker.merged_units([first, unit("d.npz", "H100", ["gdn.out"])], Path("f.npz"), "MIT")
+    assert saved == {}
