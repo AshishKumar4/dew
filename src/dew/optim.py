@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import fnmatch
+import functools
 import glob
 import inspect
 import itertools
@@ -501,11 +502,14 @@ def parameter_name(path: jax.tree_util.KeyPath) -> str:
 
 
 def _sown(node, name: str):
-    """Read the array a sowed collection holds under `name`, past its one-tuple."""
+    """Read the array a sowed collection holds under `name`: the elementwise largest of its calls'. A layer
+    called more than once (a looped layer, once a pass, `dew.batch.sown_calls`) sows once a call, each over
+    the same weights, so the clip bounds them by the largest logit any call reads; its geometry is every
+    call's alike."""
     value = node.get(name) if isinstance(node, Mapping) else None
     if value is None:
         return None
-    return value[0] if isinstance(value, (tuple, list)) else value
+    return functools.reduce(jnp.maximum, value) if isinstance(value, (tuple, list)) else value
 
 
 def _clip_scale(s_max: jax.Array, tau: float, guard: float) -> jax.Array:

@@ -32,7 +32,8 @@ import numpy as np
 from gpu_flow import Cell, run_cells
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact
-from truths_ahead import compiled_memory, compiled_truths
+from tier_wire import TRUTHS, preparing, unit_needs
+from truths_ahead import admitted_needs, compiled_memory, compiled_truths
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.categorical import token_log_probs
@@ -40,12 +41,6 @@ from dew.nn.kernels import generation
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
-PREPARE = "DEW_TIER_PREPARE"
-"""Set to 1, a flow prepares rather than runs (`preparing`): on the node's CPU, before its GPU run."""
-
-TRUTHS = "DEW_TIER_TRUTHS"
-"""The directory a part's prepare writes its flows' programs and their truths' to and its run reads them
-from."""
 
 PARAMS = "params.pickle"
 """The file of a flow's store holding the parameters its prepare drew (`Flow.params`)."""
@@ -79,11 +74,6 @@ def reference_kernels() -> dict[str, str]:
                              "the reference arm runs one")
         found[str(choice)] = names.pop()
     return found
-
-
-def preparing() -> bool:
-    """Whether this process prepares the tier's flows (`PREPARE`)."""
-    return os.environ.get(PREPARE) == "1"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -400,7 +390,7 @@ def _flat(flow: Flow, program: Callable):
     return flat, [*shapes, jax.ShapeDtypeStruct((flow.rows, flow.length), np.int32)]
 
 
-def _target():
+def node_target():
     """The node's GPU (`TOPOLOGY`): its generation, its kind's (`generation.gpu_target`), and the facts its
     serialized device states of itself, its multiprocessors and its block's shared memory among them
     (`generation.runtime_facts`), read with no GPU visible, as a prepare runs, so nothing of the CUDA
@@ -506,7 +496,7 @@ def prepare(flow: Flow) -> bool:
     (`judge`). Whether it prepared: none where no kernel off the reference path claims a choice the flow is
     for on the node's GPU (`claimed`), which its store records (`PORTABLE`) for its run to skip."""
     held_process(flow)
-    target = _target()
+    target = node_target()
     directory = store_of(flow)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / PORTABLE).unlink(missing_ok=True)
@@ -536,45 +526,13 @@ NEED = "need.json"
 by which the GPU tier admits a part's worker to a slot (`dew.training.memory.admitted` of each)."""
 
 
-UNIT = "DEW_TIER_UNIT"
-"""The name the GPU tier runs a prepare's unit under (a file, or `<file>#G/N` for a group), which its lane
-sets in the prepare's environment: its flows' needs are filed under it (`unit_needs`)."""
-
-
-def unit_needs(programs: list[dict[str, int]]) -> None:
-    """`programs` (`need`'s) added to the needs of the tier's unit this prepare runs (`UNIT`), one file a
-    unit under the tier's store (`TRUTHS`'s `needs/`), from which its lane sizes the unit's worker by Dew's
-    admission of each (`dew.training.memory.admitted`); none outside the tier's prepare, which names no
-    unit."""
-    unit = os.environ.get(UNIT)
-    if unit is None:
-        return
-    path = Path(os.environ[TRUTHS]) / "needs" / f"{hashlib.sha256(unit.encode()).hexdigest()[:16]}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    held = json.loads(path.read_text())["programs"] if path.exists() else []
-    path.write_text(json.dumps({"unit": unit, "programs": [*held, *programs]}))
-
-
 def need(dew, reference, truths: Path) -> dict[str, list[dict[str, int]]]:
-    """A flow's run's programs as the allocator admits them (`dew.training.memory.admitted`), each its
-    compile's memory (`Executable.memory`, `truths_ahead.compiled_memory`) in the admission's own terms
-    (`dew.training.memory.admission`): a float64 truth's or terms program's with the arms' state held beside
-    it (the most any arm takes as arguments, which the run keeps while its truths compute; every program's
-    outputs are fetched to the host, `loaded`, `CompiledTruths.called`). A part's worker fits a slot where
-    every program of its flows is admitted there."""
-    from dew.telemetry.instrumentation import CompiledMemory
-    from dew.training.memory import admission
-
-    arms = [executable.memory for programs in (dew, reference) for executable in programs.programs.values()
-            if executable.memory is not None]
-    state = max((memory.argument for memory in arms), default=0)
-
-    def admitted_as(memory: CompiledMemory, held: int) -> dict[str, int]:
-        return dict(zip(("resident", "beside", "temporaries"), admission(memory, held), strict=True))
-
-    truths_memory = [CompiledMemory(**memory) for memory in compiled_memory(truths)]
-    return {"programs": [*(admitted_as(memory, 0) for memory in arms),
-                         *(admitted_as(memory, state) for memory in truths_memory)]}
+    """A flow's run's programs as the allocator admits them (`truths_ahead.admitted_needs`): its own programs'
+    (Dew's and its reference's, each `Executable.memory`), the state its run holds while its truths compute,
+    and its truths' (`truths_ahead.compiled_memory`)."""
+    arms = [executable.memory._asdict() for programs in (dew, reference)
+            for executable in programs.programs.values() if executable.memory is not None]
+    return {"programs": admitted_needs(arms, compiled_memory(truths))}
 
 
 PREPARED_APART = """import sys
@@ -621,7 +579,7 @@ def loaded(flow: Flow) -> dict[str, Callable]:
 def judge(flow: Flow, programs: Mapping[str, Callable], kind: str, target=None) -> None:
     """Check 1 of the flow's program `kind` (`KINDS`) against its float64 truth, computed on this GPU by the
     programs the tier's prepare compiled for it (`truths_ahead.compiled_truths`); compiled there where this
-    process prepares (`programs` none), for `target` (the node's GPU, `_target`; this process's devices
+    process prepares (`programs` none), for `target` (the node's GPU, `node_target`; this process's devices
     where none)."""
     truth_model = float64_twin(flow.model)
     truth = flow.train(truth_model) if kind == "train" else flow.decode_truth(truth_model)

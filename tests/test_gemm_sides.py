@@ -1,6 +1,7 @@
 """The GEMM template's side operands by group (`axes.GROUPS`, kernel-templates.md Appendix C row 10): a
 bias of each group's own on the epilogue, and a scale of each group's own on the prologue, read at each
-tile's group in the template's streams, their outputs and gradients held to check 1."""
+tile's group in the template's streams, their outputs and gradients held to check 1; and sides along the
+depth, the rows and the columns of a product of no rows (row 7610)."""
 
 import functools
 
@@ -10,7 +11,7 @@ import numpy as np
 import pytest
 from generation_support import generations
 from reference_error import assert_as_exact
-from test_gemm_template import DEPTH, ROUTED, ROWS, SEEDS, SIZES, WIDTH, _draw, biased_row
+from test_gemm_template import DEPTH, ROUTED, ROWS, SEEDS, SIZES, WIDTH, _draw, biased_row, normed
 
 from dew.nn.kernels import gemm, generation
 
@@ -141,3 +142,59 @@ def test_a_side_operand_of_a_dimension_of_one_runs_on_the_template(generation_na
         assert_as_exact(jax.jit(dew), jax.jit(plain), draw, "sides of a dimension of one", seeds=SEEDS,
                         truth_fn=functools.partial(plain, wide=jnp.float64))
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
+
+
+def _scaled_depth(x, scale):
+    return x * scale
+
+
+def _biased_scaled(acc, bias, row_scale):
+    return (acc + bias[None, :]) * row_scale[:, None]
+
+
+HOOKED_NO_ROWS = {
+    "depth prologue": {"prologue": _scaled_depth, "prologue_operands": (("scale", ("depth",)),)},
+    "norm prologue": {"prologue": normed,
+                      "prologue_operands": (("mean_square", ("rows",)), ("weight", ("depth",)))},
+    "row and column epilogue": {"epilogue": _biased_scaled,
+                                "epilogue_operands": (("bias", ("columns",)), ("row_scale", ("rows",)))},
+}
+"""Hooks whose side operands lie along the depth, the rows or the columns, as a product of no rows takes
+them (`test_a_hooked_product_of_no_rows_is_empty_with_zero_side_gradients`)."""
+
+
+@pytest.mark.parametrize("kernel", [None, "xla"], ids=["derived", "xla"])
+@pytest.mark.parametrize("dense", [True, False], ids=["dense", "grouped"])
+@pytest.mark.parametrize("hooked", list(HOOKED_NO_ROWS))
+def test_a_hooked_product_of_no_rows_is_empty_with_zero_side_gradients(hooked, dense, kernel):
+    """`gemm.gemm` of no rows through a prologue or an epilogue whose side operands lie along the depth, the
+    rows or the columns (row 7610: a depth side's gradient sliced a representative row of none), on an H100
+    as chosen or XLA's: an output of no rows, the rows' gradient of none, each side's and the matrix's
+    gradients zeros of their own shapes and dtypes."""
+    values = {"scale": jnp.full((DEPTH,), 2.0), "mean_square": jnp.zeros((0,)),
+              "weight": jnp.ones((DEPTH,)), "bias": jnp.ones((WIDTH,)), "row_scale": jnp.zeros((0,))}
+    spec = HOOKED_NO_ROWS[hooked]
+    hooks = {name: value for name, value in spec.items() if not name.endswith("_operands")}
+    named = {name: tuple(entry[0] for entry in value) for name, value in spec.items()
+             if name.endswith("_operands")}
+    axes = {name: tuple(entry[1] for entry in value) for name, value in spec.items()
+            if name.endswith("_operands")}
+    sides = {name: tuple(values[each] for each in names) for name, names in named.items()}
+    x = jnp.zeros((0, DEPTH), jnp.bfloat16)
+    w = jnp.ones((DEPTH, WIDTH) if dense else (2, DEPTH, WIDTH), jnp.bfloat16)
+    sizes = None if dense else jnp.zeros((2,), jnp.int32)
+
+    def loss(x, w, sides):
+        operands = {name: tuple(zip(sides[name], axes[name], strict=True)) for name in sides}
+        out = gemm.gemm(x, w, sizes, out_dtype=jnp.float32, interpret_on_cpu=True, **hooks, **operands)
+        return jnp.sum(out), out.shape
+
+    chosen = {} if kernel is None else {"grouped_matmul": kernel}
+    with generation.assumed("sm90"), generation.chosen(**chosen):
+        (_, shape), (d_x, d_w, d_sides) = jax.value_and_grad(loss, (0, 1, 2), has_aux=True)(x, w, sides)
+    assert shape == (0, WIDTH) and d_x.shape == (0, DEPTH) and d_x.dtype == x.dtype
+    np.testing.assert_array_equal(np.asarray(d_w, np.float32), np.zeros(w.shape, np.float32))
+    for name, given in sides.items():
+        for got, side in zip(d_sides[name], given, strict=True):
+            assert got.shape == side.shape and got.dtype == side.dtype
+            np.testing.assert_array_equal(np.asarray(got), np.zeros(side.shape, np.float32))

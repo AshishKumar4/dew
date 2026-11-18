@@ -46,7 +46,7 @@ from dew.decision.layout import (
     layout_writing,
     per_question,
 )
-from dew.decision.model import DecisionModel
+from dew.decision.model import DecisionModel, state_width
 from dew.decision.objective import DecisionObjective
 from dew.decision.renderer import Unit
 from dew.decision.rows import option_width
@@ -56,7 +56,7 @@ from dew.inputs.condition import ConditionEncoder
 from dew.inputs.spec import TextCondition
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, SharedCrossAttention
-from dew.nn.protocols import CountedCondition, RematChoosing
+from dew.nn.protocols import RematChoosing
 from dew.optim import OptimConfig
 from dew.registry import (
     ModelConfig,
@@ -303,7 +303,8 @@ class DecisionRunConfig(DecoderRunConfig):
     def _context_derived(self, dtype: str) -> Mapping[str, object]:
         """The objective's context arguments: how its backbone encodes a row's context, or the encoder a
         run configures (`context_text`, built in the run's compute `dtype`, one that encodes text as
-        `_refuse_unread_context` holds it) and whether its weights train (`context_text_trained`)."""
+        `_refuse_unread_context` holds it) and whether its weights train (`context_text_trained`, which
+        `build_run` reads as well for an encoder its start carries)."""
         if self.context_layers is None:
             return {}
         if self.context_text is None:
@@ -324,8 +325,6 @@ class DecisionRunConfig(DecoderRunConfig):
             raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
         if self.context_text is not None and self.context_layers is None:
             raise ValueError("--context-text encodes the context context layers read; set --context-layers")
-        if self.context_text_trained and self.context_text is None:
-            raise ValueError("--context-text-trained trains a configured context encoder; set --context-text")
         text = self.context_text
         if text is not None and (text.field, text.unconditional) != (TextCondition.field,
                                                                      TextCondition.unconditional):
@@ -347,16 +346,14 @@ class DecisionRunConfig(DecoderRunConfig):
 
     def _context_blocks(self, configured: ConditionEncoder | None) -> CrossAttention | SharedCrossAttention:
         """The context layers the run draws (`context_form`), reading a configured encoder's states at its own
-        width (`ConditionWork.features`), else the backbone's."""
+        width (`ConditionWork.features`), else the backbone's; a shared layer reads them at the backbone's."""
         assert self.context_layers is not None
-        if configured is None:
-            form = SharedCrossAttention if self.context_form == "shared" else CrossAttention
-            return form(self.context_layers, self.context_length)
         if self.context_form == "shared":
-            raise ValueError("--context-form shared reads a context in the layer's own attention, at the "
-                             "backbone's width, which a configured --context-text encoder's states are not")
-        return CrossAttention(self.context_layers, self.context_length,
-                              context_features=_encoded_width(configured))
+            # The layer's own attention reads the context at the backbone's width, a configured encoder's
+            # states among them where they are that wide; the layer refuses any other width.
+            return SharedCrossAttention(self.context_layers, self.context_length)
+        features = None if configured is None else state_width(configured)
+        return CrossAttention(self.context_layers, self.context_length, context_features=features)
 
     def build_run(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
@@ -391,6 +388,13 @@ class DecisionRunConfig(DecoderRunConfig):
             derived["tokenizer"] = start.decision_tokenizer
             start = start.backbone()
         release = isinstance(start, PretrainedDecision)
+        # A configured context encoder trains as the run says, the run's own (`_context_derived`) or the one a
+        # saved run or release it starts from carries (`PretrainedDecision.context`).
+        if isinstance(start, PretrainedDecision) and start.context is not None:
+            derived["context_trained"] = self.context_text_trained
+        elif self.context_text_trained and self.context_text is None:
+            raise ValueError("--context-text-trained trains a configured context encoder, which neither the "
+                             "run (--context-text) nor its start carries")
         # Whether a fresh head's rows lie in blocks, as the loaded checkpoint and the run declare it.
         blocked = not release and reads_blocks(start.config, self.source.overrides())
         # The backbone's own transformations, a release's as a fresh backbone's: its head and layout
@@ -585,12 +589,3 @@ def _budgeted(layout: Layout, budgets: Budgets) -> Layout:
 
 
 __all__ = ["DecisionRunConfig", "JointShape", "Letters"]
-
-
-def _encoded_width(encoder: ConditionEncoder) -> int:
-    """The width of the states a configured context encoder hands the cross-attention, as it declares its
-    work (`CountedCondition.conditioning_flops`, `ConditionWork.features`)."""
-    if not isinstance(encoder, CountedCondition):
-        raise ValueError(f"{type(encoder).__name__} declares no conditioning_flops, whose features are the "
-                         "width its states reach the context layers at")
-    return encoder.conditioning_flops(encoder.tokenize([""])).features

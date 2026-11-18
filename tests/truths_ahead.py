@@ -8,9 +8,16 @@ terms take, at each shape its draws take (`assert_as_exact`'s stages), for the d
 serializes them under `directory` and runs nothing. Within `compiled_truths(directory, prepare=False, ...)`
 the run computes each draw's truth and terms on its own devices with those executables (`called`), tracing,
 lowering and compiling none of them; the site's verdict is reached as a site computing its own reaches it.
-A program the store does not hold for a draw's shapes, or one compiled at another `stamp` (the commit and
-JAX), is a red (`MissingTruth`), never one compiled in its place; a terms walk its values steer (a branch
-or loop it reads as it runs, `float64_terms.static`) is held as one, which its run walks on its device.
+Its arms (`ARMS`: Dew's, the reference and each further one) are compiled there too, each as its run compiles
+it (`jax.jit`) at each of its draws' own shapes, traced for the run's devices (`CompiledTruths.tracing`), so
+a GPU run traces, lowers and compiles none of a site's programs: each compiled at a run's first call,
+those ran 2,000 of a day's GPU-minutes idle (2026-11-17's census of 226 jobs). A prepare lists them from
+the site's own call (`reference_error.assert_as_exact`), the one definition its run reads.
+A program the store does not hold for a draw's shapes or an arm's statement, or one compiled at another
+`stamp` (the commit and JAX), is a red (`MissingTruth`), never one compiled in its place; a site its
+prepare did not reach, and an arm no statement holds, runs unprepared, every draw judged, recorded in the
+test's store (`unprepared`); a terms walk its values steer (a branch or loop it reads as it runs,
+`float64_terms.static`) is held as one, which its run walks on its device.
 
 A program takes its traced constants as arguments, held beside it (`held.pkl`): no executable serializes an
 array it closed over. The roles are a site's truth (`truth`: its float64 program, `arm_arithmetic.Truth`),
@@ -25,7 +32,9 @@ import contextlib
 import contextvars
 import dataclasses
 import hashlib
+import inspect
 import json
+import os
 import pickle
 import shutil
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -33,12 +42,14 @@ from pathlib import Path
 
 import jax
 import numpy as np
+from tool_support import load
 
 
 class MissingTruth(AssertionError):
-    """A check-1 site under a store of programs compiled ahead (`compiled_truths`) that its prepare did not
-    compile, or compiled for another commit or other shapes: a red with its reason, never a program compiled
-    here in its place (the GPU tier's run compiles none of a verdict's truths, row 5461)."""
+    """A check-1 site under a store of programs compiled ahead (`compiled_truths`) whose prepare compiled its
+    programs for another commit, for other shapes, or of another arm than the run's: a red with its reason,
+    never a program compiled here in its place (the GPU tier's run compiles none of a verdict's truths, row
+    5461). A site its prepare did not reach runs unprepared, recorded (`running`)."""
 
 
 PROGRAMS, HELD, SITE = "programs", "held.pkl", "site.json"
@@ -46,12 +57,19 @@ PROGRAMS, HELD, SITE = "programs", "held.pkl", "site.json"
 constants and output tree (`held`), and its record, written last, so a prepare cut short leaves none a run
 reads."""
 
+UNPREPARED = "unprepared.json"
+"""A test's record, in its store, that it ran unprepared (`unprepared`): `{"test", "where", "error"}`, its
+first reason, the GPU tier's list of unprepared tests read from these alone (a ledger row each, the
+tier's)."""
+
 
 def named(role: str, inputs) -> str:
-    """A program's name in its site's store: its `role` and its inputs' tree, shapes and dtypes, as a trace
-    keys them (`float64_terms.traced`)."""
+    """A program's name in its site's store: its `role` and its inputs' tree, shapes, dtypes and weak types,
+    as a trace keys them (`float64_terms.traced`): a weak Python scalar beside a bfloat16 array keeps it
+    bfloat16, a strong one promotes it."""
     leaves, tree = jax.tree.flatten(inputs)
-    shapes = (str(tree), tuple((tuple(np.shape(leaf)), str(jax.typeof(leaf).dtype)) for leaf in leaves))
+    shapes = (str(tree), tuple((tuple(np.shape(leaf)), str(jax.typeof(leaf).dtype),
+                                jax.typeof(leaf).weak_type) for leaf in leaves))
     return f"{role} {hashlib.sha256(repr(shapes).encode()).hexdigest()[:16]}"
 
 
@@ -71,6 +89,16 @@ class CompiledTruths:
     def path(self, label: str) -> Path:
         return self.directory / hashlib.sha256(label.encode()).hexdigest()[:32]
 
+    def holds(self, label: str) -> bool:
+        """Whether the store's prepare reached site `label` (its programs written, at any stamp)."""
+        return (self.path(label) / SITE).is_file()
+
+    def unprepared(self, why: str) -> None:
+        """Records in the store that its test ran a site, or an arm, unprepared (`unprepared`), where in its
+        file this process stands."""
+        test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+        unprepared(self.directory, test, [(frame.filename, frame.lineno) for frame in inspect.stack()], why)
+
     def device(self):
         """A device of the ones the store's programs compute on, whose platform picks a branch its platform
         picks (`float64_terms.evaluated_on`): a compile-only GPU of the target's generation, else this
@@ -81,11 +109,28 @@ class CompiledTruths:
 
         return compile_only_gpus(self.target.generation, 1)[0]
 
+    @contextlib.contextmanager
+    def tracing(self) -> Iterator[None]:
+        """Within the block, a program traces as the store's compile lowers it: for its target's GPUs
+        (`dew.training.ahead.lowering_for`), or this process's devices where it names none. An arm traced in
+        it holds the arrays its compile ahead holds (`reference_error._held_arm`)."""
+        if self.target is None:
+            yield
+            return
+        from dew.training.ahead import lowering_for
+
+        with lowering_for(self.target.generation, self.target.multiprocessors):
+            yield
+
     def compile_site(self, label: str, programs: Mapping[str, tuple[Callable, Sequence]],
-                     held: Mapping[str, dict]) -> None:
+                     held: Mapping[str, dict], *, compiled: Callable | None = None, arms: bool = False
+                     ) -> None:
         """The site's `programs` (each a function of its constants and inputs, flat, and their shapes, by
         its name, `named`) compiled for the store's target and written with what each `held`; refused for a
-        label this store compiled already, whose programs a second site of it would replace."""
+        label this store compiled already, whose programs a second site of it would replace. `compiled` makes
+        each program as its run's compile does (`dew.training.ahead.compile_programs`' `compiled`; Dew's
+        compile point where None, a truth's, whose program is its run's); `arms` whether they are a site's
+        arms (`compiled_memory`), whose state its run holds while its truths compute."""
         from dew._cache import uncached
 
         if label in self.begun:
@@ -99,35 +144,42 @@ class CompiledTruths:
         # Compiled here, never loaded from JAX's persistent cache, whose executables serialize without their
         # kernels (`dew.training.ahead.keeping`).
         with uncached():
-            built = self._compiled(programs)
+            built = self._compiled(programs, compiled)
         built.save(site / PROGRAMS)
         (site / HELD).write_bytes(pickle.dumps(dict(held)))
         memory = {name: executable.memory._asdict() for name, executable in built.programs.items()
                   if executable.memory is not None}
-        (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory}))
+        (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory,
+                                             "arms": arms}))
 
-    def _compiled(self, programs: Mapping[str, tuple[Callable, Sequence]]):
-        """`programs` compiled for the store's target (`compile_programs`), or for this process's first
-        device where it names none."""
+    def _compiled(self, programs: Mapping[str, tuple[Callable, Sequence]], compiled: Callable | None):
+        """`programs` compiled for the store's target (`compile_programs`), or for this process's first device
+        where it names none, each made by `compiled` where it is given (`compile_site`), else by Dew's compile
+        point on a target and `jax.jit` here."""
         from dew.training.ahead import AheadPrograms, BuildTarget, Executable, compile_programs
 
         if self.target is not None:
-            return compile_programs(programs, self.target.generation, self.target.multiprocessors)
+            return compile_programs(programs, self.target.generation, self.target.multiprocessors,
+                                    **({} if compiled is None else {"compiled": compiled}))
         devices = jax.devices()[:1]
         placed = jax.sharding.SingleDeviceSharding(devices[0])
+        compile_one = compiled or jax.jit
+
         def built(function, shapes):
-            placed_shapes = (jax.ShapeDtypeStruct(np.shape(shape), shape.dtype, sharding=placed)
+            placed_shapes = (jax.ShapeDtypeStruct(np.shape(shape), shape.dtype, sharding=placed,
+                                                  weak_type=shape.weak_type)
                              for shape in shapes)
-            return Executable.of(jax.jit(function).lower(*placed_shapes).compile())
+            return Executable.of(compile_one(function, out_shardings=placed).lower(*placed_shapes).compile())
 
         return AheadPrograms(BuildTarget.of(devices), {
             name: built(function, shapes) for name, (function, shapes) in programs.items()})
 
     def called(self, label: str, role: str, inputs):
-        """The site's program `role` run on `inputs` (its draw's, widened) and the constants it holds, on
-        this process's devices, its outputs fetched to the host as a site's truths are held, its device's
-        memory left to the arms (a model's float64 gradients a draw, 2.9 GB on the sinks flows); a red
-        (`MissingTruth`) where the store holds none for the site at this stamp or for these shapes."""
+        """The site's program `role` run on `inputs` (its draw's: a truth's widened, an arm's as drawn) and
+        the constants it holds, on this process's devices, its outputs fetched to the host as a site's
+        truths are held, its device's memory left to the next (a model's float64 gradients a draw, 2.9 GB
+        on the sinks flows); a red (`MissingTruth`) where the store holds none for the site at this stamp or
+        for these shapes."""
         programs, held = self._site(label)
         name = named(role, inputs)
         if name not in programs:
@@ -161,12 +213,34 @@ class CompiledTruths:
         return self.read[label]
 
 
-def compiled_memory(directory: Path) -> list[dict[str, int]]:
-    """Every program of a store's sites (`compiled_truths`, prepared) as its compile analysed its memory
+def compiled_memory(directory: Path, *, arms: bool = False) -> list[dict[str, int]]:
+    """Every program of a store's sites (`compiled_truths`, prepared), its truths' or, with `arms`, its
+    arms' (`CompiledTruths.compile_site`), as its compile analysed its memory
     (`dew.telemetry.instrumentation.CompiledMemory`, as its fields name it), its sites' record's; none for
     a program whose backend stated none."""
-    return [memory for site in Path(directory).glob(f"*/{SITE}")
-            for memory in json.loads(site.read_text()).get("memory", {}).values()]
+    records = (json.loads(site.read_text()) for site in Path(directory).glob(f"*/{SITE}"))
+    return [memory for record in records if record.get("arms", False) == arms
+            for memory in record.get("memory", {}).values()]
+
+
+def admitted_needs(arms: Sequence[dict[str, int]], truths: Sequence[dict[str, int]]) -> list[dict[str, int]]:
+    """A run's programs as the allocator admits them (`dew.training.memory.admitted`), each its compile's
+    memory (`compiled_memory`'s, `CompiledMemory`'s fields) in the admission's own terms
+    (`dew.training.memory.admission`): an arm's alone, a float64 truth's or terms program's with the arms'
+    state held beside it (the most any arm takes as arguments, which the run keeps while its truths compute;
+    every program's outputs are fetched to the host, `CompiledTruths.called`). A part's worker fits a slot
+    where every program of its units is admitted there (`tier_wire.unit_needs`)."""
+    from dew.telemetry.instrumentation import CompiledMemory
+    from dew.training.memory import admission
+
+    arms_memory = [CompiledMemory(**memory) for memory in arms]
+    state = max((memory.argument for memory in arms_memory), default=0)
+
+    def admitted_as(memory: CompiledMemory, held: int) -> dict[str, int]:
+        return dict(zip(("resident", "beside", "temporaries"), admission(memory, held), strict=True))
+
+    return [*(admitted_as(memory, 0) for memory in arms_memory),
+            *(admitted_as(CompiledMemory(**memory), state) for memory in truths)]
 
 
 COMPILED: contextvars.ContextVar[CompiledTruths | None] = contextvars.ContextVar("truths_ahead_store",
@@ -192,6 +266,26 @@ def compiled_truths(directory: str | Path, *, prepare: bool, stamp: str,
 
 
 @contextlib.contextmanager
+def prepared(directory: Path, *, stamp: str, target) -> Iterator[CompiledTruths]:
+    """A GPU tier part's test's prepare (`tests/conftest.py`'s `compiled_ahead`): its check-1 sites compiled
+    into `directory` for the node's GPU (`target`, a `BuildTarget`) with that GPU's compile-only device
+    this process's default, on which nothing computes, and their programs' needs (`admitted_needs`) filed
+    under the part's unit as it closes, whatever its test ended in (`tier_wire.unit_needs`, as a flow's are,
+    row 7900), by which the lane sizes the unit's worker."""
+    import tier_wire
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    try:
+        with (compiled_truths(directory, prepare=True, stamp=stamp, target=target) as store,
+              jax.default_device(compile_only_gpus(target.generation, 1)[0])):
+            yield store
+    finally:
+        arms, truths = compiled_memory(directory, arms=True), compiled_memory(directory)
+        tier_wire.unit_needs(admitted_needs(arms, truths))
+
+
+@contextlib.contextmanager
 def judged(label: str) -> Iterator[None]:
     """Within the block, site `label`'s truths are computed (`running`)."""
     token = SITE_IN_PROGRESS.set(label)
@@ -203,6 +297,30 @@ def judged(label: str) -> Iterator[None]:
 
 def running() -> tuple[CompiledTruths, str] | None:
     """The store whose programs compute the truths of the site in progress, and its label: where a run reads
-    a store (`compiled_truths(prepare=False)`) within a site (`judged`), else None."""
+    a store (`compiled_truths(prepare=False)`) within a site (`judged`) its prepare reached, else None. A
+    site its prepare did not reach (a cell its prepare skipped, one computing past an earlier site) runs
+    unprepared, recorded (`CompiledTruths.unprepared`); one prepared at another stamp is a red
+    (`MissingTruth`)."""
     store, label = COMPILED.get(), SITE_IN_PROGRESS.get()
-    return None if store is None or store.prepare or label is None else (store, label)
+    if store is None or store.prepare or label is None:
+        return None
+    if not store.holds(label):
+        store.unprepared(f"{label}: its prepare did not reach this site")
+        return None
+    return store, label
+
+
+def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], why: str) -> None:
+    """The one writer of a test's record that it ran unprepared (`UNPREPARED`, in its store `directory`),
+    compiling a site or an arm on its devices with every site judged: its node id, where (`frames`, innermost
+    first, `(file, line)`: the first of the test's own file, else the test's file), and the first reason it
+    gives, a record already written kept (a prepare's, before its run's)."""
+    record = directory / UNPREPARED
+    if record.exists():
+        return
+    # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
+    path = Path(load("grading", "tools/armada").owning(test))
+    lines = [line for file, line in frames if Path(file).name == path.name]
+    directory.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"test": test, "where": f"{path}:{lines[0]}" if lines else str(path),
+                                  "error": why}))

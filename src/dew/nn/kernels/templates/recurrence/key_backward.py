@@ -583,6 +583,7 @@ def _taken_memories(run) -> jax.Array:
     slots = call.heads * call.width
 
     def by_row(memories):
+        memories = memories[table.pad:memories.shape[0] - table.pad]
         return memories.reshape(run.batch, -1, slots, memories.shape[-1])
 
     held = [] if run.stored is None else [by_row(run.stored)]
@@ -591,9 +592,14 @@ def _taken_memories(run) -> jax.Array:
     # each chunk its own row's.
     slotted = jnp.concatenate([jnp.zeros_like(given[:, :1]), given, *held], axis=1)
     memories = slotted[jnp.clip(table.rows, 0, run.batch - 1), jnp.maximum(table.loads, 0)]
+    if table.turning is not None:
+        # Each chunk's memory turned by its document's load rotation, as its walk took it up.
+        rows, after, before = (part[..., None] for part in table.turning)
+        shifted = jnp.pad(memories, ((0, 0), (1, 1), (0, 0)))
+        memories = rows * memories + after * shifted[:, 2:] + before * shifted[:, :-2]
     memories = memories.reshape(-1, memories.shape[-1])
     if table.entries is not None:
-        memories = memories + table.entries
+        memories = memories + table.entries[table.pad:table.entries.shape[0] - table.pad]
     return jnp.where((table.loads >= 0).repeat(slots)[:, None], memories, 0.0)
 
 

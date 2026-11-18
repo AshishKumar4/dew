@@ -44,7 +44,7 @@ class CountedStep:
     volatile: bool = False
     reject_first: bool = False
     permanent: bool = True
-    calls: dict[int, int] = field(default_factory=dict, repr=False)
+    calls: dict[int, int] = field(default_factory=dict, compare=False, repr=False)
 
     def __call__(self, row):
         row_id = row["id"]

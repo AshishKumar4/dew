@@ -54,7 +54,7 @@ import time
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from concurrent.futures import Future
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.experimental.topologies as topologies
@@ -65,7 +65,7 @@ from jaxlib import xla_client
 
 from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
-from dew._devices import COMPILE_ONLY_MEMORY, device_memory
+from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, device_memory, pool_share
 from dew._records import JSON, boolean, record
 from dew._stated import Unestablished, traceback_frames
 from dew.batch import Batch
@@ -129,20 +129,22 @@ def compile_only_tpus(topology: str) -> tuple:
 
 
 @contextlib.contextmanager
-def stand_in_gpus(devices: Sequence, memory: int) -> Iterator[tuple]:
+def stand_in_gpus(devices: Sequence, memory: int, share: float | None = None) -> Iterator[tuple]:
     """`devices`, a host's own CPU devices (`jax.devices("cpu")`), each stated to hold a GPU's `memory`, its
-    total bytes as the GPU states them, while the block runs: every layout check and admission on them reads
-    the allocator's limit derived from it (`dew._devices.allocator_limit`, `COMPILE_ONLY_MEMORY`), as
-    `compile_only_gpus`' do, where JAX's CUDA plugin, which those need, does not install. `Trainer.validate`
-    checks a run's layout on them against the GPUs' limits; a program compiles for the CPU."""
+    total bytes as the GPU states them, at `share`, the pool's share in the run they stand in for (this
+    process's own, `pool_share`, read as the block opens, where none is given), while the block runs: every
+    layout check and admission on them reads the allocator's limit derived from them
+    (`dew._devices.allocator_limit`, `StatedGpu`), as `compile_only_gpus`' do, where JAX's CUDA plugin,
+    which those need, does not install. `Trainer.validate` checks a run's layout on them against the GPUs'
+    limits; a program compiles for the CPU."""
     positive_memory(memory)
     devices = tuple(devices)
-    COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
+    STATED_GPUS.update(dict.fromkeys(devices, StatedGpu(memory, pool_share() if share is None else share)))
     try:
         yield devices
     finally:
         for device in devices:
-            del COMPILE_ONLY_MEMORY[device]
+            del STATED_GPUS[device]
 
 
 _HOSTS_GPUS: set = set()
@@ -150,14 +152,14 @@ _HOSTS_GPUS: set = set()
 GPUs' program (`compile_ahead`'s `portable` where its mesh holds others)."""
 
 
-def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
+def host_gpus(generation: str, topology: str | Path, count: int, share: float = DEW_SHARE) -> tuple:
     """`count` compile-only devices of the CUDA `generation`'s GPUs a host serialized its own topology of
     (`jax.experimental.topologies.get_attached_topology("cuda").serialize()`, written to `topology`), none
     attached: XLA compiles over them as over that host's GPUs, the SKU's memory, clocks and multiprocessors
     its own, so a program compiled here keys the persistent cache as that host's compile of it does (its
     backend's platform version and topology fingerprint are the host's) and the host's run reads it. A
     canonical target (`compile_only_gpus`) keys another entry: the 80 GB A100 it names against a 40 GB
-    host's."""
+    host's. Each is admitted at `share`, the pool's share in the host's run (`StatedGpu`)."""
     # The CUDA plugin, which a serialized topology deserializes through, initialized as the generation's
     # compile-only GPUs initialize it: with no client and no GPU.
     compile_only_gpus(generation, 1)
@@ -166,7 +168,7 @@ def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
     _HOSTS_GPUS.update(devices)
     memory = topology_memory(serialized)
     if memory is not None:
-        COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
+        STATED_GPUS.update(dict.fromkeys(devices, StatedGpu(memory, share)))
     if len(devices) < count:
         raise ValueError(f"the topology at {topology} holds {len(devices)} GPUs, not {count}")
     held = gpu_target(devices[0].device_kind).generation
@@ -745,6 +747,13 @@ class Keeping:
         except Unestablished as refusal:
             self.refused[named] = str(refusal)
             return
+        loaded = communicators.loaded_program(executable)
+        if loaded is None:
+            # Compiled for devices this process has not loaded (a compile-only GPU's), refused before it is
+            # serialized: no program of its default backend.
+            self.refused[named] = "it was compiled for devices this process has not loaded (a compile-only " \
+                                  "target's), outside the process's default backend"
+            return
         try:
             serialized = Executable.of(executable)
         except (NotImplementedError, ValueError) as refusal:
@@ -752,9 +761,7 @@ class Keeping:
             # program, which no executable serializes.
             self.refused[named] = f"its executable does not serialize: {refusal}"
             return
-        runtime = executable.runtime_executable()
-        assert runtime is not None, "a program compiled on this process's devices is loaded"
-        ran = runtime.local_devices()
+        ran = loaded.devices
         if not set(ran) <= set(jax.devices()):
             # The file's target is the process's default backend's (`save`), which this program is none of.
             self.refused[named] = f"it runs on {sorted({device.platform for device in ran})} devices, " \
@@ -825,33 +832,62 @@ def kept(path: str | Path) -> Iterator[AheadPrograms]:
         yield programs
 
 
+class Compile(Protocol):
+    """A program's compile, as `compile_programs` makes each (`compiled`): `function` a program whose results
+    it places (`out_shardings`), which `lower` lowers: Dew's compile point (`owned_program`), or `jax.jit`
+    where the program's run compiles it so."""
+
+    def __call__(self, function: Callable, /, *,
+                 out_shardings: jax.sharding.Sharding) -> OuterProgram | jax.stages.Wrapped: ...
+
+
+def _gpu_mesh(generation: str, multiprocessors: int | None) -> jax.sharding.Mesh:
+    """One mesh axis over the compile-only GPUs of `generation` (`compile_only_gpus`)."""
+    return jax.sharding.Mesh(np.asarray(compile_only_gpus(generation, multiprocessors=multiprocessors)),
+                             ("devices",))
+
+
+@contextlib.contextmanager
+def lowering_for(generation: str, multiprocessors: int | None = None) -> Iterator[None]:
+    """Within the block, programs trace and lower as `compile_programs` lowers them for one GPU of the CUDA
+    `generation`: their launches derived for that GPU's facts (`assumed`, any GPU of the generation), on the
+    compile-only GPUs' abstract mesh, certified on the first (`report.certifying`). A program traced in it
+    holds the arrays a compile of it ahead holds (a prepare's, `tests/truths_ahead.py`)."""
+    mesh = _gpu_mesh(generation, multiprocessors)
+    with (assumed(built_target(generation, multiprocessors), portable=True),
+          jax.sharding.use_abstract_mesh(mesh.abstract_mesh), report.certifying(mesh.devices.flat[0])):
+        yield
+
+
 def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDtypeStruct]]],
-                     generation: str, multiprocessors: int | None = None) -> AheadPrograms:
-    """`programs`, each a function and the shapes and dtypes of its arguments, by its name, compiled ahead for
+                     generation: str, multiprocessors: int | None = None, *,
+                     compiled: Compile = owned_program) -> AheadPrograms:
+    """`programs`, each a function and its arguments' shapes, dtypes and weak types (each a
+    `ShapeDtypeStruct` or an abstract value), by its name, compiled ahead for
     one GPU of the CUDA `generation`, of the `multiprocessors` it states (`built_target`), on any host holding
-    the CUDA plugin (`compile_only_gpus`), its launches derived for that GPU's facts (`assumed`), and
+    the CUDA plugin (`compile_only_gpus`), its launches derived for that GPU's facts (`lowering_for`), and
     serialized: a CPU host builds what a GPU node then
     only loads and runs (`AheadPrograms.loaded`, ledger 2716). Arguments and results are placed whole on that
     GPU, whatever the function reads. A function takes and returns arrays (a backward is a program of its own
     over its residuals); one whose program holds arrays it closed over is refused, named, as no executable
     serializes them, as is one holding a kernel this host cannot lower for any GPU of the generation
     (`selection.Unlowerable`: cuDNN's, whose plan holds to its GPU's model). Each is lowered in turn and all
-    compile at once (`report.compiled_at_once`)."""
+    compile at once (`report.compiled_at_once`). `compiled(function, out_shardings=)` makes each program
+    lowered: Dew's compile point (`owned_program`), or the compile the program's run takes where that is
+    another (check 1's arms, `jax.jit`)."""
     target = built_target(generation, multiprocessors)
-    devices = compile_only_gpus(generation, multiprocessors=multiprocessors)
-    mesh = jax.sharding.Mesh(np.asarray(devices), ("devices",))
-    placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    placed = jax.sharding.NamedSharding(_gpu_mesh(generation, multiprocessors), jax.sharding.PartitionSpec())
     lowerings = []
     for name, (function, arguments) in programs.items():
-        shapes = tuple(jax.ShapeDtypeStruct(argument.shape, argument.dtype, sharding=placed)
+        shapes = tuple(jax.ShapeDtypeStruct(argument.shape, argument.dtype, sharding=placed,
+                                            weak_type=argument.weak_type)
                        for argument in arguments)
 
         def lowered(function=function, shapes=shapes, name=name) -> jax.stages.Lowered:
             """The program lowered for the target, afresh at each call (a relowering's, past a spill)."""
             try:
-                with (assumed(target, portable=True), jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
-                      report.certifying(mesh.devices.flat[0])):
-                    return owned_program(function, out_shardings=placed).lower(*shapes)
+                with lowering_for(generation, multiprocessors):
+                    return compiled(function, out_shardings=placed).lower(*shapes)
             except Unlowerable as refused:
                 raise refused.refusing(name) from refused
         lowerings.append((lowered(), None, lowered))
@@ -956,6 +992,15 @@ class AheadTarget:
     """The run's data phases whose steps are compiled in place of the first's, each over a batch of its own
     (`phase_batch`), into the run's persistent compilation cache, where that phase's first compile in the
     run finds them: none, the first step's alone."""
+    share: float = DEW_SHARE
+    """The share of each GPU XLA's pool takes in the run that loads the step (`dew._devices.pool_share`):
+    Dew's own as Dew prepares a training process, or the run's named one. Its plan is admitted against the
+    limit it derives (`StatedGpu.share`), not this process's own share, which a prepare packed beside
+    another job holds of its own GPU alone (row 7644: 6.78 GiB of an 80 GiB target)."""
+
+    def __post_init__(self) -> None:
+        if not 0 < self.share <= 1:
+            raise ValueError(f"a pool's share of a GPU is in (0, 1], not {self.share!r}")
 
     @property
     def memory(self) -> int | None:
@@ -970,9 +1015,10 @@ class AheadTarget:
             if self.multiprocessors is not None or self.capacity_gib is not None:
                 raise ValueError("a host's topology states its GPUs' memory and multiprocessors; set neither "
                                  "capacity_gib nor multiprocessors with it")
-            return host_gpus(self.generation, self.topology, self.devices)
+            return host_gpus(self.generation, self.topology, self.devices, self.share)
         if ":" not in self.generation:
-            return compile_only_gpus(self.generation, self.devices, self.memory, self.multiprocessors)
+            return compile_only_gpus(self.generation, self.devices, self.memory, self.multiprocessors,
+                                     self.share)
         if self.multiprocessors is not None:
             raise ValueError(f"a TPU topology ({self.generation}) states its own cores; set no "
                              "multiprocessors")
@@ -1390,9 +1436,13 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
                 starts = started(trainer, start, planned, plan)
     except Unlowerable as refused:
         raise refused.refusing("step") from refused
-    # The sampled step as the search compiled it, its program what it lowered then.
-    sampled = (None if planned.sampled is None
-               else AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable))
+    # The sampled step as the search compiled it, its program what it lowered then (the plan unreleased, its
+    # lowering held), digested as the step's is: a program no file can hold is refused by name.
+    sampled = None
+    if planned.sampled is not None:
+        if planned.sampled.lowered is None:
+            raise ValueError("the sampled step's plan was released before it was compiled ahead")
+        sampled = AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     memory = compiled_memory(compiled)
@@ -1449,7 +1499,7 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     shapes (`collecting`), by digest: `started`'s last part."""
     from dew.distributed.placement import placed_shapes
     from dew.state import apart, together
-    from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest
+    from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest, streak_of
     from dew.training.planning import whole_step_program
 
     candidate, split = planned.candidate, planned.split
@@ -1469,6 +1519,7 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
                     [(loss, aux, finite, accepted, committed)] * split)
             book = book_shapes(loss)
             counted = bookkeep(*booked(book, book, loss, finite, committed, aux or {}))
+            streak_of(counted)
             if committed is not None and committed.inspected is not None:
                 latest((committed.count, committed.inspected), (committed.count, committed.inspected))
             added_tokens(counted.tokens, counted.tokens)

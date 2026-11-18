@@ -25,6 +25,7 @@ import json
 import os
 from pathlib import Path
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -356,8 +357,7 @@ def _on_par_recorded(named: dict[str, str], step, truth, upstream: str, seeds: i
 
 
 @cell("recurrence", covers=lambda case: dict(zip(AXES["recurrence"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_recurrences_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """`_on_par` of a GPU's case at its declared seeds (`SEEDS`)."""
@@ -365,8 +365,7 @@ def a_recurrences_training_step_is_on_par(case: tuple[str, ...]) -> None:
 
 
 @cell("recurrence_tpu", covers=lambda case: dict(zip(AXES["recurrence_tpu"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in TPU_CASES], ids="-".join)
 def a_recurrences_training_step_on_a_tpu_is_on_par(case: tuple[str, ...]) -> None:
     """`_on_par` of a TPU's case (the TPU tier's flow, tests/test_ssd_kernel.py)."""

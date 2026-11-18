@@ -239,13 +239,32 @@ def test_elastic_phases_that_share_a_corpus_resume_inside_the_second_on_another_
         assert held == sorted(whole[step])
 
 
+@pytest.mark.parametrize("read_as", ["indexed", "streamed"])
+def test_phases_that_read_a_corpus_alone_continue_it_across_their_boundary(read_as):
+    """Two phases on their own streams each reading a corpus alone, in batches of their own: the second
+    continues it where the run left it, each record trained once and in order, as phases reading it as the
+    one member of a mix of their own do (`_alone_mixed`), where they were refused (row 5400); and a read
+    stopped in either phase or at their boundary, resumed, reads what the read never stopped reads."""
+    alone = phases((SHARED.repeat().batch(tokens=128), 3), (SHARED.repeat().batch(tokens=64), None))
+    loader = compile(alone, read=read_as, loading=READ)
+    whole, stream = read(loader, 24)
+    stream.close()
+    first, second = shared_ids(first_pass(whole, len(KEPT)))
+    assert first and second
+    assert first + second == KEPT[:len(first) + len(second)]
+    resumes_as_read(loader, whole, (2, 3, 4, 6))
+
+
 def test_phases_that_share_a_corpus_otherwise_than_as_one_member_each_are_refused():
-    """A phase that reads a corpus another reads other than as a member of its own mix, whose position no key
-    names, phases that read it through other steps before their mixes, where the one's draws are no draws of
-    the other's, and phases that read it under other keys, which draw and shuffle it otherwise, are refused,
-    as the run could not continue the corpus where it left it."""
+    """A phase that reads a corpus another reads other than alone or as a member of its own mix (a member
+    of a mix inside it), whose position no key names, phases that read it through other steps before their
+    mixes, where the one's draws are no draws of the other's, and phases that read it under other keys,
+    which draw and shuffle it otherwise, are refused, as the run could not continue the corpus where it
+    left it."""
+    nested = mix([mix([SHARED.repeat(), member(2, endless=True)]), member(3, endless=True)])
     with pytest.raises(ValueError):
-        compile(phases((source(1), 3), (source(1), None)), read="indexed", loading=READ)
+        compile(phases((SHARED.repeat().batch(tokens=128), 3), (nested.batch(tokens=64), None)),
+                read="indexed", loading=READ)
     other = mix([SHARED.map(lambda row: row), member(3, endless=True)]).batch(tokens=64)
     with pytest.raises(ValueError):
         compile(phases((mix([SHARED, member(2, endless=True)]).batch(tokens=128), 3), (other, None)),
@@ -410,17 +429,14 @@ def test_a_position_main_saved_under_plan_14_resumes_as_it_was_read(saved):
     own streams, in the first or past it (its finished phase named by its plan's identity, which held 14's
     version, `saved_identity`), or of a bounded mixture read while its layout or its held shuffle holds
     counts, resumes, and reads what a read of the same chain stopped where it stopped reads after it."""
+    from resumed_support import resumed_as_read
     from saved_positions_support import SAVED
 
     loader, steps = SAVED[saved]
-    streams = [loader().train(DataPartition()) for _ in range(2)]
-    list(itertools.islice(streams[0], steps))
-    streams[1].set_state((SAVED_BY_MAIN / f"{saved}.position").read_bytes())
     # The rest of each read, the stopped one's and the restored one's, batch by batch, eight steps on.
-    after = [[_ids(batch) for batch in itertools.islice(stream, 8)] for stream in streams]
-    for stream in streams:
-        stream.close()
-    assert after[1] == after[0] and after[0]
+    stopped, restored = resumed_as_read(loader, steps, (SAVED_BY_MAIN / f"{saved}.position").read_bytes(),
+                                        _ids, 8)
+    assert restored == stopped and stopped
 
 
 def test_a_profile_window_in_a_phase_that_reads_an_earlier_phases_batches_names_that_program(tmp_path):

@@ -96,8 +96,9 @@ mark `generations`; none, a file every generation runs). A GPU
 node runs them with `gpu-lane`, each as a task of a CUDA lane, whose rows are
 recorded and reused on the GPU's class as a CPU task's are on the CPU's. With `--prepare`, a lane's files
 run first on the node's CPU, no GPU drawn, for what their GPU run reads and must not compute while it holds
-the GPU (`gpu_prepared`: the tests marked `prepares`, their float64 truths and their programs compiled for
-the node's GPU), nothing of it recorded. With `--network`, a GPU node that
+the GPU (`gpu_prepared`: every test of its part, under the prepare's word, each preparing its float64
+truths and its programs compiled for the node's GPU or skipped, as tests/conftest.py decides), nothing of it
+recorded. With `--network`, a GPU node that
 reaches the Hub runs every file's network-marked tests, which every other task sets aside, as one lane of
 their own, recorded on a class of their own, so each train reruns only the files whose inputs changed.
 
@@ -165,6 +166,11 @@ def check1_wire():
     stages log (STAGES). Loaded where a plan shards a site, so a checkout of the harness alone (a page
     generator's scratch copy) imports this file."""
     return _loaded(HERE.parents[1] / "tests" / "check1_wire.py")
+@functools.cache
+def tier_wire():
+    """The GPU tier's prepare-to-lane contract, its one owner (tests/tier_wire.py): the prepare's word and
+    unit, and where its truths and needs are filed. Loaded where a lane prepares, as `check1_wire` is."""
+    return _loaded(HERE.parents[1] / "tests" / "tier_wire.py")
 PARITY_STAGES = HERE.parents[1] / "src" / "dew" / "parity_stages.py"
 child_groups = _loaded(HERE / "child_groups.py")
 session = _loaded(HERE / "session.py")
@@ -198,7 +204,7 @@ shares = _loaded(HERE / "shares.py")
 collection = _loaded(HERE / "collection.py")
 gpu_measures = _loaded(HERE / "measures.py")
 GPU_HEADROOM, gpu_needs = gpu_measures.GPU_HEADROOM, gpu_measures.gpu_needs
-apportioned, deadline_shares = shares.apportioned, shares.deadline_shares
+apportioned, deadline_shares, task_shares = shares.apportioned, shares.deadline_shares, shares.task_shares
 # The names the land queue's tools read from this module at every commit they run (land.sh's `ci.STALE`,
 # run_tests.py's `node_of`), older commits' and newer alike.
 STALE, node_of = grading.STALE, grading.node_of
@@ -423,8 +429,11 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
     one reading read each input once, however many rows name it."""
     digest = hashlib.sha256(common.encode())
     reading = Reading() if reading is None else reading
-    for path in inputs(name, depends):
+    # A test node's (`file::test`) inputs are its file's, the node named beside them.
+    for path in inputs(grading.owning(name), depends):
         digest.update(path.encode() + reading.part(path))
+    if "::" in name:
+        digest.update(name.encode())
     if session.SITE.fullmatch(split):
         digest.update(split.encode())
     elif split and split != COLLECT:
@@ -695,7 +704,8 @@ def reused_classes(network: bool = False) -> list[str]:
 def reused(python: str, name: str, split: str, common: str, network: bool = False,
            kept: tuple[str, str] | None = None, reading: Reading | None = None) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on a class this host reuses
-    (`reused_classes`), if it ran green there on exactly these inputs; else None. A file its plan kept
+    (`reused_classes`), if it ran green there on exactly these inputs, `cached` with that run's key (armada
+    counts it reused and times no file by it); else None. A file its plan kept
     (`kept`: its green run's class and key, `reusable`) reads that run, fresh here; any other, the record of
     the last run on these shared inputs: a key hashes them (`cache_key`), so no run on others, whose record
     the last run's may be, can be fresh here, all from one reading of the inputs (`Reading`)."""
@@ -712,12 +722,12 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
         if found is not None and found["key"] == kept[1] and fresh(found, name, common, reading) and standing(
                 found, current):
             named_at_commit(python, place, kept[0], kept[1], token)
-            return found["row"]
+            return {**found["row"], "cached": found["key"]}
     hit = green_record(python, name, split, common, token, reused_classes(network), reading, [])
     if hit is None:
         return None
     named_at_commit(python, place, hit[1], hit[0]["key"], token)
-    return hit[0]["row"]
+    return {**hit[0]["row"], "cached": hit[0]["key"]}
 
 
 def fresh(recorded: dict, name: str, common: str, reading: Reading | None = None) -> bool:
@@ -750,7 +760,7 @@ def parted_record(path: Path = session.DURATIONS) -> dict[str, dict[str, float]]
     parted: dict[str, dict[str, float]] = {}
     record = durations_record(path)
     for node in sorted(record):
-        parted.setdefault(node.split("::")[0], {})[node] = record[node]
+        parted.setdefault(grading.owning(node), {})[node] = record[node]
     return parted
 
 
@@ -1083,7 +1093,7 @@ def site_costs(python: str, name: str, test: str) -> dict[str, float]:
         record = json.loads(path.read_text())
         python_, _, rest = record["site"].partition("::")
         node = rest.rpartition("::")[0]
-        if (python_, node.split("::")[0]) == (python, name) and session.site_name(node, held) == test:
+        if (python_, grading.owning(node)) == (python, name) and session.site_name(node, held) == test:
             # The record's own words, those of what its draws paid once among them where it keeps them.
             records.append(costs.Drawn(**{word: record[word] for word in costs.Drawn.__annotations__
                                           if word in record}))
@@ -1264,14 +1274,18 @@ def collect_entries(names: list[str], timings: dict, target: float) -> list[dict
             for index, held in enumerate(names[at::count] for at in range(count))]
 
 
-def stale_row(python: str, name: str, group: str, why: str, kind: str = grading.STALE) -> dict:
-    """Row `name` (in `group`'s group) not run, red as `kind`, saying `why`: `grading.STALE`, a kept row this
-    task did not find, graded and run again by the queue; "whole", a unit its lane cannot hold."""
-    said = (f"stale, not run: the plan kept it on a record this task did not find, {why}"
-            if kind == grading.STALE else why)
-    return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0, "output": said,
+KEPT_UNFOUND = "stale, not run: the plan kept it on a record this task did not find, "
+"""How a kept row this task did not find or could not run begins what it says (`stale_row`)."""
+
+
+def stale_row(python: str, name: str, group: str, why: str) -> dict:
+    """Row `name` (in `group`'s group) with no verdict of its tests (`grading.STALE`), not run, saying `why`:
+    a kept row this task did not find, which the queue runs again, or a unit its GPU lane cannot hold
+    (`gpu_lane`), which Platform's harness evidence says, never a red of a test nor its file's verdict (Main's
+    audit, row 7614: as a red of its own kind, the tier read it as its file's verdict and its tests' red)."""
+    return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0, "output": why,
             "tests": {}, "ynn_switched": [], "cells": {}, "timings": {row(python, name, ""): 0.0},
-            **grading.red_as(kind, [])}
+            **grading.red_as(grading.STALE, [])}
 
 
 def stale_cost(name: str, group: str, reading: Reading) -> float:
@@ -1297,7 +1311,8 @@ def afforded(python: str, tests: list[str], group: str, kept: Container[str],
     for name in tests:
         cost = stale_cost(name, group, reading)
         if name in kept and cost > left:
-            stale_rows.append(stale_row(python, name, group, f"its {cost:.0f} s past the {left:.0f} s left"))
+            stale_rows.append(stale_row(python, name, group,
+                                        f"{KEPT_UNFOUND}its {cost:.0f} s past the {left:.0f} s left"))
             continue
         fitting.append(name)
         left -= cost
@@ -1402,7 +1417,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
             # The task's deadline spent on the rows before it: this group is neither read nor run, stale as a
             # kept row the task could not run is (`tested`).
             rows.append(stale_row(python, name, group,
-                                  f"the task's {deadline:.0f} s spent before it was read"))
+                                  f"{KEPT_UNFOUND}the task's {deadline:.0f} s spent before it was read"))
             continue
         part = out.with_name(f"{out.name}.{index}")
         code = max(code, tested(python, [name], group, part, left, cache, grace, common, environ, coverage,
@@ -1548,7 +1563,7 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
         spent = time.monotonic() - reading
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
-    if left := child_groups.stop(done, grace=max(grace - spent, 0.0) if expired else 0.0,
+    if left := child_groups.stop([done], grace=max(grace - spent, 0.0) if expired else 0.0,
                                  interrupt=signal.SIGINT, settle=SETTLE):
         print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
     # A process of the group still running may yet open a file: no record of this task keeps a key.
@@ -1645,7 +1660,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
     counts = json.loads(collection.read_text()) if collection.is_file() else {}
     ran = []
-    shares = task_seconds(tests, cases, log, time.monotonic() - began, expired)
+    stood = followed.visited(followed.log_events(log)) if expired or not report.is_file() else []
+    shares = task_shares(tests, cases, time.monotonic() - began, stood[-1] if expired and stood else None,
+                         expired, grading)
     # Where the task ran out of time, the file whose test started last is the one it was spent in (executed.py
     # logs each visit): its row is the deadline's red; a file pytest reported is graded by its own cases, the
     # exit the interrupt's, not its; and one with none is not graded but run again (`grading.STALE`), never
@@ -1653,13 +1670,14 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # "at 0.0 s").
     # A task stalled before any test started (its collection) has no such file: each of its rows is the
     # deadline's.
-    stood = followed.visited(followed.log_events(log)) if expired or not report.is_file() else []
+    # A row named by a test node (`file::test`) is graded by its own cases (`grading.of`), its file's
+    # collection and visits its own: a GPU lane runs each such row in a task of its own (`lane_units`).
     running = stood[-1] if stood else None
     for name in tests:
-        own = [case for case in cases if grading.file_of(case) == name]
-        red, failed, cause = grading.graded(name, own, cases, counts.get(name, {}), report.is_file(),
-                                            returncode, deadline if expired else None, running, pid.is_file(),
-                                            running)
+        own = [case for case in cases if grading.of(case, name)]
+        red, failed, cause = grading.graded(name, own, cases, counts.get(grading.owning(name), {}),
+                                            report.is_file(), returncode, deadline if expired else None,
+                                            running, pid.is_file(), running)
         # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
         # row is `unobserved`, and armada weighs no plan by it.
         unobserved = name not in shares
@@ -1679,7 +1697,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      # A pytest a signal ended, its file's red whole: the signal, for whoever it routes to.
                      **({"signal": -returncode} if red and returncode < 0 and not expired else {}),
                      "tests": {**{node: seconds for node, seconds in done_before.items()
-                                  if node.split("::", 1)[0] == name},
+                                  if grading.holds(name, node)},
                                **{grading.node_of(case): float(case.get("time") or 0) for case in own}},
                      "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
                      # A judge's, beside its pooling, what its map tasks' records say they paid
@@ -1698,22 +1716,6 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     return 0
 
 
-def task_seconds(tests: list[str], cases: list[ET.Element], log: Path, wall: float,
-                 expired: bool) -> dict[str, float]:
-    """Each of `tests`' seconds of its task's `wall` time, by its JUnit `cases`: in proportion to its tests'
-    own times (`apportioned`); where the task ran out of time (`expired`), the file running at its deadline
-    (its executed `log`'s last visit) at least what it needs, and one that never started none
-    (`deadline_shares`)."""
-    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if grading.file_of(case) == name)
-                   for name in tests}
-    if not expired:
-        return apportioned(own_seconds, wall, len(tests))
-    # The file whose test started last is the one running at the deadline (executed.py logs each visit).
-    stood = followed.visited(followed.log_events(log))
-    return deadline_shares(own_seconds, {grading.file_of(case) for case in cases}, wall,
-                           stood[-1] if stood else None)
-
-
 def resumed(tests: list[str]) -> dict[str, float]:
     """The tests of `tests` an earlier attempt of this task passed before the fleet recalled it (armada keeps
     a recalled attempt's artifacts and hands them to the next as ARMADA_RESUME, #4544), each with its seconds,
@@ -1725,7 +1727,7 @@ def resumed(tests: list[str]) -> dict[str, float]:
     passed = {}
     for line in kept.read_text().splitlines():
         found = json.loads(line)
-        if found["node"].split("::", 1)[0] in tests:
+        if grading.owning(found["node"]) in tests:
             passed[found["node"]] = float(found["seconds"])
     artifacts = os.environ.get("ARMADA_ARTIFACTS")
     if artifacts and passed:
@@ -1835,7 +1837,9 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         opened = opened | native_inputs(opened, recorded)
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
-        ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
+        # A test node's row (`file::test`) keeps its file's record, the one its process's log holds.
+        file = grading.owning(name)
+        ran = executed.get(file, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
         site = session.SITE.fullmatch(parsed_row(row_["name"])[2])  # a check-1 judge reads not as its site
         read = (None if ran["depends"] is None or (site is not None and site["start"] is None) else
                 sorted({*ran["depends"], *(opened or ())}))
@@ -1843,13 +1847,13 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             inputs = None if opened is None else sorted({*ran["depends"], *opened})
             ran = {**ran, "depends": None if inputs is None or wrote_inputs(inputs, changed) else inputs}
         ran = {**ran, "depends": site_inputs(python, row_["name"], ran["depends"])}
-        if row_["exitCode"] == 0 and name not in executed:
+        if row_["exitCode"] == 0 and file not in executed:
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None
         # A group of a file the durations record does not wholly name (`unkeyed`, split.py) keeps no key: the
         # plan, which cuts by the record alone, may cut the file otherwise (`session.cut`).
         key = (cache_key(common, name, parsed_row(row_["name"])[2], ran["depends"])
-               if green and name not in unkeyed else None)
+               if green and file not in unkeyed else None)
         # A red run begins the row's next epoch first, so every green run recorded before it stands no
         # more (`epoch`); a green one keeps the epoch it ran in, begun where the row has none, or none where
         # neither was read or written.
@@ -1900,6 +1904,9 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
 
     def evidence_of(key: str) -> tuple[str, list[str]]:
         _, name, _ = key_parts(key)
+        # A test node's record (a GPU lane's, `rows.row_place`) is no file's evidence: its file's runs are.
+        if "::" in name:
+            return name, []
         found = recorded(f"{prefix}{key}", token)
         if found is None:
             return name, ["unrecorded"]
@@ -1985,8 +1992,10 @@ def borrowed_records(names: list[str], python: str, held: str, token: str,
     a first lane on a class takes as its share. One no class measured is absent. Its run on `held`
     records its own, which every later lane reads."""
     wanted = set(names)
-    return largest_records(python, token, lambda at, name, _: name if at != held and name in wanted else None,
-                           strict=strict) if names else {}
+    # A test node's records (`file::test`) count as its file's.
+    return largest_records(python, token, lambda at, name, _: (
+        grading.owning(name) if at != held and grading.owning(name) in wanted else None), strict=strict) \
+        if names else {}
 
 
 VARIANTS = {"users": ("users_process", {"DEW_TEST_USERS_ARITHMETIC": "1"})}
@@ -2006,36 +2015,35 @@ def lane_units(python: str, tests: list[str], within: float | None = None) -> di
     for name in tests:
         file, _, group = name.partition("#")
         units[name] = (file, group, "")
+        # A test node's (`file::test`) collection counts under its file.
         units |= {f"{file}#{varied(group, variant)}": (file, group, variant)
-                  for variant, files_ in holding.items() if file in files_}
+                  for variant, files_ in holding.items() if grading.owning(file) in files_}
     return units
-
-
-PREPARES = "prepares"
-"""The mark of a GPU test whose part's prepare runs it first, on the node's CPU (`gpu_prepared`)."""
-PREPARING = {"DEW_TIER_PREPARE": "1", "JAX_PLATFORMS": "cpu"}
-"""What a lane's prepare runs its files under: the word tests/conftest.py reads to skip every test but those
-marked `PREPARES`, each of which then prepares rather than runs (tests/model_flows.py), on the CPU alone."""
 
 
 def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, deadline: float) -> int:
     """A GPU lane's prepare, on its node's CPU before its files' GPU run (`gpu_lane`) and with no GPU drawn:
-    each of `tests` that holds a test marked `PREPARES` run once in a process of its own under `PREPARING`,
+    each of `tests` run once in a process of its own on the CPU alone, under the prepare's word
+    (tests/tier_wire.py's PREPARE, under which tests/conftest.py has each test prepare its check-1 sites'
+    truths and arms for the node's GPU rather than run, one that prepares none skipped) and its unit's name
+    (UNIT): every test of the part, so a site its run reaches never goes unprepared, and its run calls stored
+    executables and compiles nothing while it holds the GPU (Main, 2026-11-17: the day's GPU jobs left 2034
+    of 3238 held GPU-minutes idle, tracing and compiling on the host),
     at most `processes` at once, as its run will select and cut it (a group `<file>#G/N` holds in its prepare
     the tests it holds in its run: the same selection, the same weights, DEW_SPLIT_DURATIONS), so each such
     test computes what its run reads and must not compute while it holds the GPU, its float64 truths and
     its programs compiled for the GPU the node's topology names (DEW_NODE_TOPOLOGY), into the store its
     environment names (DEW_TIER_TRUTHS), which the run is given too. Their rows are written to `out` and
     nothing is recorded, no test having run to its end: a prepare that fails is said in its row, and its run
-    is red for what it lacks, never computing it on the GPU. A file with nothing to prepare starts no
-    process; a file's process under other flags (`lane_units`) prepares apart, under them, as it runs. First
+    is red for what it lacks, never computing it on the GPU. A file's process under other flags
+    (`lane_units`) prepares apart, under them, as it runs. First
     the pinned fixtures the tests read offline are fetched, as the run fetches them
     (tools/fetched_fixtures.py), so the run finds each whole and waits on no download with the GPU held.
     `deadline` is the whole prepare's: each process is given what is left of it as its turn comes, its own
     end's allowance kept back, so the prepare ends within it however many files and waves it holds, and a
     file it leaves no time is a red row of its own, never started (review: a deadline a process let five
     files outlast the job's own prepare bound, whose session then ended the job and every file's prepare
-    with it); its fetch and its collections are within it too."""
+    with it); its fetch and its collection are within it too."""
     began = time.monotonic()
 
     def left() -> float:
@@ -2044,9 +2052,7 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
     subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch"], check=True,
                    timeout=max(1.0, left()))
     units = lane_units(python, tests, max(1.0, left()))
-    holding = collected(python, PREPARES, sorted({file for file, _, _ in units.values()}), max(1.0, left()))
-    verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(units)
-                if units[name][0] in holding}
+    verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(units)}
     threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
 
     def prepared(name: str, verdict: Path) -> int:
@@ -2059,8 +2065,9 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
                 "output": "not prepared: its lane's prepare had no time left for it"}]}))
             return 0
         return tested(python, [file], group, verdict, mine, "off", session.GRACE, "",
-                      {**PREPARING, "OMP_NUM_THREADS": threads, **(VARIANTS[variant][1] if variant else {}),
-                       gpu_measures.UNIT: name}, recorded=False, variant=variant)
+                      {"JAX_PLATFORMS": "cpu", tier_wire().PREPARE: "1", "OMP_NUM_THREADS": threads,
+                       **(VARIANTS[variant][1] if variant else {}), tier_wire().UNIT: name},
+                      recorded=False, variant=variant)
 
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
         for done in [pool.submit(prepared, name, verdict) for name, verdict in verdicts.items()]:
@@ -2083,8 +2090,12 @@ def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str
 
     def needs(name: str) -> dict | None:
         file, group, variant = units[name]
-        return recorded(record_key(python, row(python, file, varied("" if cut else group, variant)), held),
-                        token)
+        found = recorded(record_key(python, row(python, file, varied("" if cut else group, variant)), held),
+                         token)
+        # A test node (`file::test`) no run measured holds no more than its file's process.
+        if found is None and (whole := grading.owning(file)) != file:
+            found = recorded(record_key(python, row(python, whole, varied("", variant)), held), token)
+        return found
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         records = dict(zip(units, pool.map(needs, units), strict=True))
@@ -2093,17 +2104,20 @@ def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str
     # file's process on this class measured, whole or a group of any cut. A whole run that measured nothing (a
     # child it did not follow, no report) stays the file's, which so takes the lane's whole share.
     if cut:
-        files = {file for file, _, _ in units.values()}
+        files = {grading.owning(file) for file, _, _ in units.values()}
+        # A test node's records (`file::test`) among its file's: the most any of its runs held.
         most = largest_records(python, token, under=f"{held}/", measures=lambda _, name, group: (
-            (name, place_variant(group)) if name in files else None))
+            (grading.owning(name), place_variant(group)) if grading.owning(name) in files else None))
         records = {name: found if found is not None and not gpu_measures.measured(found)
-                   else most.get((units[name][0], units[name][2]), found) for name, found in records.items()}
+                   else most.get((grading.owning(units[name][0]), units[name][2]), found)
+                   for name, found in records.items()}
     # A group no run on this class measured borrows the most its file held on another, which holds at least
     # its own; a file's process under other flags, its tests a part of the file's, the lane's own's first.
-    borrowed = borrowed_records(sorted({units[name][0] for name, found in records.items() if found is None}),
+    borrowed = borrowed_records(sorted({grading.owning(units[name][0]) for name, found in records.items()
+                                        if found is None}),
                                 python, held, token)
-    return {name: records[name] or records.get(f"{file}#{group}" if group else file) or borrowed.get(file)
-            for name, (file, group, _) in units.items()}
+    return {name: records[name] or records.get(f"{file}#{group}" if group else file)
+            or borrowed.get(grading.owning(file)) for name, (file, group, _) in units.items()}
 
 
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,
@@ -2159,7 +2173,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     tests = list(units)
 
     measures = lane_measures(python, units, held, token)
-    prepared = gpu_measures.prepared_needs(python, tests)  # Each no less than its prepared programs' need.
+    prepared = gpu_measures.prepared_needs(python, tests, tier_wire())  # No less than its programs' need.
     unheld = gpu_measures.unschedulable(prepared, budget, float(WHOLE_GPU) * total, held)  # Nor below it.
     tests = [name for name in tests if name not in unheld]
     needed = {name: gpu_needs(measures[name], budget, prepared.get(name, 0.0)) for name in tests}
@@ -2194,7 +2208,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                 del running[future]
     rows = [{**verdict, "output": f"{short[name]}\n{verdict.get('output', '')}"} if name in short else verdict
             for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
-    rows += [stale_row(python, file, varied(group, variant), unheld[name], "whole")
+    rows += [stale_row(python, file, varied(group, variant), unheld[name])
              for name, (file, group, variant) in units.items() if name in unheld]
     out.write_text(json.dumps({"rows": rows}))
     return 0
@@ -2263,7 +2277,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     its draws, so its map tasks are weighed by armada's measures of them, never by the record
     (`site_entries`), and a judge armada did not run is a row of its task's name."""
     rows = verdict_rows(verdict)
-    kept = {node: seconds for node, seconds in record.items() if Path(node.split("::")[0]).is_file()}
+    kept = {node: seconds for node, seconds in record.items() if Path(grading.owning(node)).is_file()}
     for name, held in rows.items():
         splits = {parsed_row(row_["name"])[2] for row_ in held}
         counts = {int(split_.split("/")[1]) for split_ in splits if split_}
@@ -2274,7 +2288,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
             kept.update(raised(kept, held, marked))
             continue
         observed = {node: seconds for row_ in held for node, seconds in row_["tests"].items()}
-        own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name
+        own = {node: seconds for node, seconds in kept.items() if grading.owning(node) == name
                and session.site_name(node, marked) not in marked}
         took = sum(row_["seconds"] for row_ in held)
         if cuts.stale(session, own, observed, took, max(counts, default=1), target):
@@ -2350,7 +2364,7 @@ def slow(verdict: dict, target: float, base: dict[str, float] | None = None) -> 
         for test, seconds in (row_.get("tests") or {}).items():
             if seconds <= most or (base is not None and test in base and not mapped):
                 continue
-            found.append({"test": test, "file": test.partition("::")[0], "seconds": round(seconds, 1),
+            found.append({"test": test, "file": grading.owning(test), "seconds": round(seconds, 1),
                           "target": most,
                           **({"map_task": row_["name"], "fix": "fewer units a task (per_task, "
                               "conditioning_per_task)"} if mapped else {})})
@@ -2416,8 +2430,8 @@ def main() -> int:
         stored = cuts.refolded(session, session.stored_cuts(), runs, target, cut_by, after)
         if stored != session.stored_cuts():
             session.CUTS.write_text(json.dumps(stored, indent=0, sort_keys=True) + "\n")
-        changed = sorted({node.split("::")[0] for node in before.keys() ^ recorded.keys()}
-                         | {node.split("::")[0] for node in before.keys() & recorded.keys()
+        changed = sorted({grading.owning(node) for node in before.keys() ^ recorded.keys()}
+                         | {grading.owning(node) for node in before.keys() & recorded.keys()
                             if before[node] != recorded[node]})
         print(f"{len(changed)} files refolded in {session.DURATIONS}: {' '.join(changed) or 'none'}")
         return 0

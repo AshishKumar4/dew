@@ -855,15 +855,12 @@ def test_a_reader_that_names_a_tokenizer_class_loads_it_through_the_one_loader(t
     own reads (`load_tokenizer(cls=)`, ledger 3013): a load of its own, apart from the loader's default
     fast class over the same files and shared by every reader that names the class, encoding a caption
     as transformers' `CLIPTokenizer` itself does."""
-    import tarfile
-
+    from interop_support import extract_fixture
     from transformers import CLIPTokenizer
 
     from dew.data.text import pin_tokenizer
 
-    with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
-        archive.extractall(tmp_path, members=[member for member in archive.getmembers()
-                                              if member.name.startswith("sd/tokenizer")], filter="data")
+    extract_fixture(FIXTURES / "tiny_diffusers.tar.xz", tmp_path, "sd/tokenizer")
     pinned = pin_tokenizer(str(tmp_path / "sd" / "tokenizer"))
     slow = pinned.transformers(cls="CLIPTokenizer")
     assert type(slow) is CLIPTokenizer and pinned.transformers(cls="CLIPTokenizer") is slow
@@ -926,13 +923,16 @@ def test_a_tokenizer_whose_model_type_transformers_dispatches_without_remote_cod
     assert load_tokenizer(str(released), local_files_only=True).encode(text) == expected
 
 
-def test_token_exports_under_one_name_are_read_together_only_where_its_files_are_the_same(tmp_path):
-    """A token export commits the identity its tokenizer resolved to, each file's digest among it, so two
-    exports under one tokenizer name are read together only where their ids mean the same: a local
-    tokenizer two of whose tokens exchange ids between exports, its size and EOS as they were, is refused,
-    and a second export by the unchanged files is read with the first."""
+def test_token_exports_are_read_together_only_where_their_tokenizer_is_one(tmp_path):
+    """A token export commits the identity its tokenizer resolved to, each file's digest and their
+    canonical form's among it (`tokenizer_revision`), so exports are read together only where their ids
+    mean the same: a local tokenizer two of whose tokens exchange ids between exports, its size and EOS as
+    they were, is refused; a second export by the unchanged files is read with the first, and so is one by
+    the tokenizer as a release holds it, written again by transformers (`HFTokenizer.save_pretrained`),
+    whose files' hashes differ. A store compared tokenizers by their hashes alone, so a run continued from
+    its release could not read its start's stores with its own (row 7425)."""
     from dew.data import Memory, concat
-    from dew.data.text import export_tokens
+    from dew.data.text import HFTokenizer, export_tokens
 
     released = tmp_path / "tokenizer"
     released.mkdir()
@@ -946,6 +946,13 @@ def test_token_exports_under_one_name_are_read_together_only_where_its_files_are
 
     first, again = exported("first"), exported("again")
     assert concat([first, again]).facts()["tokenizer"] == str(released)
+    release = tmp_path / "release"
+    HFTokenizer(str(released), local_files_only=True).save_pretrained(release)
+    export_tokens(Memory([{"text": "a b a"}]), str(tmp_path / "continued"), str(release), eos=False)
+    continued = TokenFiles(str(tmp_path / "continued"))
+    stated_files = [store.facts()["tokenizer_revision"]["files"] for store in (first, continued)]
+    assert stated_files[0] != stated_files[1]
+    assert concat([first, continued]).facts()["tokenizer"] == str(released)
     stated = json.loads((released / "tokenizer.json").read_text())
     vocabulary = stated["model"]["vocab"]
     vocabulary["a"], vocabulary["b"] = vocabulary["b"], vocabulary["a"]

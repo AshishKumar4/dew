@@ -36,8 +36,6 @@ import itertools
 import json
 import logging
 import os
-import subprocess
-import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -64,6 +62,7 @@ from dew._devices import (
     write_share,
 )
 from dew._files import write_atomically
+from dew._isolated import Isolated, IsolatedFailure
 from dew.telemetry.instrumentation import compiled_memory, hlo_instructions
 from dew.telemetry.trace import collective
 
@@ -256,18 +255,19 @@ def needs_of(gpus: int | None = None) -> Needs | None:
 
 
 def _child(configured: Mapping) -> Needs:
-    """The measurement a child process of this interpreter makes (`main`), its environment the parent's."""
+    """The measurement a process of its own makes (`measure`, `dew._isolated`), its environment the
+    parent's, its pool growing: its reply comes over a pipe of its own, so whatever it or NCCL prints (an
+    `NCCL_DEBUG` log on its stdout) reaches none of it, where a reply read from the child's stdout was
+    refused for any line printed after it (row 6497's 2xH100 start)."""
     began = time.perf_counter()
-    environment = {**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}
     # The child opens the GPUs this process's JAX selects (`local_gpus`), which JAX reads from no environment.
     selected = jax.config.read("jax_cuda_visible_devices")
-    done = subprocess.run([sys.executable, "-m", "dew.communicators", selected], capture_output=True,
-                          text=True, env=environment, check=False)
-    if done.returncode != 0:
-        raise RuntimeError(f"measuring NCCL's communicators on this host's GPUs failed (exit "
-                           f"{done.returncode}), so no pool share can be sized to leave them room:\n"
-                           f"{done.stderr[-4000:]}")
-    written = json.loads(done.stdout.strip().splitlines()[-1])
+    try:
+        with Isolated({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}) as child:
+            written = child.call(measure, selected)
+    except IsolatedFailure as failed:
+        raise RuntimeError(f"measuring NCCL's communicators on this host's GPUs failed ({failed}), so no "
+                           "pool share can be sized to leave them room") from failed
     return Needs.of({**written, "seconds": time.perf_counter() - began})
 
 
@@ -482,6 +482,29 @@ def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...],
     return Collectives.of(positions.to_json(), gpus)
 
 
+@dataclasses.dataclass(frozen=True)
+class LoadedProgram:
+    """A compiled program as this process loaded it (`loaded_program`): the devices it runs on and its
+    runtime's fingerprint, None where the runtime states none."""
+
+    devices: tuple
+    """The devices it runs on (JAX's `Device`s)."""
+    fingerprint: bytes | None
+
+
+def loaded_program(executable: jax.stages.Compiled) -> LoadedProgram | None:
+    """`executable`'s program as this process loaded it (its runtime a `LoadedExecutable`), None for one
+    compiled for devices it has not (`dew.nn.kernels.generation.compile_only_gpus`), which is never loaded
+    here: no devices, fingerprint or room of this process's. The one reading of it `admit`, a kept program
+    (`dew.training.ahead`) and a step's flops (`dew.training.rungs`) take."""
+    runtime = executable.runtime_executable()
+    if runtime is None or not isinstance(runtime, LoadedExecutable):
+        return None
+    fingerprint = runtime.fingerprint
+    return LoadedProgram(tuple(runtime.local_devices()),
+                         fingerprint if isinstance(fingerprint, bytes) else None)
+
+
 def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = gpu_free_bytes) -> None:
     """Admit a compiled or loaded program's communicators and code against the room the process's sizing left
     them and its GPUs have free outside XLA's pool now (`Resident`), refusing one that would not fit before it
@@ -490,16 +513,16 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
     host's room, as does a program on the host's CPU. Every program Dew compiles passes here
     (`dew.nn.kernels.templates.report`), the RL rollouts' among them (`dew.nn.kernels.options.OuterProgram`),
     and every executable it loads compiled ahead (`dew.training.ahead`)."""
-    runtime = executable.runtime_executable()
-    if _HELD is None or runtime is None or not isinstance(runtime, LoadedExecutable):
+    program = loaded_program(executable)
+    if _HELD is None or program is None:
         return
-    devices = runtime.local_devices()
+    devices = program.devices
     if not devices or any(device.platform != "gpu" for device in devices):
         # A program on the host's CPU makes no NCCL communicator and holds no GPU code.
         return
     gpus = assigned(devices)
-    fingerprint = runtime.fingerprint
-    if not isinstance(fingerprint, bytes):
+    fingerprint = program.fingerprint
+    if fingerprint is None:
         made = collectives_of(executable, gpus)
         loaded = None
     else:
@@ -558,8 +581,9 @@ def measured_connections(cliques: Iterable[Sequence[Run]]
     return bases, connections
 
 
-def main() -> None:
-    """The child's measurement: each GPU's free bytes before the runtime starts; then, for each group size
+def measure(selected: str) -> dict:
+    """The child's measurement (`_child`), over the GPUs `selected` names (JAX's own setting): each GPU's
+    free bytes before the runtime starts; then, for each group size
     that divides this host's GPUs (the first GPUs of that many), the bytes each GPU gave, less its pool's
     growth, as a collective's communicator is made over them (an all-gather's), as an all-to-all connects
     every peer beside it, each the most a member gave, and as a permute's communicator connects each
@@ -569,7 +593,7 @@ def main() -> None:
     import numpy as np
 
     # The GPUs its parent's JAX selects (`_child`), selected before the backend opens.
-    jax.config.update("jax_cuda_visible_devices", sys.argv[1] if len(sys.argv) > 1 else _pool.ALL_GPUS)
+    jax.config.update("jax_cuda_visible_devices", selected or _pool.ALL_GPUS)
     before = {index: gpu_free_bytes(index) or 0 for index in local_gpus() or ()}
     devices = jax.local_devices()
 
@@ -578,7 +602,7 @@ def main() -> None:
                                            int((device.memory_stats() or {}).get("pool_bytes", 0)))
                 for device in devices}
 
-    spent = dict.fromkeys(before, 0)
+    spent = dict.fromkeys((device.local_hardware_id for device in devices), 0)
 
     def taken(group: list, program: Callable) -> dict[int, int]:
         """The bytes each GPU of `group` gave as `program` first ran over it, kept in `spent` as well."""
@@ -629,11 +653,6 @@ def main() -> None:
                                jax.lax.conv(image, jnp.ones((8, 8, 3, 3), jnp.float32), (1, 1), "SAME")))
     after = held_now()
     # The runtime's share on each GPU: what went that neither the pool's growth nor a communicator took.
-    runtime = {gpu: before[gpu] - after[gpu][0] - after[gpu][1] - spent[gpu] for gpu in after}
-    sys.stdout.write(json.dumps({"collective": collective, "exchanged": exchanged, "permuted": permuted,
-                                 "connections": [[*pair, *gave] for pair, gave in connections.items()],
-                                 "runtime": runtime}) + "\n")
-
-
-if __name__ == "__main__":
-    main()
+    runtime = {gpu: before[gpu] - after[gpu][0] - after[gpu][1] - spent[gpu] for gpu in before}
+    return {"collective": collective, "exchanged": exchanged, "permuted": permuted,
+            "connections": [[*pair, *gave] for pair, gave in connections.items()], "runtime": runtime}

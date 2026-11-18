@@ -181,7 +181,7 @@ WITNESSED_ON = {"DecideSettings": {
     "lettered": ("layout.form", "layout.labels"),
     "merged": ("layout.unit",),
     "shared": ("layout.shared_state", "layout.siblings")},
-    "ImageSettings": {"diffusion": ("process", "solver", "guidance")}}
+    "ImageSettings": {"diffusion": ("process", "solver", "guidance"), "published": ("grid_process",)}}
 """The settings whose options are witnessed one an armada map task (`shards`), each on the run of `TASK_RUNS`
 that witnesses it, by its builder's name: a run's unset save and one option's alternatives a task, where the
 four DecideSettings runs witnessing in turn took 700 s on one core (row 2788). A decision run's head over a
@@ -283,12 +283,13 @@ def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_l
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.shards(units=3, per_task=1)
+@pytest.mark.shards(units=4, per_task=1)
 def test_each_option_an_image_task_is_built_with_reaches_it_from_the_command_line(tmp_path):
-    """ImageSettings' options witnessed one a map task (`witnessed_in_shards`; row 5773)."""
+    """ImageSettings' options witnessed one a map task (`witnessed_in_shards`; row 5773), its process's
+    provenance (`grid_process`) on a run over a published pipeline naming no preset, which holds it True."""
     from dew.inference.images import ImageSettings
 
-    witnessed_in_shards(ImageSettings, tmp_path, 3)
+    witnessed_in_shards(ImageSettings, tmp_path, 4)
 
 
 def assert_every_option_witnessed(settings: type, witnessed: list[tuple[list[str], dict[str, str], bool]]):

@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from fla_gdn_support import CONV_SHAPES, conv_training_cases, kda_training_cases
-from generation_support import COMPILES_FOR_TPU, generations, lowers
+from generation_support import COMPILES_FOR_TPU, COMPILES_ON_CPU, generations, lowers
 from jax.sharding import PartitionSpec
 from kernel_compile import Uncounted, compile_kernels, failures, gate_generations
 
@@ -157,6 +157,7 @@ def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_g
     assert not failures(found), "\n".join(failures(found))
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("target", gate_generations(scoped=True))
 def test_the_short_convs_kernels_compile_within_each_gpus_resources(target):
     """Each of the short conv's training cases (the recurrence template's conv, `templates.recurrence.conv`)
@@ -170,6 +171,7 @@ def test_the_short_convs_kernels_compile_within_each_gpus_resources(target):
 
 
 
+@COMPILES_ON_CPU
 @lowers("sm90")
 def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources():
     """The GEMM template's Mosaic GPU grouped matmul, lone and cooperative, compiled by Mosaic for a
@@ -198,6 +200,7 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
     assert not failed, "\n".join(failed)
 
 
+@COMPILES_ON_CPU
 @lowers("sm90")
 @pytest.mark.parametrize(("block_m", "block_n", "cluster"), [(128, 128, 1), (64, 128, 1), (128, 128, 2),
                                                           (64, 256, 2)])
@@ -746,6 +749,7 @@ def _by_form(names: tuple[str, ...], forms_of: Callable[[str], set[str]]) -> lis
             for param in generations(*names) for name in param.values for form in sorted(forms_of(name))]
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "form"), _by_form(gate_generations(stated=True), _gate_forms))
 def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, form):
     """Every distinct GEMM Mosaic GPU kernel of a form a generation runs at a real projection (`_gate_cases`),
@@ -818,6 +822,7 @@ def test_a_b200s_gathered_launch_certifies_its_tcgen05_tile_at_its_first_compile
     assert not certified[-1].refused
 
 
+@COMPILES_ON_CPU
 @lowers("sm100")
 @pytest.mark.parametrize("name", GATHERED_ON_A_B200)
 def test_a_b200s_gathered_launch_fits_its_derived_resources(name):
@@ -841,8 +846,8 @@ def test_a_refused_gathering_producer_offers_its_whole_ladder_and_its_refused_ti
     """The B200's gathered input gradient's derived tile, its producer at its ladder's top
     (`producers.started`), refused as a compile finding its kernel spilling refuses it
     (`report.refuse_launch`): its rungs (`_Mosaic.rungs`) are offered whole, each a lower producer above the
-    least, though no compile refused any of them, so certification asks them a round at a time
-    (`tuning.KernelOp._climbed`); the refused tile is no pin or stored pick (`pinnable`)."""
+    least, though no compile refused any of them, so certification asks them in turn, the first that holds
+    taken (`tuning.KernelOp._climbed`); the refused tile is no pin or stored pick (`pinnable`)."""
     launch, arguments = _gathered_on_a_b200("input gradient, its rows gathered")
     with report.refusals(), generation.assumed("sm100"):
         tile = launch.derived(arguments, generation.gpu_target())
@@ -875,6 +880,7 @@ def test_an_h100s_gathered_launch_certifies_its_tile_at_its_first_compile(name):
     assert not certified[-1].refused
 
 
+@COMPILES_ON_CPU
 def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():
     """The 4B's up projection's dense kernel gradient (24,576 rows of 2560 by 9216, fp32) on a compile-only
     B200 derives a tile legal for its call (a pair's among its candidates, `mosaic_sm100.PAIR`), and its
@@ -1048,6 +1054,7 @@ def _projected(local: bool):
     return step, (shaped((ROUTED_ROWS, ROUTED_DEPTH)), shaped((ROUTED_DEPTH, ROUTED_WIDTH)))
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("local", [True, False], ids=["per-shard", "partitioned"])
 def test_a_routes_launches_run_per_shard_with_only_their_planned_collectives(local):
     """A dense projection's forward and backward through the GEMM template, its rows split over two
@@ -1086,6 +1093,7 @@ def _gpt_oss_projected():
     return step, (shaped((512, 2880)), shaped((4, 2880, 2880)), jax.ShapeDtypeStruct((4,), jnp.int32))
 
 
+@COMPILES_ON_CPU
 @lowers("sm80")
 def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
     """An A100's GEMM, its forward and its gradients at the gate's tiles, issues each cp.async copy without a
@@ -1105,6 +1113,7 @@ def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
     assert not bounded, bounded[:4]
 
 
+@COMPILES_ON_CPU
 def test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it():
     """gpt-oss-120b's 2880-wide expert projection, forward and backward, the template named, compiled for a
     compile-only A100: its program launches the template's grouped product and kernel gradient, a product
@@ -1120,6 +1129,7 @@ def test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it():
     assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
 
 
+@COMPILES_ON_CPU
 def test_a_route_whose_launch_runs_no_trip_does_not_take_it():
     """A route's launches are those its run reaches: the template's grouped product named inside a loop of no
     trips lowers all the same, and its route evidence (`kernel_compile.Expected`) states no launch of it,
@@ -1160,6 +1170,7 @@ def _blockwise_projected():
                      f32((16, 4096)), f32((8, 16, 6)))
 
 
+@COMPILES_ON_CPU
 def test_an_hoppers_blockwise_fp8_product_runs_the_template_named_for_it():
     """A blockwise-scaled FP8 MoE projection, the template named, compiled for a compile-only H100: its
     program launches the template's grouped product, reading the experts' FP8 matrices whole
@@ -1187,6 +1198,7 @@ def _nvfp4_projected(rows: int, named: str | None):
     return product, (jax.ShapeDtypeStruct((rows, 4096), jnp.bfloat16),)
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize(("rows", "named"), [(64, "packed"), (16, None)], ids=["named", "decode-cell"])
 def test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel(rows, named):
     """An NVFP4 projection on a compile-only A100, its packed kernel named, or at a decode step's rows with no
@@ -1474,6 +1486,7 @@ def test_a_capabilitys_cells_read_their_own_records_from_a_process_of_their_own(
         kernel_compile.compiled_apart((9, 0), "e", 0)
 
 
+@COMPILES_ON_CPU
 def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
     spilling fails."""

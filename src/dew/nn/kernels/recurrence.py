@@ -25,7 +25,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from dew._hashing import fmix32
-from dew.algebra.scan import Reads
+from dew.algebra.scan import Reads, turned
+from dew.nn.activations import GATE_ACTIVATIONS, logistic, silu
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels import launches
 from dew.nn.precision import (
@@ -35,7 +36,6 @@ from dew.nn.precision import (
     l2norm,
     rms_statistics,
     rms_weighted,
-    silu,
     softplus,
     stochastic_bf16,
 )
@@ -102,10 +102,17 @@ class Hooks:
     one); a skip `D v`, and the epilogue; and `write_bound`, the largest write gate
     a layer declares of l2-normalized keys (its config's: 1 for a sigmoid's, 2 for twice a sigmoid's, the
     negative-eigenvalue delta rule's), which bounds the delta rule's chunk inverse (`inverse_bound`). The
-    readout reads the state after the token's update (`reads` 'after'), or the state entering it ('before',
-    RWKV6's, `o = q^T S`); `own_weight` adds the token's own write to it weighted a key dimension, `o += ((q
+    readout reads the state after the token's update (`reads` 'after'), the state entering it ('before',
+    RWKV6's, `o = q^T S`), or the state after the update less the token's own write ('apart', `o = (g
+    q)^T S`, mamba_ssm's Mamba-3, whose own write its caller weighs apart: its intra-chunk scores strictly
+    lower, the diagonal `gamma q . k` added apart "to prevent non-causal numerical leakage",
+    `mamba3_siso_fwd.py`); `own_weight` adds the token's own write to it weighted a key dimension, `o += ((q
     * own * beta k) . 1) v` (`own` `[Hv, Dk]`, RWKV6's bonus `u` read before the update), each alone a form
-    of any recurrence. The chunked op (`recurrence_chunk.chunk`) takes the same form."""
+    of any recurrence. The chunked op (`recurrence_chunk.chunk`) takes the same form. `turns`, where past
+    zero, turns the state's first `2 turns` key rows each token, `turns` adjacent pairs each multiplied as a
+    complex number by `e^{-i turn}` (`Gated.turn`) before the decay, a head's (Mamba-3's rotating basis; the
+    chunked op's every kernel reads it through frames, `templates.recurrence.turned`), unrated, without the
+    delta rule or an own write's weight."""
     conv: Conv | None = None
     l2norm: bool = False
     scale: float | None = None
@@ -119,6 +126,11 @@ class Hooks:
     write_bound: float | None = None
     reads: Reads = 'after'
     own_weight: bool = False
+    ranks: int = 1
+    """The op's tokens a token's writes take, its ranks laid in turn (mamba_ssm's Mamba-3 MIMO), whose
+    readout 'apart' reads none of them: its scores keep the pairs of later tokens alone (`i // R > j //
+    R`, `mamba3_mimo_fwd.py`)."""
+    turns: int = 0
 
     @property
     def inverse_bound(self) -> float | None:
@@ -137,14 +149,27 @@ class Hooks:
         return bound if bound is not None and bound <= 2.0 else None
 
     @property
+    def apart(self) -> int:
+        """The op tokens of a group whose writes a readout apart from them leaves out (`ranks`) that the
+        template forms (`mainloop.Call.apart`: a decay a head or none, no delta rule, no own weight), zero
+        where it reads the whole state or the portable math alone forms it."""
+        formed = self.reads == 'apart' and not self.own_weight and self.decay != 'vector' and not self.delta
+        return self.ranks if formed else 0
+
+    @property
     def gated_write(self) -> bool:
         """Whether the step reads a write gate `beta`."""
         return self.delta or self.write_gate or self.gates is not None or self.rated
 
     def __post_init__(self):
-        if self.reads not in ('after', 'before'):
-            raise ValueError(f"a readout reads the state 'after' its token's update or 'before' it, not "
-                             f"{self.reads!r}")
+        if self.reads not in ('after', 'before', 'apart'):
+            raise ValueError(f"a readout reads the state 'after' its token's update, 'before' it or 'apart' "
+                             f"from its own write, not {self.reads!r}")
+        if self.ranks < 1 or (self.ranks > 1 and (self.reads != 'apart' or self.delta)):
+            raise ValueError(f"a token's ranks are one or more, more only where its readout reads apart from "
+                             f"their writes without the delta rule (whose writes are corrected values a "
+                             f"group's read would take), not {self.ranks} reading {self.reads!r} with "
+                             f"delta={self.delta}")
         if self.own_weight and self.delta:
             raise ValueError("a readout weighs a token's own write without the delta rule: the delta rule's "
                              "write is its corrected value, which reads the state its readout does not")
@@ -154,6 +179,11 @@ class Hooks:
             raise ValueError('the gates form one log decay a head: their decay is scalar')
         if self.rated and (self.decay != 'scalar' or self.gates is not None):
             raise ValueError('a rated decay is one a head without the gates, which rate their own')
+        if self.turns < 0 or (self.turns and (self.delta or self.own_weight or self.rated
+                                              or self.decay != 'scalar')):
+            raise ValueError(f"a state turns its key pairs under a decay a head's, unrated, without the "
+                             f"delta rule or an own write's weight, a count of none or more: not "
+                             f"{self.turns} under {self}")
 
 
 def round_to_bf16(state, key, value):
@@ -176,7 +206,8 @@ def salted_bf16(state, key, value):
     return stochastic_bf16(state, fmix32(bits ^ salt))
 
 
-def update(state, query, key, value, decay, write, *, delta: bool, reads: Reads = 'after', own=None):
+def update(state, query, key, value, decay, write, *, delta: bool, reads: Reads = 'after', own=None,
+           turn=None):
     """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` its decay per key dimension `[...,
     Dk]` or a head's `[..., 1]` (`exp(g)`) and `write` the write gate `[..., 1]`, a head's one: its output
     `[..., Dv]` and the updated state `S' = g S + (beta k) c^T`, `c = v - (g k)^T S` the delta rule's
@@ -197,16 +228,22 @@ def update(state, query, key, value, decay, write, *, delta: bool, reads: Reads 
     largest at its prefix (4.4e38) where float64's sum was 3.0e38 (the decode step's contract near the
     largest, 128-wide heads).
     Read `reads` 'before', the output is the state entering the token's, `q^T S`, the decay and the write
-    after it; `own` `[..., Dk]`, where given, adds the token's own write to the output weighed a key
+    after it; 'apart', the state after the update less the token's own write, `(g q)^T S`; `own` `[...,
+    Dk]`, where given, adds the token's own write to the output weighed a key
     dimension, `(q * own)^T ((beta k) c^T)`, RWKV6's bonus (`Hooks.own_weight`), beside the query's whole
-    read of it where it reads the state after the update, as the chunked form adds it."""
+    read of it where it reads the state after the update, as the chunked form adds it. `turn` `[..., A]`,
+    where given, turns the state's first `A` key pairs by `e^{-i turn}` before its decay (`Hooks.turns`,
+    `scan.turned`), which a readout of the state entering the token reads none of."""
     def read(x, rows):
         return jnp.sum(x[..., :, None] * rows, axis=-2)
 
+    entering = state
+    if turn is not None:
+        state = turned(state, turn[..., None, :], axis=-2)
     corrected = value - read(key * decay, state) if delta else value
     outer = jnp.swapaxes(corrected[..., :, None] * (key * write)[..., None, :], -1, -2)
-    reading = query * decay if reads == 'after' else query
-    out = read(reading, state)
+    reading = query if reads == 'before' else query * decay
+    out = read(reading, entering if reads == 'before' else state)
     # Read after the update, the token's write is the query's; its own weight, where given, adds to it.
     if reads == 'after':
         out = out + read(query, outer)
@@ -230,18 +267,18 @@ def gated(gates: Gates, gate, log_a, bias, beta):
     sigmoid write gate the gated delta rule's (`_gated_decay`, `sigmoid(beta)`), with the step's
     Mamba2's (`-exp(log_a)` times the clipped step, and the step)."""
     if gates.write == 'sigmoid' and gates.limit is None:
-        return _gated_decay(gate, log_a, bias), jax.nn.sigmoid(beta)
+        return _gated_decay(gate, log_a, bias), logistic(beta)
     step = softplus(gate + bias)
     if gates.limit is not None:
         step = jnp.clip(step, *gates.limit)
-    return -accurate_exp(log_a) * step, step if gates.write == 'step' else jax.nn.sigmoid(beta)
+    return -accurate_exp(log_a) * step, step if gates.write == 'step' else logistic(beta)
 
 
 def gated_rms(out, z, weight, norm: OutputNorm):
     """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`, its
     inverse RMS the one statistic every norm takes (`rms_statistics`)."""
     inverse = rms_statistics(out, norm.epsilon)[1]
-    return rms_weighted(out, inverse, weight=weight, gate=z, activation=norm.activation)
+    return rms_weighted(out, inverse, weight=weight, gate=GATE_ACTIVATIONS[norm.activation](z))
 
 
 ROW = {"rows": True}
@@ -254,8 +291,9 @@ class Gated:
     """The operands the hooks read beside the queries, keys and values, a decode token's (`Step`) and a
     chunked sequence's (`recurrence_chunk.Chunk`) alike, each None where its hook is off: the log decay, the
     gates' pre-activations, the write gate, the skip's `D`, the epilogue's gate and weight, a rated decay's
-    rate, and the readout's weight of the token's own write (`Hooks.own_weight`). A value kind the hooks gain
-    is a field here, an entry a row where its metadata says so (`ROW`)."""
+    rate, the readout's weight of the token's own write (`Hooks.own_weight`), and the state's turn of its key
+    pairs (`Hooks.turns`, `[..., Hv, turns]`). A value kind the hooks gain is a field here, an entry a row
+    where its metadata says so (`ROW`)."""
     log_decay: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     gate: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     log_a: jax.Array | None = None
@@ -266,6 +304,7 @@ class Gated:
     weight: jax.Array | None = None
     rate: jax.Array | None = None
     own: jax.Array | None = None
+    turn: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
 
 
 @jax.tree_util.register_dataclass
@@ -316,7 +355,8 @@ def _names(hooks: Hooks) -> tuple[str, ...]:
         gates = ('rate', 'beta')
     else:
         gates = ('log_decay',) * (hooks.decay != 'none') + ('beta',) * hooks.gated_write
-    return (*streams, *gates, *('own',) * hooks.own_weight, *('skip',) * hooks.skip,
+    return (*streams, *gates, *('turn',) * bool(hooks.turns), *('own',) * hooks.own_weight,
+            *('skip',) * hooks.skip,
             *('z', 'weight') * (hooks.output is not None), 'state')
 
 
@@ -472,7 +512,7 @@ def _gates(hooks: Hooks, given: dict, work, key_width: int):
     if g is None:
         decay = jnp.ones((rows, heads, 1), work)
     else:
-        decay = jnp.exp(g)
+        decay = accurate_exp(g)
         decay = (decay[..., None] if hooks.decay == 'scalar'
                  else jnp.broadcast_to(decay, (rows, heads, key_width)))
     write = jnp.ones((rows, heads), work) if beta is None else beta
@@ -483,6 +523,9 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     """`(output [rows, Hv, Dv], history' or None, state')` of a decode token, in XLA: each piece of
     arithmetic in at least fp32 (float64 operands in float64), the state held as it came (bf16
     rounded by `round_to_bf16`), the output in `dtype` (the value's or the token's without it)."""
+    if hooks.ranks > 1:
+        raise NotImplementedError(f"a decode token of {hooks.ranks} ranks: a token's step takes one op "
+                                  "token, its ranks the caller's (Mamba-3's `step_mamba3`)")
     given = read(hooks, operands)
     state = given['state']
     operand = given['token' if hooks.conv is not None else 'value'].dtype
@@ -491,8 +534,9 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     query, key, value, history = _prologue(hooks, given, work)
     decay, write = _gates(hooks, given, work, key_width)
     own = given['own'].astype(work) if hooks.own_weight else None
+    turn = given['turn'].astype(work) if hooks.turns else None
     out, updated = update(state.astype(work), query, key, value, decay, write[..., None], delta=hooks.delta,
-                          reads=hooks.reads, own=own)
+                          reads=hooks.reads, own=own, turn=turn)
     out = normed(hooks, skipped(hooks, out, value, given, work), given, work)
     held = _held(updated, key, value, state.dtype)
     if operands.active is not None:
@@ -534,6 +578,9 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     `step_reference` (`generation.linear_tangent`), the launch having no derivative of its own: a token
     traced for `jax.jvp`, however a jit, a scan or a remat staged it, takes the reference's tangent and
     the launch's value (row 2395)."""
+    if hooks.ranks > 1:
+        raise NotImplementedError(f"a decode token of {hooks.ranks} ranks: a token's step takes one op "
+                                  "token, its ranks the caller's (Mamba-3's `step_mamba3`)")
     def portable(operands):
         return step_reference(hooks, operands, dtype=dtype)
 
@@ -550,7 +597,8 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
             {name: value for name, value in values.items() if name not in rows})
         return (dataclasses.replace(pulled_operands, **inputs, **formed),)
 
-    launched = functools.partial(_launched, hooks, dtype=dtype)
+    # The template's decode step turns no state (`Hooks.turns`): a turned token's launch is the reference.
+    launched = functools.partial(step_reference if hooks.turns else _launched, hooks, dtype=dtype)
     return contracted("test_the_decode_step_holds_every_order")(
         linear_tangent(lambda operands: (launched(operands), ()), pulled, portable,
                        kind=KernelGlue()))(operands)

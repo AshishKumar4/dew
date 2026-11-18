@@ -53,6 +53,7 @@ from dew.config.earlier import earlier_run
 from dew.config.release import Release
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.config.trainer import (
+    PASSES,
     SourceOptions as SourceOptions,
     SourceOptionsKeywords,
     TrainerConfig as TrainerConfig,
@@ -1230,9 +1231,12 @@ class RunConfig:
         if not set(self.val_every) <= set(splits):
             raise ValueError(f"val_every times {sorted(self.val_every)}, and the run validates "
                              f"{sorted(splits) or 'none'}")
+        # A split's cadence is read as the run's is (`TrainerConfig.interval`): its `epoch` and `passes` too.
+        every = {split: self.trainer.interval(value, dataset, f"--val-every {split}")
+                 for split, value in self.val_every.items()}
         return {split: EvalSuite(reader, tuple(metrics) if self.val_metrics is None else tuple(
                     self.metric(config) for config in self.val_metrics if config.split in (None, split)),
-                                 self.val_every.get(split))
+                                 every.get(split))
                 for split, reader in splits.items()}
 
     def chain(self) -> Dataset:
@@ -1261,7 +1265,16 @@ class RunConfig:
         return fitted(dataset, validation, objective=objective, seed=self.data_seed,
                       resume=trainer.data_resume,
                       examples=trainer.examples, epochs=trainer.epochs, steps=trainer.steps,
-                      tokens=trainer.tokens)
+                      tokens=trainer.tokens, count_passes=self.reads_passes())
+
+    def reads_passes(self) -> bool:
+        """Whether a cadence of the run reads its data's passes (`epoch`, or the default `passes`): its
+        evaluation's, its checkpoints' or a split's (`val_every`), which a run bounded otherwise than in
+        epochs or examples counts (`dew.data.compile`'s `count_passes`); a run whose cadences read none
+        compiles its data as it would without them."""
+        trainer = self.trainer
+        return any(value in ("epoch", PASSES) for value in (
+            trainer.eval_every, trainer.checkpoint_every, *self.val_every.values()))
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
@@ -1399,10 +1412,11 @@ class RunConfig:
         named = dataclasses.replace(self, trainer=dataclasses.replace(self.trainer, name=name))
         planned = named.resumed(("data_plan_version",))
         dataset, held = planned.compiled(objective.data(), dataset, validation)
-        # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
-        suites = planned.suites(dataset, held, metrics)
         sized, dataset, steps = planned.trainer.resolved(dataset)
         run = dataclasses.replace(planned, trainer=sized)
+        # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's, at its
+        # cadence read as the run's is: over the sized trainer and the loader its batch ramp reads.
+        suites = run.suites(dataset, held, metrics)
         if run.trainer.quantization is not None:
             quantize_trunk(objective, run.trainer.quantization)
         # The record names the run's directory, so its run.json trains the same run again.
@@ -1738,6 +1752,11 @@ class DecoderRunConfig(RunConfig):
     """Relax each later pass toward the block's input by a per-channel θ drawn
     at zero (`Loop.implicit`), so the looped decoder starts as the one loaded
     computes; False keeps a checkpoint's own choice."""
+    loop_theta_per_pass: bool = False
+    """Give each later pass of an implicit loop (`loop_implicit`, or a checkpoint's own) a θ of its own
+    (`Loop.theta_passes`), rows for the largest count the run takes (`loop_steps`, or a phase's largest,
+    else the checkpoint's own count), each drawn at zero, or each a checkpoint's one θ (`looping`); a loop
+    that is not implicit refuses it. False keeps a checkpoint's own choice."""
     loop_exit_gate: bool = False
     """Weigh each pass's exit by a gate drawn at zeros over its states (`Loop.exit_gate`), which the
     objective's `exit_entropy` trains as Ouro does, at `EXIT_ENTROPY` where the run states none
@@ -1773,7 +1792,7 @@ class DecoderRunConfig(RunConfig):
         """Whether the run asks anything of a loop (`looped`)."""
         return (self.loop_steps is not None or self.loop_layers is not None
                 or self.loop_backprop_steps is not None or self.loop_remat or self.loop_implicit
-                or self.loop_exit_gate or self.loop_exit_threshold is not None)
+                or self.loop_theta_per_pass or self.loop_exit_gate or self.loop_exit_threshold is not None)
 
     def exit_settings(self) -> dict[str, float]:
         """The exit objective's weight an objective that trains a gate the run draws (`loop_exit_gate`)
@@ -1797,33 +1816,74 @@ class DecoderRunConfig(RunConfig):
         """`start` with its block run as the run asks (`looping`), as loaded where it asks nothing."""
         if not self.loops:
             return start
+        from dew.nn.protocols import Looped
+
+        counts = self.loop_steps if isinstance(self.loop_steps, tuple) else (self.handed_passes,)
+        rows = max((count for count in counts if count is not None), default=None)
+        own = start.model.loop if isinstance(start.model, Looped) else None
+        if own is not None and own.theta_passes is not None:
+            # A checkpoint holding rows already keeps them: a count of fewer passes reads the first, and
+            # one of more is refused by its loop, no row held for its later passes.
+            rows = own.theta_passes
+        elif rows is None and own is not None:
+            # The checkpoint's own count, where the run keeps it.
+            rows = own.steps
         return looping(start, self.handed_passes, self.loop_layers, backprop_steps=self.loop_backprop_steps,
                        remat=self.loop_remat or None, implicit=self.loop_implicit or None,
                        exit_gate=self.loop_exit_gate or None, exit_threshold=self.loop_exit_threshold,
-                       key=self.trainer.key)
+                       theta_passes=rows if self.loop_theta_per_pass else None, key=self.trainer.key)
 
 
 def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | None, *,
             backprop_steps: int | None = None, remat: bool | None = None,
             implicit: bool | None = None, exit_gate: bool | None = None,
-            exit_threshold: float | None = None, key: int | jax.Array = 0) -> "Pretrained":
+            exit_threshold: float | None = None, theta_passes: int | None = None,
+            key: int | jax.Array = 0) -> "Pretrained":
     """A loaded checkpoint whose block runs `steps` passes: a looped one's own block, or `layers`,
     which gives a decoder with no loop one over its own layers. Refused where neither names a block,
     or a new block's passes are not stated. `backprop_steps` and `remat` choose
     the loop's backward memory, `implicit` its later passes' rule (`Loop.implicit`), and `exit_gate` and
-    `exit_threshold` its exits (`Loop.exit_gate`); None keeps a looped checkpoint's own value. A loop
+    `exit_threshold` its exits (`Loop.exit_gate`) and `theta_passes` its θ's rows (`Loop.theta_passes`),
+    each row a checkpoint's one θ where it held one, so the loop computes what the checkpoint's did, a
+    source held as shapes alone rowed as its shape; None keeps a looped checkpoint's own value. A loop
     that gives its layers parameters of their own (an implicit loop's θ, an exit gate) draws them from
     `key` beside the loaded weights, fresh (`Pretrained.with_model`)."""
     from dew.nn.protocols import Looping
 
     looped = (start.model.with_passes(steps, layers, backprop_steps=backprop_steps, remat=remat,
                                       implicit=implicit, exit_gate=exit_gate,
-                                      exit_threshold=exit_threshold)
+                                      exit_threshold=exit_threshold, theta_passes=theta_passes)
               if isinstance(start.model, Looping) else None)
     if looped is None:
         raise ValueError(f"this {type(start.model).__name__} has no loop: --loop-layers names the block of "
                          "its layers to repeat and --loop-steps how many times")
+    if theta_passes is not None:
+        start = dataclasses.replace(start, variables=_theta_rows(start.variables, theta_passes))
     return start.with_model(looped, key=key)
+
+
+def _theta_rows(variables, passes: int):
+    """`variables` with each implicit loop's one θ (`loop_theta` `[d]`) a row for each later pass of
+    `passes` (`[passes - 1, d]`), every row that θ, which computes what the one θ did (`Loop.theta_passes`);
+    a θ that holds rows already, as it is."""
+    import jax.numpy as jnp
+
+    def rowed(path, leaf):
+        named = isinstance(path[-1], jax.tree_util.DictKey) and path[-1].key == "loop_theta"
+        if not named or len(leaf.shape) != 1:
+            return leaf
+        shape = (passes - 1, *leaf.shape)
+        # A source held as shapes alone (`weights=False`, a resume's) rows its shape, its channels placed as
+        # its one θ's were and its rows whole.
+        if isinstance(leaf, jax.ShapeDtypeStruct):
+            placed = leaf.sharding
+            if isinstance(placed, jax.sharding.NamedSharding):
+                placed = jax.sharding.NamedSharding(placed.mesh,
+                                                    jax.sharding.PartitionSpec(None, *placed.spec))
+            return jax.ShapeDtypeStruct(shape, leaf.dtype, sharding=placed)
+        return jnp.broadcast_to(leaf, shape)
+
+    return jax.tree_util.tree_map_with_path(rowed, variables)
 
 
 __all__ = ["DecoderRunConfig", "MetricConfig", "ObjectiveConfig", "Prepared", "Release", "RunConfig",

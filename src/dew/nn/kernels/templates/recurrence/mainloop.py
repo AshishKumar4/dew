@@ -310,6 +310,12 @@ class Call:
     the keys' rows, as mamba_ssm's SSD does (`gated_keys`). The two part at fp32's edge: a key of 2^64 and a
     value of (145/128) 2^64 decayed by exp(-0.1268) write (16385/16384) 2^128 rounded on the key, past
     fp32's largest, and (255/256) 2^128 on the value (base review 3ee9253c9 F1)."""
+    apart: int = 0
+    """The tokens of a group whose readout reads the state after its update less the group's writes
+    (`recurrence.Hooks.reads` 'apart', a token's ranks `Hooks.ranks`, mamba_ssm's Mamba-3, whose caller
+    weighs them apart), zero where the readout reads the whole state: its scores and their gradient keep the
+    pairs of later groups alone (`algebra.chunk_scores`', `local_gradient`'s and `scores_gradient`'s
+    `apart`), a decay a head without the delta rule."""
     producers: resources.Producers = dataclasses.field(default_factory=resources.Producers)
     """Its tiles' (`Tiles.producers`)."""
     residents: resources.Residents = dataclasses.field(default_factory=resources.Residents)
@@ -2074,7 +2080,8 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
             tile = stream_tile(slots, "values", values, columns=pl.ds(role * bv, bv))
             # The chunk's own pairs' scores staged for its local product (`output_launch`'s first step's).
             scores = algebra.chunk_scores(queries.__getitem__, keyed.__getitem__, slices, gate, low,
-                                          held.dtype, Issuer(call), laid=laid, column_scale=column_scale)
+                                          held.dtype, Issuer(call), laid=laid, column_scale=column_scale,
+                                          apart=call.apart)
             operands.staged(family, scores, scored)
             corrected = _scan_corrected(call, slots, tile, bv, state, (gate, low), betas, issue)
             # The memory the chunk enters, in its registers, staged as the memories' form for its product.

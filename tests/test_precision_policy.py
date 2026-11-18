@@ -118,6 +118,47 @@ def test_an_fp32_call_stating_highest_multiplies_every_product_at_highest(implem
     assert precisions and not narrowed, narrowed
 
 
+@pytest.mark.parametrize("operand, stated, run, cublas", [
+    (jnp.float32, jax.lax.Precision.HIGHEST, None, True), (jnp.float32, None, "highest", True),
+    (jnp.float32, None, None, False), (jnp.bfloat16, jax.lax.Precision.HIGHEST, None, False),
+    (jnp.int8, None, None, True)],
+    ids=["an operation's fp32 at highest", "the run's fp32 at highest", "fp32 at the default",
+         "bf16 at highest", "int8"])
+def test_a_program_holding_an_ieee_fp32_dot_compiles_its_gemm_on_cublas(operand, stated, run, cublas,
+                                                                        monkeypatch):
+    """A program holding a dot XLA's Triton GEMM computes wrong on an A100 compiles it on cuBLAS
+    (`report.targeted` reads the program's own dots and its device's target, `report.triton_wrong`): fp32
+    operands at IEEE fp32 products, whose cuBLAS sum is nearer float64 (rows 5026/5028/5029: a Wan walk
+    1.59 times the reference's distance where 1.5 holds), one an operation states 'highest' in a run at
+    the default as one the run states; and an int8 product, which Triton computes as two or four times
+    it (openxla/xla#51016), whoever made it. At the default precision, or of bf16 operands, the dot stays
+    XLA's own, a Triton GEMM. Compiled through Dew's one compile for a compile-only
+    A100 (`report.xla_compiled`), its instructions read as XLA's schema states them."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.templates.report import xla_compiled
+    from dew.telemetry.instrumentation import custom_call_kind, hlo_instructions
+
+    monkeypatch.setenv("XLA_FLAGS", "")
+    mesh = Mesh(np.array(compile_only_gpus("sm80", 1, 80 * 2**30)), ("data",))
+    placed = NamedSharding(mesh, PartitionSpec())
+
+    def product(x, w):
+        return jnp.dot(x, w, precision=stated,
+                       preferred_element_type=jnp.int32 if operand == jnp.int8 else None)
+
+    shapes = [jax.ShapeDtypeStruct(shape, operand, sharding=placed) for shape in ((256, 512), (512, 384))]
+    with jax.default_matmul_precision(run):
+        lowered = jax.jit(product).trace(*shapes).lower()
+    instructions = hlo_instructions(xla_compiled(lowered, None)).values()
+    # No dot left to XLA's own fusions (a Triton GEMM), the product a GEMM library call, whichever of
+    # cuBLAS's the device's compile takes (`custom_call_kind`).
+    own = [each.op for each in instructions if each.op == "dot" or "dot" in each.fused]
+    library = [each.target for each in instructions if custom_call_kind(each.target) == "gemm"]
+    assert (bool(library) and not own) == cublas, (library, own)
+
+
 @pytest.mark.parametrize("scope", ["plain", "forward mode"])
 def test_an_fp32_call_stating_highest_takes_its_forward_derivative_on_jax_nn_s_xla_attention(scope):
     """jax.nn's xla attention is JAX's own products, which forward mode differentiates as written: an fp32
@@ -927,13 +968,14 @@ def test_dews_own_transcendentals_are_as_exact_as_jaxs_across_their_range(name, 
     to large positive and near zero, their input in fp32 and bf16 (check 1)."""
     from contract_support import on_a_tpu
 
-    from dew.nn import precision
+    from dew.nn import activations, precision
 
     def draw(seed):
         x = np.random.default_rng(seed).uniform(*span, 4096).astype(np.float32)
         return (jnp.asarray(x, dtype),)
 
-    ours, theirs = {"softplus": (precision.softplus, jax.nn.softplus), "silu": (precision.silu, jax.nn.silu),
+    ours, theirs = {"softplus": (precision.softplus, jax.nn.softplus),
+                    "silu": (activations.silu, jax.nn.silu),
                     "exp": (on_a_tpu(precision.accurate_exp), jnp.exp),
                     "exp2": (on_a_tpu(functools.partial(precision.accurate_exp, base2=True)), jnp.exp2)}[name]
     for part, mine, jaxs in (("value", ours, theirs),
@@ -1161,3 +1203,77 @@ def test_an_aligned_sum_along_an_axis_sums_each_rows_terms():
     third = np.broadcast_to((2.0 ** (70 + rows)).astype(np.float32)[:, None], (6, 2))
     found = aligned_sum([(jnp.asarray(first), jnp.asarray(second), jnp.asarray(third))], axis=1)
     np.testing.assert_array_equal(np.asarray(found)[:, 0], 2.0 ** (120 + rows))
+
+
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+def test_a_gated_norms_gate_gradient_is_a_number_where_its_exp_overflows(activation):
+    """A gated norm's gate on JAX's derivative (the portable path, `norms.gated_rms_normalized`) at gates of
+    -100 and -1000, where `e^-gate` overflows fp32: every gradient a number, as the one logistic's declared
+    tangent gives it (`activations.GATE_ACTIVATIONS`), where JAX's derivative of the logistic's arithmetic
+    made the gate's zero times infinity. Its values are the gated norm's own check 1's
+    (tests/test_norm_swiglu.py)."""
+    from dew.nn.norms import gated_rms_normalized
+
+    x = jnp.asarray(np.random.default_rng(7609).standard_normal((2, 8)), jnp.float32)
+    gate = jnp.asarray([[-100.0, -1000.0, -3.0, 0.5, 17.0, -100.0, 2.0, -50.0]] * 2, jnp.float32)
+    scale = jnp.ones((8,), jnp.float32)
+
+    def loss(x, gate):
+        return jnp.sum(gated_rms_normalized(x, gate, scale, 1e-6, x.dtype, activation, implementation="xla"))
+
+    grads = jax.grad(loss, argnums=(0, 1))(x, gate)
+    assert all(np.all(np.isfinite(np.asarray(grad))) for grad in grads)
+
+
+@pytest.mark.parametrize("gate", [17.0, 20.0, -17.0])
+def test_a_kernels_logistic_slope_is_the_declared_tangents_past_its_value_rounding_to_one(gate):
+    """A kernel's slope of the one logistic (`precision.activation_and_slope`, the recurrence conv's
+    backward) is the declared tangent's, `s(x) s(-x)` (`activations.logistic`'s, as JAX differentiates it),
+    bit for bit, and a number past zero at an fp32 gate of 17, where `s(x)` rounds to one and `s (1 - s)`
+    made the slope zero; silu's is `s + g s(x) s(-x)`, the product rule over it. Their values against
+    float64 are the logistic's contract's (`test_silu_holds_every_order`)."""
+    from dew.nn.activations import logistic
+    from dew.nn.precision import activation_and_slope, logistic_value
+
+    value = jnp.asarray([gate], jnp.float32)
+    declared = jax.grad(lambda g: logistic(g)[0])(value)
+    _, slope = activation_and_slope(value, "sigmoid")
+    np.testing.assert_array_equal(np.asarray(slope), np.asarray(declared))
+    product = logistic_value(value) * logistic_value(-value)
+    np.testing.assert_array_equal(np.asarray(slope), np.asarray(product))
+    assert float(slope[0]) > 0
+    _, silu_slope = activation_and_slope(value, "silu")
+    np.testing.assert_array_equal(np.asarray(silu_slope), np.asarray(logistic_value(value) + value * slope))
+
+
+def _ones(digits: int, exponent: int) -> float:
+    """A float of `digits` significant bits all ones, times `2^exponent`."""
+    return (2 ** digits - 1) / 2 ** (digits - 1) * 2.0 ** exponent
+
+
+@pytest.mark.parametrize(("dtype", "left", "right"), [
+    (jnp.float32, _ones(24, 60), _ones(24, 59) - 2.0 ** (59 - 22)),
+    (jnp.float64, _ones(53, 500), _ones(53, 499) - 2.0 ** (499 - 51)),
+    (jnp.float64, _ones(53, 1023), _ones(53, -1) - 2.0 ** (-1 - 51)),
+    (jnp.float16, _ones(11, 15), _ones(11, -1) - 2.0 ** (-1 - 9)),
+    (jnp.bfloat16, _ones(8, 60), _ones(8, 59) - 2.0 ** (59 - 6)),
+    (jnp.float64, _ones(53, 511), _ones(53, 511)),
+    (jnp.float16, _ones(11, 7), _ones(11, 7)),
+], ids=["fp32 edge", "float64 edge", "float64 top", "float16 top", "bfloat16 edge", "float64 top product",
+        "float16 top product"])
+def test_an_exact_product_at_a_dtypes_edge_keeps_its_residual(dtype, left, right):
+    """`precision.two_product`'s range-safe split (`bit_split`) at the top of each dtype's range, its
+    operands' significands all ones (and two less): their product and its residual sum to the exact
+    rational product, a product in the top binade's too.
+    A Veltkamp split multiplies by `2^(p/2) + 1` first and overflows to NaN (past 2^115 in fp32, 2^996 in
+    float64; base reviews 9bc4326dd F1, 1fe546a10 F1); an odd significand's truncated cut left its low parts'
+    product past `p` bits, rounded (float64's 27 and 26 bits; the precision owner's review); the top binade's
+    rounded cut carried past the largest float, and two cuts rounded up a product in it ((2 - 2^-52)
+    2^511 squared, 255.875 squared in float16: train 1018's review F1)."""
+    from dew.nn.precision import two_product
+
+    with jax.enable_x64(new_val=dtype == jnp.float64):
+        a, b = jnp.asarray(left, dtype), jnp.asarray(right, dtype)
+        product, residual = two_product(a, b, bit_split=True)
+        exact = Fraction(float(a)) * Fraction(float(b))
+        assert Fraction(float(product)) + Fraction(float(residual)) == exact

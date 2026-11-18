@@ -621,8 +621,11 @@ class Aux(Generic[Effects]):
     """The `qk` collection the attention layers sowed, which the optimizer's QK-Clip reads.
 
     It is nested by module path. Each attention layer holds `max_logits`, a
-    one-tuple of an fp32 `[rows, heads]` array of per-head logit maxima, and
-    an MLA layer also holds `qk_nope`, an int scalar giving its nope width.
+    tuple of an fp32 `[rows, heads]` array of per-head logit maxima for each
+    call of the layer, one but where a model runs it again (a looped layer's
+    passes, a head read at each exit: `dew.batch.sown_calls`), which the clip
+    reads at their largest; an MLA layer also holds `qk_nope`, an int scalar
+    giving its nope width, a call each alike.
     Rows are the batch's rows, with microbatches concatenated under a
     pipeline. It is None where the step asked for none (`Step.qk_stats`),
     and empty where it asked and no layer sowed any; a run whose optimizer
@@ -1212,10 +1215,12 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def towers(self) -> tuple[Held, ...]:
         """Every network this objective's programs run, whose quantization the options they compile
-        with read (`dew.nn.kernels.options.compiler_options`): the modules `program_key` names, and
-        an objective whose steps also call frozen towers (a condition's encoder, an autoencoder)
-        adds them."""
-        return tuple(entry.module for entry in self.program_key())
+        with read (`dew.nn.kernels.options.compiler_options`): the modules `program_key` names and its
+        inputs' condition encoders (`InputSpec.encoders`: a diffusion run's text towers, a decision
+        run's configured context encoder), and an objective whose steps call further towers (an
+        autoencoder) adds them."""
+        encoders = () if self.inputs is None else tuple(encoder for _, encoder in self.inputs.encoders)
+        return (*(entry.module for entry in self.program_key()), *encoders)
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         """Replace the modules `program_key` names, one per entry in its order."""
@@ -1444,7 +1449,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             self._program_cache = cached
         from dew.nn.sharding import trace_context
         # The options follow where the program runs (`compiler_options`), so they key it too.
-        options = {**compiler_options(*self.towers(), *modules), **(step or {})}
+        options = {**compiler_options(), **(step or {})}
         key = (name, trace_context(), tuple(sorted(options.items())))
         held = cached[1].get(key)
         kept = (*holds, *modules)

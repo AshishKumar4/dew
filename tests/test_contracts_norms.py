@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from contract_support import EDGES, OWN_FORWARD_ORDERS, REVERSE_ONLY, assert_contract, normal_draw, on_a_tpu
 
-from dew.nn import ngpt, precision
+from dew.nn import activations, ngpt, precision
 from dew.nn.activations import exact_gelu, gated_product
 
 
@@ -37,12 +37,13 @@ def test_an_exact_gelu_holds_every_order(edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_silu_holds_every_order(edge):
-    """`precision.silu` (`x / (1 + e^-x)`, its exp the most accurate and a true division, its tangent
-    declared, row 7062): every order finite wherever float64 is a normal float32 and JAX's silu is."""
+    """`activations.silu` (`x / (1 + e^-x)`, Dew's one logistic: its exp accurate and a true division, its
+    tangent declared, row 7062): every order finite wherever float64 is a normal float32 and JAX's silu
+    is."""
     (x,) = normal_draw(2671, (4, 7), scale=EDGES[edge])
     (direction,) = normal_draw(2672, x.shape, scale=EDGES[edge])
     (cotangent,) = normal_draw(2673, x.shape)
-    assert_contract(precision.silu, (x,), (direction,), cotangent, f"silu {edge}",
+    assert_contract(activations.silu, (x,), (direction,), cotangent, f"silu {edge}",
                     truth_fn=jax.nn.silu, plain_fn=jax.nn.silu)
 
 

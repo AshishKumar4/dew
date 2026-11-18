@@ -181,31 +181,33 @@ def rms_statistics(x: jax.Array, epsilon: float, *, axis=-1, keepdims: bool = Tr
 
 
 def activation_and_slope(gate, activation: str) -> tuple[jax.Array, jax.Array]:
-    """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid'.
+    """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid', its sigmoid and its slope the
+    one logistic's arithmetic (`logistic_and_slope`), as a kernel's body takes them; a gate differentiated by
+    JAX takes Dew's one logistic itself (`activations.gate_activation`), whose tangent is declared.
 
-    silu's derivative `s + g s (1 - s)`, with `s = sigmoid(g)`, cancels to
-    zero near g = -1.28; formed as the product rule forms it, `s + g (s (1 - s))`,
-    its worst element there is half `(g s)(1 - s) + s`'s, as XLA's is."""
-    sigmoid = jax.nn.sigmoid(gate)
-    slope = sigmoid * (1.0 - sigmoid)
+    silu's derivative `s + g s s(-g)`, with `s = sigmoid(g)`, cancels to
+    zero near g = -1.28; formed as the product rule forms it, `s + g (s s(-g))`,
+    its worst element there is half `(g s) s(-g) + s`'s, as XLA's is."""
+    sigmoid, slope = logistic_and_slope(gate)
     if activation == 'sigmoid':
         return sigmoid, slope
     return gate * sigmoid, sigmoid + gate * slope
 
 
 def rms_weighted(x: jax.Array, inverse: jax.Array, *, weight: jax.Array | None = None,
-                 gate: jax.Array | None = None, activation: str = 'silu',
+                 gate: jax.Array | None = None,
                  rounded: Callable[[jax.Array], jax.Array] | None = None, weight_first: bool = False
                  ) -> jax.Array:
-    """An RMS norm's arithmetic past its statistics: `x` times its rows' `inverse` RMS (`rms_statistics`'s,
-    or a kernel's own), times `weight`, times `activation(gate)` (`activation_and_slope`: Qwen3-Next's gated
-    norm), in that order and in `x`'s dtype, which the caller widens (at least fp32) and rounds once after;
-    with `weight_first`, the weight folded into the inverse before the rows (Flax's `nn.RMSNorm`,
-    `x * (inverse * weight)`). `rounded` rounds the normalized rows, before any weight multiplies them
-    (Llama's and Qwen3's cast first, `RMSNorm.scale_after_cast`; a norm computing in its input's dtype),
-    which a weight folded first has none of. The fused norm kernel, the recurrence's gated output norm, the
-    portable norm and the portable gated norm compute it alike, each keeping its own statistics, memory
-    schedule and derivative."""
+    """An RMS norm's arithmetic past its statistics: `x` times its rows' `inverse` RMS (`rms_statistics`'s, or
+    a kernel's own), times `weight`, times the activated `gate` (Qwen3-Next's gated norm: a kernel's body
+    activates it by `activation_and_slope`, a gate JAX differentiates by `activations.GATE_ACTIVATIONS`),
+    in that order and in `x`'s dtype, which the caller widens (at least fp32) and rounds once after; with
+    `weight_first`, the weight folded into the inverse before the rows (Flax's `nn.RMSNorm`,
+    `x * (inverse * weight)`). `rounded` rounds the normalized rows, before any weight
+    multiplies them (Llama's and Qwen3's cast first, `RMSNorm.scale_after_cast`; a norm computing in its
+    input's dtype), which a weight folded first has none of. The fused norm kernel, the recurrence's gated
+    output norm, the portable norm and the portable gated norm compute it alike, each keeping its own
+    statistics, memory schedule and derivative."""
     if weight is not None and weight_first:
         if rounded is not None:
             raise ValueError("a weight folded into the inverse leaves no normalized rows to round first")
@@ -214,7 +216,7 @@ def rms_weighted(x: jax.Array, inverse: jax.Array, *, weight: jax.Array | None =
         y = x * inverse if rounded is None else rounded(x * inverse)
         if weight is not None:
             y = y * weight
-    return y if gate is None else y * activation_and_slope(gate, activation)[0]
+    return y if gate is None else y * gate
 
 
 def weighted_total(x: jax.Array, weights: jax.Array, axis=None) -> tuple[jax.Array, jax.Array]:
@@ -398,7 +400,12 @@ def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
 FP32_PRODUCTS = frozenset({"HIGHEST", "F32_F32_F32"})
 """The precision names that declare fp32 operands' products in IEEE fp32 (`precision_names`): `highest` and
 the F32_F32_F32 preset, which `jax_default_matmul_precision` spells 'highest', 'float32' or the preset's
-name."""
+name. On a GPU a program holding such a dot compiles its GEMMs on cuBLAS
+(`dew.nn.kernels.templates.report.targeted`, reading the program's own dots, an operation's precision as
+a run's), whose sum is the one a float32 reference is computed with: XLA's Triton GEMM sums farther from
+float64 (rows 5026/5028/5029). That is the price of 'highest' meeting its reference, a wrong result
+weighed against a slower one: a decode-sized float32 forward is slower on cuBLAS, a training step and a long
+forward are not (M-IG-13's A100 and GH200 measures)."""
 
 
 def declares_fp32_products(precision: jax.lax.PrecisionLike) -> bool:
@@ -502,34 +509,21 @@ def accurate_exp(x, *, base2: bool = False) -> jax.Array:
     return _exp(base2, x.astype(jnp.float32)).astype(x.dtype)
 
 
-def _logistic(x) -> jax.Array:
+def logistic_value(x) -> jax.Array:
+    """`1 / (1 + e^-x)` in at least float32, its exp accurate (`accurate_exp`) and a true division: the one
+    logistic's arithmetic, which `activations.logistic` declares its tangent over and a kernel's body, which
+    differentiates nothing, calls as it is (`activation_and_slope`, the recurrence step's and conv's). JAX's
+    derivative of it is no number where `e^-x` overflows (below x near -88 in fp32): what JAX differentiates
+    takes `activations.logistic`."""
     work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
     return 1.0 / (1.0 + accurate_exp(-work))
 
 
-def _logistic_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
-    """`logistic`'s value and tangent `s (1 - s)`, each order finite where `e^-x` overflows (`s` zero)."""
-    (x,), (tangent,) = primals, tangents
-    s = logistic(x)
-    return s, s * (1.0 - s) * tangent.astype(s.dtype)
-
-
-logistic = contracted("test_silu_holds_every_order")(declared_tangent(Protected(), _logistic, _logistic_jvp))
-"""`1 / (1 + e^-x)` in at least float32, its exp accurate (`accurate_exp`) and a true division: a backend's
-logistic is no part of it (`silu`'s)."""
-
-
-def silu(x) -> jax.Array:
-    """`x / (1 + e^-x)` as `x` times its `logistic` (its exp accurate and a true division), in at least
-    float32 and rounded once, its derivative through the logistic's declared tangent: a backend's logistic is
-    no part of it, a v5e's approximate even at HIGHEST, which held Mamba-2's layer at 3.5 times its CPU
-    float32 through its conv's and its gate's silus, where this holds it at 0.89 times, its training step
-    unchanged (row 7062, M-JS-136). A gated MLP's silu stays JAX's (`activations.silu`): on a v5e this one
-    took a SwiGLU MLP's bf16 training step 2.1% longer, where JAX's held its fp32 output within its CPU
-    float32's distance from float64 (4.9e-7 against 1.05e-6); on a GH200 the two are the same (M-JS-137)."""
-    given = jnp.asarray(x)
-    x = given.astype(at_least_fp32(given.dtype))
-    return (x * logistic(x)).astype(given.dtype)
+def logistic_and_slope(x) -> tuple[jax.Array, jax.Array]:
+    """The one logistic's value `s(x)` and derivative `s(x) s(-x)` (`logistic_value`), as a kernel's body
+    differentiates it by hand, `activations.logistic`'s declared tangent alike: `s (1 - s)` reads the rounded
+    `s(x)`, one past x near 17 in fp32, its derivative then zero where float64's is 4.1e-8."""
+    return logistic_value(x), logistic_value(x) * logistic_value(-jnp.asarray(x))
 
 
 def softplus_series(x) -> jax.Array:
@@ -541,7 +535,8 @@ def softplus_series(x) -> jax.Array:
     normal wherever `y` is, the series in `s^2` alone: `s` itself, half of `y` near fp32's least normal
     (`x` near -87), is subnormal, which a target flushing them (a TPU's, a GPU's) made zero, and the softplus
     with it, where `y` is the answer; `s^2` underflowing leaves the series its first term, one. Formed in at
-    least float32 and rounded once to `x`'s dtype; its derivative the logistic, as JAX's."""
+    least float32 and rounded once to `x`'s dtype; its derivative Dew's one logistic
+    (`activations.logistic`)."""
     given = jnp.asarray(x)
     x = given.astype(at_least_fp32(given.dtype))
     y = accurate_exp(-jnp.abs(x))
@@ -564,11 +559,13 @@ def _series_terms(dtype) -> int:
 
 
 def _softplus_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
-    """`softplus`'s value and tangent: its derivative the logistic, as JAX's softplus's, in at least float32
-    and rounded once to its input's dtype."""
+    """`softplus`'s value and tangent: its derivative Dew's one logistic (`activations.logistic`), in at
+    least float32 and rounded once to its input's dtype."""
+    from dew.nn.activations import logistic
+
     (x,), (tangent,) = primals, tangents
     work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
-    return softplus(x), (jax.nn.sigmoid(work) * tangent.astype(work.dtype)).astype(tangent.dtype)
+    return softplus(x), (logistic(work) * tangent.astype(work.dtype)).astype(tangent.dtype)
 
 
 softplus = contracted("test_softplus_holds_every_order")(
@@ -1371,14 +1368,34 @@ def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
     return jnp.where(biased == 0xFF, x.astype(jnp.float32), rounded)
 
 
+def _split_bits(dtype) -> tuple[type, int, int]:
+    """A float's significand split for `two_product`'s `bit_split`: its unsigned bits' type, the mask keeping
+    its high part and the low bits masked, `p - floor(p / 2)` of its `p`, so its high part holds
+    `floor(p / 2)` bits. An even `p`'s truncated remainder holds the other half (fp32's 12, bfloat16's 4); an
+    odd `p`'s would hold one bit more (float64's 27, float16's 6), its low parts' product past `p` bits, so
+    the cut rounds to nearest there (`_odd`), its remainder signed and at most half the high part's last
+    bit: every product of two parts exact (Dekker's)."""
+    limits = jnp.finfo(dtype)
+    unsigned = np.dtype(f'uint{limits.bits}').type
+    low = (limits.nmant + 2) // 2
+    return unsigned, ~((1 << low) - 1) & np.iinfo(unsigned).max, low
+
+
+def _odd(dtype) -> bool:
+    """Whether a float's significand holds an odd count of bits (`_split_bits`' rounded cut)."""
+    return (jnp.finfo(dtype).nmant + 1) % 2 == 1
+
+
 @_protected
 def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
                 rounding: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
     """Dekker's rounded product and its residual, with a Veltkamp significand split.
 
-    Guidance keeps the multiply split, which also supports float64. `bit_split`
-    truncates fp32 significands instead, avoiding splitter overflow in norm
-    interpretation and quantizer division; near underflow the splits differ.
+    Guidance keeps the multiply split. `bit_split` truncates the significands
+    instead (`_split_bits`: a float's low half of its bits masked, fp32's 12,
+    float64's 27, a 16-bit float's), with no splitter to overflow: the multiply
+    split's `2^(p/2) + 1` overflowed past 2^115 in fp32 and 2^996 in float64
+    (base reviews 9bc4326dd F1, 1fe546a10 F1); near underflow the splits differ.
     `subtract` keeps division's subtractive residual order and its signed zeros.
     Norm interpretation passes `optimization_barrier` as `rounding` to keep each
     product and residual step separate; the other callers allow fusion.
@@ -1392,17 +1409,36 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         if bit_split and isinstance(value, np.generic | np.ndarray):
             # A constant (a kernel's static factor) splits where it is known, on the host.
             constant = np.asarray(value, np.float32)
-            high = (constant.view(np.uint32) & np.uint32(0xfffff000)).view(np.float32)
+            unsigned, mask, _ = _split_bits(np.float32)
+            high = (constant.view(unsigned) & unsigned(mask)).view(np.float32)
             return jnp.asarray(high), jnp.asarray(constant - high)
         if bit_split:
-            bits = jax.lax.bitcast_convert_type(value, jnp.uint32) & jnp.uint32(0xfffff000)
-            high = jax.lax.bitcast_convert_type(bits, jnp.float32)
+            unsigned, mask, low = _split_bits(value.dtype)
+            mask = np.array(mask, unsigned)
+            bits = jax.lax.bitcast_convert_type(value, unsigned)
+            if _odd(value.dtype):
+                # Half the cut's last bit added to the magnitude's bits: the cut rounds to nearest.
+                bits = bits + np.array(1 << (low - 1), unsigned)
+            high = jax.lax.bitcast_convert_type(bits & mask, value.dtype)
         else:
             splitter = (1 << 27) + 1 if value.dtype == jnp.float64 else (1 << 12) + 1
             scaled = value * splitter
             high = scaled - (scaled - value)
         return high, rounded(value - high)
 
+    scale = None
+    if bit_split and _odd(jnp.result_type(left, right)):
+        # A rounded cut of the top binade's last values carries past the largest float, and two cuts
+        # rounded up carry a product in the top binade past it ((2 - 2^-52) 2^511 squared, the head inf):
+        # such an operand, and the larger of such a product's, is halved first, its product and residual
+        # doubled back after (each exact, a power of two; train 1018's review F1).
+        top = 2.0 ** (jnp.finfo(jnp.result_type(left, right)).maxexp - 1)
+        large = jnp.abs(left * right) >= top
+        larger = jnp.abs(left) >= jnp.abs(right)
+        halves = [(jnp.abs(left) >= top) | (large & larger), (jnp.abs(right) >= top) | (large & ~larger)]
+        left, right = (jnp.where(half, operand * 0.5, operand)
+                       for operand, half in zip((left, right), halves, strict=True))
+        scale = jnp.where(halves[0], 2.0, 1.0) * jnp.where(halves[1], 2.0, 1.0)
     lh, ll = split(left)
     rh, rl = split(right)
     product = rounded(left * right)
@@ -1413,7 +1449,8 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         term = rounded(first * second)
         lost = rounded(lost - term if subtract else lost + term)
     tail = rounded(ll * rl)
-    return product, rounded(tail - lost if subtract else lost + tail)
+    residual = rounded(tail - lost if subtract else lost + tail)
+    return (product, residual) if scale is None else (product * scale, residual * scale)
 
 
 def _correctly_rounded_divide(numerator: jax.typing.ArrayLike,

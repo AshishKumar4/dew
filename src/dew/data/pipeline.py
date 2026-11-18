@@ -213,6 +213,12 @@ class MarkConsumed:
         return {**element, CONSUMED: 1, REFUSED: 0}
 
 
+class MarkCounted(MarkConsumed):
+    """The mark of a run bounded in steps that counts its passes (`dew.data.bounds._counted`), which bounds
+    nothing: no limit before it is the run's bound (`examples_limit`), a take of the chain's own standing
+    there reading as it does counting none."""
+
+
 @dataclasses.dataclass
 class Owed:
     """The source examples rows a step dropped or made none of were the last of (`Rejected.consumed`),
@@ -521,7 +527,7 @@ DROP_REMAINDER = True
 (`drop_remainder=False`); Dew drops it because the training step is compiled for one batch shape, and a
 short batch would compile a second program and take an update over fewer rows. A validation pass never
 drops one (`dew.data.lowering._Build.batch_order`), and a run bounded in examples keeps its last batch,
-filled and marked (`dew.data.compile._bounded`)."""
+filled and marked (`dew.data.bounds._bounded`)."""
 TOKEN_FIELDS = ("text",)
 """The per-token fields a pack or a window lays out where none are named."""
 PACK_BINS = 32
@@ -771,9 +777,24 @@ def _main_importable() -> bool:
     return main.get("__file__") is not None
 
 
+UNCOUNTED = 1 << 62
+"""A bound in examples past any count: a run's bound before a memory read holds the examples it counts
+(`dew.data.compile._rebound`), set to its epochs' passes once it holds them."""
+
+
+def examples_limit(stages: Sequence[object]) -> int | None:
+    """Where a run bounded in examples stops reading (the limit before its mark, `examples_bound`): its index
+    in `stages`, None for a read a run counting its passes marks (`MarkCounted`), or a read with no mark."""
+    at = examples_bound(stages)
+    mark = stages[at] if at is not None else None
+    if at is None or at == 0 or (isinstance(mark, Map) and isinstance(mark.step, MarkCounted)):
+        return None
+    return at - 1 if isinstance(stages[at - 1], Limit) else None
+
+
 def examples_bound(stages: Sequence[object]) -> int | None:
     """Where a run bounded in examples marks the source examples it reads (`MarkConsumed`), the stage
-    after the bound's limit (`dew.data.compile._bounded`): its index in `stages`, None for a read the run
+    after the bound's limit (`dew.data.bounds._bounded`): its index in `stages`, None for a read the run
     bounds otherwise. The one locator of the bound every compile and lowering step asks."""
     return next((index for index, stage in enumerate(stages)
                  if isinstance(stage, Map) and isinstance(stage.step, MarkConsumed)), None)
@@ -809,7 +830,7 @@ class FlatMap:
     examples: bool = False
     """Whether this is an objective's step that makes several rows of each source example (a decision
     layout's row a question): a corpus counts its source examples before it (`Accepted`), and a run's
-    `examples=` bound stands before it (`dew.data.compile._bounded`)."""
+    `examples=` bound stands before it (`dew.data.bounds._bounded`)."""
     pool: PoolKind | None = None
     """The pool its step runs on (`Map.pool`)."""
 
@@ -980,7 +1001,7 @@ class Limit:
     passes: int | None = None
     """Where set, the limit is that many passes over the rows reaching it, which a memory read that holds
     them counts as it holds them and sets `count` to (`dew.data.materialize`): a run of epochs's bound
-    (`dew.data.compile._bounded`), the stages the read ran stating the count it resolved to."""
+    (`dew.data.bounds._bounded`), the stages the read ran stating the count it resolved to."""
 
     def __repr__(self) -> str:
         # A limit of a count is recorded as it always was, in a saved plan's order among them.

@@ -25,6 +25,7 @@ from affine_run import FEATURES, Affine, Regression
 from arm_arithmetic import float64_held
 from export_support import Stalled
 from jax.extend.backend import get_backend
+from map_judge import marked_seeds
 from port_support import row_names_port
 from process_support import assert_exits_cleanly
 from reference_error import as_given, assert_as_exact, seeds_for
@@ -904,16 +905,13 @@ def test_a_step_handed_a_state_another_split_left_at_an_updates_end_reads_it_in_
         lm(split=4, accumulation=2).compile(pooled, BATCH)(pooled, BATCH)
 
 
-RESUMED_SEEDS = 128
-"""Check 1's declared seeds for a run resumed at a finer split against the uninterrupted run, sized paired
-(`seeds_for` with the resumed run as `dew_fn`, the float64 truth) on armada at main 2aa25af4e (probe
-slow-theme, 2026-11-14): 128, where sizing them live at every run cost 418 s of 522 fits (row 5673)."""
-
-
-def test_a_run_resumed_at_a_finer_split_lands_where_the_uninterrupted_run_does(tmp_path):
+@pytest.mark.check1_shards(seeds=128, per_task=32)
+def test_a_run_resumed_at_a_finer_split_lands_where_the_uninterrupted_run_does(tmp_path, request):
     """A run saved at an update's end in two microbatches a step and resumed in four, a memory setting
     alone, lands where the run nobody stopped lands: its weights as exact as that run's (check 1), from
-    the float64 run of its steps (`regression_truth`)."""
+    the float64 run of its steps (`regression_truth`). Its 128 seeds were sized paired (`seeds_for`, the
+    resumed run as `dew_fn`) on armada at main 2aa25af4e, where sizing them live cost 418 s of 522 fits
+    (row 5673); its mark declares them, 32 a map task."""
     runs = itertools.count()
 
     @as_given
@@ -932,7 +930,8 @@ def test_a_run_resumed_at_a_finer_split_lands_where_the_uninterrupted_run_does(t
         return {"params": truthful(x)["params"]}
 
     label = "a run resumed at a finer split"
-    assert_as_exact(resumed, uninterrupted, regression_rows, label, truth_fn=truth, seeds=RESUMED_SEEDS)
+    assert_as_exact(resumed, uninterrupted, regression_rows, label, truth_fn=truth,
+                    seeds=marked_seeds(request))
 
 
 def regression_truth() -> Callable:
@@ -1534,8 +1533,7 @@ class Displayed:
 def test_a_rung_key_states_its_modules_configuration_not_their_display():
     """A rung record's key states its modules as plain data (`dew._stated.stated`), not as they print: two
     equal configurations whose displays differ name one record, another width another; a module holding an
-    array of JAX's, which no plain form states, keeps no record, its run deciding its rung
-    as it compiles, never refused."""
+    array of JAX's, or a typed PRNG key, by its values, the same values one record and others another."""
     from dew.training.rungs import rung_key
 
     trainer = lm()
@@ -1545,7 +1543,11 @@ def test_a_rung_key_states_its_modules_configuration_not_their_display():
         return rung_key([module], (state, BATCH), [1, 2], trainer.device_mesh)
 
     assert key(Displayed(4)) == key(Displayed(4)) != key(Displayed(8))
-    assert key(Displayed(4, held=jnp.zeros(2))) is None
+    zeros, ones = (key(Displayed(4, held=values)) for values in (jnp.zeros(2), jnp.ones(2)))
+    assert zeros is not None and zeros == key(Displayed(4, held=jnp.zeros(2))) != ones
+    # A typed PRNG key by its key data, its key type beside it (train 1019's review, F1).
+    first, second = (key(Displayed(4, held=jax.random.key(seed))) for seed in (0, 1))
+    assert first is not None and first == key(Displayed(4, held=jax.random.key(0))) != second
 
 
 def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():

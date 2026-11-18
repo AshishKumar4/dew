@@ -24,6 +24,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.batch import Batch, Variables
+from dew.nn.activations import silu
 from dew.nn.blocks import IMAGENET_MEAN, IMAGENET_STD, torch_bicubic_resize
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
@@ -54,8 +55,8 @@ class Projector(nn.Module):
     @nn.compact
     def __call__(self, tokens: jax.Array) -> jax.Array:
         if self.kind == "mlp":
-            hidden = nn.silu(Dense(self.width)(tokens))
-            hidden = nn.silu(Dense(self.width)(hidden))
+            hidden = silu(Dense(self.width)(tokens))
+            hidden = silu(Dense(self.width)(hidden))
             return Dense(self.features)(hidden)
         batch, count, width = tokens.shape
         side = math.isqrt(count)

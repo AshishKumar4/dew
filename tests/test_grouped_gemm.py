@@ -536,9 +536,11 @@ def ragged_draw(seed):
 
 UNSEEN = {
     "ampere-class": generation.GpuTarget("sm80", "Unmeasured Ampere-class GPU", shared_limit=99 * 1024,
-                                         multiprocessors=46, clock_hz=1.4e9, memory_bandwidth=0.45e12),
+                                         multiprocessors=46, clock_hz=1.4e9, memory_bandwidth=0.45e12,
+                                         host_links={}),
     "hopper-class": generation.GpuTarget("sm90", "Unmeasured Hopper-class GPU", shared_limit=180 * 1024,
-                                         multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12),
+                                         multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12,
+                                         host_links={}),
 }
 """GPUs no row measured, one of each family: an Ampere-class part with fewer multiprocessors and the
 smaller block of an sm86 than an A100's, and a Hopper-class one with fewer multiprocessors, a smaller
@@ -1097,8 +1099,11 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
     token no slot reads zero), bitwise the projection of the rows gathered first, paired; `scattered`, each
     row written at its entry of a permutation, bitwise those rows put there after, its cotangents read
     back through it; with `layer`, `matrices` two stacks read at that layer (`gemm`'s `layer`), bitwise the
-    layer's matrices' projection, each stack's gradient that layer's, every other zero. Its outputs,
-    tangents and cotangents are in the tokens' dtype, the cotangents integers."""
+    layer's matrices' projection, each stack's gradient that layer's, every other zero; and an unpaired one
+    whose epilogue reads its accumulator through its rounding alone, the rounding a named output (`gemm`'s
+    `named`, row 7131's residual), its reverse pass bitwise the gathered rows' (the saved output read back
+    where its rows landed: the scattered product's P0, [[4], [2]] for [[2], [4]]). Its outputs, tangents and
+    cotangents are in the tokens' dtype, the cotangents integers."""
     table = jnp.asarray(rng.integers(0, 30, 72), jnp.int32)
     slots = jnp.asarray(rng.permutation(72), jnp.int32) if scattered else None
     sizes = jnp.asarray([20, 0, 44], jnp.int32)
@@ -1124,6 +1129,22 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
         jax.tree.map(np.testing.assert_array_equal, check(fused), check(apart))
     unread = np.setdiff1d(np.arange(tokens.shape[0]), np.asarray(table))
     assert np.all(np.asarray(jax.vjp(fused, *operands)[1](cotangent)[0])[unread] == 0)
+
+    def squared(acc):  # the accumulator read through its rounding alone, the named second output
+        rounded = acc.astype(tokens.dtype)
+        return rounded * rounded, rounded
+
+    named = {**options, "epilogue": squared, "named": (None, "rounded")}
+
+    def named_fused(tokens, first):
+        return gemm.gemm(tokens, first, sizes, gather=table, scatter=slots, layer=layer, **named)
+
+    def named_apart(tokens, first):
+        outs = gemm.gemm(tokens[table], first if layer is None else first[layer], sizes, **named)
+        return outs if slots is None else tuple(jnp.zeros_like(out).at[slots].set(out) for out in outs)
+
+    jax.tree.map(np.testing.assert_array_equal, jax.vjp(named_fused, *operands[:2])[1](cotangent),
+                 jax.vjp(named_apart, *operands[:2])[1](cotangent))
 
 
 @runs("sm100")

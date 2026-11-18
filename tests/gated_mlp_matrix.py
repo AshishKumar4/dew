@@ -17,6 +17,7 @@ generation with it named, the route its choice reports the `fused` kernel.
 
 import contextlib
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -90,8 +91,7 @@ CASES = (
 
 
 @cell("gated_mlp", covers=lambda case: dict(zip(AXES["gated_mlp"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_fused_mlps_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The layer's training step of `case` on its GPU with its products fused on par with the products apart

@@ -401,17 +401,18 @@ dew.config.DecoderRunConfig
   loop_backprop_steps: int | None = None
   loop_remat: bool = False
   loop_implicit: bool = False
+  loop_theta_per_pass: bool = False
   loop_exit_gate: bool = False
   loop_exit_threshold: float | None = None
 dew.config.MetricConfig
   name: str
   fields: JsonDict = builtins.dict()
-  defaults: JsonDict = builtins.dict()
+  defaults: JsonRecords = builtins.dict()
   split: str | None = None
 dew.config.ObjectiveConfig
   name: str
   fields: JsonDict = builtins.dict()
-  defaults: JsonDict = builtins.dict()
+  defaults: JsonRecords = builtins.dict()
 dew.config.Prepared
   run: RunConfig
   objective: dew.objectives.base.Objective[LossT, EffectsT]
@@ -466,7 +467,7 @@ dew.config.diffusion.FlowRolloutConfig
 dew.config.env.EnvConfig
   name: str
   fields: JsonDict = builtins.dict()
-  defaults: JsonDict = builtins.dict()
+  defaults: JsonRecords = builtins.dict()
   count: int | None = None
   episode_length: int | None = None
   action_repeat: int = 1
@@ -498,7 +499,7 @@ dew.config.env.EpisodesConfig
 dew.config.env.RolloutConfig
   name: str = 'dreamer'
   fields: JsonDict = builtins.dict()
-  defaults: JsonDict = builtins.dict()
+  defaults: JsonRecords = builtins.dict()
 dew.config.env.TeacherConfig
   run: str
   step: int | str | None = None
@@ -544,6 +545,7 @@ dew.config.lm.LMRunConfig
   loop_backprop_steps: int | None = None
   loop_remat: bool = False
   loop_implicit: bool = False
+  loop_theta_per_pass: bool = False
   loop_exit_gate: bool = False
   loop_exit_threshold: float | None = None
   tokenizer: str = 'byte'
@@ -593,8 +595,8 @@ dew.config.trainer.TrainerConfig
   restore_best: bool = False
   cooldowns: Annotated[Cooldowns, tyro.conf.subcommand('cooldowns')] | None = None
   log_every: Annotated[int | str, _cadence_argument(timed=False)] = 100
-  eval_every: Annotated[int | str | None, _cadence_argument(timed=False)] = 'epoch'
-  checkpoint_every: Annotated[int | str | datetime.timedelta | None, _cadence_argument()] = 'epoch'
+  eval_every: Annotated[int | str | None, _cadence_argument(timed=False)] = 'passes'
+  checkpoint_every: Annotated[int | str | datetime.timedelta | None, _cadence_argument()] = 'passes'
   checkpoint_final: bool = True
   local_directory: str | None = None
   local_every: int | str | None = None
@@ -665,6 +667,7 @@ dew.decision.config.DecisionRunConfig
   loop_backprop_steps: int | None = None
   loop_remat: bool = False
   loop_implicit: bool = False
+  loop_theta_per_pass: bool = False
   loop_exit_gate: bool = False
   loop_exit_threshold: float | None = None
   pretrained: str = 'convaiinnovations/laya'
@@ -1002,7 +1005,7 @@ dew.quantization.Quantization
 dew.registry.ModelConfig
   name: str = 'simple_dit'
   fields: JsonDict = builtins.dict()
-  defaults: JsonDict = builtins.dict()
+  defaults: JsonRecords = builtins.dict()
   wrappers: tuple[Wrapper, ...] = ()
 dew.sampling.text.Sampling
   temperature: float = 1.0
@@ -1035,6 +1038,7 @@ dew.training.ahead.AheadTarget
   multiprocessors: int | None = None
   topology: str | None = None
   phases: tuple[int, ...] = ()
+  share: float = 0.95
 dew.training.budget.Pause
   fraction: float
 dew.training.budget.Plateau

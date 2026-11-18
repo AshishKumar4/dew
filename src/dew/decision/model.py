@@ -8,7 +8,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 
-from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
+from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, sows_appended, thaw
 from dew.decision.head import Head, answer_states
 from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import HOWS, ContextReader
@@ -16,9 +16,9 @@ from dew.inputs.condition import BackboneCall, BackboneEncoder, ConditionEncoder
 from dew.inputs.spec import Condition, encode_conditions
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, ModelInputs
-from dew.nn.inspection import INSPECTED, QK, component, in_parts, observed_maxima
+from dew.nn.inspection import INSPECTED, QK, component, in_parts
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
-from dew.nn.protocols import EXITS, Looped, TokenModel, VocabularyRows
+from dew.nn.protocols import EXITS, CountedCondition, Looped, TokenModel, VocabularyRows
 from dew.nn.visibility import block_ends, block_starts
 from dew.nn.wrapping import HeadedModel
 from dew.objectives.base import joined
@@ -131,7 +131,7 @@ class DecisionModel(HeadedModel):
                 # document alone.
                 segments, documents = context_documents(inputs.context, inputs.context_lengths,
                                                         inputs.context_segments, inputs.max_segments)
-                states = _apart(encoded, inputs.context, segments, documents, encoded_width(encoder))
+                states = _apart(encoded, inputs.context, segments, documents, encoded_tokens(encoder))
                 return {CONTEXT: states, CONTEXT_LENGTHS: inputs.context_lengths,
                         **({} if inputs.context_segments is None else {CONTEXT_SEGMENTS: segments})}
 
@@ -298,14 +298,15 @@ class DecisionModel(HeadedModel):
         assert isinstance(backbone, Looped), "a looped backbone's exits"
         earlier, gates = backbone.exit_passes(sown)
         # Every exit through the head, each sowing what the step opened: a QK-Clip bounds the head by the
-        # largest logit any scored exit reads (`observed_maxima`); a watched module keeps its latest call's
-        # summary, the last pass's, as a module run more than once does (`dew.nn.inspection.watching`).
+        # largest logit any scored exit reads, each exit's call kept after the last's (`sows_appended`);
+        # a watched module keeps its latest call's summary, the last pass's, as a module run more than once
+        # does (`dew.nn.inspection.watching`).
         read = [self.head_logits(variables, state, inputs, spanned, train=train, rngs=rngs, opened=opened)
                 for state in (*earlier, states)]
         sown = {name: value for name, value in sown.items() if name != EXITS}
         head = dict(read[-1][1])
         if QK in opened:
-            head[QK] = observed_maxima(*(held.get(QK, {}) for _, held in read))
+            head[QK] = functools.reduce(sows_appended, (held.get(QK, {}) for _, held in read), {})
         return tuple(logits for logits, _ in read), gates, beside_head(sown, head, opened)
 
     def head_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
@@ -480,10 +481,19 @@ def document_lengths(segments: jax.Array, documents: int) -> jax.Array:
     return jnp.sum(segments[:, :, None] == jnp.arange(1, documents + 1), axis=1)
 
 
-def encoded_width(encoder: ConditionEncoder) -> int:
+def encoded_tokens(encoder: ConditionEncoder) -> int:
     """The tokens a configured context encoder reads a text at, its own tokenization's width, which a
     document of a row's context is encoded at (`_apart`)."""
     return len(encoder.tokenize([""])["input_ids"][0])
+
+
+def state_width(encoder: ConditionEncoder) -> int:
+    """The width of the states a configured context encoder hands the cross-attention, as it declares its
+    work (`CountedCondition.conditioning_flops`, `ConditionWork.features`)."""
+    if not isinstance(encoder, CountedCondition):
+        raise ValueError(f"{type(encoder).__name__} declares no conditioning_flops, whose features are the "
+                         "width its states reach the context layers at")
+    return encoder.conditioning_flops(encoder.tokenize([""])).features
 
 
 def _apart(encoded: Callable[[jax.Array, jax.Array], jax.Array], tokens: jax.Array, segments: jax.Array,

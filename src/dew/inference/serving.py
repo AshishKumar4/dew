@@ -29,10 +29,11 @@ the task's bound policy. A request draws with its submitted key folded as a
 one-row `TextGeneration` call folds it, so it draws the same tokens served
 or alone, except where the model's products round at boundaries that its
 programs' own roundings cross (a quantized decoder's moving weights, ledger
-2032): there each draw is on par with the model's full forward, by check 1,
-not equal to the lone task's. `submit` returns a future for its `Generation`, `step` runs one
-iteration, `run` steps until queue and rows are empty, and calling the
-server with a batch does both.
+2032, and a paged prefill's attention where a device's paged kernel reads the
+pool, docs/concepts/inference.md): there each draw is on par with the model's
+full forward, by check 1, not equal to the lone task's. `submit` returns a
+future for its `Generation`, `step` runs one iteration, `run` steps until
+queue and rows are empty, and calling the server with a batch does both.
 
 Per step the host does the admission bookkeeping and one copy of the drawn
 ids, and reads a step's draws only after dispatching the next, so the device
@@ -40,8 +41,9 @@ never waits for it; a row's exit reaches the host a step late, and its slot
 is refilled the step after. Submitting a request with an integer seed
 launches nothing on the device: the admission's program makes its key.
 
-Over a paged cache (`kv_cache=KVCache(page_size=...)`) the rows share one
-page pool whose ledger is `dew.inference.pages.Pages`, and a prompt runs over
+Over a paged cache (`kv_cache=KVCache(page_size=...)`, a page size, or
+'shared', wherever pages serve requests that repeat prompts, `Server.from_task`)
+the rows share one page pool whose ledger is `dew.inference.pages.Pages`, and a prompt runs over
 the pool through its row's page table from the row's cursor. A prompt can
 then prefill in pieces while the other rows draw (`chunk`, which a dense
 cache takes too where the step is mixed), and start from the pages of a
@@ -606,43 +608,34 @@ def _unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bool = Fa
 
 
 PAGE_SIZE = 64
-"""The slots a page holds where neither a caller nor the model's layout names a page size
-(`paged_layout`). A served GRPO batch of 8 prompts x 8 samples at Qwen3-0.6B's config on a GH200 (M-IG-11,
-64 new tokens, medians of 5 rounds, each arm alone): pages of 64 took 0.453 s at 512-token prompts and
-0.615 s at 2048 against a dense cache's 0.439 and 1.154, and pages of 16 0.509 and 0.703."""
+"""The slots a page holds where a server's requests share prompts and neither its caller nor the model's
+layout names a page size (`Server.from_task`'s 'shared'). A served GRPO batch of 8 prompts x 8 samples at
+Qwen3-0.6B's config on a GH200 (M-IG-11, 64 new tokens, medians of 5 rounds, each arm alone): pages of 64
+took 0.453 s at 512-token prompts and 0.615 s at 2048 against a dense cache's 0.439 and 1.154, and pages of
+16 0.509 and 0.703. Over prompts no two of which share, pages cost what they cannot save: on an A100 at that
+config, 256- and 512-token prompts at 32 to 128 slots, pages of 64 drew 13 to 21% fewer output tokens a
+second than whole rows (M-IG-12), so a server pages only where its caller says its prompts repeat."""
 
 
-type PageSize = int | Literal["whole"] | None
-"""A caller's page size for a server it builds (`served_layout`): pages of that many slots, each row's
-cache whole ('whole'), or None, paged where paging serves the task as it draws."""
+type PageSize = int | Literal["whole", "shared"] | None
+"""A page size a caller names for a server's cache (`Server.from_task`'s `kv_cache`): pages of that many
+slots; each row's cache whole ('whole'); pages wherever a server over them keeps a prefix cache, where the
+caller's requests repeat prompts, a group's samples of one or a session's turns ('shared'); or None, the
+model's own layout."""
 
 
-def served_layout(task: TextGeneration, capacity: int, page_size: PageSize = None) -> KVCache | None:
-    """The cache layout a server of `task`'s rows of `capacity` slots takes where its caller names a page size
-    at most (a served rollout's, `dew.objectives.rl.RolloutScheduler.serve`, and an episode cohort's,
-    `RolloutScheduler.episodes`): the model's own layout, its format kept, in pages of `page_size` slots;
-    unpaged, each row's cache whole, for 'whole' (None for a model of no layout to replace, whose rows are
-    whole); and where none is named, pages of the layout's own size or
-    `PAGE_SIZE` wherever a server over pages draws as the task draws, rows whole where not: the model's
-    layout replaceable (`Layered`), the task drawing by sampling (`Sample`; speculation and beams serve
-    whole rows), paging changing nothing the model computes (`_unserved_modes`) and its max_seq_len
-    holding a row in whole pages (`_served_layout`). Its prefix cache on as a paged server keeps one by
-    default, the requests over one prompt prefill it once (rows 5374, 5375)."""
-    model = task.model
-    if page_size == "whole":
-        # The model's own layout unpaged, its format kept, which replaces a layout of pages it declares.
-        return (dataclasses.replace(model.kv_cache, page_size=None, pages=None, groups=1)
-                if isinstance(model, Layered) else None)
-    if page_size is None:
-        if not isinstance(model, Layered) or not (task.strategy is None or isinstance(task.strategy, Sample)):
-            return None
-        page_size = model.kv_cache.page_size or PAGE_SIZE
-        ceiling = cache_ceiling(model)
-        if (_unserved_modes(model, paged=True) is not None or ceiling is None
-                or ceiling // page_size * page_size < capacity):
-            return None
-    declared = model.kv_cache if isinstance(model, Layered) else KVCache()
-    return dataclasses.replace(declared, page_size=page_size)
+def served_layout(task: TextGeneration, capacity: int, kv_cache: KVCache | PageSize = None) -> KVCache | None:
+    """The cache layout `Server.from_task` lays `task`'s rows of `capacity` slots in for its `kv_cache`
+    (`_laid`), None for a model of no layout, whose rows are whole; and for 'shared', that layout only where
+    a server over it keeps a prefix cache (`_reuses_prefixes`) and the model's max_seq_len holds a row of
+    `capacity` in its whole pages (`_holds`), None where not: what a caller serving the task only where its
+    server shares prompts' pages reads, as an episode cohort does
+    (`dew.objectives.rl.RolloutScheduler.episodes`)."""
+    *_, strategy = resolve(*task.controls(), task.strategy)
+    layout = _laid(task.model, kv_cache, capacity, strategy, None)
+    shares = (layout is not None and _reuses_prefixes(task.model, layout, strategy, None)
+              and _holds(task.model, capacity, layout.page_size))
+    return None if kv_cache == "shared" and not shares else layout
 
 
 def _served_mesh(task: TextGeneration) -> Mesh | None:
@@ -783,7 +776,7 @@ class Server:
                 state_shardings(self.mesh, shapes, offloaded=_offloaded(model)), self._admitted, transforms,
                 stopping, grammar, progress)
             self._step, self._admitting = map(dispatched, decode_programs(formats, self._admitted,
-                                                                          compiler_options(model)))
+                                                                          compiler_options()))
             if chosen is not None:
                 # The compile that chose the layout is the decoding step: compiling it again at the
                 # formats would repeat the server's largest compile (`resident_formats`).
@@ -886,7 +879,7 @@ class Server:
 
     @classmethod
     def from_task(cls, task: TextGeneration, *, slots: int, capacity: int,
-                  admission: int | None = None, kv_cache: KVCache | None = None, chunk: int | None = None,
+                  admission: int | None = None, kv_cache: KVCache | PageSize = None, chunk: int | None = None,
                   prefix_cache: bool | None = None, prefix_states: int | None = None,
                   prefix_state_every: int | None = None, host_pages: int = 0,
                   decode_steps: int = 1, prefill_mesh: Mesh | None = None) -> Server:
@@ -899,9 +892,11 @@ class Server:
         verifies and emits a block in every row, which draws as the row-wise
         sampler draws, over a dense cache whose prompts prefill whole.
 
-        `kv_cache` replaces the model's cache layout (`dew.nn.kv_cache`). A
-        paged layout pools the pages of every row, so short requests fit more
-        rows than `pages * page_size / capacity`. `chunk` prefills a prompt in
+        `kv_cache` replaces the model's cache layout (`dew.nn.kv_cache`), a
+        page size pages the model's own, 'whole' keeps each row's whole and
+        'shared' pages it where requests repeat prompts (`_laid`); None keeps
+        the model's own. A paged layout pools the pages of every row, so short
+        requests fit more rows than `pages * page_size / capacity`. `chunk` prefills a prompt in
         pieces of at most that many tokens, one piece a step, so a long prompt
         does not stall the rows beside it. It also works over a dense cache
         where the admitting step is mixed. `prefix_cache` lets a request reuse
@@ -960,17 +955,18 @@ class Server:
         run's, and `reload` moves it to the version it serves.
         """
         mesh = _served_mesh(task)
-        policy, chain, criteria = task._controls(None, None, None)
+        policy, chain, criteria = task.controls()
         transforms, stopping, strategy = resolve(policy, chain, criteria, task.strategy)
+        layout = _laid(task.model, kv_cache, capacity, strategy, prefill_mesh)
         if prefix_cache is None:
-            prefix_cache = _reuses_prefixes(task.model, kv_cache, strategy, prefill_mesh)
+            prefix_cache = _reuses_prefixes(task.model, layout, strategy, prefill_mesh)
         plan = _served_plan(strategy, mesh, chunk, prefix_cache)
         if chunk is not None and (type(chunk) is not int or chunk < 1):
             raise ValueError("chunk must be a positive number of prompt tokens per piece")
         for name, value in (("prefix_states", prefix_states), ("prefix_state_every", prefix_state_every)):
             if value is not None and (type(value) is not int or value < 1):
                 raise ValueError(f"{name} must be a positive integer")
-        model, layout, rounded = _served_layout(task.model, kv_cache, capacity)
+        model, layout, rounded = _served_layout(task.model, layout, capacity)
         groups = row_groups(mesh)
         model, rows = _cache_rows(cache_sized(model, rounded), layout, slots, rounded, groups, chunk,
                                   prefix_cache, prefix_states, prefix_state_every, host_pages)
@@ -1811,6 +1807,38 @@ def _reuses_prefixes(model: nn.Module, kv_cache: KVCache | None, strategy: Strat
             and prefill_mesh is None and _unserved_modes(model, paged=True, prefix=True) is None)
 
 
+def _laid(model: nn.Module, kv_cache: KVCache | PageSize, capacity: int, strategy: Strategy,
+          prefill_mesh: Mesh | None) -> KVCache | None:
+    """The layout a server lays its rows' cache in for `from_task`'s `kv_cache`, None for a model of no
+    layout, whose rows are whole: a `KVCache` as given; for a page size, the model's own layout, its format
+    kept, in pages of that many slots, or unpaged, each row's cache whole, for 'whole'; for None the
+    model's own; and for 'shared' the model's own, in pages of `PAGE_SIZE` where it names no page size and
+    a server over them keeps a prefix cache (`_reuses_prefixes`) whose rows' `capacity` its max_seq_len
+    holds in whole pages (`_holds`), so requests over one prompt prefill it once (rows 5374, 5375)."""
+    if isinstance(kv_cache, KVCache):
+        return kv_cache
+    own = model.kv_cache if isinstance(model, Layered) else None
+    if kv_cache == "whole":
+        return None if own is None else dataclasses.replace(own, page_size=None, pages=None, groups=1)
+    if kv_cache is None:
+        return own
+    if kv_cache != "shared":
+        return dataclasses.replace(KVCache() if own is None else own, page_size=kv_cache)
+    if own is None or own.page_size is not None:
+        return own
+    paged = dataclasses.replace(own, page_size=PAGE_SIZE)
+    return paged if _holds(model, capacity, PAGE_SIZE) and _reuses_prefixes(model, paged, strategy,
+                                                                             prefill_mesh) else own
+
+
+def _holds(model: nn.Module, capacity: int, page_size: int | None) -> bool:
+    """Whether `model`'s max_seq_len holds a row of `capacity` slots in whole pages of `page_size`
+    (`_rounded`), which `_served_layout` refuses where it does not."""
+    ceiling = cache_ceiling(model)
+    return (ceiling is not None and type(capacity) is int and capacity > 0
+            and _rounded(capacity, ceiling, page_size) >= capacity)
+
+
 def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
                  prefix_cache: bool) -> Speculative | None:
     """The speculative blocks a server's rows draw (`Dense.plan`), or None where they sample a token a step
@@ -1862,28 +1890,36 @@ def _moved[T](tree: T, sharding: jax.sharding.Sharding | Callable[[jax.Array], j
 
 def _served_layout(model: nn.Module, kv_cache: KVCache | None,
                    capacity: int) -> tuple[nn.Module, KVCache, int]:
-    """The served model over `kv_cache` where given, its cache layout, and its rows' `capacity` rounded to
-    whole 64-slot tiles and whole pages: one program serves one capacity, so the cache holds whole tiles of
-    it rather than a power-of-two bucket (every decode step's attention reads each slot, and a capacity of
-    384 bucketed to 512 read a third more), and a model shorter than the tiles keeps whole pages within its
-    max_seq_len, which no row passes."""
+    """The served model over the layout `kv_cache` (`_laid`), the model's own where it is, its cache
+    layout, and its rows' `capacity` rounded (`_rounded`), refused where the model's max_seq_len holds it in
+    no whole pages."""
     ceiling = cache_ceiling(model)
     if ceiling is None:
         raise ValueError("a server needs a model that declares max_seq_len for its cache")
     if type(capacity) is not int or capacity < 1:
         raise ValueError("capacity must be a positive number of cache slots per row")
-    if kv_cache is not None:
+    if kv_cache is not None and not (isinstance(model, Layered) and kv_cache == model.kv_cache):
         if not isinstance(model, Layered):
             raise ValueError(f"{type(model).__name__} declares no kv_cache layout to replace")
         model = model.with_kv_cache(kv_cache)
     layout = model.kv_cache if isinstance(model, Layered) else KVCache()
-    unit = math.lcm(64, layout.page_size or 64)
-    page = layout.page_size or 1
-    rounded = min(-(-capacity // unit) * unit, ceiling // page * page)
+    rounded = _rounded(capacity, ceiling, layout.page_size)
     if rounded < capacity:
         raise ValueError(f"a capacity of {capacity} passes the model's max_seq_len of {ceiling}"
-                         + ("" if page == 1 else f" in whole pages of {page}"))
+                         + ("" if layout.page_size is None else f" in whole pages of {layout.page_size}"))
     return model, layout, rounded
+
+
+def _rounded(capacity: int, ceiling: int, page_size: int | None) -> int:
+    """A row's `capacity` slots rounded up to whole 64-slot tiles and whole pages of `page_size` within the
+    model's max_seq_len `ceiling`, below `capacity` where the ceiling holds it in no whole pages: one
+    program serves one capacity, so the cache holds whole tiles of it rather than a power-of-two bucket
+    (every decode step's attention reads each slot, and a capacity of 384 bucketed to 512 read a third
+    more), and a model shorter than the tiles keeps whole pages within its max_seq_len, which no row
+    passes."""
+    unit = math.lcm(64, page_size or 64)
+    page = page_size or 1
+    return min(-(-capacity // unit) * unit, ceiling // page * page)
 
 
 def _cache_rows(model: nn.Module, layout: KVCache, slots: int, capacity: int, groups: int, chunk: int | None,

@@ -3,7 +3,6 @@ its recorded peak, and of the records its runs left, the one that held the most;
 Dew's admission of the programs its prepare filed."""
 
 import concurrent.futures
-import hashlib
 import json
 import math
 import os
@@ -57,47 +56,43 @@ def largest(keys: Iterable[str], read: Callable[[str], dict | None],
     return most
 
 
-UNIT = "DEW_TIER_UNIT"
-"""The lane unit a prepare's process prepares (`gpu_prepared`): its file, or `<file>#G/N`, as the lane names
-it, so its flows file their programs' memory under it (`prepared_needs`)."""
-NEEDS = "needs"
-"""Under the tier's store (DEW_TIER_TRUTHS), each prepared unit's programs' memory, in bytes:
-`<sha256(unit)[:16]>.json`, holding `{"unit": UNIT, "programs": [{"resident", "beside", "temporaries"}, ...]}`
-(tests/model_flows.py)."""
 NEEDED = """import json, sys
 import jax
+from dew._devices import allocator_limit
 from dew.training.memory import needed
 device = jax.local_devices()[0]
 units = json.load(sys.stdin)
-print(json.dumps({name: max(needed(device, p["resident"], p["beside"], p["temporaries"]) for p in programs)
-                  for name, programs in units.items()}))
+print(json.dumps({name: allocator_limit(max(needed(device, p["resident"], p["beside"], p["temporaries"])
+                                            for p in programs)) for name, programs in units.items()}))
 """
-"""Each unit's least pool, by Dew's own admission (dew.training.memory `needed`, the inverse of `admitted`) of
-the most demanding of its programs on this GPU, its allocator's stranding counted: one accounting, the one the
-planner trusts (Main, 2026-11-17)."""
+"""Each unit's least pool, in the pool's bytes the lane's budget counts, by Dew's own admission
+(dew.training.memory `needed`, the inverse of `admitted`) of the most demanding of its programs on this
+GPU, its allocator's stranding counted: one accounting, the one the planner trusts (Main, 2026-11-17).
+`needed` is the GPU's memory whose pool admits it, and the pool its share of that (`allocator_limit`)
+(train 997's review: read as pool bytes, every need was its share's inverse larger)."""
 
 
-def prepared_programs(names: Iterable[str]) -> dict[str, list[dict]]:
-    """The programs' memory each of `names` filed at its prepare (`NEEDS`), by unit; none where the tier's
-    store names none, or the unit filed nothing."""
-    store = os.environ.get("DEW_TIER_TRUTHS")
+def prepared_programs(names: Iterable[str], wire) -> dict[str, list[dict]]:
+    """The programs' memory each of `names` filed at its prepare (the tier's contract `wire`, its
+    `needs_file`), by unit; none where the tier's store names none, or the unit filed nothing."""
+    store = os.environ.get(wire.TRUTHS)
     if not store:
         return {}
     found = {}
     for name in names:
-        path = Path(store) / NEEDS / f"{hashlib.sha256(name.encode()).hexdigest()[:16]}.json"
+        path = wire.needs_file(Path(store), name)
         if path.is_file() and (filed := json.loads(path.read_text()))["unit"] == name and filed["programs"]:
             found[name] = filed["programs"]
     return found
 
 
-def prepared_needs(python: str, names: Iterable[str]) -> dict[str, float]:
+def prepared_needs(python: str, names: Iterable[str], wire) -> dict[str, float]:
     """Each of `names`' least pool in bytes by Dew's admission of the programs it filed at its prepare
     (`NEEDED`), read on this GPU in a process of the lane's environment that takes no pool (its allocator
     grows): a part's float64 truths, which no measured run of it held, are admitted before they run
     (2026-11-17: two flows' 1.71 GiB terms walk beside 1.1 GiB of arms ran out of a 2.84 GiB share). None
     where none filed, or Dew could not read them, which the lane says: their measured shares stand."""
-    programs = prepared_programs(names)
+    programs = prepared_programs(names, wire)
     if not programs:
         return {}
     path = os.pathsep.join(filter(None, ("src", os.environ.get("PYTHONPATH"))))

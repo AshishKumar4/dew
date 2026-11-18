@@ -31,7 +31,7 @@ from jax.experimental.profiler import get_profiled_instructions_proto
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
-from dew._devices import device_memory, pool_share, pool_statement
+from dew._devices import device_memory, pool_share, pool_statement, stated_share
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
@@ -89,14 +89,15 @@ _log = logging.getLogger(__name__)
 def read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
                rollout: Rollout | None, mesh: MeshSpec | Mesh) -> str | None:
     """Why every step of a trainer reads its batch whole, or None where a plan may split it (`splits`):
-    a custom `step`, a layout that keeps the variables on the host, a `rollout` or an Explicit mesh
-    axis. Refuses the arguments no Trainer takes together."""
+    a custom `step`, a layout that keeps the variables on the host where the run states no split (no plan
+    splits the host's step: it reads its batch in the split stated, `StepCompiler._compile_host`), a
+    `rollout` or an Explicit mesh axis. Refuses the arguments no Trainer takes together."""
     if accumulation < 1:
         raise ValueError(f"accumulation must be at least 1, got {accumulation}")
     # Split under an Explicit axis, a step met a cotangent the split typed
     # float32[16@data,16,16] against its forward's float32[16,16,16].
     whole = ("a custom step owns its execution" if step is not None else
-             "the layout keeps the variables on the host" if "variables" in layout.host else
+             "the layout keeps the variables on the host" if "variables" in layout.host and split is None else
              "a rollout writes a batch of its own" if rollout is not None else
              "an Explicit mesh axis types the step's rows" if explicit_axes(mesh) else None)
     if split is not None and (split < 1 or (whole is not None and split > 1)):
@@ -190,9 +191,12 @@ class Relowered:
 
 class SampledStep(NamedTuple):
     """A step that also summarizes what the run inspects (`Candidate.sampled`): the program it compiled
-    from (its lowering) and its executable."""
+    from (its lowering), which a run compiled ahead names it by (`program_digest`), and its executable.
+    A plan the run steps by lets the lowering go (`Planned.released`): JAX holds every executable
+    compiled from a lowering while the lowering lives, so a kept one held the sampled module resident
+    through the run (base review of 2ffc61c8c, F2)."""
 
-    lowered: jax.stages.Lowered
+    lowered: jax.stages.Lowered | None
     executable: jax.stages.Compiled
 
 
@@ -508,11 +512,14 @@ class Planned:
                                    profiled=(runs, len(profile)))
 
     def released(self) -> Planned:
-        """This plan as the run keeps it once admitted: its executable without the program it was lowered
-        from. JAX keeps each executable compiled from a lowering while the lowering lives (its in-memory
-        compilation cache, keyed by the lowered module), so releasing it lets every executable the search
-        or a guided compile made of it go, the one the run steps alone held."""
-        return dataclasses.replace(self, candidate=dataclasses.replace(self.candidate, program=None))
+        """This plan as the run keeps it once admitted: its executables without the programs they were
+        lowered from, the step's and its sampled step's. JAX keeps each executable compiled from a lowering
+        while the lowering lives (its in-memory compilation cache, keyed by the lowered module), so
+        releasing them lets every executable the search or a guided compile made of them go, the ones the
+        run steps alone held."""
+        sampled = None if self.sampled is None else self.sampled._replace(lowered=None)
+        return dataclasses.replace(self, candidate=dataclasses.replace(self.candidate, program=None),
+                                   sampled=sampled)
 
 
 def released(trees) -> None:
@@ -628,8 +635,10 @@ def pool_record(devices: Sequence) -> dict[str, JSON]:
     plan against the memory stated for them (`compile_only`), at the share their loading run takes."""
     limits = [limit for device in devices if (limit := device_memory(device).get("bytes_limit")) is not None]
     attached = set(jax.local_devices())
-    stated = {"share": pool_share(), "source": "compile_only"} if not attached.issuperset(devices) else (
-        pool_statement())
+    # Devices this process does not attach plan at the share their loading run states (`stated_share`).
+    shares = [pool_share() if (share := stated_share(device)) is None else share
+              for device in devices if device not in attached]
+    stated = {"share": min(shares), "source": "compile_only"} if shares else pool_statement()
     return {"limit": min(limits, default=None), **stated}
 
 
@@ -793,7 +802,7 @@ class FitSearch[LossT, EffectsT]:
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right, as the
         # step's own (`options`) are made; the target's own policy is the compile point's
         # (`report.targeted`).
-        self.required = compiler_options(*self.objective.towers()) or None
+        self.required = compiler_options() or None
 
     def admitted(self, candidates: Sequence[int], first: int) -> tuple[Planned, tuple[Probe, ...]]:
         """The first fitting plan the split-and-rung search finds (`searched`), and every compile it made:

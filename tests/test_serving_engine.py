@@ -52,6 +52,10 @@ class Counted:
         self.rows += 1
         return self.rows <= self.width
 
+    def taken(self) -> int:
+        """Every row it holds (`PassPlan.taken`)."""
+        return min(self.rows, self.width)
+
 
 def weights(value: float):
     return {"w": jnp.full((), value, jnp.float32)}

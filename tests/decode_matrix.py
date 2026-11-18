@@ -11,6 +11,7 @@ selector taking a paged kernel (`select(PAGED, case)`, as the layer asks it,
 """
 
 import flax.linen as nn
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -187,8 +188,7 @@ regenerated where the axes or the selectors' support change)."""
 
 
 @cell("decode", covers=lambda case: dict(zip(AXES["decode"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"a {case[0]} cell runs on its own device alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_decode_step_is_on_par(case: tuple[str, ...]) -> None:
     """A decode step of `case` on its device, through its choice's route at its kernel, on par with the

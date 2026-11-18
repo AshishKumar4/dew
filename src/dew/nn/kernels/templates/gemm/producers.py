@@ -43,7 +43,7 @@ def rungs(op, ba, config: mosaic_gpu.Tiles) -> Iterator[mosaic_gpu.Tiles]:
     """The tiles a refused `config`'s gathering producer (`_top`) steps through where a compile refused it
     with `op`'s kernel (`op.KERNEL`) spilling: its ladder below it in turn, its top first where `config`
     states none, then a setmaxnreg step lower each (`resources.Producers.stepped`), each the next rung's
-    whether or not the last spilled, so certification asks them a round at a time
+    whether or not the last spilled, so certification asks them in turn, the first that holds taken
     (`tuning.KernelOp._climbed`); none where it gathers nothing (a spill beside a producer of TMA copies
     alone is its consumers', which a raise of the producer starves). The assembler, not a model, finds a
     producer's registers."""

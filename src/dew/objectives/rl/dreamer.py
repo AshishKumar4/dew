@@ -39,6 +39,7 @@ from flax.typing import Dtype
 
 from dew.batch import Batch, Variables, merge, under
 from dew.inference.models import ReleasesModel
+from dew.nn.activations import logistic, silu
 from dew.nn.categorical import kl_divergence
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32, divided
@@ -117,7 +118,7 @@ class _Layers(nn.Module):
         held = at_least_fp32(self.dtype)
         for _ in range(self.count):
             x = nn.Dense(self.units, kernel_init=_init(), dtype=self.dtype, param_dtype=held)(x)
-            x = nn.silu(nn.RMSNorm(epsilon=1e-4, dtype=self.dtype, param_dtype=held)(x))
+            x = silu(nn.RMSNorm(epsilon=1e-4, dtype=self.dtype, param_dtype=held)(x))
         return x
 
 
@@ -161,7 +162,7 @@ class ConvEncoder(nn.Module):
             x = x.reshape(rows, height // 2, 2, width // 2, 2, channels).max((2, 4))
             norm = nn.RMSNorm(epsilon=1e-4, dtype=self.dtype, param_dtype=at_least_fp32(self.dtype),
                               name=f"cnn{stage}norm")
-            x = nn.silu(norm(x))
+            x = silu(norm(x))
         return x.reshape(*lead, -1)
 
 
@@ -199,14 +200,14 @@ class ConvDecoder(nn.Module):
         x0 = x0.reshape(-1, self.blocks, height, width, depths[-1] // self.blocks)
         x0 = x0.transpose(0, 2, 3, 1, 4).reshape(-1, *shape)
         x1 = dense(2 * self.units, name="sp1")(stoch.reshape(math.prod(lead), -1))
-        x1 = dense(size, name="sp2")(nn.silu(norm(name="sp1norm")(x1)))
-        x = nn.silu(norm(name="spnorm")(x0 + x1.reshape(-1, *shape)))
+        x1 = dense(size, name="sp2")(silu(norm(name="sp1norm")(x1)))
+        x = silu(norm(name="spnorm")(x0 + x1.reshape(-1, *shape)))
         # The stages' names are the code's, `conv{i}` the stage before the i-th encoder stage's map.
         for stage in reversed(range(len(depths) - 1)):
             x = conv(depths[stage], kernel_init=_init(), name=f"conv{stage}")(x.repeat(2, -2).repeat(2, -3))
-            x = nn.silu(norm(name=f"conv{stage}norm")(x))
+            x = silu(norm(name=f"conv{stage}norm")(x))
         x = conv(self.image[-1], kernel_init=_init(), name="imgout")(x.repeat(2, -2).repeat(2, -3))
-        return jax.nn.sigmoid(x).reshape(*lead, *self.image)
+        return logistic(x).reshape(*lead, *self.image)
 
 
 class WorldModel(nn.Module):
@@ -351,17 +352,17 @@ class WorldModel(nn.Module):
     def core(self, deter: jax.Array, stoch: jax.Array, action: jax.Array) -> jax.Array:
         """The block GRU's next deterministic state (rssm.py:135-158)."""
         action = action / jax.lax.stop_gradient(jnp.maximum(1, jnp.abs(action)))
-        parts = [nn.silu(norm(dense(x))) for dense, norm, x in
+        parts = [silu(norm(dense(x))) for dense, norm, x in
                  zip(self.dynamics_in, self.dynamics_norms,
                      (deter, stoch.reshape(*stoch.shape[:-2], -1), action), strict=True)]
         joined = jnp.concatenate(parts, -1)[..., None, :].repeat(self.blocks, -2)
         grouped = deter.reshape(*deter.shape[:-1], self.blocks, -1)
         x = jnp.concatenate([grouped, joined], -1).reshape(*deter.shape[:-1], -1)
-        x = nn.silu(self.dynamics_hidden_norm(self.dynamics_hidden(x)))
+        x = silu(self.dynamics_hidden_norm(self.dynamics_hidden(x)))
         gates = self.gru(x).reshape(*deter.shape[:-1], self.blocks, -1)
         reset, candidate, update = (part.reshape(*deter.shape[:-1], -1) for part in jnp.split(gates, 3, -1))
-        candidate = jnp.tanh(jax.nn.sigmoid(reset) * candidate)
-        update = jax.nn.sigmoid(update - 1)
+        candidate = jnp.tanh(logistic(reset) * candidate)
+        update = logistic(update - 1)
         # The state carried at its own dtype, whatever the networks compute in.
         return (update * candidate + (1 - update) * deter).astype(deter.dtype)
 
@@ -418,7 +419,7 @@ class WorldModel(nn.Module):
         x = self.policy_layers(feature)
         wide = at_least_fp32(self.dtype)
         mean, std = (head(x).astype(wide) for head in (self.policy_mean, self.policy_std))
-        std = (self.max_std - self.min_std) * jax.nn.sigmoid(std + 2.0) + self.min_std
+        std = (self.max_std - self.min_std) * logistic(std + 2.0) + self.min_std
         return jnp.tanh(mean), std
 
 
@@ -817,7 +818,7 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio, Variables]):
         actions = jnp.concatenate([jnp.swapaxes(imagined.action, 0, 1), last_action[:, None]], 1)
         still = self.model.bind(held)
         rewards = twohot_mean(still.reward(features), self.bins)
-        cont = jax.nn.sigmoid(still.continue_(features))
+        cont = logistic(still.continue_(features))
         model = self.model.bind(variables)
         values = twohot_mean(model.value(features), self.bins)
         slow = self.model.bind(merge(variables, jax.lax.stop_gradient(step.ema)) if step.ema is not None

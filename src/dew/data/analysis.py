@@ -54,6 +54,7 @@ from dew.data.pipeline import (
     MapBatch,
     MapWithIndex,
     MarkConsumed,
+    MarkCounted,
     Measure,
     Mixture,
     Native,
@@ -649,7 +650,7 @@ _EAGER = (Map, MapWithIndex, Filter, FlatMap, Pack, Windows, TokenSplit)
 
 def _held_bound(stages: Sequence[Stage], at: int) -> int:
     """The stages of a bound in examples standing at `at` before a pack a memory read runs over its whole
-    source, or a layout a shuffle draws after (`_drawn_cut`) (`dew.data.compile._bounded`: a repeat without
+    source, or a layout a shuffle draws after (`_drawn_cut`) (`dew.data.bounds._bounded`: a repeat without
     a count where it reads on, its limit and its marks): the memory read runs them as it holds the rest,
     the source examples cycled to the limit and marked before the layout lays them out, so its windows
     carry the examples they consume. None (0) where no such bound stands there."""
@@ -657,7 +658,7 @@ def _held_bound(stages: Sequence[Stage], at: int) -> int:
     repeats = int(isinstance(first, Repeat) and first.epochs is None)
     bound = stages[at + repeats:at + repeats + 3]
     marked = (len(bound) == 3 and isinstance(bound[0], Limit) and isinstance(bound[1], Map)
-              and isinstance(bound[1].step, MarkConsumed)
+              and isinstance(bound[1].step, MarkConsumed) and not isinstance(bound[1].step, MarkCounted)
               and (isinstance(bound[2], Pack) or _drawn_cut(stages, at + repeats + 2)))
     return repeats + 2 if marked else 0
 
@@ -763,9 +764,13 @@ def _volatile(stage: Stage) -> bool:
 def _drops(stage: Stage) -> bool:
     """Whether a stage can drop or make rows, so the rows after it are not
     the rows before it, one for one."""
-    return isinstance(stage, (Filter, FlatMap, Pack, Windows, Native, Batched)) or (
-        isinstance(stage, (Map, MapWithIndex, RandomMap)) and stage.rejects
-    )
+    return isinstance(stage, (Filter, FlatMap, Pack, Windows, Native, Batched)) or rejects(stage)
+
+
+def rejects(stage: Stage) -> bool:
+    """Whether `stage` drops a record it cannot make (`rejects`: a decode's failure), keeping every other
+    one for one."""
+    return isinstance(stage, (Map, MapWithIndex, RandomMap)) and stage.rejects
 
 
 def _written(source: Source, stages: Sequence[Stage]) -> tuple[Stage, ...]:
@@ -900,7 +905,9 @@ def _analyzed(
     one canonical pass, so its split is whole. With `bound`, a cache after
     configured steps is analyzed as it is once they bind: each binds to the
     step its declaration states (`_bind`), and a prefix no cache can key is
-    refused, so the cache holds what they make."""
+    refused, so the cache holds what they make; and a memory read runs a configured step that binds to
+    an eager one (any that draws nothing) as it holds its rows, as it will once the step binds, so the
+    order after it is the held rows' (a global shuffle of a table a holdout selects)."""
     source = pipeline.source
     nested = children(pipeline)
     joined = isinstance(source, Concatenated)
@@ -932,7 +939,10 @@ def _analyzed(
         if _drawn_cut(stages, eager) and examples_bound((*ran, *stages[:eager])) is not None:
             # A shuffle draws the windows a layout cuts counted examples across: each share lays its own.
             break
-        held = 1 if isinstance(stages[eager], _EAGER) else _held_bound(stages, eager)
+        # Analyzed `bound`, a configured step counts as the step it binds to, eager unless it draws.
+        stage = stages[eager]
+        once_bound = bound and isinstance(stage, Configured) and not stage.random
+        held = 1 if isinstance(stage, _EAGER) or once_bound else _held_bound(stages, eager)
         if not held:
             break
         eager += held

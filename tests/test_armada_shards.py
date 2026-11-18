@@ -788,6 +788,32 @@ def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
     assert maps and set(again["after"]) == {entry["name"] for entry in maps}
 
 
+PARAMETERED = SITE.replace("@pytest.mark.check1_shards(seeds=4, per_task=8)\ndef test_site():",
+                           "@pytest.mark.parametrize(\"form\", [pytest.param(\"dense\", id=\"dense\", "
+                           "marks=pytest.mark.check1_shards(seeds=4, per_task=8))])\ndef test_site(form):")
+"""The site of one parameter, `test_site[dense]`: its group's name holds brackets, outside the Worker's key
+alphabet."""
+
+
+def test_a_parametrized_sites_row_is_kept_under_a_key_the_worker_takes_and_reused_cached(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A site of one parameter (`test_site[dense]`) records its judge's row under a place the Worker takes
+    (`rows.spelled`), so an unchanged rerun keeps it, its tasks unrun, and the task that reads it reports it
+    `cached` (2026-11-18: every such row's record was refused before any request, 19,218 lookups from 11-13
+    on, and none was reused)."""
+    assert PARAMETERED != SITE
+    run_cached(ci, tmp_path, monkeypatch, cache_worker, PARAMETERED, later=True)
+    kept, ran = planned_now(ci)
+    assert ("tests/test_site.py", "test_site[dense]") in kept and ran == []
+    out = tmp_path / ".verdict/verdict.json"
+    rows = []
+    for entry in planned(ci).values():
+        assert entry_task(ci, monkeypatch, entry, out) == 0
+        rows += json.loads(out.read_text())["rows"]
+    [judged] = [row for row in rows if row["name"] == "3.12:tests/test_site.py#test_site[dense]"]
+    assert judged["exitCode"] == 0 and judged["cached"]
+
+
 def test_a_judge_after_a_cut_finer_than_declared_is_kept_on_what_its_map_tasks_drew(
         ci, tmp_path, monkeypatch, cache_worker):
     """A site cut finer than its mark declares (its measured rate past two targets, `cut_draws`) is judged

@@ -40,18 +40,25 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.mesh import SEQUENCE_AXIS
+from dew.nn.activations import silu
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.kernels import chunked_launch, recurrence_algebra, recurrence_chunk
-from dew.nn.kernels.recurrence_chunk import RESET_DECAY
 from dew.nn.kv_cache import Opened, compute_dtype
-from dew.nn.linear import DepthwiseConv1d, held_scan, over_sequence, scan_cache, sequence_conv, sequence_split
+from dew.nn.linear import (
+    DepthwiseConv1d,
+    held_scan,
+    over_sequence,
+    scan_cache,
+    sequence_conv,
+    sequence_entered,
+    sequence_split,
+)
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import accumulated, accurate_exp, at_least_fp32, float32_dot_general, silu, softplus
+from dew.nn.precision import accumulated, accurate_exp, at_least_fp32, float32_dot_general, softplus
 from dew.nn.residuals import Residual
 from dew.nn.sharding import rows_like
 from dew.nn.ssm import affine_spans
@@ -247,7 +254,7 @@ class Mamba(nn.Module):
         if shards > 1:
             # Each shard convolves its slice reading the real tokens before it from the earlier ones
             # (`sequence_conv`); the step, B and C come token by token outside; each shard scans from
-            # zero, then from the state the earlier ones leave it (`_sequence_scan`), as Mamba-2's does.
+            # zero, then from the state the earlier ones leave it (`_sequence_scan`, `sequence_entered`).
             convolved = over_sequence(functools.partial(_sequence_conv, dtype=wide), shards,
                                       (mixed.astype(wide), tokens.segments, valid), (taps, bias))
             xs, step, B, C = self._projected(convolved, valid)
@@ -306,21 +313,12 @@ def _sequence_conv(mixed, segments, valid, taps, bias, *, dtype):
 
 def _sequence_scan(xs, step, B, C, starts, A, D, *, chunk_size: int):
     """This shard's slice of the selective scan, inside a `shard_map` that holds the sequence axis manual
-    (`over_sequence`): run from zero, the state it leaves and its span's log decay `A sum(dt)` (a document
-    start in it zeroing the decay, `RESET_DECAY`) give the state the earlier shards leave it
-    (`recurrence_algebra.entering`, each channel's and state's decay its own: the span laid as `[B, D N]`
-    decays of `[1, 1]` memories), and the scan runs again from that state, a start in it dropping it as on
-    one device."""
-    _, leaving = selective_scan(xs, step, A, B, C, D, None, starts, chunk_size)
-    batch, channels, states = leaving.shape
-    decay = jnp.sum(step, axis=1)[..., None] * A                    # [B, D, N]
-    if starts is not None:
-        decay = jnp.where(jnp.any(starts, axis=1)[:, None, None], RESET_DECAY, decay)
-    span = recurrence_algebra.Span(decay.reshape(batch, channels * states),
-                                   leaving.reshape(batch, channels * states, 1, 1))
-    entering = recurrence_algebra.entering(span, SEQUENCE_AXIS).reshape(batch, channels, states)
-    out, _ = selective_scan(xs, step, A, B, C, D, entering, starts, chunk_size)
-    return out
+    (`over_sequence`), from the state the earlier shards leave it (`sequence_entered`), each channel's and
+    state's decay its own, `A sum(dt)`."""
+    def run(state):
+        return selective_scan(xs, step, A, B, C, D, state, starts, chunk_size)
+
+    return sequence_entered(run, jnp.sum(step, axis=1)[..., None] * A, starts)
 
 
 class _StepProjection(nn.Module):

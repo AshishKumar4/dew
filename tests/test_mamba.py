@@ -99,7 +99,7 @@ def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_on
     """Under a sequence axis of 4, the layer runs rows with padding and packed documents as `held_scan`
     runs them on one device (`assert_split_as_whole`): each shard's conv reads the real tokens before it
     from the earlier shards, and its scan enters with the state they leave it, each channel's and state's
-    decay its own (`_sequence_scan`, row 1710)."""
+    decay its own (`linear.sequence_entered`, rows 1710, 7423)."""
     mixer = Mamba(emb_features=8, intermediate_size=16, state_size=4, time_step_rank=2, chunk_size=4)
     variables = jax.tree.map(np.asarray, mixer.init(jax.random.key(1), jnp.zeros((1, 32, 8))))
     assert_split_as_whole(mixer, variables, row, SPLIT_SEEDS[row], f"mamba split over the sequence, {row}",

@@ -366,7 +366,7 @@ verifies the type (`test_a_type_a_script_defines_and_registers_verifies`)."""
 
 def test_a_type_a_script_defines_and_registers_verifies(tmp_path):
     """A type whose config and causal LM a script defines in its own `__main__` and registers at runtime
-    verifies from parts: tier 2's float64 twin, built in a process of its own (`dew.interop.isolated`),
+    verifies from parts: tier 2's float64 twin, built in a process of its own (`dew._isolated`),
     finds the script's classes there as `multiprocessing`'s spawn finds them, the script's guarded block
     not run again."""
     import os
@@ -403,7 +403,7 @@ with open(sys.argv[3], "w") as out:
 
 def test_a_script_verifying_at_its_top_level_runs_once(tmp_path):
     """A script that verifies a type transformers registers, CWM, at its top level with no `__main__` guard,
-    verifies, and runs once: the twin's process (`dew.interop.isolated`) imports no script whose classes
+    verifies, and runs once: the twin's process (`dew._isolated`) imports no script whose classes
     it does not need, so the script's own load is not run again there."""
     import os
     import subprocess

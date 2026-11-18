@@ -1438,33 +1438,51 @@ claimed local gradient and memory's, its last chunk's alone from the final memor
 the given gradients enter them."""
 
 
-def assert_backward_witnessed(lane: Lane, heads: int = 1) -> None:
-    """The step witness of the fast backward (`back_enclosures`), each form it takes: a bf16 call of three
-    chunks under the delta rule and without it (the SSD's, its keys taking the gate), and an fp32 call under
-    the delta rule (its values in parts), each where the template trains it on the device (`Run.trained`: an
-    A100's registers hold no fp32 call's, 264 to 328 a thread, whose training step takes another kernel),
-    every record each launch keeps inside its step's enclosure; and a backward that read another output's
-    and final memory's gradients refused (`CARRIED_GRADIENT_SHARES`): its records, claimed for those
-    given."""
-    import jax.numpy as jnp
+BACKWARD_FORMS = {"bf16 under the delta rule": (None, True), "bf16, its keys gated": (None, False),
+                  "fp32 under the delta rule": (np.float32, True)}
+"""The fast backward's forms the step witness takes (`assert_backward_form_witnessed`): a bf16 call of three
+chunks under the delta rule and without it (the SSD's, its keys taking the gate), and an fp32 call under the
+delta rule (its values in parts), each its draw's dtype (None its default, bf16) and whether the delta rule
+holds."""
 
+
+def assert_backward_form_witnessed(lane: Lane, form: str, heads: int = 1) -> bool:
+    """The step witness (row 2084 (e)) of the fast backward (`back_enclosures`) in one of its forms
+    (`BACKWARD_FORMS`) where the template trains it on the device (`Run.trained`: an A100's registers hold no
+    fp32 call's, 264 to 328 a thread, whose training step takes another kernel): every record each launch
+    keeps inside its step's enclosure. Whether the template trains it, so the form was witnessed."""
+    dtype, delta = BACKWARD_FORMS[form]
+    operands = draw(0, "mild", heads=heads, dtype=dtype)
+    run = recorded(*operands, delta=delta)
+    if not run.trained:
+        return False
+    back = recorded_backward(operands, delta=delta, run=run)
+    for name, inside in back_witnessed(back, lane).items():
+        assert np.all(inside), (back.run.write, back.run.held, name, np.mean(inside))
+    return True
+
+
+def assert_claimed_gradients_refused(lane: Lane, heads: int = 1) -> None:
+    """A fast backward that read another output's and final memory's gradients (another seed's) refused by
+    the step witness (`CARRIED_GRADIENT_SHARES`): its records, claimed for those given."""
     operands = draw(0, "mild", heads=heads)
-    wide = draw(0, "mild", heads=heads, dtype=jnp.float32)
-    forms = ((operands, True), (operands, False), (wide, True))
-    runs = [(x, delta, recorded(*x, delta=delta)) for x, delta in forms]
-    backs = [recorded_backward(x, delta=delta, run=run) for x, delta, run in runs if run.trained]
-    for back in backs:
-        held = back_witnessed(back, lane)
-        for name, inside in held.items():
-            assert np.all(inside), (back.run.write, back.run.held, name, np.mean(inside))
-    # The bf16 delta rule's backward witnessed above (the first form, which every device trains), its
-    # records claimed for another draw's gradients; recorded again, it took a quarter of the witness.
-    back = backs[0] if runs[0][2].trained else recorded_backward(operands, run=runs[0][2])
-    other = recorded_backward(operands, seed=1, run=runs[0][2])
+    # One forward recording read by both backwards (base's: recorded again, it took a quarter of the witness).
+    run = recorded(*operands, delta=True)
+    back = recorded_backward(operands, run=run)
+    other = recorded_backward(operands, seed=1, run=run)
     claimed = back._replace(dh=other.dh, dh0=other.dh0, records=other.records)
     refused = back_witnessed(claimed, lane)
     for name, share in CARRIED_GRADIENT_SHARES.items():
         assert np.mean(~refused[name]) >= share, (name, np.mean(~refused[name]))
+
+
+def assert_backward_witnessed(lane: Lane, heads: int = 1) -> None:
+    """The step witness of the fast backward in each of its forms (`assert_backward_form_witnessed`) and a
+    backward that read another output's and final memory's gradients refused
+    (`assert_claimed_gradients_refused`)."""
+    for form in BACKWARD_FORMS:
+        assert_backward_form_witnessed(lane, form, heads)
+    assert_claimed_gradients_refused(lane, heads)
 
 
 class KeyBackStep(NamedTuple):
