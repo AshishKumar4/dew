@@ -617,6 +617,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
                                                                                   strict=True)),
                   *(() if forked.entry is None else _headed_entry(forked.entry, heads, *varying)))
         outputs, final = _walk_once(*declared, width=width, recomputed=recomputed_memory(), held=held,
+                                    documents=forked.loads.shape[1],
                                     context=derive.context())(operands, walked)
         out = jnp.moveaxis(outputs.reshape(*outputs.shape[:2], -1, columns), 1, 2)
         return out[:, :length].astype(dtype), final
@@ -668,18 +669,19 @@ def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, column
 
 
 @functools.lru_cache(maxsize=FORMS_HELD)
-def _walk_once(declare: Callable, facts: tuple, *, width: int, recomputed: bool, held: int, context: tuple):
+def _walk_once(declare: Callable, facts: tuple, *, width: int, recomputed: bool, held: int, context: tuple,
+               documents: int = 0):
     """The walk (`_walk`) by the forms `declare(**dict(facts))` derives (`_delta_forms`, `_oja_forms`) as one
     nested program (`dew.nn.nested`), traced once for equal shapes within a trace (`jax.jit`'s cache, keyed
     on the function and its operands' types) and compiled by the enclosing program, the latest `FORMS_HELD`
-    kept. Keyed on every fact the walk reads: its declaration's, `width`, `recomputed` and `held`
-    (`_walk`'s), and `context`, what the forms' derivation reads (`derive.context`: the mesh,
+    kept. Keyed on every fact the walk reads: its declaration's, `width`, `recomputed`, `held` and
+    `documents` (`_walk`'s), and `context`, what the forms' derivation reads (`derive.context`: the mesh,
     target, numerics, precision and checks a split is priced and traced under), which the walk reads no
     other way: JAX's trace cache keys on none of Dew's, and the split one context derives is no other's.
     Traced at every call, each layer's walk took 0.65 s of a trace again (jsf-gdn-layers: 8 equal layers'
     training step 5.2 s, 1 layer's 0.63 s)."""
     del context
-    walked = _walk(declare(**dict(facts)), width, recomputed, held)
+    walked = _walk(declare(**dict(facts)), width, recomputed, held, documents)
 
     def recurrence_walk(operands, h):
         return walked(operands, h)
@@ -849,7 +851,7 @@ def _hooks(given, entry, loads, stores, begun):
     return before, after
 
 
-def _forked_steps(forms, operands, given, forked, held: int, decayed):
+def _forked_steps(forms, operands, given, forked, held: int, documents: int, decayed):
     """A forked walk forward (`_walk`), its documents in place: each chunk's outputs, the memory entering
     each chunk, the row's last memory, and the walk's table at its end. The walk takes the row's segments in
     token order, a segment a document's tokens within one chunk, each from the memory entering it: the
@@ -858,30 +860,30 @@ def _forked_steps(forms, operands, given, forked, held: int, decayed):
     later one of the same chunk loads). Each segment's outputs and the state it leaves are its window of the
     chunk's forms (`Derived.prepare`'s `window`), the state stored in its document's slot where the segment
     ends a storing document, and the chunk's next memory where it ends the chunk. The segments are at most
-    the chunks and the documents, each one window's work, as many as a row laid a chunk a document took, the
-    walk's trip its real segments': no value and no iteration is sized by the documents' bound (scheduled
-    by it, 128 tokens of two documents under a bound of 8 ran 10 iterations for 3 segments, row 7831)."""
+    the chunks and the documents, each one window's work, as many as a row laid a chunk a document took; no
+    value is sized by the documents' bound."""
     loads, stores, begun, entry = forked
     chunks, count = loads.shape
-    total = chunks * count
     place = jnp.arange(count)
     starts = loads >= 0
-    # Each segment's first token: each document's first, and a chunk's first where its document continues;
-    # each token's next segment's first (`total` past the row's last).
+    # Each segment's first token, in token order: each document's first, and a chunk's first where its
+    # document continues; past the row's segments, a sentinel past its tokens.
     marks = (starts | (place == 0)).reshape(-1)
-    ahead = jnp.where(marks, jnp.arange(total), total)
-    following = jnp.concatenate([jax.lax.cummin(ahead, reverse=True)[1:], jnp.full((1,), total)])
+    events = chunks + documents
+    origins = jnp.nonzero(marks, size=events, fill_value=chunks * count)[0]
+    following = jnp.concatenate([origins[1:], jnp.full((1,), chunks * count, origins.dtype)])
     zero_decay, zero = jnp.zeros_like(decayed), jnp.zeros_like(given[0])
 
-    def segment(walked):
-        first, ((chunk_in, held_chunk, leaving), table, outputs, entering) = walked
-        after = following[first]
-        chunk, origin = first // count, first % count
+    def segment(carried, at):
+        (chunk_in, held_chunk, leaving), table, outputs, entering = carried
+        first, after = at
+        real = first < chunks * count
+        chunk, origin = jnp.minimum(first // count, chunks - 1), first % count
         through = jnp.where(after // count == chunk, after % count - 1, count - 1)
         # Entering a new chunk, its memory is the one the chunk before left.
         new = chunk != held_chunk
         memory_in = jax.tree.map(lambda a, b: jnp.where(new, a, b), leaving, chunk_in)
-        entering = entering.at[chunk].set(jnp.where(new, memory_in[1], entering[chunk]))
+        entering = entering.at[chunk].set(jnp.where(real & new, memory_in[1], entering[chunk]))
         continuing = ~starts[chunk, origin]
         memory = jnp.where(continuing, memory_in[1],
                            _opened(given, table, loads[chunk, origin], entry, begun[chunk, origin]))
@@ -889,21 +891,19 @@ def _forked_steps(forms, operands, given, forked, held: int, decayed):
         decay = jnp.where(continuing, memory_in[0], zero_decay)
         left = forms.step((decay, memory), window)
         out = forms.mapped(window, (decay, memory))
-        rows = (place >= origin) & (place <= through)
+        rows = (place >= origin) & (place <= through) & real
         outputs = outputs.at[chunk].set(jnp.where(rows[:, None], out, outputs[chunk]))
-        table = table_stored(table, stores[chunk, through], left[1])
-        leaving = jax.tree.map(lambda a, b: jnp.where(through == count - 1, a, b), left, leaving)
-        return after, ((memory_in, chunk, leaving), table, outputs, entering)
+        table = table_stored(table, jnp.where(real, stores[chunk, through], 0), left[1])
+        ends = real & (through == count - 1)
+        leaving = jax.tree.map(lambda a, b: jnp.where(ends, a, b), left, leaving)
+        return ((memory_in, jnp.where(real, chunk, held_chunk), leaving), table, outputs, entering), None
 
     shaped = jax.eval_shape(lambda chunk: forms.mapped(forms.prepare(chunk), (decayed, zero)),
                             jax.tree.map(lambda x: x[0], operands))
     table = jnp.zeros((held, *given.shape[1:]), given.dtype)
     start = (((decayed, zero), jnp.asarray(-1), (decayed, zero)), table,
              jnp.zeros((chunks, *shaped.shape), shaped.dtype), jnp.zeros((chunks, *zero.shape), zero.dtype))
-    # The walk's forward alone: its derivative replays each chunk (`_forked_adjoint`), so its trip may be
-    # the row's own.
-    _, ((_, _, last), table, outputs, entering) = jax.lax.while_loop(
-        lambda walked: walked[0] < total, segment, (jnp.asarray(0, following.dtype), start))
+    ((_, _, last), table, outputs, entering), _ = jax.lax.scan(segment, start, (origins, following))
     return outputs, entering, last[1], table
 
 
@@ -947,7 +947,7 @@ def _forked_adjoint(backward, operands, given, forked, entering, table, d_output
     return d_operands, (d_given, loads, stores, begun, *(() if entry is None else d_entry))
 
 
-def _walk(forms, width: int, recomputed: bool, held: int = 0):
+def _walk(forms, width: int, recomputed: bool, held: int = 0, documents: int = 0):
     """`xla_mainloop`'s walk over every row's and head's chunks (`[rows, heads, chunks, C, ...]` operands and
     the memory entering), by the token update's derived `forms` (`dew.algebra.scan`): each chunk's values
     that read no memory at once, the memory alone in sequence, then each chunk's outputs from the memory
@@ -972,7 +972,8 @@ def _walk(forms, width: int, recomputed: bool, held: int = 0):
         empty = forms.init({})[0]
         decayed = varying_like(jnp.zeros((width,), empty.dtype), *jax.tree.leaves(operands))
         if forked is not None:
-            outputs, entering, last, table = _forked_steps(forms, operands, memory, forked, held, decayed)
+            outputs, entering, last, table = _forked_steps(forms, operands, memory, forked, held, documents,
+                                                           decayed)
             return outputs, last, (entering, table)
         prepared = jax.vmap(forms.prepare)(operands)
 
