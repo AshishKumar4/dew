@@ -572,8 +572,11 @@ def test_an_lm_validation_of_metrics_alone_reports_each_pass():
 
 def test_a_qk_clip_reads_every_scored_exits_head():
     """A decision loss weighing a looped backbone's passes, the first weighed and the last not, sows for
-    QK-Clip its head's logit maxima over every scored exit: each row and head's the largest any pass count's
-    own model's head reads (`with_passes(k)`), on par from float64 (check 1), the first pass's among them."""
+    QK-Clip its head's logit maxima at every scored exit, a call each (`dew.batch.sown_calls`), which the
+    clip reads at their largest: each row and head's the largest any pass count's own model's head reads
+    (`with_passes(k)`), on par from float64 (check 1), the first pass's among them (row 7909)."""
+    import functools
+
     from flax.traverse_util import flatten_dict
 
     from dew.decision.task import laid_out
@@ -587,11 +590,16 @@ def test_a_qk_clip_reads_every_scored_exits_head():
     step = Step(jnp.asarray(0), jax.random.key(0), None, qk_stats=True)
 
     def maxima(tree):
-        """The logit maxima a QK-Clip reads of the head's attention layers, by their paths."""
-        return {"/".join(path): leaf for path, leaf in flatten_dict(tree).items() if path[-1] == "max_logits"}
+        """The logit maxima a QK-Clip reads of the head's attention layers, by their paths: each layer's
+        largest over its calls."""
+        return {"/".join(path): functools.reduce(jnp.maximum, calls)
+                for path, calls in flatten_dict(tree).items() if path[-1] == "max_logits"}
 
     def sown(variables):
         _, aux = weighed.loss(variables, batch, step)
+        calls = {len(calls) for path, calls in flatten_dict(aux.qk_stats["head"]).items()
+                 if path[-1] == "max_logits"}
+        assert calls == {STEPS}, f"a call of the head a scored exit, not {calls}"
         return maxima(aux.qk_stats["head"])
 
     def apart(backbone):

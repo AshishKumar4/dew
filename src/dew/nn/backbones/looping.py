@@ -10,7 +10,7 @@ pass starts from the cache as the step entered it and only the last pass's write
 entering cache in place of the one the pass before left, and the carry is dropped; the last runs after
 the scan, as the first does. What a pass sows, a router's or attention's statistics or captured
 intermediates, extends the step's sows pass by pass, as the unrolled passes' did, a router's and
-attention's at the block's own layer names (`OBSERVED`), each pass a call of the same weights. The
+attention's at the block's own layer names (`BY_CALL`), each pass a call of the same weights. The
 passes before the last `backprop_steps` pass no gradient back: the cut is static, the passes before it
 scanned, the pass it cuts traced on its own and those after it scanned, so no pass before it keeps
 residuals or runs a backward. Where every pass exits (`Loop.exiting`: an exit gate, or `exits`) each
@@ -28,9 +28,11 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.core.scope import DenyList
 
+from dew.batch import sows_appended
+
 from ..precision import at_least_fp32, softplus
 from ..protocols import EXITS
-from .decoder_stack import OBSERVED, WRITTEN, Loop, PassView, SharedPassView, sows_appended
+from .decoder_stack import BY_CALL, WRITTEN, Loop, PassView, SharedPassView
 from .layer_names import group_layers
 
 
@@ -106,7 +108,7 @@ class PassStack:
     """What later passes write, stacked on a leading pass axis as a scan over `views`' passes reads it,
     and each pass's back where the unrolled passes put it. A collection a stack writes (`WRITTEN`) holds
     a pass's layer entries under the names its view (`PassView`) stores them by, but for what a pass
-    observes of the block's weights (`OBSERVED`); under `shared`, and for those, every pass's entries are
+    observes of the block's weights (`BY_CALL`); under `shared`, and for those, every pass's entries are
     the block's own, its sows extending them in pass order, and under `shared` the cache is the
     scan's carry, which comes back dropped. What a pass sows elsewhere (`appended`: captured
     intermediates, a name of no layer) extends the tuples it sows into at each leaf, pass by pass, as
@@ -120,8 +122,8 @@ class PassStack:
 
     def _per_pass(self, collection: str) -> bool:
         """Whether `collection` keeps each pass's layer entries apart, under the pass's own names: none of
-        what a pass observes of the block's weights (`OBSERVED`), which every pass sows at their names."""
-        return collection in WRITTEN and collection not in OBSERVED and not self.shared
+        what a pass observes of the block's weights (`BY_CALL`), which every pass sows at their names."""
+        return collection in WRITTEN and collection not in BY_CALL and not self.shared
 
     def inside(self, variables: Mapping[str, Mapping]) -> dict:
         self.held = {collection: dict(tree) for collection, tree in variables.items()}
