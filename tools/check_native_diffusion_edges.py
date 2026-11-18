@@ -14,7 +14,6 @@ from flax import linen as nn
 
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
-from dew.nn.backbones.unet_condition import UNet2DCondition
 from dew.nn.inputs import DenoisingCondition
 from dew.sampling.walks import sample
 
@@ -123,7 +122,7 @@ def check_unet(directory, case):
     dropout = DROPPED.get(case)
     changed = {} if dropout is None else {"dropout": dropout}
     config = json.loads((directory / "unet/config.json").read_text()) | changed
-    model = UNet2DCondition(**unet_fields(config, attention_impl="xla"))
+    model = unet_fields(config, attention_impl="xla").value
     params, _ = translate_unet_weights(component_tensors(directory, "unet"), model)
     training = dropout is not None
     source = UNet2DConditionModel.from_pretrained(directory / "unet", **changed).train(training)

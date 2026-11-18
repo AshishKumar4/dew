@@ -24,13 +24,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from reference_runs.common import warmup_cosine
 from reference_worker import drawn, serve
 from transformers import AutoModelForCausalLM
 
 from _dew_torch.precision import float64
-
-sys.path.insert(0, str(Path(__file__).resolve().parent / "reference_runs"))
-from common import warmup_cosine
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKPOINT = ROOT / "tests/fixtures/hf/qwen3-tiny"
@@ -84,10 +82,12 @@ def _steps(dtype: torch.dtype, tokens: np.ndarray) -> dict[str, list[float]]:
 
 def answered(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's steps, in float32 and float64."""
-    def answer(inputs):
-        return tuple({leaf: np.asarray(values, dtype)
-                      for leaf, values in run(precision, inputs["tokens"]).items()}
-                     for precision, dtype in ((torch.float32, np.float32), (torch.float64, np.float64)))
+    def stepped(precision, dtype, tokens) -> dict[str, np.ndarray]:
+        return {leaf: np.asarray(values, dtype) for leaf, values in run(precision, tokens).items()}
+
+    def answer(inputs: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+        return (stepped(torch.float32, np.float32, inputs["tokens"]),
+                stepped(torch.float64, np.float64, inputs["tokens"]))
 
     return drawn(cases, answer)
 

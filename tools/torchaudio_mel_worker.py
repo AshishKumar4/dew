@@ -19,6 +19,9 @@ from reference_worker import drawn, serve
 
 from _dew_torch.precision import default_dtype
 
+COHORT = "torchaudio"
+"""The releases this file runs against, which its type check reads (tools/reference_releases.RELEASES)."""
+
 
 def mel(waveform: np.ndarray, dtype) -> np.ndarray:
     """The log mel frames of `waveform` at `dtype`."""

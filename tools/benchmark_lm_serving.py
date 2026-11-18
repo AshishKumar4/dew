@@ -41,7 +41,6 @@ import platform
 import pstats
 import sys
 import time
-import uuid
 from pathlib import Path
 
 import numpy as np
@@ -373,35 +372,17 @@ def vllm_parallelism(mesh: dict[str, int] | None) -> dict[str, int | bool]:
     return {"tensor_parallel_size": mesh.get("tensor", 1) * expert, "enable_expert_parallel": expert > 1}
 
 
-async def engine_points(args):
-    """The same scheduler/stream clocks, without HTTP serialization. Output stays token ids, not text, as
-    Dew's and SGLang's do (`detokenize=False`). An engine over several GPUs starts its workers by
-    spawning them, as vLLM advises once the parent has touched CUDA, which forked workers cannot
-    initialize again."""
-    parallelism = vllm_parallelism(args.mesh)
-    if parallelism.get("tensor_parallel_size", 1) > 1:
-        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    from vllm import SamplingParams
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.inputs import TokensPrompt
-    from vllm.v1.engine.async_llm import AsyncLLM
+async def stamped(stream, produced) -> list[float]:
+    """The time each of a request's tokens reached the client, from an in-process engine's stream of its
+    growing output, `produced(chunk)` the tokens each chunk holds so far."""
+    stamps: list[float] = []
+    async for chunk in stream:
+        stamps.extend([time.perf_counter()] * (produced(chunk) - len(stamps)))
+    return stamps
 
-    engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
-        model=args.model, dtype="bfloat16", max_model_len=args.prompt + args.output,
-        max_num_seqs=max(args.slots), gpu_memory_utilization=0.90,
-        generation_config="vllm", enable_prefix_caching=False, disable_log_stats=True, **parallelism))
 
-    async def streamed(prompt, output):
-        """The time each of a request's tokens reached the client."""
-        policy = SamplingParams(temperature=0, top_p=1, top_k=-1, min_p=0, repetition_penalty=1,
-                                max_tokens=output, ignore_eos=True, detokenize=False)
-        stamps: list[float] = []
-        async for result in engine.generate(TokensPrompt(prompt_token_ids=prompt.tolist()), policy,
-                                            uuid.uuid4().hex):
-            arrived = len(result.outputs[0].token_ids) - len(stamps)
-            stamps.extend([time.perf_counter()] * arrived)
-        return stamps
-
+async def engine_sweep(args, streamed, engine):
+    """An in-process engine's points over its requests (`streamed`), the engine shut down after."""
     try:
         points = await async_sweep(args, closed_loop(streamed), streamed)
     finally:
@@ -409,30 +390,16 @@ async def engine_points(args):
     return {"label": args.hardware}, points
 
 
-async def sglang_points(args):
-    """SGLang's engine in-process, on the same clocks as vllm-engine, its output token ids."""
-    import sglang
-
-    engine = sglang.Engine(model_path=args.model, dtype="bfloat16", context_length=args.prompt + args.output,
-                           max_running_requests=max(args.slots), mem_fraction_static=0.90,
-                           disable_radix_cache=True, skip_tokenizer_init=True, log_level="error")
-    policy = {"temperature": 0, "top_p": 1, "top_k": -1, "min_p": 0, "repetition_penalty": 1,
-              "ignore_eos": True}
-
-    async def streamed(prompt, output):
-        """The time each of a request's tokens reached the client, from SGLang's stream of growing output."""
-        stamps: list[float] = []
-        async for chunk in await engine.async_generate(input_ids=prompt.tolist(), stream=True,
-                                                       sampling_params={**policy, "max_new_tokens": output}):
-            arrived = chunk["meta_info"]["completion_tokens"] - len(stamps)
-            stamps.extend([time.perf_counter()] * arrived)
-        return stamps
-
-    try:
-        points = await async_sweep(args, closed_loop(streamed), streamed)
-    finally:
-        engine.shutdown()
-    return {"label": args.hardware}, points
+def engine_of(backend: str):
+    """`backend`'s points over its engine, each in-process engine's in a module of its own
+    (`serving_vllm_engine`, `serving_sglang_engine`), whose interpreter alone has its engine."""
+    if backend == "vllm":
+        return vllm_points
+    if backend == "vllm-engine":
+        from serving_vllm_engine import engine_points
+        return engine_points
+    from serving_sglang_engine import sglang_points
+    return sglang_points
 
 
 def main():
@@ -501,8 +468,8 @@ def main():
     peaks = ([peak_memory.measured([os.path.abspath(__file__), *sys.argv[1:], "--peak-run", str(index)])
               for index in range(len(args.slots))]
              if args.backend == "dew" and peak_memory.keeps_high_water() else None)
-    engines = {"vllm": vllm_points, "vllm-engine": engine_points, "sglang-engine": sglang_points}
-    hardware, points = dew_points(args) if args.backend == "dew" else asyncio.run(engines[args.backend](args))
+    hardware, points = (dew_points(args) if args.backend == "dew"
+                        else asyncio.run(engine_of(args.backend)(args)))
     if args.backend == "dew":
         for point, peak in zip(points, peaks or [[None]] * len(points), strict=True):
             kept = [held for held in peak if held is not None]

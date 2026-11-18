@@ -110,16 +110,20 @@ class TrainerMesh(TypedDict):
     microbatches: int | None
 
 
-def trainer_mesh(mesh: Mapping[str, int]) -> TrainerMesh:
+def trainer_mesh(mesh: Mapping[str, int | tuple[str, ...]]) -> TrainerMesh:
     """The trainer's `mesh` and `microbatches` a case's mesh record names: its
-    MeshSpec fields and the pipeline's microbatches, refusing a field it lacks."""
+    MeshSpec fields (its axes' sizes and the axes it makes explicit) and the pipeline's
+    microbatches, refusing a field it lacks."""
     fields = {f.name for f in dataclasses.fields(MeshSpec)}
     unknown = sorted(set(mesh) - fields - {"microbatches"})
     if unknown:
         raise ValueError(f"mesh has no field {unknown}; it names MeshSpec's fields {sorted(fields)} "
                          f"and microbatches")
+    microbatches = mesh.get("microbatches")
+    if not (microbatches is None or isinstance(microbatches, int)):
+        raise ValueError(f"a mesh's microbatches are a count, not {microbatches!r}")
     sizes = {name: value for name, value in mesh.items() if name != "microbatches"}
-    return {"mesh": dataclasses.replace(MeshSpec(), **sizes), "microbatches": mesh.get("microbatches")}
+    return {"mesh": dataclasses.replace(MeshSpec(), **sizes), "microbatches": microbatches}
 
 
 def media_values(case: Case) -> tuple[str, TowerBase, ProjectorBase, int]:

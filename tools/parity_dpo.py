@@ -25,8 +25,12 @@ import dataclasses
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
+
+COHORT = "trl"
+"""The releases this file runs against, which its type check reads (tools/reference_releases.RELEASES)."""
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 TRL = "1.12.0"
@@ -59,9 +63,10 @@ def trl_loss(arrays: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
     import torch
     from trl import DPOConfig, DPOTrainer
 
-    defaults = {field.name: field.default if field.default is not dataclasses.MISSING
-                else field.default_factory() if field.default_factory is not dataclasses.MISSING else None
-                for field in dataclasses.fields(DPOConfig)}
+    defaults: dict[str, Any] = {
+        field.name: field.default if field.default is not dataclasses.MISSING
+        else field.default_factory() if field.default_factory is not dataclasses.MISSING else None
+        for field in dataclasses.fields(DPOConfig)}
     policy = torch.tensor(arrays["policy_logits"], dtype=dtype, requires_grad=True)
     reference = torch.tensor(arrays["ref_logits"], dtype=dtype)
 
@@ -103,31 +108,6 @@ def evaluated(arrays: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], dic
     fp32, exact = trl_loss(arrays, torch.float32), trl_loss(arrays, torch.float64)
     return ({name: np.asarray(value, np.float32) for name, value in fp32.items()},
             {name: np.asarray(value, np.float64) for name, value in exact.items()})
-
-
-def composed(arrays):
-    """Dew's own composition (`dew.rl.preference_logsigmoid_terms`) on a batch in TRL's layout, which
-    tests/test_dpo.py holds to the recording."""
-    import jax
-    import jax.numpy as jnp
-
-    from dew.rl import preference_logsigmoid_terms
-
-    ids = jnp.asarray(arrays["input_ids"], jnp.int32)[:, 1:, None]
-    mask = arrays["completion_mask"][:, 1:]
-
-    def token_log_probs(logits):
-        return jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids, axis=-1)[..., 0]
-
-    def loss(policy_logits):
-        policy, ref = token_log_probs(policy_logits), token_log_probs(arrays["ref_logits"])
-        half = policy.shape[0] // 2
-        terms, (chosen, rejected) = preference_logsigmoid_terms(
-            policy[:half], policy[half:], ref[:half], ref[half:], mask[:half], mask[half:], BETA)
-        return jnp.mean(terms), jnp.stack([jnp.mean(chosen), jnp.mean(rejected)])
-
-    (value, rewards), gradient = jax.value_and_grad(loss, has_aux=True)(arrays["policy_logits"])
-    return {"loss": value, "policy_logits_grad": gradient, "rewards": rewards}
 
 
 if __name__ == "__main__":
