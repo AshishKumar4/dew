@@ -308,6 +308,25 @@ class Loop:
                              f"exit gate weighs, got {self.exit_threshold} with exit_gate={self.exit_gate}")
 
 
+def sows_appended(held: Mapping, sown: Mapping) -> dict:
+    """A collection's `held` entries with a call's `sown` ones appended (`_appended`): what a loop's pass
+    sows after the calls before it (`PassView`, `looping.PassStack`)."""
+    return {**held, **{name: _appended(held.get(name), value) for name, value in sown.items()}}
+
+
+def _appended(held, sown):
+    """`held` with `sown` appended at each leaf: a sown tuple extends the held one, a mapping merges
+    key by key, and any other value replaces the held one, as a sow's reduction does."""
+    if isinstance(sown, Mapping):
+        merged: dict[str, object] = dict(held or {})
+        for name, value in sown.items():
+            merged[name] = _appended(merged.get(name), value)
+        return merged
+    if isinstance(sown, tuple):
+        return (*(held or ()), *sown)
+    return sown
+
+
 @dataclasses.dataclass
 class SharedPassView:
     """The passes of a `Loop` with `shared_cache` over its block's own cache entries, which every
@@ -322,10 +341,20 @@ class SharedPassView:
     the passes (`looping.run_loop`)."""
     layers: tuple[int, int]
     entering: Mapping | None = None
+    observed: dict = dataclasses.field(default_factory=dict)
+    """What the step sowed of the block's weights' use before the pass (`OBSERVED`), which the pass's own
+    sows follow (`outside`)."""
 
     def first(self, variables: Mapping[str, Mapping]) -> dict:
         self.entering = variables.get('cache')
-        return dict(variables)
+        return self._observing(variables)
+
+    def _observing(self, variables: Mapping[str, Mapping]) -> dict:
+        """`variables` with what the pass observes (`OBSERVED`) held back: it sows it afresh, entering
+        none, as a pipeline's scan writes only the collections that enter it empty."""
+        self.observed = {collection: dict(tree) for collection, tree in variables.items()
+                         if collection in OBSERVED}
+        return {collection: {} if collection in OBSERVED else tree for collection, tree in variables.items()}
 
     def _apart(self, name: str) -> bool:
         """Whether `name` is the entry of layers outside the block."""
@@ -333,14 +362,15 @@ class SharedPassView:
         return run is not None and (run.stop <= self.layers[0] or run.start >= self.layers[1])
 
     def inside(self, variables: Mapping[str, Mapping]) -> dict:
-        rest = {collection: tree for collection, tree in variables.items() if collection != 'cache'}
+        rest = {collection: tree for collection, tree in self._observing(variables).items()
+                if collection != 'cache'}
         cache = {**{name: value for name, value in variables.get('cache', {}).items() if self._apart(name)},
                  **{name: value for name, value in (self.entering or {}).items() if not self._apart(name)}}
         return {**rest, 'cache': cache} if cache else rest
 
-    @staticmethod
-    def outside(variables: Mapping[str, Mapping]) -> dict:
-        return dict(variables)
+    def outside(self, variables: Mapping[str, Mapping]) -> dict:
+        return {**variables, **{collection: sows_appended(held, variables.get(collection, {}))
+                                for collection, held in self.observed.items()}}
 
 
 @dataclasses.dataclass
@@ -377,7 +407,9 @@ class PassView:
     def inside(self, variables: Mapping[str, Mapping]) -> dict:
         self.held = {collection: dict(tree) for collection, tree in variables.items()}
         back = self.first - self.offset
-        return {collection: tree if collection in OBSERVED else
+        # What the pass observes it sows afresh, entering none, as a pipeline's scan writes only the
+        # collections that enter it empty; `outside` appends it after the calls before.
+        return {collection: {} if collection in OBSERVED else
                 {self._moved(name, back): value for name, value in tree.items() if self._ours(name)}
                 for collection, tree in self.held.items()}
 
@@ -387,7 +419,7 @@ class PassView:
                for collection, tree in self.held.items()}
         for collection, tree in variables.items():
             if collection in OBSERVED:
-                out[collection] = dict(tree)
+                out[collection] = sows_appended(out.get(collection, {}), tree)
                 continue
             out.setdefault(collection, {}).update(
                 {self._moved(name, self.offset - self.first): value for name, value in tree.items()})
