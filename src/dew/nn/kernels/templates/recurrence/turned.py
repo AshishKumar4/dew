@@ -19,7 +19,7 @@ import numpy as np
 from dew.algebra import scan
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
 from dew.nn.kernels.chunked_launch import entry_write
-from dew.nn.precision import at_least_fp32, compensated_add, vanishing
+from dew.nn.precision import at_least_fp32, compensated_add
 
 TWO_PI = (np.float32(2 * np.pi), np.float32(2 * np.pi - float(np.float32(2 * np.pi))))
 """2 pi as fp32's nearest and what it drops, a turn's whole in double float."""
@@ -315,6 +315,18 @@ def _crossed(x, y):
     return x[..., 0] * y[..., 1] - x[..., 1] * y[..., 0]
 
 
+def _before(x, axis: int):
+    """`x`'s exclusive prefix sums along `axis`: each place's sum of those before it, the inclusive sums
+    shifted one place, where the inclusive sum less the place's own lost a small sum beside a large term to
+    its rounding (a chunk's last writer's whole weight beside its earlier ones' exp(-30) each under decays
+    near zero: the turns' gradient's worst row 3.75 from float64 over its size)."""
+    summed = jnp.cumsum(x, axis=axis)
+    axis %= x.ndim
+    padding = [(0, 0)] * x.ndim
+    padding[axis] = (1, 0)
+    return jnp.pad(jax.lax.slice_in_dim(summed, 0, x.shape[axis] - 1, axis=axis), padding)
+
+
 def _suffix(x, axis: int):
     """`x`'s inclusive suffix sums along `axis`."""
     return jnp.flip(jnp.cumsum(jnp.flip(x, axis), axis=axis), axis)
@@ -357,7 +369,7 @@ def _halves(query, key, value, d_out, log, beta, ids, teams, *, scale: float, gr
         later = _suffix(_crossed(q[..., 1, :, :], jnp.einsum('...ij,...jk->...ik', pairs, k[..., 0, :, :])),
                         axis=-2)
         terms = _crossed(jnp.einsum('...ij,...ik->...jk', pairs, q[..., 1, :, :]), k[..., 0, :, :])
-        earlier = jnp.cumsum(terms, axis=-2) - terms
+        earlier = _before(terms, axis=-2)
         level = jnp.stack([earlier, later], axis=-3)
         total = total + jnp.reshape(level, (*level.shape[:-4], length, level.shape[-1]))
         size = half
@@ -391,7 +403,7 @@ def turn_gradient(query, key, value, d_out, g, beta, state, d_final, starts, *, 
     own = _halves(q, k, v, do, log, b, ids, teams, scale=scale, group=group)
     entered = _suffix(_crossed(readers, jnp.einsum('bhnkv,bhncv->bhnck', memories, do)), axis=-2)
     terms = -_crossed(writers, jnp.einsum('bhnkv,bhncv->bhnck', leaving, v))
-    left = jnp.cumsum(terms, axis=-2) - terms
+    left = _before(terms, axis=-2)
     through = jnp.sum(_crossed(jnp.swapaxes(leaving, -1, -2), jnp.swapaxes(passes * memories, -1, -2)),
                       axis=-2)
     return unlaid(own + entered + left + through[..., None, :])
@@ -416,16 +428,6 @@ def _between(later, earlier) -> jax.Array:
     decay `eps |G|` off, where the chunk's `|G|` is many times the pair's own (the crossing form's turn
     gradient 2.5 to 5.3 times the recurrence's error from float64, its arithmetic in float64 0.5 times)."""
     return (later[0] - earlier[0]) + (later[1] - earlier[1])
-
-
-def _vanished(g, begins):
-    """A row's log decays `g` `[B, T, H]` with each that vanishes (`precision.vanishing`: its decay and every
-    span's through it zero) taken as zero, and where its prefix restarts, `[B, T, H]`: at each document's
-    first token (`begins` `[B, T, 1]`) and at each vanished token, which a span through cuts as a document's
-    start does, as the scan's decays segment theirs (`scan._decays_value`): summed in, two of -2^127 put a
-    prefix at -inf and its turns' gradient NaN where the recurrence is finite (audit KPM-02)."""
-    vanished = g <= vanishing(g.dtype)
-    return jnp.where(vanished, 0.0, g), begins | vanished
 
 
 def _sides(q, k, log, b, reads, writes, scale: float):
@@ -460,8 +462,9 @@ def _packed(query, key, value, d_out, g, beta, state, d_final, starts, *, scale:
     # Each chunk's log decays' prefix restarts at each document's first token: summed across a chunk's
     # documents, a pair of a later one took its decays as a difference of the earlier ones' (PaTH's row
     # 7609: a first document's -2^30 rounded the next one's to nothing). A token whose decay vanishes cuts
-    # a head's as a document's start does (`_vanished`).
-    g, cut = _vanished(jnp.asarray(g, work), begins[..., None])
+    # a head's as a document's start does (`scan.vanished`).
+    g, cut = scan.vanished(jnp.asarray(g, work))
+    cut = cut | begins[..., None]
     log = scan.compensated(laid(g), axis=-1, restarts=laid(cut))
     b = laid(jnp.asarray(beta, work))
     ids = laid(jnp.cumsum(cut.astype(jnp.int32), axis=1), mode='edge')
@@ -531,8 +534,8 @@ def _laid_documents(query, key, value, d_out, g, beta, given, d_final, documents
 
     q, k = (laid(jnp.asarray(x, work)[..., :turned]) for x in (query, key))
     v, do = (laid(jnp.asarray(x, work)) for x in (value, d_out))
-    # A token whose decay vanishes cuts its chunk's prefix (`_vanished`): a span through it is none.
-    g, cut = _vanished(jnp.asarray(g, work), jnp.zeros((batch, length, 1), bool))
+    # A token whose decay vanishes cuts its chunk's prefix (`scan.vanished`): a span through it is none.
+    g, cut = scan.vanished(jnp.asarray(g, work))
     log = scan.compensated(laid(g), axis=-1, restarts=laid(cut))
     seen = jnp.cumsum(laid(cut).astype(jnp.int32), axis=-1)
     b = laid(jnp.asarray(beta, work))

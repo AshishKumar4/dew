@@ -15,8 +15,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from recorded_runs import assert_as_exact_as_recorded
 from reference_error import assert_fp32_reduction_bound, declared_seeds
-from reference_runs import assert_as_exact_as_recorded
 from tool_support import run_from
 
 from dew.nn.backbones.edm2 import EDM2UNet

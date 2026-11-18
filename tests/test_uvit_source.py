@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_runs import assert_arms_as_recorded
+from recorded_runs import assert_arms_as_recorded
 from torch_layout import QKV, dew_leaf, join_qkv, node, split_qkv, torch_leaf
 
 from dew.nn.backbones.uvit import UViT

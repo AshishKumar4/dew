@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_runs import assert_arms_as_recorded
+from recorded_runs import assert_arms_as_recorded
 
 from dew.nn.moe import Router
 

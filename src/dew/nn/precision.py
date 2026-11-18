@@ -131,9 +131,11 @@ __all__ = [
     "spread",
     "sqrt_or_zero",
     "stochastic_bf16",
+    "summed_once",
     "twice_scaled",
     "two_product",
     "two_sum",
+    "uncontracted",
     "weighted_total",
     "wide_cpu_arithmetic",
     "widened_reduction",
@@ -1301,7 +1303,16 @@ def _protected(transform: Callable) -> Callable:
 
 @_protected
 def two_sum(left, right):
-    """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum)."""
+    """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum). Each operand is read as
+    one value (`uncontracted`): a compiler that fused the multiply making an operand into the sum (an FMA,
+    XLA's CPU and GPU contract one) would add its exact product where the steps after read its rounded
+    one, counting that rounding twice."""
+    return _two_sum(*uncontracted(left, right))
+
+
+def _two_sum(left, right):
+    """`two_sum`'s arithmetic over operands no multiply makes in the same fusion: a compensated pair's
+    halves, made by additions alone, and values read as one value each (`uncontracted`)."""
     total = left + right
     part = total - left
     return total, (left - (total - part)) + (right - part)
@@ -1325,6 +1336,28 @@ def float_bits(x: jax.Array) -> tuple[jax.Array, ...]:
     normalized = jnp.where(biased > 0, fraction, (fraction << up) & ((1 << width) - 1))
     exponent = jnp.where(biased > 0, biased - bias, limits.minexp - up)
     return sign, biased, fraction, normalized, exponent
+
+
+def uncontracted(*values):
+    """`values` each read as the one value it is, never fused into the arithmetic that reads it: an error-free
+    transform reads each operand more than once and holds only where every read sees the same rounded value,
+    which a compiler's contraction of a multiply into an add (an FMA, XLA's CPU and GPU, Triton's) breaks by
+    reading the exact product at one place and the rounded one at another (a two_product's product added in a
+    compensated sum, its residual then counted twice). An optimization barrier, which no fusion crosses, on
+    the value where it is made, so every reader sees the one rounded value (`two_sum`'s operands,
+    `two_product`'s product); a caller whose plain float32 arithmetic leaned on the contractions a barrier
+    splits around it takes its sum compensated (`summed_once`, row 7979).
+
+    In a Pallas TPU kernel's body (`launches.interpreting` False, a launch compiled for a TPU,
+    `generation.backend`) the values as they are: Pallas TPU's Mosaic lowering takes no barrier (post108 to
+    post110, whose attention forms reach `two_product` and `two_sum` in a kernel body, `natural_exp` and
+    `natural_carried`), which the fork's post111 lowers (row 7954 retires this branch). XLA's TPU programs,
+    and an interpreted kernel's body, which lowers to them, keep the barrier."""
+    from dew.nn.kernels.generation import backend
+    from dew.nn.kernels.launches import interpreting
+
+    in_tpu_kernel = interpreting() is False and backend() == "tpu"
+    return values if in_tpu_kernel else jax.lax.optimization_barrier(values)
 
 
 def binade_of(x: jax.Array) -> jax.Array:
@@ -1422,6 +1455,10 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
             unsigned, mask, _ = _split_bits(np.float32)
             high = (constant.view(unsigned) & unsigned(mask)).view(np.float32)
             return jnp.asarray(high), jnp.asarray(constant - high)
+        # The value read as one (`uncontracted`): its split reads it twice (its high part from its bits or a
+        # scaled copy, then `value - high`), which a multiply that made it, contracted into the subtraction,
+        # would read exactly at one and rounded at the other, a spurious low part.
+        (value,) = uncontracted(value)
         if bit_split:
             unsigned, mask, low = _split_bits(value.dtype)
             mask = np.array(mask, unsigned)
@@ -1451,7 +1488,11 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         scale = jnp.where(halves[0], 2.0, 1.0) * jnp.where(halves[1], 2.0, 1.0)
     lh, ll = split(left)
     rh, rl = split(right)
-    product = rounded(left * right)
+    # The product read as one value (`uncontracted`) by the residual's steps and by its caller alike: a
+    # compiler that took its multiply into the step reading it (`product - head`, a caller's `n - product`)
+    # would read the exact product there and the rounded one elsewhere, the residual then the product's
+    # rounding where a caller adds it to the rounded product.
+    (product,) = uncontracted(rounded(left * right))
     head = rounded(lh * rh)
     lost = rounded(product - head if subtract else head - product)
     cross = ((ll, rh), (lh, rl)) if subtract else ((lh, rl), (ll, rh))
@@ -1775,8 +1816,19 @@ def compensated_add(left, right):
     XLA reassociates no float arithmetic unless fast math is on; with it,
     `lo` cancels to zero and the sum is the plain one."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
-    total, dropped = two_sum(left_hi, right_hi)
-    return two_sum(total, dropped + left_lo + right_lo)
+    return _renormalized((*uncontracted(left_hi), left_lo), (*uncontracted(right_hi), right_lo))
+
+
+@_protected
+def _renormalized(left, right):
+    """`compensated_add`'s arithmetic over pairs whose his no multiply makes in the same fusion (each read as
+    one value, `uncontracted`, or a compensated reduction's accumulator, made by additions alone): the his'
+    TwoSum, then the pair's own, whose operands are additions' (`_two_sum`, no barrier of its own: one in a
+    reduction's computation splits the fusions around the program, row 7953). A lo is read once, so a
+    multiply contracted into its addition reads it once too."""
+    (left_hi, left_lo), (right_hi, right_lo) = left, right
+    total, dropped = _two_sum(left_hi, right_hi)
+    return _two_sum(total, dropped + left_lo + right_lo)
 
 
 @_protected
@@ -1808,9 +1860,10 @@ def _compensated(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     """The sum of `values` over `axes` its compensated pair rounds once, its tangent the plain sum's: a
     protected span (`_compensated_sum`, `dew.nn.derivatives.declared_tangent`), whose compensation the
     algebra pass must not cancel."""
-    wide = values.astype(at_least_fp32(values.dtype))
+    # Each value read as one (`uncontracted`) where it is made: the reduction's pairs are its additions'.
+    (wide,) = uncontracted(values.astype(at_least_fp32(values.dtype)))
     zero = jnp.zeros((), wide.dtype)
-    hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
+    hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), _renormalized, axes)
     return compensated_total((hi, lo), jnp.sum(wide, axes)).astype(values.dtype)
 
 
@@ -1894,6 +1947,41 @@ def _compensated_sum_jvp(axes: tuple[int, ...], primals: tuple[jax.Array],
 
 _compensated_sum = contracted("test_the_precision_seams_hold_every_order")(
     declared_tangent(Protected(), _compensated, _compensated_sum_jvp, nondiff_argnums=(1,)))
+
+
+def summed_once(values: Sequence[jax.Array], products: Sequence[tuple[jax.Array, jax.Array]] = ()
+                ) -> jax.Array:
+    """The sum of `values` and of `products` (each a `(left, right)` pair, broadcasting as `*` does), every
+    product's rounding (`two_product`) and every addition's (`two_sum`) kept and added back once at the end:
+    the sum as one rounding of its twice-precise value leaves it (Ogita, Rump and Oishi's Dot2), whatever a
+    compiler fuses or keeps apart, so no contraction of a multiply into an add (an FMA) it takes or leaves
+    rounds it more (row 7953: a barrier in a step's arithmetic split its fusion and lost the contractions its
+    plain float32 sum leaned on, row 7979). Its tangent is the plain sum's."""
+    return _summed_once(tuple(values), tuple(products))
+
+
+def _summed_once_value(values, products):
+    total = values[0]
+    carried = jnp.zeros_like(total)
+    for left, right in products:
+        product, lost = two_product(left, right, bit_split=True)
+        total, dropped = two_sum(total, product)
+        carried = carried + (lost + dropped)
+    for value in values[1:]:
+        total, dropped = two_sum(total, value)
+        carried = carried + dropped
+    return total + carried
+
+
+def _summed_once_tangent(primals, tangents):
+    (values, products), (value_tangents, product_tangents) = primals, tangents
+    terms = [*value_tangents, *(left_tangent * right + left * right_tangent for (left, right), (
+        left_tangent, right_tangent) in zip(products, product_tangents, strict=True))]
+    return _summed_once_value(values, products), sum(terms[1:], terms[0])
+
+
+_summed_once = contracted("test_the_precision_seams_hold_every_order")(
+    declared_tangent(Protected(), _summed_once_value, _summed_once_tangent))
 
 def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
     """The value `x` takes in `dtype`, held in `x`'s own dtype (`rounded_operand`'s value).

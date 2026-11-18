@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import initialized_decoder
-from reference_runs import assert_arms_as_recorded
+from recorded_runs import assert_arms_as_recorded
 
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs

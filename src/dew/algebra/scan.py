@@ -1124,13 +1124,26 @@ def between(exponents, *, base2: bool = False) -> jax.Array:
     return _decays(exponents, base2).between
 
 
+def vanished(exponents, base2: bool = False) -> tuple[jax.Array, jax.Array]:
+    """`(live, cut)` of `exponents` (decays' natural logarithms, base 2's where `base2`): `live` the exponents
+    with each vanished token's (`precision.vanishing`'s threshold: its decay zero) set to 0, and `cut` where
+    a span restarts, at each vanished token. A prefix sums `live` and restarts at a `cut`, and a span reaching
+    through a cut is zero, so no sum holds a vanished token's (two of -2**127 summed are -inf; one of -2**70
+    loses a later -1 to its rounding). The one reading of the threshold: a walk's chunk (`_walked`), a
+    chunk's spans (`_decays_value`) and a turned call's turns' gradient (`templates.recurrence.turned`) go
+    through it, where three copies of it left the turned gradient's prefixes summing vanished tokens (row
+    8426, audit KPM-02)."""
+    cut = exponents <= vanishing(exponents.dtype, base2)
+    return jnp.where(cut, 0.0, exponents), cut
+
+
 def _walked(exponents, base2: bool) -> jax.Array:
     """A chunk's whole decay in natural units, per key, as a walk's state carries it (`Derived.step`,
     `merge`): its exponents' compensated sum, or its dtype's vanished decay where a token's decay vanishes
     (`vanishing`; two of -2**127 summed are -inf, and its residual NaN)."""
-    vanished = exponents <= vanishing(exponents.dtype, base2)
-    live = _scanned(jnp.where(vanished, 0.0, exponents))[-1] * (math.log(2.0) if base2 else 1.0)
-    return _held(jnp.where(jnp.any(vanished, axis=0), vanishing(exponents.dtype, base2=False), live))
+    live, cut = vanished(exponents, base2)
+    summed = _scanned(live)[-1] * (math.log(2.0) if base2 else 1.0)
+    return _held(jnp.where(jnp.any(cut, axis=0), vanishing(exponents.dtype, base2=False), summed))
 
 
 def _held(decay: jax.Array) -> jax.Array:
@@ -1145,9 +1158,9 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     one and starts the next, taken as 0 within it, so no span's sum holds a vanished token's (a prefix
     holding -2**127 twice is -inf; one holding -2**70 loses a later -1 to its rounding, its decay 1 in place
     of `exp(-1)`), and each span through one is zero."""
-    vanished = exponents <= vanishing(exponents.dtype, base2)
-    high, low = compensated(jnp.where(vanished, 0.0, exponents), restarts=vanished)
-    segments = jnp.cumsum(vanished.astype(jnp.int32), axis=0)
+    live, cut = vanished(exponents, base2)
+    high, low = compensated(live, restarts=cut)
+    segments = jnp.cumsum(cut.astype(jnp.int32), axis=0)
     count = exponents.shape[0]
     below = (jnp.arange(count)[:, None] >= jnp.arange(count)[None, :])[:, :, None]
     gaps = (high[:, None] - high[None, :]) + (low[:, None] - low[None, :])

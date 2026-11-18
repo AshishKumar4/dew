@@ -93,9 +93,10 @@ def test_softplus_holds_every_order(edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_precision_seams_hold_every_order(edge):
-    """`precision`'s correctly rounded division (a primitive of its own), compensated sum and rounded operand
-    (each a custom derivative): every order finite wherever float64 is a normal float32 and the plain
-    formula, the division, the sum and the identity as JAX writes them, is."""
+    """`precision`'s correctly rounded division (a primitive of its own), compensated sum, rounded operand
+    and sum of products rounded once (each a custom derivative): every order finite wherever float64 is a
+    normal float32 and the plain formula, the division, the sum, the identity and the sum of products as JAX
+    writes them, is."""
     numerator, denominator = normal_draw(2648, (5, 4), (5, 4), scale=EDGES[edge])
     numerator_direction, denominator_direction = normal_draw(2649, (5, 4), (5, 4), scale=EDGES[edge])
     (cotangent,) = normal_draw(2650, (5, 4))
@@ -117,6 +118,19 @@ def test_the_precision_seams_hold_every_order(edge):
     assert_contract(lambda x: precision.rounded_operand(x, jnp.bfloat16), (numerator,),
                     (numerator_direction,), cotangent, f"a rounded operand {edge}",
                     plain_fn=lambda x: x.astype(jnp.bfloat16).astype(x.dtype))
+
+    def plain_terms(x, eps, dt, slope):
+        return x + eps * dt + slope * dt ** 2
+
+    def terms_once(x, eps, dt, slope):
+        return precision.summed_once((x,), ((eps, dt), (slope, dt ** 2)))
+
+    (scale,) = normal_draw(2657, (5, 1), scale=EDGES[edge] ** 0.25)
+    (scale_direction,) = normal_draw(2658, (5, 1), scale=EDGES[edge] ** 0.25)
+    assert_contract(terms_once, (numerator, denominator, scale, numerator),
+                    (numerator_direction, denominator_direction, scale_direction, numerator_direction),
+                    cotangent, f"a sum of products rounded once {edge}", truth_fn=plain_terms,
+                    plain_fn=plain_terms)
 
 
 @pytest.mark.parametrize("edge", EDGES)
