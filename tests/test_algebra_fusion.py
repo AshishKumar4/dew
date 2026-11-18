@@ -260,6 +260,63 @@ def test_a_prologue_the_template_refuses_leaves_the_rows_computed_once():
     assert len(projections) == 2 and rows == [jnp.bfloat16, jnp.bfloat16], rows
 
 
+def named_gate(x, w, up):
+    """A gate projection named for remat (`checkpoint_name`, as Dew's models name gate_proj) and its SwiGLU
+    with `up` after it, the activation written entry by entry (`jax.nn.silu`'s own derivative rule is a call
+    no epilogue enters)."""
+    from jax.ad_checkpoint import checkpoint_name
+
+    gate = checkpoint_name(x @ w, "gate_proj")
+    return gate * jax.lax.logistic(gate) * up
+
+
+def test_a_named_products_consumers_are_its_epilogue_its_name_the_launchs_residual():
+    """A product named for remat, its SwiGLU after the name, under the pass on an H100 whose template a call
+    names: the SwiGLU is the product's epilogue (its 'gemm_epilogue' route the fused kernel's), where the
+    name ended the region; the name is the launch's own, on a value the fused call hands out (its residual,
+    `fused_gemm._named`), no product of XLA's left to name; the program computes as written, gradients too
+    (check 1)."""
+    from contract_support import normal_drawn
+    from reference_error import assert_as_exact, with_gradients
+
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16),
+              jax.ShapeDtypeStruct((256, 256), jnp.bfloat16))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        with generation.routes() as found:
+            traced = jax.jit(algebra.rewritten(named_gate, kernels=True)).trace(*shapes)
+        assert any(route.choice == "gemm_epilogue" and route.kernel == "fused" for route in found), [
+            (route.choice, route.kernel) for route in found]
+        assert not [equation for equation in traced.jaxpr.jaxpr.eqns
+                    if equation.primitive is jax.lax.dot_general_p]
+        operands = normal_drawn(5098, (256, 512), (512, 256), (256, 256), dtype=jnp.bfloat16)
+        cotangent = normal_drawn(5099, (256, 256), dtype=jnp.bfloat16)
+        assert_as_exact(jax.jit(with_gradients(algebra.rewritten(named_gate, kernels=True))),
+                        jax.jit(with_gradients(named_gate)),
+                        lambda seed: (*operands(seed), *cotangent(seed)), "a named gate under the pass",
+                        seeds=8,
+                        truth_fn=with_gradients(lambda *x: named_gate(*(a.astype(jnp.float64) for a in x))))
+
+
+def named_rows(x, w):
+    """A sine of rows named for remat before it, then their product: a name on a prologue's value."""
+    from jax.ad_checkpoint import checkpoint_name
+
+    return jnp.sin(checkpoint_name(x, "rows")) @ w
+
+
+def test_a_name_on_a_products_rows_stays_outside_its_prologue():
+    """A remat name on the value a product's prologue reads (`named_rows`) bounds the prologue, which still
+    fuses the sine after it on an H100 whose template a call names: a producer's stage runs no name (a name
+    pulled into it was refused there, and the sine's operand formed whole)."""
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), \
+            generation.routes() as found:
+        traced = jax.jit(algebra.rewritten(named_rows, kernels=True)).trace(*shapes)
+    assert any(route.choice == "gemm_prologue" and route.kernel == "fused" for route in found), [
+        (route.choice, route.kernel) for route in found]
+    assert not [equation for equation in traced.jaxpr.jaxpr.eqns if equation.primitive is jax.lax.sin_p]
+
+
 def test_a_starts_forward_nothing_reads_is_never_written_as_a_kernel():
     """A start-like program (row 6783): a region that makes a parameter and computes a grouped product from
     it, as a flax init's block makes its parameters inside its forward (here a checkpointed one), the

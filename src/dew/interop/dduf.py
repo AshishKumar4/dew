@@ -15,7 +15,7 @@ import base64
 import hashlib
 import os
 from collections.abc import Mapping
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import IO
 
 import jax
@@ -24,7 +24,7 @@ import numpy as np
 from dew import _records
 from dew._builds import dew_cache_dir
 from dew._cache import hub_answer, recorded_hub_answer
-from dew._files import staged, stat_identity
+from dew._files import inside, staged, stat_identity
 from dew.interop import sources
 from dew.interop.safetensors_io import stored_spec
 
@@ -44,8 +44,7 @@ def _contained(entries: Entries, label: str) -> Entries:
     """`entries`, refused where one names a path outside the directory it unpacks into, which the DDUF
     format's own checks leave (`read_dduf_file` admits `../x.json`)."""
     for name in entries:
-        parts = PurePosixPath(name)
-        if parts.is_absolute() or ".." in parts.parts:
+        if not inside(name):
             raise ValueError(f"{label} names an entry {name!r} outside its own directory")
     return entries
 

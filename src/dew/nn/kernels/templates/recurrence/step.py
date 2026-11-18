@@ -498,7 +498,8 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token, 
         token.stored(state_out, kept, start + k)
         if hooks.delta:
             return read_write(k, written) if reads_write else jnp.zeros_like(written)
-        return (read(k, tile), read_write(k, written)) if reads_write else (read(k, tile),)
+        # Two terms summed apart where the query reads the write, else the one `_summed_keys` takes bare.
+        return (read(k, tile), read_write(k, written)) if reads_write else read(k, tile)
 
     if hooks.delta:
         sums = _summed_keys(span, row, lambda k, tile: (read(k, tile), (entry(1, k) * entry(2, k)) * tile),

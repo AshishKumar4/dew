@@ -12,13 +12,23 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, SUMS_IN_IEEE, generations, lowers, runs
+from generation_support import COMPILES_ON_CPU, INTERPRETS, SUMS_IN_IEEE, generations, lowers, runs
 from jax.experimental.pallas import fuser
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import as_given, assert_as_exact, with_gradients
 from tuned import each_config
 
-from dew.nn.kernels import fused_gemm, gemm, generation, grouped_matmul, low_rank, projections, tuning
+from dew.nn.kernels import (
+    fused_gemm,
+    gemm,
+    generation,
+    grouped_launch,
+    grouped_matmul,
+    grouped_triton,
+    low_rank,
+    projections,
+    tuning,
+)
 from dew.nn.kernels.templates import cost, mosaic_sm90, product, resources, tail
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
 from dew.nn.kernels.templates.gemm.hooks import Hooks
@@ -1212,7 +1222,7 @@ def test_a_dense_forwards_balanced_tail_holds_check_1_through_its_hooks(rows, de
     def dew(x, w, ms, nw, b):
         return mosaic_gpu.gmm(x, w[None], jnp.asarray([rows], jnp.int32), tiles=COOPERATIVE,
                               transpose_rhs=False, out_dtype=jnp.bfloat16, multiprocessors=8,
-                              interpret=grouped_matmul.INTERPRETED, dense=True, prologue=normed,
+                              interpret=grouped_launch.INTERPRETED, dense=True, prologue=normed,
                               prologue_operands=(ms, nw), prologue_axes=(("rows",), ("depth",)),
                               epilogue=biased, epilogue_operands=(b,), epilogue_axes=(("columns",),))
 
@@ -1244,7 +1254,7 @@ def test_a_dense_depth_split_whose_last_wave_would_balance_walks_its_runs():
     def dew(splits):
         return mosaic_gpu.gmm(x, w[None], jnp.asarray([rows], jnp.int32),
                               tiles=dataclasses.replace(COOPERATIVE, splits=splits), transpose_rhs=False,
-                              out_dtype=jnp.bfloat16, multiprocessors=8, interpret=grouped_matmul.INTERPRETED,
+                              out_dtype=jnp.bfloat16, multiprocessors=8, interpret=grouped_launch.INTERPRETED,
                               dense=True)
 
     with generation.assumed(target):
@@ -1272,7 +1282,7 @@ def test_a_dense_products_depth_split_sums_its_partials_once(generation_name, tr
     def dew(splits, out_dtype=jnp.bfloat16, **hooks):
         return mosaic_gpu.gmm(x, w[None], jnp.asarray([rows], jnp.int32),
                               tiles=dataclasses.replace(tiles, splits=splits), transpose_rhs=transpose_rhs,
-                              out_dtype=out_dtype, multiprocessors=8, interpret=grouped_matmul.INTERPRETED,
+                              out_dtype=out_dtype, multiprocessors=8, interpret=grouped_launch.INTERPRETED,
                               dense=True, exact_sums=bool(jnp.dtype(out_dtype) == jnp.float32), **hooks)
 
     with generation.assumed(generation_name):
@@ -1904,8 +1914,8 @@ def test_the_tpu_launches_gradients_hold_check_1(case):
                         truth_fn=_gradients(_plain(spec, truth=True)))
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
-@pytest.mark.parametrize("launch,trans_rhs", [(grouped_matmul.Gmm(), False), (grouped_matmul.Gmm(), True),
-                                              (grouped_matmul.Tgmm(), None)],
+@pytest.mark.parametrize("launch,trans_rhs", [(grouped_triton.Gmm(), False), (grouped_triton.Gmm(), True),
+                                              (grouped_triton.Tgmm(), None)],
                          ids=["Gmm", "Gmm-transposed", "Tgmm"])
 def test_the_hooked_dense_launches_lower_for_cuda(launch, trans_rhs, generation_name):
     """Each Triton launch of a dense call, with a prologue (and the forward's epilogue) and at the highest
@@ -1916,7 +1926,7 @@ def test_the_hooked_dense_launches_lower_for_cuda(launch, trans_rhs, generation_
     f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
     sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
     prologue = (normed, (f32((rows,)), f32((depth,))), (("rows",), ("depth",)))
-    if isinstance(launch, grouped_matmul.Tgmm):
+    if isinstance(launch, grouped_triton.Tgmm):
         args = (bf16((rows, depth)), bf16((rows, width)), sizes, prologue[1])
         hooks = Hooks(prologue[0], prologue[2])
         options = {"out_dtype": "float32", "hooks": hooks, "interpret": False}
@@ -1946,7 +1956,7 @@ def test_the_mosaic_kernels_load_a_side_operands_rows_from_any_dimension():
     sizes = jnp.asarray(SIDE_SIZES)
     common = {"tiles": mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma'), "out_dtype": jnp.float32,
               "multiprocessors": 1,
-              "interpret": grouped_matmul.INTERPRETED}
+              "interpret": grouped_launch.INTERPRETED}
     for hook, layout, transposed in SIDE_LAYOUTS:
         def dew(x, w, dy, side, hook=hook, layout=layout, transposed=transposed):
             options = {"prologue": hook, "prologue_operands": (side.T if transposed else side,),
@@ -1970,7 +1980,7 @@ def test_a_split_kernel_gradient_holds_check_1(splits):
 
     def split(x, dy):
         return mosaic_gpu.tgmm(x, dy, sizes, tiles=tiles, out_dtype=jnp.float32, multiprocessors=1,
-                               interpret=grouped_matmul.INTERPRETED)
+                               interpret=grouped_launch.INTERPRETED)
 
     def plain(x, dy, truth=False):
         wide = jnp.float64 if truth else jnp.float32
@@ -1998,7 +2008,7 @@ def test_a_dense_split_kernel_gradient_reads_its_runs_as_loaded_and_holds_check_
 
         def split(x, dy):
             return mosaic_gpu.tgmm(x, dy, jnp.asarray([ROWS], jnp.int32), tiles=tiles, out_dtype=jnp.float32,
-                                   multiprocessors=1, interpret=grouped_matmul.INTERPRETED, dense=True)
+                                   multiprocessors=1, interpret=grouped_launch.INTERPRETED, dense=True)
 
         def plain(x, dy, truth=False):
             wide = jnp.float64 if truth else jnp.float32
@@ -2020,7 +2030,7 @@ def test_a_kernel_gradient_its_consumers_feed_holds_check_1(exact_sums):
 
     def fed(x, dy):
         return mosaic_gpu.tgmm(x, dy, jnp.asarray(SIZES), tiles=tiles, out_dtype=jnp.float32,
-                               multiprocessors=1, interpret=grouped_matmul.INTERPRETED, exact_sums=exact_sums)
+                               multiprocessors=1, interpret=grouped_launch.INTERPRETED, exact_sums=exact_sums)
 
     def plain(x, dy):
         return _kernel_gradient(x, dy, SIZES)
@@ -2092,7 +2102,7 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
     through each launch at one tile, grouped and dense, it and the default path are each on par with the
     plain kernel gradient over the draws (check 1), truth the plain kernel gradient in float64."""
     # One tile both ways, a step of EXACT_STEP rows.
-    tiles = {grouped_matmul.Tgmm: grouped_matmul.Tile(64, 128, 64, 4, 2),
+    tiles = {grouped_triton.Tgmm: grouped_launch.Tile(64, 128, 64, 4, 2),
              grouped_matmul.MosaicTgmm: mosaic_gpu.Tiles(64, 128, 64, 2, 1, family='wgmma')}
     launches = ("triton", "mosaic") if generation_name == "sm90" else ("triton",)
     for launch, group_sizes, precision in itertools.product(launches, (SIZES, None),
@@ -2210,8 +2220,8 @@ def test_a_pin_names_only_a_config_the_launchs_kernel_takes():
     calls = ((forward, (x, w), "mosaic", grouped_matmul.MosaicGmm,
               mosaic_gpu.Tiles(64, 64, 64, 1, 1, family='wgmma'),
               mosaic_gpu.Tiles(64, 64, 64, 2, 1, family='wgmma')),
-             (gradient, (x, dy), "triton", grouped_matmul.Tgmm, grouped_matmul.Tile(128, 128, 64, 4, 3),
-              grouped_matmul.Tile(64, 128, 64, 4, 3)))
+             (gradient, (x, dy), "triton", grouped_triton.Tgmm, grouped_launch.Tile(128, 128, 64, 4, 3),
+              grouped_launch.Tile(64, 128, 64, 4, 3)))
     for run, args, named, launch, refused, legal in calls:
         with generation.assumed("sm90"), generation.chosen(grouped_matmul=named):
             with tuning.pinned({launch: refused}), pytest.raises(tuning.Unpinnable):
@@ -2271,11 +2281,11 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
         assert launch.legal(exact, narrow, target) and launch.legal(plain, narrow, target)  # 128 a thread
         assert not launch.legal(exact, wide, target) and launch.legal(plain, wide, target)  # 256
         # Triton's kernel gradient with exact sums takes at most EXACT_STEP rows a step.
-        triton = grouped_matmul.Tgmm()
+        triton = grouped_triton.Tgmm()
         steps = {tile.block_m for tile in triton.fitting(triton.bind(
             bf16((rows, 768)), bf16((rows, 1536)), sizes, (), out_dtype="float32", interpret=False,
             exact_sums=True), target)}
-        assert steps and max(steps) <= grouped_matmul.EXACT_STEP
+        assert steps and max(steps) <= grouped_launch.EXACT_STEP
 
 
 @lowers("sm90")
@@ -2431,6 +2441,7 @@ def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_its_float64
     assert float(product.interpreted(declared, lhs, rhs, (((1,), (0,)), ((), ())))[0, 0]) == 1.0
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "family"), [("sm80", "mma.sync"), ("sm90", "wgmma"),
                                                          ("sm100", "tcgen05")])
 @pytest.mark.parametrize("product", ["forward", "kernel gradient"])
@@ -2484,5 +2495,3 @@ def test_each_familys_deepest_ring_compiles_within_its_resources(generation_name
     found = compile_mosaic_kernels([case(stages)], generation_name)
     assert found[0].get("kernels"), found
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-
-

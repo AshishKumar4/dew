@@ -17,8 +17,9 @@ RESOLVED=2026-10-12T00:00:00Z
 # Dew's own FlashAttention wheels resolve as they stood when 0.3.12 was published (PyPI's upload times,
 # 2026-11-15T00:58:08-00:58:16Z), past the pins the locks hold (-P); nothing else moves.
 FLASH=2026-11-15T00:59:00Z
-# jaxlib and its CUDA plugins resolve as they stood when 0.12.0.1 was published, which the jax build Dew
-# carries its patches on pins exactly; nothing else moves.
+# What of JAX's own builds Dew's package index does not serve (libtpu) resolves as it stood when jaxlib
+# 0.12.0.1 was published, which the jax build Dew carries its patches on pins exactly; jaxlib and the CUDA
+# plugins are the index's (`UNDATED`). Nothing else moves.
 JAXLIB=2026-10-21T22:00:00Z
 # The agent environments' SDKs resolve as they stood when their adapters were written: OpenEnv
 # 0.9.0 and Daytona 0.225.0 with the API clients it pins to its own version.
@@ -26,14 +27,15 @@ ENVIRONMENTS=2026-10-17T00:00:00Z
 # certifi resolves past RESOLVED to 2026.10.19, the first without the emSign root whose intermediates'
 # keys were compromised (constraints.txt holds that floor); nothing else moves.
 CERTIFI=2026-10-20T03:00:00Z
-# Every package Dew's package index (constraints.txt's extra index) serves its own builds of, as its root page
-# lists them (the fork's patch_stack.py writes it: jax, qwix), takes no date: the index's static pages give no
-# upload times, which a date would need. Read at each lock, so a package the index takes on resolves with it,
-# and none of the dated lists below dates one (both at once filtered every version of the CUDA plugins once the
-# index took them: ledger 3116).
-INDEX=$(sed -n 's/^--extra-index-url //p' constraints.txt)
-UNDATED=$(curl -fsS "$INDEX/" | sed -n 's|.*<a href="\([^/"]*\)/">.*|\1|p')
-[ -n "$UNDATED" ] || { echo "Dew's package index $INDEX lists no package" >&2; exit 1; }
+# Every package Dew's package index (constraints.txt's extra indexes: the index, and a release under test's
+# staging of it) serves its own builds of, as their root pages list them (the fork's patch_stack.py writes
+# them: jax, qwix), takes no date: the index's static pages give no upload times, which a date would need.
+# Read at each lock, so a package the index takes on resolves with it, and none of the dated lists below dates
+# one (both at once filtered every version of the CUDA plugins once the index took them: ledger 3116).
+INDEXES=$(sed -n 's/^--extra-index-url //p' constraints.txt)
+UNDATED=$(for index in $INDEXES; do curl -fsS "${index%/}/" | sed -n 's|.*<a href="\([^/"]*\)/">.*|\1|p'; done |
+  sort -u)
+[ -n "$UNDATED" ] || { echo "Dew's package index ($INDEXES) lists no package" >&2; exit 1; }
 # Each package of a dated list the index does not serve (`UNDATED`), with its date: `--exclude-newer-package
 # NAME=DATE -P NAME`.
 dated() {

@@ -946,7 +946,9 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
     emits (`_emitted_forms`: plain and transposed right operands, 16-bit and fp32 stores, fixed and streamed
     side vectors and tiles, several outputs, the running sum) at one consumer and at the family's most
     (`_contract_cases`), each form among those the compile gate compiles for the generation, where its
-    contract compiles beside its picks."""
+    contract compiles beside its picks. A form's most consumers are those of the family its launch derives
+    on (a B200's GEMM forms tcgen05's, one consumer, where its contract bundle, mma.sync's fed rings, takes
+    two)."""
     family = bundles.of(generation_name, jnp.bfloat16)
     assert family is not None
     # Every contract form is compiled beside the gate's picks (`test_each_gemm_mainloop_compiles_...`).
@@ -954,8 +956,10 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
                                for name in param.values}
     assert _family_forms(generation_name) <= _gate_forms(generation_name)
     cases = _contract_cases(generation_name)
-    counts = sorted({1, min(family.consumers, mosaic_gpu.CONSUMERS)})
-    expected = {(form, count) for form in _emitted_forms(family) for count in counts}
+    launched = {case.form: pricing.family_of(case.tile, jnp.bfloat16) for case in cases}
+    assert set(launched) == _emitted_forms(family), sorted(_emitted_forms(family) ^ set(launched))
+    expected = {(form, count) for form, emitting in launched.items()
+                for count in {1, min(emitting.consumers, mosaic_gpu.CONSUMERS)}}
     got = {(case.form, case.consumers) for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))
 
@@ -1749,4 +1753,3 @@ def test_a_grouped_calls_walk_takes_every_column_tile_and_a_dense_ones_a_power_o
         tile = launch.derived(arguments, generation.gpu_target())
     columns = 768 // tile.block_n  # three or six: no power of two, so the two bands differ
     assert (tile.grid_block_n & (tile.grid_block_n - 1) == 0) if dense else tile.grid_block_n == columns, tile
-

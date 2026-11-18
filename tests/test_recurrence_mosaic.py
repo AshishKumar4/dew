@@ -1968,7 +1968,7 @@ def test_a_launch_past_its_ladders_foot_is_certified_at_a_program_fewer():
             operands).lower(lowering_platforms=('cuda',))
     walked = [each for each in report.certifications() if id(each) not in before and any(
         binary.kernel == 'recurrence_query_key' for _, binary in each.kernels.values())]
-    # A round certifies its rungs together: one after the rung that holds is certified, and not taken.
+    # Rungs are certified one after another: the walk stops at the first that holds.
     held = [each.config.residents.of('recurrence_query_key') for each in walked if not each.refused]
     assert held == [2], walked
 
@@ -2045,7 +2045,7 @@ def test_lightning_attentions_training_step_starts_unspilled_asking_each_rung_on
     # kernel's next rung reads nothing that moved. A rung's kernels that did not move keep their modules.
     spilled = [(each.pulled, module) for each in certified for module, binary in each.kernels.values()
                if binary.refused]
-    # A round certifies its rungs together: one after the rung a kernel holds at is certified, and not taken.
+    # Rungs are certified one after another: each kernel's walk stops at the rung it holds at.
     held: dict[str, bool] = collections.defaultdict(bool)
     for each in certified:
         for _, binary in each.kernels.values():
@@ -2182,7 +2182,8 @@ with report.refusals(), generation.assumed(facts), report.certifying(device):
     found = report._misses_of([dataclasses.replace(binary, frame=8)])
     report._held(found, programs[1])
     (identity, _), _, refused = found[0]
-    stored = [tuning.stored_verdict(device.device_kind, report._verdict_key(identity, rung, refused.reverse))
+    stored = [tuning.stored_verdict(report.verdict_target(device),
+                                    report._verdict_key(identity, rung, refused.reverse))
               is not None for rung in rungs]
 print(json.dumps({"stored": stored}))
 """

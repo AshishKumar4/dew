@@ -29,7 +29,7 @@ import grain.python as grain
 import numpy as np
 from etils import epath
 
-from dew._files import staged
+from dew._files import inside, is_uri, staged
 from dew.data.pipeline import TOKEN_FIELDS, Rejected
 from dew.data.tokens import chunk_table
 
@@ -343,8 +343,9 @@ class HFTokenizer:
                  held: str | None = None):
         self.name = name
         self.local_files_only = local_files_only
-        # The file hashes a record holds of the tokenizer it names, which its files must hash to here.
-        self.files = files
+        # The file hashes a record holds of the tokenizer it names, which its files must hash to here, each
+        # path confined to the tokenizer's directory before any file is read or written by it.
+        self.files = None if files is None else confined_files(files)
         # The run that holds a copy of it by those hashes (`held_place`), read in place of its name.
         self.held = held
 
@@ -356,7 +357,9 @@ class HFTokenizer:
         if self.files is not None and self.held is not None:
             place = held_place(self.held, self.files)
             if (place / HELD_FILES).exists():
-                # The copy its run holds, as a directory of this host's (a run on a bucket among them).
+                # The copy its run holds, as a directory of this host's (a run on a bucket among them), its
+                # files its own: a run is outside input, and a link out would copy another file in.
+                _unlinked(place, self.files)
                 source = cached_tokenizer(place, self.files)
         pinned = pin_tokenizer(source, local_files_only=self.local_files_only)
         if self.files is not None and pinned.files != self.files:
@@ -437,10 +440,11 @@ class HFTokenizer:
     def save_pretrained(self, directory) -> None:
         """Write this tokenizer's own files into an export directory.
 
-        The tokenizer writes tokenizer.json, tokenizer_config.json and its
-        vocabulary itself, so the export copies no files by hand and the
-        result loads in anything that reads the HF layout.
-        """
+        The tokenizer writes tokenizer.json, tokenizer_config.json and its vocabulary itself, as it holds
+        them (a run's processor may have set its special tokens and template), so the export copies no files
+        by hand and the result loads in anything that reads the HF layout. Its files' hashes are not its
+        run's: runs compare tokenizers through one canonical form where the hashes differ
+        (`canonical_files`)."""
         self.tokenizer.save_pretrained(str(directory))
 
     def __repr__(self):
@@ -966,12 +970,44 @@ def cached_tokenizer(source: epath.Path, files: Mapping[str, str], *, named: str
     return str(local)
 
 
+def canonical_files(tokenizer: HFTokenizer) -> dict[str, str]:
+    """The hashes of `tokenizer`'s files as this host's transformers writes them (`save_pretrained` of the
+    tokenizer it loads), each path in its directory: one canonical form, which two copies of one tokenizer
+    share whatever bytes each holds, a copy transformers wrote again among them."""
+    with tempfile.TemporaryDirectory(prefix="dew-canonical-") as written:
+        tokenizer.tokenizer.save_pretrained(written)
+        return {str(path.relative_to(written)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in sorted(Path(written).rglob("*")) if path.is_file()}
+
+
+def confined_files(files: Mapping[str, str]) -> dict[str, str]:
+    """A record's tokenizer files (each path to its hash) whose paths all stand within the tokenizer's
+    directory, a file's (`dew._files.inside`), not a directory's. Any other is refused (ValueError)
+    before a file is read or written by it: a saved run's record is outside input, and a path out of the
+    directory would copy into, or out of, an unrelated place (`copy_checked`)."""
+    for path in files:
+        if not inside(path, directory=False):
+            raise ValueError(f"a recorded tokenizer file must be a path within its directory, not {path!r}")
+    return dict(files)
+
+
+def _unlinked(held: epath.Path, files: Mapping[str, str]) -> None:
+    """Refuse (ValueError) a run's held tokenizer copy (`held_place`) a file of which a link takes out of
+    its directory; a bucket's holds no links."""
+    if is_uri(str(held)):
+        return
+    root = Path(held).resolve()
+    for path in files:
+        if not Path(held / path).resolve().is_relative_to(root):
+            raise ValueError(f"the tokenizer the run holds at {held} links {path} out of its directory")
+
+
 def copy_checked(source: epath.Path, target: epath.Path, files: Mapping[str, str]) -> None:
     """Each of a tokenizer's `files` copied from the directory `source` into `target`, each read and checked
-    against its hash before it is written: a file missing, or whose bytes differ, is refused, naming it.
-    The one copier of a tokenizer's files, into a run (`dew.inference.tasks.hold_tokenizer`) and into this
-    host's cache (`cached_tokenizer`)."""
-    for path, digest in files.items():
+    against its hash before it is written: a path out of the directory (`confined_files`), a file missing,
+    or one whose bytes differ, is refused, naming it. The one copier of a tokenizer's files, into a run
+    (`dew.inference.tasks.hold_tokenizer`) and into this host's cache (`cached_tokenizer`)."""
+    for path, digest in confined_files(files).items():
         contents = (source / path).read_bytes()
         if hashlib.sha256(contents).hexdigest() != digest:
             raise ValueError(f"the tokenizer at {source} differs from its record in {path}")

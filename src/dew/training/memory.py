@@ -21,7 +21,7 @@ from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding
 
 from dew import communicators
-from dew._devices import device_memory, gpu_free_bytes, xla_flag
+from dew._devices import device_memory, fresh_pool, gpu_free_bytes, xla_flag
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
@@ -306,16 +306,19 @@ def recompute_record[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> 
 
 
 def rung_record[LossT, EffectsT](objective: Objective[LossT, EffectsT], xla_defaults: bool, *,
-                                 narrow: bool) -> dict[str, JSON]:
+                                 narrow: bool, ns_group: int | None = None) -> dict[str, JSON]:
     """The rung of the fit ladder a step compiles at, as a checkpoint records
     it: the objective's head tile and whether that head is fused, its trained
     modules' remat (`recompute_record`), whether the step keeps XLA's
     default options, beside each head (`dew.training.planning.FitSearch.ladder`),
-    and whether it reads the parameters through narrow copies
-    (`dew.training.narrow`). Each decides the program a step runs."""
+    whether it reads the parameters through narrow copies
+    (`dew.training.narrow`), and the stacks of one shape its Newton-Schulz joins at a time where the run
+    states none (`ns_group`, `dew.newton_schulz.released`: None joins them all). Each decides the program a
+    step runs."""
     tile = head_tile_of(objective)
     return {'head_tile': None if tile is None else list(tile), 'head_fused': head_fused_of(objective),
-            'remat': recompute_record(objective), 'xla_defaults': xla_defaults, 'narrow': narrow}
+            'remat': recompute_record(objective), 'xla_defaults': xla_defaults, 'narrow': narrow,
+            'ns_group': ns_group}
 
 
 def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0,
@@ -338,7 +341,16 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     stats = compiled_memory(executable)
     if stats is None:
         return None
-    return admitted(devices, stats.argument - built, placed_beside(stats, held), stats.temp, placed=placed)
+    return admitted(devices, *admission(stats, held, built), placed=placed)
+
+
+def admission(stats: CompiledMemory, held: int = 0, built: int = 0) -> tuple[int, int, int]:
+    """A compiled program's terms as the allocator admits it (`admitted`): its resident bytes, its argument
+    bytes less the `built` bytes of them its first call builds in place; the bytes placed beside its
+    temporaries (`placed_beside`: its outputs that write over no donated argument and the `held` bytes kept
+    outside it); and its temporaries, one allocation. A step's fit (`step_headroom`) and a GPU part's need
+    (tests/model_flows.py's `need`) read it alike."""
+    return stats.argument - built, placed_beside(stats, held), stats.temp
 
 
 def placed_beside(stats: CompiledMemory, held: int) -> int:
@@ -393,6 +405,28 @@ def _admitted(devices: Sequence, memory: Sequence[Mapping[str, int]], beside: in
     return min(margins)
 
 
+def needed(device, resident: int, beside: int, temporaries: int) -> int:
+    """The least bytes a GPU like `device` must hold for `admitted` to admit a step of `temporaries`, with
+    `resident` bytes in use and `beside` more placed: its allocator a fresh pool at its limit, as a GPU not
+    attached states it (`dew._devices.fresh_pool`), read through the one admission (`_admitted`) that
+    leaves zero or more bytes to spare there and none one byte fewer: the inverse of `admitted`, which a
+    pool of GPUs is sized by."""
+
+    def headroom(memory: int) -> int:
+        spare = _admitted([device], [fresh_pool(memory, resident)], beside, temporaries)
+        assert spare is not None
+        return spare
+
+    # The headroom grows with the memory: double to a size that admits, then halve to its least.
+    low, high = 0, max(1, resident + beside + temporaries)
+    while headroom(high) < 0:
+        low, high = high + 1, 2 * high
+    while low < high:
+        middle = (low + high) // 2
+        low, high = (low, middle) if headroom(middle) >= 0 else (middle + 1, high)
+    return low
+
+
 def stated(memory: Sequence[Mapping[str, int]]) -> bool:
     """Whether every device's `memory` (`device_memory`) states its limit and its use, which a fit check
     reads; a CPU's states none, so no step's headroom on it is known ahead of its run."""
@@ -412,14 +446,17 @@ def local_devices(mesh: Mesh) -> list:
 
 
 class FirstRunFailed(RuntimeError):
-    """A newly compiled step's first run its devices refused: the record of the check that said it fits
-    (`fitted`, `memory_record`) and what this process's devices of its mesh hold now (`now`), each GPU's
-    bytes free outside XLA's pool (`outside_pool`) among it."""
+    """A newly compiled step's first run its devices refused: what they said (`refusal`, the error it is
+    raised from, its text first in its own, so a reader of its message alone tells an out-of-memory from
+    any other failure), the record of the check that said it fits (`fitted`, `memory_record`) and what this
+    process's devices of its mesh hold now (`now`), each GPU's bytes free outside XLA's pool
+    (`outside_pool`) among it."""
 
-    def __init__(self, step: int, fitted: JSON, now: list[JSON]):
+    def __init__(self, step: int, refusal: BaseException, fitted: JSON, now: list[JSON]):
         self.fitted, self.now = fitted, now
         super().__init__(
-            f"the training step compiled for step {step} failed on its first run. It was checked to fit: "
+            f"the training step compiled for step {step} failed on its first run: "
+            f"{type(refusal).__name__}: {refusal}. It was checked to fit: "
             f"{json.dumps(fitted)}; the devices now hold {json.dumps(now)}. 'outside' is a GPU's bytes free "
             "outside XLA's pool, whose limit is its bytes_limit (XLA_PYTHON_CLIENT_MEM_FRACTION of the GPU): "
             "a collective's communicators (NCCL) take their buffers there, beside cuBLAS's workspaces and "
@@ -439,7 +476,7 @@ def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> dict[str,
                             **{key: value for key, value in (device.memory_stats() or {}).items()
                                if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
                            for device in devices]
-        raise FirstRunFailed(step, fitted, now) from error
+        raise FirstRunFailed(step, error, fitted, now) from error
     read = () if fitted is None else listed(record(fitted, "fitted")["devices"], "devices", read=record,
                                             what="each device's memory as the fit check read it")
     checked = {integer(device["id"], "id"): outside for device in read
@@ -555,12 +592,12 @@ def temporaries_factor(mesh: Mesh) -> int:
 @dataclasses.dataclass(frozen=True)
 class MemoryMiss:
     """What a compile of the step at `split` microbatches that did not fit says of the splits above it,
-    every number its own: its temporaries (`scaled`, every one taken as scaled by a microbatch's rows, which
-    errs toward a split too coarse, which its compile refuses, never one too fine, which every step would pay
-    for: XLA states no live set of a GPU compile to Python, its memory statistics carrying sizes alone) and
-    the bytes it was short (`shortfall`, its stranding counted, `factor`). A split above it holds its share
-    of them; the next program is XLA's to fuse and schedule again, so the compile at the split this names
-    is its judge."""
+    every number its own: the bytes a microbatch's rows scale (`scaled`: those its live set states descend
+    from a batch row axis, with those it states no provenance of, `LiveSet`; every temporary where it states
+    no live set, which errs toward a split too coarse, which its compile refuses, never one too fine, which
+    every step would pay for) and the bytes it was short (`shortfall`, its stranding counted, `factor`). A
+    split above it holds its share of them; the next program is XLA's to fuse and schedule again, so the
+    compile at the split this names is its judge."""
 
     split: int
     scaled: int
@@ -572,6 +609,60 @@ class MemoryMiss:
         `scaled * self.split / split`."""
         saved = self.scaled - self.scaled * self.split // split
         return self.factor * saved >= self.shortfall
+
+
+LIMIT_EXIT = "xla_gpu_memory_limit_early_exit_bytes"
+"""A GPU compile's limit (Dew's JAX build's, from post99): past it, the arguments, new outputs and
+temporaries XLA assigns (argument + output - alias + temp), the compile stops after buffer assignment, its
+executable stating its memory and its live set and refusing to run; within it, it compiles whole. Each
+attempt of a plan is one compile, whole where the step can fit and stopped where it cannot."""
+
+
+def compile_limit(devices: Sequence, held: int, built: int) -> int | None:
+    """The bytes past which no step fits `devices` (`LIMIT_EXIT`), as XLA sums a step (its arguments, its
+    outputs that write over none of them and its temporaries): the fit check's own arithmetic
+    (`step_headroom`) solved for that sum. The check places the step's temporaries and new outputs beside
+    its arguments, `built` of them not yet resident, and the `held` bytes the loop keeps beside it, `built`
+    among them, all in the least allocator limit among `devices`; so the most a fitting step's sum reaches
+    is that limit less what is held beside the step outside its arguments (`held - built`: the prefetched
+    batches), where the devices hold nothing but its arguments. A step XLA stops past it fits nowhere the
+    check admits; one within it is compiled whole and the fit check judges it. A 4.8B multimodal
+    transformer's step on a GH200 (row 5805): the
+    limit less all of `held`, the arguments it builds among it counted twice, stopped a step the check
+    admitted, which its first run then refused. None where a device states no limit."""
+    limits = [limit for device in devices if (limit := device_memory(device).get("bytes_limit")) is not None]
+    if not limits or len(limits) < len(devices):
+        return None
+    return min(limits) - (held - built)
+
+
+@dataclasses.dataclass(frozen=True)
+class LiveSet:
+    """What a compile's live set at its peak (`jax.stages.Compiled.peak_live`: each buffer's dimensions'
+    provenance among the step's arguments) says of the step: the bytes of the buffers a microbatch's rows
+    scale (`scaled`: a dimension descends from a batch argument's row axis), and those whose provenance no
+    op states (`unknown`: an opaque kernel's). An argument's buffer (the state, the batch) is neither: no
+    split changes it."""
+
+    scaled: int
+    unknown: int
+
+    @staticmethod
+    def of(executable: jax.stages.Compiled, rows: frozenset[tuple[int, int]]) -> LiveSet | None:
+        """The live set of `executable`, `rows` the (argument, axis) pairs of the batch's rows; None where
+        the backend states none."""
+        live = executable.peak_live()
+        if live is None:
+            return None
+        scaled = unknown = 0
+        for buffer in live:
+            if buffer.kind == "parameter":
+                continue
+            if any(dimension is None for dimension in buffer.dims):
+                unknown += buffer.bytes
+            elif any(dimension is not None and dimension & rows for dimension in buffer.dims):
+                scaled += buffer.bytes
+        return LiveSet(scaled, unknown)
 
 
 def pooled_headroom(headroom: int | None) -> int | None:

@@ -1519,6 +1519,12 @@ class Transport[Allocated, Opened](abc.ABC):
     of one row: `gathered.Ring`, its threads' cp.async copies; a ring family's producer, or a consumer that
     feeds its rings; mma.sync's one warpgroup beside its pipeline, `mosaic_sm80._gathered_walk`)."""
 
+    selects_sources: bool = False
+    """Whether a step's view may choose its source at run time among several arrays' views (`rings.Among`, a
+    traced index: a launch's column tile among matrices side by side), each step's load copying the chosen
+    one's alone (`Ring.copied`): a ring family's, whose loads read each step's blocks through its rings; not
+    a pipeline's walk, which takes each stream's one array (cp.async's `emit_pipeline`, `mosaic_sm80`)."""
+
     gathers_alone: bool = True
     """Whether a walk gathering some streams' rows loads the others whole beside them (a GEMM's gathered
     rows beside its matrix); where not (mma.sync's walk, which gathers every stream's rows or none), only a
@@ -2260,6 +2266,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     bounded_loads = True
     fixes_up = True
     gathers_rows = True
+    selects_sources = True
     takes_pingpong = True
     walks_once = True
     # Mosaic GPU's default for a warpgroup (its CompilerParams' 128 x 4 x 4 bytes).

@@ -6,6 +6,7 @@ of (`passed`), and a step's slots of them (`Slots`, `WholeSlots`; `Beside` its o
 them). The families and walks that compose them are `mosaic`'s."""
 
 import dataclasses
+import functools
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
@@ -46,6 +47,17 @@ class Rows:
 
 
 @dataclasses.dataclass(frozen=True)
+class Among:
+    """A step's source chosen at run time among several arrays' views (`which`, traced, the index of the one
+    a tile reads: a launch's column tile among matrices side by side, `mosaic_gpu.Beside`): `viewed` takes
+    each source's tile at the step's indices, and a ring's load copies the chosen one's alone (`Ring.copy`),
+    one copy a step as any other view's."""
+
+    which: Any
+    sources: tuple
+
+
+@dataclasses.dataclass(frozen=True)
 class Paired:
     """A step's block indices in a pair's view, which the two CTAs of a pair (`Family.pairs_product`) load
     between them: `indices` in the pair's blocks, its block the slot's twice along `along` (`viewed`), each
@@ -64,14 +76,26 @@ class Split:
     along: int
 
 
+def prefetch(view) -> None:
+    """An L2 prefetch of a step's view (`viewed`, `plgpu.async_prefetch`): an `Among`'s chosen source's
+    alone, as a ring's load copies it (`Ring.copy`)."""
+    if isinstance(view, Among):
+        for index, source in enumerate(view.sources):
+            pl.when(view.which == index)(functools.partial(prefetch, source))
+        return
+    plgpu.async_prefetch(view)
+
+
 def viewed(view: tuple, block: tuple, step):
     """Step `step`'s tile of a stream's view `(ref, index_map)` (`Family.opened`): the `block`-shaped tile of
     `ref` at the block indices `index_map(step)` gives, as a `BlockSpec`'s index map does; where it gives
     `Rows`, each run's view at its table's entry; where it gives `Paired`, the pair's block (`block` twice
     along its axis) as a `Split`, each CTA's half its own; where `ref` is `Pieces` of refs (an fp32 operand's
     bf16 parts, each its own array's), each one's tile at the indices, its share of the block's rows, in
-    order."""
+    order; where `ref` is `Among` refs, each one's tile at the indices, a load copying the chosen one's."""
     ref, index_map = view
+    if isinstance(ref, Among):
+        return Among(ref.which, tuple(viewed((each, index_map), block, step) for each in ref.sources))
     indices = index_map(step)
     if isinstance(ref, Pieces):
         share = (block[0] // len(ref), *block[1:])
@@ -121,9 +145,12 @@ def _loaded(group: dict, turn_of: Callable, view_of: Callable) -> None:
         ring.load(turn_of(key, ring), view_of(key, ring))
         return
     key, lead = next(iter(group.items()))
-    lead.freed(turn_of(key, lead))
+    # One slot for the pair (its rings hold one depth, `joined`), its index formed once (`Ring.load`).
+    turn = turn_of(key, lead)
+    slot = opaque(turn.slot)
+    lead.free(turn, slot)
     for key, ring in group.items():
-        ring.copied(turn_of(key, ring), view_of(key, ring))
+        ring.copy(slot, view_of(key, ring))
 
 
 def _keyed(rings) -> dict:
@@ -287,22 +314,29 @@ class Ring:
         return viewed(view, self.block, step)
 
     def load(self, turn: Turn, view) -> None:
-        """The producer's load of `turn`'s step from `view`, once its slot is free (`freed`, `copied`)."""
-        self.freed(turn)
-        self.copied(turn, view)
-
-    def freed(self, turn: Turn) -> None:
-        """The producer's wait for `turn`'s slot to be free: released by the last rotation's step, whose
-        parity is the other; none for a slot's first fill."""
+        """The producer's load of `turn`'s step from `view`, once its slot is free (`free`, `copy`): the
+        slot's index formed once (`opaque`) for its wait and its copies, as an index each formed apart repeats
+        its arithmetic past the barrier (+16 mov, +8 each of four integer ops and a register at an H100's
+        fused dK/dV, 2.9% of its time, M-ET-87)."""
         slot = opaque(turn.slot)
+        self.free(turn, slot)
+        self.copy(slot, view)
+
+    def free(self, turn: Turn, slot) -> None:
+        """The producer's wait for `turn`'s slot (`slot`, its index `opaque`) to be free: released by the last
+        rotation's step, whose parity is the other; none for a slot's first fill."""
         pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
             self.consumed.at[slot], phase=turn.rotation - 1))
 
-    def copied(self, turn: Turn, view) -> None:
-        """`turn`'s step copied from `view` into its slot, freed (`freed`): `Pieces` each into its part of the
-        slot's rows, one arrival each at the slot's load barrier, which takes as many (`ring`'s `copies`, a
-        joined pair's every member's, `joined`)."""
-        slot = opaque(turn.slot)
+    def copy(self, slot, view) -> None:
+        """A step copied from `view` into `slot` (its index `opaque`), freed (`free`): `Pieces` each into its
+        part of the slot's rows, one arrival each at the slot's load barrier, which takes as many (`ring`'s
+        `copies`, a joined pair's every member's, `joined`)."""
+        if isinstance(view, Among):
+            # The chosen source's copy alone, one arrival as any view's.
+            for index, source in enumerate(view.sources):
+                pl.when(view.which == index)(functools.partial(self.copy, slot, source))
+            return
         if not isinstance(view, Pieces):
             plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot],
                                     collective_axes=self.multicast)

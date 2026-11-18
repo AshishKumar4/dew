@@ -140,7 +140,7 @@ from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass, field
-from typing import ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -190,6 +190,10 @@ from .sessions import (
     session_metrics,
     varies,
 )
+
+if TYPE_CHECKING:
+    from dew.inference.serving import PageSize, Server
+    from dew.inference.tasks import TextGeneration
 
 
 class Publisher(Protocol):
@@ -716,7 +720,7 @@ class RolloutScheduler:
                decode: Callable[[Sequence[int]], str] = lambda ids: " ".join(str(token) for token in ids),
                groups: int = 4, max_new_tokens: int = 32, estimator: str = "group", truncation: str = "score",
                sampling: Sampling | None = None, ahead: int = 1, max_lag: int = 1, sync_every: int = 1,
-               page_size: int | None = None,
+               page_size: PageSize = None,
                log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
                overlong: tuple[int, int] | None = None, admit: int | None = None,
                generation_batches: int = 1) -> RolloutScheduler:
@@ -728,17 +732,15 @@ class RolloutScheduler:
         at the run's progress at its updates (`LMObjective.policy`). The proximal policy is rescored
         under the trainer's weights, so a `max_lag` above 0 needs `objective.behavior_importance`. A
         reward-side reference penalty (`GRPOObjective.reward_kl`) is `objective`'s own, as `sampled`'s.
-        With `page_size` the server pages its cache in pages of that many slots and shares prompt pages
-        where the model admits it, as a paged server does by default (`Server.from_task`'s
+        The server pages its cache in pages of `page_size` slots, keeps each row's cache whole for
+        'whole', and by default pages wherever pages serve the policy as it draws (`serve`), sharing prompt
+        pages where the model admits it, as a paged server does by default (`Server.from_task`'s
         `prefix_cache`), so a group's samples of one prompt prefill it once
         (`dew.inference.pages.Pages.waits`). A run over
         several processes serves from one server over its mesh, each process's rows seated on its own
         devices, which every process steps together as it admits each call's groups and reloads at each
         push (`NativeRolloutServer.waited`): its draws run between the trainer's steps, not beside them."""
         from dew.inference.rollouts import NativeRolloutServer
-        from dew.inference.serving import Server
-        from dew.nn.kv_cache import KVCache
-        from dew.nn.protocols import Layered
 
         from .sources import PromptSource
 
@@ -746,14 +748,8 @@ class RolloutScheduler:
         width = objective.seq_len + 1
 
         def built(variables: Variables, version: int) -> Server:
-            policy = objective.policy(variables, drawing, Progress(jnp.asarray(version, jnp.int32)))
-            if page_size is None:
-                return Server.from_task(policy, slots=slots, capacity=width)
-            # The policy's own cache layout, its format kept, in pages.
-            declared = policy.model.kv_cache if isinstance(policy.model, Layered) else KVCache()
-            # Its prefix cache as the server keeps one by default, wherever the model admits it.
-            return Server.from_task(policy, slots=slots, capacity=width,
-                                    kv_cache=dataclasses.replace(declared, page_size=page_size))
+            return cls.serve(objective.policy(variables, drawing, Progress(jnp.asarray(version, jnp.int32))),
+                             slots=slots, capacity=width, page_size=page_size)
 
         server = NativeRolloutServer.deferred(built, drawing)
         source = PromptSource(server, reward, decode=decode, max_new_tokens=max_new_tokens)
@@ -767,17 +763,46 @@ class RolloutScheduler:
         scheduler._owned = (source.close, server.close)
         return scheduler
 
+    @staticmethod
+    def serve(policy: TextGeneration, *, slots: int, capacity: int, page_size: PageSize = None) -> Server:
+        """The server a served rollout draws `policy`'s completions from (`served`): `slots` rows of
+        `capacity` slots, its cache laid as `served_layout` lays it: in pages of `page_size` slots, each row
+        whole for 'whole', and where none is named in pages wherever they serve the policy as it draws, so a
+        group's samples of one prompt prefill it once (row 5375)."""
+        from dew.inference.serving import Server, served_layout
+
+        return Server.from_task(policy, slots=slots, capacity=capacity,
+                                kv_cache=served_layout(policy, capacity, page_size))
+
     @classmethod
     def episodes(cls, policy: EpisodeInference, environment: EnvironmentFactory, verifier: Verifier, *,
                  objective: Scorer, max_prompt_tokens: int, max_new_tokens: int, max_turns: int,
                  sampling: Sampling, groups: int = 2, credit: str = "session",
                  record: EpisodeRecorder | None = None, journal: EpisodeJournal | None = None,
-                 log: Callable[[SchedulerRecord], None] | None = None) -> RolloutScheduler:
+                 log: Callable[[SchedulerRecord], None] | None = None,
+                 page_size: PageSize = None) -> RolloutScheduler:
         """Collect `groups` tool episodes of each `task_id` row at every call, in lock step under the
         step's variables, and train `objective` on them (`EpisodeCollector`; truncated episodes are
-        masked), a group's prompt packed once where it shares (`scorer`)."""
+        masked), a group's prompt packed once where it shares (`scorer`). A `TextGeneration` policy serves
+        its cohort's turns over a paged cache (`EpisodeCollector.kv_cache`) in pages of `page_size` slots,
+        and where none is named wherever they serve it as it draws (`served_layout`, one row a prompt): each
+        turn prefills only what follows its row's history, where the policy drawn whole ('whole') prefills
+        every turn's history again (row 5374)."""
+        from dew.inference.serving import served_layout
+        from dew.inference.tasks import TextGeneration
+
+        if not isinstance(policy, TextGeneration) and page_size not in (None, "whole"):
+            raise TypeError(f"a cohort served over pages of {page_size} slots serves a TextGeneration "
+                            f"policy, not a {type(policy).__name__}")
+        # A served cohort draws one row a prompt (`EpisodeCollector.kv_cache`); a policy drawing more is
+        # drawn whole where no page size is named.
+        layout = (served_layout(policy, max_prompt_tokens + max_new_tokens, page_size)
+                  if isinstance(policy, TextGeneration) and (policy.n == 1 or page_size is not None)
+                  else None)
+        # A cohort over whole rows draws its policy whole.
+        layout = layout if layout is not None and layout.page_size is not None else None
         collector = EpisodeCollector(policy, environment, verifier, max_prompt_tokens, max_new_tokens,
-                                     max_turns, sampling, record, journal)
+                                     max_turns, sampling, record, journal, kv_cache=layout)
         return cls(Synchronous(collector), groups=groups, credit=credit, log=log, scorer=objective)
 
     @property

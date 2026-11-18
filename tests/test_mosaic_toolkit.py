@@ -1850,6 +1850,40 @@ def test_a_product_issued_within_a_staged_block_is_refused():
         mosaic.committed()
 
 
+@pytest.mark.gpu(reason="compiles a launch under each lowering semantics and runs it on this GPU")
+@pytest.mark.generations("sm90", "sm100")
+@pytest.mark.parametrize("semantics", [plgpu.LoweringSemantics.Lane, plgpu.LoweringSemantics.Warpgroup],
+                         ids=["lane", "warpgroup"])
+def test_a_launch_runs_a_flags_branch_and_its_negations_branch_each_alone(semantics):
+    """A launch's `pl.when(flag)` and `pl.when(~flag)` each run where their condition holds and there alone,
+    under either lowering semantics: post102's warpgroup lowering negated a boolean through ~int(x), -1 or -2,
+    which its conversion to a boolean read as true either way, so a persistent kernel ran its inactive tiles'
+    branch beside every active tile's (train 967, seen only as 8 bytes spilled)."""
+    def body(out_gmem):
+        program = jax.lax.axis_index("program")
+
+        @functools.partial(pl.run_scoped, staged=plgpu.SMEM((128,), jnp.int32))
+        def _(staged):
+            active = program > 0
+
+            @pl.when(active)
+            def _():
+                staged[...] = jnp.full(staged.shape, 1, jnp.int32)
+
+            @pl.when(~active)
+            def _():
+                staged[...] = jnp.full(staged.shape, 2, jnp.int32)
+
+            plgpu.commit_smem()
+            plgpu.copy_smem_to_gmem(staged, out_gmem.at[pl.ds(program * 128, 128)])
+            plgpu.wait_smem_to_gmem(0)
+
+    out = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((256,), jnp.int32), grid=(2,),
+                       grid_names=("program",),
+                       compiler_params=plgpu.CompilerParams(lowering_semantics=semantics))()
+    np.testing.assert_array_equal(np.asarray(out), np.repeat(np.asarray([2, 1], np.int32), 128))
+
+
 @pytest.mark.gpu(reason="a warp's lanes hold values of their own only on the device")
 @pytest.mark.parametrize("read", ["uniform", "own"])
 def test_a_uniform_read_gives_each_lane_its_warps_lane_zero_value(read):

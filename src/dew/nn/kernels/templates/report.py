@@ -16,11 +16,9 @@ import functools
 import hashlib
 import importlib.metadata
 import importlib.util
-import itertools
 import json
 import logging
 import math
-import os
 import re
 import shutil
 import struct
@@ -586,9 +584,6 @@ class Certification:
     pulled: bool
     kernels: dict[str, tuple[str, "Binary"]]
     stored: bool
-    round: int
-    """The round of certification it was compiled or read in (`certified_together`): configs certified at once
-    share one."""
     device: Hashable
     """The GPU it was certified on (`_certifying_device`, a `jax.Device`), whose assembler's answer it is."""
 
@@ -597,9 +592,6 @@ class Certification:
         """Its kernels the GPU's assembler refuses (`Binary.refused`)."""
         return tuple(binary for _, binary in self.kernels.values() if binary.refused)
 
-
-_ROUNDS = itertools.count()
-"""Each round of certification's number (`Certification.round`)."""
 
 _CERTIFIED: dict[tuple, Certification] = {}
 """Each launch certified (`certified`), by its identity, config, device and product."""
@@ -656,8 +648,7 @@ def targeting(mesh: jax.sharding.Mesh) -> Iterator[None]:
         _TARGETED.reset(token)
 
 
-def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round: int | None = None
-              ) -> tuple["Binary", ...] | None:
+def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple["Binary", ...] | None:
     """`op`'s kernels at `config` for `arguments` the GPU's assembler refuses (`Binary.refused`: spilling, or
     their warpgroup MMAs serialized), each launch compiled
     alone before its program is: its kernels' binaries (`binaries`) as the plugin's own compiler makes them
@@ -671,9 +662,9 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
     assembly the PTX compiler rejects), which its program's compile reads as before (`settled`) and
     `uncertified` names;
     a launch Mosaic refuses as it lowers (a block past its shared memory) raises here as its program's
-    lowering would. Once a process, by launch (`certifications`), and once a GPU model a
+    lowering would. Once a process, by launch (`certifications`), and once a compile target a
     machine: each verdict, an accepted config's and a refused one's, is stored beside the kernel picks
-    (`_verdict_key`), so a warm start traces and compiles nothing to certify."""
+    (`_verdict_key`, `verdict_target`), so a warm start traces and compiles nothing to certify."""
     device = _certifying_device()
     if device is None or arguments.arguments.get("interpret"):
         return ()
@@ -687,7 +678,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
         if key in _UNCERTIFIED:
             return None
     stored = _verdict_key(_identity(op, arguments), config, reverse)
-    verdict = None if stored is None else tuning.stored_verdict(device.device_kind, stored)
+    verdict = None if stored is None else tuning.stored_verdict(verdict_target(device), stored)
     if isinstance(verdict, dict):
         kernels = verdict
     else:
@@ -702,59 +693,31 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
                 _UNCERTIFIED[key] = str(error)[:400]
             return None
         if stored is not None:
-            tuning.store_verdict(device.device_kind, stored, kernels)
-    found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None,
-                          next(_ROUNDS) if round is None else round, device)
+            tuning.store_verdict(verdict_target(device), stored, kernels)
+    found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None, device)
     with _GUARD:
         _CERTIFIED[key] = found
     return found.refused
 
 
-def certified_together(op, arguments: tokamax.BoundArguments, configs: Sequence[Hashable]
-                       ) -> list[tuple["Binary", ...] | None]:
-    """Each of `configs` certified (`certified`) in one round, all at once on as many threads, each tracing
-    under this thread's states (`dew._cache.carried`: the assumed GPU, the kernel choices, JAX's per-thread
-    settings) in a copy of this context, on the device this thread certifies on: a search's rungs, which the
-    assembler answers only one yes or no each (`rung_round` bounds a round by the host's cores)."""
-    from jax._src import mesh as mesh_lib
-
-    round = next(_ROUNDS)
-    # The device this thread certifies on and the meshes its program is set on and traced under (its axes
-    # manual within a map), named to each thread: JAX holds both per thread (`jax.set_mesh`,
-    # `jax.sharding.use_abstract_mesh`), which no other thread sees (row 6791; train 909's review F4), and a
-    # launch certified off them lowers its kernels as its program does not (`_certifying_placement`).
-    device = _certifying_device()
-    placed, abstract = mesh_lib.get_concrete_mesh(), jax.sharding.get_abstract_mesh()
-    if len(configs) < 2 or device is None:
-        return [certified(op, arguments, config, round=round) for config in configs]
-    entered = _cache.carried()
-
-    def asked(config: Hashable) -> tuple["Binary", ...] | None:
-        with (entered(), certifying(device),
-              contextlib.nullcontext() if placed.empty else jax.set_mesh(placed),
-              contextlib.nullcontext() if abstract.empty else jax.sharding.use_abstract_mesh(abstract)):
-            return certified(op, arguments, config, round=round)
-
-    with ThreadPoolExecutor(len(configs), thread_name_prefix="dew-certify") as pool:
-        submitted = [pool.submit(contextvars.copy_context().run, asked, config) for config in configs]
-        return [each.result() for each in submitted]
-
-
-def rung_round() -> int:
-    """The most rungs a round of certification compiles at once (`certified_together`): the cores this
-    process may run on, so a small host takes fewer rungs a round rather than sharing its cores among more
-    compiles."""
-    return max(1, len(os.sched_getaffinity(0)))
+def verdict_target(device) -> str:
+    """The compile target whose verdicts a certification on `device` stores and reads
+    (`tuning.stored_verdict`): its generation (`generation.device_target`), which names what the assembler
+    builds a launch's kernels for, the verdict's one hardware input. An H100, a GH200 and a compile-only H100
+    share sm90's, so a build certifying for a compile-only GPU stores the verdicts a run on its GPU reads,
+    where by GPU model a GH200's run read none of them (row 6717)."""
+    return generation.device_target(device).generation
 
 
 def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
-    """What decides a launch's certification on a GPU model (the store's file, `tuning.stored_verdict`) before
-    it traces, as its stored verdict's key: the launch's `identity` (`_identity`, the same in every process),
-    its config, whether reverse mode runs it, Dew's code (`package_digest`: a Dew edit certifies again), the
-    installed JAX, jaxlib and CUDA plugins, whose Mosaic GPU and XLA lower and compile it (the Pallas lowering
-    cache's seal of them), the ptxas that assembles it (`_assemblers`), and the environment a kernel's
-    lowering and compile read (that cache's policy). None where the installation has no seal (an edited or a
-    source install of JAX), whose code no key states: its verdicts are not stored."""
+    """What decides a launch's certification for a compile target (the store's file, `verdict_target`,
+    `tuning.stored_verdict`) before it traces, as its stored verdict's key: the launch's `identity`
+    (`_identity`, the same in every process), its config, whether reverse mode runs it, Dew's code
+    (`package_digest`: a Dew edit certifies again), the installed JAX, jaxlib and CUDA plugins, whose Mosaic
+    GPU and XLA lower and compile it (the Pallas lowering cache's seal of them), the ptxas that assembles it
+    (`_assemblers`), and the environment a kernel's lowering and compile read (that cache's policy). None
+    where the installation has no seal (an edited or a source install of JAX), whose code no key states: its
+    verdicts are not stored."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
@@ -1517,7 +1480,7 @@ def _held(found: list, program: jax.stages.Lowered) -> None:
         verdicts.setdefault((identity, config, launch.reverse), {})[name] = (modules.get(name, ""), binary)
     for (identity, config, reverse), kernels in verdicts.items():
         if (key := _verdict_key(identity, config, reverse)) is not None:
-            tuning.store_verdict(device.device_kind, key, kernels)
+            tuning.store_verdict(verdict_target(device), key, kernels)
 
 
 def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashable], Refused]]

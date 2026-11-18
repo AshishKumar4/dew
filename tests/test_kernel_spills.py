@@ -19,10 +19,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from lane_environment import DETERMINISTIC_OPS
 from generation_support import lowers
 from jax.experimental.layout import Format, Layout
 from kernel_compile import Uncounted
-from process_support import fresh
+from process_support import fresh, keeping_picks
 
 from dew.inputs import Field, InputSpec
 from dew.nn.attention import scaled_dot_product_attention
@@ -152,6 +153,7 @@ import optax
 from token_support import token_rows
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.templates import report
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
@@ -177,19 +179,23 @@ pallas_lowering.lower_unpipelined_jaxpr_to_module = lowered_afresh
 # Qwen3.5-4B's linear attention: 16 key heads and 32 value heads, each 128 wide, over a row of 12,288 tokens.
 model = CausalTransformer(vocab_size=64, emb_features=512, num_layers=1, num_heads=4, head_dim=128,
                           mlp_features=512, max_seq_len=12288, dtype="bfloat16", mixer=GatedDeltaNetMixer())
+devices = compile_only_gpus(sys.argv[1], 1, 80 * 2**30)
 trainer = Trainer(LMObjective(model, 12288), optax.adam(1e-3), key=jax.random.key(0),
-                  mesh=MeshSpec().build(compile_only_gpus(sys.argv[1], 1, 80 * 2**30)))
+                  mesh=MeshSpec().build(devices))
 compile_ahead(trainer, token_rows(64, 1, 12289))
-print(json.dumps({"events": events, "modules": modules}))
+print(json.dumps({"events": events, "modules": modules, "kind": devices[0].device_kind,
+                  "stored": [certification.stored for certification in report.certifications()]}))
 """
 """A one-layer decoder of Qwen3.5-4B's gated delta net compiled ahead for a compile-only GPU of the generation
-argv[1] names: each program it lowered by name, and each Mosaic GPU kernel lowered afresh by its module's
-text."""
+or the kind argv[1] names (`compile_only_gpus`): each program it lowered by name, each Mosaic GPU kernel
+lowered afresh by its module's text, the kind its device reported, and whether each launch it certified
+read its verdict back from the store (`report.certifications`' `stored`)."""
 
 
 @pytest.mark.parametrize("target", [pytest.param("sm90", marks=lowers("sm90")),
                                     pytest.param("sm100", marks=lowers("sm100"))])
-def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target):
+@pytest.mark.parametrize("deterministic", [False, True], ids=["keeping picks", "deterministic ops"])
+def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target, deterministic):
     """A one-layer decoder of the 4B's gated delta net, its step compiled ahead for a compile-only H100 and a
     compile-only B200 (`RECURRENT_AHEAD`), twice over one cache: each process lowers the step once, the cold
     one certifies each launch's configs once each (whatever its walk takes: a config refused steps the
@@ -202,9 +208,13 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target):
     lowered afresh once in the cold process: the step's kernels certification lowered are the lowerings it
     made (a launch's trace held, `tuning.lowered_once`, bound into the step as certification traced it,
     under the step's own mesh), where the step lowered its kernels again, each a cache miss, 34 of a 4B's 36
-    kernels on a B200 the ones certification had made (FS-CERTSPLIT4: 27 s of its lowering)."""
+    kernels on a B200 the ones certification had made (FS-CERTSPLIT4: 27 s of its lowering). Under
+    deterministic ops too, which keep no picks but keep the verdicts (row 7308: every warm start under
+    --xla_gpu_deterministic_ops certified every launch again)."""
     cache = tmp_path / "cache"
-    runs = [fresh(RECURRENT_AHEAD, target, cache_dir=cache) for _ in range(2)]
+    # The lane's own flags each time, without deterministic ops and with them, whatever the lane's are.
+    flags = f"{keeping_picks()} {DETERMINISTIC_OPS}" if deterministic else keeping_picks()
+    runs = [fresh(RECURRENT_AHEAD, target, cache_dir=cache, flags=flags) for _ in range(2)]
     cold, warm = (run["events"] for run in runs)
     modules = runs[0]["modules"]
     assert len(set(modules)) == len(modules), collections.Counter(modules).most_common(3)
@@ -212,6 +222,23 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target):
     certified = [name for name in cold if name.startswith("jit(certified_")]
     assert certified and len(set(certified)) == len(certified), certified
     assert not [name for name in warm if name.startswith("jit(certified_")], warm
+
+
+@lowers("sm90")
+def test_a_verdict_certified_for_a_gpu_is_read_by_another_kind_of_its_generation(tmp_path):
+    """Certification's verdicts are the compile target's (`report.verdict_target`): a step compiled ahead for
+    a compile-only H100 certifies its launches and stores their verdicts, and a process certifying the same
+    launches on another kind of sm90 (a compile-only GH200) reads them, certifying
+    nothing (rows 6717, 7322: a GH200's run read none of a compile-only H100's verdicts and certified each
+    launch again)."""
+    cache = tmp_path / "cache"
+    flags = keeping_picks()
+    h100 = fresh(RECURRENT_AHEAD, "sm90", cache_dir=cache, flags=flags)
+    gh200 = fresh(RECURRENT_AHEAD, "NVIDIA GH200 480GB", cache_dir=cache, flags=flags)
+    assert h100["kind"] != gh200["kind"] == "NVIDIA GH200 480GB", (h100["kind"], gh200["kind"])
+    # Each launch certified (`report.certifications`): the H100's compiled there, the GH200's read back.
+    assert h100["stored"] and not any(h100["stored"]), h100["stored"]
+    assert gh200["stored"] and all(gh200["stored"]), gh200["stored"]
 
 
 HANDED = """
@@ -828,14 +855,12 @@ def test_a_plain_jit_on_this_gpu_certifies_its_launch_there_and_runs():
 
 
 @lowers("sm90")
-def test_a_round_of_rungs_traced_under_a_compile_only_gpus_mesh_is_certified_on_that_gpu():
-    """A round of a launch's configs certified at once (`report.certified_together`, a ladder's rounds past
-    its first rung) under a compile-only H100's mesh, no device named to certify on: each certified on that
-    mesh's GPU (`Certification.device`), which this thread reads and every thread of the round is told, and
-    none on another. JAX holds the mesh per thread (`jax.set_mesh`), so a round's threads that read it
-    themselves found none: on a GPU host they certified on the host's own GPU, the launch certified twice,
-    and on a host of no GPU they certified nothing and answered that each config holds, a config no
-    assembler checked kept (train 909's review F4 of row 6791's fix)."""
+def test_a_launchs_rungs_traced_under_a_compile_only_gpus_mesh_are_certified_on_that_gpu():
+    """A launch's configs certified in turn (`report.certified`, a ladder's rungs past its first) under a
+    compile-only H100's mesh, no device named to certify on: each certified on that mesh's GPU
+    (`Certification.device`), which the certifying thread reads, and none on another: never the host's own
+    GPU, nor nothing on a host of none, a config no assembler checked kept (train 909's review F4 of row
+    6791's fix)."""
     from dew.nn.kernels.generation import compile_only_gpus
 
     op = TwoKernels()
@@ -848,7 +873,7 @@ def test_a_round_of_rungs_traced_under_a_compile_only_gpus_mesh_is_certified_on_
         bound = op.bind(*operands, out_dtype="bfloat16", trans_rhs=False, interpret=False)
         first = bound.heuristics_config
         configs = [first, dataclasses.replace(first, stages=first.stages - 1)]
-        answers = report.certified_together(op, bound, configs)
+        answers = [report.certified(op, bound, config) for config in configs]
     assert all(answer is not None for answer in answers), answers
     found = [each for each in report.certifications() if id(each) not in before]
     assert sorted(map(repr, (each.config for each in found))) == sorted(map(repr, configs)), found

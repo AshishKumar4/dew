@@ -18,12 +18,15 @@ conv (tests/test_short_conv.py).
 """
 
 import dataclasses
+import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.derivatives import KernelGlue, contracted, with_gradients_formed
+from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
+from dew.nn.precision import compensated_sum
 
 from . import generation
 from .generation import INHERENT, Choice
@@ -95,6 +98,33 @@ def preactivation(window, taps, bias):
     for inputs, tap in zip(window[1:], taps[1:], strict=True):
         total = total + inputs * tap
     return total if bias is None else total + bias
+
+
+def conv_bias(bias: jax.Array, leading: tuple[int, ...]) -> jax.Array:
+    """A conv's bias `[C]` added at every row and token of `leading` `[B, S]` (`_spread_bias`): its gradient
+    the wide pre-activation cotangent summed over them in one compensated reduction, rounded once, the one
+    rule of a conv's bias, XLA's conv's (`dew.nn.linear.xla_conv1d`), a decode step's (`recurrence`) and
+    the kernels' (their partials, the split conv's shards)."""
+    return _spread_bias((*leading, bias.shape[0]))(bias)
+
+
+# Bounded: a server's calls vary their rows, each shape a wrapper of its own.
+@functools.lru_cache(maxsize=256)
+def _spread_bias(shape: tuple[int, ...]) -> Callable:
+    """A conv's bias spread over the rows and tokens of `shape` `[B, S, C]`, differentiated at every order
+    (`generation.linear_tangent`): reverse mode sums its tokens' cotangents in one compensated reduction
+    rounded once (`compensated_sum`), forward mode takes the broadcast's own tangent. XLA's float32 sum of a
+    conv's bias gradient over its tokens left it 1.6 to 2.4 times as far from float64 as the sum rounded once
+    (armada's CPU and an A100 and a GH200, row 1710), past what a split conv's shards
+    (`linear._shards_summed`) and the kernels' partials add to it."""
+    def spread(values: jax.Array) -> jax.Array:
+        return jnp.broadcast_to(values, shape)
+
+    return contracted("test_a_convs_bias_holds_every_order")(
+        generation.linear_tangent(lambda values: (spread(values), None),
+                                  lambda saved, operands, cotangent: (
+                                      compensated_sum(cotangent, tuple(range(len(shape) - 1))),),
+                                  spread, kind=Protected()))
 
 
 def _launched(interpret: bool):

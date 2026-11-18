@@ -13,7 +13,7 @@ import pytest
 from generation_support import cublas_compiled
 from reference_error import assert_as_exact, equations
 
-from dew.nn.kernels import formats, gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_matmul, tuning
 from dew.nn.kernels.templates import product
 from dew.nn.kernels.templates.gemm import mosaic_gpu, row_tiles
 
@@ -28,13 +28,13 @@ def test_a_gathered_grouped_product_reads_each_row_where_its_table_says():
     with generation.assumed("sm90"):
         a_gathered_product_is_on_par(interpret=True)
         a_gathered_product_is_on_par(interpret=True, paired=True, scattered=True)
-        a_deep_gathered_step_reads_its_rows_as_their_copy_would(grouped_matmul.INTERPRETED)
+        a_deep_gathered_step_reads_its_rows_as_their_copy_would(grouped_launch.INTERPRETED)
     tokens, table = jnp.zeros((200, 128), jnp.bfloat16), jnp.zeros((256,), jnp.int32)
     with generation.assumed("sm80"), pytest.raises(ValueError):
         mosaic_gpu.gmm(tokens, jnp.zeros((4, 128, 256), jnp.bfloat16),
                        jnp.asarray([70, 0, 129, 57], jnp.int32),
                        tiles=mosaic_gpu.Tiles(128, 128, 32, 3, 1, family="mma.sync"), transpose_rhs=False,
-                       out_dtype=jnp.float32, multiprocessors=4, interpret=grouped_matmul.INTERPRETED,
+                       out_dtype=jnp.float32, multiprocessors=4, interpret=grouped_launch.INTERPRETED,
                        gather=table)
 
 
@@ -167,16 +167,16 @@ def test_a_gathered_kernel_gradient_reads_each_operands_rows_where_its_table_say
     mma.sync (no producer warpgroup), refused."""
     with generation.assumed(generation_name):
         tokens, cotangent, table = a_gathered_kernel_gradient_is_its_gathered_rows_gradient(
-            grouped_matmul.INTERPRETED, splits, tiles=KERNEL_GRADIENT_TILES[generation_name])
+            grouped_launch.INTERPRETED, splits, tiles=KERNEL_GRADIENT_TILES[generation_name])
     with generation.assumed("sm90"), pytest.raises(ValueError):
         mosaic_gpu.tgmm(tokens, cotangent, jnp.asarray([70, 0, 129, 51], jnp.int32),
                         tiles=KERNEL_GRADIENT_TILES["sm90"], out_dtype=jnp.float32, multiprocessors=4,
-                        interpret=grouped_matmul.INTERPRETED, gather=(table, None),
+                        interpret=grouped_launch.INTERPRETED, gather=(table, None),
                         prologue=lambda rows: rows)
     with generation.assumed("sm80"), pytest.raises(ValueError):
         mosaic_gpu.tgmm(tokens, cotangent, jnp.asarray([70, 0, 129, 51], jnp.int32),
                         tiles=mosaic_gpu.Tiles(128, 128, 32, 3, 1, family="mma.sync"), out_dtype=jnp.float32,
-                        multiprocessors=4, interpret=grouped_matmul.INTERPRETED, gather=(table, None))
+                        multiprocessors=4, interpret=grouped_launch.INTERPRETED, gather=(table, None))
 
 
 KERNEL_GRADIENT_TILES = {"sm90": mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma'),
@@ -370,7 +370,7 @@ def test_a_grouped_products_depth_split_sums_as_its_walk_apart():
     def product(splits):
         return mosaic_gpu.gmm(tokens, matrices, sizes, tiles=dataclasses.replace(tiles, splits=splits),
                               transpose_rhs=False, out_dtype=jnp.float32, multiprocessors=4,
-                              interpret=grouped_matmul.INTERPRETED)
+                              interpret=grouped_launch.INTERPRETED)
 
     with generation.assumed("sm90"):
         np.testing.assert_array_equal(np.asarray(product(4)), np.asarray(product(1)))

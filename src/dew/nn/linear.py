@@ -208,8 +208,9 @@ def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, seg
         before = jnp.pad(segments, ((0, 0), (K - 1, 0)))[:, tap:tap + length]
         return jnp.where((before == segments)[..., None], window, 0)
 
+    spread_bias = None if bias is None else short_conv.conv_bias(bias.astype(wide), x.shape[:2])
     windows = short_conv.preactivation([read(tap) for tap in range(K)], [taps[:, tap] for tap in range(K)],
-                                       None if bias is None else bias.astype(wide))
+                                       spread_bias)
     if activation:
         windows = silu(windows)
     if valid is not None:
@@ -280,9 +281,9 @@ def entered_conv1d(x, kernel, valid, documents, held, entered, *, bias=None, par
         return jnp.where((rank >= taps_count - 1 - tap)[..., None], inside, behind)
 
     taps = kernel.astype(wide)
+    spread_bias = None if bias is None else short_conv.conv_bias(bias.astype(wide), x.shape[:2])
     windows = short_conv.preactivation([read(tap) for tap in range(taps_count)],
-                                       [taps[:, tap] for tap in range(taps_count)],
-                                       None if bias is None else bias.astype(wide))
+                                       [taps[:, tap] for tap in range(taps_count)], spread_bias)
     if activation:
         windows = silu(windows)
     windows = jnp.where(real[:, :, None], windows, 0)
@@ -598,10 +599,8 @@ def _forked(mixed, taps, bias, scan, state_shape: tuple[int, ...], *, coordinate
     """`held_scan` of a call over forks: its conv (`forked_conv`) and its scan a level of the forks' chains
     in one pass (`forked_scan`), `scan(convolved, *, starts, valid, held, forked)` running each document from
     its table slot (`forked` its `(loads, stores, held)`, `held` its given memories, `Chunk.loads`); a cached
-    call from the layer's held conv history and state `held`, read and left as they were."""
-    if sequence_shards() > 1:
-        raise LayoutRefused("documents that continue another are read whole in their rows; a sequence axis "
-                            "splits them")
+    call from the layer's held conv history and state `held`, read and left as they were. Under a sequence
+    axis the call runs whole, its documents read across the axis (`sequence_split`)."""
     history, held = (None, None) if held is None else held
     convolved = forked_conv(mixed, taps, coordinates, history=history, bias=bias, parts=parts, dtype=dtype)
 
@@ -609,6 +608,16 @@ def _forked(mixed, taps, bias, scan, state_shape: tuple[int, ...], *, coordinate
         return scan(convolved, starts=starts, valid=valid, held=state, forked=(loads, stores, held))
 
     return forked_scan(convolved, rule, coordinates, fork_start(held, (mixed.shape[0], *state_shape), wide))
+
+
+def sequence_split(decode: bool, coordinates: Coordinates) -> int:
+    """The ways a recurrent mixer's call splits its rows' sequence over the mesh's sequence axis
+    (`over_sequence`), the one statement of it for Mamba-1 and -2, the gated delta net and Kimi's delta
+    attention: the axis's (`sequence_shards`) for a call over whole rows; one, the call run whole with its
+    state replicated over the axis, for a decode call, whose cache holds one state a row and whose tokens
+    a row's next few, no sequence of them the axis's to split, and for a call over forks, whose documents
+    continue their parents' (`_forked`)."""
+    return 1 if decode or coordinates.forks is not None else sequence_shards()
 
 
 def over_sequence(local, shards: int, tokens: tuple, whole: tuple):
@@ -1310,12 +1319,8 @@ class GatedDeltaNet(nn.Module):
         # and keys (`l2norm`).
         stored, conv = self._stored(operand)
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
-        shards = sequence_shards()
-        if shards > 1 and not forked:
-            if decode:
-                raise LayoutRefused(f"a gated delta net under a sequence axis of {shards} runs whole "
-                                    f"training sequences; a decode step holds one state per row. Decode on "
-                                    f"a mesh with sequence=1.")
+        shards = sequence_split(decode, tokens)
+        if shards > 1:
             rule = functools.partial(chunk_gated_delta_rule, chunk_size=self.chunk_size,
                                      max_segments=tokens.max_segments, write_bound=1.0)
             out = over_sequence(functools.partial(split_delta_rule, widths=widths, parts=heads,

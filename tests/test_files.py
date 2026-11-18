@@ -93,3 +93,29 @@ def test_a_built_directory_published_second_leaves_the_first_whole(tmp_path):
         assert not built.exists()
     assert sorted(path.name for path in directory.iterdir()) == ["who"]
     assert (directory / "who").read_text() == "first"
+
+
+@pytest.mark.parametrize("path", ["../escape.json", "/etc/passwd", "a/../../b", "a/./b", "a//b", "a\\..\\b",
+                                  "C:/windows/file", "."])
+def test_every_reader_of_outside_paths_refuses_one_out_of_its_directory_alike(path):
+    """A path out of the directory it is read against, or written in a form that could reach out of it (a
+    `.` or empty part, a backslash, a drive), is refused alike by every reader of outside input: a saved
+    run's tokenizer files, a DDUF archive's entries, a source's subfolder and a sandboxed program's files,
+    and a store's child, each through the one test of it (`dew._files.inside`). Their rules differed: only
+    a tokenizer's refused `.`, empty parts, backslashes and drives, so a fix to one left the others
+    weaker."""
+    from dew._files import inside
+    from dew.data.storage import Store
+    from dew.data.text import confined_files
+    from dew.interop.dduf import _contained
+    from dew.interop.sources import SourceReference
+    from dew.rl.sandbox import Program
+
+    assert not inside(path)
+    for read in (lambda: confined_files({path: "0" * 64}), lambda: _contained({path: (0, 1)}, "archive"),
+                 lambda: SourceReference("org/name", subfolder=path),
+                 lambda: Program(command=("python",), files={path: ""}),
+                 lambda: Store("/tmp").child(path)):
+        with pytest.raises(ValueError):
+            read()
+    assert inside("transformer/config.json") and inside("unet/") and not inside("unet/", directory=False)
