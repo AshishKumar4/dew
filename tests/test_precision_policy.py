@@ -1155,20 +1155,27 @@ COMPENSATED_SHAPES = ("turned", "product into sum", "scaled into sum", "scaled i
 
 
 def compensated_primitives_hold_under_jit(shape: str) -> None:
-    """`_compensated_shapes`' `shape` jitted is its eager run, bit for bit, on the process's default device:
-    eagerly each operation is its own program, rounded on its own, the arithmetic an error-free transform is
-    stated in; under jit a compiler that contracted a multiply into the sum reading it (an FMA, XLA's CPU and
-    GPU) added its exact product where the transform's later steps read its rounded one, and the
-    compensated sum lost what it carried (a turn's angle off by 1.9e-6). The precision P0 of 2026-11-18."""
+    """`_compensated_shapes`' `shape` jitted, its pair read as its consumer reads it (high plus low, rounded
+    once), on par with its eager run from float64 (check 1) on the process's default device: eagerly each
+    operation is its own program, rounded on its own, the arithmetic an error-free transform is stated in;
+    under jit a compiler that contracted a multiply into the sum reading it (an FMA, XLA's CPU and GPU) read
+    the exact product where the transform's later steps read its rounded one, and the compensated sum lost
+    what it carried (a turn's angle 12 times its eager error on a CPU, 1.9e-6 off in Mamba-3). A contraction
+    that only rounds a low part's own arithmetic once keeps the pair as exact as eager. The precision P0 of
+    2026-11-18."""
     function = _compensated_shapes()[shape]
-    rng = np.random.default_rng(2026_1118)
-    x = jnp.asarray(rng.uniform(-3e4, 3e4, 4096), jnp.float32)
-    y = jnp.asarray(rng.standard_normal(4096), jnp.float32)
-    z = jnp.asarray(rng.standard_normal(4096) * 1e-3, jnp.float32)
-    eager = function(x, y, z)
-    jitted = jax.jit(function)(x, y, z)
-    for one, other in zip(jax.tree.leaves(jitted), jax.tree.leaves(eager), strict=True):
-        np.testing.assert_array_equal(np.asarray(one), np.asarray(other))
+
+    def summed(x, y, z):
+        high, low = function(x, y, z)
+        return high + low
+
+    def draw(seed):
+        rng = np.random.default_rng([2026_1118, seed])
+        return (jnp.asarray(rng.uniform(-3e4, 3e4, 4096), jnp.float32),
+                jnp.asarray(rng.standard_normal(4096), jnp.float32),
+                jnp.asarray(rng.standard_normal(4096) * 1e-3, jnp.float32))
+
+    assert_as_exact(jax.jit(summed), summed, draw, f"a compensated {shape} under jit", seeds=8)
 
 
 @pytest.mark.parametrize("shape", COMPENSATED_SHAPES)
