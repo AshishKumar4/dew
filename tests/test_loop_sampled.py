@@ -289,16 +289,19 @@ def test_a_fresh_sampled_run_draws_from_its_first_microbatch_unsaid(caplog):
     assert [record.name for record in caplog.records] == ["dew.training.compiler"]
 
 
-def test_a_sampled_run_whose_variables_are_on_the_host_is_refused_by_name():
-    """A run drawing its pass count per microbatch whose layout keeps its variables on the host (a
-    host-master run, which no plan of the devices steps) is refused naming the pairing (row 8271)."""
-    from dew.training import Layout, Trainer
+def test_a_sampled_run_whose_variables_are_on_the_host_is_refused_as_it_is_built():
+    """A run drawing its pass count per microbatch whose stated layout keeps its variables on the host (a
+    host-master run, which no plan of the devices steps) is refused as the trainer is built (rows 8271,
+    8400), and a run of the default layout is never offered the streamed host layout (`streaming.refusal`),
+    which its first compile then refused, a layout the user never stated."""
+    from dew.training import Layout, Trainer, streaming
 
-    trainer = Trainer(LMObjective(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
-                      layout=Layout(host=("variables",), min_shard=1, tolerance=1.0), sampled_passes=TRAINED)
-    state, _, _ = trainer.place()
     with pytest.raises(ValueError):
-        trainer.compile(state, token_batch())
+        Trainer(LMObjective(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
+                layout=Layout(host=("variables",), min_shard=1, tolerance=1.0), sampled_passes=TRAINED)
+    default = Trainer(LMObjective(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
+                      sampled_passes=TRAINED)
+    assert streaming.refusal(default, stated=False, ahead=False) is not None
 
 
 def test_a_sampled_pass_count_is_exported_where_the_trainer_is():

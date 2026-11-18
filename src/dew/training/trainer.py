@@ -268,17 +268,16 @@ def signature_digest(signature: Hashable) -> str:
 
 
 def _custom_step_refusal(step, record: bool, inspection, rollout: Rollout | None,
-                         sampled: SampledPasses | None) -> None:
-    """Refuse what a custom step cannot serve (records of its Steps, an inspection of its update), and a
-    rollout beside per-microbatch pass counts, sampling at the cap what each trains at its own (row 8272)."""
+                         sampled: SampledPasses | None, layout: Layout) -> None:
+    """Refuse what a custom step cannot serve (records of its Steps, an inspection of its update), and beside
+    per-microbatch pass counts a rollout (sampling at the cap, row 8272) or a host state (row 8400)."""
     if rollout is not None and sampled is not None:
         raise ValueError("a rollout samples one policy a step, not sampled_passes' count a microbatch")
-    if record and step is not None:
-        raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
-                         "build them with Step(record=True)")
-    if inspection is not None and step is not None:
-        raise ValueError("a custom step commits no update an inspection reads (Trainer(inspection=...)); "
-                         "summarize its arrays in the step's own report")
+    if sampled is not None and "variables" in layout.host:
+        raise ValueError("sampled_passes runs each count at its cap's plan where the devices hold the state")
+    if step is not None and (record or inspection is not None):
+        raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach, and "
+                         "commits no update an inspection reads: build Step(record=True), report its arrays")
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -380,7 +379,7 @@ class Trainer(Generic[Loss, Effects]):
         self._scaled = dynamic_scale if isinstance(dynamic_scale, bool) else None
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
-        _custom_step_refusal(step, record, inspection, rollout, sampled_passes)
+        _custom_step_refusal(step, record, inspection, rollout, sampled_passes, layout)
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
