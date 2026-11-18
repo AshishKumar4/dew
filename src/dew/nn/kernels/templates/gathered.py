@@ -21,7 +21,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir as mgpu_ir
 from jax.extend.mlir.dialects import arith as mgpu_arith, memref as mgpu_memref, vector as mgpu_vector
 
-from dew.nn.kernels.templates import rings, stores, swizzling
+from dew.nn.kernels.templates import across, rings, stores, swizzling
 
 
 @dataclasses.dataclass(frozen=True)
@@ -274,20 +274,50 @@ class Gathers:
                                                     mgpu_utils.ThreadSubset.WARP))
         layout = mgpu_fragments.TMA_INDICES_4_LAYOUT
         vector = mgpu_ir.VectorType.get((4,), i32)
-        start = splat_value(column)
+        # The step's column as the warp holds it uniformly, as its rows' entries are (`_entries`).
+        start = across.lane_value(splat_value(column), 0)
         issuer = mgpu_utils.single_thread_predicate(mgpu_utils.ThreadSubset.WARP)
-        for tile in self.tiles(shape[0]):
-            # The tile's entries, four a register, every thread the same (`layout`), each a load of its own:
-            # a tile's first entry lies where its group's rows start, at no 16-byte alignment.
-            registers = [mgpu_vector.from_elements(vector, [
-                mgpu_memref.load(rows, [mgpu_utils.c(tile * tile_rows + 4 * part + lane, index)])
-                for lane in range(4)]) for part in range(tile_rows // 4)]
+        tiles = list(self.tiles(shape[0]))
+        entries = self._entries(rows, len(tiles), tile_rows)
+        for at, tile in enumerate(tiles):
+            # The tile's entries, four a register, every thread the same (`layout`).
+            mine = entries[at * tile_rows:(at + 1) * tile_rows]
+            registers = [mgpu_vector.from_elements(vector, mine[4 * part:4 * (part + 1)])
+                         for part in range(tile_rows // 4)]
             indices = mgpu_fragments.FragmentedArray(
                 _registers=_registered(registers, layout, tile_rows), _layout=layout, _is_signed=False)
             ctx.async_copy(src_ref=source, dst_ref=mgpu_utils.memref_slice(slot, mgpu_utils.ds(tile, 1)),
                            gmem_slice=(indices, mgpu_utils.ds(mgpu_arith.index_cast(index, start), width)),
                            gmem_transform=mgpu_launch.TileTransform((tile_rows, tile_columns)),
                            swizzle=self.swizzle, barrier=tracked, arrive=False, predicate=issuer)
+
+    def _entries(self, rows, tiles: int, tile_rows: int) -> list:
+        """The table entries of the warp's `tiles` tiles (`rows`, a step's table in global memory: tile t's
+        `tile_rows` entries from row t * `tile_rows`, the warp's tiles those `tiles` names), in order, each as
+        every lane of the warp holds it uniformly: its lanes load them a warp's width at a time, an entry a
+        lane, and each is read from its lane (`across.lane_value`), which ptxas holds in a uniform register,
+        where a TMA gather reads its indices. Loaded by every thread and read from a register a lane, each
+        gather4's four were moved into uniform registers by R2UR (66% of a load warp's issues at the line
+        that loaded them, the emulated B200's gathered kernel gradient, M-EM-71)."""
+        i32, index = mgpu_ir.IntegerType.get_signless(32), mgpu_ir.IndexType.get()
+        warp, warps = self.share
+        count = tiles * tile_rows
+        lane = mgpu_arith.remui(mgpu_utils.thread_idx(), mgpu_utils.c(mgpu_utils.WARP_SIZE, i32))
+        found = []
+        for first in range(0, count, mgpu_utils.WARP_SIZE):
+            # The lane's entry: its tile among the warp's (tile `warp + q * warps`, `tiles`), its row within.
+            position = mgpu_arith.addi(lane, mgpu_utils.c(first, i32))
+            tile = mgpu_arith.addi(mgpu_utils.c(warp, i32), mgpu_arith.muli(
+                mgpu_arith.divui(position, mgpu_utils.c(tile_rows, i32)), mgpu_utils.c(warps, i32)))
+            row = mgpu_arith.addi(mgpu_arith.muli(tile, mgpu_utils.c(tile_rows, i32)),
+                                  mgpu_arith.remui(position, mgpu_utils.c(tile_rows, i32)))
+            # A lane past the warp's entries loads the table's first, which no gather reads.
+            held = mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.ult, position, mgpu_utils.c(count, i32))
+            row = mgpu_arith.select(held, row, mgpu_utils.c(0, i32))
+            loaded = mgpu_memref.load(rows, [mgpu_arith.index_cast(index, row)])
+            found += [across.lane_value(loaded, at)
+                      for at in range(min(mgpu_utils.WARP_SIZE, count - first))]
+        return found
 
 
 def _registered(registers: list, layout, rows: int):
