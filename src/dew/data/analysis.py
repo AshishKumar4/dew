@@ -54,6 +54,7 @@ from dew.data.pipeline import (
     MapBatch,
     MapWithIndex,
     MarkConsumed,
+    MarkCounted,
     Measure,
     Mixture,
     Native,
@@ -657,7 +658,7 @@ def _held_bound(stages: Sequence[Stage], at: int) -> int:
     repeats = int(isinstance(first, Repeat) and first.epochs is None)
     bound = stages[at + repeats:at + repeats + 3]
     marked = (len(bound) == 3 and isinstance(bound[0], Limit) and isinstance(bound[1], Map)
-              and isinstance(bound[1].step, MarkConsumed)
+              and isinstance(bound[1].step, MarkConsumed) and not isinstance(bound[1].step, MarkCounted)
               and (isinstance(bound[2], Pack) or _drawn_cut(stages, at + repeats + 2)))
     return repeats + 2 if marked else 0
 

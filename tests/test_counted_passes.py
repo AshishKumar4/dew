@@ -4,6 +4,7 @@ record count, it evaluates and checkpoints where a run of its epochs does, resum
 stopped, and a run whose cadences read no pass compiles as it did."""
 
 import dataclasses
+import itertools
 import json
 from pathlib import Path
 
@@ -182,3 +183,51 @@ def test_a_read_whose_count_would_change_its_rows_counts_no_pass_and_reads_as_be
         finally:
             for stream in streams:
                 stream.close()
+
+
+def test_a_take_of_the_chains_own_where_the_count_marks_reads_each_share_as_counting_none():
+    """A take of the chain's own standing where a run counting its passes marks them, read by two shares:
+    each share reads the records it reads counting none, the take no bound of the run's
+    (`MarkCounted`, `examples_limit`), where the take with the mark after it read as the run's bound was
+    dealt to the shares as quotas of their own (the theme's re-review, F1)."""
+    import numpy as np
+
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+
+    chain = Pipeline(Memory({"id": np.arange(1, 11, dtype=np.int32)}, shard_rows=3)).take(5).read(
+        "indexed").batch(1)
+    plain, counting = (_loader(chain, counting=asked, expands=False) for asked in (False, True))
+    assert counting.pass_examples == 5
+    for share in range(2):
+        streams = [loader.train(DataPartition(share, 2)) for loader in (plain, counting)]
+        try:
+            assert _ids(streams[1], 6) == _ids(streams[0], 6)
+        finally:
+            for stream in streams:
+                stream.close()
+
+
+def test_a_memory_read_holding_an_objectives_rows_carries_each_example_it_consumed_to_a_kept_row():
+    """A memory read holding the rows an objective makes of each record (`Fanned`, none of every fourth),
+    run counting its passes: its batches over one pass carry every example it read, those of the records
+    it made no row of carried to the next row kept and the last kept, so the trainer counts the pass
+    whole (`consumption_counted`), where its rows carried none and the count failed (the theme's
+    re-review, F2)."""
+    import numpy as np
+    from data_support import Fanned
+
+    from dew.data import Memory
+    from dew.data.compile import compile
+    from dew.data.pipeline import ObjectiveData, Pipeline
+
+    loader = compile(Pipeline(Memory({"id": np.arange(1, 13, dtype=np.int32)})).batch(2), read="memory",
+                     objective=ObjectiveData(train=(Fanned(),)), steps=9, count_passes=True)
+    assert loader.pass_examples == 12
+    stream = loader.train(DataPartition())
+    try:
+        batches = [consumption_counted(batch, clocked=False, counting=True)
+                   for batch in itertools.islice(stream, 9)]
+    finally:
+        stream.close()
+    assert sum(batch[CONSUMED_COUNT].examples for batch in batches) == 12

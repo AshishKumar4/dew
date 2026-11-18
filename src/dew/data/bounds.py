@@ -16,6 +16,7 @@ from dew.data.pipeline import (
     Limit,
     Map,
     MarkConsumed,
+    MarkCounted,
     Native,
     Pack,
     Phases,
@@ -77,7 +78,7 @@ def _counted(pipeline: Pipeline) -> Pipeline:
     resume reads from its start and an exact one refuses. Placed only where `_countable` says so."""
     at = _placement(pipeline, passes=True, counting=True)
     assert isinstance(at, int), at
-    return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], Map(MarkConsumed()),
+    return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], Map(MarkCounted()),
                                                  *pipeline.stages[at:]))
 
 

@@ -213,6 +213,12 @@ class MarkConsumed:
         return {**element, CONSUMED: 1, REFUSED: 0}
 
 
+class MarkCounted(MarkConsumed):
+    """The mark of a run bounded in steps that counts its passes (`dew.data.bounds._counted`), which bounds
+    nothing: no limit before it is the run's bound (`examples_limit`), a take of the chain's own standing
+    there reading as it does counting none."""
+
+
 @dataclasses.dataclass
 class Owed:
     """The source examples rows a step dropped or made none of were the last of (`Rejected.consumed`),
@@ -778,10 +784,12 @@ UNCOUNTED = 1 << 62
 
 def examples_limit(stages: Sequence[object]) -> int | None:
     """Where a run bounded in examples stops reading (the limit before its mark, `examples_bound`): its index
-    in `stages`, None for a read marked with no bound, as a run counting its passes marks it
-    (`dew.data.bounds._counted`), or a read with no mark."""
+    in `stages`, None for a read a run counting its passes marks (`MarkCounted`), or a read with no mark."""
     at = examples_bound(stages)
-    return at - 1 if at is not None and at > 0 and isinstance(stages[at - 1], Limit) else None
+    mark = stages[at] if at is not None else None
+    if at is None or at == 0 or (isinstance(mark, Map) and isinstance(mark.step, MarkCounted)):
+        return None
+    return at - 1 if isinstance(stages[at - 1], Limit) else None
 
 
 def examples_bound(stages: Sequence[object]) -> int | None:
