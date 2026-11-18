@@ -23,6 +23,7 @@ from reference_error import (
     GateFailure,
     Inconclusive,
     as_given,
+    as_recorded,
     assert_as_exact,
     assert_moves,
     assert_same_artifact,
@@ -1496,7 +1497,7 @@ def test_a_recording_with_pilot_shards_sizes_paired_on_them_as_the_live_draws_do
     def recorded(index, inputs):
         asked.append(int(index))
         return reference(index, inputs)
-    recorded.recorded, recorded.pilots = True, reference.pilots
+    as_recorded(recorded, reference.pilots)
 
     def dew(index, inputs):
         return reordered(inputs["x"], inputs["w"])
@@ -1610,8 +1611,7 @@ def _recorded_pairs(dew, reference, count: int, missing=()):
     def truth(seed):
         return {"y": np.zeros(64, np.float64)}
 
-    recorded.recorded = True
-    return recorded, recorded_dew, truth, asked
+    return as_recorded(recorded), recorded_dew, truth, asked
 
 
 def test_a_recorded_reference_with_pilots_sizes_paired_on_them_alone():
