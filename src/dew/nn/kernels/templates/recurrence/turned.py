@@ -126,16 +126,32 @@ def _turned_primal(launch, scale, group, held, query, key, value, g, beta, state
                            starts, documents)[0]
 
 
-def _in_last_frame(tokens, opening):
-    """Each token's frame and each document's opening frame (`frames`, `_forked_frames`) less its row's last
-    token's (`Psi`), as rotations `(cos, sin)`, and the rotation by `-Psi` `[B, 1, H, A]`: the common frame
-    the call is read in its row's last token's, so a recent write's key turns by nearly nothing and the
-    final memory needs no turn back. Read in the first document's frame and turned back, every recent write
-    took two roundings of a full turn the recurrence's takes none of: under a decay keeping a few tokens the
-    final memory 1.9 times the recurrence's error from float64, an angle of 1.2e-7 radians its most."""
-    last = tuple(part[:, -1:] for part in tokens)
-    back = tuple(-part for part in last)
-    relative = compensated_add(tokens, tuple(jnp.broadcast_to(part, tokens[0].shape) for part in back))
+def _in_last_frame(tokens, opening, starts=None):
+    """Each token's frame and each document's opening frame (`frames`, `_forked_frames`) less its document's
+    last token's (`Psi`), as rotations `(cos, sin)`, and the rotation by `-Psi` of the row's first document
+    `[B, 1, H, A]`, which the memory entering takes: each document read in its own last token's frame, so a
+    recent write's key turns by nearly nothing and the final memory, the last document's, needs no turn back.
+    Read in the first document's frame and turned back, every recent write took two roundings of a full turn
+    the recurrence's takes none of: under a decay keeping a few tokens the final memory 1.9 times the
+    recurrence's error from float64, an angle of 1.2e-7 radians its most. A packed call's documents (`starts`
+    `[B, T]`) each take their own, so no document's arithmetic reads another's turns (a row's last token's
+    frame put a Mamba-3 document's outputs a rounding apart with and without the documents beside it,
+    test_mixers' no-token-reaches-another-document); a forked call's (`opening`) share the row's last, as a
+    memory one stores and another enters is read in one frame."""
+    batch, length = tokens[0].shape[:2]
+    if opening is None and starts is not None:
+        # Each token's document's last token: the least position at or after it whose next one starts a
+        # document, or the row's last.
+        place = jnp.arange(length)
+        ends = jnp.concatenate([jnp.asarray(starts, bool)[:, 1:], jnp.ones((batch, 1), bool)], axis=1)
+        lasts = jax.lax.cummin(jnp.where(ends, place, length), axis=1, reverse=True)
+        lasts = lasts.reshape(*lasts.shape, *(1,) * (tokens[0].ndim - 2))
+        last = tuple(jnp.take_along_axis(part, jnp.broadcast_to(lasts, part.shape), axis=1)
+                     for part in tokens)
+    else:
+        last = tuple(jnp.broadcast_to(part[:, -1:], part.shape) for part in tokens)
+    relative = compensated_add(tokens, tuple(-part for part in last))
+    back = tuple(-part[:, :1] for part in last)
     opened = None
     if opening is not None:
         opened = scan.rotation(*compensated_add(opening, tuple(jnp.broadcast_to(part, opening[0].shape)
@@ -158,7 +174,7 @@ def _turned_forward(launch, scale, group, held, query, key, value, g, beta, stat
         tokens, opening = frames(turn, starts), None
     else:
         tokens, opening = _forked_frames(turn, starts, documents, given=state.shape[1])
-    (cos, sin), opened, back = _in_last_frame(tokens, opening)
+    (cos, sin), opened, back = _in_last_frame(tokens, opening, starts)
     turned = [scan.rotated(_wide(x), cos, sin).astype(x.dtype) for x in (query, key)]
     if state is not None:
         # The memory entering, in the first frame, turned into the common one.
