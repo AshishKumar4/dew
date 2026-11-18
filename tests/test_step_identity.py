@@ -1059,3 +1059,57 @@ def test_a_step_made_inside_a_function_resumes_exactly_by_its_code_closure_and_r
     assert resumed_changes(reader(jax.random.key(0)), state) == ()
     with pytest.raises(ValueError):
         resumed_changes(reader(jax.random.key(1)), state)
+
+
+def shifted_where_weak(value):
+    """A step made inside a function: each id shifted by one where the array it closes over is weakly
+    typed, as a trace that promotes by it computes otherwise."""
+    def shift(row):
+        return {**row, "id": np.int32(row["id"] + (1 if value.weak_type else 0))}
+    return shift
+
+
+def _flipped_bits(key, bit_width, shape):
+    """Threefry's random bits, each flipped: an implementation of its own under the default tag."""
+    from jax.extend import random as extended
+
+    return jax.numpy.bitwise_not(extended.threefry_prng_impl.random_bits(key, bit_width, shape))
+
+
+def _tagged_alike(*, flipped: bool):
+    """A typed key of key data 0 under an implementation printing the default tag (`?`): threefry's, or
+    threefry's with its random bits flipped."""
+    from jax.extend import random as extended
+
+    threefry = extended.threefry_prng_impl
+    impl = extended.define_prng_impl(key_shape=threefry.key_shape, seed=threefry.seed, split=threefry.split,
+                                     random_bits=_flipped_bits if flipped else threefry.random_bits,
+                                     fold_in=threefry.fold_in)
+    return jax.random.wrap_key_data(jax.numpy.zeros(threefry.key_shape, jax.numpy.uint32), impl=impl)
+
+
+@pytest.mark.parametrize("held", ["weak type", "key implementation"])
+def test_a_captured_array_differing_only_in_what_its_bytes_do_not_hold_refuses_exact_resume(held):
+    """A step closing over an array of JAX's whose bytes, dtype name and sharding are the same as the one
+    its run saved with, but whose weak type, or whose typed key's implementation under one printed tag,
+    differs: its exact resume is refused, where the statement held neither and the resumed run read other
+    rows, or drew other bits, as an unchanged one (rows 7903, 7904). The same array resumes exactly."""
+    import jax.numpy as jnp
+
+    if held == "weak type":
+        saved, other = jnp.asarray(1), jnp.asarray(1, dtype=jnp.int32)
+        assert saved.weak_type and not other.weak_type
+        step = shifted_where_weak
+    else:
+        saved, other = _tagged_alike(flipped=False), _tagged_alike(flipped=True)
+        assert str(saved.dtype) == str(other.dtype)
+        step = shifted_by
+
+    def reader(value):
+        pipeline = Pipeline(ROWS).map(step(value)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(lambda: reader(saved))
+    assert resumed_changes(reader(saved), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(other), state)

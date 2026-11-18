@@ -242,14 +242,17 @@ line, signature and counters, which a function's own statement holds or which de
 
 def _jax_array(value: jax.Array, at: str, again: Callable[..., JSON]) -> JSON:
     """An array of JAX's by its values, fetched to the host, as a NumPy array's (`_data`: its dtype, shape
-    and bytes; a typed PRNG key's its key type and key data, `terms.held_bits`), and its sharding: a trace
-    that closes over it bakes both into its program. Refused where this process holds only part of it,
-    whose bytes no one process reads."""
+    and bytes; a typed PRNG key's its key type and key data, `terms.held_bits`), its weak type and its
+    sharding: a trace that closes over it bakes all of them into its program, and may branch on its weak
+    type. A typed key's dtype is stated as any value is, by its implementation's parts, which its printed
+    tag alone does not tell apart (two implementations may print one). Refused where this process holds
+    only part of it, whose bytes no one process reads."""
     if not value.is_fully_addressable:
         raise Unestablished(f"{at}: an array of JAX's this process holds only part of")
     # A typed PRNG key's bits are its key data, its dtype the key type, which NumPy cannot read whole.
     dtype, bits = terms.held_bits(value)
-    return ["jax array", str(dtype), _data(bits, at), again(value.sharding, at=f"{at}.sharding")]
+    return ["jax array", again(dtype, at=f"{at}.dtype"), value.weak_type, _data(bits, at),
+            again(value.sharding, at=f"{at}.sharding")]
 
 
 def _data(value, at: str) -> JSON | None:
