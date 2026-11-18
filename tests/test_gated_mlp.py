@@ -195,8 +195,8 @@ def assert_same_program(one, other) -> None:
     """`one` and `other` (closed jaxprs, as `jax.make_jaxpr` returns them) are the same program: equation for
     equation the same primitive over the same wiring of variables of the same avals, the same effects and
     parameters, each nested program (a call's, a kernel's body) compared as a program again, closed ones
-    with their captured constants, a rule's function by its kind and name, and the same captured
-    constants."""
+    with their captured constants, a rule a trace wraps afresh by its kind and how it reads, and the same
+    captured constants."""
     from dew.nn.programs import computed
 
     closed, opened = type(one), type(one.jaxpr)
@@ -225,13 +225,12 @@ def assert_same_program(one, other) -> None:
                     assert_same_program(value, theirs.params[key])
                 elif isinstance(value, opened):
                     same(value, theirs.params[key])
-                elif callable(value):
-                    # A rule a trace wraps afresh (a custom derivative's): the same function by its kind and
-                    # name, its program the equation's own bodies, compared above.
-                    assert (type(value), getattr(value, "__qualname__", None)) == (
-                        type(theirs.params[key]), getattr(theirs.params[key], "__qualname__", None)), key
                 else:
-                    assert value == theirs.params[key], (key, mine, theirs)
+                    # A rule a trace wraps afresh (a custom derivative's, its program the equation's own bodies,
+                    # compared above) is the same rule where it reads as the same, of the same kind.
+                    other_value = theirs.params[key]
+                    assert value == other_value or (type(value) is type(other_value)
+                                                    and str(value) == str(other_value)), (key, mine, theirs)
             for out_mine, out_theirs in zip(mine.outvars, theirs.outvars, strict=True):
                 assert out_mine.aval == out_theirs.aval
                 names[out_mine] = out_theirs
