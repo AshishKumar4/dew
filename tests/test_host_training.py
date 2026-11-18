@@ -136,12 +136,13 @@ def crossed(optimizer, label: str, devices=None):
             state, *_ = step(state, data)
         return state
 
-    def draw(seed):
-        """A small and a large gradient, the large past the global clip's bound."""
-        rng = np.random.default_rng([127, seed])
-        return np.float32(rng.uniform(.1, 1.)), np.float32(rng.uniform(10., 80.))
+    layouts_agree(run, gradients, label, HOST, DEVICE)
 
-    layouts_agree(run, draw, label, HOST, DEVICE)
+
+def gradients(seed):
+    """`Coupled`'s inputs: a small and a large gradient, the large past a global clip's bound."""
+    rng = np.random.default_rng([127, seed])
+    return np.float32(rng.uniform(.1, 1.)), np.float32(rng.uniform(10., 80.))
 
 
 def test_a_host_step_read_in_a_stated_split_is_on_par_with_the_devices_split_step():
@@ -1579,15 +1580,13 @@ def test_a_host_step_under_autopgle_runs_its_programs_guided_by_a_trials_profile
     """Under JAX's AutoPGLE a host step, whose programs Dew compiles ahead of its run and no jit call
     profiles, steps on a trial after its startup, profiled, and each program those steps ran, compiled
     again guided by the profile, runs in its executable's place: here every program, handed one
-    instruction's profile (`COST`), which a CPU's compile takes and does not read, its guided compile's
-    optimized program the unguided one's text for text, so the run steps as the unguided run does, bit for
-    bit (testing.md:109: one program), compiling nothing past its startup."""
-    import re
+    instruction's profile (`COST`). A guided compile is another compile, so its three updates are held to
+    the unguided run's from float64 (check 1, `layouts_agree`), not bit for bit."""
+    import contextlib
 
     from test_plan import COST, autopgle
 
-    from dew.telemetry.compiles import executable_only
-    from dew.training.planning import Trials, guided_compile
+    from dew.training.planning import Trials
 
     ran = []
 
@@ -1599,35 +1598,34 @@ def test_a_host_step_under_autopgle_runs_its_programs_guided_by_a_trials_profile
             ran.extend(programs)
             return COST, programs
 
-    def stepped(trials):
-        trainer = Trainer(Tiny(composite=True), optax.adamw(.03), key=jax.random.PRNGKey(9), layout=HOST)
-        state, _, _ = trainer.place()
-        batch = placed_batch(trainer, batches()[0])
-        held = None if trials is None else trials(state, batch)
-        step = trainer.compile(state, batch, held)
-        state = state if held is None else held.state
-        for _ in range(3):
-            with executable_only():
-                state, *_ = step(state, batch)
-        return trainer, state
+    held = {}
 
-    _, unguided = stepped(None)
-    with autopgle(2):
-        trainer, guided = stepped(Handed)
+    def compiled(arm: str, data):
+        """The run's trainer and its step, guided by AutoPGLE's trial for the "guided" `arm`, compiled once a
+        precision over the first call's `data`."""
+        guided = arm == "guided"
+        key = (arm, x64())
+        if key not in held:
+            trainer = Trainer(Coupled(), optax.adam(.01), key=jax.random.key(4), layout=HOST)
+            start = widened_start(trainer)
+            with autopgle(2) if guided else contextlib.nullcontext():
+                trials = Handed(start, data) if guided else None
+                held[key] = trainer, trainer.compile(start, data, trials)
+        return held[key]
+
+    def run(arm, small, large):
+        data = {"small": jnp.asarray(small), "large": jnp.asarray(large)}
+        trainer, step = compiled(arm, data)
+        state = widened_start(trainer)
+        for _ in range(3):
+            state, *_ = step(state, data)
+        return state
+
+    layouts_agree(run, gradients, "three updates of a host step guided by a trial's profile", "guided",
+                  "unguided")
+    trainer, _ = held[("guided", False)]
     record = trainer._compiler.host_startup.record()["pgle"]
     assert record["runs"] == 2 and record["bytes"] == len(COST) and record["programs"] == len(ran) > 0, record
-    # The premise of the bitwise claim: each guided compile is the program it replaces, its optimized HLO's
-    # instructions alike, their source metadata (a trace's stack frames and the table naming them) aside.
-    def instructions(executable) -> list[str]:
-        program = executable.as_text().split("\nFileNames")[0]
-        return re.sub(r", metadata=\{[^}]*\}", "", program).splitlines()
-
-    for program, executable, lowered, relower in ran:
-        mine, theirs = instructions(guided_compile(lowered, program.options, COST, relower)), instructions(
-            executable)
-        differing = [pair for pair in zip(mine, theirs, strict=False) if pair[0] != pair[1]][:4]
-        assert not differing and len(mine) == len(theirs), (program.called, len(mine), len(theirs), differing)
-    equal(guided.variables, unguided.variables)
 
 
 def test_a_host_step_lowers_for_a_gpu_here_compiling_nothing():
