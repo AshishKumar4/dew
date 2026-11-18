@@ -645,7 +645,7 @@ def _arm_role(role: str, fn, label: str) -> str | None:
     at = f"{label}: its {role} arm"
     try:
         known: dict[int, Any] = {}
-        _mutable_known(fn, known, set())
+        _mutable_known(fn, known, set(), at)
         statement = stated(fn, at, known)
     except Unestablished as unstated:
         _log.info("an arm no statement holds runs unprepared: %s", unstated)
@@ -653,19 +653,25 @@ def _arm_role(role: str, fn, label: str) -> str | None:
     return f"{role} {hashlib.sha256(json.dumps(statement, sort_keys=True).encode()).hexdigest()[:16]}"
 
 
-def _mutable_known(value, known: dict[int, Any], walking: set[int]) -> None:
+def _mutable_known(value, known: dict[int, Any], walking: set[int], at: str) -> None:
     """Into `known` (`dew._stated.stated`'s values its caller states), each list, dict or set `value`
-    reaches through partials, records, tuples, jits and what each function reads, stated by its type alone
-    (row 7674): such a container is state an arm keeps as it runs (a test's record of its calls, a cache a
-    trace fills), which a prepare's trace of the arm fills and its run, calling the arm's executable, does
-    not."""
-    if id(value) in walking or id(value) in known:
+    reaches through partials, records, tuples, jits, containers and what each function reads, stated by its
+    contents as this process first named an arm reading it (`_FIRST_NAMED`): such a container may be state an
+    arm keeps as it runs (a test's record of its calls, a cache a trace fills), which a prepare's trace of the
+    arm fills after its first naming and its run, calling the arm's executable, never does; and it may hold
+    what the arm computes by (a test's options read off its backend, another in a GPU's run than in its CPU's
+    prepare), which names another arm (row 7674: stated by its type alone, the run computed the prepare's
+    program). Each container's parts are walked before it is stated, through the one `known` every reached
+    container's statement is in, so one a trace filled since its first naming is stated as it was then
+    wherever it lies, inside another or beside an alias of itself (the review's: a dict read its record
+    trace-filled in a prepare, empty in its run)."""
+    if id(value) in walking:
         return
     walking.add(id(value))
-    if isinstance(value, (list, dict, set)):
-        known[id(value)] = ["mutable", type(value).__qualname__]
-        return
-    if isinstance(value, functools.partial):
+    container = isinstance(value, (list, dict, set))
+    if container:
+        parts = tuple(value.values()) if isinstance(value, dict) else tuple(value)
+    elif isinstance(value, functools.partial):
         parts = (value.func, *value.args, *value.keywords.values())
     elif dataclasses.is_dataclass(value) and not isinstance(value, type):
         parts = tuple(getattr(value, field.name) for field in dataclasses.fields(value))
@@ -680,7 +686,17 @@ def _mutable_known(value, known: dict[int, Any], walking: set[int]) -> None:
     else:
         return
     for part in parts:
-        _mutable_known(part, known, walking)
+        _mutable_known(part, known, walking, at)
+    if container:
+        named = _FIRST_NAMED.get(id(value))
+        if named is None:
+            named = _FIRST_NAMED[id(value)] = (value, ["mutable", stated(value, at, known)])
+        known[id(value)] = named[1]
+
+_FIRST_NAMED: dict[int, tuple[Any, Any]] = {}
+"""Each list, dict or set an arm reads (`_mutable_known`), by its `id`, with its statement as this process
+first named an arm reading it, before any trace of that arm wrote to it, as a prepare names it and a run, a
+process whose executables write to none, alike; held, so no other container takes its `id`."""
 
 
 def _paired_most(reference_fn, most: int = MOST_SEEDS) -> int | None:
