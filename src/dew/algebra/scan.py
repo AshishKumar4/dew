@@ -277,11 +277,12 @@ def _stepped(state, prepared: Prepared, issue=None):
     return Walk(decay, leaving, transfer)
 
 
-def _at_token(declaration: Scan, names: Sequence[str], affine, token: Mapping) -> tuple:
+def _at_token(declaration: Scan, names: Sequence[str], affine, token: Mapping, *,
+              split_reader: bool = False) -> tuple:
     """One token's exponent and the affine map's parts at it (`_token`), `token` its operands without the
     walked axis, the exponent in float32 at least: a narrower prefix loses a decay's digits to its partials'
     magnitude, and float16's overflows past six resets (65504); a reset token's decay `RESET_DECAY`."""
-    exponent, *values = _token(affine, tuple(token[name] for name in names))
+    exponent, *values = _token(affine, tuple(token[name] for name in names), split_reader=split_reader)
     exponent = exponent.astype(at_least_fp32(exponent.dtype))
     if declaration.reset is not None:
         exponent = jnp.where(token[declaration.reset], RESET_DECAY, exponent)
@@ -326,13 +327,14 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
 
     def token(carry, step):
         h, apart, index = carry
-        z, b, u, strength, c, q, r = _at_token(declaration, names, affine, step)
+        z, b, u, strength, c, q, r, read_scale = _at_token(
+            declaration, names, affine, step, split_reader=True)
         # A token that reads the state entering it (`Scan.reads`) reads it before its decay and its write: a
         # reset's zero, any other's whole, a decay that vanishes at this token erasing nothing it reads.
         entering = None
         if declaration.reads == "before":
             read = h if declaration.reset is None else jnp.where(step[declaration.reset], 0.0, h)
-            entering = _read(read, q, affine.values_read) + r
+            entering = read_scale * _read(read, q, affine.values_read) + r
         floor = vanishing(z.dtype, affine.base2)
         h = jnp.where((z <= floor)[:, None], 0.0, h)
         decay = jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],))
@@ -341,20 +343,22 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             # since it: the group's first takes the state as it enters (`h`, its vanishing decay's zero).
             apart = jnp.where(index % group == 0, h, jnp.where((z <= floor)[:, None], 0.0, apart))
             apart = apart * decay[:, None]
-            entering = _read(apart, q, affine.values_read) + r
+            entering = read_scale * _read(apart, q, affine.values_read) + r
         if not affine.per_key:
             correction = jnp.sum(c[:, None] * h, axis=0)
             transitioned = (h - b[:, None] * (strength * correction)[None, :]) * decay[:, None]
             h = transitioned + b[:, None] * u[None, :]
             if affine.values_read:
-                output = jnp.sum(transitioned * q[None, :], axis=1) + b * jnp.sum(u * q) + r
+                output = read_scale * (
+                    jnp.sum(transitioned * q[None, :], axis=1) + b * jnp.sum(u * q)) + r
             else:
-                output = jnp.sum(q[:, None] * transitioned, axis=0) + jnp.sum(q * b) * u + r
+                output = read_scale * (
+                    jnp.sum(q[:, None] * transitioned, axis=0) + jnp.sum(q * b) * u) + r
         else:
             decayed = h * decay[:, None]
             correction = jnp.sum(c[:, None] * decayed, axis=0)
             h = decayed + b[:, None] * (u - strength * correction)[None, :]
-            output = _read(h, q, affine.values_read) + r
+            output = read_scale * _read(h, q, affine.values_read) + r
         return (h, apart, index + 1), output if entering is None else entering
 
     carried = at_least_fp32(h.dtype)
@@ -772,7 +776,7 @@ def _substituted(lower, given):
     return lax.fori_loop(0, given.shape[0], row, jnp.zeros_like(given))
 
 
-def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
+def _token(parts: linear_scan.Parts, token: tuple, *, split_reader: bool = False) -> tuple:
     """One token's exponent, input vector `B` and values `U`, correction strength `s` and vector `C`, reader
     `Q` and free readout `R` (zeros where the readout has none): the affine map's parts
     (`linear_scan.Parts`) at the token's values, each in float32 at least."""
@@ -801,7 +805,24 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     s = jnp.asarray(1.0 if corrects else 0.0, carried)
     exponent = along(parts.exponent, keys if parts.per_key else 1)
     reader, out = (values, keys) if parts.values_read else (keys, values)
-    return exponent, B, U, s, C, along(parts.reader, reader), along(parts.free, out)
+    if not split_reader:
+        return exponent, B, U, s, C, along(parts.reader, reader), along(parts.free, out)
+
+    from egglog import get_callable_args
+
+    def factored(term):
+        scalar = get_callable_args(term, linear_scan.Token.scalar)
+        if scalar is not None:
+            return jnp.ones((reader,), carried), linear_scan.value_of(scalar[0], read, keys, carried)
+        product = get_callable_args(term, linear_scan.Token.times)
+        if product is not None:
+            lhs, ls = factored(product[0])
+            rhs, rs = factored(product[1])
+            return lhs * rhs, ls * rs
+        return along(term, reader), jnp.asarray(1.0, carried)
+
+    vector, factor = factored(parts.reader)
+    return exponent, B, U, s, C, vector, along(parts.free, out), factor
 
 
 def _pairing_role(left) -> str:
