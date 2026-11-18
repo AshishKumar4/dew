@@ -9,8 +9,9 @@ import os
 from pathlib import Path
 
 PROGRESS = "progress.jsonl"
-"""The file of the tests a task passed, a JSON line each: its node id, its call's seconds and, where it
-compiled a program the shared cache lacked (tests/conftest.py's property `compiled`), `cold`."""
+"""The file of the tests a task passed, a JSON line each: its node id, its seconds (its setup's, call's and
+teardown's, as JUnit times a test) and, where it compiled a program the shared cache lacked over that time
+(tests/conftest.py's property `compiled`), `cold`."""
 SET_ASIDE = "DEW_SET_ASIDE"
 """What names the JSON list of the node ids a resumed attempt sets aside (ci.py's `tested`): exactly those,
 never a test whose id one of them begins, as pytest's --deselect, which matches by prefix, would (train
@@ -32,6 +33,7 @@ def pytest_collection_finish(session) -> None:
         session.config.hook.pytest_deselected(items=dropped)
 
 
+_set_up: dict[str, float] = {}
 _called: dict[str, float] = {}
 _session: dict[str, str | None] = {}
 """The task's own artifacts (ARMADA_ARTIFACTS), named once its session starts (`pytest_configure`)."""
@@ -49,10 +51,12 @@ def pytest_runtest_logreport(report) -> None:
     artifacts = _session.get("artifacts")
     if not artifacts:
         return
-    if report.when == "call" and report.passed:
-        _called[report.nodeid] = report.duration
+    if report.when == "setup" and report.passed:
+        _set_up[report.nodeid] = report.duration
+    elif report.when == "call" and report.passed:
+        _called[report.nodeid] = _set_up.pop(report.nodeid, 0.0) + report.duration
     elif report.when == "teardown" and report.nodeid in _called:
-        seconds = _called.pop(report.nodeid)
+        seconds = _called.pop(report.nodeid) + report.duration
         if report.passed:
             cold = any(name == "compiled" and int(value) > 0 for name, value in report.user_properties)
             Path(artifacts).mkdir(parents=True, exist_ok=True)
