@@ -470,8 +470,8 @@ def _power_of_two(n, dtype=jnp.float32) -> jax.Array:
     """`2^n` in `dtype` (fp32 or float64), of an integral `n` within its normal exponents, set in its
     exponent bits."""
     limits = jnp.finfo(dtype)
-    unsigned = jnp.dtype(f"int{limits.bits}")
-    return jax.lax.bitcast_convert_type((n.astype(unsigned) + (limits.maxexp - 1)) << limits.nmant, dtype)
+    signed = jnp.dtype(f"int{limits.bits}")
+    return jax.lax.bitcast_convert_type((n.astype(signed) + (limits.maxexp - 1)) << limits.nmant, dtype)
 
 
 def _exp_jvp(base2: bool, primals, tangents) -> tuple[jax.Array, jax.Array]:
