@@ -15,8 +15,6 @@ import re
 from collections.abc import Container, Iterator, Mapping
 from pathlib import Path
 
-import grading
-
 DURATIONS = Path("tests/test_durations.json")
 CUTS = Path("tests/test_cuts.json")
 """Each split test file's cut as main's CI last ran it, kept while the file's groups hold (`stored_cuts`): the
@@ -348,7 +346,9 @@ def units(nodes: list[str]) -> list[list[int]]:
     marks: dict[str, dict[str, str]] = {}
     held: dict[tuple[str, str] | int, list[int]] = {}
     for index, node in enumerate(nodes):
-        name = grading.owning(node)
+        # The node's file as grading.owning reads it, spelled here: conftest loads this module bare (stdlib
+        # imports alone), where grading is no sibling it can import.
+        name = node.partition("::")[0]
         if name not in marks:
             marks[name] = shared_setups(name)
         setup = marks[name].get(test_name(node))
