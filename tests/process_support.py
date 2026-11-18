@@ -269,6 +269,17 @@ def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,
                          environment=environment)
 
 
+def terminate_all(processes: Sequence[subprocess.Popen[str]]) -> None:
+    """Kill every session `processes` lead, all of them first, then return once none still runs
+    (`terminate`): a worker of a pool killed after its peer's settling outlived it long enough to see the
+    peer gone and end on its own, its exit no SIGKILL (row 7678)."""
+    for process in processes:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+    for process in processes:
+        terminate(process)
+
+
 def terminate(process: subprocess.Popen[str]) -> None:
     """Kill the session even if its leader already exited and left descendants,
     and return once none of them still runs (tools/armada/child_groups.py's `stop`)."""
