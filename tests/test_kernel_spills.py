@@ -153,6 +153,7 @@ import optax
 from token_support import token_rows
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.templates import report
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
@@ -182,11 +183,13 @@ devices = compile_only_gpus(sys.argv[1], 1, 80 * 2**30)
 trainer = Trainer(LMObjective(model, 12288), optax.adam(1e-3), key=jax.random.key(0),
                   mesh=MeshSpec().build(devices))
 compile_ahead(trainer, token_rows(64, 1, 12289))
-print(json.dumps({"events": events, "modules": modules, "kind": devices[0].device_kind}))
+print(json.dumps({"events": events, "modules": modules, "kind": devices[0].device_kind,
+                  "stored": [certification.stored for certification in report.certifications()]}))
 """
 """A one-layer decoder of Qwen3.5-4B's gated delta net compiled ahead for a compile-only GPU of the generation
 or the kind argv[1] names (`compile_only_gpus`): each program it lowered by name, each Mosaic GPU kernel
-lowered afresh by its module's text, and the kind its device reported."""
+lowered afresh by its module's text, the kind its device reported, and whether each launch it certified
+read its verdict back from the store (`report.certifications`' `stored`)."""
 
 
 @pytest.mark.parametrize("target", [pytest.param("sm90", marks=lowers("sm90")),
@@ -233,8 +236,9 @@ def test_a_verdict_certified_for_a_gpu_is_read_by_another_kind_of_its_generation
     h100 = fresh(RECURRENT_AHEAD, "sm90", cache_dir=cache, flags=flags)
     gh200 = fresh(RECURRENT_AHEAD, "NVIDIA GH200 480GB", cache_dir=cache, flags=flags)
     assert h100["kind"] != gh200["kind"] == "NVIDIA GH200 480GB", (h100["kind"], gh200["kind"])
-    assert [name for name in h100["events"] if name.startswith("jit(certified_")], h100["events"]
-    assert not [name for name in gh200["events"] if name.startswith("jit(certified_")], gh200["events"]
+    # Each launch certified (`report.certifications`): the H100's compiled there, the GH200's read back.
+    assert h100["stored"] and not any(h100["stored"]), h100["stored"]
+    assert gh200["stored"] and all(gh200["stored"]), gh200["stored"]
 
 
 HANDED = """
