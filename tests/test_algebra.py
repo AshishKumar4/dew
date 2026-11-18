@@ -545,7 +545,8 @@ def test_a_logistic_turned_back_into_code_is_dews_one_logistic():
     """A logistic held as a term (a program's own, `jax.lax.logistic`, or Dew's read as it by the normal
     form) is turned back into code as Dew's one logistic (`precision.logistic_value`, `terms.value_of`): the
     evaluated form holds no `logistic_p`, whose backend's form a v5e and Mosaic's `approx_math` compute
-    approximately, and its values are Dew's, bit for bit."""
+    approximately, and its values are Dew's, bit for bit, its derivative Dew's declared one, a number where
+    `e^-x` overflows."""
     from dew.algebra import forms, terms
     from dew.nn.precision import logistic_value
     from dew.nn.programs import equations
@@ -559,3 +560,7 @@ def test_a_logistic_turned_back_into_code_is_dews_one_logistic():
     program = jax.make_jaxpr(evaluated)(x)
     assert all(equation.primitive is not jax.lax.logistic_p for equation in equations(program.jaxpr))
     np.testing.assert_array_equal(np.asarray(jax.jit(evaluated)(x)), np.asarray(logistic_value(x)))
+    # Differentiated, the form is Dew's declared tangent: a number where `e^-x` overflows fp32.
+    gradient = jax.grad(lambda value: jnp.sum(evaluated(value)))(jnp.linspace(-1000.0, 30.0, 64,
+                                                                             dtype=jnp.float32))
+    assert np.all(np.isfinite(np.asarray(gradient)))
