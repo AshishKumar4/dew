@@ -1129,6 +1129,29 @@ def test_an_aligned_sum_of_float64_terms_keeps_float64():
         assert found.dtype == jnp.float64 and float(found) == 1 + 2.0 ** -30
 
 
+def test_an_aligned_sums_derivative_reduces_each_term_before_it_adds():
+    """`aligned_sum` along an axis of terms of different shapes (`x` `[2, 1]` and `y` `[1, 1]`, unit
+    values and directions): its tangent is 3, and `y`'s gradient 1, each term reduced over the axis before
+    the terms add, as its value is; summed broadcast first, `y`'s direction counted on both rows gave 4, its
+    gradient 2 (base review 675f2c056 F1)."""
+    x, y = jnp.ones((2, 1), jnp.float32), jnp.ones((1, 1), jnp.float32)
+
+    def summed(x, y):
+        return aligned_sum([(x,), (y,)], axis=0)
+
+    _, tangent = jax.jvp(summed, (x, y), (x, y))
+    assert float(tangent[0, 0]) == 3.0
+    assert float(jax.grad(lambda y: summed(x, y)[0, 0])(y)[0, 0]) == 1.0
+
+
+def test_an_aligned_sum_of_a_subnormal_factor_raises_it_by_its_bits():
+    """`aligned_sum` of a term whose factor is fp32-subnormal (`2^-140`) and whose product is in range
+    (`2^-140 2^100`): `2^-40` exactly, the factor normalized by its bits, where lifted by a multiply XLA:CPU
+    flushes it to zero (base review 675f2c056 F2)."""
+    found = aligned_sum([(jnp.float32(2.0 ** -140), jnp.float32(2.0 ** 100), jnp.float32(1.0))])
+    assert float(found) == 2.0 ** -40
+
+
 def test_an_aligned_sum_along_an_axis_sums_each_rows_terms():
     """`aligned_sum` over an axis: each row's two columns `(1 + 2^-20) 2^(140 + i)` and `-2^(140 + i)`, each
     past fp32's range, summed along the row to `2^(120 + i)` exactly."""
