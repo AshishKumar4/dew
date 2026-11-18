@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from scipy import integrate, stats
+from scipy import integrate, optimize, special, stats
 from test_pass_weights import looped, phased_trainer
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -23,10 +23,12 @@ from dew.training.phase_passes import SampledPasses
 
 LAWS = [SampledPasses(mean=2.0, dispersion=0.5, cap=4), SampledPasses(mean=4.0, dispersion=0.5, cap=8),
         SampledPasses(mean=3.0, dispersion=0.0, cap=6), SampledPasses(mean=32.0, dispersion=0.0, cap=3),
-        SampledPasses(mean=32.0, dispersion=1.0, cap=3)]
+        SampledPasses(mean=32.0, dispersion=1.0, cap=3), SampledPasses(mean=1e6, dispersion=0.1, cap=2)]
 """The note's law (mean 2, dispersion 0.5, cap 4), a wider one, a Poisson count (no dispersion), and two
 whose cap holds little of their unbounded mass (a Poisson count of mean 32 is at most 3 with chance
-~2e-11: a count redrawn past the cap would be drawn ~5e10 times)."""
+~2e-11: a count redrawn past the cap would be drawn ~5e10 times), and one whose counts' mass lies where its
+rate is drawn far below its mean (each count's mode near a log rate of 6.6, its mean's 13.8, 47 of its
+deviations away)."""
 
 DRAWS = 2_500
 """The microbatches a seed's key draws a law's counts at."""
@@ -35,23 +37,39 @@ SEEDS = 8
 """The keys a law's shares are read over (`sampling_gate.assert_draws_as_declared`)."""
 
 
-SPAN = 39
-"""The standard deviations either side of the log rate's mean past which its normal density is 0 in
-float64 (exp(-39² / 2) underflows past the least subnormal), so a quadrature over them misses nothing."""
+SPAN = 40
+"""The standard deviations either side of a count's mode past which its integrand over the log rate,
+log-concave and at least as narrow as the log rate's normal density, is 0 beside its peak in float64."""
 
 
 def probabilities(law: SampledPasses) -> np.ndarray:
     """The bounded law's probability at each count 1 to its cap, from its statement alone: the Poisson's
-    closed form where it has no dispersion, else the Poisson's probability integrated over the log-normal
-    rate (scipy's adaptive quadrature in float64, over the log rate's `SPAN`), conditioned on the cap."""
+    closed form where it has no dispersion, its log probabilities normalized in log space; else the Poisson's
+    probability integrated over the log-normal rate (scipy's adaptive quadrature in float64), each count's
+    integrand about its own mode (scipy's root of its log's derivative) scaled by its peak, over `SPAN` of
+    the log rate's deviations either side; conditioned on the cap."""
     location = math.log(law.mean - 1) - law.dispersion ** 2 / 2
     if law.dispersion == 0:
-        unbounded = stats.poisson.pmf(np.arange(law.cap), math.exp(location))
+        logs = stats.poisson.logpmf(np.arange(law.cap), math.exp(location))
     else:
-        reach = SPAN * law.dispersion
-        unbounded = np.array([integrate.quad(
-            lambda x, n=n: stats.poisson.pmf(n, np.exp(x)) * stats.norm.pdf(x, location, law.dispersion),
-            location - reach, location + reach, points=[location])[0] for n in range(law.cap)])
+        logs = []
+        for n in range(law.cap):
+            def log_integrand(x, n=n):
+                return (n * x - math.exp(x) - special.gammaln(n + 1)
+                        - ((x - location) / law.dispersion) ** 2 / 2)
+
+            def slope(x, n=n):
+                return n - math.exp(x) - (x - location) / law.dispersion ** 2
+
+            reach = SPAN * law.dispersion
+            mode = optimize.brentq(slope, min(location, math.log(max(n, 1))) - reach,
+                                   max(location, math.log(max(n, 1))) + reach, xtol=1e-15)
+            peak = log_integrand(mode)
+            logs.append(peak + math.log(integrate.quad(
+                lambda x, f=log_integrand, peak=peak: math.exp(f(x) - peak), mode - reach, mode + reach,
+                points=[mode], limit=500)[0]))
+        logs = np.asarray(logs)
+    unbounded = np.exp(logs - logs.max())
     return unbounded / unbounded.sum()
 
 
@@ -68,6 +86,31 @@ def test_a_sampled_pass_count_follows_its_bounded_law(law):
         return np.bincount(drawn - 1, minlength=law.cap)
 
     assert_draws_as_declared(counts_of, probabilities(law), f"law {law}", seeds=SEEDS)
+
+
+@pytest.mark.parametrize("law", [SampledPasses(mean=1e20, dispersion=0.0, cap=4),
+                                 SampledPasses(mean=2.0, dispersion=1e-323, cap=1)],
+                         ids=["vast-mean", "subnormal-dispersion"])
+def test_a_sampled_pass_count_at_its_laws_extremes_draws_its_one_count(law):
+    """A law whose every draw is its cap: a Poisson count of mean 1e20, below 4 with chance ~1e-60, past any
+    uniform's least step (its counts' common term, rounded alike, read as four equal ones), and a cap of one
+    under a dispersion too small to step through (which divided by a step of 0)."""
+    assert {law.count((0, 7), position) for position in range(DRAWS)} == {law.cap}
+
+
+def test_a_sampled_pass_count_of_a_vanishing_dispersion_is_its_means_poisson():
+    """A law of a dispersion near 0 (1e-300) draws as the Poisson count of its mean, conditioned on its cap (a
+    rate of 1: counts 1, 2 and 3 at 0.4, 0.4 and 0.2), as a fair draw of it would be (the sampling gate)."""
+    from sampling_gate import assert_draws_as_declared
+
+    law = SampledPasses(mean=2.0, dispersion=1e-300, cap=3)
+    poisson = stats.poisson.pmf(np.arange(law.cap), 1.0)
+
+    def counts_of(seed: int) -> np.ndarray:
+        return np.bincount([law.count((seed, 7), position) - 1 for position in range(DRAWS)],
+                           minlength=law.cap)
+
+    assert_draws_as_declared(counts_of, poisson / poisson.sum(), f"law {law}", seeds=SEEDS)
 
 
 def test_a_sampled_pass_count_is_its_key_and_position_alone():
@@ -100,9 +143,9 @@ TRAINED = SampledPasses(mean=2.0, dispersion=0.5, cap=CAP)
 
 
 def token_batch(seed: int = 2) -> dict:
-    """Two rows a device of 17 tokens."""
+    """Two rows a device of 17 tokens, drawn as int32 on the host, so placing them compiles no cast."""
     rows = jax.device_count() * 2
-    return {"text": jnp.asarray(np.random.default_rng(seed).integers(0, 256, (rows, 17)), jnp.int32)}
+    return {"text": jnp.asarray(np.random.default_rng(seed).integers(0, 256, (rows, 17), dtype=np.int32))}
 
 
 def held(leaf):

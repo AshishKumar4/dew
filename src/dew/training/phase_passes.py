@@ -222,14 +222,13 @@ class PhasePasses[L, E]:
 
 
 RATE_SPAN = 39
-"""The standard deviations either side of a log rate's mean past which its normal density is 0 in float64
-(exp(-39² / 2) underflows past the least subnormal), the span `SampledPasses.cumulative` integrates over."""
+"""The standard deviations either side of its mode past which a count's integrand over the log rate (a
+log-concave one, at least as narrow as its normal density) is 0 beside its peak in float64 (exp(-39² / 2)
+underflows past the least subnormal): the span `SampledPasses.cumulative` integrates each count's over."""
 
-RATE_STEPS = 32
-"""The trapezoid steps `SampledPasses.cumulative` takes across the narrowest width of its integrand."""
-
-EXP_RANGE = 709.0
-"""The largest exponent whose exponential float64 holds (exp(709.78) overflows)."""
+MODE_NODES = 64
+"""The Gauss-Legendre nodes a unit of count takes in `SampledPasses.cumulative`'s integral of the log rate's
+mode over the count, whose integrand is analytic there."""
 
 
 @dataclass(frozen=True)
@@ -272,28 +271,73 @@ class SampledPasses:
 
     @functools.cached_property
     def cumulative(self) -> np.ndarray:
-        """The bounded law's cumulative probability at each count 1 to `cap`, its last 1: the Poisson's
-        probability of each count less one, at the rate `exp(location)` without dispersion, else integrated
-        over the log rate's normal density in log space, by the trapezoid rule over `RATE_SPAN` standard
-        deviations either side (past which the density underflows float64), its step `RATE_STEPS` to the
-        narrower of the density's width and a Poisson's at the cap (`1 / sqrt(cap)` in the log rate), where an
-        integrand this smooth and this fast to vanish is exact to float64; then conditioned on the cap."""
+        """The bounded law's cumulative probability at each count 1 to `cap`, its last 1, from each count's
+        log probability less a term common to all: the Poisson's of the count less one at the rate
+        `exp(location)` without dispersion (its common `-exp(location)` left out, which past a mean of
+        2^53 would round every count's alike); else the Poisson's integrated over the log rate's normal
+        density, its log integrand `n x - exp(x) - (x - location)² / (2 dispersion²) - log n!` concave in the
+        log rate `x`: its peak value, its integral over the count of its mode (`_mode`, Laplace's envelope:
+        the peak's derivative in `n` is the mode less `digamma(n + 1)`), so no count's peak is the difference
+        of the exponential's large values; and its integral about its own mode scaled by the peak
+        (`_about_mode`), never about `location`, from which a cap low beside the mean moves each count's mass
+        far. Then conditioned on the cap."""
         below = np.arange(self.cap)
         factorials = np.array([math.lgamma(n + 1) for n in below])
         location = math.log(self.mean - 1) - self.dispersion ** 2 / 2
         if self.dispersion == 0:
-            logs = below * location - math.exp(location) - factorials
+            logs = below * location - factorials
         else:
-            reach = RATE_SPAN * self.dispersion
-            step = min(self.dispersion, 1 / math.sqrt(self.cap)) / RATE_STEPS
-            rates = np.linspace(location - reach, location + reach, 2 * math.ceil(reach / step) + 1)
-            # The rate's exponential past float64's range is a Poisson's probability of 0 at every count.
-            terms = (below[:, None] * rates - np.exp(np.minimum(rates, EXP_RANGE)) - factorials[:, None]
-                     - ((rates - location) / self.dispersion) ** 2 / 2)
-            peaks = terms.max(axis=1)
-            logs = peaks + np.log(np.exp(terms - peaks[:, None]).sum(axis=1))
+            nodes, weights = np.polynomial.legendre.leggauss(MODE_NODES)
+            counts = below[1:, None] + (nodes[None, :] - 1) / 2
+            units = _mode(counts, location, self.dispersion) @ (weights / 2)
+            modes = _mode(below.astype(float), location, self.dispersion)
+            logs = (np.concatenate([[0.0], np.cumsum(units)]) - factorials
+                    + np.log([_about_mode(float(mode), count, location, self.dispersion)
+                              for count, mode in enumerate(modes)]))
         probabilities = np.exp(logs - logs.max())
         cumulative = np.cumsum(probabilities / probabilities.sum())
         # The sum's last partial is 1 but for its rounding, which a uniform draw past it must not reach.
         cumulative[-1] = 1.0
         return cumulative
+
+
+def _mode(counts: np.ndarray, location: float, dispersion: float) -> np.ndarray:
+    """The log rate at which each count's log integrand peaks (`SampledPasses.cumulative`), at real counts
+    `counts` too: the root of its derivative `dispersion² (count - exp(x)) - (x - location)`, decreasing in
+    `x`, bisected between `location` and the count's log (a count of 0 left of `location` by
+    `dispersion² exp(location)`, at most a million) to float64's last bit, its sign compared, never
+    computed, where the exponential's terms overflow."""
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        logs = np.log(np.where(counts > 0, counts, 1.0))
+        reach = min(dispersion ** 2 * math.exp(min(location, 709.0)), 1e6)
+        low = np.where(counts > 0, np.minimum(location, logs), location - reach)
+        high = np.where(counts > 0, np.maximum(location, logs), location)
+        while True:
+            middle = (low + high) / 2
+            if not np.any((middle > low) & (middle < high)):
+                return low
+            rising = dispersion ** 2 * (counts - np.exp(middle)) > middle - location
+            low, high = np.where(rising, middle, low), np.where(rising, high, middle)
+
+
+def _about_mode(mode: float, count: int, location: float, dispersion: float) -> float:
+    """A count's integrand over the log rate (`SampledPasses.cumulative`) about its `mode`, scaled by its peak
+    and by the normal density's width: the integral over the standardized log rate `z` (`x = mode +
+    dispersion z`) of `exp(-exp(mode) (expm1(dispersion z) - dispersion z) - z² / 2)`, the peak's own terms
+    cancelled exactly by the mode's equation, so nothing in it is the difference of large values; over
+    `RATE_SPAN` either side, its peak's width (`1 / sqrt(1 + dispersion² exp(mode))`) a breakpoint of scipy's
+    adaptive quadrature."""
+    from scipy import integrate
+
+    scale = math.exp(mode)
+    width = 1 / math.sqrt(1 + dispersion ** 2 * count + (location - mode))
+
+    def integrand(z: float) -> float:
+        t = dispersion * z
+        # expm1(t) - t, its series where the difference would cancel.
+        lost = t * t / 2 * (1 + t / 3 + t * t / 12) if abs(t) < 1e-4 else math.expm1(min(t, 709.0)) - t
+        exponent = scale * lost + z * z / 2
+        return 0.0 if exponent > 745 else math.exp(-exponent)
+
+    return sum(integrate.quad(integrand, start, end, epsabs=0, epsrel=1e-13, limit=200)[0]
+               for start, end in ((-RATE_SPAN, -width), (-width, 0.0), (0.0, width), (width, RATE_SPAN)))
