@@ -808,3 +808,19 @@ def test_an_offloaded_banks_regrouped_pages_copy_as_a_resident_banks_do(wide):
     with jax.enable_x64(new_val=wide):
         copied = _banked_page_copies(bank, own, parents)
     np.testing.assert_array_equal(np.asarray(copied), np.asarray(resident(bank, own, parents)))
+
+
+def test_an_offloaded_banks_regrouped_page_copies_lower_with_the_bank_in_host_memory():
+    """`_banked_page_copies` over a bank in host memory (`KVCache.offloaded`'s, as a held-banks server keeps
+    it) compiles for an A100 (`compile_programs`), its pages read to the device and written where the bank
+    lies (`dew.nn.host_memory`), its result in host memory."""
+    from dew.training.ahead import compile_programs
+
+    def regrouped(bank, own, parents):
+        copied = _banked_page_copies(jax.device_put(bank, jax.memory.Space.Host), own, parents)
+        assert jax.typeof(copied).memory_space is jax.memory.Space.Host
+        return copied
+
+    shapes = [jax.ShapeDtypeStruct((2, 1, 6, 2, 1), jnp.float32), jax.ShapeDtypeStruct((2, 3), jnp.int32),
+              jax.ShapeDtypeStruct((2, 3), jnp.int32)]
+    compile_programs({"regrouped": (regrouped, shapes)}, "sm80")
