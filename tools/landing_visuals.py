@@ -219,9 +219,8 @@ def load_pipe(experiment):
     """The run loaded as `dew.pipeline` loads a Hub run, at the commit its revision resolves, and that
     commit's metadata directory, whose run.json the provenance hashes."""
     import dew
-    from dew.interop import sources
-
     from dew.inference import TextToImage
+    from dew.interop import sources
 
     metadata = sources.snapshot(experiment.model, experiment.revision, weights=False)
     pipe = dew.pipeline(experiment.model, revision=metadata.name)

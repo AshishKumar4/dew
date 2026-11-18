@@ -282,7 +282,7 @@ def train_and_reload(task, source, reference, key, given, noise):
         np.testing.assert_array_equal(loaded, before)
         diffusers_reads(task, source.source, saved, restored.model, restored.variables, noise, given)
         if restored.autoencoder is None or source.autoencoder is None:
-            raise ValueError(f"{directory} holds no autoencoder")
+            raise ValueError(f"the {task} pipeline holds no autoencoder")
         np.testing.assert_array_equal(restored.autoencoder.decode(restored.variables["autoencoder"], noise),
                                       source.autoencoder.decode(trained["autoencoder"], noise))
         if source.finish is not None and restored.finish is not None:
