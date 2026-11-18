@@ -531,6 +531,14 @@ class ForkedChunks:
                          row.shape[0] - 1)
         return cls(loads, stores, taken, row[owner])
 
+    def added(self, forked: Forked) -> jax.Array | None:
+        """Each chunk's added slot (`recurrence_chunk.Chunk.adds`), the document it takes up's, zero for none:
+        `[NC]`; None where the call adds none."""
+        if forked.adds is None:
+            return None
+        return jnp.where(self.taken >= 0, jnp.asarray(forked.adds, jnp.int32).reshape(-1)[
+            jnp.maximum(self.taken, 0)], 0)
+
     def entries(self, forked: Forked):
         """Each chunk's entry write (`recurrence_chunk.Chunk.entry_key`), the document it takes up's, zero for
         none: `[NC, Hv, Dk, Dv]` summed over its terms and weighed; None where the call gives none. A chunk's

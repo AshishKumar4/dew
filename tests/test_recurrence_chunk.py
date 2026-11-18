@@ -598,13 +598,14 @@ FORKED_TEMPLATE = [HOOKS[4], HOOKS[8], FORMED[4]]
 """The forked call's forms on the template: the gated delta rule, Kimi delta attention and Mamba2's SSD."""
 
 
-def the_templates_forked_documents_are_as_exact_as_each_alone(hooks):
+def the_templates_forked_documents_are_as_exact_as_each_alone(hooks, added: bool = False):
     """The recurrence template over a forked call in 16 bits: its walks take each document's memory up from
     the call's table and keep the finals its documents store (`table.Taking`, `table.Returning`; ledger
-    5376), as its call over each document alone (`assert_forked_on_par`), the same launches' arithmetic."""
+    5376), where `added` each document adding its `ADDS` slot (`Chunk.adds`), as its call over each document
+    alone (`assert_forked_on_par`), the same launches' arithmetic."""
     assert_forked_on_par('mosaic_gpu', hooks, functools.partial(narrowed_draw, hooks),
-                         f'mosaic_gpu {hooks} a forked call\'s documents, against each alone',
-                         seeds=8, alone=True)
+                         f'mosaic_gpu {hooks} a forked call\'s documents{" adding a slot" if added else ""}, '
+                         'against each alone', seeds=8, alone=True, added=added)
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=1)
@@ -613,6 +614,16 @@ def test_the_templates_forked_documents_are_as_exact_as_each_alone_interpreted(h
     """`the_templates_forked_documents_are_as_exact_as_each_alone` interpreted off a GPU. A draw a task: four
     took 287 to 381 s a task (jsf-table-phase at 693aa1c1c)."""
     the_templates_forked_documents_are_as_exact_as_each_alone(hooks)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=1)
+@pytest.mark.parametrize('hooks', FORKED_TEMPLATE, ids=str)
+def test_the_templates_documents_adding_a_slot_are_as_exact_as_each_alone_interpreted(hooks):
+    """The template's walks over a forked call whose documents each add a second table slot (`Chunk.adds`,
+    `ADDS`): the forward's taking sums both slots (`table.Taking`), the reverse walk returns the memory's
+    gradient to both (`table.Returning`, the given slots' sum; Kimi delta attention's taken memories),
+    interpreted off a GPU (`the_templates_forked_documents_are_as_exact_as_each_alone`)."""
+    the_templates_forked_documents_are_as_exact_as_each_alone(hooks, added=True)
 
 
 UNDELTA_HEADS = 8

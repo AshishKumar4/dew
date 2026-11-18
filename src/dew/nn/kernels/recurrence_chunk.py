@@ -352,9 +352,9 @@ READOUT_HANDOFF = ("a readout of the state entering its token, or weighing its t
 """Why a kernel of the chunked op hands a call of another readout over to the portable math."""
 
 ADDS_HANDOFF = ("a forked call whose documents add a second table slot to the memory they enter "
-                "(`Chunk.adds`), which the portable math's walk takes and the template's and the TPU scan's "
-                "tables do not yet (row 7662)")
-"""Why the template and the TPU's scan hand a forked call that adds a slot over to the portable math."""
+                "(`Chunk.adds`), which the portable math's walk and the template take and the TPU scan's "
+                "table does not yet (row 7662)")
+"""Why the TPU's scan hands a forked call that adds a slot over to the portable math."""
 
 
 PORT_FORKED = Refusal('forked', "a forked call, whose documents enter earlier documents' finals of the same "
@@ -510,7 +510,6 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
                 "operand's own) do not compute; it rounds an fp32 product at the default alone, under the "
                 "run's fast forms (`fast_rounding`)", row=INHERENT, kind='handoff'),
     Requirement('readout', lambda case: case.readout, READOUT_HANDOFF, row='ledger 6128', kind='handoff'),
-    Requirement('adds', lambda case: not case.added, ADDS_HANDOFF, row='7662', kind='handoff'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
 call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Template.eligible`: dtypes,

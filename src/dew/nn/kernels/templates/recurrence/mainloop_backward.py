@@ -57,7 +57,13 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     walk_stores,
     whole_blocks,
 )
-from dew.nn.kernels.templates.recurrence.table import Table, returned_by, table_landing, table_returned
+from dew.nn.kernels.templates.recurrence.table import (
+    Table,
+    returned_by,
+    table_landing,
+    table_returned,
+    table_slots,
+)
 from dew.nn.kernels.templates.resources import largest_live_set
 from dew.nn.precision import compensated_sum
 
@@ -252,10 +258,12 @@ def _tabled_gradients(run, grads: tuple, taken) -> tuple:
         return grads
     table = run.table
     # Each chunk taking a given slot up adds to its row's slot (a stored slot's, its storing chunk's walk).
-    given_slot = (table.loads > 0) & (table.loads <= table.count)
-    given = jnp.zeros((run.batch, table.count, *_taken_up(run, taken).shape[1:]), jnp.float32).at[
-        table.rows, jnp.clip(table.loads - 1, 0, table.count - 1)].add(
-        jnp.where(given_slot[:, None, None, None], _taken_up(run, taken), 0.0), mode="drop")
+    given = jnp.zeros((run.batch, table.count, *_taken_up(run, taken).shape[1:]), jnp.float32)
+    # A slot a chunk adds (`Table.adds`) takes the same gradient as the one it loads.
+    for slots in (table.loads, *(() if table.adds is None else (table.adds,))):
+        given_slot = (slots > 0) & (slots <= table.count)
+        given = given.at[table.rows, jnp.clip(slots - 1, 0, table.count - 1)].add(
+            jnp.where(given_slot[:, None, None, None], _taken_up(run, taken), 0.0), mode="drop")
     return (*grads[:5], given[..., :run.key_width, :run.value_width])
 
 
@@ -618,7 +626,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                 *refs, streams, staging, landing):
         skip_ref, refs = (refs[0], refs[1:]) if skips else (None, refs)
         entered_ref, refs = (refs[0], refs[1:]) if call.per_key else (None, refs)
-        table_refs, refs = refs[:2 * (table is not None)], refs[2 * (table is not None):]
+        taken = 0 if table is None else len(table_slots(table))
+        table_refs, refs = refs[:taken], refs[taken:]
         refs, returned_refs = refs[:len(refs) - returns], refs[len(refs) - returns:]
         dh_ref, dv_ref, dh0_ref, *gated_ref = refs
         j, s, h = at["blocks"], at["sequences"], at["heads"]
@@ -696,7 +705,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                                  table=table)(
         q, k, k if w is None else w, do, local, hi, lo, dht, sequences, k if v is None else v,
         hi if beta is None else beta, *(() if skip is None else (skip.astype(jnp.float32),)),
-        *(() if memory is None else (memory,)), *(() if table is None else (table.loads, table.stores)))
+        *(() if memory is None else (memory,)), *(() if table is None else table_slots(table)))
     # A forked call's stored slots' gathered gradients the walk alone reads.
     return launched[:-1] if returns == 2 else launched
 

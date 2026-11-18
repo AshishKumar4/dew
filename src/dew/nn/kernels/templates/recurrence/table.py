@@ -28,7 +28,9 @@ class Table:
     zero a zero memory, -1 none: the chunk continues the one before), and the stored slot it leaves its
     memory in, `stores` (zero none); each chunk's entry write `entries` `[chunks * HV * Dk, Dv]` fp32, zero
     but where it takes a document up, where the call gives one; the row each chunk walks (`rows` `[chunks]`,
-    which the gradients' sums read and no launch); and a row's slots, `count` given and `held` stored."""
+    which the gradients' sums read and no launch); a row's slots, `count` given and `held` stored; and the
+    second slot each chunk taking a document up adds to its memory, `adds` `[chunks]` (one-based, zero none;
+    `Chunk.adds`), where the call gives them."""
 
     given: jax.Array
     loads: jax.Array
@@ -37,11 +39,13 @@ class Table:
     rows: jax.Array
     count: int = dataclasses.field(metadata={'static': True})
     held: int = dataclasses.field(metadata={'static': True})
+    adds: jax.Array | None = None
 
     @property
     def operands(self) -> tuple:
         """What a walk's launch reads of it, in order (`Taking.of`, `Returning.of`)."""
-        return (self.given, self.loads, self.stores, *(() if self.entries is None else (self.entries,)))
+        return (self.given, self.loads, self.stores, *(() if self.adds is None else (self.adds,)),
+                *(() if self.entries is None else (self.entries,)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,26 +95,33 @@ class Taking:
     def of(cls, table: Table, refs: Sequence, stored, slots: Memories, row, smem) -> "Taking":
         """`table`'s walk from its refs as a launch reads them (`Table.operands`) and its stored slots'
         output `stored`."""
-        given, loads, stores, *entries = refs
-        return cls(slots, (given, loads, stores, entries[0] if entries else None), stored, row, table.count,
+        given, loads, stores, *rest = refs
+        adds, rest = (rest[0], rest[1:]) if table.adds is not None else (None, rest)
+        return cls(slots, (given, loads, stores, adds, rest[0] if rest else None), stored, row, table.count,
                    table.held, smem)
 
     def opened(self) -> None:
         """Nothing: a stored slot is written by a document before any later one reads it."""
 
     def before(self, n, state):
-        given, loads, _, entries = self.refs
+        given, loads, _, adds, entries = self.refs
         load = loads[n]
 
-        def taken(i):
+        def slot(at, i):
             def from_given():
-                return lax.cond(load > 0, lambda: self.slots.read(given, self.row * self.count + load - 1, i),
+                return lax.cond(at > 0, lambda: self.slots.read(given, self.row * self.count + at - 1, i),
                                 self.slots.zero)
 
             def from_stored():
-                return self.slots.read(self.stored, self.row * self.held + load - self.count - 1, i)
+                return self.slots.read(self.stored, self.row * self.held + at - self.count - 1, i)
 
-            memory = lax.cond(load > self.count, from_stored, from_given) if self.held else from_given()
+            return lax.cond(at > self.count, from_stored, from_given) if self.held else from_given()
+
+        def taken(i):
+            memory = slot(load, i)
+            if adds is not None:
+                # The second slot a document adds to the one it enters (`Table.adds`), zero for none.
+                memory = memory + slot(adds[n], i)
             return memory if entries is None else memory + self.slots.read(entries, n, i)
 
         # A slice at a time: each taken up beside the slices carried, the one it replaces dead after it.
@@ -150,6 +161,7 @@ class Returning:
     held: int
     chunks: int
     smem: object
+    adds: Any = None
 
     def opened(self) -> None:
         """The row's stored slots' gradients zeroed for the walk's sums."""
@@ -175,16 +187,23 @@ class Returning:
         load = self.loads[n]
         call = self.slots.call
 
+        def returned(at):
+            # A stored slot's gradient gathers this chunk's: a slice at a time, each summed beside the
+            # gradient's slices, then kept.
+            @pl.when(at > self.count)
+            def _():
+                base = self.row * self.held + at - self.count - 1
+                summed = [part + self.slots.read(self.returned, base, i) for i, part in enumerate(grad)]
+                call.family.kept(summed, self.slots.views(self.returned, base), call.interpret,
+                                 smem=self.smem)
+
         def taken():
             call.family.stored(list(grad), self.slots.views(self.taken, n), smem=self.smem)
             if self.held:
-                @pl.when(load > self.count)
-                def _():
-                    base = self.row * self.held + load - self.count - 1
-                    # A slice at a time: each summed beside the gradient's slices, then kept.
-                    summed = [part + self.slots.read(self.returned, base, i) for i, part in enumerate(grad)]
-                    call.family.kept(summed, self.slots.views(self.returned, base), call.interpret,
-                                     smem=self.smem)
+                returned(load)
+                if self.adds is not None:
+                    # The slot it added (`Table.adds`) takes the same gradient.
+                    returned(self.adds[n])
             return [self.slots.zero()] * len(grad)
 
         return lax.cond(load >= 0, taken, lambda: list(grad))
@@ -219,9 +238,16 @@ def returned_by(table: Table | None, refs: Sequence, returned: Sequence, call: "
     if table is None:
         return None
     taken, *gathered = returned
+    adds = refs[2] if table.adds is not None else None
     return lambda role: Returning(Memories(call, head, column(role), bv), refs[0], refs[1], taken,
                                   gathered[0] if gathered else None, row, table.count, table.held,
-                                  call.chunks, landing(role))
+                                  call.chunks, landing(role), adds)
+
+
+def table_slots(table: Table) -> tuple:
+    """What a reverse walk's launch reads of `table` (`Returning`): each chunk's loaded and stored slots, and
+    its added ones where the call gives them (`Table.adds`)."""
+    return (table.loads, table.stores, *(() if table.adds is None else (table.adds,)))
 
 
 def stored_split(table: Table | None, launched: Sequence) -> tuple[tuple, jax.Array | None]:
