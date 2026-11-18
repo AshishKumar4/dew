@@ -295,6 +295,35 @@ def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     assert dew_traced and reference_traced
 
 
+def test_a_qualification_run_sizes_a_prepared_site_through_its_stored_arms(tmp_path, monkeypatch):
+    """A qualification run (`check1_wire.QUALIFY`) of a site prepared for it sizes the site's seeds and then
+    judges it through the programs its prepare compiled, the sizing draws' among them (row 7606): its run
+    traces neither arm, where clearing the store compiled both on its GPU, the reference traced only as its
+    sizing's float64 truth, on the host; the count it sizes is recorded."""
+    from check1_wire import QUALIFY
+
+    dew, reference, draw = _site()
+    traced: list[tuple[str, str]] = []
+
+    def dew_arm(a, b):
+        traced.append(("dew", str(a.dtype)))
+        return dew(a, b)
+
+    def reference_arm(a, b):
+        traced.append(("reference", str(a.dtype)))
+        return reference(a, b)
+
+    record = tmp_path / "qualified.jsonl"
+    monkeypatch.setenv(QUALIFY, str(record))
+    with compiled_truths(tmp_path / "store", prepare=True, stamp="a"):
+        assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
+    traced.clear()
+    with compiled_truths(tmp_path / "store", prepare=False, stamp="a"):
+        assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
+    assert set(traced) <= {("reference", "float64")}
+    assert json.loads(record.read_text().splitlines()[-1])["sized"] <= 8
+
+
 def test_a_compiled_sites_window_loop_and_run_to_run_arms_are_traced_by_its_prepare_alone(tmp_path):
     """Arms over a site's windows (`over_windows`) and declared to vary from run to run (`run_to_run`), each
     a record of its arm: judged from programs compiled ahead, the run traces neither (their prepare did), as
