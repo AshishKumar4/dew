@@ -382,6 +382,14 @@ def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     assert dew_traced and reference_traced
 
 
+def _rewriting() -> bool:
+    """Whether the algebra pass is on where this is called (`dew.algebra.passes`): a function of this module,
+    which an arm's statement names (`dew._stated.stated`), where the switch itself has no statable form."""
+    from dew._cache import ALGEBRA
+
+    return ALGEBRA.value.on
+
+
 def test_an_arm_of_its_own_compiler_options_is_prepared_whole(tmp_path):
     """A site whose reference arm is a jit of its own compiler options (`without_ynn`, which on the CPU lane
     turns YNNPACK's fusions off by them: a library arm's cuBLAS on a GPU,
@@ -393,13 +401,11 @@ def test_an_arm_of_its_own_compiler_options_is_prepared_whole(tmp_path):
     A reference, it is traced and lowered with the algebra pass off, as its call runs (`unrewritten`): held
     whole, it was traced with the pass on, the program it stored a rewrite of the reference (the review).
     Its draw's arrays JAX's, so no NumPy refusal runs it beside the gate's arm (`_refuse_numpy_arms`)."""
-    from dew._cache import ALGEBRA
-
     dew, reference, numpy_draw = _site()
     traced: list[bool] = []
 
     def counted(a, b):
-        traced.append(ALGEBRA.value.on)
+        traced.append(_rewriting())
         return reference(a, b)
 
     def draw(seed):
