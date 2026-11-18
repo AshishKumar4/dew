@@ -2252,7 +2252,7 @@ def folded_entries(record: dict[str, session.Entry], verdict: dict, target: floa
             if (measured := row_.get("peak")) is not None:
                 for node in row_.get("tests", {}):
                     if node in kept:
-                        peaks[node] = int(measured)
+                        peaks[node] = session.moved_peak(peaks.get(node), int(measured))
                 # A task killed before it reported a case (its pytest OOM-killed) still bounds its file's
                 # tests: their peaks raised to it, never lowered by a run that timed none of them (review).
                 if not row_.get("tests"):

@@ -72,15 +72,13 @@ def pytest_runtest_logreport(report) -> None:
 def task_peak() -> int | None:
     """This task's resident peak in bytes so far: its cgroup's (cgroup v2's memory.peak, which every process
     the task started counts in, a test's ranks with it), each of its tests' bound above (row 6003: a test's
-    four ranks peaked at 7.17 GiB, packed beside another on a medium). None where the task runs in no
-    cgroup this process can read."""
-    cgroup = Path("/proc/self/cgroup")
-    line = cgroup.read_text().split("\n")[0] if cgroup.is_file() else ""
-    # cgroup v2's one hierarchy, `0::<path>`; under v1 (no such line) no peak is kept.
-    if "::" not in line:
-        return None
-    peak = Path("/sys/fs/cgroup") / line.split("::", 1)[1].lstrip("/") / "memory.peak"
-    return int(peak.read_text()) if peak.is_file() else None
+    four ranks peaked at 7.17 GiB, packed beside another on a medium), read by Dew's one cgroup reader
+    (src/dew/data/cgroups.py through host.py, its root DEW_CGROUP_ROOT's where set). None where the task's
+    cgroup states no peak."""
+    import host
+
+    reader = host.cgroups()
+    return reader.memory_peak(reader.own(host.cgroup_root()))
 
 
 def resumed(tests: list[str], owning: Callable[[str], str]) -> tuple[dict[str, float], set[str], int | None]:
