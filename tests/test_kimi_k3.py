@@ -27,8 +27,8 @@ from kimi_support import (
     kimi_source,
     recorded_dew,
 )
+from recorded_runs import assert_as_exact_as_recorded
 from reference_error import ieee_fixture
-from reference_runs import assert_as_exact_as_recorded
 
 from dew.interop import Pretrained
 from dew.interop.codecs import decode_e2m1, quantize_packed_mxfp4

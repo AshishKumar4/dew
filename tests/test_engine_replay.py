@@ -11,8 +11,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from recorded_runs import assert_arms_as_recorded
 from reference_error import indexed_recording, recording
-from reference_runs import assert_arms_as_recorded
 from tool_support import load
 
 from dew.batch import coordinates

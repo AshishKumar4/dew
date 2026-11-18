@@ -33,6 +33,7 @@ from multimodal_families import (
     text_rows,
 )
 from one_draw import assert_as_exact_as_the_reference
+from recorded_runs import assert_arms_as_recorded
 from recorded_truths import assert_truths_as_recorded
 from reference_error import (
     GateFailure,
@@ -43,7 +44,6 @@ from reference_error import (
     recording as read_recording,
     widened,
 )
-from reference_runs import assert_arms_as_recorded
 from safetensors.numpy import load_file
 
 from dew.batch import VALIDITY_FIELD, coordinates
