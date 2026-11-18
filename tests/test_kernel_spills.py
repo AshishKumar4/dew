@@ -178,14 +178,15 @@ pallas_lowering.lower_unpipelined_jaxpr_to_module = lowered_afresh
 # Qwen3.5-4B's linear attention: 16 key heads and 32 value heads, each 128 wide, over a row of 12,288 tokens.
 model = CausalTransformer(vocab_size=64, emb_features=512, num_layers=1, num_heads=4, head_dim=128,
                           mlp_features=512, max_seq_len=12288, dtype="bfloat16", mixer=GatedDeltaNetMixer())
+devices = compile_only_gpus(sys.argv[1], 1, 80 * 2**30)
 trainer = Trainer(LMObjective(model, 12288), optax.adam(1e-3), key=jax.random.key(0),
-                  mesh=MeshSpec().build(compile_only_gpus(sys.argv[1], 1, 80 * 2**30)))
+                  mesh=MeshSpec().build(devices))
 compile_ahead(trainer, token_rows(64, 1, 12289))
-print(json.dumps({"events": events, "modules": modules}))
+print(json.dumps({"events": events, "modules": modules, "kind": devices[0].device_kind}))
 """
 """A one-layer decoder of Qwen3.5-4B's gated delta net compiled ahead for a compile-only GPU of the generation
-argv[1] names: each program it lowered by name, and each Mosaic GPU kernel lowered afresh by its module's
-text."""
+or the kind argv[1] names (`compile_only_gpus`): each program it lowered by name, each Mosaic GPU kernel
+lowered afresh by its module's text, and the kind its device reported."""
 
 
 @pytest.mark.parametrize("target", [pytest.param("sm90", marks=lowers("sm90")),
@@ -218,6 +219,22 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target, d
     certified = [name for name in cold if name.startswith("jit(certified_")]
     assert certified and len(set(certified)) == len(certified), certified
     assert not [name for name in warm if name.startswith("jit(certified_")], warm
+
+
+@lowers("sm90")
+def test_a_verdict_certified_for_a_gpu_is_read_by_another_kind_of_its_generation(tmp_path):
+    """Certification's verdicts are the compile target's (`report.verdict_target`): a step compiled ahead for
+    a compile-only H100 certifies its launches and stores their verdicts, and a process certifying the same
+    launches on another kind of sm90 (a compile-only GH200) reads them, certifying
+    nothing (rows 6717, 7322: a GH200's run read none of a compile-only H100's verdicts and certified each
+    launch again)."""
+    cache = tmp_path / "cache"
+    flags = keeping_picks()
+    h100 = fresh(RECURRENT_AHEAD, "sm90", cache_dir=cache, flags=flags)
+    gh200 = fresh(RECURRENT_AHEAD, "NVIDIA GH200 480GB", cache_dir=cache, flags=flags)
+    assert h100["kind"] != gh200["kind"] == "NVIDIA GH200 480GB", (h100["kind"], gh200["kind"])
+    assert [name for name in h100["events"] if name.startswith("jit(certified_")], h100["events"]
+    assert not [name for name in gh200["events"] if name.startswith("jit(certified_")], gh200["events"]
 
 
 HANDED = """

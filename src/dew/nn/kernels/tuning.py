@@ -1272,53 +1272,54 @@ def _store(device_kind: str, picks) -> None:
 
 
 _VERDICTS: dict[str, dict[str, _records.JSON]] = {}
-"""Each GPU model's certification verdicts this process read from its store or stored there
+"""Each compile target's certification verdicts this process read from its store or stored there
 (`stored_verdict`), by launch key, as the store holds them (`encoded`)."""
 
 
-def _verdicts_path(device_kind: str) -> str:
-    """The store of the certification verdicts of GPUs of `device_kind`, beside their picks
-    (`kernel_picks_path`): verdicts alone, each by what decides its compile (`report._verdict_key`), where
-    the picks are measured timings. A model's own (row 6717: an H100 and a GH200, which assemble alike,
-    share none until the ptxas each runs is known, row 7309). Read and written under deterministic ops too,
+def _verdicts_path(target: str) -> str:
+    """The store of the certification verdicts of kernels assembled for `target` (a generation,
+    `report.verdict_target`), beside the GPU models' picks (`kernel_picks_path`): verdicts alone, each by
+    what decides its compile (`report._verdict_key`), where the picks are measured timings. An H100's, a
+    GH200's and a compile-only H100's alike (row 6717). Read and written under deterministic ops too,
     which keep no picks (`dew._cache.keeps_picks`): a verdict is what the assembler said of a compile, the
     same in every process alike in what its key states, the run's XLA flags among them (row 7308: the cuda
     lane's warm start certified every launch again)."""
-    return _cache.kernel_picks_path(f"certified {device_kind}")
+    return _cache.kernel_picks_path(f"certified {target}")
 
 
-def stored_verdict(device_kind: str, key: str) -> Rebuilt | None:
-    """Certification's verdict of the launch `key` names on GPUs of `device_kind` (`report.certified`), an
+def stored_verdict(target: str, key: str) -> Rebuilt | None:
+    """Certification's verdict of the launch `key` names, its kernels assembled for `target`
+    (`report.certified`), an
     accepted config's or a refused one's, as stored (`_verdicts_path`) and rebuilt (`decoded`), read once a
     process; none where none is stored, or this checkout cannot rebuild it (`Unreadable`: it certifies
     again)."""
     with _LOADING:
-        if device_kind not in _VERDICTS:
-            _VERDICTS[device_kind] = {entry["certified"]: entry["verdict"]
-                                      for entry in _stored(_verdicts_path(device_kind))
-                                      if isinstance(entry, dict) and "certified" in entry}
-        found = _VERDICTS[device_kind].get(key)
+        if target not in _VERDICTS:
+            _VERDICTS[target] = {entry["certified"]: entry["verdict"]
+                                 for entry in _stored(_verdicts_path(target))
+                                 if isinstance(entry, dict) and "certified" in entry}
+        found = _VERDICTS[target].get(key)
     try:
         return None if found is None else decoded(found)
     except Unreadable as unread:
         _log.warning("a certification verdict stored for %s is not this checkout's, so its launch certifies "
-                     "again: %s", device_kind, unread)
+                     "again: %s", target, unread)
         return None
 
 
-def store_verdict(device_kind: str, key: str, verdict: dict[str, tuple[str, report.Binary]]) -> None:
-    """`verdict` stored for the launch `key` names on GPUs of `device_kind` (`_verdicts_path`), as the picks
-    are (`encoded`), one writer at a time, the file replaced whole."""
+def store_verdict(target: str, key: str, verdict: dict[str, tuple[str, report.Binary]]) -> None:
+    """`verdict` stored for the launch `key` names, its kernels assembled for `target` (`_verdicts_path`), as
+    the picks are (`encoded`), one writer at a time, the file replaced whole."""
     written = encoded(verdict)
-    path = _verdicts_path(device_kind)
+    path = _verdicts_path(target)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with filelock.FileLock(path + '.lock'):
         kept = [entry for entry in _stored(path)
                 if not (isinstance(entry, dict) and entry.get("certified") == key)]
-        write_atomically(path, json.dumps({"device_kind": device_kind,
+        write_atomically(path, json.dumps({"target": target,
                                            "data": [*kept, {"certified": key, "verdict": written}]}))
     with _LOADING:
-        _VERDICTS.setdefault(device_kind, {})[key] = written
+        _VERDICTS.setdefault(target, {})[key] = written
 
 
 def _shapes(value):
