@@ -1644,6 +1644,38 @@ def regrouped_layout(layout: KVCache, prompts: int, width: int, prompt: int, new
     return layout
 
 
+def _banked_page_copies(bank: jax.Array, own: jax.Array, parents: jax.Array) -> jax.Array:
+    """An offloaded bank's pool `[layers, heads, pages, ...]` with each layer's pages `parents` `[layers,
+    rows]` copied to its pages `own`, a page at a time where the bank lies: every page read to the device
+    before any is written (a row's own page may be another's parent's), a page past the pool read and
+    written as none."""
+    layers, count = own.shape
+    last = bank.shape[2] - 1
+    extent = (1, bank.shape[1], 1, *bank.shape[3:])
+
+    def start(layer: jax.Array, page: jax.Array) -> tuple[jax.Array, ...]:
+        zero = jnp.zeros((), jnp.int32)
+        return (layer, zero, jnp.minimum(page, last), *(zero,) * (bank.ndim - 3))
+
+    def read(index: jax.Array, pages: jax.Array) -> jax.Array:
+        layer, row = index // count, index % count
+        page = fetched(jax.lax.dynamic_slice(bank, start(layer, parents[layer, row]), extent))
+        return pages.at[index].set(page[0, :, 0])
+
+    held = jax.lax.fori_loop(0, layers * count, read, jnp.zeros((layers * count, *bank.shape[1:2],
+                                                                   *bank.shape[3:]), bank.dtype))
+
+    def write(index: jax.Array, pool: jax.Array) -> jax.Array:
+        layer, row = index // count, index % count
+        page = placed_like(pool, held[index][None, :, None])
+        target = own[layer, row]
+        return jax.lax.cond(target <= last,
+                            lambda pool: jax.lax.dynamic_update_slice(pool, page, start(layer, target)),
+                            lambda pool: pool, pool)
+
+    return jax.lax.fori_loop(0, layers * count, write, bank)
+
+
 def gather_cache_rows(cache, rows):
     """A decode cache reindexed on its batch axis, one gather per leaf.
 
@@ -1734,9 +1766,14 @@ def _regrouped_pages(store: Mapping[str, jax.Array], rows: jax.Array, banked: bo
         if name == TABLE:
             regrouped[name] = table
         elif name in POOLED:
-            # An offloaded pool's pages move a page at a time (`pages_read`, `pages_written`), unbanked.
-            regrouped[name] = (on_device(copied, leaf, own, parents, banked=True) if banked
-                               else copied(leaf, own, parents))
+            # An offloaded pool's pages move a page at a time (`pages_read`, `pages_written`; a bank's,
+            # `_banked_page_copies`), a resident bank's layers mapped.
+            if not banked:
+                regrouped[name] = copied(leaf, own, parents)
+            elif on_host(leaf):
+                regrouped[name] = _banked_page_copies(leaf, own, parents)
+            else:
+                regrouped[name] = jax.vmap(copied)(leaf, own, parents)
         else:
             regrouped[name] = on_device(lambda held: jnp.take(held, rows, axis=0), leaf, banked=banked)
     return regrouped
