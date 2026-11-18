@@ -442,8 +442,9 @@ class _InferenceWalk(NamedTuple):
     in_key: bool = False
     """Whether its values are its keys' leading columns (`MosaicForward.in_key`), read from the key slot."""
     decides: bool = False
-    """Whether its plain launch's consumers walk again scaled where a row's sums passed fp32's largest
-    (`mosaic.Decided`, `MosaicForward.decides`); a rewalk's launch never does."""
+    """Whether its launches' consumers walk again scaled where a row's sums passed fp32's largest
+    (`mosaic.Decided`, `MosaicForward.decided`): the fold's rewalk's too, whose rows' sums pass it alike (an
+    unscaled rewalk left the decode step's overflowing rows no number)."""
 
 
 def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, at: Tiles, at_spans,
@@ -472,7 +473,7 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                         family=family, training=False, interpret=interpret, parts=parts,
                         counted=walk.counts and form.natural == spec.natural, finishes=rows, columns=first,
                         splits=splits, registered=walk.registered, in_key=walk.in_key,
-                        decides=walk.decides and into is None,
+                        decides=walk.decides,
                         table=paged, sources=sources,
                         out_dtype=jnp.float32 if split else out_dtype, walks=walks,
                         shared_by=len(blocks),
