@@ -300,16 +300,21 @@ def elementwise(function, shape: tuple[int, ...]) -> bool:
                     or any(not isinstance(aval, ShapedArray) or aval.shape not in (tuple(shape), ())
                            for aval in avals)):
                 return False
-            # A call's program (a declared tangent's primal and its marked span among them, Dew's one
-            # logistic's), or each branch of a conditional, mapped too, the call itself none the lowering
-            # reads; any other operation entrywise and one Pallas's Triton lowering takes.
+            # A call's program mapped too (a declared tangent's primal and its marked span among them, Dew's
+            # one logistic's): Pallas lowers a call as its body, a marked span by Dew's JAX build's
+            # call-primitive lowering (`eval_jaxpr`'s rule for every call primitive, Triton's among them),
+            # which its rules table does not list. A conditional the lowering takes, each branch mapped;
+            # any other operation entrywise and one the lowering takes.
             called = programs.called(equation)
-            inner = ((called,) if called is not None
-                     else programs.branches(equation) if equation.primitive is jax.lax.cond_p else None)
-            if inner is not None:
-                if not all(mapped(each) for each in inner):
+            if called is not None:
+                if not mapped(called):
                     return False
-            elif equation.primitive not in lowered or not layout.entrywise(equation):
+            elif equation.primitive not in lowered:
+                return False
+            elif equation.primitive is jax.lax.cond_p:
+                if not all(mapped(each) for each in programs.branches(equation)):
+                    return False
+            elif not layout.entrywise(equation):
                 return False
         return True
 

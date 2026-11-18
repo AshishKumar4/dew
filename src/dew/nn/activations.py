@@ -87,7 +87,8 @@ def _logistic(x) -> jax.Array:
     return logistic_value(given).astype(given.dtype)
 
 
-logistic = contracted("test_silu_holds_every_order")(declared_tangent(Protected(), _logistic, _logistic_jvp))
+logistic = contracted("test_silu_holds_every_order")(
+    declared_tangent(Protected(computes=logistic_value), _logistic, _logistic_jvp))
 """Dew's one logistic, `1 / (1 + e^-x)` formed in at least float32 (`precision.logistic_value`) and rounded
 once to `x`'s dtype, its exp accurate (`precision.accurate_exp`: a target's own where it is, Dew's on one
 whose is not, a v5e's) and a true division: a backend's logistic is no part of it, a v5e's approximate even

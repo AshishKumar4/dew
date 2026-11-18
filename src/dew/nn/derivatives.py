@@ -303,7 +303,11 @@ def _array(leaf):
 @dataclasses.dataclass(frozen=True)
 class Protected:
     """A span the algebra pass keeps as it is: an error-free transform's (`dew.nn.precision`), whose
-    residual a reassociation would cancel."""
+    residual a reassociation would cancel; or, where it names what it `computes`, one operation of Dew's
+    in at least float32 and rounded once to its operand's dtype (`dew.nn.precision.logistic_value`, Dew's
+    one logistic, `dew.nn.activations.logistic`), which the algebra's normal form reads as that operation
+    (`dew.algebra.normal_form`), its arithmetic Dew's wherever it is fused."""
+    computes: Callable | None = None
 
 
 @dataclasses.dataclass(frozen=True)
