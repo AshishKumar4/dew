@@ -165,9 +165,10 @@ def _computed(equation: jcore.JaxprEqn, operands: list) -> list | None:
         return None
     (operand,) = operands
     dtype = jnp.result_type(operand)
-    # The logistic node a program's own sigmoid binds (`jax.lax.logistic`, its parameters with it: a bare
-    # bind carries none, which no program's equation equals).
-    return [jax.lax.logistic(jnp.asarray(operand).astype(at_least_fp32(dtype))).astype(dtype)]
+    # The logistic node a program's own sigmoid binds, its parameters with it (its accuracy unstated, as
+    # `jax.lax.logistic` binds it by default): a bare bind carries none, which no program's equation equals.
+    return [jax.lax.logistic_p.bind(jnp.asarray(operand).astype(at_least_fp32(dtype)), accuracy=None)
+            .astype(dtype)]
 
 
 FOLDED = frozenset({jax.lax.iota_p, jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.transpose_p,
