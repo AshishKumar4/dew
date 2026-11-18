@@ -428,3 +428,22 @@ def test_a_decoder_run_states_a_sampled_pass_count_whole_and_once(fields):
     stated = DecoderRunConfig(loop_steps_sample="lognormal-poisson", loop_steps_mean=2.0,
                               loop_steps_dispersion=0.5, loop_steps_max=4)
     assert stated.sampled_passes() == SampledPasses(2.0, 0.5, 4) and stated.handed_passes == 4
+
+
+class _Drawing:
+    """A rollout drawing nothing: the batch it is handed (`dew.training.rollout.Rollout`)."""
+
+    def __call__(self, state, batch, key):
+        return batch
+
+
+def test_a_rollout_beside_a_pass_count_drawn_per_microbatch_is_refused():
+    """A rollout samples a step's rows and behaviour log-probabilities from the one policy it holds, at the
+    run's cap, while a run drawing its pass count per microbatch trains each microbatch at its own count, so
+    it would train on rows a policy it does not run sampled: such a trainer is refused as it is built, and
+    one at a phase's counts is not (row 8272)."""
+    model = looped(steps=CAP).with_passes(CAP)
+    assert model is not None
+    with pytest.raises(ValueError):
+        phased_trainer(model, 0, None, sampled_passes=TRAINED, rollout=_Drawing())
+    phased_trainer(model, 0, (CAP,), rollout=_Drawing())
