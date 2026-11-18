@@ -18,7 +18,7 @@ import numpy as np
 
 from dew.algebra import scan
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
-from dew.nn.precision import at_least_fp32, compensated_add, two_product
+from dew.nn.precision import at_least_fp32, compensated_add
 
 TWO_PI = (np.float32(2 * np.pi), np.float32(2 * np.pi - float(np.float32(2 * np.pi))))
 """2 pi as fp32's nearest and what it drops, a turn's whole in double float."""
@@ -28,11 +28,14 @@ CHUNK = 64
 
 
 def _wrapped(angle):
-    """A double-float angle `(high, low)` less its whole turns (`TWO_PI`, each turn's product exact,
-    Dekker's), about [0, 2 pi)."""
-    turns = jnp.floor(angle[0] * np.float32(1 / (2 * np.pi)))
-    whole, dropped = two_product(-turns, jnp.full_like(turns, TWO_PI[0]))
-    return compensated_add(angle, (whole, dropped - turns * TWO_PI[1]))
+    """A double-float angle `(high, low)` within 5 pi of zero (a sum of two within pi or two pi) less its
+    whole turns, within pi of zero: at most two, each turn's parts' product exact (`TWO_PI` times one or
+    two), so no residual rests on a product's rounding, which XLA's contraction of a multiply into its
+    neighbouring add moves under jit: Dekker's product of a document's whole count of turns lost its
+    residual so, every frame 9.5e-7 radians off on XLA:CPU (1.2e-13 eager), a forked call's final memory
+    2.2 times the recurrence's error from float64 (row 7419)."""
+    turns = jnp.round(angle[0] * np.float32(1 / (2 * np.pi)))
+    return compensated_add(angle, (-turns * TWO_PI[0], -turns * TWO_PI[1]))
 
 
 def _wide(x) -> jax.Array:
@@ -41,28 +44,22 @@ def _wide(x) -> jax.Array:
     return x.astype(at_least_fp32(x.dtype))
 
 
-def frames(turn, starts=None, entering=None) -> tuple[jax.Array, jax.Array]:
+def frames(turn, starts=None) -> tuple[jax.Array, jax.Array]:
     """Each token's frame `[B, T, ..., A]`: its document's turns through it (`turn` `[B, T, ..., A]`; `starts`
     `[B, T]` each document's first token, where given), each within pi of zero first (`scan.within_pi`), their
-    compensated prefix (`_prefix`) on from `entering` `[B, ..., A]` in the row's first document (where given:
-    a carried angle), less its whole turns, a double float `(high, low)` in about [0, 2 pi). Within pi, a
-    document's prefix is at most its length times pi, which a double float holds to 2^-48 of itself, below
-    fp32's rounding of a turned key past 2^20 tokens, and its whole turns' count under 2^19, its product with
-    2 pi's high part exact."""
+    compensated prefix (`_prefix`, its whole turns taken off as it runs), a double float `(high, low)` within
+    pi of zero, which holds an angle to 2^-48 of pi, its whole turns' 2 pi each to 2^-48 of itself: past
+    2^20 tokens' turns, their drift below fp32's rounding of a turned key."""
     turn = jnp.asarray(turn)
     within = scan.within_pi(turn.astype(at_least_fp32(turn.dtype)))
     restarts = jnp.zeros(within.shape[:2], bool) if starts is None else jnp.asarray(starts, bool)
     restarts = jnp.reshape(restarts, (*restarts.shape, *(1,) * (within.ndim - 2)))
-    summed = _prefix(within, restarts)
-    if entering is not None:
-        first = jnp.cumsum(restarts.astype(jnp.int32), axis=1) == 0
-        on = jnp.where(first, jnp.asarray(entering, within.dtype)[:, None], 0.0)
-        summed = compensated_add(summed, (jnp.broadcast_to(on, within.shape), jnp.zeros_like(within)))
-    return _wrapped(summed)
+    return _prefix(within, restarts)
 
 
 def _prefix(values, restarts) -> tuple[jax.Array, jax.Array]:
-    """`values` `[B, T, ...]`'s inclusive prefix sums along their tokens as double floats, restarting at
+    """`values` `[B, T, ...]`'s (angles within pi of zero) inclusive prefix sums along their tokens as double
+    floats less their whole turns, each within pi of zero (`_wrapped` at every sum of two), restarting at
     each of `restarts` (`[B, T, ...]` broadcast): a chunk's own a walk of its `CHUNK` tokens (each
     renormalized, `compensated_add`), each chunk's entering the walk of the chunks' ends, so every token is
     read once (an associative scan's every level reads all of them: 7402's angles took a Mamba-3 step's
@@ -79,7 +76,7 @@ def _prefix(values, restarts) -> tuple[jax.Array, jax.Array]:
     def within(total, token):
         value, restart = token
         total = tuple(jnp.where(restart, 0.0, part) for part in total)
-        total = compensated_add(total, (value, jnp.zeros_like(value)))
+        total = _wrapped(compensated_add(total, (value, jnp.zeros_like(value))))
         return total, total
 
     zero = jnp.zeros((batch, chunks, *values.shape[2:]), values.dtype)
@@ -89,14 +86,14 @@ def _prefix(values, restarts) -> tuple[jax.Array, jax.Array]:
 
     def across(entering, chunk):
         end, broke = chunk
-        leaving = compensated_add(entering, end)
+        leaving = _wrapped(compensated_add(entering, end))
         return tuple(jnp.where(broke, e, part) for e, part in zip(end, leaving, strict=True)), entering
 
     ends = tuple(jnp.moveaxis(part[-1], 1, 0) for part in local)
     _, offsets = jax.lax.scan(across, (zero[:, 0], zero[:, 0]), (ends, jnp.moveaxis(restarted, 1, 0)))
     seen = jnp.cumsum(flags.astype(jnp.int32), axis=0) > 0
     offsets = tuple(jnp.moveaxis(part, 0, 1)[None] for part in offsets)
-    summed = compensated_add(local, offsets)
+    summed = _wrapped(compensated_add(local, offsets))
     summed = tuple(jnp.where(seen, part, whole) for part, whole in zip(local, summed, strict=True))
     high, low = (jnp.reshape(jnp.moveaxis(part, 0, 2), (batch, chunks * CHUNK, *values.shape[2:]))[:, :length]
                  for part in summed)
