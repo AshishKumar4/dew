@@ -46,11 +46,19 @@ COLLECTIVES = {
     'xla_gpu_reduce_scatter_combine_threshold_bytes': 1 << 27,
     'xla_gpu_enable_all_gather_combine_by_dim': False,
     'xla_gpu_enable_reduce_scatter_combine_by_dim': False,
+    'xla_disable_hlo_passes': 'rematerialization',
 }
 """NVIDIA JAX-Toolbox's collective options for a GPU step over several devices: the scheduler overlaps
 each collective with compute, and the collectives combine into few large ones. Measured in
 docs/performance.md, "Collectives over several GPUs". A step that gathers its layers' parameters combines
-its all-gathers up to one layer's instead (`gathered_layer_bytes`)."""
+its all-gathers up to one layer's instead (`gathered_layer_bytes`).
+
+XLA's rematerialization pass is off, as MaxText runs it (row 1307): the plan fits a step to the devices'
+room by its own ladder (`dew.training.planning.FitSearch`), and XLA's pass, against a limit of its own below
+the plan's, recomputes what it picks at a rung that already fits, a sharded weight's all-gather among them.
+Qwen3-8B's step over four compile-only H100s (fsdp 2 x tensor 2, two 4096-token rows a data shard, 48 GiB
+stated) settled at `minimal` either way, 19.2 GB of temporaries; with the pass on it gathered 14
+rematerialized all-gathers more, 16.8 GB a step against 11.7, 78 of them synchronous against 66."""
 
 GATHER_THRESHOLD = 'xla_gpu_all_gather_combine_threshold_bytes'
 """The bytes XLA combines a step's all-gathers up to (`COLLECTIVES`, `step_compiler_options`)."""
