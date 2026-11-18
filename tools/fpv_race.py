@@ -447,9 +447,8 @@ def _staged(world: World, stage: str, updates: int, every: int | None, report: d
     (world.json's `level`), where a stopped stage goes on; one stopped between the two is restored at that
     checkpoint and scored before the next chunk trains. Returns the stage's last state, its agent and the
     level it ended at."""
-    from dew.rl.flight import FlightEnv
-
     from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective
+    from dew.rl.flight import FlightEnv
 
     done = _latest(world.out / stage)
     points = [point for point in report.get(stage, []) if point["updates"] <= done]
