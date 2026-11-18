@@ -692,8 +692,9 @@ class Tcgen05Walked(Tcgen05Placed):
                      for name, shape in zip(self.kept_sums, shapes, strict=True))
         return mosaic.looped(segments, start, sums), tuple(mosaic.Kept(acc) for acc in sums)
 
-    def issuing(self, streams, products: Sequence[mosaic.Product], lo, hi, *, first, lefts: Mapping,
-                ready, shares: Mapping | None = None) -> None:
+    def issuing(self, streams, products: Sequence[mosaic.Product], lo, hi, *, first,
+                lefts: Sequence[Mapping], ready: Sequence, reaches: Sequence[tuple] | None = None,
+                shares: Mapping | None = None) -> None:
         # Once the resident tiles are in (`ready`, their barriers), the walk's steps as `issued` runs them: a
         # step's scores and their cotangents fresh into its turn, then the kept products onto their sums
         # (`WalkedProducts.kept`, in their declared order) once its compute warpgroup gives their lefts, but
@@ -702,6 +703,9 @@ class Tcgen05Walked(Tcgen05Placed):
         # once its last are issued. A kept product reads its program's share of its right's columns
         # (`shares[into]`, `(first, count)`; the whole where it has none). A fused walk's dQ over the step's
         # turns once their compute warpgroup read the step before last's.
+        # Its one compute warpgroup's tiles, its walk the program's.
+        del reaches
+        (lefts,) = lefts
         placed = walked_products(products, self.kept_sums)
         hand_offs = self._hand_offs()
         scored, formed, finished = hand_offs.scored, hand_offs.formed, hand_offs.finished

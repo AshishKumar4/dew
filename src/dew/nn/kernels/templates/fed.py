@@ -112,7 +112,7 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *,
             refills: bool = True, counted=0) -> "dict[str, Ring] | Feed":
         """`RingFamily.fed`: a `Feed` of steps `lo` to `hi` from `views`, its ring counters from `lo`
-        `counted` turns on (the walk's `first`: a decided walk's second pass, `mosaic.Decided`), its first
+        `counted` turns on (the walk's `first`: a decided walk's second pass, `after_walk.Decided`), its first
         steps primed by the loading consumer, drained at its walk's end."""
         feed = Feed(streams, views, lo, hi, wg == self.loader, first=lo - counted, refills=refills,
                     drains=True)

@@ -32,6 +32,7 @@ import jax
 import jax.numpy as jnp
 from jax.extend import core as jaxpr_core
 
+from dew.nn import programs
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, emission
 from dew.nn.kernels.templates.attention import (
@@ -313,7 +314,9 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
     work = plans[0]
     if work is None:
         raise NotImplementedError(f"the template's decode derives no config on {target}")
-    launches = [found for kernel in _kernels(traced.jaxpr) if (found := emission.work_of(kernel)) is not None]
+    kernels = (equation for equation in programs.equations(traced.jaxpr)
+               if equation.primitive.name in ("pallas_call", "mpmd_map"))
+    launches = [found for kernel in kernels if (found := emission.work_of(kernel)) is not None]
     priced = dataclasses.replace(sum(launches, Work()), span=sum(each.span for each in launches))
     if max(plan.slices for plan in work.values()) > 1:
         slices = max(plan.slices for plan in work.values())
@@ -321,21 +324,6 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
         written = rows * queries * heads * width * jnp.dtype(dtype).itemsize
         priced = priced + Work(device_bytes=states + written, kernels=1)
     return priced
-
-
-def _kernels(jaxpr) -> list:
-    """Every kernel equation (`pallas_call`, `mpmd_map`) of `jaxpr` and of the jaxprs within it, in order."""
-    found = []
-    for equation in jaxpr.eqns:
-        if equation.primitive.name in ("pallas_call", "mpmd_map"):
-            found.append(equation)
-            continue
-        for value in equation.params.values():
-            for inner in value if isinstance(value, (tuple, list)) else (value,):
-                held = getattr(inner, "jaxpr", inner)
-                if hasattr(held, "eqns"):
-                    found.extend(_kernels(held))
-    return found
 
 
 @overload

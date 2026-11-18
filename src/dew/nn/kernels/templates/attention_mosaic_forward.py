@@ -33,6 +33,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, launches, tuning
 from dew.nn.kernels.templates import (
+    after_walk,
     attention_algebra as algebra,
     mosaic,
     operands,
@@ -253,7 +254,7 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
         scoped.append(family.staged_memory((consumers, block_q, block_k), dtype, swizzling.UNSWIZZLED))
     scoped += [family.load_barriers(consumers * parts), family.schedule(consumers)]
     if decides:
-        # A decided walk's verdicts, a word a consumer, and their barrier (`mosaic.Decided`).
+        # A decided walk's verdicts, a word a consumer, and their barrier (`after_walk.Decided`).
         scoped += list(family.decided_scratch(consumers).values())
     # Its rings stage the keys and values as stored: quantized `codes` where given, an fp32 call's parts
     # one above the other.
@@ -393,9 +394,9 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
              else paged_reads(call.table, call.page, tiles.block_k))
     def launch(form: algebra.Forward, live: "jax.Array | _Flags | None", into: tuple | None = None
                ) -> "tuple[tuple, jax.Array, None] | tuple[tuple, None, _Flags]":
+        q, form = _rewalked(spec, form, raw, taken, hooks)
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
-        q, form = _rewalked(spec, form, raw, taken, hooks, bundle_of(at, raw.dtype))
         # A rewalk's flags: those the plain launch stated of its rows (`flagged`), else its live rows'.
         flags = (None if live is None else live if isinstance(live, _Flags)
                  else _Flags.of(live.reshape(*live.shape[:2], -1), at.block_q))
@@ -443,8 +444,8 @@ class _InferenceWalk(NamedTuple):
     """Whether its values are its keys' leading columns (`MosaicForward.in_key`), read from the key slot."""
     decides: bool = False
     """Whether its launches' consumers walk again scaled where a row's sums passed fp32's largest
-    (`mosaic.Decided`, `MosaicForward.decided`): the fold's rewalk's too, whose rows' sums pass it alike (an
-    unscaled rewalk left the decode step's overflowing rows no number)."""
+    (`after_walk.Decided`, `MosaicForward.decided`): the fold's rewalk's too, whose rows' sums pass it alike
+    (an unscaled rewalk left the decode step's overflowing rows no number)."""
 
 
 def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, at: Tiles, at_spans,
@@ -587,10 +588,10 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
     def launch(form: algebra.Forward, live: jax.Array | None, into=None):
         del live, into
+        q, form = _rewalked(spec, form, raw, taken, hooks)
         counted = counts and form.natural == spec.natural
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
-        q, form = _rewalked(spec, form, raw, taken, hooks, bundle_of(at, raw.dtype))
         # The launches on the family arranged for their own tiles (`bundle_of`), as their derivation priced
         # them: a natural rewalk's key tile its own (`Tiles.relaunch`).
         launching = bundle_of(at, query.dtype)
@@ -707,8 +708,8 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     return call, spec, operands, read, taken, hooks
 
 
-def _rewalked(spec: algebra.Forward, form: algebra.Forward, query: jax.Array, taken: float, hooks: Hooks,
-              family: mosaic.Family) -> tuple[jax.Array, algebra.Forward]:
+def _rewalked(spec: algebra.Forward, form: algebra.Forward, query: jax.Array, taken: float, hooks: Hooks
+              ) -> tuple[jax.Array, algebra.Forward]:
     """A launch's query operand and form: the fold's natural rewalk (`algebra.unfolded`) of a call whose
     plain launch took its power of two into its scale (`taken`, `_prepared`) the query taken by the power
     (in the kernel, after the prologue, where its consumers take the query's, `_prologued`) and the scale
@@ -755,7 +756,7 @@ class _Refs(NamedTuple):
     schedule: Ref
     relay: Ref | None = None
     converted: tuple[Ref, Ref] | None = None
-    decided: mosaic.Decided | None = None
+    decided: after_walk.Decided | None = None
 
 
 class _Layout(NamedTuple):
@@ -773,7 +774,7 @@ class _Layout(NamedTuple):
     after: bool = False
     """Whether the output's stage is scoped after the walks (`stages_after_walks`), none of the program's."""
     decides: bool = False
-    """Whether its consumers decide a second walk (`mosaic.Decided`), its verdicts' scratch scoped last."""
+    """Whether its consumers decide a second walk (`after_walk.Decided`), its verdicts' scratch last."""
 
     def unpacked(self, q_ref, k_ref, v_ref, *refs) -> _Refs:
         """A program's refs, its kernel's then its scoped allocations': the weights' relay tile last where
@@ -782,8 +783,9 @@ class _Layout(NamedTuple):
         read, refs = refs[:self.reads], refs[self.reads:]
         written, refs = refs[:self.outputs], refs[self.outputs:]
         (q_smem, row_smem, *stages), (q_loaded, schedule, *verdicts) = refs[:self.arrays], refs[self.arrays:]
-        decided = (None if not self.decides else mosaic.Decided(*verdicts, verdicts[0].shape[0]) if verdicts
-                   else mosaic.Decided(None, None, 1))
+        words, barrier = verdicts if verdicts else (None, None)
+        decided = (after_walk.Decided(words, barrier, len(verdicts) and words.shape[0] or 1) if self.decides
+                   else None)
         relay = stages.pop() if self.relays else None
         converted = (stages[-2], stages[-1]) if self.converts else None
         stages = stages[:-2] if self.converts else stages
@@ -1126,8 +1128,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
               first, spans: _Spans | None, hooked: _Hooked, place: tuple, *, hooks: Hooks, training: bool,
               anchors: tuple | None = None, interpret: bool, certified: tuple | None = None, kept=None,
               relay=None, codes: _Codes | None = None, value_width: int,
-              first_at: Callable | None = None, decided: mosaic.Decided | None = None,
-              walked: Callable | None = None):
+              first_at: Callable | None = None, decided: after_walk.Decided | None = None,
+              past_walks: Callable | None = None):
     """A consumer's query block (batch row, head and key head `place`): its walk of the key tiles it reads
     through the family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook
     on each tile, passing those of the program's `streamed` range its partner alone reads; then its output
@@ -1171,12 +1173,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     dot = functools.partial(_dot, family, interpret)
 
     def walk(spec: algebra.Forward, turns) -> tuple:
-        # Its walk in `spec`'s form from its start, its steps `turns` past the rings' first.
         start, merged = _started(program, spec, hooked, state_rows, value_width, training=training)
-        # Every consumer but the first takes a turn ahead, which the first's closing turn matches: each makes
-        # as many arrivals as the others at any count of consumers (three take one fewer than the first and
-        # second, and its partners' last turn waited forever: the interpreted hang of row 4840).
-        pl.when(consumer > 0)(turn)
 
         def scored(index, slots, product=None):
             return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
@@ -1226,17 +1223,9 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         # (`Family.walk_own`), `turns` past the rings' first.
         state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
                                          between=lambda: (turn(), turn()), counted=turns)
-        # The first consumer's closing turn, which every other's turn ahead matches, at its walk's end: before
-        # any barrier every consumer passes after its walk (a decided walk's verdicts, `mosaic.Decided`; the
-        # stages over the rings, `walked`), which a partner's last turn would wait on otherwise (the ring
-        # protocol's rare interleavings deadlocked so).
-        pl.when(consumer == 0)(turn)
         return state, trained, merged
 
     def store(spec: algebra.Forward, state: algebra.Partial, trained, merged: bool) -> None:
-        # Where its stages lie over the rings' slots, past every consumer's walk first (`Family.walked`).
-        if walked is not None:
-            walked()
         if merged:
             state = algebra.merge(spec, _initial(family, spec, hooked, state_rows), state)
         keep = None if kept is None else _kept_of(program, kept, rows=(row, head, first))
@@ -1251,22 +1240,47 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         _stored_walk(program, spec, state, trained, hooked, (row, head, first), hooks=hooks,
                      training=training, out=(out_view, out_stage), rows=(stored, row_smem), keep=keep)
 
-    state, trained, merged = walk(spec, 0)
-    if decided is None:
+    _walks_stored(walk, store, spec, consumer, turn, decided=decided, past=past_walks, streamed=streamed)
+
+
+def _walks_stored(walk: Callable, store: Callable, spec: algebra.Forward, consumer, turn: Callable, *,
+                  decided: after_walk.Decided | None, past: Callable | None, streamed: tuple) -> None:
+    """A consumer's walk (`walk(spec, turns)`: in `spec`'s form, its steps `turns` past the rings' first) and
+    its stores (`store(spec, *walked)`). Every consumer but the first takes a turn ahead of each walk, which
+    the first's closing turn at the walk's end matches: each makes as many arrivals as the others at any count
+    of consumers (three took one fewer than the first and second, and its partners' last turn waited forever:
+    the interpreted hang of row 4840), before any barrier the consumers pass after their walks (a partner's
+    last turn waited on it behind the verdicts' barrier otherwise: the ring protocol's rare interleavings
+    deadlocked). Each store is past every consumer's walks where its stages lie over the rings' slots (`past`,
+    `after_walk.over_rings_scoped`'s `walked`). Where its launch decides (`decided`, `after_walk.Decided`), a
+    row whose sums passed fp32's largest (inf, which every later add keeps, or a value's own NaN) has every
+    consumer walk its keys again scaled, a walk of `streamed`'s steps on, its stores that walk's; else the
+    walk's."""
+    def walked(spec: algebra.Forward, turns) -> tuple:
+        pl.when(consumer > 0)(turn)
+        found = walk(spec, turns)
+        pl.when(consumer == 0)(turn)
+        return found
+
+    def stored(spec: algebra.Forward, state: algebra.Partial, trained, merged: bool) -> None:
+        if past is not None:
+            past()
         store(spec, state, trained, merged)
+
+    state, trained, merged = walked(spec, 0)
+    if decided is None:
+        stored(spec, state, trained, merged)
         return
-    # A row whose sums passed fp32's largest (inf, which every later add keeps, or a value's own NaN) has
-    # every consumer walk its keys again scaled, its stores that walk's (`mosaic.Decided`); else the walk's.
     # A row's verdict its sums times zero summed along it, no number exactly where one of them is none; the
     # rows' then the warpgroup's vote (`bar.red.or.pred`, a vector's alone: a tile's own refused layouts).
     rows = jnp.isnan(jnp.sum(state.acc * 0.0, axis=-1))
     taken = decided.stated(consumer, jnp.any(rows))
-    pl.when(jnp.logical_not(taken))(lambda: store(spec, state, trained, merged))
+    pl.when(jnp.logical_not(taken))(lambda: stored(spec, state, trained, merged))
 
     @pl.when(taken)
     def _():
         scaled = dataclasses.replace(spec, headroom=True)
-        store(scaled, *walk(scaled, streamed[1] - streamed[0]))
+        stored(scaled, *walked(scaled, streamed[1] - streamed[0]))
 
 
 class _Written(NamedTuple):
@@ -1886,7 +1900,7 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
                           family, tuple(tile.at[index] for tile in refs.converted), read.hooked.scales,
                           row if read.sources is None else read.sources[row], lax.div(head, group),
                               tiles.block_k, interpret), value_width=value_width, decided=refs.decided,
-                      walked=walked)
+                      past_walks=walked)
 
         def producer():
             *_, views, _, own = placed()

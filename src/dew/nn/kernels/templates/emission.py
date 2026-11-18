@@ -454,18 +454,22 @@ class _Counting:
             return self.cond(params["branches"], values)
         elif (region := _REGIONS.get(primitive)) is not None:
             return region(self, equation, values) or unknown
-        elif primitive is derivatives.marked_call_p and isinstance(params["kind"], derivatives.Rare):
-            # A rare span's verdict read as its common value (`derivatives.Rare`).
-            return [np.False_]
-        elif primitive is derivatives.marked_call_p and isinstance(params["kind"], derivatives.WalkStep):
-            if self.loops:
-                self.loops[-1].marks += 1
-            return self.run(params["call_jaxpr"], values)
+        elif primitive is derivatives.marked_call_p and isinstance(params["kind"], _MARKS):
+            return self.marked(params, values)
         elif (inner := programs.called(equation)) is not None:
             return self.run(inner, values)
         elif primitive not in _FREE:
             raise Unpriced(f"no rule prices {primitive} in a kernel's body")
         return unknown
+
+    def marked(self, params, values: list) -> list:
+        """A marked span a count reads by its kind: a rare span's verdict as its common value, False
+        (`derivatives.Rare`), a walk's step counted by its loop and run (`derivatives.WalkStep`)."""
+        if isinstance(params["kind"], derivatives.Rare):
+            return [np.False_]
+        if self.loops:
+            self.loops[-1].marks += 1
+        return self.run(params["call_jaxpr"], values)
 
     def place(self, name) -> int | None:
         """The concrete index along axis `name`: its warp's among its warpgroup's warps (`warp`), its
@@ -611,6 +615,9 @@ def _placed(primitive, values: list):
         return dataclasses.replace(place, plus=place.plus + 1)
     return place.compared(primitive, other) if place is values[0] else None
 
+
+_MARKS = (derivatives.Rare, derivatives.WalkStep)
+"""The marked spans a count reads by their kind (`_Counting.marked`)."""
 
 _REGIONS = {pallas.run_scoped_p: _Counting.scoped, lax.while_p: _Counting.loop, lax.scan_p: _Counting.scanned,
             mpmd.mpmd_map_p: _Counting.warps}

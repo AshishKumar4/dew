@@ -743,7 +743,7 @@ def _keys_first_issued(walk: _Backward, streams, reached: Callable, walked: plac
     k_smem, v_smem, k_loaded, v_loaded = resident
     lefts = {"keys": k_smem.at[0], "values": v_smem.at[0], **({"staged": staged[0]} if walk.fused else {})}
     walked.issuing(streams, KEYS_FIRST + (FUSED_DQ if walk.fused else ()), *reached()[:2], first=first,
-                   lefts=lefts, ready=(k_loaded.at[0], v_loaded.at[0]),
+                   lefts=(lefts,), ready=(k_loaded.at[0], v_loaded.at[0]),
                    shares={placed.DK: shares[0], placed.DV: shares[1]})
 
 

@@ -1767,12 +1767,12 @@ def test_the_forward_on_tcgen05s_chunks_holds_check_1_interpreted(call, training
 @pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
 @pytest.mark.parametrize("consumers", [2, 3])
 def test_the_forwards_schedule_holds_every_property_in_every_interleaving(consumers, training, rare):
-    """The forward's launch on wgmma at `consumers` a program over 192 queries and 128 keys, traced as an
-    H100 builds it: every interleaving of its warpgroups and its loads' landings explored
+    """The forward's launch on wgmma at `consumers` a program over 192 queries and 128 keys, traced as an H100
+    builds it: every interleaving of its warpgroups and its loads' landings explored
     (`ring_protocol.explore`), no deadlock and every barrier's phase whole, its decided walk's second taken
-    (`rare`, the producer streaming the steps again, `mosaic.Decided`) or not. Its consumers' schedule turns
-    balance at any count (row 4840: at three the third made one fewer, and its partners' last turn waited
-    on a phase that never completed, the interpreted hang)."""
+    (`rare`, the producer streaming the steps again, `after_walk.Decided`) or not. Its consumers' schedule
+    turns balance at any count (row 4840: at three the third made one fewer, and its partners' last turn
+    waited on a phase that never completed, the interpreted hang)."""
     from ring_protocol import explore, programs
 
     query, key = jnp.ones((1, 192, 1, 64), jnp.bfloat16), jnp.ones((1, 128, 1, 64), jnp.bfloat16)

@@ -590,7 +590,8 @@ def shared_bytes(family: "Family", scope: Scope) -> int:
     every address word (`Scope.addresses`)."""
     barriers = sum(_count(leaf.num_barriers) for tree in (scope.program, scope.walks, scope.over)
                    for leaf in jax.tree.leaves(tree) if _barrier(leaf))
-    # The barrier a program's consumers pass before writing over their rings' slots (`Family.walked`).
+    # The barrier a program's consumers pass before writing over their rings' slots
+    # (`after_walk.over_rings_scoped`).
     passed = 1 if scope.over and scope.after else 0
     return scratch_bytes(family, scope) + BARRIER_BYTES * (barriers + passed) + scope.addresses
 

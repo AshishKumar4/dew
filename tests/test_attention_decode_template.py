@@ -80,12 +80,12 @@ def _operands(query_shape: tuple[int, ...], keys: int):
 @INTERPRETS
 @pytest.mark.parametrize("device", ["sm90", "sm80"])
 def test_a_decode_steps_rows_whose_sums_pass_fp32s_largest_walk_again_scaled_interpreted(device):
-    """A bf16 decode step (`attention_decode.attend`) whose first row's values are positive and near 2^124,
-    so its walk's unscaled sums over its 200 keys pass fp32's largest, each value within bf16's, beside a
-    row of ordinary values, interpreted as an H100 or an A100 runs it: on par with the reference path at a
-    scale its sums hold (check 1), the first row's programs walking their keys again scaled in their
-    launch (`mosaic.Decided`) and the second's not, with no pass over the values before the launch to choose
-    its walk."""
+    """A bf16 decode step (`attention_decode.attend`) whose first row's values are positive and near 2^124, so
+    its walk's unscaled sums over its 200 keys pass fp32's largest, each value within bf16's, beside a row of
+    ordinary values, interpreted as an H100 or an A100 runs it: on par with the reference path at a scale its
+    sums hold (check 1), the first row's programs walking their keys again scaled in their launch
+    (`after_walk.Decided`) and the second's not, with no pass over the values before the launch to choose its
+    walk."""
     positions, heads, kv_heads = CALLS["one-query"]
     spans = _spans(positions)
     drawn = _drawn(positions, heads, kv_heads, jnp.bfloat16)

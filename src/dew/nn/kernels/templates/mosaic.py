@@ -42,7 +42,7 @@ from dew import _cache
 from dew.nn import derivatives
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import (
-    across,
+    after_walk,
     bodies,
     emission,
     handoffs,
@@ -591,47 +591,6 @@ class Kept:
 
 
 @dataclasses.dataclass(frozen=True)
-class Decided:
-    """A walk its program's consumers decide to take again, over the same steps, after the walk before it
-    (`Transport.stream`'s `again`, `Family.walk_own`'s `counted`): each consumer's verdict a word of its own
-    (`words`, `Transport.decided_scratch`'s) published at a barrier of the consumers' arrivals, which the
-    producer and every consumer wait on, so all of them read the same words and walk again, or none does.
-    A program of one warpgroup, which no producer serves (`ConsumerFed`'s one consumer, cp.async's), decides
-    alone: its verdict its own, no word or barrier (`words` None)."""
-
-    words: Any
-    barrier: Any
-    consumers: int
-
-    def stated(self, wg, verdict: jax.Array) -> jax.Array:
-        """Consumer `wg`'s `verdict` (a scalar, uniform over its warpgroup) published, and whether any
-        consumer's takes the walk again (`taken`)."""
-        if self.words is None:
-            return _rare(_uniform(verdict.astype(jnp.int32)) != 0)
-        self.words[wg] = verdict.astype(jnp.int32)
-        plgpu.barrier_arrive(self.barrier)
-        return self.taken()
-
-    def taken(self) -> jax.Array:
-        """Whether some consumer's published verdict takes the walk again, read once every consumer's is: a
-        rare verdict (`derivatives.Rare`), which a count of the kernel's work reads as not taken."""
-        plgpu.barrier_wait(self.barrier)
-        published = (self.words[index] for index in range(self.consumers))
-        return _rare(_uniform(functools.reduce(operator.or_, published)) != 0)
-
-
-_rare = derivatives.marked(derivatives.Rare(), lambda verdict: verdict)
-"""A decided walk's verdict marked rare (`derivatives.Rare`)."""
-
-
-def _uniform(verdict: jax.Array) -> jax.Array:
-    """A verdict every lane holds alike read warp-uniform (`across.uniform`), so a branch on it is not
-    divergent and the copies issued under it address their tiles once, not lane by lane (row 7898); the
-    interpreter's its own."""
-    return verdict if bodies.interpreting() else across.uniform(verdict)
-
-
-@dataclasses.dataclass(frozen=True)
 class Walk:
     """A program's walk of its tile, its steps storing what it computes (no accumulator past them, and its
     `carry`, from its value here, only between them: a per-key memory's gradients across key blocks):
@@ -1124,12 +1083,13 @@ class Issuer[Accumulator](abc.ABC):
         del declared, slots
         return inline
 
-    def issuing(self, streams, products: Sequence[Product], lo, hi, *, first, lefts: Mapping,
-                ready) -> None:
+    def issuing(self, streams, products: Sequence[Product], lo, hi, *, first, lefts: Sequence[Mapping],
+                ready: Sequence, reaches: Sequence[tuple] | None = None) -> None:
         """The issuing role's walk of steps `lo` to `hi` (the streams' steps counted from `first`): each of
         `products` issued as its consumer's walk reads it (`places_on_role`), its left operands the program's
-        tiles `lefts` names, once `ready` (the query's load) is done."""
-        del streams, products, lo, hi, first, lefts, ready
+        tiles `lefts` names (a mapping a consumer), once `ready` (its query loads' barriers) are done; each
+        consumer's at its own steps `reaches` within `lo` to `hi` (None: the program's)."""
+        del streams, products, lo, hi, first, lefts, ready, reaches
         raise NotImplementedError(f"{self.name}'s consumers issue their own products")
 
     def product_columns(self, products: tuple | None) -> int:
@@ -1570,13 +1530,8 @@ class Transport[Allocated, Opened](abc.ABC):
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
 
     stages_over_rings: bool = False
-    """Whether tiles a program scopes after its walks share its rings' slots (`scoped`: one `plgpu.RefUnion`,
-    as large as the larger, `resources.Scope.over`) where its rings are the program's and its consumers
-    alone read them (`ConsumerFed`'s): a tile written only once every consumer has passed the end of its
-    walks (`walked`), when none reads a slot again and no load lands in one. sm120's forward at width 256
-    staged its output beside its rings, 136,272 bytes at 64 x 32, past the 101,376 a program holds, and
-    split its output's columns four ways, its scores formed four times (3.16x FlashAttention's time,
-    M-EM-70c)."""
+    """Whether tiles a program scopes after its walks may share its rings' slots, its rings the program's
+    and its consumers their only readers (`after_walk.over_rings_scoped`: sm120's forward at width 256)."""
 
     ring_slots: int | None = None
     """The slots each stream's ring holds whatever stages a launch asks (`streams`), where it fixes them (a
@@ -1644,65 +1599,15 @@ class Transport[Allocated, Opened](abc.ABC):
         `shared` bytes it stages where stated; `report.Launch.kernels`), which the compile point checks its
         kernel against; whether its program moves registers between its roles where the launch states
         it (`moves`; else its model decides, `resources.moves_registers`); and whether its arithmetic reduces
-        across warps (`reduces`: a forward whose warps hold whole rows, `Issuer.rows_whole`, does not),
-        reserving the family's reduction scratch (`reduction_scratch`) where it does."""
+        across warps (`reduces`), reserving the family's reduction scratch there."""
 
     def scoped(self, body, *allocations, streams, after_walks: tuple = (), over_rings: bool = False):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
-        (`streams`), and what it returns. With `after_walks`, allocations no walk reads, `body` takes
-        `after` too: `after(fn)` runs `fn(*refs)` of them once a role's walks have ended, in a scope of their
-        own where the family scopes its walks apart (`walks_scoped`: the walks' slots reused, as
-        `resources.Scope.after` counts them), over its rings' slots where the launch asks it (`over_rings`)
-        and the family stages so (`stages_over_rings`, `body` taking `walked` too), the program's
-        otherwise."""
+        (`streams`), and what it returns; with `after_walks`, allocations no walk reads, `body` takes `after`
+        too (`after_walk.scoped`: over its rings' slots where the launch asks it, `over_rings`)."""
         if not after_walks:
             return self.program_scoped(body, *allocations, streams=streams)
-        if over_rings and self.stages_over_rings and not self.walks_scoped:
-            return self._scoped_over_rings(body, allocations, streams, after_walks)
-        if self.walks_scoped:
-            # The after-walks scope is the program's own kind (`program_scoped`: collective where its
-            # consumers share one).
-            def after(fn):
-                return self.program_scoped(lambda *refs, streams: fn(*refs), *after_walks, streams=streams)
-
-            return self.program_scoped(functools.partial(body, after=after), *allocations, streams=streams)
-        held = len(allocations)
-
-        def program(*refs, streams):
-            return body(*refs[:held], streams=streams, after=lambda fn: fn(*refs[held:]))
-
-        return self.program_scoped(program, *allocations, *after_walks, streams=streams)
-
-    def _scoped_over_rings(self, body, allocations: tuple, streams: dict, after_walks: tuple):
-        """`scoped` where the tiles after the walks share the rings' slots (`stages_over_rings`): every ring's
-        slots and those tiles one union, the rings' barriers apart, and `body` given `after` and `walked`.
-        The order a tile is written in: a consumer's last product reads its slot (mma.sync's loads are its
-        own; a warpgroup MMA's awaited before its accumulator finishes), then it arrives at `walked`'s
-        barrier, of as many arrivals as a ring's slot has readers; a tile is written only after every
-        consumer's arrival, so after every read of every slot, and no load lands past a consumer-fed walk's
-        last step. Each consumer passes `walked` once, before its first write `after`. This order is the
-        union's proof obligation, which no interpreted cell witnesses yet: the GPU interpreter's race
-        detection flags the plain consumer-fed ring itself (row 7853)."""
-        names = tuple(streams)
-        slots = tuple(streams[name]["smem"] for name in names)
-        rest = {name: {key: value for key, value in streams[name].items() if key != "smem"} for name in names}
-        readers = streams[names[0]]["consumed"].num_arrivals
-        held = len(allocations)
-
-        def program(*refs, streams):
-            (ring_slots, staged), passed = refs[held], refs[held + 1]
-            rings = {name: {**streams[name], "smem": slot}
-                     for name, slot in zip(names, ring_slots, strict=True)}
-
-            def walked():
-                plgpu.barrier_arrive(passed)
-                plgpu.barrier_wait(passed)
-
-            return body(*refs[:held], streams=rings, after=lambda fn: fn(*staged), walked=walked)
-
-        union = plgpu.RefUnion(slots, tuple(after_walks))
-        return self.program_scoped(program, *allocations, union, plgpu.Barrier(num_arrivals=readers),
-                                   streams=rest)
+        return after_walk.scoped(self, body, allocations, streams, after_walks, over_rings=over_rings)
 
     @abc.abstractmethod
     def program_scoped(self, body, *allocations, streams):
@@ -1767,8 +1672,8 @@ class Transport[Allocated, Opened](abc.ABC):
         `walk(streams, lo, hi, first)` its walk of steps `lo` to `hi` counted from `first`: on a layout with a
         producer, the steps before and after its own passed (`passed`, `between()` after each), which its
         partners read; on one whose consumers feed their rings (`ConsumerFed.walk_own`), every streamed step
-        over its own feed (`fed`), a step none of its own masked by its step. `counted` turns past the rings'
-        first, a decided walk's second pass over the same steps (`Decided`). Returns `walk`'s value."""
+        over its own feed (`fed`), a step none of its own masked by its step, `counted` turns past the rings'
+        first (`after_walk.Decided`'s second pass). Returns `walk`'s value."""
         del views, wg
         lo, hi = own
         first = streamed[0] - counted
@@ -1839,15 +1744,13 @@ class Transport[Allocated, Opened](abc.ABC):
         return {name: ring.acquire(ring.turn(0)) for name, ring in held.items()}
 
     @abc.abstractmethod
-    def stream(self, streams, views: dict, lo, hi, *, again: "Decided | None" = None) -> None:
+    def stream(self, streams, views: dict, lo, hi, *, again: "after_walk.Decided | None" = None) -> None:
         """The producer's loads of steps `lo` to `hi` from `views` (`opened`'s), where the family has one
-        (`streamed`); with `again`, the same steps once more where its consumers take their walk again
-        (`Decided.taken`), the rings' turns running on past the first pass."""
+        (`streamed`); with `again`, once more where its consumers take their walk again, turns running on."""
 
     def decided_scratch(self, consumers: int) -> dict:
-        """The scoped allocations a decided walk's verdicts take (`Decided`): a word each of `consumers`
-        consumers and the barrier they publish them at; none where one consumer alone walks the program's
-        rings, no producer beside it (`feeds_itself`)."""
+        """A decided walk's verdicts' scoped allocations (`after_walk.Decided`): a word a consumer and their
+        barrier; none where one consumer alone walks the program's rings (`feeds_itself`)."""
         if consumers == 1 and self.feeds_itself:
             return {}
         return {"words": plgpu.SMEM((consumers,), jnp.int32),
@@ -2357,7 +2260,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         # Its once streams held apart, one deep, beside its rings.
         return self.opened(allocated, views), views, self.opened(once, once_views)
 
-    def stream(self, streams, views: dict, lo, hi, *, again: "Decided | None" = None) -> None:
+    def stream(self, streams, views: dict, lo, hi, *, again: "after_walk.Decided | None" = None) -> None:
         rings = tuple(streams.values())
 
         def tiles(index):

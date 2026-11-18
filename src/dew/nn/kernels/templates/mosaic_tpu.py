@@ -332,7 +332,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         return Streams(allocated, views)
 
     def decided_scratch(self, consumers: int) -> dict:
-        # One core a program, its walk its one role: it decides a second walk alone (`mosaic.Decided`).
+        # One core a program, its walk its one role: it decides a second walk alone (`after_walk.Decided`).
         del consumers
         return {}
 

@@ -480,10 +480,10 @@ class MosaicForward(_Mainloop[Tiles]):
                             arguments.get("residuals"), config, arguments.get("table"),
                             arguments.get("sources"), arguments.get("scales"), arguments.get("initial"))
 
-    def decided(self, query, value, score_params, residuals: Kept, config: Tiles, table=None, sources=None,
-                scales=None, initial=None) -> bool:
+    def decided(self, query, value, score_params, residuals: Kept | None, config: Tiles, table=None,
+                sources=None, scales=None, initial=None) -> bool:
         """Whether its launch at `config` walks unscaled and decides a scaled second walk of a program whose
-        rows' sums passed fp32's largest (`mosaic.Decided`), no pass over its values before it and no branch
+        rows' sums passed fp32's largest (`after_walk.Decided`), no pass over its values before it and no branch
         read on the host: an inference launch whose rows' sums can pass it (`algebra.headroom`), on a family
         whose consumers walk its rings (tcgen05's rows' issuer would wait on the verdicts too), where the
         scaled walk's registers at the config the unscaled walk derives hold within the family's budget, by
