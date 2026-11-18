@@ -1133,8 +1133,10 @@ def _compensated_shapes():
 
     def turned(x, y, z):
         del y
-        # The whole turns taken in float32 at every width, so the float64 truth reduces by the same ones.
-        turns = jnp.floor(x.astype(jnp.float32) * np.float32(1 / (2 * np.pi))).astype(x.dtype)
+        # The whole turns of the angle's float32 product, a stated rounding at every width (the exact
+        # product of two float32 values rounded once is float32's own), so the float64 truth reduces by the
+        # same ones.
+        turns = jnp.floor((x * np.float32(1 / (2 * np.pi))).astype(jnp.float32).astype(x.dtype))
         whole, dropped = two_product(-turns, jnp.full_like(turns, TWO_PI_SPLIT[0]))
         return compensated_add((x, z * np.float32(2 ** -30)), (whole, dropped - turns * TWO_PI_SPLIT[1]))
 
