@@ -22,8 +22,8 @@ from jax.extend import core as jcore
 from jax.extend.core import primitives
 
 from dew.algebra import terms
-from dew.algebra.forms import aval
-from dew.nn.derivatives import Protected, marked_call_p
+from dew.algebra.forms import aval, computed
+from dew.nn.derivatives import marked_call_p
 from dew.nn.programs import called, entrywise, host_evaluated, live, on_host
 
 
@@ -123,11 +123,11 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | No
         operands = [read(atom) for atom in equation.invars]
         # A marked span stays as written: a boundary the algebra reads by its kind
         # (`dew.nn.derivatives.marked`, a protected span's inside no rule touches), so no region crosses it;
-        # one that states the operation it computes is that operation (`_computed`).
+        # one that states the operation it computes is that operation (`computed`).
         body = None if equation.primitive is marked_call_p else called(equation)
-        computed = _computed(equation, operands) if equation.primitive is marked_call_p else None
-        if computed is not None:
-            outputs = computed
+        made = computed(equation, operands)
+        if made is not None:
+            outputs = made
         elif body is not None:
             # What the call computes, the primal of a custom derivative's: its own derivative rule bars its
             # region (`BARRIERS`); a declaration's is the call's, kept where the call is written.
@@ -150,21 +150,6 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | No
                                or _normal(equation, operands, widened, laid))
         env.update(zip(equation.outvars, outputs, strict=True))
     return [read(atom) for atom in jaxpr.outvars]
-
-
-def _computed(equation: jcore.JaxprEqn, operands: list) -> list | None:
-    """A marked span's outputs as the operation it states it computes (`Protected.computes`): Dew's one
-    logistic (`precision.logistic_value`) the logistic, `logistic_p`, in at least float32 and rounded once to
-    its operand's dtype, so a program's own sigmoid and Dew's reach one normal form (an fp32 one the same
-    equation); None for any other span, kept as written."""
-    from dew.nn.precision import at_least_fp32, logistic_value
-
-    kind = equation.params["kind"]
-    if not (isinstance(kind, Protected) and kind.computes is logistic_value and len(operands) == 1):
-        return None
-    (operand,) = operands
-    dtype = jnp.result_type(operand)
-    return [jax.lax.logistic(jnp.asarray(operand).astype(at_least_fp32(dtype))).astype(dtype)]
 
 
 FOLDED = frozenset({jax.lax.iota_p, jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.transpose_p,

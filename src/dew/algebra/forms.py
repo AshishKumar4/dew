@@ -10,6 +10,7 @@ from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from egglog import get_callable_args
 from jax.core import ShapedArray
@@ -17,7 +18,8 @@ from jax.extend import core as jcore
 
 from dew.algebra import program, terms
 from dew.nn import programs
-from dew.nn.precision import float32_dot_general
+from dew.nn.derivatives import Protected, marked_call_p
+from dew.nn.precision import at_least_fp32, float32_dot_general, logistic_value
 
 
 class Accumulated(NamedTuple):
@@ -212,6 +214,22 @@ def _platform_default(equation: jcore.JaxprEqn,
     return programs.branches(equation)[platforms.index(None)] if None in platforms else None
 
 
+def computed(equation: jcore.JaxprEqn, operands: Sequence) -> list | None:
+    """A marked span's outputs as the operation it states it computes (`Protected.computes`): Dew's one
+    logistic (`precision.logistic_value`) the logistic, `logistic_p`, in at least float32 and rounded once to
+    its operand's dtype, so a program's own sigmoid and Dew's reach one normal form (an fp32 one the same
+    equation), a declaration traced inline (`evaluated_inline`) and a region made canonical
+    (`normal_form.canonical`) alike; None for any other equation, a span stating nothing kept as written."""
+    if equation.primitive is not marked_call_p:
+        return None
+    kind = equation.params["kind"]
+    if not (isinstance(kind, Protected) and kind.computes is logistic_value and len(operands) == 1):
+        return None
+    (operand,) = operands
+    dtype = jnp.result_type(operand)
+    return [jax.lax.logistic(jnp.asarray(operand).astype(at_least_fp32(dtype))).astype(dtype)]
+
+
 def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
     """`jaxpr`'s outputs over `values`, each platform choice its default branch's (`inlined`) and each
     placement its operand (`PLACEMENTS`)."""
@@ -227,6 +245,9 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
         if (default := _platform_default(equation, producers)) is not None:
             operands = [read(atom) for atom in equation.invars[1:]]
             outs = evaluated_inline(default.jaxpr, default.consts, operands)
+        elif (made := computed(equation, [read(atom) for atom in equation.invars])) is not None:
+            # A span stating the operation it computes, that operation (Dew's one logistic its logistic).
+            outs = made
         elif (called := programs.called(equation)) is not None:
             # A call's program (`dew.nn.programs.called`), its constants with it.
             outs = evaluated_inline(called.jaxpr, called.consts, [read(atom) for atom in equation.invars])
