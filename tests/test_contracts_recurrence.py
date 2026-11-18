@@ -56,6 +56,15 @@ def test_a_run_updating_in_its_backward_moves_as_its_step_would(edge):
                     draw=measured(edge, draw))
 
 
+def seeded_key(seed: int) -> jax.Array:
+    """`jax.random.key(seed)` with every bit of `seed`: formed with 64-bit integers on (its draws taken after,
+    in float32), where a 32-bit one wrapped a draw's `salt + 4096 seed` past 2^32 onto a smaller seed's, the
+    sizing's pilot seeds (from 2^20, `reference_error.SIZING_FROM`) onto the verdict's (seed zero's key
+    unchanged)."""
+    with jax.enable_x64(new_val=True):
+        return jax.random.key(seed)
+
+
 def measured(edge: str, draw):
     """A cell's seeded `draw` where check 1 measures it on the mesh (`assert_contract`'s `draw`): its normal
     domain alone, where float32 holds every value; an edge's mesh run is held to the contract's own rule at
@@ -161,7 +170,7 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
     starts = marked if packed else None
 
     def draw(seed):
-        keys = jax.random.split(jax.random.key(1861 + 4096 * seed), 8)
+        keys = jax.random.split(seeded_key(1861 + 4096 * seed), 8)
         query, key, value = (jax.random.normal(k, (rows, length, heads, width)) * scale for k in keys[:3])
         g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
         beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
@@ -580,7 +589,7 @@ def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
     scale = EDGES[edge]
 
     def draw(seed):
-        draws = jax.random.split(jax.random.key(3311 + per_key + 4096 * seed), 7)
+        draws = jax.random.split(seeded_key(3311 + per_key + 4096 * seed), 7)
         q, k, v = (jax.random.normal(d, (tokens, n)) * scale
                    for d, n in zip(draws[:3], (keys_, keys_, values), strict=True))
         g = -jax.nn.softplus(jax.random.normal(draws[3], (tokens, keys_) if per_key else (tokens,)))
