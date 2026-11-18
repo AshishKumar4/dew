@@ -50,6 +50,7 @@ from dew._pool import (
     visible_gpus,
 )
 from dew.clusters import LOCAL_DEVICES, SCHEDULERS, Launched, Scheduler, detected_environment
+from dew.data import cgroups
 
 VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 """What an `--env` name may be: it lands unquoted in the remote shell line."""
@@ -545,20 +546,6 @@ def _escalate(forced: threading.Event) -> None:
         signal.signal(signum, lambda _signum, _frame: forced.set())
 
 
-def oom_kills(membership: Path = Path("/proc/self/cgroup"),
-              root: Path = Path("/sys/fs/cgroup")) -> int | None:
-    """How many processes the kernel's OOM killer has killed in this process's cgroup (cgroup v2's
-    `memory.events` `oom_kill`, its own and its children's), None where the host keeps no such count (cgroup
-    v1, a host that is not Linux)."""
-    held = membership.read_text().splitlines() if membership.exists() else []
-    unified = next((line.removeprefix("0::") for line in held if line.startswith("0::")), None)
-    events = None if unified is None else root / unified.lstrip("/") / "memory.events"
-    if events is None or not events.exists():
-        return None
-    counts = dict(line.split() for line in events.read_text().splitlines() if line.strip())
-    return int(counts["oom_kill"]) if "oom_kill" in counts else None
-
-
 def _exit_text(code: int, oom_killed: int = 0) -> str:
     """How a Popen return code reads: a signal by name, else the code. A SIGKILL while the launcher's cgroup
     counted `oom_killed` more OOM kills is said to be the kernel's: the host's memory ran out, which a
@@ -598,7 +585,8 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
     handlers = {signum: signal.signal(signum, _raise_stopped) for signum in STOP_SIGNALS}
     forced = threading.Event()
     # The OOM kills the launcher's cgroup counted before its ranks, so a rank killed by the kernel is said.
-    kills_before = oom_kills()
+    group = cgroups.own()
+    kills_before = cgroups.oom_kills(group)
     try:
         for process in processes:
             # Started with a lifeline (`dew._cleanup.start`), which ends the rank's group when this launcher
@@ -637,7 +625,7 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
                 # A rank preempted at the step the pool agreed on leaves the
                 # others writing the same checkpoint.
                 preempted = code == PREEMPTED_EXIT
-                kills = oom_kills()
+                kills = cgroups.oom_kills(group)
                 oom_killed = kills - kills_before if kills is not None and kills_before is not None else 0
                 emit(f"rank {rank} on {processes[rank].host} "
                      + ("stopped at a preemption checkpoint" if preempted else _exit_text(code, oom_killed))

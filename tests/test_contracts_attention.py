@@ -11,6 +11,7 @@ from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
 
 from dew.nn import attention, kv_cache
 from dew.nn.kernels.templates import attention as template, attention_quantized
+from dew.nn.sharding import manual_map
 
 
 def plain_attention(query, key, value):
@@ -119,7 +120,13 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
         cotangent = cotangent.astype(jnp.bfloat16)
 
     def paged(query, key, value, sinks):
-        return getattr(kv_cache, kernel)(None)(query, key, value, table, lengths, None, sinks)
+        # Launched per shard as a decode step launches it (`kv_cache.decode_specs`): a kernel takes no axis
+        # the partitioner holds.
+        def local(query, key, value, lengths, table, sinks):
+            return getattr(kv_cache, kernel)(None)(query, key, value, table, lengths, None, sinks)
+
+        specs, out = kv_cache.decode_specs(query.shape, paged=True, sinks=True)
+        return manual_map(local, specs, out)(query, key, value, lengths, table, sinks)
 
     def plain(query, key, value, sinks):
         # Each row's pages in its table's order, `[rows, keys, key heads, D]`, each key head read by two

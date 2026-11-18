@@ -11,6 +11,8 @@ hands on.
 from __future__ import annotations
 
 import contextlib
+import functools
+import itertools
 import math
 from collections.abc import Collection, Hashable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
@@ -220,13 +222,25 @@ class PhasePasses[L, E]:
         return self.built[passes]
 
 
+RATE_SPAN = 39
+"""The standard deviations either side of its mode past which a count's integrand over the log rate (a
+log-concave one, at least as narrow as its normal density) is 0 beside its peak in float64 (exp(-39² / 2)
+underflows past the least subnormal): the span `SampledPasses.cumulative` integrates each count's over."""
+
+MODE_NODES = 64
+"""The Gauss-Legendre nodes a unit of count takes in `SampledPasses.cumulative`'s integral of the log rate's
+mode over the count, whose integrand is analytic there."""
+
+
 @dataclass(frozen=True)
 class SampledPasses:
     """A looped model's pass count drawn afresh for each microbatch a run steps (`count`), from a named law
     bounded to `cap` (row 7660): `law` 'lognormal-poisson', the count `1 + N`, `N ~ Poisson(Λ)`,
     `log Λ ~ Normal(log(mean - 1) - dispersion² / 2, dispersion²)`, so `mean` is the count's mean before its
-    bound, conditioned on 1 to `cap` by rejection, as recurrent-depth training draws it (Geiping et al. 2025,
-    arXiv 2502.05171). A draw is a function of the run's key and the microbatch's global position alone,
+    bound, conditioned on 1 to `cap`, as recurrent-depth training draws it (Geiping et al. 2025, arXiv
+    2502.05171), by the bounded law's inverse cumulative (`cumulative`), one uniform a draw however little of
+    the unbounded law's mass the cap holds. A draw is a function of the run's key and the microbatch's global
+    position alone,
     its place among every microbatch the run dispatched: every process draws alike, and a resume, a replan
     or a step of another split draws on as the run would have."""
 
@@ -252,10 +266,97 @@ class SampledPasses:
 
     def count(self, key: Sequence[int], position: int) -> int:
         """The pass count of the run's microbatch at global `position` under the run's `key` (its words,
-        `jax.random.key_data`): a draw of the bounded law, a count past `cap` drawn again."""
+        `jax.random.key_data`): the bounded law's inverse cumulative (`cumulative`) at one uniform draw."""
         draws = np.random.Generator(np.random.Philox(np.random.SeedSequence([*map(int, key), int(position)])))
-        location = math.log(self.mean - 1) - self.dispersion ** 2 / 2
+        return 1 + int(np.searchsorted(self.cumulative, draws.random(), side="right"))
+
+    @functools.cached_property
+    def cumulative(self) -> np.ndarray:
+        """The bounded law's cumulative probability at each count 1 to `cap`, its last 1, from each count's
+        log probability less a term common to all: the Poisson's of the count less one at the rate
+        `exp(location)` without dispersion (its common `-exp(location)` left out, which past a mean of
+        2^53 would round every count's alike); else the Poisson's integrated over the log rate's normal
+        density, its log integrand `n x - exp(x) - (x - location)² / (2 dispersion²) - log n!` concave in the
+        log rate `x`: its peak value, its integral over the count of its mode (`_mode`, Laplace's envelope:
+        the peak's derivative in `n` is the mode less `digamma(n + 1)`), so no count's peak is the difference
+        of the exponential's large values; and its integral about its own mode scaled by the peak
+        (`_about_mode`), never about `location`, from which a cap low beside the mean moves each count's mass
+        far. Then conditioned on the cap."""
+        below = np.arange(self.cap)
+        factorials = np.array([math.lgamma(n + 1) for n in below])
+        location = math.log(self.mean - 1) - self.dispersion * self.dispersion / 2
+        if location == -math.inf:
+            # A dispersion whose square float64 cannot hold: a count past one is drawn with chance
+            # exp(-dispersion² / 8) or less (its rate past its least value), 0 in float64.
+            return np.ones(self.cap)
+        if self.dispersion == 0:
+            logs = below * location - factorials
+        else:
+            nodes, weights = np.polynomial.legendre.leggauss(MODE_NODES)
+            counts = below[1:, None] + (nodes[None, :] - 1) / 2
+            units = _mode(counts, location, self.dispersion) @ (weights / 2)
+            modes = _mode(below.astype(float), location, self.dispersion)
+            logs = (np.concatenate([[0.0], np.cumsum(units)]) - factorials
+                    + np.array([_about_mode(float(mode), self.dispersion) for mode in modes]))
+        probabilities = np.exp(logs - logs.max())
+        cumulative = np.cumsum(probabilities / probabilities.sum())
+        # The sum's last partial is 1 but for its rounding, which a uniform draw past it must not reach.
+        cumulative[-1] = 1.0
+        return cumulative
+
+
+def _mode(counts: np.ndarray, location: float, dispersion: float) -> np.ndarray:
+    """The log rate at which each count's log integrand peaks (`SampledPasses.cumulative`), at real counts
+    `counts` too: the root of its derivative `dispersion² (count - exp(x)) - (x - location)`, decreasing in
+    `x`, bisected between `location` and the count's log (a count of 0 left of `location` by
+    `dispersion² exp(location)`, at most a million) to float64's last bit, its sign compared, never
+    computed, where the exponential's terms overflow."""
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        logs = np.log(np.where(counts > 0, counts, 1.0))
+        reach = min(dispersion ** 2 * math.exp(min(location, 709.0)), 1e6)
+        low = np.where(counts > 0, np.minimum(location, logs), location - reach)
+        high = np.where(counts > 0, np.maximum(location, logs), location)
         while True:
-            drawn = 1 + int(draws.poisson(math.exp(draws.normal(location, self.dispersion))))
-            if drawn <= self.cap:
-                return drawn
+            middle = (low + high) / 2
+            if not np.any((middle > low) & (middle < high)):
+                return low
+            rising = dispersion ** 2 * (counts - np.exp(middle)) > middle - location
+            low, high = np.where(rising, middle, low), np.where(rising, high, middle)
+
+
+def _about_mode(mode: float, dispersion: float) -> float:
+    """The log of a count's integrand over the log rate (`SampledPasses.cumulative`) about its `mode`, scaled
+    by its peak and by the normal density's width: the integral over the standardized log rate `z` (`x = mode
+    + dispersion z`) of `exp(-exp(mode) (expm1(dispersion z) - dispersion z) - z² / 2)`, the peak's own terms
+    cancelled exactly by the mode's equation, so nothing in it is the difference of large values. In units
+    of its peak's width (`1 / sqrt(1 + dispersion² exp(mode))`, held as its log so no dispersion's square
+    overflows, `u = z / width`): its log's curvature is at least 1 in `u` above the mode and in `z` below it,
+    so it is 0 beside its peak past `RATE_SPAN` units above and `RATE_SPAN` deviations below, or where it
+    reaches 0 first; each side in panels doubling from one unit (scipy's adaptive quadrature on each), so no
+    panel is wider than the integrand's own scale where it starts."""
+    from scipy import integrate
+
+    scale = math.exp(mode)
+    # log(1 + dispersion² exp(mode)) as a softplus of its log, finite however large the dispersion.
+    curvature = 2 * math.log(dispersion) + mode
+    log_width = -(curvature + math.log1p(math.exp(-curvature)) if curvature > 0
+                  else math.log1p(math.exp(curvature))) / 2
+    width, stride = math.exp(log_width), math.exp(math.log(dispersion) + log_width)
+
+    def integrand(u: float) -> float:
+        t = stride * u
+        # expm1(t) - t, its series where the difference would cancel.
+        lost = t * t / 2 * (1 + t / 3 + t * t / 12) if abs(t) < 1e-4 else math.expm1(min(t, 709.0)) - t
+        exponent = scale * lost + (width * u) ** 2 / 2
+        return 0.0 if exponent > 745 else math.exp(-exponent)
+
+    def panels(side: float, reach: float) -> list[float]:
+        edges = [0.0, side]
+        while abs(edges[-1]) < reach and integrand(edges[-1]) > 0:
+            edges.append(side * min(2 * abs(edges[-1]), reach))
+        return edges
+
+    halves = (panels(1.0, RATE_SPAN), panels(-1.0, RATE_SPAN / width if width > 0 else math.inf)[::-1])
+    total = sum(integrate.quad(integrand, start, end, epsabs=0, epsrel=1e-13, limit=200)[0]
+                for edges in halves for start, end in itertools.pairwise(edges))
+    return log_width + math.log(total)

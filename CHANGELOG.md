@@ -7,6 +7,24 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A run that keeps its variables on the host (`Layout(host=("variables",))`) can inspect
+  (`Trainer(inspection=...)`): its sampled steps summarize what a device run's summarize, its watched
+  outputs' activations and cotangents among them (their probes differentiated beside the parameters, under
+  the loss scale its backward is seeded with), and its unsampled steps are the uninspected run's. Its
+  startup compiles both bodies. A fit whose host steps compile past their startup passes counts it in its
+  own record (`train/step_misses`), no other fit's; a fit of device steps logs no such count.
+
+- A step that keeps its variables on the host (`Layout(host=("variables",))`) compiles every program it calls
+  at its run's startup, over its state's and batch's shapes (`options.collecting`), its CPU companion's and
+  its accelerator's alike, stepping on its own results' shapes until they settle; its steps then trace,
+  lower and compile nothing, a window that replays included; a step that does (an input no pass
+  foresaw) compiles, each program named in a warning and counted in the fit's record (`train/step_misses`). Its
+  glue between the transaction's phases (an attempt's arithmetic, the replay's and the records', a
+  microbatch's reading and its outcome) runs as programs of their own. The startup's programs and seconds
+  are logged and kept (`StepCompiler.host_startup`). A program compiled over shapes within `collecting`
+  serves a later call over arrays alike in shape, dtype, weak type, placement and static arguments
+  (`OuterProgram`).
+
 - A layout that keeps the variables on the host (`Layout(host=("variables",))`) reads each step's batch in
   the split the run states, each microbatch an attempt of its own, as a device step does; it read every
   step's batch whole, refusing a stated split.
@@ -117,8 +135,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
 
-- Dew requires its JAX build 0.12.0.1.post110 and, on Linux x86_64 and aarch64, its own jaxlib build
-  0.12.0.1.post103, with its CUDA and PJRT plugins 0.12.0.1.post103 (post96's until now). A GPU compile takes a
+- Dew requires its JAX build 0.12.0.1.post112 and, on Linux x86_64 and aarch64, its own jaxlib build
+  0.12.0.1.post111, with its CUDA and PJRT plugins 0.12.0.1.post111 (post96's until now). A GPU compile takes a
   device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
   whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
   executables' buffer assignment, which jaxlib's client of it reads, so `Compiled.peak_live()` lists the buffers
@@ -143,8 +161,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `[1, n]` one in its own layout broadcasts, where a kernel holding it through an optimization barrier failed to
   lower; Pallas TPU lowers an optimization barrier; a Mosaic GPU gather or scatter of four rows names the thread
   that issues it; and the GPU interpreter's race detection orders a copy into shared memory after the reads its
-  thread's synchronization orders, as a ring refilled once its readers release a slot. Elsewhere jaxlib stays the
-  stock 0.12.0.1.
+  thread's synchronization orders, as a ring refilled once its readers release a slot. A Pallas Mosaic GPU float
+  add, subtract or multiply under `xla_no_contract` metadata rounds on its own, where each was contractible into a
+  fused multiply-add, and the lowering cache keys that label; a tiled array, an accumulator's tile among them,
+  reduces whole to a scalar under either semantics; `lax.optimization_barrier` states that it rearranges, so a
+  traced work count reads a program holding one; Mosaic GPU names the provider that assembles a kernel's PTX; a
+  deviceless capture with no CUDA plugin raises `NoCudaPlugin`; and Triton's pipeliner sizes a load's buffers by
+  each wgmma reader's stage, where a wgmma a stage after a register use was one buffer short and the next copy
+  overwrote a tile it still read. Elsewhere jaxlib stays the stock 0.12.0.1.
 
 - A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
   anything, where its run states no `ns_group`: a step that fits only with them joined one at a time takes

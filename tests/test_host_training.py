@@ -2,6 +2,7 @@
 
 Streamed-bank ownership and placement are Dew execution policies; Optax oracles the updates.
 """
+import contextlib
 import dataclasses
 import json
 import os
@@ -157,6 +158,176 @@ def test_a_host_step_read_in_a_stated_split_is_on_par_with_the_devices_split_ste
         return ({**batch, "y": batch["y"] + noise},)
 
     layouts_agree(run, draw, "a split step across the execution boundary", HOST, DEVICE)
+
+
+def placed_batch(trainer: Trainer, batch):
+    """`batch` placed on the trainer's devices as its prefetcher hands a step it."""
+    from dew.distributed.batches import batch_shardings
+
+    return jax.device_put(batch, batch_shardings(trainer.device_mesh, batch))
+
+
+def test_a_host_window_that_replays_steps_on_its_startups_programs_alone():
+    """A host step whose window replays (two microbatches an update, one rejected and replayed) runs its
+    every step on the programs its startup compiled over its state's shapes (`HostStartup`), nothing
+    traced, lowered or compiled at any step (`executable_only`): the pass took the replay's arm as well.
+    Its state is bit for bit the same steps' each traced at its call (`HostRun.stepped` with the startup's
+    programs let go, `options.release`): the pass read and wrote nothing of the run."""
+    from dew.distributed.batches import batch_shardings
+    from dew.distributed.host import transfer
+    from dew.nn.kernels.options import release
+    from dew.telemetry.compiles import executable_only
+
+    def run(quiet: bool):
+        trainer = Trainer(Tiny(composite=True), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
+                          accumulation=2, dynamic_scale=SHORT_SCALE, layout=HOST)
+        state, _, _ = trainer.place()
+        data = [placed_batch(trainer, batch) for batch in batches()]
+        step = trainer.compile(state, data[0])
+        startup = trainer._compiler.host_startup
+        assert startup is not None, "a host step's startup compiles its programs"
+        assert any(name.endswith("pooled_cotangent") for name in startup.names), startup
+        if not quiet:
+            release()
+        cpu = trainer.state_mesh
+        for batch in data:
+            if quiet:
+                with executable_only():
+                    state, *_ = step(state, batch)
+                continue
+            with jax.set_mesh(cpu):
+                batch = transfer(batch, batch_shardings(cpu, batch))
+                state = step.stepped(step.windowed(state, batch), batch, transfer)[0]
+        assert int(state.updates) == 1
+        return state
+
+    equal(run(quiet=True), run(quiet=False))
+
+
+def test_a_host_fits_misses_are_its_own_record_never_another_fits(caplog):
+    """A host step that misses its startup's programs (let go at its fit's second step by an observer on
+    the fit's loop, `options.release` and JAX's own caches, as an input no pass foresaw would miss them)
+    compiles them and says so: each named in a warning and counted in that fit's record
+    (`train/step_misses`), its run going on. A second fit in the same process, missing none, logs none of
+    the first's; a fit whose steps are no host's logs no such count."""
+    from recording import RecordingTracker
+
+    from dew.data.dataset import Loader
+    from dew.nn.kernels.options import release
+    from dew.training.observe import Observe
+
+    def let_go(state) -> None:
+        release()
+        jax.clear_caches()
+
+    def fitted(layout, released: bool) -> list[tuple[int, dict]]:
+        tracker = RecordingTracker()
+        rows = np.stack([np.arange(row, row + 9) % 16 for row in range(jax.device_count())]).astype(np.int32)
+
+        def stream(partition):
+            while True:
+                yield {"text": rows}
+        trainer = Trainer(LMObjective(decoder(), 8, head_chunks=1, ema_decay=None), optax.adam(.01),
+                          key=jax.random.key(3), layout=layout, tracker=tracker)
+        trainer.fit(Loader(stream, None, batch=jax.device_count(), records=None), steps=4, log_every=1,
+                    eval_every=None, checkpoint_every=None,
+                    observe=Observe(2, let_go) if released else None)
+        return tracker.scalars
+
+    with caplog.at_level("WARNING", logger="dew.training.compiler"):
+        missed = fitted(HOST, released=True)
+    assert max(row.get("train/step_misses", 0) for _, row in missed) > 0, missed
+    assert any("its startup pass did not" in record.message for record in caplog.records)
+    clean = fitted(HOST, released=False)
+    assert {row["train/step_misses"] for _, row in clean if "train/step_misses" in row} == {0.0}, clean
+    assert not any("train/step_misses" in row for _, row in fitted(Layout(), released=False))
+
+def three_steps(trainer: Trainer, vocabulary: int):
+    """`trainer`'s run of three steps over one batch of `vocabulary`'s tokens, from its fresh start, held
+    to the programs its startup compiled (`executable_only`): the state after them."""
+    from dew.telemetry.compiles import executable_only
+
+    state, _, _ = trainer.place()
+    rows = np.stack([np.arange(row, row + 9) % vocabulary for row in range(jax.device_count())])
+    batch = placed_batch(trainer, {"text": jnp.asarray(rows.astype(np.int32))})
+    step = trainer.compile(state, batch)
+    for _ in range(3):
+        with executable_only():
+            state, *_ = step(state, batch)
+    return state
+
+
+class _CountedProjection(LMObjective):
+    """An LM objective that counts each projection of its parameters before an update reads them
+    (`projected` with `updated` False), as each trace of it runs its Python."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reads: list[None] = []
+
+    def projected(self, params, *, updated: bool):
+        if not updated:
+            self.reads.append(None)
+        return super().projected(params, updated=updated)
+
+
+def test_a_projecting_decoders_host_steps_run_on_its_startups_programs_alone():
+    """A host decoder whose parameters a step reads projected (Gemma 3n's AltUp prediction coefficients
+    clamped, `ProjectsParameters`) runs its steps on the programs its startup compiled: the projection,
+    arithmetic on its parameters, is a program of its own (`dew.training.transaction.Read`), each leaf it
+    leaves as it is handed back as the array it is. Over its startup and three steps the projection's Python
+    runs twice: once in the read's one trace, whose program computes the changed leaves from that trace,
+    and once in the step's commit; the read's program traced it a third time when it lowered (row 8397)."""
+    from dew.nn.gemma3n import AltUp
+
+    model = decoder(altup=AltUp(num_inputs=2, coef_clip=.5), scan_layers=False)
+    objective = _CountedProjection(model, 8, head_chunks=1, ema_decay=None)
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(3), layout=HOST)
+    assert int(three_steps(trainer, 16).updates) == 3
+    assert len(objective.reads) == 2
+
+
+def test_an_inspecting_host_runs_sampled_and_unsampled_steps_compile_nothing():
+    """A host run that inspects a watched block's output and cotangent steps sampled and unsampled steps on
+    the programs its startup compiled, both bodies passed (`HostRun.startup`): nothing traced, lowered or
+    compiled at either (`executable_only`)."""
+    from dew.telemetry.compiles import executable_only
+    from dew.training import Inspection
+
+    model = decoder(scan_layers=False)
+    trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None), optax.adam(.01),
+                      key=jax.random.key(3), layout=HOST,
+                      inspection=Inspection(modules=("layers_0",), targets=("params",), cotangents=True))
+    state, _, _ = trainer.place()
+    rows = np.stack([np.arange(row, row + 9) % 16 for row in range(jax.device_count())]).astype(np.int32)
+    batch = placed_batch(trainer, {"text": jnp.asarray(rows)})
+    step = trainer.compile(state, batch)
+    for sampled in (False, True, False, True):
+        with executable_only():
+            state, *_, committed = step(state, batch, sampled=sampled)
+    assert int(state.updates) == 4 and committed.inspected is not None
+
+
+def test_a_casting_projection_is_the_identity_where_its_leaves_are_of_its_dtype_alone():
+    """A host step's read of its variables (`Read`) hands back as they are only the leaves its projection
+    leaves as given in the trace context it runs in: a cast to float32 passes float32 leaves through, and,
+    in float64 (a check-1 truth's replay), casts its float64 leaves: each context's own plan."""
+    from dew.training.transaction import Read
+
+    read = Read(lambda variables, compute: jax.tree.map(lambda leaf: leaf.astype(jnp.float32), variables))
+    narrow = {"params": {"w": jnp.arange(3, dtype=jnp.float32)}}
+    assert read(narrow, None)["params"]["w"] is narrow["params"]["w"]
+    with jax.enable_x64(new_val=True):
+        wide = {"params": {"w": jnp.arange(3, dtype=jnp.float64)}}
+        assert read(wide, None)["params"]["w"].dtype == jnp.float32
+
+
+
+def test_a_host_decoders_steps_run_on_its_startups_programs_alone():
+    """A host decoder's step, its layers banked and stacked on the CPU each step, runs every step on the
+    programs its startup compiled over its state's shapes, nothing traced, lowered or compiled
+    (`executable_only`)."""
+    assert int(three_steps(streaming_decoder(HOST), 256).updates) == 3
 
 
 @pytest.mark.parametrize("composite", [False, True])
@@ -1055,7 +1226,6 @@ def streaming_decoder(layout: Layout | None = None, checkpoints: Checkpoints | N
 def assumed_on_cpu(generation_name: str):
     """A block choosing as on `generation_name`'s devices (`generation.assumed`), its facts that part's, every
     kernel XLA's: the CPU running the run runs none of that part's own."""
-    import contextlib
 
     from dew.nn.kernels import generation
 
@@ -1219,6 +1389,21 @@ def test_a_distillations_streamed_price_reads_its_teachers_banks():
         links.append(trainer.layout_choice.streamed.link)
     distilled, alone = links
     assert distilled > alone, links
+
+
+def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companions_here():
+    """A host step prepared for GPUs this process lacks (one compile-only H100, `prepare_host_step`), over its
+    fresh state's shapes, compiles the accelerator's programs for them and its CPU companion's on this
+    host's CPUs, nothing placed: what fills the shared cache its run's startup reads (the GPU tier's
+    `test_gpu_host_startup`)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.training.ahead import prepare_host_step
+
+    trainer = streaming_decoder(HOST, dtype=jnp.bfloat16)
+    trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus("sm90", 1, 80 * 2 ** 30)))
+    tokens = np.stack([np.arange(row, row + 9) % 256 for row in range(1)]).astype(np.int32)
+    startup = prepare_host_step(trainer, {"text": tokens})
+    assert startup.by_backend["gpu"]["programs"] > 0 and startup.by_backend["cpu"]["programs"] > 0, startup
 
 
 def test_a_streamed_step_on_gpus_is_priced_over_the_hosts_cpu_companion():

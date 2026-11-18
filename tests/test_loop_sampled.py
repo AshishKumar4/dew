@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from scipy import integrate, stats
+from scipy import integrate, optimize, special, stats
 from test_pass_weights import looped, phased_trainer
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -22,8 +22,13 @@ from dew.training.interval import DISPATCHED_MICROBATCHES, Interval
 from dew.training.phase_passes import SampledPasses
 
 LAWS = [SampledPasses(mean=2.0, dispersion=0.5, cap=4), SampledPasses(mean=4.0, dispersion=0.5, cap=8),
-        SampledPasses(mean=3.0, dispersion=0.0, cap=6)]
-"""The note's law (mean 2, dispersion 0.5, cap 4), a wider one, and a Poisson count (no dispersion)."""
+        SampledPasses(mean=3.0, dispersion=0.0, cap=6), SampledPasses(mean=32.0, dispersion=0.0, cap=3),
+        SampledPasses(mean=32.0, dispersion=1.0, cap=3), SampledPasses(mean=1e6, dispersion=0.1, cap=2)]
+"""The note's law (mean 2, dispersion 0.5, cap 4), a wider one, a Poisson count (no dispersion), and two
+whose cap holds little of their unbounded mass (a Poisson count of mean 32 is at most 3 with chance
+~2e-11: a count redrawn past the cap would be drawn ~5e10 times), and one whose counts' mass lies where its
+rate is drawn far below its mean (each count's mode near a log rate of 6.6, its mean's 13.8, 47 of its
+deviations away)."""
 
 DRAWS = 2_500
 """The microbatches a seed's key draws a law's counts at."""
@@ -32,23 +37,46 @@ SEEDS = 8
 """The keys a law's shares are read over (`sampling_gate.assert_draws_as_declared`)."""
 
 
-SPAN = 39
-"""The standard deviations either side of the log rate's mean past which its normal density is 0 in
-float64 (exp(-39² / 2) underflows past the least subnormal), so a quadrature over them misses nothing."""
+SPAN = 40
+"""The standard deviations either side of a count's mode past which its integrand over the log rate,
+log-concave and at least as narrow as the log rate's normal density, is 0 beside its peak in float64."""
 
 
 def probabilities(law: SampledPasses) -> np.ndarray:
     """The bounded law's probability at each count 1 to its cap, from its statement alone: the Poisson's
-    closed form where it has no dispersion, else the Poisson's probability integrated over the log-normal
-    rate (scipy's adaptive quadrature in float64, over the log rate's `SPAN`), conditioned on the cap."""
+    closed form where it has no dispersion, its log probabilities normalized in log space; else the Poisson's
+    probability integrated over the log-normal rate (scipy's adaptive quadrature in float64), each count's
+    integrand about its own mode (scipy's root of its log's derivative) scaled by its peak, over `SPAN` of
+    the log rate's deviations either side; conditioned on the cap."""
     location = math.log(law.mean - 1) - law.dispersion ** 2 / 2
     if law.dispersion == 0:
-        unbounded = stats.poisson.pmf(np.arange(law.cap), math.exp(location))
+        logs = stats.poisson.logpmf(np.arange(law.cap), math.exp(location))
     else:
-        reach = SPAN * law.dispersion
-        unbounded = np.array([integrate.quad(
-            lambda x, n=n: stats.poisson.pmf(n, np.exp(x)) * stats.norm.pdf(x, location, law.dispersion),
-            location - reach, location + reach, points=[location])[0] for n in range(law.cap)])
+        logs = []
+        for n in range(law.cap):
+            # A rate past float64's range is a probability of 0 at every count, as the largest rate's is.
+            def log_integrand(x, n=n):
+                return (n * x - math.exp(min(x, 709.0)) - special.gammaln(n + 1)
+                        - ((x - location) / law.dispersion) ** 2 / 2)
+
+            def slope(x, n=n):
+                return n - math.exp(min(x, 709.0)) - (x - location) / law.dispersion ** 2
+
+            reach = SPAN * law.dispersion
+            mode = optimize.brentq(slope, min(location, math.log(max(n, 1))) - reach,
+                                   max(location, math.log(max(n, 1))) + reach, xtol=1e-15)
+            peak = log_integrand(mode)
+            # Breakpoints a peak's width apart near it, and doubling out to the span below it, so the
+            # quadrature samples a peak far narrower than the span.
+            width = 1 / math.sqrt(math.exp(mode) + law.dispersion ** -2)
+            points = sorted({mode + step * width for step in range(-60, 61)}
+                            | {mode - 2.0 ** power * width for power in range(6, 64)
+                               if 2.0 ** power * width < reach})
+            logs.append(peak + math.log(integrate.quad(
+                lambda x, f=log_integrand, peak=peak: math.exp(f(x) - peak), mode - reach, mode + reach,
+                points=points, limit=4000)[0]))
+        logs = np.asarray(logs)
+    unbounded = np.exp(logs - logs.max())
     return unbounded / unbounded.sum()
 
 
@@ -65,6 +93,51 @@ def test_a_sampled_pass_count_follows_its_bounded_law(law):
         return np.bincount(drawn - 1, minlength=law.cap)
 
     assert_draws_as_declared(counts_of, probabilities(law), f"law {law}", seeds=SEEDS)
+
+
+@pytest.mark.parametrize(("law", "count"), [(SampledPasses(mean=1e20, dispersion=0.0, cap=4), 4),
+                                            (SampledPasses(mean=2.0, dispersion=1e-323, cap=1), 1),
+                                            (SampledPasses(mean=2.0, dispersion=1e154, cap=3), 1),
+                                            (SampledPasses(mean=2.0, dispersion=1e300, cap=3), 1)],
+                         ids=["vast-mean", "subnormal-dispersion", "vast-dispersion",
+                              "unsquarable-dispersion"])
+def test_a_sampled_pass_count_at_its_laws_extremes_draws_its_one_count(law, count):
+    """A law whose every draw is one count: a Poisson count of mean 1e20, below 4 with chance ~1e-60, past
+    any uniform's least step, draws its cap (its counts' common term, rounded alike, read as four equal ones);
+    a cap of one under a dispersion too small to step through draws 1 (which divided by a step of 0); and a
+    dispersion so vast its rate is past its least value but with chance exp(-dispersion² / 8), 0 in float64,
+    draws 1 too, where its peak's width (its square overflowing) or its log rate's mean was out of range."""
+    assert {law.count((0, 7), position) for position in range(DRAWS)} == {count}
+
+
+def test_a_sampled_pass_count_of_a_vanishing_dispersion_is_its_means_poisson():
+    """A law of a dispersion near 0 (1e-300) draws as the Poisson count of its mean, conditioned on its cap (a
+    rate of 1: counts 1, 2 and 3 at 0.4, 0.4 and 0.2), as a fair draw of it would be (the sampling gate)."""
+    from sampling_gate import assert_draws_as_declared
+
+    law = SampledPasses(mean=2.0, dispersion=1e-300, cap=3)
+    poisson = stats.poisson.pmf(np.arange(law.cap), 1.0)
+
+    def counts_of(seed: int) -> np.ndarray:
+        return np.bincount([law.count((seed, 7), position) - 1 for position in range(DRAWS)],
+                           minlength=law.cap)
+
+    assert_draws_as_declared(counts_of, poisson / poisson.sum(), f"law {law}", seeds=SEEDS)
+
+
+def test_a_broad_laws_draws_are_its_statements():
+    """A law whose counts' integrands over the log rate are far narrower than the rate's spread (mean e^450,
+    dispersion 30, cap 256: count 200's peak 0.0024 of a deviation wide) draws, at each position, the count
+    its statement's cumulative (`probabilities`, scipy's quadrature about each count's mode in the log rate
+    itself) gives at the draw's own uniform (`SampledPasses.count`'s Philox). The two cumulatives agree to
+    ~1e-12, so two fair readings part only where a uniform falls that near a step between counts: ~5e-6
+    likely over the draws. One that missed a peak's tails (row 8274's review) moved a count's mass by 15%."""
+    law = SampledPasses(mean=math.exp(450), dispersion=30.0, cap=256)
+    stated = np.cumsum(probabilities(law))
+    stated[-1] = 1.0
+    for position in range(DRAWS):
+        uniform = np.random.Generator(np.random.Philox(np.random.SeedSequence([0, 7, position]))).random()
+        assert law.count((0, 7), position) == 1 + int(np.searchsorted(stated, uniform, side="right"))
 
 
 def test_a_sampled_pass_count_is_its_key_and_position_alone():
@@ -96,10 +169,16 @@ TRAINED = SampledPasses(mean=2.0, dispersion=0.5, cap=CAP)
 """The trainer cells' law."""
 
 
-def token_batch(seed: int = 2) -> dict:
-    """Two rows a device of 17 tokens."""
+def token_draw(seed: int = 2) -> np.ndarray:
+    """Two rows a device of 17 tokens, int32, on the host: a run handed them places them as it steps,
+    compiling nothing of its own to make them."""
     rows = jax.device_count() * 2
-    return {"text": jnp.asarray(np.random.default_rng(seed).integers(0, 256, (rows, 17)), jnp.int32)}
+    return np.random.default_rng(seed).integers(0, 256, (rows, 17), dtype=np.int32)
+
+
+def token_batch(seed: int = 2) -> dict:
+    """`token_draw` on the default device."""
+    return {"text": jnp.asarray(token_draw(seed))}
 
 
 def held(leaf):
@@ -134,7 +213,7 @@ def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count(trai
     programs: dict = {}
     drawn = []
     for index in range(8):
-        step.drawn(TRAINED, sampled.key, interval, index)
+        step.drawn(interval, index)
         (count,) = step.counts
         drawn.append(count)
         placement = jax.tree.map(lambda leaf: leaf.sharding, state)
@@ -163,28 +242,65 @@ def test_a_sampled_runs_draws_go_on_through_another_split_and_a_resume():
     step's microbatches, at the split its step reads."""
     key = jax.random.key(0)
     flops = dict.fromkeys(range(1, CAP + 1))
-    four, two = DrawingStep({}, flops, 4), DrawingStep({}, flops, 2)
+    four, two = (DrawingStep({}, flops, split, TRAINED, words(key)) for split in (4, 2))
     interval = Interval(time.time(), None, microbatches=0)
     drawn = []
     for index in range(10):
-        four.drawn(TRAINED, key, interval, index)
+        four.drawn(interval, index)
         drawn += four.counts
     control = {DISPATCHED_MICROBATCHES: interval.microbatches}
     resumed = Interval.resumed(dict(control), last_saved=10)
     for index in range(10, 15):
-        two.drawn(TRAINED, key, resumed, index)
+        two.drawn(resumed, index)
         drawn += two.counts
     assert drawn == [TRAINED.count(words(key), position) for position in range(50)]
     lacking = Interval.resumed({}, last_saved=7)
-    two.drawn(TRAINED, key, lacking, 7)
+    two.drawn(lacking, 7)
     assert two.counts == [TRAINED.count(words(key), position) for position in (14, 15)]
     assert lacking.microbatches == 16
 
 
-def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path):
+def test_a_sampled_step_called_by_hand_draws_each_calls_counts_itself():
+    """A sampled run's step as `Trainer.compile` returns it, called by hand with no fit drawing for it (a
+    script's loop, `dew inspect`'s sampled window), draws each call's counts itself (row 8268): its first
+    call's at its state's step's microbatches, each next call's past the last, the counts the run's key
+    draws there, a call a fit drew for (`drawn`) running the fit's."""
+    batch = token_batch()
+    sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, split=2)
+    state, _, _ = sampled.place()
+    step = sampled.compile(state, batch)
+    assert isinstance(step, DrawingStep) and step.split == 2
+    drawn = []
+    for _ in range(3):
+        state, *_ = step(state, batch)
+        drawn += step.counts
+    assert drawn == [TRAINED.count(words(sampled.key), position) for position in range(6)]
+    step.drawn(Interval(time.time(), None, microbatches=40), int(state.step))
+    step(state, batch)
+    assert step.counts == [TRAINED.count(words(sampled.key), position) for position in (40, 41)]
+
+
+def test_a_sampled_run_whose_variables_are_on_the_host_is_refused_as_it_is_built():
+    """A run drawing its pass count per microbatch whose stated layout keeps its variables on the host (a
+    host-master run, which no plan of the devices steps) is refused as the trainer is built (rows 8271,
+    8400), and a run of the default layout is never offered the streamed host layout (`streaming.refusal`),
+    which its first compile then refused, a layout the user never stated."""
+    from dew.training import Layout, Trainer, streaming
+
+    with pytest.raises(ValueError):
+        Trainer(LMObjective(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
+                layout=Layout(host=("variables",), min_shard=1, tolerance=1.0), sampled_passes=TRAINED)
+    default = Trainer(LMObjective(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
+                      sampled_passes=TRAINED)
+    assert streaming.refusal(default, stated=False, ahead=False) is not None
+
+
+def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path, caplog):
     """A sampled run of four steps over data read in phases (`PhasedStream`), stopped after two and resumed,
     lands, bit for bit, where the run never stopped lands: each microbatch draws its count whatever its
-    data's phase, and its resume draws on from the microbatches its checkpoint counted."""
+    data's phase, and its resume draws on from the microbatches its checkpoint counted. A fresh run and a
+    resume of a checkpoint that counted its microbatches say nothing of a checkpoint lacking them (row
+    8276)."""
     from test_data_mixtures import assert_same, parameters
     from test_pass_weights import phased_draw, phased_loader
 
@@ -197,9 +313,13 @@ def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path):
                           checkpoints=Checkpoints(str(directory), keep=8)).fit(
             phased_loader(tokens), steps=steps, log_every=100, checkpoint_every=1)
 
-    whole = fitted(tmp_path / "whole", 4)
-    fitted(tmp_path / "resumed", 2)
-    resumed = fitted(tmp_path / "resumed", 4)
+    with caplog.at_level("INFO", logger="dew.training.compiler"):
+        whole = fitted(tmp_path / "whole", 4)
+        fitted(tmp_path / "resumed", 2)
+        resumed = fitted(tmp_path / "resumed", 4)
+    # The one note of a checkpoint lacking its count names its step and microbatch (`DrawingStep.drawn`).
+    assert not [record for record in caplog.records if record.name == "dew.training.compiler"
+                and isinstance(record.args, tuple) and len(record.args) == 2]
     assert int(resumed.step) == 4
     assert_same(parameters(whole), parameters(resumed), "the resumed sampled run is not the run unstopped")
 
@@ -248,7 +368,7 @@ def test_a_fixed_and_a_sampled_run_of_one_config_each_trace_their_own_window(sam
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
         if isinstance(step, DrawingStep):
-            step.drawn(TRAINED, trainer.key, Interval(time.time(), None, microbatches=0), 0)
+            step.drawn(Interval(time.time(), None, microbatches=0), 0)
         step(state, batch)
 
     runs = [{}, {"sampled_passes": TRAINED}]
@@ -288,7 +408,7 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
     from dew.training.model_flops import TRAINING_FLOPS, prepare_counts
 
     model = looped(steps=CAP)
-    host = {"text": np.asarray(token_batch()["text"])}
+    host = {"text": token_draw()}
     sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, split=2)
     counted = prepare_counts(sampled.objective, host, count_model=True,
                              counts=sampled.phase_passes.counted())
@@ -301,7 +421,7 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
     step = sampled.compile(state, batch)
     assert isinstance(step, DrawingStep)
     interval = Interval(time.time(), None, microbatches=0)
-    flops = step.drawn(TRAINED, sampled.key, interval, 0)
+    flops = step.drawn(interval, 0)
     _, _, metrics, *_ = step(state, batch)
     work = counted[TRAINING_FLOPS]
     expected = sum(jnp.sum(jnp.asarray(work[part::2, count - 1]), dtype=jnp.float32)
@@ -428,3 +548,46 @@ def test_a_decoder_run_states_a_sampled_pass_count_whole_and_once(fields):
     stated = DecoderRunConfig(loop_steps_sample="lognormal-poisson", loop_steps_mean=2.0,
                               loop_steps_dispersion=0.5, loop_steps_max=4)
     assert stated.sampled_passes() == SampledPasses(2.0, 0.5, 4) and stated.handed_passes == 4
+
+
+class _Drawing:
+    """A rollout drawing nothing: the batch it is handed (`dew.training.rollout.Rollout`)."""
+
+    def __call__(self, state, batch, key):
+        return batch
+
+
+def test_a_rollout_beside_a_pass_count_drawn_per_microbatch_is_refused():
+    """A rollout samples a step's rows and behaviour log-probabilities from the one policy it holds, at the
+    run's cap, while a run drawing its pass count per microbatch trains each microbatch at its own count, so
+    it would train on rows a policy it does not run sampled: such a trainer is refused as it is built, and
+    one at a phase's counts is not (row 8272)."""
+    model = looped(steps=CAP).with_passes(CAP)
+    assert model is not None
+    with pytest.raises(ValueError):
+        phased_trainer(model, 0, None, sampled_passes=TRAINED, rollout=_Drawing())
+    phased_trainer(model, 0, (CAP,), rollout=_Drawing())
+
+
+def test_a_sampled_runs_step_compiled_ahead_holds_every_count(tmp_path):
+    """A run that draws its pass count per microbatch, its step compiled ahead for compile-only GPUs
+    (`compile_ahead`), holds beside its cap's step every other count's at the cap's plan, each its own program
+    (`AheadOfTime.counts`, row 7924), saved and loaded with it; a run handed it takes each count's
+    (`AheadOfTime.at_count`), a count it holds none of refused."""
+    from test_compile_ahead import gpus
+
+    from dew.training import MeshSpec
+    from dew.training.ahead import AheadOfTime, compile_ahead
+
+    trainer = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED,
+                             mesh=MeshSpec().build(gpus("sm90")))
+    ahead = compile_ahead(trainer, {"text": token_draw()})
+    assert sorted(ahead.counts) == list(range(1, CAP))
+    programs = {count: step.program for count, (step, _) in ahead.counts.items()}
+    assert len({ahead.program, *programs.values()}) == CAP
+    ahead.save(tmp_path / "step.dew-aot")
+    loaded = AheadOfTime.load(tmp_path / "step.dew-aot")
+    assert {count: step.program for count, (step, _) in loaded.counts.items()} == programs
+    assert all(loaded.at_count(count).program == program for count, program in programs.items())
+    with pytest.raises(ValueError):
+        loaded.at_count(CAP)

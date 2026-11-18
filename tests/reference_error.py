@@ -93,6 +93,7 @@ from arm_forms import (
     _Windowed,
     _ynn_decided,
     as_given as as_given,
+    as_recorded as as_recorded,
     dew_path as dew_path,
     dew_programs as dew_programs,
     over_windows as over_windows,
@@ -1740,8 +1741,7 @@ def recorded_pilots(reference_fn, draw, count: int):
     @functools.wraps(reference_fn)
     def view(*inputs):
         return reference_fn(*inputs)
-    view.recorded, view.pilots = True, range(SIZING_FROM, SIZING_FROM + count)
-    return view
+    return as_recorded(view, range(SIZING_FROM, SIZING_FROM + count))
 
 
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
@@ -2072,8 +2072,7 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
             return jax.pure_callback(
                 lambda at: {name: np.asarray(value, kept[name].dtype) for name, value in read(at).items()},
                 kept, index, vmap_method="sequential")
-        recorded.recorded = True
-        return recorded
+        return as_recorded(recorded)
 
     return draw, lookup(reference), lookup(truth)
 
@@ -2270,9 +2269,7 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         leaves = {name: _recorded_leaf(evidence, str(dtypes[name]), name, row) for name in mse}
         return _RecordedRounded(leaves, decisions_at(int(index))) if decided else leaves
 
-    reference.recorded = True
-    if pilots:
-        reference.pilots = range(SIZING_FROM, SIZING_FROM + pilots)
+    as_recorded(reference, range(SIZING_FROM, SIZING_FROM + pilots) if pilots else None)
 
     def recorded_sketch(index: int, name: str):
         evidence, _, row = held(index)

@@ -267,15 +267,17 @@ def signature_digest(signature: Hashable) -> str:
 
 
 
-def _custom_step_refusal(step, record: bool, inspection) -> None:
-    """Refuse what a custom step cannot serve (ValueError): records of its Steps, or an inspection of an
-    update it commits."""
-    if record and step is not None:
-        raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
-                         "build them with Step(record=True)")
-    if inspection is not None and step is not None:
-        raise ValueError("a custom step commits no update an inspection reads (Trainer(inspection=...)); "
-                         "summarize its arrays in the step's own report")
+def _custom_step_refusal(step, record: bool, inspection, rollout: Rollout | None,
+                         sampled: SampledPasses | None, layout: Layout) -> None:
+    """Refuse what a custom step cannot serve (records of its Steps, an inspection of its update), and beside
+    per-microbatch pass counts a rollout (sampling at the cap, row 8272) or a host state (row 8400)."""
+    if rollout is not None and sampled is not None:
+        raise ValueError("a rollout samples one policy a step, not sampled_passes' count a microbatch")
+    if sampled is not None and "variables" in layout.host:
+        raise ValueError("sampled_passes runs each count at its cap's plan where the devices hold the state")
+    if step is not None and (record or inspection is not None):
+        raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach, and "
+                         "commits no update an inspection reads: build Step(record=True), report its arrays")
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -377,7 +379,7 @@ class Trainer(Generic[Loss, Effects]):
         self._scaled = dynamic_scale if isinstance(dynamic_scale, bool) else None
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
-        _custom_step_refusal(step, record, inspection)
+        _custom_step_refusal(step, record, inspection, rollout, sampled_passes, layout)
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
@@ -1107,7 +1109,7 @@ class Trainer(Generic[Loss, Effects]):
         with self.phase_passes.scoped(self, self._compiler):
             compiled = self._took(self._compiler.compile(self._stepping(), state, batch, trials))
         assert compiled.step is not None
-        return self._compiler.drawing(self, self._stepping, compiled, state, batch)
+        return self._compiler.drawing(self, self._stepping, compiled, state, batch, self.key)
 
     @ruled
     def _planned_unplaced(self, start: Start, batch: Batch) -> None:
@@ -1333,10 +1335,8 @@ class Trainer(Generic[Loss, Effects]):
             metrics=metrics, preview=preview and self.tracker is not None, best=selection, stop=plateau,
             suites=suites, pause=pause, scored_to=None if scored_to is None else os.fspath(scored_to),
             held_best=restore_best and self.checkpoints is None, restore_best=restore_best, observe=observe,
-            summaries=tuple(summaries), startup=startup,
-            declared=declared, branches=() if cooldowns is None else cooldowns.branches(
-                steps, tokens, self.accumulation, self._shape.examples),
-        )
+            summaries=tuple(summaries), startup=startup, declared=declared, branches=() if cooldowns is None
+            else cooldowns.branches(steps, tokens, self.accumulation, self._shape.examples))
 
     def scheduled(self, updates: int | None) -> None:
         """Build the configured optimizer (an `OptimConfig`) for `updates` updates, as `fit` and
@@ -1473,11 +1473,11 @@ class Trainer(Generic[Loss, Effects]):
         drops a step not finite whole, a scaled one as its scale backs off or one whose optimizer holds
         updates back (`holds_back`, its groups' inner one under DiLoCo), stops at no single such step."""
         from dew.held_updates import holds_back
-
-        held = abstract.opt_state if abstract.inner is None else abstract.inner.opt_state
         saved = current if checkpoints is not None and checkpoints.latest is not None else None
-        return Interval.resumed(run.stop_control, last_saved=saved, kept_paths=leaf_paths(checked(abstract)),
-                                skips_nonfinite=self.skip_nonfinite or self.dynamic_scale or holds_back(held))
+        skip = self.skip_nonfinite or self.dynamic_scale or holds_back((abstract.inner or abstract).opt_state)
+        first = Interval.resumed(run.stop_control, last_saved=saved, kept_paths=leaf_paths(checked(abstract)),
+                                 skips_nonfinite=skip)
+        return self._compiler.counting(first, host=self.host_master)  # its host steps' misses counted in it
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
@@ -1923,9 +1923,8 @@ class Trainer(Generic[Loss, Effects]):
                     examples=self._consumed(interval))
                 run.scored = frozenset(plan.suites if names is None else names)
                 run.other += run.evaluation.elapsed_seconds
-        scores = (
-            {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
-        )
+        evaluated = run.evaluation
+        scores = {} if evaluated is None or evaluated.step != current else dict(evaluated.scores)
         # Before the step's save, so a preemption inside the branch saves this step to run it again; at
         # the run's last step, after its final save (`_wind_down`). The points share one length and
         # decay, so those due together are one branch.
@@ -2320,7 +2319,7 @@ class Trainer(Generic[Loss, Effects]):
             self._unproven = True
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
-        return (*self._compiler.drawn(compiled[signature], self.key, interval, run.current), trials.state)
+        return (*self._compiler.drawn(compiled[signature], interval, run.current), trials.state)
 
     def _saved_checkpoint(
         self,

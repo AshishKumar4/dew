@@ -626,9 +626,12 @@ def _compiled(flow: ModelFlow, named: Mapping[str, tuple[Callable, list]], arm: 
     for kind in flow.kinds:
         name = f"{kind} {arm}"
         with generation.routes() as found[kind]:
-            compiled[kind] = compile_programs({name: named[name]}, target.generation, target.multiprocessors)
+            # Over the node's own topology, tuned as its run's compile would be (row 8422).
+            compiled[kind] = compile_programs({name: named[name]}, target.generation, target.multiprocessors,
+                                              topology=os.environ[TOPOLOGY])
     return AheadPrograms(compiled[flow.kinds[0]].target, {
-        name: program for each in compiled.values() for name, program in each.programs.items()}), found
+        name: program for each in compiled.values() for name, program in each.programs.items()},
+        tuned=all(each.tuned for each in compiled.values())), found
 
 
 def prepare(flow: ModelFlow) -> bool:
