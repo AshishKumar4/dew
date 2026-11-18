@@ -4,6 +4,8 @@ ends, so the task's next attempt, recalled while it ran, sets them aside and goe
 (tools/armada/ci.py `resumed`, armada's ARMADA_RESUME). Loaded by a CI task's pytest beside executed.py;
 writes nothing outside a task."""
 
+import functools
+import importlib.util
 import json
 import os
 from collections.abc import Callable
@@ -75,10 +77,19 @@ def task_peak() -> int | None:
     four ranks peaked at 7.17 GiB, packed beside another on a medium), read by Dew's one cgroup reader
     (src/dew/data/cgroups.py through host.py, its root DEW_CGROUP_ROOT's where set). None where the task's
     cgroup states no peak."""
-    import host
+    reader = _host().cgroups()
+    return reader.memory_peak(reader.own(_host().cgroup_root()))
 
-    reader = host.cgroups()
-    return reader.memory_peak(reader.own(host.cgroup_root()))
+
+@functools.cache
+def _host():
+    """host.py beside this plugin, loaded once by its path, as ci.py loads its neighbours: this module runs in
+    a task's pytest and inside ci.py alike, and neither puts tools/armada on sys.path."""
+    spec = importlib.util.spec_from_file_location("armada_host", Path(__file__).with_name("host.py"))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def resumed(tests: list[str], owning: Callable[[str], str]) -> tuple[dict[str, float], set[str], int | None]:

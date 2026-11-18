@@ -617,7 +617,7 @@ def moved_peak(held: int | None, measured: int) -> int:
     test's tasks (`heavy_files`); else the recorded one, unchanged."""
     if held is None or (held > LARGE_FROM) != (measured > LARGE_FROM):
         return measured
-    return measured if abs(measured - held) > PEAK_MOVES * held else held
+    return held if held * (1 - PEAK_MOVES) <= measured <= held * (1 + PEAK_MOVES) else measured
 
 
 def heavy_files(path: Path = DURATIONS) -> set[str]:
