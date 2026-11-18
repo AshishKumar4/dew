@@ -1297,11 +1297,11 @@ class Transaction:
         """Commit the window when it is due, then advance the state's clocks.
 
         A rejected attempt costs the same trace as an accepted one. With a
-        dynamic scaler an attempt is admitted only when every value it
-        produced is finite, the committed parameters and optimizer state
-        included; a rejected attempt returns `state` with its window dropped
-        (`dropped_window`), its parameters, optimizer state and EMA untouched,
-        and the scaler moved.
+        dynamic scaler an attempt is admitted on its loss and gradient finite alone, as GradScaler's
+        `found_inf` (row 6748), its committed state's finiteness reported after (`unfinite_state`); one
+        whose optimizer holds updates back on its whole new state finite. A rejected attempt returns `state`
+        with its window dropped (`dropped_window`), its parameters, optimizer state and EMA untouched, and
+        the scaler moved.
 
         A window of one microbatch commits on every step it can, by elementwise selects; a longer window
         under `lax.cond`, which skips the optimizer on the microbatches that do not close it. A GPU
