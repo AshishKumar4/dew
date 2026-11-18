@@ -549,7 +549,9 @@ class TrainerConfig:
         run (which `fit` resolves) or None as given."""
         if value is None or isinstance(value, int) or is_share(value):
             return value
-        passed = dataset.pass_examples if dataset.epochs is not None else None
+        # A pass of a read with no record count, as a run of its epochs or one counting its passes reads it
+        # (`dew.data.compile`'s `count_passes`).
+        passed = dataset.pass_examples
         if value == PASSES and dataset.steps_per_epoch is None and not passed:
             _log.info("%s passes: the run counts none of its data's passes (no record count, and no "
                       "--trainer.epochs over source examples), so it runs at the run's end (%s)", option,
