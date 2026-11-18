@@ -61,6 +61,9 @@ def markers(encoded: Encoded) -> list[int]:
 
 FIXTURE = TINY / "seeds.npz"
 LAYA_SEEDS = 64
+SLIP_SEEDS = 16
+"""The seeds the rule's negative proof draws: a slip needs only the seeds that decide it, and fewer than that
+raise Inconclusive, which the proof refuses; 8 decide it on armada (row 6429), 16 hold it with room."""
 """The declared seeds, sized by `seeds_for` paired as the recording confirmed them
 (tools/venv_reference.py's `laya` site, tools/laya_worker.py)."""
 OUTPUTS = ("sequential", "parallel")
@@ -144,12 +147,12 @@ def test_the_rule_catches_a_head_that_ignores_the_question_type():
     """The type embedding is the only place a choice and a noul differ in
     the head; dropping it moves the logits past the rule: check 1 decides
     against it, the truth the typed head's own float64 run."""
-    drawn, reference, truth = indexed_recording(recording(FIXTURE), "laya", LAYA_SEEDS, inputs_of=draw,
+    drawn, reference, truth = indexed_recording(recording(FIXTURE), "laya", SLIP_SEEDS, inputs_of=draw,
                                                 truth_fn=jax.jit(lambda inputs: dew(jnp.float64, inputs)))
     untyped = jax.jit(lambda inputs: dew(jnp.float32, inputs, typed=False))
     with pytest.raises(GateFailure) as failed:
         assert_as_exact(as_given(lambda index, inputs: untyped(inputs)), reference, drawn,
-                        "logits without the question type", seeds=LAYA_SEEDS, truth_fn=truth)
+                        "logits without the question type", seeds=SLIP_SEEDS, truth_fn=truth)
     assert not isinstance(failed.value, Inconclusive)
 
 
