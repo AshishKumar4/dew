@@ -198,6 +198,24 @@ the phase it stands in, the steps it has read, the phases it finished and how, a
 reader's position (`position`, base64), which is what a process count reads."""
 
 
+def saved_plan(position: bytes) -> Mapping[str, object] | None:
+    """The data plan's record a reader's `position` holds (`dew.data.plan.Plan.record`): a global position's,
+    a per-share one's or a replicated one's (`PLAN`); None where it holds none."""
+    place = decode(position)
+    if place is not None:
+        return place.plan
+    try:
+        held = json.loads(position)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    match held:
+        case {"dew_data_plan": Mapping() as plan}:
+            return plan
+        case {"dew_replicated_position": {"dew_data_plan": Mapping() as plan}}:
+            return plan
+    return None
+
+
 def phase_position(position: bytes) -> bytes | None:
     """The position of the phase's own reader inside a read of phases' `position` (`STEP_PHASES`), or None
     for any other kind."""
