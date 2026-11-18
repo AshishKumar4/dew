@@ -137,7 +137,8 @@ def kind_of(row: dict, ops: dict[str, HloInstruction] | None = None) -> str:
     if op == "custom-call":
         if not target and name.startswith("pallas_call"):
             return "pallas"
-        return CALL_KINDS.get(custom_call_kind(target), "custom-call")
+        call = custom_call_kind(target)
+        return "custom-call" if call is None else CALL_KINDS.get(call, "custom-call")
     for kind, members in FUSED_KINDS:
         if (fused if op == "fusion" else {op}) & members:
             return kind
@@ -413,7 +414,7 @@ def dump_files(hlo: Path, module: str, program: str | None = None) -> Iterator[d
     with contextlib.ExitStack() as stack:
         if hlo.is_file():
             archive = stack.enter_context(tarfile.open(hlo))
-            found = [(key, member) for member in archive.getmembers()
+            found = [(key, (archive, member)) for member in archive.getmembers()
                      if member.isfile() and (key := wanted(member.name))]
         else:
             found = [(key, path) for path in hlo.rglob(f"module_*.{module}.*after_optimizations*.txt")
@@ -433,8 +434,12 @@ def dump_files(hlo: Path, module: str, program: str | None = None) -> Iterator[d
             if isinstance(source, Path):
                 files[suffix] = source
                 continue
+            archived, member = source
+            reader = archived.extractfile(member)
+            if reader is None:
+                raise SystemExit(f"{member.name} in {hlo} holds no file's contents")
             target = directory / f"module{suffix}"
-            with archive.extractfile(source) as reader, target.open("wb") as writer:
+            with reader, target.open("wb") as writer:
                 shutil.copyfileobj(reader, writer)
             files[suffix] = target
         yield files
