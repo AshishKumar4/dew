@@ -2101,22 +2101,28 @@ def test_a_step_compiled_ahead_is_admitted_at_the_loading_runs_pool_share_not_th
     """A prepare whose own process holds a sliver of its GPU (a job packed beside others, its pool's
     fraction 0.08) admits the run it compiles for at the share that run holds (`AheadTarget.share`): Dew's
     own by default, the run's named one where it names another. It admitted an 80 GiB GPU's step against
-    6.78 GiB, its own share of its own GPU, and refused a state that fits the run (row 7644)."""
+    6.78 GiB, its own share of its own GPU, and refused a state that fits the run (row 7644). Targets of two
+    shares made in one process each keep their own, built before either is read, and so does a direct
+    `compile_only_gpus` (the library's path), where the last target's share was every alike GPU's and a
+    direct one took the process's (train 1026's review, F1)."""
     from dew._devices import DEW_SHARE, FRACTIONS, device_memory
-    from dew.training.ahead import AheadTarget
+    from dew.training.ahead import AheadTarget, compile_only_gpus
 
     for name in FRACTIONS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(FRACTIONS[1], "0.08")
     memory = 80 * 2**30
-    for target, share in ((AheadTarget("sm90", 2, capacity_gib=80), DEW_SHARE),
-                          (AheadTarget("sm90", 2, capacity_gib=80, share=0.5), 0.5)):
-        limits = {device_memory(device)["bytes_limit"] for device in target.compile_only()}
-        assert limits == {int(memory * share)}
+    made = [(target.compile_only(), share) for target, share in (
+        (AheadTarget("sm90", 2, capacity_gib=80), DEW_SHARE),
+        (AheadTarget("sm90", 2, capacity_gib=80, share=0.5), 0.5))]
+    made.append((compile_only_gpus("sm90", 2, memory), DEW_SHARE))
+    for devices, share in made:
+        assert {device_memory(device)["bytes_limit"] for device in devices} == {int(memory * share)}
     with pytest.raises(ValueError):
         AheadTarget("sm90", 2, capacity_gib=80, share=1.5)
 
 
+@COMPILES_ON_CPU
 def test_a_program_compiled_for_a_compile_only_gpu_is_refused_by_the_keeper_not_crashed_on():
     """A program a process compiles at Dew's compile point for a compile-only GPU (`gpus`), as a GPU cell's
     prepare does on its host's CPU, is no program of the process's default backend: the keeper
