@@ -372,3 +372,18 @@ def test_a_cold_run_is_kept_as_its_tests_cold_times_and_every_cut_weighs_them(ci
     # group.
     cells = [ci.session.cost([1.0, 60.0])] * 14
     assert max(ci.cuts.split(ci.session, cells, sum(cells), 240.0, cut=1)) <= 240.0
+
+
+def test_a_file_armada_has_not_timed_weighs_no_less_than_its_tests_recorded_costs(ci, tmp_path):
+    """Scaled by how armada ran the files it timed, a file it has not is never weighed below its own tests'
+    recorded costs: here a timed file ran in a tenth of its tests' cold costs, as a warm run does, and the
+    other, ten tests of 100 s cold, still weighs their 1,000 s, not 100 s that would pack it whole at a 240 s
+    target (row 7939's review)."""
+    for name in ("test_timed", "test_untimed"):
+        (tmp_path / "tests" / f"{name}.py").write_text("def test_cell(): pass\n")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/{name}.py::test_cell[{n}]": [1.0, 100.0] for name in ("test_timed", "test_untimed")
+         for n in range(10)}))
+    timings = {"files": {"3.12:tests/test_timed.py": 100.0}}
+    assert ci.weights(["tests/test_timed.py", "tests/test_untimed.py"], timings) == {
+        "tests/test_timed.py": 1000.0, "tests/test_untimed.py": 1000.0}

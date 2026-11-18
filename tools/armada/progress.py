@@ -9,7 +9,8 @@ import os
 from pathlib import Path
 
 PROGRESS = "progress.jsonl"
-"""The file of the tests a task passed, a JSON line each: its node id and its call's seconds."""
+"""The file of the tests a task passed, a JSON line each: its node id, its call's seconds and, where it
+compiled a program the shared cache lacked (tests/conftest.py's property `compiled`), `cold`."""
 SET_ASIDE = "DEW_SET_ASIDE"
 """What names the JSON list of the node ids a resumed attempt sets aside (ci.py's `tested`): exactly those,
 never a test whose id one of them begins, as pytest's --deselect, which matches by prefix, would (train
@@ -53,6 +54,8 @@ def pytest_runtest_logreport(report) -> None:
     elif report.when == "teardown" and report.nodeid in _called:
         seconds = _called.pop(report.nodeid)
         if report.passed:
+            cold = any(name == "compiled" and int(value) > 0 for name, value in report.user_properties)
             Path(artifacts).mkdir(parents=True, exist_ok=True)
             with (Path(artifacts) / PROGRESS).open("a") as progress:
-                progress.write(json.dumps({"node": report.nodeid, "seconds": seconds}) + "\n")
+                progress.write(json.dumps({"node": report.nodeid, "seconds": seconds,
+                                           **({"cold": True} if cold else {})}) + "\n")

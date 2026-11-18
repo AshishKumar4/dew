@@ -220,8 +220,9 @@ class RemoteCache:
 
     def mark(self) -> tuple[str | None, int]:
         """Where the current bundle's compiled programs stand now (`compiled_since`), read through the watch
-        its account already keeps (`_moved_on`)."""
-        if not self.available:
+        its account already keeps (`_moved_on`): the local watch's, which a remote given up keeps, so a
+        test that compiled while the Worker was unreachable is still timed cold."""
+        if not self.writes.watching:
             return None, 0
         with self.state:
             self._moved_on()
@@ -231,7 +232,7 @@ class RemoteCache:
         """The programs compiled since `mark` (`mark`) under the same bundle: a program the shared cache did
         not hold, so the test that ran meanwhile ran cold; None where it is not known (no shared cache,
         the bundle moved on, the watch lost events)."""
-        if not self.available or mark[0] is None:
+        if not self.writes.watching or mark[0] is None:
             return None
         with self.state:
             self._moved_on()
@@ -240,8 +241,9 @@ class RemoteCache:
             return len(self.written.get(mark[0], [])) - mark[1]
 
     def opened(self, file: str) -> None:
-        """Bundle `file` in the local cache, and the programs compiled from here on its."""
-        if not self.available:
+        """Bundle `file` in the local cache, and the programs compiled from here on its: its account kept
+        while the directory is watched, its programs fetched while the remote is available."""
+        if not self.writes.watching:
             return
         try:
             with self.state:
@@ -255,7 +257,7 @@ class RemoteCache:
                 # A bundle written back and now running again (A, B, A) counts what it opens from here on: the
                 # opens since its close, its own reads among them, went to it while sealed (review).
                 self.sealed.discard(file)
-                if file in self.held:
+                if file in self.held or not self.available:
                     return
                 self.held[file] = set()
             # What a prepare fetched into the directory ahead for it (`prefetch`), its values there already,

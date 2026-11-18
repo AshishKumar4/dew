@@ -800,8 +800,9 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
     takes. base/kernels' route census, 1,576 tests recorded at 2,654 s in a
     file main ran in 6 s, was packed by that median with six other files into
     one task, which ran past its deadline (train 18). Else the recorded sum, scaled by
-    how much slower armada ran the files measured both ways; else None, for a
-    file nothing has timed."""
+    how much slower armada ran the files measured both ways, and never below it, a floor as
+    a measured file's is (a test's cold time outweighs a warm run's measure); else None,
+    for a file nothing has timed."""
     recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
     # A file armada holds no timing of weighs its rows' sum at the cut they name (`measured_cut`), which is
     # what its timing would say: armada keeps a plan's rows from run to run, and drops the file timings a run
@@ -816,7 +817,7 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
                     if name in measured and recorded.get(name, 0) > 1)
     slower = ratios[len(ratios) // 2] if ratios else 1.0
     return {name: max(measured[name], recorded.get(name, 0.0)) if name in measured
-            else recorded[name] * slower if name in recorded else None for name in files}
+            else recorded[name] * max(slower, 1.0) if name in recorded else None for name in files}
 
 
 def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | None:
@@ -1649,7 +1650,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # does a run that records none (a prepare's: a test it prepared has not passed, and a test an earlier
     # attempt passed still prepares into this one's store).
     resumes = recorded and site is None and coverage is None
-    done_before = resumed(tests) if resumes else {}
+    done_before, cold_before = resumed(tests) if resumes else ({}, set())
     aside = out.with_name(f"{out.name}.set-aside.json")
     aside.write_text(json.dumps(sorted(done_before)))
     command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if resumes else [])]
@@ -1708,7 +1709,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                **{grading.node_of(case): float(case.get("time") or 0) for case in own}},
                      # The tests that compiled a program the shared cache lacked (`compiled_cold`): their
                      # seconds are a cold run's, which the durations record keeps apart (`folded_entries`).
-                     **({"cold": cold} if (cold := compiled_cold(own)) else {}),
+                     # An earlier attempt's among them (`resumed`).
+                     **({"cold": cold} if (cold := sorted(set(compiled_cold(own)) | {
+                         node for node in cold_before if grading.holds(name, node)})) else {}),
                      "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
                      # A judge's, beside its pooling, what its map tasks' records say they paid
                      # (`site_costs`).
@@ -1726,28 +1729,31 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     return 0
 
 
-def resumed(tests: list[str]) -> dict[str, float]:
+def resumed(tests: list[str]) -> tuple[dict[str, float], set[str]]:
     """The tests of `tests` an earlier attempt of this task passed before the fleet recalled it (armada keeps
     a recalled attempt's artifacts and hands them to the next as ARMADA_RESUME, #4544), each with its seconds,
-    as tools/armada/progress.py kept them; copied into this attempt's progress, so a second recall keeps them
-    too. None outside a resumed task."""
+    as tools/armada/progress.py kept them, and those of them that ran cold (`compiled_cold`); copied into
+    this attempt's progress, so a second recall keeps them too. None outside a resumed task."""
     kept = Path(os.environ.get("ARMADA_RESUME", "/nonexistent")) / progress.PROGRESS
     if not kept.is_file():
-        return {}
-    passed = {}
+        return {}, set()
+    passed, cold = {}, set()
     for line in kept.read_text().splitlines():
         found = json.loads(line)
         if grading.owning(found["node"]) in tests:
             passed[found["node"]] = float(found["seconds"])
+            if found.get("cold"):
+                cold.add(found["node"])
     artifacts = os.environ.get("ARMADA_ARTIFACTS")
     if artifacts and passed:
         Path(artifacts).mkdir(parents=True, exist_ok=True)
         with (Path(artifacts) / progress.PROGRESS).open("a") as carried:
-            carried.writelines(json.dumps({"node": node, "seconds": seconds}) + "\n"
-                               for node, seconds in passed.items())
+            carried.writelines(
+                json.dumps({"node": node, "seconds": seconds, **({"cold": True} if node in cold else {})}) + "\n"
+                for node, seconds in passed.items())
     if passed:
         print(f"resumed: {len(passed)} tests an earlier attempt passed set aside", flush=True)
-    return passed
+    return passed, cold
 
 
 def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:

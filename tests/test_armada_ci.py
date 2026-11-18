@@ -769,7 +769,10 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     # The next, recalled after its first test: that one set aside, the one its name begins run, both in
     # its row.
     (tmp_path / "resume").mkdir()
-    (tmp_path / "resume" / "progress.jsonl").write_text(progress.read_text().splitlines()[0] + "\n")
+    # The test it passed had compiled a program the shared cache lacked: its row still times it cold, and the
+    # progress carried on says so for a later recall (row 7939's review).
+    first = {**json.loads(progress.read_text().splitlines()[0]), "cold": True}
+    (tmp_path / "resume" / "progress.jsonl").write_text(json.dumps(first) + "\n")
     progress.unlink()
     (tmp_path / "ran").unlink()
     monkeypatch.setenv("ARMADA_RESUME", str(tmp_path / "resume"))
@@ -778,7 +781,9 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     assert row["exitCode"] == 0, row["output"]
     assert (tmp_path / "ran").read_text() == "again "
     assert set(row["tests"]) == {f"tests/test_resumed.py::test_first{end}" for end in ("", "_again")}
-    assert [json.loads(line)["node"] for line in progress.read_text().splitlines()] == kept
+    assert row["cold"] == ["tests/test_resumed.py::test_first"]
+    carried = [json.loads(line) for line in progress.read_text().splitlines()]
+    assert [line["node"] for line in carried] == kept and carried[0]["cold"] and "cold" not in carried[1]
     assert stored == {}
     # A split group resumed sets its tests aside after split.py cuts its file, as every group's container
     # cuts it whole: a cut of the rest alone would run another group's tests and none of some (train 674's
