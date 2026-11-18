@@ -1224,6 +1224,44 @@ def test_a_distillations_streamed_price_reads_its_teachers_banks():
     assert distilled > alone, links
 
 
+def test_a_streamed_step_on_gpus_is_priced_over_the_hosts_cpu_companion():
+    """The streamed step of a bf16 decoder on GPUs (one compile-only H100) is admitted over this host's CPUs
+    as its companion (`streaming.streamed`): the companion read outside the GPUs' mesh, whose trace no CPU
+    program may run in (M-MC-24b: a GH200's fit refused there)."""
+    from dew.distributed.batches import placed_abstract
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.training import streaming
+
+    trainer = streaming_decoder(dtype=jnp.bfloat16)
+    trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus("sm90", 1, 80 * 2 ** 30)))
+    trainer._laid_out(Layout(host=streaming.STREAMED))
+    start = trainer._started("never")
+    rows = placed_abstract(trainer.device_mesh, {"text": np.zeros((1, 8), np.int32)})
+    fits, _ = streaming.streamed(trainer, start, rows, jnp.bfloat16, ())
+    assert fits
+
+
+def test_a_lora_run_with_a_frozen_base_is_priced_streamed():
+    """A fresh bf16 LoRA run, its adapted weights' base frozen (the run's frozen collection), is priced
+    streamed, no longer refused: its frozen base's banks are read once a forward, its other leaves resident
+    (`streaming.streamed`)."""
+    from dew.lora import LoRA
+    from dew.training.ahead import stand_in_gpus
+
+    base = decoder(dtype=jnp.bfloat16)
+    variables = nn.unbox(base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(base, variables, key=1)
+    objective = LMObjective(adapter.model, 8, head_chunks=1, ema_decay=None,
+                            variables=jax.tree.map(np.asarray, adapter.variables))
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5))
+    rows = [{"text": np.arange(row, row + 9, dtype=np.int32) % 16} for row in range(16)]
+    data = Memory(rows).repeat().batch(jax.device_count()).read("memory").loading(Loading(workers=0))
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
+        trainer.fit(data, steps=1, log_every=100)
+    choice = trainer.layout_choice
+    assert choice.refused is None and choice.streamed is not None and choice.streamed.link > 0, choice
+
+
 def test_a_part_stating_no_host_link_prices_no_streamed_step():
     """A fresh fit on a part whose table states no host link (a TPU's, `GpuTarget.host_links`) keeps its
     devices' layout, the streamed step refused by name in the choice it keeps."""
