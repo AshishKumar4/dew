@@ -36,7 +36,7 @@ from dew.nn.precision import (
 from dew.telemetry.instrumentation import hlo_instructions
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
-SEEDS = {"auto": 8, "local auto": 8}
+SEEDS = {"auto": 8, "local auto": 8, "default": 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (paired, on armada): the most any
 of a site's cases took."""
 
@@ -154,15 +154,22 @@ def test_local_attention_under_auto_computes_the_precision_it_is_asked_for(span)
                     truth_fn=call("reference"))
 
 
-@pytest.mark.parametrize("precision", [None, jax.lax.Precision.DEFAULT, "default"])
-def test_fused_attention_default_precision_matches_the_attention_equation(precision):
-    query, key, value = jax.random.normal(
-        jax.random.key(0), (3, *BF16_QKV), dtype=jnp.float32)
-    scores = jnp.einsum("bqhd,bkhd->bhqk", query, key) / jnp.sqrt(query.shape[-1])
-    expected = jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(scores, axis=-1), value)
-    actual = scaled_dot_product_attention(
-        query, key, value, precision=precision, implementation="xla")
-    assert jnp.max(jnp.abs(actual - expected)) < 1e-5
+def test_fused_attention_default_precision_matches_the_attention_equation():
+    """XLA's attention at the default precision on par with the attention equation, the reference path run
+    in float64 its truth (check 1); `Precision.DEFAULT` and "default" spell that default alike, each the same
+    program as no precision given, bit for bit on one draw."""
+    draw = qkv_draws(jnp.float32)
+
+    def attended(precision):
+        return jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, precision=precision,
+                                                                    implementation="xla"))
+
+    assert_as_exact(attended(None), jax.jit(reference_attention), draw, "xla at the default precision",
+                    seeds=SEEDS["default"], truth_fn=reference_attention)
+    operands = draw(0)
+    for alias in (jax.lax.Precision.DEFAULT, "default"):
+        np.testing.assert_array_equal(np.asarray(attended(alias)(*operands)),
+                                      np.asarray(attended(None)(*operands)))
 
 
 @pytest.mark.parametrize("helper", ["rounded_operand", "rounded_to"])
