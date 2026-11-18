@@ -16,6 +16,7 @@ What the route serves is read from the product's own selector: the product trace
 case's generation with the packed kernel named, the route its choice reports the packed kernel.
 """
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -84,8 +85,7 @@ def _truth(values: np.ndarray):
 
 
 @cell("nvfp4", covers=lambda case: dict(zip(AXES["nvfp4"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def an_nvfp4_products_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The NVFP4 product's training step of `case` on its GPU with its matrix decoded in the mainloop on par

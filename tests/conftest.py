@@ -171,7 +171,9 @@ def pytest_runtest_makereport(item, call):
     # it unprepared, compiling its sites on its GPU as a test outside a part does, every site judged; in one
     # that prepared any site, a site its prepare did not reach runs unprepared too (`truths_ahead.running`),
     # and one prepared at another commit or for other shapes is a red (`truths_ahead.MissingTruth`).
-    if (call.when == "call" and call.excinfo is not None and tier_wire.preparing()
+    # A test its prepare skipped (a cell no GPU of the node runs) computed nothing: its run skips it too.
+    if (call.when == "call" and call.excinfo is not None
+            and not call.excinfo.errisinstance(pytest.skip.Exception) and tier_wire.preparing()
             and (store := _sites_store(item)) is not None and not any(store.glob("*/site.json"))):
         from truths_ahead import UNPREPARED, unprepared
 

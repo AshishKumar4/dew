@@ -18,6 +18,7 @@ kernel named `pallas`, a call the kernel's requirements refuse (a norm wider tha
 `selection.KernelRefused`, and the route the selector reports the Pallas kernel's.
 """
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -183,8 +184,7 @@ CASES = (
 
 
 @cell("norm_swiglu", covers=lambda case: dict(zip(AXES["norm_swiglu"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_fused_entrys_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The fused kernel's training step of `case` on its GPU on par with its entry's XLA arithmetic (check
