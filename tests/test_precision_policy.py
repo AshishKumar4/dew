@@ -1096,7 +1096,6 @@ ALIGNED_CASES = {
     "in range though its terms are not": ([(1 + 2.0 ** -20, 2.0 ** 70, 2.0 ** 70),
                                            (-1.0, 2.0 ** 70, 2.0 ** 70)], 2.0 ** 120),
     "past the largest": ([(1.0, 2.0 ** 70, 2.0 ** 70), (1.0, 2.0 ** 70, 2.0 ** 70)], float("inf")),
-    "into the subnormals": ([(1.0, 2.0 ** -70, 2.0 ** -70), (1.0, 2.0 ** -70, 2.0 ** -70)], 2.0 ** -139),
 }
 """`aligned_sum`'s cases: three-factor terms whose products leave fp32's range, and their sum, exact in any
 order of summing (two terms, their sum a float32)."""
@@ -1104,9 +1103,9 @@ order of summing (two terms, their sum a float32)."""
 
 @pytest.mark.parametrize("case", list(ALIGNED_CASES))
 def test_an_aligned_sum_is_exact_where_its_terms_leave_fp32s_range(case):
-    """`aligned_sum` of fp32 terms each past fp32's range where their sum is in it, past it, or below the
-    least normal: exactly the sum, as a float32 holds it. Summed as formed, two terms of +-2^140 were inf -
-    inf, NaN (base review ead11c83a F1)."""
+    """`aligned_sum` of fp32 terms each past fp32's range where their sum is in it or past it: exactly the
+    sum, as a float32 holds it (a subnormal sum is no case: XLA:CPU flushes subnormals to zero). Summed as
+    formed, two terms of +-2^140 were inf - inf, NaN (base review ead11c83a F1)."""
     terms, total = ALIGNED_CASES[case]
     found = aligned_sum([tuple(jnp.float32(factor) for factor in term) for term in terms])
     assert float(found) == total
