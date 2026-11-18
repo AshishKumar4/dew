@@ -542,10 +542,10 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
             _ahead(programs, held, label, truth, terms_fn, terms=terms, wide=wide)
         store.compile_site(label, programs, held)
     # A qualification run sizes a plain site first (`_qualified`), on its sizing draws through its arms.
-    sized = bool(os.environ.get(QUALIFY)) and not (also or terms)
+    sizing = _sizing_seeds(reference_fn) if os.environ.get(QUALIFY) and not (also or terms) else range(0)
     _compile_arms(store, {"dew": (dew_fn, False), "reference": (reference_fn, True),
                           **{f"further {name}": (fn, True) for name, fn in also.items()}},
-                  draw, label, seeds=seeds, orders=orders, sized=sized)
+                  draw, label, seeds=seeds, orders=orders, sizing=sizing)
 
 
 def armed(label: str) -> str:
@@ -565,15 +565,14 @@ def _arm_compile(plain: bool) -> Callable:
 
 
 def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool]], draw, label: str, *,
-                  seeds: int, orders, sized: bool = False) -> None:
+                  seeds: int, orders, sizing: range = range(0)) -> None:
     """A site's `arms` (each a role's function and whether it is a reference, unrewritten) compiled ahead into
-    `store` at the shapes of every draw of its stages and each of its `orders`, and where a qualification run
-    sizes the site (`sized`, `_qualified`), of every sizing draw its sizing may take (`SIZING_FROM` on, as
-    many as `seeds_for` draws at `MOST_SEEDS`), each traced as its run traces it, for the store's devices
-    (`CompiledTruths.tracing`, in the arithmetic arms run in, `summed_as_run`), and compiled as the gate
-    compiles it (`_arm_compile`): its run calls each draw's executable (`_ahead_arm`), tracing, lowering and
-    compiling none, its sizing too. An arm the gate runs as given, or one running Dew's own programs
-    (`dew_programs`, a host loop), holds no program."""
+    `store` at the shapes of every draw of its stages and each of its `orders`, and of every seed of `sizing`
+    where a qualification run sizes the site (`_qualified`, `_sizing_seeds`), each traced as its run traces
+    it, for the store's devices (`CompiledTruths.tracing`, in the arithmetic arms run in, `summed_as_run`),
+    and compiled as the gate compiles it (`_arm_compile`): its run calls each draw's executable
+    (`_ahead_arm`), tracing, lowering and compiling none, its sizing too. An arm the gate runs as given, or
+    one running Dew's own programs (`dew_programs`, a host loop), holds no program."""
     # Each arm named as each process first finds it, before any call of it here (`_arm_role`); one no
     # statement holds runs unprepared in its run.
     named_arms = {role: (named_role, fn, reference) for role, (fn, reference) in arms.items()
@@ -584,7 +583,6 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
         # prepare computes nothing on its host (bible §8), and its trace refuses an arm that cannot trace.
         _refuse_numpy_arms(draw, *(fn for _, fn, _ in named_arms.values()))
     inputs: dict[str, tuple] = {}
-    sizing = range(SIZING_FROM, SIZING_FROM + 2 * MOST_SEEDS) if sized else range(0)
     for seed in itertools.chain(range(staged_units(seeds)), sizing):
         drawn = drawn_on_the_host(draw, seed)
         for ordered in (drawn,) if orders is None else orders(drawn):
@@ -683,6 +681,36 @@ def _mutable_known(value, known: dict[int, Any], walking: set[int]) -> None:
         return
     for part in parts:
         _mutable_known(part, known, walking)
+
+
+def _paired_most(reference_fn, most: int = MOST_SEEDS) -> int | None:
+    """The most seeds a paired sizing of `reference_fn` takes (`seeds_for`'s, its draws from SIZING_FROM to
+    twice it, `parity._sized_count`): `most`, a recording's pilots' half where it holds fewer; None for a
+    recording without pilots, which no sizing takes (`_qualified`), its count its recording's."""
+    if not getattr(reference_fn, "recorded", False):
+        return most
+    pilots = getattr(reference_fn, "pilots", None)
+    return None if pilots is None else min(most, len(pilots) // 2)
+
+
+def _sizing_seeds(reference_fn) -> range:
+    """The seeds a qualification run's paired sizing of a site may draw (`_qualified`, `seeds_for`), none
+    where it takes none (`_paired_most`)."""
+    most = _paired_most(reference_fn)
+    return range(0) if most is None else range(SIZING_FROM, SIZING_FROM + 2 * most)
+
+
+def _host_truth(fn, device):
+    """A truth (a truth function or a reference, `_truth_program`'s) placed on `device` (a GPU run's sizing's,
+    the host's): a plain or jitted function its program there (`Truth`), a window loop's its own placed,
+    one already placed, run as given, or running Dew's own programs as it is."""
+    if isinstance(fn, _Windowed):
+        return _Windowed(_host_truth(fn.fn, device))
+    if isinstance(fn, Truth):
+        return fn if fn.device is not None else Truth(fn.fn, device)
+    if fn is None or _given(fn) or getattr(fn, "dew_programs", False):
+        return fn
+    return Truth(fn, device)
 
 
 def _stored_arms(store: CompiledTruths, label: str, dew_fn, reference_fn, also: Mapping, compiled: tuple):
@@ -1520,24 +1548,28 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
 
     record = {"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0], "label": label,
               "declared": seeds}
-    recorded = getattr(reference_fn, "recorded", False) and getattr(reference_fn, "pilots", None) is None
+    recorded = _paired_most(reference_fn) is None
     if not plain or recorded:
         record["unsized"] = "its verdict is not the plain pair's" if not plain else "a recording's count"
     else:
         # Its sizing draws' truths its own, never the store's programs', computed on the host under one (a GPU
         # run's): the GPU's memory is the arms'.
         store = COMPILED.get()
-        # Its sizing draws' truths the host's (a truth function's, else its reference's widened, the original
-        # reference's, never the stored arm's: the store holds no float64 program of it).
-        truthful = truth_fn if truth_fn is not None else reference_fn
-        program = _truth_program(truthful)
-        if store is not None and isinstance(program, Truth) and program.device is None:
-            truth_fn = Truth(program.fn, jax.local_devices(backend="cpu")[0])
-        # Its arms the programs its prepare compiled at the sizing draws' shapes too (`_compile_arms`'s
-        # `sized`), never compiled here.
-        arms = (None if store is None
-                else _stored_arms(store, label, dew_fn, reference_fn, {},
-                                  _arms_with(dew_fn, reference_fn, [], label))[:2])
+        arms = None
+        if store is not None:
+            # Its sizing draws' truths the host's: a truth function's, else its reference's widened, the
+            # original reference's, never the stored arm's, which holds no float64 program.
+            truth_fn = _host_truth(truth_fn if truth_fn is not None else reference_fn,
+                                   jax.local_devices(backend="cpu")[0])
+            if store.holds(label):
+                # Its arms the programs its prepare compiled at the sizing draws' shapes too
+                # (`_compile_arms`'s `sizing`), never compiled here.
+                arms = _stored_arms(store, label, dew_fn, reference_fn, {},
+                                    _arms_with(dew_fn, reference_fn, [], label))[:2]
+            else:
+                # A site its prepare did not reach sizes and runs unprepared, recorded before its sizing
+                # compiles (a sizing that fails reaches no verdict to record it, `truths_ahead.running`).
+                store.unprepared(f"{label}: its prepare did not reach this site")
         token = COMPILED.set(None)
         try:
             record["sized"] = seeds_for(reference_fn, draw, label, truth_fn=truth_fn, dew_fn=dew_fn,
@@ -1742,12 +1774,12 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     if COMPILED.get() is not None:
         raise ValueError(f"{label}: a sizing draws seeds past a prepared site's, whose truths' programs no "
                          "prepare compiled")
-    if dew_fn is not None and getattr(reference_fn, "recorded", False):
-        pilots = getattr(reference_fn, "pilots", None)
-        if pilots is None:
+    if dew_fn is not None:
+        held = _paired_most(reference_fn, most)
+        if held is None:
             raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
                              f"sizing's from SIZING_FROM; its site keeps its recorded count")
-        most = min(most, len(pilots) // 2)
+        most = held
     paired = dew_fn is not None
     if arms is None:
         _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
