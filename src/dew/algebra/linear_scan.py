@@ -229,9 +229,9 @@ class Parts:
     """A token's update and readout as the affine map the rules reach (`parts`): the decay `exp(exponent)`
     (`exp2` where `base2`), a scalar's or each key's (`per_key`), on the state; the input `left right^T`;
     the corrections' sum `left (correction^T (D h))^T`, None where none corrects; the readout
-    `reader^T h + free`, or where `values_read` `h reader + free` (the state read along its values, Oja's
-    rule on its transposed state). Each a term free of the state over the traced programs' values `atoms`
-    (each its program and its atom, at `Token.value`'s place)."""
+    `reader_scale reader^T h + free`, or where `values_read` `reader_scale h reader + free` (the state read
+    along its values, Oja's rule on its transposed state). Each a term free of the state over the traced
+    programs' values `atoms` (each its program and its atom, at `Token.value`'s place)."""
 
     update: Program
     readout: Program
@@ -245,6 +245,7 @@ class Parts:
     reader: Token
     free: Token
     values_read: bool = False
+    reader_scale: float = 1.0
 
 
 def _chain(traced: Program) -> int:
@@ -286,10 +287,38 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
     if found is None:
         raise Refused("the readout is not the state contracted with a vector over its keys or its values "
                       f"plus a part free of it{stopped}")
+    reader, free = found
+    reader, reader_scale = _reader_scale(reader, atoms)
     base2, per_key, exponent, left, right, *correction = args
     return Parts(update, readout, tuple(atoms), bool(terms.integer(base2)),
                  bool(terms.integer(per_key)), exponent, left, right,
-                 correction[0] if correction else None, *found, values_read=values_read)
+                 correction[0] if correction else None, reader, free, values_read=values_read,
+                 reader_scale=reader_scale)
+
+
+def _reader_scale(reader: Token, atoms: list) -> tuple[Token, float]:
+    """A reader's literal scalar factored once, so its transposes keep it before their products."""
+    def factored(term):
+        scalar = get_callable_args(term, Token.scalar)
+        if scalar is not None:
+            literal = get_callable_args(scalar[0], Token.literal)
+            if literal is not None:
+                return None, terms.real(literal[0])
+            leaf = get_callable_args(scalar[0], Token.value)
+            if leaf is not None:
+                _, atom = atoms[terms.integer(leaf[0])]
+                if isinstance(atom, jcore.Literal):
+                    return None, float(atom.val)
+        product = get_callable_args(term, Token.times)
+        if product is not None:
+            left, ls = factored(product[0])
+            right, rs = factored(product[1])
+            vector = right if left is None else left if right is None else left.times(right)
+            return vector, ls * rs
+        return term, 1.0
+
+    vector, scale = factored(reader)
+    return Token.scalar(Token.literal(1.0)) if vector is None else vector, scale
 
 
 _KEEPING = (jax.lax.copy_p,)
