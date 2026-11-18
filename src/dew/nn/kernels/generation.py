@@ -1022,23 +1022,27 @@ device_description_str: "{target.device_kind}"
 
 
 def compile_only_gpus(generation: str, count: int = 1, memory: int | None = None,
-                      multiprocessors: int | None = None) -> tuple:
+                      multiprocessors: int | None = None, share: float | None = None) -> tuple:
     """`count` compile-only devices of the CUDA `generation`, none attached: XLA's CUDA backend compiles a
     program over them, a mesh's collectives included, as for that many of the generation's GPUs, of the
     `multiprocessors` a build states where it states them (`built_target`). `memory` states each GPU's
     memory, its total bytes as the GPU states them (`nvidia-smi`'s total): XLA's scheduler and
     rematerialization read it as the target's (`device_memory_size`), and every admission of a program
     compiled for these devices reads the allocator's limit derived from it (`dew._devices.allocator_limit`,
-    `COMPILE_ONLY_MEMORY`), as the GPU's own allocator states it. Absent it, the devices state no memory: a
-    step is compiled ahead for them only where it is stated (`compile_ahead`)."""
-    from dew._devices import COMPILE_ONLY_MEMORY
+    `dew._devices.STATED_GPUS`), as the GPU's own allocator states it, at `share`, the pool's share in the
+    run that loads their programs: Dew's own (`DEW_SHARE`, a constant) where none is given, never this
+    process's (`pool_share`). Devices of two shares are two (each its record), however alike otherwise.
+    Absent `memory`, the devices state no memory: a step is compiled ahead for them only where it is
+    stated (`compile_ahead`)."""
+    from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu
 
     if memory is not None:
         positive_memory(memory)
+    held = DEW_SHARE if share is None else share
     stated = built_target(generation, multiprocessors).multiprocessors
-    devices = _compile_only_gpus(generation, count, memory, stated)
+    devices = _compile_only_gpus(generation, count, memory, stated, held)
     if memory is not None:
-        COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
+        STATED_GPUS.update(dict.fromkeys(devices, StatedGpu(memory, held)))
     return devices
 
 
@@ -1050,9 +1054,10 @@ def positive_memory(memory: int) -> None:
 
 @functools.cache
 def _compile_only_gpus(generation: str, count: int, memory: int | None,
-                       multiprocessors: int | None) -> tuple:
+                       multiprocessors: int | None, share: float) -> tuple:
     """`compile_only_gpus`, one topology for each GPU however a caller states it (the generation's own
-    multiprocessors as None or as their count)."""
+    multiprocessors as None or as their count), and for each `share` its loading run takes, which the
+    topology does not read: devices of their own, so each holds its own record (`StatedGpu`)."""
     import jax.experimental.topologies as topologies
 
     config = target_config(built_target(generation, multiprocessors), memory)
