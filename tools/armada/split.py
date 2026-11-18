@@ -22,8 +22,8 @@ import json
 import os
 from pathlib import Path
 
-import pytest
 import grading
+import pytest
 import session
 
 

@@ -8,8 +8,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-import grading
-
 
 def collected(python: str, marks: str, files: list[str], within: float | None = None, tolerant: bool = False,
               pinned: bool = False) -> tuple[dict[str, int], dict[str, list[str]]]:
@@ -40,5 +38,7 @@ def collected(python: str, marks: str, files: list[str], within: float | None = 
         counts: dict[str, int] = {}
         for node in done.stdout.splitlines():
             if "::" in node:
-                counts[grading.owning(node)] = counts.get(grading.owning(node), 0) + 1
+                # The node's file as grading.owning reads it, spelled here: ci.py loads this module by its path, where
+                # grading is no sibling it can import.
+                counts[node.split("::")[0]] = counts.get(node.split("::")[0], 0) + 1
         return counts, json.loads(pins.read_text()) if pinned and counts else {}

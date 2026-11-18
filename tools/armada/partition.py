@@ -9,8 +9,6 @@ library alone."""
 import collections
 from collections.abc import Container, Iterable, Mapping
 
-import grading
-
 
 def collected(lines: Iterable[str]) -> dict[str, set[str]]:
     """Each test file's node ids among `lines`, as `pytest --collect-only -q` prints them, a line a test."""
@@ -18,7 +16,9 @@ def collected(lines: Iterable[str]) -> dict[str, set[str]]:
     for line in lines:
         node = line.strip()
         if node.startswith("tests/") and "::" in node:
-            found.setdefault(grading.owning(node), set()).add(node)
+            # The node's file as grading.owning reads it, spelled here: ci.py loads this module by its path, where
+            # grading is no sibling it can import.
+            found.setdefault(node.split("::")[0], set()).add(node)
     return found
 
 
