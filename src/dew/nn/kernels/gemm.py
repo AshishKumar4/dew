@@ -1169,7 +1169,7 @@ def _keeps_launch(lhs, rhs, group_sizes, hook, sides: tuple, outs: tuple, summed
     without reporting it: `selection.selected`), each the call `_gemm` makes of it (`_gemm_call`), its outputs
     `outs` (the plain product's the first alone); options as `_gemm`'s (`_input_cotangents`'). A hooked call a
     chosen kernel refuses keeps nothing (its plain products run apart, its hook in XLA)."""
-    interpret = options['interpret_on_cpu'] and jax.default_backend() == 'cpu'
+    interpret = xla_products.interpreted(options['interpret_on_cpu'])
     group_sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if group_sizes is None else group_sizes
     kernels = []
     for epilogue, after, dtypes in ((None, (), outs[:1]), (hook, sides, outs)):
@@ -1228,7 +1228,7 @@ def _prologue_keeps_launch(lhs, rhs, group_sizes, prologue, prologue_arrays, pro
     XLA's program of the whole product. Gathered rows keep the prologue (`_gemm_t` gathers them first)."""
     if options['gather'] is not None:
         return True
-    interpret = options['interpret_on_cpu'] and jax.default_backend() == 'cpu'
+    interpret = xla_products.interpreted(options['interpret_on_cpu'])
     dense = group_sizes is None
     sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if dense else group_sizes.astype(jnp.int32)
     product = declared(lhs.dtype, options['precision'], outputs=(out_dtype,), operands=(lhs.dtype, rhs.dtype))

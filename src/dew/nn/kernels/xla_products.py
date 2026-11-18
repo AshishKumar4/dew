@@ -19,6 +19,15 @@ from . import generation
 from .templates.product import SCALE_DEPTH, eight
 
 
+def interpreted(interpret_on_cpu: bool) -> bool:
+    """Whether a call asking `interpret_on_cpu` interprets its kernel: where the context places it on a CPU
+    (`generation.placed_platform`), not wherever this process's default backend is one. A GPU's program a
+    CPU host compiles ahead (its default device a compile-only GPU's, `dew.training.ahead`) holds no
+    interpreted branch: the interpreter's host callbacks' ordered effect, every branch's in the program, took
+    a token parameter on its CUDA executable, which its run on the GPU did not pass (row 8099)."""
+    return interpret_on_cpu and generation.placed_platform() == 'cpu'
+
+
 def _on_platform(kernel, fallback, interpret_on_cpu: bool):
     """`kernel` where the call lowers for its target's platform (CUDA, or a TPU's), and `fallback`
     everywhere else: a TPU's program, which never runs on CUDA, holds no CUDA branch, and a GPU's no TPU
@@ -30,7 +39,7 @@ def _on_platform(kernel, fallback, interpret_on_cpu: bool):
     target = generation.gpu_target()
     tpu = generation.tpu(target)
     branches = {'tpu' if tpu else 'cuda': functools.partial(kernel, interpret=False)}
-    if interpret_on_cpu and jax.default_backend() == 'cpu':
+    if interpreted(interpret_on_cpu):
         if not tpu and generation.capability(target.generation) is None:
             raise ValueError("interpret_on_cpu interprets the kernel as the GPU or TPU this CPU process "
                              "emulates; state it with generation.assumed(...)")
