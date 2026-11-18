@@ -578,7 +578,8 @@ def _first_decays(dg, run, dh0, taken=None):
 def _taken_memories(run) -> jax.Array:
     """The memory each chunk of a forked call took up `[chunks * HV * Dk, Dv]` fp32, as its walk formed it
     (`table.Taking`): its given or stored slot's (`table.Table.loads`; the forward's stored finals,
-    `run.stored`), its entry write added; zero at a chunk that took none up."""
+    `run.stored`), the slot it adds where it adds one (`table.Table.adds`), its entry write added; zero at a
+    chunk that took none up."""
     call, table = run.call, run.table
     slots = call.heads * call.width
 
@@ -591,12 +592,16 @@ def _taken_memories(run) -> jax.Array:
     # Slot zero a zero memory, then the given slots and the stored ones, one-based as `loads` counts them;
     # each chunk its own row's.
     slotted = jnp.concatenate([jnp.zeros_like(given[:, :1]), given, *held], axis=1)
-    memories = slotted[jnp.clip(table.rows, 0, run.batch - 1), jnp.maximum(table.loads, 0)]
+    rows = jnp.clip(table.rows, 0, run.batch - 1)
+    memories = slotted[rows, jnp.maximum(table.loads, 0)]
+    if table.adds is not None:
+        # The slot it adds to the one it loads (`Table.adds`), zero for none.
+        memories = memories + slotted[rows, jnp.maximum(table.adds, 0)]
     if table.turning is not None:
         # Each chunk's memory turned by its document's load rotation, as its walk took it up.
-        rows, after, before = (part[..., None] for part in table.turning)
+        cosines, after, before = (part[..., None] for part in table.turning)
         shifted = jnp.pad(memories, ((0, 0), (1, 1), (0, 0)))
-        memories = rows * memories + after * shifted[:, 2:] + before * shifted[:, :-2]
+        memories = cosines * memories + after * shifted[:, 2:] + before * shifted[:, :-2]
     memories = memories.reshape(-1, memories.shape[-1])
     if table.entries is not None:
         memories = memories + table.entries[table.pad:table.entries.shape[0] - table.pad]

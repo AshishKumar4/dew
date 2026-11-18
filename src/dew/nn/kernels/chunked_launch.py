@@ -195,6 +195,19 @@ def packed_sequences(starts, firsts, bound: int, *, chunk: int) -> Sequences:
     return sequences(batch, length, cu_seqlens(starts, batch * (bound + 1), firsts), chunk=chunk)
 
 
+def entry_write(key, value, weight, *, values_first: bool = False) -> jax.Array:
+    """A forked document's entry write `weight sum_r key_r value_r^T` (`recurrence_chunk.Chunk.entry_key`):
+    `key` `[..., R, Dk]`, `value` `[..., R, Dv]`, the write `[..., Dk, Dv]`, or with `values_first` `value`
+    `[..., Dv, R]` and the write `[..., Dv, Dk]` (the TPU forked scan's layout); `weight` broadcast against
+    the write. Its terms summed aligned to the largest (`precision.aligned_sum`), so a sum in range is its
+    value though its terms leave fp32's range: the one form the portable walk's opening, the template's
+    chunks (`ForkedChunks.entries`) and the TPU forked scan take."""
+    rank = key.shape[-2]
+    if values_first:
+        return aligned_sum([(weight, value[..., :, r:r + 1], key[..., r:r + 1, :]) for r in range(rank)])
+    return aligned_sum([(weight, key[..., r, :, None], value[..., r, None, :]) for r in range(rank)])
+
+
 def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> Sequences:
     """The spans of `cu_seqlens` (`[N + 1]` int32 over the `batch * length` tokens, each row's
     boundaries among them), or of the rows themselves where None. A traced `cu_seqlens` takes the most
@@ -360,8 +373,9 @@ class Forked:
     first slot (`firsts` `[B, D]`, `S` past a row's last), the table slot it enters and the stored slot it
     leaves its final in (`loads`, `stores` `[B, D]`), the stored slots' count (`held`), its entry write,
     where the call gives one (`entry`, its `[B, D, Hv, Dk, Dv]` never formed: each walk forms a chunk's
-    own), and where a turned call gives it, the rotation `(cos, sin)` `[B, D, Hv, A]` each document turns
-    the memory it takes up by as its walk loads it, its first `A` key pairs (`turning`,
+    own), the second slot each document adds to the one it enters, where the call gives them (`adds` `[B, D]`,
+    `Chunk.adds`), and where a turned call gives it, the rotation `(cos, sin)` `[B, D, Hv, A]` each document
+    turns the memory it takes up by as its walk loads it, its first `A` key pairs (`turning`,
     `templates.recurrence.turned`: minus the document's own turns)."""
 
     firsts: jax.Array
@@ -369,6 +383,7 @@ class Forked:
     stores: jax.Array
     entry: tuple | None
     held: int = dataclasses.field(metadata={'static': True})
+    adds: jax.Array | None = None
     turning: tuple | None = None
 
     @classmethod
@@ -385,19 +400,21 @@ class Forked:
         if operands.entry_key is not None:
             entry = tuple(jnp.asarray(t, work) for t in
                           (operands.entry_key, operands.entry_value, operands.entry_weight))
-        return cls(begins, loads, jnp.asarray(operands.stores, jnp.int32), entry, operands.held)
+        adds = None if operands.adds is None else jnp.asarray(operands.adds, jnp.int32)
+        return cls(begins, loads, jnp.asarray(operands.stores, jnp.int32), entry, operands.held, adds)
 
     @property
     def walked(self) -> tuple:
-        """The operands a walk takes beside the call's (`carrying`): the documents' slots, entry write and
-        load rotation."""
-        return (self.firsts, self.loads, self.stores, *(() if self.entry is None else self.entry),
-                *(() if self.turning is None else self.turning))
+        """The operands a walk takes beside the call's (`carrying`): the documents' slots, their added slots,
+        entry write and load rotation."""
+        return (self.firsts, self.loads, self.stores, *(() if self.adds is None else (self.adds,)),
+                *(() if self.entry is None else self.entry), *(() if self.turning is None else self.turning))
 
     def carrying(self, firsts, loads, stores, *rest) -> "Forked":
         """This call's documents from the operands a product's walk was handed (`walked`)."""
-        entry, turning = ((rest[:3], rest[3:]) if self.entry is not None else ((), rest))
-        return Forked(firsts, loads, stores, tuple(entry) or None, self.held, tuple(turning) or None)
+        adds, rest = (rest[0], rest[1:]) if self.adds is not None else (None, rest)
+        entry, turning = (rest[:3], rest[3:]) if self.entry is not None else ((), rest)
+        return Forked(firsts, loads, stores, tuple(entry) or None, self.held, adds, tuple(turning) or None)
 
     def tokens(self, length: int) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Each of a call's `length` tokens' part in its walk, `[B, S]` int each, the documents walked in
@@ -541,6 +558,13 @@ class ForkedChunks:
         taken = jnp.maximum(self.taken, 0)
         cos, sin = (part.reshape(-1, *part.shape[2:])[taken] for part in forked.turning)
         return jnp.where(live, cos, 1.0), jnp.where(live, sin, 0.0)
+    def added(self, forked: Forked) -> jax.Array | None:
+        """Each chunk's added slot (`recurrence_chunk.Chunk.adds`), the document it takes up's, zero for none:
+        `[NC]`; None where the call adds none."""
+        if forked.adds is None:
+            return None
+        return jnp.where(self.taken >= 0, jnp.asarray(forked.adds, jnp.int32).reshape(-1)[
+            jnp.maximum(self.taken, 0)], 0)
 
     def entries(self, forked: Forked):
         """Each chunk's entry write (`recurrence_chunk.Chunk.entry_key`), the document it takes up's, zero for
@@ -558,6 +582,4 @@ class ForkedChunks:
         # an elementwise product summed after: the SSD port's weight gradient took 1.6 to 1.9 times the
         # error each document alone takes from float64 summed after (armada, 11-11).
         weighed = jnp.where((self.taken >= 0)[:, None], weight, 0)
-        # Its terms summed aligned to the largest, which may leave fp32's range where the sum is in it.
-        return aligned_sum([(weighed[..., None, None], key[:, r, :, :, None], value[:, r, :, None, :])
-                            for r in range(key.shape[1])])
+        return entry_write(jnp.moveaxis(key, 1, 2), jnp.moveaxis(value, 1, 2), weighed[..., None, None])

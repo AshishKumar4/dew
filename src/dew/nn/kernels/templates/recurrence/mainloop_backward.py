@@ -266,12 +266,14 @@ def _tabled_gradients(run, grads: tuple, taken) -> tuple:
         return grads
     table = run.table
     # Each chunk taking a given slot up adds to its row's slot (a stored slot's, its storing chunk's walk),
-    # its gradient turned back into the slot's frame where the call turns it (`_turned_back`).
-    given_slot = (table.loads > 0) & (table.loads <= table.count)
+    # its gradient turned back into the slot's frame where the call turns it (`_turned_back`); a slot a chunk
+    # adds (`Table.adds`) takes the same gradient as the one it loads.
     returned = _turned_back(run, _taken_up(run, taken))
-    given = jnp.zeros((run.batch, table.count, *returned.shape[1:]), jnp.float32).at[
-        table.rows, jnp.clip(table.loads - 1, 0, table.count - 1)].add(
-        jnp.where(given_slot[:, None, None, None], returned, 0.0), mode="drop")
+    given = jnp.zeros((run.batch, table.count, *returned.shape[1:]), jnp.float32)
+    for slots in (table.loads, *(() if table.adds is None else (table.adds,))):
+        given_slot = (slots > 0) & (slots <= table.count)
+        given = given.at[table.rows, jnp.clip(slots - 1, 0, table.count - 1)].add(
+            jnp.where(given_slot[:, None, None, None], returned, 0.0), mode="drop")
     return (*grads[:5], given[..., :run.key_width, :run.value_width])
 
 

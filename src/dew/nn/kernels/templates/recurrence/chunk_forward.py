@@ -108,6 +108,7 @@ class ForkedTable:
     entries: jax.Array | None
     rows: jax.Array
     held: int = dataclasses.field(metadata={'static': True})
+    adds: jax.Array | None = None
     turning: tuple | None = None
     """Each chunk's load rotation `(cos, sin)` `[NC, HV, A]` (`chunked_launch.ForkedChunks.turning`), where
     a turned call gives one."""
@@ -131,7 +132,8 @@ def tabled(forked: ForkedTable, width: int, columns: int) -> Table:
                         for part in turning_rows(cos, sin, width))
     return Table(laid(forked.given), forked.loads.reshape(-1).astype(jnp.int32),
                  forked.stores.reshape(-1).astype(jnp.int32), entries, forked.rows, forked.given.shape[1],
-                 forked.held, turning)
+                 forked.held, None if forked.adds is None else forked.adds.reshape(-1).astype(jnp.int32),
+                 turning)
 
 
 def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None,
