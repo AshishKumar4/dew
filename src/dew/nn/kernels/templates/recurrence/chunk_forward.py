@@ -115,8 +115,9 @@ def tabled(forked: ForkedTable, width: int, columns: int) -> Table:
     entries = None if forked.entries is None else laid(forked.entries)
     turning = None
     if forked.turning is not None:
+        cos, sin = forked.turning
         turning = tuple(part.reshape(-1, part.shape[2] * width).astype(jnp.float32)
-                        for part in turning_rows(*forked.turning, width))
+                        for part in turning_rows(cos, sin, width))
     return Table(laid(forked.given), forked.loads.reshape(-1).astype(jnp.int32),
                  forked.stores.reshape(-1).astype(jnp.int32), entries, forked.given.shape[1], forked.held,
                  turning)
