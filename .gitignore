@@ -39,3 +39,4 @@ build/
 
 # run logs a test runner writes where it is started, never part of the tree
 /*.log
+/.scratch/

@@ -490,16 +490,18 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
         reference, draw, truth, *_ = CLASSES[law]()
         # The reference and its truth run their programs unrewritten, as a site's do.
         reference, truth = unrewritten(reference), unrewritten(truth)
-        pool = _drawn(reference, reference, draw, range(3 * OFFSET * 1024, 3 * OFFSET * 1024 + 512), truth)
+        [pool] = _drawn(reference, reference, draw, range(3 * OFFSET * 1024, 3 * OFFSET * 1024 + 512),
+                        truth)
         names, values = pool.names, np.asarray(pool.mine)
+    else:
+        names, values = ["leaf"], None
     verdicts = []
     for _ in range(runs):
         # Each seed's squared errors' logs (`_Draws`): Dew's the reference's law times ratio squared.
-        if law in CLASSES:
+        if values is not None:
             mine = 2 * np.log(ratio) + values[rng.integers(0, len(values), span)]
             theirs = values[rng.integers(0, len(values), span)]
         else:
-            names = ["leaf"]
             mine = 2 * np.log(ratio) + log_errors(_law(law, rng, span))[:, None]
             theirs = log_errors(_law(law, rng, span))[:, None]
         leaves = mine.shape[1]
@@ -544,7 +546,8 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int, ampli
         for _ in range(2):
             errors = rng.standard_normal((span, rows, width))
             if amplified:
-                errors[..., 0] *= scale if shared else 2.0 ** rng.integers(0, steepest + 1, (span, rows))
+                own = 2.0 ** rng.integers(0, steepest + 1, (span, rows)) if scale is None else scale
+                errors[..., 0] *= own
             sized = np.sqrt(np.mean(np.square(errors), axis=2)) / truth
             arms.append(sized.max(axis=1))
             # Each seed's worst row's largest element's share, as check 1 reads each arm's.
@@ -566,7 +569,8 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int, ampli
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description="Check 1's null runs on operation classes: each nonpassing "
+                                     "verdict counted, and the red rate's one-sided Clopper-Pearson bound.")
     parser.add_argument("name", help=f"a class ({', '.join(sorted(CLASSES))}), or with --ratio a control's "
                         "law: a class's or exact-f, flip, gamma-1")
     mode = parser.add_mutually_exclusive_group()
@@ -633,7 +637,7 @@ def main(argv: list[str]) -> int:
 
         seeds = range(2 * OFFSET * 1024 + options.chunk * options.draws,
                       2 * OFFSET * 1024 + (options.chunk + 1) * options.draws)
-        draws = _drawn(reference, reference, draw, seeds, truth)
+        [draws] = _drawn(reference, reference, draw, seeds, truth)
         print(json.dumps({"class": options.name, "chunk": options.chunk, "names": draws.names,
                           "mse": np.exp(np.asarray(draws.mine)).tolist(),
                           "log_worst": np.asarray(draws.worst[..., 0]).tolist()}), flush=True)

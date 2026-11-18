@@ -250,7 +250,7 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, *, rows: boo
             f"holds a batch that is a multiple of {divisor}")
 
 
-def microbatch(batch: Batch, part: jax.Array, split: int) -> Batch:
+def microbatch(batch: Batch, part: jax.typing.ArrayLike, split: int) -> Batch:
     """The `part`th of the `split` microbatches a step reads `batch` in
     (`Trainer.compile`): every `split`th row from row `part` (`microbatched`),
     a share of each device's rows where `split` divides them, so no row

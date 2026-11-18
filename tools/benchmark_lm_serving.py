@@ -445,11 +445,15 @@ def main():
     parser.add_argument("--vocab-limit", type=int, default=150_000)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--admission", type=int, default=0)
-    parser.add_argument("--decode-steps", type=int, default=1)
-    parser.add_argument("--kv", choices=("dense", "paged"), default="dense")
-    parser.add_argument("--page-size", type=int, default=16, help="a paged cache's slots a page (--kv paged)")
+    parser.add_argument("--decode-steps", type=int, default=None,
+                        help="Dew: the decode iterations a device call runs (1)")
+    parser.add_argument("--kv", choices=("dense", "paged"), default=None,
+                        help="Dew: the server's cache (dense)")
+    parser.add_argument("--page-size", type=int, default=None,
+                        help="Dew: a paged cache's slots a page (--kv paged; 16)")
     parser.add_argument("--mesh", type=json.loads, default=None,
-                        help='Dew: the weights placed on a mesh of these MeshSpec fields ({"tensor": 2})')
+                        help='Dew: the weights placed on a mesh of these MeshSpec fields ({"tensor": 2}); '
+                             "vllm-engine: its tensor and expert parallelism")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-steps", type=int, default=20)
     parser.add_argument("--generations", action="store_true")
@@ -463,6 +467,14 @@ def main():
     args.rate = [float(value) for value in args.rate.split(",") if value]
     if args.rate and args.backend == "vllm":
         parser.error("--rate runs Dew and the in-process engines")
+    # Dew's server's own settings, which every other backend's engine runs its own of.
+    stated = [flag for flag, value in (("--decode-steps", args.decode_steps), ("--kv", args.kv),
+                                       ("--page-size", args.page_size)) if value is not None]
+    if stated and args.backend != "dew":
+        parser.error(f"{', '.join(stated)} set Dew's server; {args.backend} runs its own cache and steps")
+    args.decode_steps = 1 if args.decode_steps is None else args.decode_steps
+    args.kv = "dense" if args.kv is None else args.kv
+    args.page_size = 16 if args.page_size is None else args.page_size
     if args.mesh is not None and args.backend not in ("dew", "vllm-engine"):
         parser.error("--mesh places Dew's weights, or sets vllm-engine's parallelism; a vLLM server "
                      "takes its own flags")
@@ -491,13 +503,18 @@ def main():
     if args.backend == "dew":
         for point, peak in zip(points, peaks or [[None]] * len(points), strict=True):
             point["peak_device_bytes"] = None if None in peak else max(peak)
+    # Each setting recorded where its backend applies it: Dew's server's steps, cache and pages, which every
+    # other engine runs its own of, and the mesh, which places Dew's weights or sets vllm-engine's
+    # parallelism (`vllm_parallelism`).
+    served = ({"decode_steps": args.decode_steps, "kv": args.kv,
+               **({"page_size": args.page_size} if args.kv == "paged" else {})}
+              if args.backend == "dew" else {})
+    served |= {"mesh": args.mesh} if args.backend in ("dew", "vllm-engine") else {}
     record = {"backend": args.backend, "model": args.model, "hardware": hardware,
               "prompt": args.prompt, "output": args.output, "vocab_limit": args.vocab_limit,
               "sampling": {"temperature": 0, "ignore_eos": True}, "warm_output": args.output,
               "transport": "HTTP streaming" if args.backend == "vllm" else "in-process",
-              "decode_steps": args.decode_steps, "kv": args.kv,
-              **({"page_size": args.page_size} if args.kv == "paged" else {}), "mesh": args.mesh,
-              "host": platform.processor(), "sweep": points}
+              **served, "host": platform.processor(), "sweep": points}
     args.out.write_text(json.dumps(record, indent=2) + "\n")
 
 

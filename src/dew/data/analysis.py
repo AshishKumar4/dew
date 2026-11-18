@@ -54,6 +54,7 @@ from dew.data.pipeline import (
     MapBatch,
     MapWithIndex,
     MarkConsumed,
+    MarkCounted,
     Measure,
     Mixture,
     Native,
@@ -649,7 +650,7 @@ _EAGER = (Map, MapWithIndex, Filter, FlatMap, Pack, Windows, TokenSplit)
 
 def _held_bound(stages: Sequence[Stage], at: int) -> int:
     """The stages of a bound in examples standing at `at` before a pack a memory read runs over its whole
-    source, or a layout a shuffle draws after (`_drawn_cut`) (`dew.data.compile._bounded`: a repeat without
+    source, or a layout a shuffle draws after (`_drawn_cut`) (`dew.data.bounds._bounded`: a repeat without
     a count where it reads on, its limit and its marks): the memory read runs them as it holds the rest,
     the source examples cycled to the limit and marked before the layout lays them out, so its windows
     carry the examples they consume. None (0) where no such bound stands there."""
@@ -657,7 +658,7 @@ def _held_bound(stages: Sequence[Stage], at: int) -> int:
     repeats = int(isinstance(first, Repeat) and first.epochs is None)
     bound = stages[at + repeats:at + repeats + 3]
     marked = (len(bound) == 3 and isinstance(bound[0], Limit) and isinstance(bound[1], Map)
-              and isinstance(bound[1].step, MarkConsumed)
+              and isinstance(bound[1].step, MarkConsumed) and not isinstance(bound[1].step, MarkCounted)
               and (isinstance(bound[2], Pack) or _drawn_cut(stages, at + repeats + 2)))
     return repeats + 2 if marked else 0
 

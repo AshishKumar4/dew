@@ -621,8 +621,11 @@ class Aux(Generic[Effects]):
     """The `qk` collection the attention layers sowed, which the optimizer's QK-Clip reads.
 
     It is nested by module path. Each attention layer holds `max_logits`, a
-    one-tuple of an fp32 `[rows, heads]` array of per-head logit maxima, and
-    an MLA layer also holds `qk_nope`, an int scalar giving its nope width.
+    tuple of an fp32 `[rows, heads]` array of per-head logit maxima for each
+    call of the layer, one but where a model runs it again (a looped layer's
+    passes, a head read at each exit: `dew.batch.sown_calls`), which the clip
+    reads at their largest; an MLA layer also holds `qk_nope`, an int scalar
+    giving its nope width, a call each alike.
     Rows are the batch's rows, with microbatches concatenated under a
     pipeline. It is None where the step asked for none (`Step.qk_stats`),
     and empty where it asked and no layer sowed any; a run whose optimizer

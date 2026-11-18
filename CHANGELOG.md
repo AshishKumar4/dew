@@ -7,11 +7,24 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A layout that keeps the variables on the host (`Layout(host=("variables",))`) reads each step's batch in
+  the split the run states, each microbatch an attempt of its own, as a device step does; it read every
+  step's batch whole, refusing a stated split.
+
 - A step over several GPUs compiles without XLA's rematerialization pass (`dew.training.memory.COLLECTIVES`),
   as MaxText runs it: its plan fits it by Dew's ladder, and XLA's pass, against a limit of its own below the
   plan's, recomputed what it picked at a rung that already fit, a sharded weight's all-gather among them.
   Qwen3-8B over four H100s (fsdp 2 x tensor 2) at 48 GiB: 14 fewer re-gathered all-gathers, 11.7 GB gathered
   a step against 16.8, at the same rung and temporaries (row 1307).
+
+- A fresh run that states no layout chooses whether to stream its parameters from the host
+  (`Layout(host=("variables",))`, `dew.training.streaming`; row 1880): the plan its devices hold, priced as its
+  compiled step's hardware FLOPs over the GPU's dense peak, against the streamed step, its own FLOPs or its host
+  link's transfers whichever is longer, then its update over the host's memory. It streams where its devices
+  hold only the streamed step, or where that step is the cheaper; the choice is said and kept
+  (`Trainer.layout_choice`). A GPU's host link is a table fact of each part (`GpuTarget.host_links`,
+  `host_link_rate`: PCIe's or NVLink-C2C's datasheet rate one way); a TPU states none yet. A resume
+  lays out as its checkpoint trained. A process takes the streamed plan only where it was started with a CPU companion of its devices.
 
 - A launch whose derived config spills certifies its ladder's rungs one after another and takes the first
   that holds, where it certified them in threaded rounds as wide as the host's cores: a rung's certification
@@ -104,7 +117,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
 
-- Dew requires its JAX build 0.12.0.1.post109 and, on Linux x86_64 and aarch64, its own jaxlib build
+- Dew requires its JAX build 0.12.0.1.post110 and, on Linux x86_64 and aarch64, its own jaxlib build
   0.12.0.1.post103, with its CUDA and PJRT plugins 0.12.0.1.post103 (post96's until now). A GPU compile takes a
   device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
   whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
@@ -126,7 +139,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   in a warp context could hang its block, now refused as its arrive is; and an interpreted Mosaic GPU kernel's
   shared memory admitted another execution's device beside the live one's, now one execution at a time. A Mosaic
   GPU kernel branches on whether any or every element of a boolean array holds (`jnp.any`, `jnp.all`) under either
-  semantics, the warpgroup's threads agreeing through one `bar.red` predicate reduction. Elsewhere jaxlib stays the
+  semantics, the warpgroup's threads agreeing through one `bar.red` predicate reduction. A Mosaic GPU row made a
+  `[1, n]` one in its own layout broadcasts, where a kernel holding it through an optimization barrier failed to
+  lower; Pallas TPU lowers an optimization barrier; a Mosaic GPU gather or scatter of four rows names the thread
+  that issues it; and the GPU interpreter's race detection orders a copy into shared memory after the reads its
+  thread's synchronization orders, as a ring refilled once its readers release a slot. Elsewhere jaxlib stays the
   stock 0.12.0.1.
 
 - A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes

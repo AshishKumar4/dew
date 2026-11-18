@@ -31,7 +31,13 @@ from dew.state import Accumulation, TrainState, apart, occupied, together
 from dew.telemetry.instrumentation import StepFlops
 from dew.training._candidates import Stepping, _shaped, candidate_for, lowered_for
 from dew.training._lowering import Lowered, routed
-from dew.training.distributed import link_figure, link_figures, resumed_link_figures
+from dew.training.distributed import (
+    link_figure,
+    link_figures,
+    microbatch,
+    microbatch_shapes,
+    resumed_link_figures,
+)
 from dew.training.memory import (
     climb_to,
     head_tile_of,
@@ -332,7 +338,7 @@ class StepCompiler[L, E]:
         a step runs."""
         return rung_record(self.objective, self._xla_defaults, narrow=self._narrow, ns_group=self._ns_group)
 
-    def checkpoint_rung(self) -> JSON:
+    def checkpoint_rung(self) -> dict[str, JSON]:
         """The rung a checkpoint records: the run's own, which every newly met
         shape starts from (`rung`'s fields as the first compile found them),
         and under `shapes` the rung each shape compiled at, by its layout
@@ -520,6 +526,23 @@ class StepCompiler[L, E]:
         kept = planned.released()
         return dataclasses.replace(compiled, step=self.runner(stepping, kept, settings.device_mesh),
                                    planned=kept)
+
+    def holds_unplaced(self, batch: Batch) -> bool:
+        """Whether a fresh run's first step was planned over `batch`'s shapes before its state was placed
+        (`planned_unplaced`), the plan its first compile takes."""
+        return self._unplaced is not None and self._unplaced.signature == batch_signature(batch)
+
+    def anew(self) -> StepCompiler[L, E]:
+        """A compiler of this one's objective, links, step compiled ahead and pass counts, nothing planned:
+        where a run lays its state out otherwise than the plans this one made were for
+        (`dew.training.streaming.laid_start`), whose ladder climbs and plans read no step of that layout."""
+        return StepCompiler(self.objective, self._stated_links, self.ahead, self.phase_passes)
+
+    @property
+    def unplaced(self) -> Planned | None:
+        """The plan a fresh run's first step took before its state was placed (`planned_unplaced`), None
+        where its devices held none or none was made."""
+        return None if self._unplaced is None else self._unplaced.planned
 
     def planned_unplaced(self, stepping: Stepping, state: TrainState, batch: Batch,
                          unplaced: int) -> None:
@@ -863,36 +886,56 @@ class StepCompiler[L, E]:
                                   device=stepping.shape.device,
                                   gathered=layer_gathers(self.objective, state.variables,
                                                          settings.device_mesh.devices.size))
+        # The batch read in the split the run states (no plan chooses one: the step is the host's), its window
+        # that many microbatches an update times the run's accumulation, as a device step's (`step_program`).
+        split = stepping.shape.split or 1
+        window = split * settings.accumulation
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with stepping.traced_on(cpu) as schedule:
-            _, shapes = stepping.loss_shape(state, cpu_batch, settings.accumulation)
+            micro = microbatch_shapes(cpu_batch, split)
+            _, shapes = stepping.loss_shape(state, micro, window, split)
             stepping.staging.refuse_unpipelined(schedule, self.objective)
-            prepared = stepping.initialize_accumulation(state, cpu_batch, shapes,
-                                                        window=settings.accumulation, shape_only=True)
+            prepared = stepping.initialize_accumulation(state, micro, shapes, window=window, split=split,
+                                                        shape_only=True)
             placement = stepping.shardings(prepared)
-            transaction = Transaction(self.objective, settings.optimizer, settings.accumulation, shapes,
+            transaction = Transaction(self.objective, settings.optimizer, window, shapes, split=split,
                                       record=settings.record, examples=stepping.shape.examples,
                                       skip=settings.skip_nonfinite)
             body = transaction.step(realize=execution.realize, host=True,
                                     frozen=tuple(path for path, _, _ in frozen_trees(state.variables, sites)))
+        # A split step's whole from its microbatches' outputs, its loss as an unsplit step logs it.
+        whole = whole_step_program(self.objective)
 
         def run(current, batch, sampled: bool = False):
             # A host-master run inspects nothing (`compile` refuses it), so no step of it is sampled.
             with stepping.traced_on(cpu):
                 batch = transfer(batch, batch_shardings(cpu, batch))
-                if settings.accumulation > 1 and (current.accumulation is None or (
+                if window > 1 and (current.accumulation is None or (
                         (stepping.shape.ramp or stepping.shape.stage_starts)
                         and not current.accumulation.replays(prepared.accumulation))):
-                    current = stepping.initialize_accumulation(current, batch, shapes,
-                                                               window=settings.accumulation)
-                # The device steps run in the accelerator's forward (`HostExecution`).
-                advanced, loss, aux, committed = body(current, model_batch(batch), 0, batch_tokens(batch),
-                                                      batch.get(CLOSES_WINDOW))
-                advanced, *stepped = outcome(current, advanced, loss, aux, committed, batch, 1,
-                                             batch_consumed(batch), split=1)
+                    # The window, and with it the split, the state's from here on, as a device step's
+                    # (`builds_window`).
+                    current = dataclasses.replace(
+                        stepping.initialize_accumulation(current, microbatch_shapes(batch, split), shapes,
+                                                         window=window, split=split),
+                        window_size=jax.device_put(np.int32(window)))
+                has_batch_stats = (split > 1 and current.window is not None
+                                   and current.window.batch_statistics is not None)
+                pooled = stepping.model_batch(batch) if has_batch_stats else None
+                outputs = []
+                # Each microbatch an attempt of its own, its device work the accelerator's forward
+                # (`HostExecution`), the step counted at its last.
+                for part in range(split):
+                    micro = microbatch(batch, np.int32(part), split)
+                    advanced, loss, aux, committed = body(current, model_batch(micro), part,
+                                                          batch_tokens(micro), micro.get(CLOSES_WINDOW),
+                                                          pooled)
+                    current, *output = outcome(current, advanced, loss, aux, committed, batch,
+                                               part == split - 1, batch_consumed(micro), split=split)
+                    outputs.append(tuple(output))
                 # A leaf already where its placement says stays the array it
                 # is: the resident frozen collection crosses no boundary.
-                return transfer(advanced, placement), *stepped
+                return transfer(current, placement), *(whole(outputs) if split > 1 else outputs[0])
         return run
 
     # ------------------------------------------------------------------ The loop
