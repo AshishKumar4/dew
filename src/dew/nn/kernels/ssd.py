@@ -37,6 +37,7 @@ from jax.typing import DTypeLike
 
 from dew.nn import derivatives
 from dew.nn.kernels import launches
+from dew.nn.precision import twice_scaled
 
 from ..precision import exact_float32
 from . import generation
@@ -252,24 +253,7 @@ def _opened(given_ref, table, entry, load, document, zero):
     if entry is None:
         return taken
     key, value, weight = (ref[document] for ref in entry)
-    return taken + sum(_product(weight, value[:, r:r + 1], key[r:r + 1, :]) for r in range(key.shape[0]))
-
-
-def _exponent(x) -> jax.Array:
-    """`x`'s binary exponent from its bits, -127 for a zero (and a subnormal)."""
-    return ((jax.lax.bitcast_convert_type(x, jnp.int32) >> 23) & 0xFF) - 127
-
-
-def _product(a, b, c) -> jax.Array:
-    """`a b c`, broadcast, its first product the pair whose exponents sum nearest zero, so no partial product
-    leaves fp32's range where the whole is in it: a document's entry write `weight value_r key_r^T` (a term's
-    outer product at a time, a few terms) and its adjoint's terms. In any one order, keys and values of 2^80
-    under a weight of 2^-100 overflowed where the write is 2^60, keys of 2^-80 under the same weight
-    underflowed where it is 2^-80, and a value of 2^100 against a memory's gradient of 2^60 overflowed where
-    the keys' gradient is 2^120 (base reviews 200f6ca65, 7047162e7)."""
-    ea, eb, ec = (_exponent(jnp.asarray(x, jnp.float32)) for x in (a, b, c))
-    ab, ac, bc = jnp.abs(ea + eb), jnp.abs(ea + ec), jnp.abs(eb + ec)
-    return jnp.where((ab <= ac) & (ab <= bc), (a * b) * c, jnp.where(ac <= bc, (a * c) * b, (b * c) * a))
+    return taken + sum(twice_scaled(weight, value[:, r:r + 1], key[r:r + 1, :]) for r in range(key.shape[0]))
 
 
 def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, a_ref, state_ref, given_ref,
@@ -394,13 +378,13 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, 
                 # three-factor products formed range-preserving (`_product`), no two-factor partial of them.
                 rows = range(key.shape[0])
                 dkey[document] = dkey[document] + jnp.concatenate(
-                    [jnp.sum(_product(weight, value[:, r:r + 1], dmemory), axis=0, keepdims=True)
+                    [jnp.sum(twice_scaled(weight, value[:, r:r + 1], dmemory), axis=0, keepdims=True)
                      for r in rows], axis=0)
                 dvalue[document] = dvalue[document] + jnp.concatenate(
-                    [jnp.sum(_product(weight, key[r:r + 1, :], dmemory), axis=1, keepdims=True)
+                    [jnp.sum(twice_scaled(weight, key[r:r + 1, :], dmemory), axis=1, keepdims=True)
                      for r in rows], axis=1)
                 dweight[document] = dweight[document] + sum(
-                    jnp.sum(_product(value[:, r:r + 1], key[r:r + 1, :], dmemory), keepdims=True)
+                    jnp.sum(twice_scaled(value[:, r:r + 1], key[r:r + 1, :], dmemory), keepdims=True)
                     for r in rows)
         return (jnp.where(inside, dx + wx, dx), jnp.where(inside, db + wb, db),
                 jnp.where(inside, dc + wc, dc), jnp.where(within, da + wa, da),
