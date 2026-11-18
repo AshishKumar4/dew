@@ -1317,8 +1317,16 @@ def uncontracted(*values):
     transform reads each operand more than once and holds only where every read sees the same rounded value,
     which a compiler's contraction of a multiply into an add (an FMA, XLA's CPU and GPU, Triton's) breaks by
     reading the exact product at one place and the rounded one at another (a two_product's product added in a
-    compensated sum, its residual then counted twice). An optimization barrier, which no fusion crosses."""
-    return jax.lax.optimization_barrier(values)
+    compensated sum, its residual then counted twice). An optimization barrier, which no fusion crosses.
+
+    On a TPU (`generation.backend`) the values as they are: Pallas TPU's Mosaic lowering takes no barrier
+    (post108, whose attention forms reach `two_product` and `two_sum` in a kernel body, `natural_exp` and
+    `natural_carried`), and whether a TPU's compilers contract a multiply into an add is unmeasured: a v5e
+    run of `x y - barrier(x y)` decides it, with the fork's lowering of the barrier in Pallas TPU, which
+    retires this branch."""
+    from dew.nn.kernels.generation import backend
+
+    return values if backend() == "tpu" else jax.lax.optimization_barrier(values)
 
 
 def binade_of(x: jax.Array) -> jax.Array:
