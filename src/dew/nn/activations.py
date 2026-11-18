@@ -33,7 +33,8 @@ import jax
 import jax.numpy as jnp
 from flax.typing import Dtype
 
-from .derivatives import Protected, contracted, declared_tangent
+from . import derivatives
+from .derivatives import Protected, contracted, declared_tangent, marked
 from .kernels import norm_swiglu
 from .precision import at_least_fp32, capped_logits, divided, logistic_value, rounded_to, softplus
 
@@ -195,8 +196,9 @@ class Xielu(nn.Module):
 
 
 def ungated_activation(name: str, x: jax.Array) -> jax.Array:
-    """`x` through the `UNGATED` activation `name`, in `x`'s dtype; callers check `name` first."""
-    return UNGATED[name](x)
+    """`x` through the `UNGATED` activation `name`, in `x`'s dtype, one region (`derivatives.Activation`, a
+    fusion pass's epilogue's); callers check `name` first."""
+    return marked(derivatives.Activation(name, gated=False), UNGATED[name])(x)
 
 
 def _exact_gelu(x: jax.Array) -> jax.Array:
@@ -381,9 +383,12 @@ def _portable(activate, halves):
 def _dispatched(activation, portable, kernel_choice, kernel):
     """The product over the operands: SwiGLU's Pallas `kernel(*operands, portable)` where
     `kernel_choice(*operands)` chooses it (every order of its derivative is the portable product's;
-    every level runs the kernels), else `portable`, which every other activation runs."""
+    every level runs the kernels), else `portable`, which every other activation runs. Whichever runs is
+    one region of `activation`'s gated product over the operands (`derivatives.Activation`), the seam a
+    fusion pass's epilogue replaces from its kind (`_gate_function`'s activation and the rounded product,
+    `_gated`); inlined, it is what the dispatcher emits."""
     def product(*operands: jax.Array) -> jax.Array:
         chosen = 'xla' if activation != 'swiglu' else kernel_choice(*operands)
         return kernel(*operands, portable) if chosen == 'pallas' else portable(*operands)
 
-    return product
+    return marked(derivatives.Activation(activation, gated=True), product)

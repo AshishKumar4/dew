@@ -17,7 +17,13 @@ from dew.nn import derivatives
 from dew.nn.derivatives import KernelGlue, Protected, Surrogate, marked, marked_call_p
 from dew.nn.programs import called
 
-KINDS = [kind() for kind in typing.get_args(derivatives.Kind.__value__)]
+STATED = {derivatives.Activation: [derivatives.Activation("swiglu", gated=True),
+                                   derivatives.Activation("gelu", gated=False)]}
+"""The kinds a span states fields of, each as the spans that mark it state them: an activation's region by its
+activation's name, gated and ungated."""
+
+KINDS = [stated for kind in typing.get_args(derivatives.Kind.__value__)
+         for stated in (STATED[kind] if kind in STATED else [kind()])]
 """Every kind a span is marked as, each through either builder (`derivatives.Kind`'s)."""
 
 
@@ -30,7 +36,7 @@ def body(x, y):
     return jnp.sin(x) * y + jnp.sum(x * y)
 
 
-@pytest.mark.parametrize("kind", KINDS, ids=lambda kind: type(kind).__name__)
+@pytest.mark.parametrize("kind", KINDS, ids=repr)
 def test_a_marked_span_computes_as_its_body_and_stays_one_call_of_its_kind_through_every_transform(kind):
     """A marked span computes what its body does, and its program holds it as one call of its kind; so do
     its derivatives forward and backward (`jax.jvp`, `jax.linearize`, `jax.grad`), its batched form
@@ -90,7 +96,7 @@ def _scaled_backward(scale: float):
     return primal, forward, backward
 
 
-@pytest.mark.parametrize("kind", KINDS, ids=lambda kind: type(kind).__name__)
+@pytest.mark.parametrize("kind", KINDS, ids=repr)
 def test_a_declared_derivative_is_one_marked_call_and_differentiates_as_its_rule(kind):
     """A custom derivative declared with its kind (`declared_derivative`: no bare `jax.custom_vjp`) is one
     marked call of that kind, its primal, forward and backward together, which every transform keeps: its
