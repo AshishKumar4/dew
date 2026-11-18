@@ -39,6 +39,7 @@ from dew.nn.kernels.templates import (
     attention_route,
     bundles,
     report,
+    resources,
 )
 
 pytestmark = pytest.mark.kernel
@@ -797,6 +798,28 @@ def test_a_ladder_that_spills_throughout_certifies_its_ends_alone():
     assert taken is None or taken not in refused, taken
     assert refused == set(rungs), (rungs, refused)
     assert len(certified & set(rungs)) < len(rungs), (certified, rungs)
+
+
+@COMPILES_ON_CPU
+def test_a_ladder_holds_no_rung_its_assembler_caps_otherwise():
+    """The accurate backward under an alibi hook 64 wide on an H100, at a 128-row query block: its dQ's
+    program moves registers there and not at 64 rows, so its kernels assemble under other caps (248 against
+    255), and its ladder (`MosaicBackward.ladder`, whose rungs a refusal infers refused) holds no rung whose
+    launches' stated caps or register movement differ from its own (row 8467)."""
+    op, ba, derived = _gated_backward("sm90", 64, accurate=True, hooks="alibi")
+    with generation.assumed("sm90"):
+        config = dataclasses.replace(derived, block_q=128)
+        dtype = ba.arguments["query"].dtype
+
+        def stated(tiles):
+            dq, dkv = op._launch_registers(ba, tiles)
+            launches = ((tiles.dkv, dkv),) if tiles.fused else ((tiles, dq), (tiles.dkv, dkv))
+            return [(model.cap(1), model.moves) for model in (
+                resources.register_model(attention_mosaic.bundle_of(each, dtype), each.consumers, registers)
+                for each, registers in launches)]
+
+        assert stated(dataclasses.replace(config, block_q=64)) != stated(config)
+        assert all(stated(rung) == stated(config) for rung in op.ladder(ba, config)), op.ladder(ba, config)
 
 
 @COMPILES_ON_CPU
