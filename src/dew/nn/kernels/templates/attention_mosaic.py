@@ -473,14 +473,18 @@ class MosaicForward(_Mainloop[Tiles]):
     slot held until the values' product is issued, the keys read once: its inference walk's (a training
     walk's anchored launches stream the value array the call gives, the keys' columns sliced)."""
 
+    def _decides(self, residuals: Kept, value_dtype) -> bool:
+        """`deciding` but its family's part: an inference launch whose rows' sums can pass fp32's largest."""
+        return (residuals is not Kept.SPLIT and not self.scaled and self.rounds is None
+                and algebra.headroom(value_dtype))
+
     def deciding(self, residuals: Kept, value_dtype, family: mosaic.Family) -> bool:
         """Whether its launch walks unscaled and decides a second, scaled walk of a program whose rows' sums
         passed fp32's largest (`mosaic.Decided`): an inference launch whose rows' sums can pass it
         (`algebra.headroom`), so no pass over its values chooses its kernels before it and no branch is read
         on the host. A family whose issuing role walks the rings (tcgen05's rows) takes none: its issuer
         would wait on the verdicts too."""
-        return (residuals is not Kept.SPLIT and not self.scaled and self.rounds is None
-                and algebra.headroom(value_dtype) and not family.places_on_role)
+        return self._decides(residuals, value_dtype) and not family.places_on_role
 
     def _hooks(self, score_params, output_params, initial, drop, query_params=()) -> Hooks:
         """The call's hooks from its parameters, state and draw, its static hooks the op's."""
@@ -954,7 +958,8 @@ class MosaicForward(_Mainloop[Tiles]):
                                 merged=initial is not None and residuals is not Kept.SPLIT,
                                 started=initial is not None and residuals is Kept.SPLIT,
                                 prologue=(None if self.query_mod is None
-                                          else (self.query_mod, self.query_kinds, self.query_dtypes)))
+                                          else (self.query_mod, self.query_kinds, self.query_dtypes)),
+                                decides=self._decides(residuals, value.dtype))
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:

@@ -1999,6 +1999,10 @@ class ForwardRegisters:
     prologue: tuple | None = None
     """The query prologue its consumers take on their query tiles (`MosaicForward.query_mod`), with its
     parameters' kinds and dtypes, `(hook, kinds, dtypes)`; None where it has none."""
+    decides: bool = False
+    """Whether its launch walks unscaled and decides a scaled second walk where its family takes one
+    (`MosaicForward.deciding`, a family whose consumers walk its rings): priced at the scaled walk's
+    registers, the larger of its two loops."""
 
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
            columns: int | None = None) -> int | None:
@@ -2017,7 +2021,7 @@ class ForwardRegisters:
         return max(before, forward_registers(
             family, tiles, value_width, self.dtype, self.residuals,
             natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,
-            scaled=self.scaled, codes=self.codes,
+            scaled=self.scaled or (self.decides and not family.places_on_role), codes=self.codes,
             positions=self.positions, per_span=self.per_span, merged=self.merged, started=self.started))
 
 
