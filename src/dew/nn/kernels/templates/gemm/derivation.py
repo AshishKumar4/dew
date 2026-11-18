@@ -274,10 +274,10 @@ def _padded_side(layouts: tuple, consumers: int, role: int, most_rows: int, colu
     area = max(resources.held_area(layout, consumers) for layout in layouts)
     itemsize = jnp.dtype(dtype).itemsize
     best = None
-    for block_m in range(role, most_rows + 1, role):
-        block_n = next((block_n for block_n in columns if block_n * block_m <= area), None)
-        if block_n is None:
-            continue
+    # No rows past those the narrowest width's accumulator area holds: a taller tile holds no width.
+    tallest = min(most_rows, area // columns[-1]) if columns else 0
+    for block_m in range(role, tallest + 1, role):
+        block_n = next(block_n for block_n in columns if block_n * block_m <= area)
         tiles = Tiles(block_m, block_n, steps[0], 2, 1, warpgroups=consumers, family=layouts[0].name)
         seconds = pricing.step_seconds(tiles, target, (itemsize, itemsize))
         if seconds is None:

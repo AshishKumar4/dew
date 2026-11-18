@@ -44,8 +44,7 @@ class Ring(rings.Ring):
 
     def load(self, turn: rings.Turn, view) -> None:
         slot = rings.opaque(turn.slot)
-        pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
-            self.consumed.at[slot], phase=turn.rotation - 1))
+        self.free(turn, slot)
         tokens, rows = view
         height, width = self.block
         [depth] = rows.rest
@@ -95,8 +94,7 @@ class Committed(Ring):
 
     def load(self, turn: rings.Turn, view) -> None:
         slot = rings.opaque(turn.slot)
-        pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
-            self.consumed.at[slot], phase=turn.rotation - 1))
+        self.free(turn, slot)
         tokens, rows = view
         height, width = self.block
         [depth] = rows.rest

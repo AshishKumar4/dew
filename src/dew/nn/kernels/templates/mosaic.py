@@ -813,11 +813,16 @@ class Issuer[Accumulator](abc.ABC):
         step's keys, two granules of 64 at width 128, held at two instructions priced 80 registers where
         ptxas spilled 12 bytes at 80 and held at 88 (the decode gate red at the promotion's composed tip);
         one granule at a product's whole depth (a GEMM step's transposed weight at 64) holds at two
-        instructions, its whole granule refusing 19 picks ptxas holds (the gates both ways, 432 cells)."""
+        instructions, its whole granule refusing 19 picks ptxas holds (the gates both ways, 432 cells). A
+        granule of one instruction still holds the next instruction's fragments, loaded before the current
+        one issues (`operand_steps_ahead`), within the product's depth: an mma.sync 64 x 256 share at a
+        32-deep step held 32 left and 32 right fragment registers live in its PTX where the granule's 16
+        priced the right's at 16, a consumer at 241 where it held 257, so ptxas spilled 192 and 164 bytes at
+        an RTX PRO 6000's two-consumer scaled forwards (row 5634)."""
         consumed = (1 + self.operand_steps_ahead) * self.fragment_depth(depth)
         if retained:
             return min(depth, max(loaded, consumed))
-        return loaded if depth > loaded > self.fragment_depth(depth) else min(loaded, consumed)
+        return loaded if depth > loaded > self.fragment_depth(depth) else min(depth, consumed)
 
     def fragment_depth(self, depth: int) -> int:
         """The depth consumed by one instruction: the step's where its issuer does not split products."""

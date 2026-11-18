@@ -696,7 +696,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                            cost=unit_cost.estimate(2 * m * n * k * len(matrices), *operands,
                                                    *prologue_operands, *epilogue_operands, *out_type),
                            **_prefetched(tiles, grid, k // block_k, transpose_rhs, interpret,
-                                         dense=dense, parts=(tail, scales, mx_scales, gather)))
+                                         dense=dense, parts=(tail, scales, mx_scales, gather), beside=beside))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
                   *_workspace(tail, (multiprocessors, 2, consumers, *part), interpret))
 
@@ -725,7 +725,7 @@ def _gmm_operands(lhs, rhs, paired, scales, step_scales, mx_scales, gather, scat
 
 
 def _prefetched(tiles: Tiles, grid: tuple, steps: int, transpose_rhs: bool, interpret, *, dense: bool,
-                parts: tuple) -> dict:
+                parts: tuple, beside: "Beside | None" = None) -> dict:
     """Dew: a dense `gmm`'s matrix prefetched into L2 before its launch's wait for the one before it
     (`bodies.dependent`'s `prefetched`, `bodies.waits`): each program's first tile's matrix blocks of its
     first stages, so its first loads hit L2 rather than wait on memory under the previous launch's tail
@@ -734,7 +734,8 @@ def _prefetched(tiles: Tiles, grid: tuple, steps: int, transpose_rhs: bool, inte
     (no tail, scales or gathered rows: `parts` all None), whose first tile a program's index states (its
     persistent walk's first, `persistent.tiled`); a grouped one's needs its routing, written before the
     wait. A prefetch reads nothing into the program, so a matrix the launch before it still writes is
-    prefetched early, never read stale."""
+    prefetched early, never read stale. Matrices side by side (`beside`, the operands after the first's)
+    prefetch the first tile's own matrix's blocks (`BesideRefs.columns`)."""
     plain = dense and all(part is None for part in parts)
     if not (plain and tiles.splits == 1 and tiles.cluster == 1
             and bodies.waits(interpret)):
@@ -743,11 +744,14 @@ def _prefetched(tiles: Tiles, grid: tuple, steps: int, transpose_rhs: bool, inte
 
     def prefetched(lhs_gmem, matrix_gmem, *refs):
         # The matrix is the launch's second operand, after the rows (`gmm`'s operands: a dense call's
-        # take no table).
-        del lhs_gmem, refs
+        # take no table), the matrices side by side next.
+        del lhs_gmem
         _, column_tile = tail_of.planar_snake(lax.axis_index("programs"), grid, 1, tiles.grid_block_n)
-        view = (_matrix_columns(matrix_gmem.at[0], column_tile, block_n=tiles.block_n,
-                                transpose_rhs=transpose_rhs), _rhs_index(transpose_rhs))
+        others = () if beside is None else refs[:len(beside.starts) - 1]
+        columns = (_matrix_columns(matrix_gmem.at[0], column_tile, block_n=tiles.block_n,
+                                   transpose_rhs=transpose_rhs) if beside is None
+                   else BesideRefs(beside, (matrix_gmem, *others)).columns(0, column_tile))
+        view = (columns, _rhs_index(transpose_rhs))
         return [rings.viewed(view, block, step) for step in range(min(tiles.stages, steps))]
 
     return {'prefetched': prefetched}
@@ -1724,15 +1728,15 @@ def beside_refusal(tiles: Tiles, family: mosaic.Family, widths: tuple[int, ...],
     where it can: one would read or store a column tile as more than its own matrix's with hooks, a pair,
     scales, tables, transposed or packed rows or a swapped launch (`parts`, None where the call has none), a
     depth split, on a family whose products span a pair (each CTA its half of the pair's columns, which may
-    lie in two matrices), or one whose walk reads its blocks other than through its rings
-    (`mosaic.RingFamily`: cp.async's pipeline takes each stream's one array, `mosaic_sm80`); and each width
-    whole column tiles, one at least (a matrix of no columns is no column tile of the launch, its products
-    apart). Exact sums are a tile's accumulation alone, whichever matrix it reads, so they are taken. The
-    launch's refusal (`gmm`) and the router's eligibility read it alike."""
+    lie in two matrices), or one whose transport selects no step's source among arrays
+    (`Transport.selects_sources`: cp.async's pipeline takes each stream's one array, `mosaic_sm80`); and each
+    width whole column tiles, one at least (a matrix of no columns is no column tile of the launch, its
+    products apart). Exact sums are a tile's accumulation alone, whichever matrix it reads, so they are taken.
+    The launch's refusal (`gmm`) and the router's eligibility read it alike."""
     if any(part is not None for part in parts):
         return ("matrices side by side take no hooks, pair, scales, tables, transposed or packed rows, "
                 "swapped launch")
-    if tiles.splits > 1 or family.pairs_product or not isinstance(family, mosaic.RingFamily):
+    if tiles.splits > 1 or family.pairs_product or not family.selects_sources:
         return "matrices side by side take no depth split, a pair's products or a pipeline's walk"
     columns = tile_columns(tiles, family)
     if any(width % columns or not width for width in widths):
