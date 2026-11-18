@@ -768,7 +768,7 @@ def planned_now(ci) -> tuple[set[tuple[str, str]], list[dict]]:
     """The rows the plan keeps, and the entries it runs, each holding a row no kept task reads."""
     entries = list(planned(ci).values())
     kept = {held for entry in entries for held in ci.kept_of(entry["tests"].split())[1]}
-    return kept, [entry for entry in entries if ci.KEPT_AT not in entry["tests"]]
+    return kept, [entry for entry in entries if ci.session.KEPT_AT not in entry["tests"]]
 
 
 @KINDS

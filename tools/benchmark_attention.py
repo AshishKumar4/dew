@@ -127,7 +127,7 @@ def decision_runs(batch: int, seq: int, options: int):
 
 def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, sinks=None, dtype=None,
                  block_groups=None, runs=None):
-    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.attention import attention_implementation, scaled_dot_product_attention
     from dew.nn.local_attention import local_attention
     window, softcap = config.sliding_window, config.softcap
     if sinks is not None and implementation in ('jax_cudnn', 'tokamax_triton'):
@@ -151,10 +151,11 @@ def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, sin
             logits_soft_cap=softcap, implementation='triton')
     if causal and window is not None and block_groups is None and runs is None:
         return lambda q, k, v: local_attention(
-            q, k, v, window=window, implementation=implementation, sinks=sinks, softcap=softcap, dtype=dtype)
+            q, k, v, window=window, implementation=attention_implementation(implementation), sinks=sinks, softcap=softcap,
+            dtype=dtype)
     key_runs, places = (None, None) if runs is None else runs
     return lambda q, k, v: scaled_dot_product_attention(
-        q, k, v, implementation=implementation,
+        q, k, v, implementation=attention_implementation(implementation),
         causal=causal, sliding_window=window, sinks=sinks, softcap=softcap, dtype=dtype,
         block_groups=block_groups, key_runs=key_runs, places=places)
 
@@ -312,7 +313,8 @@ def main(config: BenchmarkConfig) -> list[dict]:
     for case, peak in zip(cases(config), peaks, strict=True):
         row = measure(case, config)
         # A row its kernel did not serve has no program's peak.
-        row["peak_device_bytes"] = None if not row.get("served") or None in peak else max(peak)
+        held = [value for value in peak if value is not None]
+        row["peak_device_bytes"] = max(held) if row.get("served") and len(held) == len(peak) else None
         rows.append(row)
         label = (f"{row['implementation']} S={row['sequence_length']} "
                  f"D={row['head_dim']} causal={row['causal']}")

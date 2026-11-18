@@ -8,6 +8,7 @@ import dataclasses
 import functools
 import json
 import logging
+import time
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
@@ -23,11 +24,21 @@ from dew.distributed.batches import batch_layout, batch_shardings, batch_signatu
 from dew.distributed.placement import Validation
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import gpu_target
-from dew.nn.kernels.options import hold, trace_context
+from dew.nn.kernels.options import (
+    Spent,
+    abstract_signature,
+    collecting,
+    hold,
+    owned_program,
+    shapes_of,
+    spending,
+    trace_context,
+)
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
 from dew.state import Accumulation, TrainState, apart, occupied, together
+from dew.telemetry.compiles import executable_only
 from dew.telemetry.instrumentation import StepFlops
 from dew.training._candidates import Stepping, _shaped, candidate_for, lowered_for
 from dew.training._lowering import Lowered, routed
@@ -65,7 +76,7 @@ from dew.training.planning import (
 )
 from dew.training.profiling import pgle_runs
 from dew.training.rungs import keep_rung, plan_flops, recorded_rung
-from dew.training.transaction import Transaction, outcome
+from dew.training.transaction import Transaction, outcome_of
 
 if TYPE_CHECKING:
     from dew.training.ahead import AheadOfTime
@@ -137,6 +148,159 @@ class Plan(NamedTuple):
     rung: JSON
     split: int | None
     resumed: bool = False
+
+
+class HostStartup(NamedTuple):
+    """What a host step's startup compiled over its state's shapes before its first step
+    (`StepCompiler._compile_host`): its programs' names, how many, the seconds it took, and by backend
+    (`options.spending`: its CPU companion's, its accelerator's) each one's seconds tracing and lowering,
+    and compiling or reading JAX's persistent cache: the run's own compiles of a step whose steps then
+    compile nothing."""
+
+    names: tuple[str, ...]
+    programs: int
+    seconds: float
+    by_backend: Mapping[str, Mapping[str, float]]
+
+    @classmethod
+    def of(cls, spent: Sequence[Spent], seconds: float) -> HostStartup:
+        by_backend: dict[str, dict[str, float]] = {}
+        for each in spent:
+            held = by_backend.setdefault(each.platform, {"programs": 0, "lowered": 0.0, "compiled": 0.0})
+            held["programs"] += 1
+            held["lowered"] += each.lowered
+            held["compiled"] += each.compiled
+        return cls(tuple(sorted({each.program for each in spent})), len(spent), seconds, by_backend)
+
+    def record(self) -> dict[str, JSON]:
+        return {"names": list(self.names), "programs": self.programs, "seconds": self.seconds,
+                "by_backend": {name: dict(held) for name, held in self.by_backend.items()}}
+
+
+STEADY = 3
+"""The steps a host step's startup pass steps over shapes before its state's types are those it steps from
+(`StepCompiler._compile_host`): the state as placed, then as a step returns it."""
+
+
+class HostRun:
+    """A step that keeps its variables on the host, as its run calls it (`StepCompiler._compile_host`): each
+    step's microbatches through the transaction's phases (`body`) and the glue between them, every
+    program of which a startup pass compiled over its shapes (`startup`), each step run where none
+    compiles (`executable_only`), refused by name where one is missing; a batch of shapes no pass stepped
+    over (a ramp's stage's), or a step called in a trace context none stepped in (a float64 replay's
+    precision), has a pass of its own before its step."""
+
+    def __init__(self, stepping: Stepping, body: Callable, placement, prepared: TrainState, shapes,
+                 split: int, window: int, empty, whole: Callable):
+        self.stepping, self.body, self.placement, self.prepared = stepping, body, placement, prepared
+        self.shapes, self.split, self.window, self.whole = shapes, split, window, whole
+        # The window built with the step, which its first step takes (`windowed`).
+        self.empty = empty
+        # Its glue between the transaction's phases, a program of its own as the transaction's is
+        # (`Transaction.step`): a microbatch's reading of the batch, and its outcome.
+        self.opened = owned_program(functools.partial(_opened, split=split))
+        self.ended = owned_program(functools.partial(outcome_of, split=split))
+        self.started: set[Hashable] = set()
+
+    def __call__(self, current, batch, sampled: bool = False):
+        # A host-master run inspects nothing (`compile` refuses it), so no step of it is sampled.
+        from dew.distributed.host import transfer
+
+        cpu = self.stepping.settings.state_mesh
+        with self.stepping.traced_on(cpu):
+            batch = transfer(batch, batch_shardings(cpu, batch))
+            current = self.windowed(current, batch)
+            if (abstract_signature(batch), trace_context()) not in self.started:
+                self.startup(current, batch)
+            with executable_only():
+                return self.stepped(current, batch, transfer)
+
+    def windowed(self, current: TrainState, batch: Batch) -> TrainState:
+        """`current` with the window its step reads: the one built with the step at a run's first, a
+        ramp's stage's built afresh where its window replays other shapes (`builds_window`)."""
+        stepping, window, split = self.stepping, self.window, self.split
+        if window > 1 and current.accumulation is None and self.empty is not None:
+            empty, self.empty = self.empty, None
+            return dataclasses.replace(current, accumulation=empty,
+                                       window_size=jax.device_put(np.int32(window)))
+        if window > 1 and (current.accumulation is None or (
+                (stepping.shape.ramp or stepping.shape.stage_starts)
+                and not current.accumulation.replays(self.prepared.accumulation))):
+            # The window, and with it the split, the state's from here on, as a device step's.
+            return dataclasses.replace(
+                stepping.initialize_accumulation(current, microbatch_shapes(batch, split), self.shapes,
+                                                 window=window, split=split),
+                window_size=jax.device_put(np.int32(window)))
+        return current
+
+    def stepped(self, current: TrainState, batch: Batch, moved: Callable) -> tuple:
+        """One step over `current` and `batch`, values or shapes, each move made by `moved`."""
+        split = self.split
+        # Every step reads the state where its placement puts it, as the step before it returned it: the
+        # programs its startup compiled over those placements are the ones each step calls.
+        current = moved(current, self.placement)
+        has_batch_stats = (split > 1 and current.window is not None
+                           and current.window.batch_statistics is not None)
+        pooled = self.stepping.model_batch(batch) if has_batch_stats else None
+        outputs = []
+        # Each microbatch an attempt of its own, its device work the accelerator's forward
+        # (`HostExecution`), the step counted at its last.
+        for part in range(split):
+            at = np.int32(part)
+            micro, tokens, closes, consumed = _microbatch_of(self.opened, batch, part, split)
+            advanced, loss, aux, committed = self.body(current, micro, at, tokens, closes, pooled)
+            count, clock, *output = self.ended(current.step, current.consumed, current.microstep,
+                                               advanced.microstep, loss, aux, committed, batch,
+                                               np.int32(part == split - 1), consumed)
+            current = dataclasses.replace(advanced, step=count, consumed=clock)
+            outputs.append(tuple(output))
+        # A leaf already where its placement says stays the array it
+        # is: the resident frozen collection crosses no boundary.
+        return moved(current, self.placement), *(self.whole(outputs) if split > 1 else outputs[0])
+
+    def startup(self, held: TrainState, batch: Batch) -> HostStartup:
+        """The step over `held`'s and `batch`'s shapes within `collecting`: every program it calls compiled
+        there as it calls them over arrays, each of them its steps then run (`OuterProgram`'s `_shaped`); a
+        pass that reads and writes nothing of the run. Its first step reads the state as given, each later
+        one the state the step before returned, whose types its programs state (a weak type among them):
+        the pass steps on its own results' shapes until they are the shapes it stepped from. What it
+        compiled (`HostStartup`)."""
+        from dew.training.execution import placed_as
+
+        began = time.perf_counter()
+        with collecting(), spending() as spent:
+            shaped = shapes_of(held)
+            for _ in range(STEADY):
+                returned = self.stepped(shaped, shapes_of(batch), placed_as)[0]
+                if abstract_signature(returned) == abstract_signature(shaped):
+                    break
+                shaped = returned
+            else:
+                raise ValueError(f"a host step's state takes other types at each of its first {STEADY} "
+                                 "steps: its programs settle on none to compile ahead of its first step")
+        self.started.add((abstract_signature(batch), trace_context()))
+        passed = HostStartup.of(spent, time.perf_counter() - began)
+        _log.info("a host step's startup compiled %d programs over its state's shapes in %.1f s (%s): %s",
+                  passed.programs, passed.seconds, passed.by_backend, ", ".join(passed.names))
+        return passed
+
+
+def _opened(batch: Batch, part: jax.Array, *, split: int) -> tuple:
+    """A host step's `part`th microbatch of `batch` (`microbatch`), its real tokens and the source examples
+    it consumes (`_microbatch_of`)."""
+    micro = microbatch(batch, part, split)
+    return micro, batch_tokens(micro), batch_consumed(micro)
+
+
+def _microbatch_of(opened: Callable, batch: Batch, part: int, split: int) -> tuple:
+    """A host step's `part`th microbatch of `batch` (`_opened`, its program), the objective's batch of it,
+    its real tokens, whether it closes the window and the source examples it consumes. A field with no rows
+    is the batch's own array, which every microbatch reads whole, and the whole batch is its one microbatch:
+    those the program would hand back as given, which the arrays a call is keyed by keep as they are."""
+    micro, tokens, consumed = opened(batch, np.int32(part))
+    micro = batch if split == 1 else jax.tree.map(
+        lambda sliced, given: sliced if np.ndim(given) else given, micro, batch)
+    return model_batch(micro), tokens, micro.get(CLOSES_WINDOW), consumed
 
 
 class Unplaced(NamedTuple):
@@ -300,6 +464,8 @@ class StepCompiler[L, E]:
         # A fresh run's first step planned over its state's shapes before the state is placed
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
         self._unplaced: Unplaced | None = None
+        # What a host step's startup compiled over its state's shapes (`_compile_host`), None before one.
+        self.host_startup: HostStartup | None = None
         # Where each step's plan stands, by the batch's layout and the pass count it runs (`_plan_key`): the
         # rung and split this process's search found, which every later search of that step starts at
         # (`_planned`), so a process searches a step once; or the rung a resumed checkpoint recorded for
@@ -893,6 +1059,13 @@ class StepCompiler[L, E]:
             _log.info("the step fits the devices in the plan %s", plan)
         return planned, flops, plan, validation, keep
 
+    def prepared_host(self, stepping: Stepping, state: TrainState, batch: Batch) -> HostStartup:
+        """A fresh host step's startup over `state`'s and `batch`'s shapes (`_compile_host`), nothing placed:
+        what a build host compiles to warm the shared cache (`dew.training.ahead.prepare_host_step`)."""
+        self._compile_host(stepping, state, batch)
+        assert self.host_startup is not None, "a host step's compile runs its startup pass"
+        return self.host_startup
+
     def _compile_host(self, stepping: Stepping, state: TrainState, batch: Batch
                       ) -> CompiledStep:
         settings = stepping.settings
@@ -921,39 +1094,20 @@ class StepCompiler[L, E]:
                                       skip=settings.skip_nonfinite)
             body = transaction.step(realize=execution.realize, host=True,
                                     frozen=tuple(path for path, _, _ in frozen_trees(state.variables, sites)))
-        # A split step's whole from its microbatches' outputs, its loss as an unsplit step logs it.
-        whole = whole_step_program(self.objective)
-
-        def run(current, batch, sampled: bool = False):
-            # A host-master run inspects nothing (`compile` refuses it), so no step of it is sampled.
-            with stepping.traced_on(cpu):
-                batch = transfer(batch, batch_shardings(cpu, batch))
-                if window > 1 and (current.accumulation is None or (
-                        (stepping.shape.ramp or stepping.shape.stage_starts)
-                        and not current.accumulation.replays(prepared.accumulation))):
-                    # The window, and with it the split, the state's from here on, as a device step's
-                    # (`builds_window`).
-                    current = dataclasses.replace(
-                        stepping.initialize_accumulation(current, microbatch_shapes(batch, split), shapes,
-                                                         window=window, split=split),
-                        window_size=jax.device_put(np.int32(window)))
-                has_batch_stats = (split > 1 and current.window is not None
-                                   and current.window.batch_statistics is not None)
-                pooled = stepping.model_batch(batch) if has_batch_stats else None
-                outputs = []
-                # Each microbatch an attempt of its own, its device work the accelerator's forward
-                # (`HostExecution`), the step counted at its last.
-                for part in range(split):
-                    micro = microbatch(batch, np.int32(part), split)
-                    advanced, loss, aux, committed = body(current, model_batch(micro), part,
-                                                          batch_tokens(micro), micro.get(CLOSES_WINDOW),
-                                                          pooled)
-                    current, *output = outcome(current, advanced, loss, aux, committed, batch,
-                                               part == split - 1, batch_consumed(micro), split=split)
-                    outputs.append(tuple(output))
-                # A leaf already where its placement says stays the array it
-                # is: the resident frozen collection crosses no boundary.
-                return transfer(current, placement), *(whole(outputs) if split > 1 else outputs[0])
+        # A state of shapes alone (a build host's, warming the shared cache: `dew.training.ahead
+        # .prepare_host_step`) holds its window's shapes.
+        concrete = not isinstance(jax.tree.leaves(state.variables)[0], jax.ShapeDtypeStruct)
+        # The window a run's first step builds (`builds_window`), built here, with the step: its first
+        # step reads it as built, compiling and tracing nothing (`executable_only`).
+        empty = (None if window == 1 or state.accumulation is not None else stepping.initialize_accumulation(
+            state, microbatch_shapes(cpu_batch, split), shapes, window=window, split=split,
+            shape_only=not concrete).accumulation)
+        run = HostRun(stepping, body, placement, prepared, shapes, split, window, empty,
+                      whole_step_program(self.objective))
+        # The run's startup, before its first step, over its state with that window.
+        with stepping.traced_on(cpu):
+            self.host_startup = run.startup(state if empty is None else dataclasses.replace(
+                state, accumulation=empty, window_size=jax.device_put(np.int32(window))), cpu_batch)
         return run
 
     # ------------------------------------------------------------------ The loop

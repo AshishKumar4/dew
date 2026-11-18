@@ -225,30 +225,37 @@ def test_a_surrogate_holds_every_order(edge):
 def test_the_fused_norms_and_products_hold_every_order(edge):
     """`norm_swiglu`'s fused pre-norm seam, RMS norm, RMS norm with an activation after it (its tangent on
     the tile declared), gated norm, SiLU product and packed SiLU product (each through
-    `generation.linear_tangent`), interpreted on a CPU as the norm tests call them: every order finite
-    wherever float64 is a normal float32 and the plain formula, the norm and the product as written, is."""
+    `generation.linear_tangent`), interpreted on a CPU as the norm tests call them, each launched as its
+    selector's choice launches it, on the logical axes production names (`RESIDUAL` a norm's rows,
+    `MLP_HIDDEN` a product's), so a mesh runs it per shard: every order finite wherever float64 is a normal
+    float32 and the plain formula, the norm and the product as written, is."""
     import test_norm_swiglu as norms
 
-    x, branch, gate, up = normal_draw(2661, (3, 16), (3, 16), (3, 16), (3, 16), scale=EDGES[edge])
+    from dew.nn.sharding import MLP_HIDDEN, RESIDUAL
+
+    rows = (2, 3, 16)
+    x, branch, gate, up = normal_draw(2661, rows, rows, rows, rows, scale=EDGES[edge])
     (scale,) = normal_draw(2662, (16,))
-    dx, dbranch, dgate, dup = normal_draw(2663, (3, 16), (3, 16), (3, 16), (3, 16), scale=EDGES[edge])
+    dx, dbranch, dgate, dup = normal_draw(2663, rows, rows, rows, rows, scale=EDGES[edge])
     (dscale,) = normal_draw(2664, (16,))
-    (cotangent,) = normal_draw(2665, (3, 16))
+    (cotangent,) = normal_draw(2665, rows)
     sites = {
-        "a pre-norm seam": (joined(norms.fused_seam(1e-6, jnp.float32, offset=False, after_cast=False)),
+        "a pre-norm seam": (joined(norms.fused_seam(1e-6, jnp.float32, offset=False, after_cast=False,
+                                                    axes=RESIDUAL)),
                             joined(lambda x, branch, scale: (x + branch, plain_rms(x + branch) * scale)),
                             (x, branch, scale), (dx, dbranch, dscale),
                             jnp.concatenate([cotangent, cotangent], axis=-1)),
-        "an unweighted RMS norm": (norms.fused_unweighted(1e-6), plain_rms, (x,), (dx,), cotangent),
-        "an RMS norm with an activation": (norms.fused_activated(1e-6, jax.nn.swish),
+        "an unweighted RMS norm": (norms.fused_unweighted(1e-6, axes=RESIDUAL), plain_rms, (x,), (dx,),
+                                   cotangent),
+        "an RMS norm with an activation": (norms.fused_activated(1e-6, jax.nn.swish, axes=RESIDUAL),
                                            lambda x, scale: jax.nn.swish(plain_rms(x) * scale), (x, scale),
                                            (dx, dscale), cotangent),
-        "a gated RMS norm": (norms.fused_gated(1e-6, jnp.float32, "silu"),
+        "a gated RMS norm": (norms.fused_gated(1e-6, jnp.float32, "silu", axes=RESIDUAL),
                              lambda x, gate, scale: plain_rms(x) * scale * jax.nn.silu(gate),
                              (x, gate, scale), (dx, dgate, dscale), cotangent),
-        "a SiLU product": (norms.fused_swiglu(), lambda gate, up: jax.nn.silu(gate) * up, (gate, up),
-                           (dgate, dup), cotangent),
-        "a packed SiLU product": (norms.fused_packed(),
+        "a SiLU product": (norms.fused_swiglu(axes=MLP_HIDDEN), lambda gate, up: jax.nn.silu(gate) * up,
+                           (gate, up), (dgate, dup), cotangent),
+        "a packed SiLU product": (norms.fused_packed(axes=MLP_HIDDEN),
                                   lambda gate_up: jax.nn.silu(gate_up[..., 0, :]) * gate_up[..., 1, :],
                                   (jnp.stack([gate, up], axis=-2),), (jnp.stack([dgate, dup], axis=-2),),
                                   cotangent),

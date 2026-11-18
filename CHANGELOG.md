@@ -7,6 +7,16 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A step that keeps its variables on the host (`Layout(host=("variables",))`) compiles every program it calls
+  at its run's startup, over its state's and batch's shapes (`options.collecting`), its CPU companion's and
+  its accelerator's alike, stepping on its own results' shapes until they settle; its steps then trace,
+  lower and compile nothing (`executable_only` holds from the first), a window that replays included. Its
+  glue between the transaction's phases (an attempt's arithmetic, the replay's and the records', a
+  microbatch's reading and its outcome) runs as programs of their own. The startup's programs and seconds
+  are logged and kept (`StepCompiler.host_startup`). A program compiled over shapes within `collecting`
+  serves a later call over arrays alike in shape, dtype, weak type, placement and static arguments
+  (`OuterProgram`).
+
 - A layout that keeps the variables on the host (`Layout(host=("variables",))`) reads each step's batch in
   the split the run states, each microbatch an attempt of its own, as a device step does; it read every
   step's batch whole, refusing a stated split.

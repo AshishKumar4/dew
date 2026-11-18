@@ -412,14 +412,15 @@ def encoded_form(quantization, tensors, names):
 
 
 def memory_limited_to(limit: int) -> int:
-    """The memory of a GPU whose allocator is limited to `limit` bytes (`dew._devices.allocator_limit`): what
-    a test states of a compile-only GPU (`compile_only_gpus`' `memory`) to plan against `limit`."""
+    """The memory of a GPU whose allocator is limited to `limit` bytes at Dew's share (`DEW_SHARE`, which
+    `compile_only_gpus` and `stand_in_gpus` state where none is given, `dew._devices.allocator_limit`): what a
+    test states of a compile-only or stand-in GPU's `memory` to plan against `limit`."""
     import math
 
-    from dew._devices import allocator_limit, pool_share
+    from dew._devices import DEW_SHARE, allocator_limit
 
-    memory = math.ceil(limit / pool_share())
-    assert allocator_limit(memory) == limit, (limit, memory)
+    memory = math.ceil(limit / DEW_SHARE)
+    assert allocator_limit(memory, DEW_SHARE) == limit, (limit, memory)
     return memory
 
 

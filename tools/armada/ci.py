@@ -536,16 +536,17 @@ def pinned_classes() -> list[str]:
 def reusable(python: str, rows: list[tuple[str, str]], common: str,
              missed: dict[str, int]) -> dict[tuple[str, str], str]:
     """The rows of `rows` (each a file and its group, "" for the whole file) that ran green on exactly these
-    inputs (`common`, and each file's own, `fresh`) on any class the tasks run on (`pinned_classes`), which a
-    task of theirs could land on, read at plan time with the cache's read token (`READ_TOKEN`): a task of
-    their own would only look each up and exit. A heavy file's groups are rows like any other, each looked up
-    by its own (2026-10-30: the plan looked up whole files alone, and a docs-only change's 1,034 green groups
-    of heavy files each booted a container to read its record). Each with where its green run is kept
-    (`green_key`'s class and key, `KEPT_AT`'s token), which the plan hands the task that holds it, so no run
-    of another commit replacing a row's last record between plan and task can hide it (2026-10-30: a kept task
-    found 23 of its 259 files and ran the rest). None where the plan has no token or no class (the maintainer,
-    2026-10-28: a lane run with most files unchanged booted a container a task; 2026-10-29: the suite pinned
-    to 25/17 and 26/17). Why each other row was not, counted in `missed` (`green_record`'s word)."""
+    inputs (`common`, and each file's own, `fresh`) on any class the tasks run on (`pinned_classes`),
+    which a task of theirs could land on, read at plan time with the cache's read token (`READ_TOKEN`): a
+    task of their own would only look each up and exit. A heavy file's groups are rows like any other,
+    each looked up by its own (2026-10-30: the plan looked up whole files alone, and a docs-only change's
+    1,034 green groups of heavy files each booted a container to read its record). Each with where its
+    green run is kept (`green_key`'s class and key, `session.KEPT_AT`'s token), which the plan hands the
+    task that holds it, so no run of another commit replacing a row's last record between plan and task
+    can hide it (2026-10-30: a kept task found 23 of its 259 files and ran the rest). None where the plan
+    has no token or no class (the maintainer, 2026-10-28: a lane run with most files unchanged booted a
+    container a task; 2026-10-29: the suite pinned to 25/17 and 26/17). Why each other row was not,
+    counted in `missed` (`green_record`'s word)."""
     token, held = os.environ.get(READ_TOKEN), pinned_classes()
     if not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
         return {}
@@ -591,18 +592,10 @@ def eager_sites(python: str, sites: Sequence[tuple[str, str]]) -> set[tuple[str,
         return {site for site, later in zip(sites, pool.map(needed, sites), strict=True) if later}
 
 
-KEPT_AT = "@"
-"""What joins a kept row's file to where its green run is kept in a plan entry's tests (`reusable`):
-`tests/test_a.py@<class>:<key>`, or a group's, `tests/test_a.py#2/3@<class>:<key>`, which the task reads
-(`kept_of`)."""
-
-GROUP_AT = "#"
-"""What joins a kept row's file to its group in its token (`KEPT_AT`), as a row's name does (`row`)."""
-
-
 def kept_token(name: str, group: str, at: str) -> str:
-    """The token of file `name`'s row in `group` ("" for the whole file), kept where `at` says (`KEPT_AT`)."""
-    return f"{name}{GROUP_AT + group if group else ''}{KEPT_AT}{at}"
+    """The token of file `name`'s row in `group` ("" for the whole file), kept where `at` says
+    (`session.KEPT_AT`)."""
+    return f"{name}{session.GROUP_AT + group if group else ''}{session.KEPT_AT}{at}"
 
 
 KEPT_BYTES = 64 * 1024
@@ -632,13 +625,13 @@ def kept_tasks(python: str, found: Mapping[tuple[str, str], str],
 
 
 def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
-    """A task's `tests`, each a file's name, or a kept row's token, its file's name with its group where it
-    has one and where its green run is kept (`KEPT_AT`): the files the task runs whole, those kept among
-    them, and each kept row's class and key by its file and group."""
+    """A task's `tests`, each a file's name, or a kept row's token, its file's name with its group where
+    it has one and where its green run is kept (`session.KEPT_AT`): the files the task runs whole, those
+    kept among them, and each kept row's class and key by its file and group."""
     names, kept = [], {}
     for test in tests:
-        at_row, _, at = test.partition(KEPT_AT)
-        name, _, group = at_row.partition(GROUP_AT)
+        at_row, _, at = test.partition(session.KEPT_AT)
+        name, _, group = at_row.partition(session.GROUP_AT)
         if not group:
             names.append(name)
         if at:
@@ -774,12 +767,6 @@ def durations_record(path: Path = session.DURATIONS) -> dict[str, float]:
     """The durations record (`session.DURATIONS`, or the one at `path`): each test's node id and its cost
     (`session.cost`)."""
     return session.costs(path)
-
-
-def durations_entries(path: Path = session.DURATIONS) -> dict[str, float | list[float]]:
-    """The durations record's entries as kept, each test's least warm and least cold seconds
-    (`session.entry`)."""
-    return json.loads(path.read_text()) if path.is_file() else {}
 
 
 def members(name: str, split: str, reading: Reading | None = None) -> list[str]:
@@ -1184,6 +1171,7 @@ def plan(target: float, timings: dict, census: bool = False, reach: dict | None 
         session.shared_setups(name)
     recorded = recorded_tests()
     stored = stored_weights()
+    heavy = session.heavy_files()
     entries = []
     for python in PYTHONS:
         # Every file on the floor, and on the census every file on every Python; on a pushed run, its cache's
@@ -1244,7 +1232,8 @@ def plan(target: float, timings: dict, census: bool = False, reach: dict | None 
     # What the newest Python runs no test of, it imports (`COLLECT`): on a pushed run, every file but its own.
     rest = [] if census else [name for name in every if name not in NEWEST_FILES]
     collecting = collect_entries(rest, timings, target)
-    return keyed(entries + [{**entry, **stamped} for entry in collecting])
+    return keyed([session.sized(entry, heavy)
+                  for entry in entries + [{**entry, **stamped} for entry in collecting]])
 
 
 def keyed(entries: list[dict]) -> list[dict]:
@@ -1256,7 +1245,7 @@ def keyed(entries: list[dict]) -> list[dict]:
     CPU was about a quarter used). Hashed: a kept task's entry, which travels whole as one environment
     string, holds up to `KEPT_BYTES` of row names already."""
     def key(entry: dict) -> str:
-        identity = {"rows": entry.get("rows") or [entry["name"]], "kept": KEPT_AT in entry["tests"],
+        identity = {"rows": entry.get("rows") or [entry["name"]], "kept": session.KEPT_AT in entry["tests"],
                     **{field: entry.get(field) for field in ("cache", "census")}}
         return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     return [{**entry, "key": key(entry)} for entry in entries]
@@ -1631,7 +1620,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # does a run that records none (a prepare's: a test it prepared has not passed, and a test an earlier
     # attempt passed still prepares into this one's store).
     resumes = recorded and site is None and coverage is None
-    done_before, cold_before = progress.resumed(tests, grading.owning) if resumes else ({}, set())
+    done_before, cold_before, peak_before = (progress.resumed(tests, grading.owning) if resumes
+                                             else ({}, set(), None))
     aside = out.with_name(f"{out.name}.set-aside.json")
     aside.write_text(json.dumps(sorted(done_before)))
     command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if resumes else [])]
@@ -1644,6 +1634,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
         command, environment, deadline, grace, pid, python, evidence_name(python, tests, group), began)
+    # This attempt's peak, and an earlier attempt's where it ran tests this row carries (`progress.resumed`).
+    peak = max((found for found in (progress.task_peak(), peak_before) if found is not None), default=None)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
@@ -1694,6 +1686,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      **({"cold": cold} if (cold := sorted(set(grading.compiled_cold(own)) | {
                          node for node in cold_before if grading.holds(name, node)})) else {}),
                      "ynn_switched": grading.ynn_switched(own), "cells": grading.flow_cells(own),
+                     # The task's resident peak, its tests' bound of their memory (`task_peak`).
+                     **({"peak": peak} if peak is not None else {}),
                      # A judge's, beside its pooling, what its map tasks' records say they paid
                      # (`site_costs`).
                      "timings": {row(python, name, group if site else ""): seconds,
@@ -2227,16 +2221,17 @@ def raised(record: dict[str, float], held: list[dict], marked: dict) -> dict[str
     return taken
 
 
-def folded_entries(record: dict[str, float | list[float]], verdict: dict, target: float) -> dict:
+def folded_entries(record: dict[str, session.Entry], verdict: dict, target: float) -> dict:
     """The durations `record`'s entries with main's CI `verdict` folded in (`session.entry`): each test's
     warm time as `folded` keeps the record, a run in which it compiled a program the shared cache lacked
     (a row's `cold`) timing it no warm time; its cold time the least of the green runs so, raised by a
-    red or cut-off row's past it, as `raised` raises an entry. A test the warm record drops loses its
-    cold time with it: one record, so no test is timed cold that the record no longer holds (Main,
-    2026-11-18, row 7939)."""
+    red or cut-off row's past it, as `raised` raises an entry; its peak the newest of its rows' (`peak`).
+    A test the warm record drops loses its cold time and peak with it: one record, so no test is timed
+    cold or sized that the record no longer holds (Main, 2026-11-18, rows 7939 and 6003)."""
     warm = {node: session.warm_cold(held)[0] for node, held in record.items()}
     cold = {node: found for node, held in record.items()
             if (found := session.warm_cold(held)[1]) is not None}
+    peaks = {node: found for node, held in record.items() if (found := session.peak(held)) is not None}
     # The warm fold sees each cold-timed test at its warm record, where it has one: a cold run moves no warm
     # time. A test no warm run has timed takes its cold time as its warm one, which a warm run lowers.
     calm = {**verdict, "rows": [
@@ -2252,7 +2247,20 @@ def folded_entries(record: dict[str, float | list[float]], verdict: dict, target
                     before = cold.get(node)
                     cold[node] = (seconds if before is None else min(before, seconds) if green
                                   else max(before, seconds))
-    return {node: session.entry(seconds, cold.get(node)) for node, seconds in kept.items()}
+            # Each test's peak, the newest task's that ran it, red or green: a bound that follows its test as
+            # it grows, never the least of runs it has outgrown (`task_peak`).
+            if (measured := row_.get("peak")) is not None:
+                for node in row_.get("tests", {}):
+                    if node in kept:
+                        peaks[node] = int(measured)
+                # A task killed before it reported a case (its pytest OOM-killed) still bounds its file's
+                # tests: their peaks raised to it, never lowered by a run that timed none of them (review).
+                if not row_.get("tests"):
+                    file = row_["name"].split(":", 1)[1].split("#", 1)[0]
+                    for node in kept:
+                        if grading.owning(node) == file:
+                            peaks[node] = max(peaks.get(node, 0), int(measured))
+    return {node: session.entry(seconds, cold.get(node), peaks.get(node)) for node, seconds in kept.items()}
 
 
 def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, float]:
@@ -2417,7 +2425,7 @@ def main() -> int:
         return 1 if wrong or not nodes else 0
     if args.operation == "durations":
         target = json.loads(Path(".armada.json").read_text())["target"]
-        before, verdict = durations_entries(), json.loads(args.verdict.read_text())
+        before, verdict = session.entries(), json.loads(args.verdict.read_text())
         # The record main's CI cut its files by, read before its times change it (`cuts.refolded`).
         cut_by = {name: own_tests(name, tests) for name, tests in parted_record().items()}
         recorded = folded_entries(before, verdict, target)

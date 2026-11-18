@@ -1146,9 +1146,11 @@ def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes:
     held = record_class(member)
     if held is not None:
         declared = declared_type(held, name)
-        if (not (dtypes and name == "dtype") and isinstance(declared, type)
-                and declared not in (Any, object, bool, int, float, str) and not is_protocol(declared)
-                and not issubclass(declared, (Mapping, Sequence)) and isinstance(value, declared)):
+        # A subscripted generic's nominal class is its origin (`ConditionEncoder[Any, Any]`'s, the class).
+        nominal = typing.get_origin(declared) or declared
+        if (not (dtypes and name == "dtype") and isinstance(nominal, type)
+                and nominal not in (Any, object, bool, int, float, str) and not is_protocol(nominal)
+                and not issubclass(nominal, (Mapping, Sequence)) and isinstance(value, nominal)):
             # A value the caller built, of the field's own nominal class (an encoder a binder made),
             # is kept as it is, whatever its kind; `Any` and `object` name no class to check, and a
             # scalar or a dtype's name is read as before (`_rebuilt`).
