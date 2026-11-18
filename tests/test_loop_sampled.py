@@ -142,8 +142,10 @@ def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count():
         np.testing.assert_array_equal(np.asarray(loss), np.asarray(own_loss), err_msg=f"microbatch {index}")
         for name, value in jax.device_get(metrics).items():
             np.testing.assert_array_equal(value, jax.device_get(own_metrics)[name], err_msg=f"{index} {name}")
-        assert jax.tree.all(jax.tree.map(lambda a, b: bool(np.array_equal(a, b)),
-                                         jax.device_get(state), jax.device_get(own))), f"microbatch {index}"
+        ours, theirs = (jax.tree_util.tree_flatten_with_path(jax.device_get(tree))[0] for tree in (state, own))
+        unlike = [jax.tree_util.keystr(path) for (path, a), (_, b) in zip(ours, theirs, strict=True)
+                  if not np.array_equal(a, b)]
+        assert not unlike, f"microbatch {index} at {count} passes: {unlike}"
     assert drawn == [TRAINED.count(words(sampled.key), position) for position in range(8)]
     assert len(set(drawn)) > 1 and interval.microbatches == 8
 
