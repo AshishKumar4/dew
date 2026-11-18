@@ -217,9 +217,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # fla's simple GLA rounds at its release's placements, its write gated on the values
         # (`mainloop.Call.values_gated`).
         values_gated = simple_gla(hooks)
-        # Keys at most one in size, which the template's own pairs may fold their decays against
-        # (`mainloop.Call.unit_keys`).
-        unit_keys = hooks.l2norm
+        # Keys of unit norm (the op's `l2norm`, or as `write_bound` declares: `Hooks.inverse_bound`'s
+        # contract), which the template's own pairs may fold their decays against (`mainloop.Call.unit_keys`).
+        unit_keys = hooks.l2norm or hooks.write_bound is not None
         rounded = chunk_rounding(hooks.delta, jnp.result_type(query, key, value), released=values_gated)
         skip = given['skip'] if hooks.skip else None
         # Without the delta rule the template takes the skip, its output wide where an epilogue or the

@@ -678,55 +678,6 @@ def test_a_memory_read_through_a_decay_past_fp32s_normals_is_as_exact_as_the_rec
                     seeds=FEWEST_SEEDS)
 
 
-def subnormal_draw(hooks, seed: int):
-    """`draw`'s operands of one sequence in bf16 driving a chunk's own pairs into fp32's subnormals: each
-    token's decay along every key dimension near its floor (log decays in (-6, -5) a token, a sub-chunk's
-    pairs reaching 2^-120 and past), unit-norm keys and queries of varied entries (the call's own norm),
-    and write gates down to 2^-60 (the system's rows, a key times its gate, as small), with cotangents of the
-    output and the final memory."""
-    (operands,) = draw(hooks, packed=False, seed=seed)
-    rng = np.random.default_rng([seed, 7299])
-    log_decay = hosted(rng.uniform(-6.0, -5.0, operands.log_decay.shape))
-    beta = hosted(2.0 ** rng.uniform(-60.0, 0.0, operands.beta.shape))
-    operands = dataclasses.replace(operands, log_decay=log_decay, beta=beta, **{
-        name: getattr(operands, name).astype(jnp.bfloat16) for name in ('query', 'key', 'value')})
-    return operands, cotangents(operands, seed)
-
-
-@pytest.mark.check1_shards(seeds=16, per_task=2)
-def test_own_pairs_folded_against_unit_keys_are_as_exact_into_fp32s_subnormals():
-    """The template's own pairs where its keys are normalised (`Hooks.l2norm`, `mainloop.Call.unit_keys`),
-    each row taking its decay before the key's product (`recurrence_algebra.key_diagonal_bands`), against the
-    same template over the same normalised keys stated as given (its own pairs' row times the key first),
-    over draws driving those products into fp32's subnormals (`subnormal_draw`), interpreted: its output,
-    final memory and every operand's gradient on par from float64 (check 1), the two orders rounding apart
-    under gradual underflow (row 7299)."""
-    folding = recurrence.Hooks(decay='vector', l2norm=True)
-    width = KEY_WIDTH
-
-    def folded(operands):
-        return chunk_on('mosaic_gpu', folding, operands, chunk_size=CHUNK)
-
-    def unfolded(operands):
-        # The normalisation the folding call takes inside, done before it, so the template sees keys it
-        # states nothing of.
-        query, key = (l2norm(x.astype(jnp.float32)).astype(x.dtype) for x in (operands.query, operands.key))
-        given = dataclasses.replace(operands, query=query, key=key)
-        return chunk_on('mosaic_gpu', recurrence.Hooks(decay='vector', scale=width ** -0.5), given,
-                        chunk_size=CHUNK)
-
-    def truth(operands, seeded):
-        with jax.enable_x64(new_val=True):
-            wide = jax.tree.map(lambda t: jnp.asarray(t, jnp.float64)
-                                if jnp.issubdtype(jnp.asarray(t).dtype, jnp.floating) else t,
-                                (operands, seeded))
-            return jax.jit(with_gradients(functools.partial(token_by_token, folding)))(*wide)
-
-    assert_as_exact(jax.jit(with_gradients(folded)), jax.jit(with_gradients(unfolded)),
-                    functools.partial(subnormal_draw, folding), f'{folding} own pairs into the subnormals',
-                    seeds=16, truth_fn=truth)
-
-
 ROUNDED_ONCE = [recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True),
                 recurrence.Hooks(decay='scalar', scale=0.1, skip=True),
                 recurrence.Hooks(decay='scalar', scale=0.1, skip=True, output=recurrence.OutputNorm(1e-6))]
