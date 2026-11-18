@@ -211,11 +211,14 @@ def _activation_spans(jaxpr) -> list:
 @pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
 def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, implementation):
     """A gated product (`gated_product`, 'swiglu'), its XLA arithmetic or SwiGLU's Pallas kernel where it
-    is named (on an H100's routes, interpreted on a CPU), is one region of its activation
-    (`derivatives.Activation('swiglu', gated=True)`) over its gate and up projection, whichever route it
-    takes, the seam a fusion pass's epilogue replaces: inlined, it computes what the route unmarked
-    computes, its value and its operands' gradients bit for bit. An ungated MLP's named activation is one
-    region of it ungated."""
+    is named (on an H100's routes), is one region of its activation (`derivatives.Activation('swiglu',
+    gated=True)`) over its gate and up projection, whichever route it takes, the seam a fusion pass's
+    epilogue replaces: the region's body is the program the route unmarked traces, equation for equation,
+    so inlined it computes what the route computes; and the XLA route's value and operands' gradients are
+    that route's unmarked, bit for bit, run (a CPU runs no Pallas GPU kernel its selector takes). An
+    ungated MLP's named activation is one region of it ungated."""
+    from jax.extend.core import ClosedJaxpr
+
     from dew.nn import derivatives
     from dew.nn.kernels import norm_swiglu
     from dew.nn.mlp import GatedMLP
@@ -226,16 +229,19 @@ def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, 
     portable = activations._portable(activations.silu, lambda gate, up: (gate, up))
     plain = portable if implementation == "xla" else (
         lambda gate, up: norm_swiglu.swiglu(gate, up, portable))
+    with generation.assumed("sm90"):
+        traced, unmarked = (jax.make_jaxpr(function)(gate, up) for function in (product, plain))
+    (span,) = traced.jaxpr.eqns
+    body = span.params["call_jaxpr"]
+    assert span.primitive is derivatives.marked_call_p
+    assert span.params["kind"] == derivatives.Activation("swiglu", gated=True)
+    assert str(body.jaxpr if isinstance(body, ClosedJaxpr) else body) == str(unmarked.jaxpr)
+    assert ("pallas_call" in str(unmarked)) == (implementation == "pallas")
+    if implementation == "xla":
+        def summed(function):
+            return jax.jit(jax.value_and_grad(lambda g, u: jnp.sum(function(g, u).astype(jnp.float32)),
+                                              argnums=(0, 1)))
 
-    def summed(function):
-        return jax.jit(jax.value_and_grad(lambda g, u: jnp.sum(function(g, u).astype(jnp.float32)),
-                                          argnums=(0, 1)))
-
-    # Off a GPU the selector takes XLA's arithmetic, a kernel named too: both arms take the H100's route.
-    with generation.assumed("sm90", interpreted=True):
-        traced = jax.make_jaxpr(product)(gate, up)
-        assert _activation_spans(traced.jaxpr) == [derivatives.Activation("swiglu", gated=True)]
-        assert ("pallas_call" in str(traced)) == (implementation == "pallas")
         (value, gradients), (own, own_gradients) = summed(product)(gate, up), summed(plain)(gate, up)
         np.testing.assert_array_equal(np.asarray(value), np.asarray(own))
         for mine, theirs in zip(gradients, own_gradients, strict=True):
