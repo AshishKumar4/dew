@@ -717,6 +717,39 @@ def test_an_own_pair_at_fp32s_edge_reads_as_float64_does(case):
     np.testing.assert_array_equal(ours[normal], truth[normal])
 
 
+def subnormal_draw(hooks, seed: int):
+    """`draw`'s operands of one sequence in bf16 driving a chunk's own pairs into fp32's subnormals: each
+    token's decay along every key dimension near its floor (log decays in (-6, -5) a token, a sub-chunk's
+    pairs reaching 2^-120 and past), unit-norm keys and queries of varied entries (the call's own norm),
+    and write gates down to 2^-60 (the system's rows, a key times its gate, as small), with cotangents of the
+    output and the final memory."""
+    (operands,) = draw(hooks, packed=False, seed=seed)
+    rng = np.random.default_rng([seed, 7299])
+    log_decay = hosted(rng.uniform(-6.0, -5.0, operands.log_decay.shape))
+    beta = hosted(2.0 ** rng.uniform(-60.0, 0.0, operands.beta.shape))
+    operands = dataclasses.replace(operands, log_decay=log_decay, beta=beta, **{
+        name: getattr(operands, name).astype(jnp.bfloat16) for name in ('query', 'key', 'value')})
+    return operands, cotangents(operands, seed)
+
+
+@pytest.mark.check1_shards(seeds=16, per_task=2)
+def test_own_pairs_folded_against_unit_keys_are_as_exact_into_fp32s_subnormals():
+    """The template's own pairs where its keys are normalised (`Hooks.l2norm`, `mainloop.Call.unit_keys`),
+    each row taking its decay before the key's product (`recurrence_algebra.key_diagonal_bands`), over draws
+    driving those products into fp32's subnormals (`subnormal_draw`), interpreted: its output, final memory
+    and every operand's gradient on par with the recurrence a token at a time from float64 (check 1), the
+    two orders rounding apart under gradual underflow (row 7299)."""
+    hooks = recurrence.Hooks(decay='vector', l2norm=True)
+
+    def ours(operands):
+        return chunk_on('mosaic_gpu', hooks, operands, chunk_size=CHUNK)
+
+    reference = functools.partial(token_by_token, hooks)
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(reference)),
+                    functools.partial(subnormal_draw, hooks), f'{hooks} own pairs into the subnormals',
+                    seeds=16)
+
+
 ROUNDED_ONCE = [recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True),
                 recurrence.Hooks(decay='scalar', scale=0.1, skip=True),
                 recurrence.Hooks(decay='scalar', scale=0.1, skip=True, output=recurrence.OutputNorm(1e-6))]
