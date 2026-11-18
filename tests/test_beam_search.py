@@ -28,6 +28,7 @@ from reference_runs import assert_arms_as_recorded
 
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
+from dew.nn.kernels import generation
 from dew.nn.kv_cache import KVCache, regrouped_layout
 from dew.sampling import Beam, Sampling, decoding, generate
 
@@ -293,25 +294,31 @@ def test_a_search_over_a_paged_model_draws_what_it_draws_over_the_dense_one(mode
     its pages (`regrouped_layout`), each regrouped row sharing its parent's written pages: two prompts of
     five tokens, whose whole pages every beam of the prompt reads and whose part page the first child
     keeps and its siblings copy, decoded six tokens across their pages' ends, draw the dense search's
-    tokens, lengths and scores bit for bit (row 8034); and the pool holds fewer slots than the dense
-    cache's rows, by the prompts' whole pages its beams share."""
+    tokens, lengths and scores bit for bit (row 8034), the paged decode reading its gathered rows through
+    the layer's attention (`paged_decode='gathered'`), the dense cache's arithmetic (a paged kernel's own
+    is held to it by its cells); and the pool holds fewer slots than the dense cache's rows, by the
+    prompts' whole pages its beams share."""
     # Rows long enough that a beam's own pages leave the prompt's shared ones to save.
     decoder = model[0].clone(max_seq_len=24)
     params = nn.unbox(decoder.init(jax.random.key(0), jnp.ones((1, 3), jnp.int32)))
     prompts = jnp.asarray([[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]], jnp.int32)
     layout = KVCache(page_size=page_size)
-    found = {name: generate(held, params, prompts, 6, key=jax.random.key(0),
-                            sampling=Sampling(pad_token_id=0), n=2, strategy=Beam(width=3))
-             for name, held in (("dense", decoder), ("paged", decoder.with_kv_cache(layout)))}
+    # The paged decode reads its gathered rows through the layer's attention, the dense cache's arithmetic,
+    # so its scores are the dense search's bit for bit wherever it runs.
+    with generation.chosen(paged_decode="gathered"):
+        found = {name: generate(held, params, prompts, 6, key=jax.random.key(0),
+                                sampling=Sampling(pad_token_id=0), n=2, strategy=Beam(width=3))
+                 for name, held in (("dense", decoder), ("paged", decoder.with_kv_cache(layout)))}
     for field in ("tokens", "lengths", "raw_log_probs"):
         np.testing.assert_array_equal(np.asarray(getattr(found["paged"], field)),
                                       np.asarray(getattr(found["dense"], field)), err_msg=field)
     pool = regrouped_layout(layout, 2, 3, 5, 6, decoder.max_seq_len)
     assert pool.pages is not None and pool.pages * page_size < 2 * 3 * decoder.max_seq_len
     # A loop scanning past its budget (`trips`) advances every row on, its pool sized for the scan.
-    tripped = {name: generate(held, params, prompts, 2, key=jax.random.key(0), trips=6,
-                              sampling=Sampling(pad_token_id=0), n=2, strategy=Beam(width=3))
-               for name, held in (("dense", decoder), ("paged", decoder.with_kv_cache(layout)))}
+    with generation.chosen(paged_decode="gathered"):
+        tripped = {name: generate(held, params, prompts, 2, key=jax.random.key(0), trips=6,
+                                  sampling=Sampling(pad_token_id=0), n=2, strategy=Beam(width=3))
+                   for name, held in (("dense", decoder), ("paged", decoder.with_kv_cache(layout)))}
     np.testing.assert_array_equal(np.asarray(tripped["paged"].tokens), np.asarray(tripped["dense"].tokens))
 
 

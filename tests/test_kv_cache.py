@@ -39,6 +39,7 @@ from dew.nn.kv_cache import (
     pages_read,
     pages_written,
     quantize,
+    regrouped_layout,
     rotated,
     write_cache,
     write_tokens,
@@ -824,3 +825,14 @@ def test_an_offloaded_banks_regrouped_page_copies_lower_with_the_bank_in_host_me
     shapes = [jax.ShapeDtypeStruct((2, 1, 6, 2, 1), jnp.float32), jax.ShapeDtypeStruct((2, 3), jnp.int32),
               jax.ShapeDtypeStruct((2, 3), jnp.int32)]
     compile_programs({"regrouped": (regrouped, shapes)}, "sm80")
+
+
+@pytest.mark.parametrize(("layout", "rebuilds"), [(KVCache(page_size=2, groups=2), False),
+                                                   (KVCache(page_size=2), True)], ids=["groups", "rebuilds"])
+def test_a_search_regrouping_rows_unpaged_says_so(layout, rebuilds, caplog):
+    """A search that regroups its rows decodes a pool split among groups, or a model that rebuilds its cache,
+    unpaged (`regrouped_layout`), each row's cache whole, and says so in the log, never silently."""
+    with caplog.at_level("INFO", logger="dew.nn.kv_cache"):
+        chosen = regrouped_layout(layout, 2, 3, 5, 6, 24, rebuilds=rebuilds)
+    assert chosen.page_size is None and chosen.quantized == layout.quantized
+    assert [record.name for record in caplog.records] == ["dew.nn.kv_cache"]

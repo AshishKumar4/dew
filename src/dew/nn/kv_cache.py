@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -59,6 +60,8 @@ from dew.nn.sharding import manual_map, sequence_shards
 
 if TYPE_CHECKING:
     from dew.nn.inputs import Admitted
+
+_log = logging.getLogger(__name__)
 
 KVDtype = Literal["int8", "float8_e4m3fn"]
 """The storage formats a quantized cache takes."""
@@ -1614,10 +1617,10 @@ def regrouped_layout(layout: KVCache, prompts: int, width: int, prompt: int, new
     `prompts` rows of `prompt` slots prefilled, then `width` rows each, `new_tokens` more tokens apiece (the
     steps its loop advances them, past its budget too).
 
-    A pool split among groups (`KVCache.groups`) decodes unpaged (`unpaged`): a regrouped row's parent may
-    lie in another group's part; so does a model that rebuilds its cache past a position (`rebuilds`,
-    LongRoPE's), whose rebuild opens every row its own block and picks its leaves by row. An undivided pool
-    keeps its pages, a regrouped row sharing its parent's
+    A pool split among groups (`KVCache.groups`) decodes unpaged (`unpaged`), said in the log: a regrouped
+    row's parent may lie in another group's part (row 8493); so does a model that rebuilds its cache past a
+    position (`rebuilds`, LongRoPE's), whose rebuild opens every row its own block and picks its leaves by
+    row (row 8494). An undivided pool keeps its pages, a regrouped row sharing its parent's
     written ones (`gather_cache_rows`), sized for both phases: the prefill's tables give each prompt row
     its whole block (`default_page_table`, `refuse_unassigned`), `prompts * per_row` pages; past the branch,
     a prompt of `f` whole pages, which its rows share, holds at most `f + width * min(own, per_row - f)`,
@@ -1630,6 +1633,9 @@ def regrouped_layout(layout: KVCache, prompts: int, width: int, prompt: int, new
     if layout.page_size is None:
         return layout
     if layout.groups > 1 or rebuilds:
+        _log.info("a search that regroups its rows decodes its paged cache unpaged, each row's cache "
+                  "whole: %s", "its model rebuilds its cache past a position (row 8494)" if rebuilds
+                  else f"its pool is split among {layout.groups} groups (row 8493)")
         return unpaged(layout)
     size = layout.page_size
     per_row, own = capacity // size, -(-new_tokens // size) + 1
