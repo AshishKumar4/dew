@@ -192,7 +192,8 @@ def test_an_episode_schedulers_cohort_draws_what_its_policy_draws_whole(kind, se
     from dew.sampling.strategies import Beam
 
     model = MODELS[kind]().with_kv_cache(KVCache(page_size=PAGE))
-    sampling = GREEDY if searched else SAMPLED
+    # Every token but the pad ends a turn, so each episode runs its turns and its contexts grow past pages.
+    sampling = replace(GREEDY if searched else SAMPLED, eos_token_ids=tuple(range(1, VOCAB)))
     initialized = jax.jit(model.init)
     for seed in range(4):
         variables = nn.unbox(initialized(jax.random.key(seed), jnp.ones((1, 2), jnp.int32)))
