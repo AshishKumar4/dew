@@ -335,3 +335,55 @@ def test_a_recorded_test_that_grew_past_its_deadline_raises_its_record_and_the_n
     after = [entry for entry in ci.plan(240.0, {}) if entry["python"] == "3.12" and grown in entry["tests"]]
     heaviest = max(after, key=lambda entry: entry["weight"])
     assert len(after) > len(before) and heaviest["weight"] < 400.0 + 20.0
+
+
+def test_a_cold_run_is_kept_as_its_tests_cold_times_and_every_cut_weighs_them(ci, tmp_path, monkeypatch):
+    """A run whose test compiled a program the shared cache lacked (its row's `cold`) times that test cold:
+    the fold keeps the least cold time beside the least warm one in the one record (`session.entry`), a
+    red run raising it, and no cold time moves a warm one; a test first timed cold takes that as its warm
+    time too; a test the record drops loses both. Every cut and weight reads a test's cost, its cold time
+    where one is recorded, so 14 cells recorded at 1 s warm and 60 s cold are no longer one group of 14 s
+    (row 7939: such a group took 1,107 s cold)."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
+    (tmp_path / "tests/test_cells.py").write_text("".join(f"def test_{name}(): pass\n" for name in "abc"))
+    record = {"tests/test_cells.py::test_a": 1.0, "tests/test_cells.py::test_b": [2.0, 50.0],
+              "tests/test_gone.py::test_x": [3.0, 9.0]}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(record, indent=0) + "\n")
+    rows = [{"name": "3.12:tests/test_cells.py", "exitCode": 0, "seconds": 70.0,
+             "tests": {"tests/test_cells.py::test_a": 30.0, "tests/test_cells.py::test_b": 40.0,
+                       "tests/test_cells.py::test_c": 20.0},
+             "cold": ["tests/test_cells.py::test_a", "tests/test_cells.py::test_b",
+                      "tests/test_cells.py::test_c"]}]
+    verdict = tmp_path / "main.json"
+    verdict.write_text(json.dumps({"sha": commit(tmp_path, "main"), "part": "all", "rows": rows}))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
+    assert ci.main() == 0
+    folded = json.loads((tmp_path / "tests/test_durations.json").read_text())
+    a, b, c = (f"tests/test_cells.py::test_{name}" for name in "abc")
+    assert folded == {a: [1.0, 30.0], b: [2.0, 40.0], c: [20.0, 20.0]}
+    assert ci.durations_record() == {a: 30.0, b: 40.0, c: 20.0}
+    # A red run past a cold time raises it; a green warm run moves only the warm time.
+    rows = [{"name": "3.12:tests/test_cells.py", "exitCode": 1, "seconds": 60.0,
+             "tests": {"tests/test_cells.py::test_a": 60.0}, "cold": ["tests/test_cells.py::test_a"]}]
+    verdict.write_text(json.dumps({"sha": commit(tmp_path, "main"), "part": "all", "rows": rows}))
+    assert ci.main() == 0
+    assert json.loads((tmp_path / "tests/test_durations.json").read_text())[a] == [1.0, 60.0]
+    # A cut weighs each cell by its cost: fourteen 1 s warm, 60 s cold cells cut at a 240 s target are no one
+    # group.
+    cells = [ci.session.cost([1.0, 60.0])] * 14
+    assert max(ci.cuts.split(ci.session, cells, sum(cells), 240.0, cut=1)) <= 240.0
+
+
+def test_a_file_armada_has_not_timed_weighs_no_less_than_its_tests_recorded_costs(ci, tmp_path):
+    """Scaled by how armada ran the files it timed, a file it has not is never weighed below its own tests'
+    recorded costs: here a timed file ran in a tenth of its tests' cold costs, as a warm run does, and the
+    other, ten tests of 100 s cold, still weighs their 1,000 s, not 100 s that would pack it whole at a 240 s
+    target (row 7939's review)."""
+    for name in ("test_timed", "test_untimed"):
+        (tmp_path / "tests" / f"{name}.py").write_text("def test_cell(): pass\n")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/{name}.py::test_cell[{n}]": [1.0, 100.0] for name in ("test_timed", "test_untimed")
+         for n in range(10)}))
+    timings = {"files": {"3.12:tests/test_timed.py": 100.0}}
+    assert ci.weights(["tests/test_timed.py", "tests/test_untimed.py"], timings) == {
+        "tests/test_timed.py": 1000.0, "tests/test_untimed.py": 1000.0}
