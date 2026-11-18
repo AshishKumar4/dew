@@ -1763,12 +1763,14 @@ def test_the_forward_on_tcgen05s_chunks_holds_check_1_interpreted(call, training
                    value_width=width, tiles=tiles, training=training, target=generation.gpu_target("sm100"))
 
 
+@pytest.mark.parametrize("rare", [False, True], ids=["common", "rare"])
 @pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
 @pytest.mark.parametrize("consumers", [2, 3])
-def test_the_forwards_schedule_holds_every_property_in_every_interleaving(consumers, training):
+def test_the_forwards_schedule_holds_every_property_in_every_interleaving(consumers, training, rare):
     """The forward's launch on wgmma at `consumers` a program over 192 queries and 128 keys, traced as an
     H100 builds it: every interleaving of its warpgroups and its loads' landings explored
-    (`ring_protocol.explore`), no deadlock and every barrier's phase whole. Its consumers' schedule turns
+    (`ring_protocol.explore`), no deadlock and every barrier's phase whole, its decided walk's second taken
+    (`rare`, the producer streaming the steps again, `mosaic.Decided`) or not. Its consumers' schedule turns
     balance at any count (row 4840: at three the third made one fewer, and its partners' last turn waited
     on a phase that never completed, the interpreted hang)."""
     from ring_protocol import explore, programs
@@ -1781,7 +1783,7 @@ def test_the_forwards_schedule_holds_every_property_in_every_interleaving(consum
         with generation.assumed("sm90"), tuning.pinned({attention_mosaic.MosaicForward: tiles}):
             return attention_mosaic.forward(query, key, key, spans, residuals=training, interpret=False)
 
-    threads, arrivals = programs(forward, query, key, threads=consumers + 1)
+    threads, arrivals = programs(forward, query, key, threads=consumers + 1, rare=rare)
     assert explore(threads, arrivals) > 0
 
 

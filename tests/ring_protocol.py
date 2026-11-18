@@ -50,6 +50,7 @@ import jax
 import numpy as np
 from jax.extend import core as jcore
 
+from dew.nn import derivatives
 from dew.nn.programs import called
 
 THREAD_AXIS = "wg"
@@ -81,8 +82,8 @@ class _Interpreter:
     toolkit's synchronization an `Event` (`events`), every other evaluated concretely (`bind`) or, a value no
     synchronization reads (a tile's data), left unevaluated."""
 
-    def __init__(self, thread: int):
-        self.thread, self.events, self.refs, self.allocated = thread, [], 0, []
+    def __init__(self, thread: int, rare: bool = False):
+        self.thread, self.events, self.refs, self.allocated, self.rare = thread, [], 0, [], rare
 
     def run(self, jaxpr: jcore.Jaxpr, consts, args) -> list:
         env: dict = dict(zip((*jaxpr.constvars, *jaxpr.invars), (*consts, *args), strict=True))
@@ -103,6 +104,10 @@ class _Interpreter:
         if name == "layout_cast":
             # A register layout's statement (`plgpu.layout_cast`), its value its operand's.
             return [values[0]]
+        if name == "marked_call" and isinstance(params["kind"], derivatives.Rare):
+            # A rare span's verdict (a decided walk's, `derivatives.Rare`): the run's own (`programs`' `rare`),
+            # each program's alike.
+            return [np.bool_(self.rare)]
         # A call's program, read where every reader reads it (`dew.nn.programs.called`).
         inner = called(equation)
         if inner is not None:
@@ -275,14 +280,16 @@ SYNC: dict[str, Callable] = {
 """Each primitive of the toolkit's synchronization and shared memory, as an `Event`."""
 
 
-def programs(kernel: Callable, *operands, threads: int) -> tuple[list[list[Event]], dict[str, int]]:
+def programs(kernel: Callable, *operands, threads: int, rare: bool = False
+             ) -> tuple[list[list[Event]], dict[str, int]]:
     """Each warpgroup's program of `kernel` (a Mosaic GPU launch the toolkit built, `mosaic.kernel`) over
-    `operands`: its events, by warpgroup index, and each barrier allocation's arrivals a phase, by name."""
+    `operands`, its rare spans taken where `rare` (`derivatives.Rare`: a decided walk's second): its events,
+    by warpgroup index, and each barrier allocation's arrivals a phase, by name."""
     closed = jax.make_jaxpr(kernel)(*operands)
     body = _body(closed.jaxpr)
     found, arrivals = [], {}
     for thread in range(threads):
-        interpreter = _Interpreter(thread)
+        interpreter = _Interpreter(thread, rare)
         interpreter.run(body.jaxpr, body.consts, [Ref(f"gmem{index}", barrier=False, num_arrivals=0)
                                                   for index in range(len(body.jaxpr.invars))])
         found.append(interpreter.events)
