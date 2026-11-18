@@ -405,6 +405,19 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """Why the launch takes no call of `ba` on `family`, or None (`refused`)."""
         raise NotImplementedError
 
+    def ladder(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
+        # `config`'s fields at each smaller query block its derivation takes (halvings and three quarters,
+        # the blocks its walk steps through), within `config`'s register cap and residency, largest first.
+        if not self._typed(config):
+            return ()
+        target = generation.gpu_target()
+        regime = (self.register_budget(config), self.resident(ba, config, target))
+        blocks = {config.block_q * 3 // 4, *(config.block_q >> shift for shift in range(1, 8))}
+        smaller = (dataclasses.replace(config, block_q=block) for block in sorted(blocks, reverse=True)
+                   if 0 < block < config.block_q)
+        return tuple(rung for rung in smaller if self.takes(ba, rung, target)
+                     and (self.register_budget(rung), self.resident(ba, rung, target)) == regime)
+
     def resident(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> int:
         """The programs of its launch at `config` a multiprocessor holds at once: its family's residency at
         its registers (`Family.programs`) and its shared memory's, each program's reservation its own
