@@ -46,8 +46,8 @@ def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_
 
 
 def lane_machine(root: Path, monkeypatch, url: str, name: str, source: str) -> None:
-    """A GPU lane's machine at `root` with the test cache at `url` (`gpu_lane_at`), its Python and fetcher, and
-    test file `name` holding `source`."""
+    """A GPU lane's machine at `root` with the test cache at `url` (`gpu_lane_at`), its Python and
+    fetcher, and test file `name` holding `source`."""
     gpu_lane_at(root, monkeypatch, url, 0)
     interpreter(root, "3.12")
     fetcher(root)
