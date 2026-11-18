@@ -28,6 +28,7 @@ from dew.nn.kv_cache import (
     KVCache,
     KVSpec,
     KVStore,
+    _banked_page_copies,
     _gather_pages,
     _gathered_attention,
     default_page_table,
@@ -35,6 +36,8 @@ from dew.nn.kv_cache import (
     gpu_paged,
     hadamard,
     overflowed,
+    pages_read,
+    pages_written,
     quantize,
     rotated,
     write_cache,
@@ -790,3 +793,18 @@ def test_a_paged_stores_regrouped_rows_share_their_parents_written_pages_and_wri
         gather_cache_rows({"layer": store}, jnp.asarray([-1, 1], jnp.int32))["layer"][TABLE])
     tail = int(cursor[1]) // size
     assert negative[0, tail] != negative[1, tail]
+
+
+@pytest.mark.parametrize("wide", [False, True], ids=["int32", "x64"])
+def test_an_offloaded_banks_regrouped_pages_copy_as_a_resident_banks_do(wide):
+    """The page-at-a-time copies an offloaded bank's regrouped pages take (`_banked_page_copies`) give a
+    resident bank's (`pages_read` then `pages_written`, each layer's), a layer's two pages swapped among
+    them, so each layer's pages are read before any is written, and a page past the pool written as none;
+    under 64-bit indices too, whose loop counts its slices' starts must share a dtype with."""
+    bank = jnp.arange(2 * 6 * 2, dtype=jnp.float32).reshape(2, 1, 6, 2, 1)
+    own = jnp.asarray([[1, 0, 6], [2, 5, 6]], jnp.int32)
+    parents = jnp.asarray([[0, 1, 6], [3, 2, 6]], jnp.int32)
+    resident = jax.vmap(lambda leaf, own, parents: pages_written(leaf, own, pages_read(leaf, parents, 1), 1))
+    with jax.enable_x64(new_val=wide):
+        copied = _banked_page_copies(bank, own, parents)
+    np.testing.assert_array_equal(np.asarray(copied), np.asarray(resident(bank, own, parents)))

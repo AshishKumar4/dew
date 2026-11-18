@@ -1646,34 +1646,37 @@ def regrouped_layout(layout: KVCache, prompts: int, width: int, prompt: int, new
 
 def _banked_page_copies(bank: jax.Array, own: jax.Array, parents: jax.Array) -> jax.Array:
     """An offloaded bank's pool `[layers, heads, pages, ...]` with each layer's pages `parents` `[layers,
-    rows]` copied to its pages `own`, a page at a time where the bank lies: every page read to the device
-    before any is written (a row's own page may be another's parent's), a page past the pool read and
-    written as none."""
+    rows]` copied to its pages `own`, a layer at a time and a page at a time where the bank lies: each
+    layer's pages read to the device before any of them is written (a row's own page may be another's
+    parent's; one layer's pages never another's), a page past the pool read and written as none."""
     layers, count = own.shape
     last = bank.shape[2] - 1
     extent = (1, bank.shape[1], 1, *bank.shape[3:])
 
-    def start(layer: jax.Array, page: jax.Array) -> tuple[jax.Array, ...]:
+    def start(layer, page) -> tuple[jax.Array, ...]:
+        # Every index int32, as a slice's starts must share one dtype (`fetched_at`'s).
         zero = jnp.zeros((), jnp.int32)
-        return (layer, zero, jnp.minimum(page, last), *(zero,) * (bank.ndim - 3))
+        return (jnp.asarray(layer, jnp.int32), zero, jnp.minimum(jnp.asarray(page, jnp.int32), last),
+                *(zero,) * (bank.ndim - 3))
 
-    def read(index: jax.Array, pages: jax.Array) -> jax.Array:
-        layer, row = index // count, index % count
-        page = fetched(jax.lax.dynamic_slice(bank, start(layer, parents[layer, row]), extent))
-        return pages.at[index].set(page[0, :, 0])
+    def layer_copies(layer, pool: jax.Array) -> jax.Array:
+        def read(row, pages: jax.Array) -> jax.Array:
+            page = fetched(jax.lax.dynamic_slice(pool, start(layer, parents[layer, row]), extent))
+            return pages.at[row].set(page[0, :, 0])
 
-    held = jax.lax.fori_loop(0, layers * count, read, jnp.zeros((layers * count, *bank.shape[1:2],
-                                                                   *bank.shape[3:]), bank.dtype))
+        held = jax.lax.fori_loop(0, count, read, jnp.zeros((count, bank.shape[1], *bank.shape[3:]),
+                                                           bank.dtype))
 
-    def write(index: jax.Array, pool: jax.Array) -> jax.Array:
-        layer, row = index // count, index % count
-        page = placed_like(pool, held[index][None, :, None])
-        target = own[layer, row]
-        return jax.lax.cond(target <= last,
-                            lambda pool: jax.lax.dynamic_update_slice(pool, page, start(layer, target)),
-                            lambda pool: pool, pool)
+        def write(row, pool: jax.Array) -> jax.Array:
+            target = own[layer, row]
+            page = placed_like(pool, held[row][None, :, None])
+            return jax.lax.cond(target <= last,
+                                lambda pool: jax.lax.dynamic_update_slice(pool, page, start(layer, target)),
+                                lambda pool: pool, pool)
 
-    return jax.lax.fori_loop(0, layers * count, write, bank)
+        return jax.lax.fori_loop(0, count, write, pool)
+
+    return jax.lax.fori_loop(0, layers, layer_copies, bank)
 
 
 def gather_cache_rows(cache, rows):
