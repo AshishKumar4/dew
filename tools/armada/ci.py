@@ -701,7 +701,8 @@ def reused_classes(network: bool = False) -> list[str]:
 def reused(python: str, name: str, split: str, common: str, network: bool = False,
            kept: tuple[str, str] | None = None, reading: Reading | None = None) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on a class this host reuses
-    (`reused_classes`), if it ran green there on exactly these inputs; else None. A file its plan kept
+    (`reused_classes`), if it ran green there on exactly these inputs, `cached` with that run's key (armada
+    counts it reused and times no file by it); else None. A file its plan kept
     (`kept`: its green run's class and key, `reusable`) reads that run, fresh here; any other, the record of
     the last run on these shared inputs: a key hashes them (`cache_key`), so no run on others, whose record
     the last run's may be, can be fresh here, all from one reading of the inputs (`Reading`)."""
@@ -718,12 +719,12 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
         if found is not None and found["key"] == kept[1] and fresh(found, name, common, reading) and standing(
                 found, current):
             named_at_commit(python, place, kept[0], kept[1], token)
-            return found["row"]
+            return {**found["row"], "cached": found["key"]}
     hit = green_record(python, name, split, common, token, reused_classes(network), reading, [])
     if hit is None:
         return None
     named_at_commit(python, place, hit[1], hit[0]["key"], token)
-    return hit[0]["row"]
+    return {**hit[0]["row"], "cached": hit[0]["key"]}
 
 
 def fresh(recorded: dict, name: str, common: str, reading: Reading | None = None) -> bool:
