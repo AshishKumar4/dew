@@ -255,11 +255,14 @@ def declared_tangent[Value](kind: TangentKind, primal: Callable[..., Value], tan
     an operand no tangent reaches is a `SymbolicZero` there, as `defjvp` gives it), the primal and the rule
     each one marked call of `kind` (`bound_span`) within the custom rule, as `declared_derivative` declares
     its; a surrogate's tangent is `surrogate`'s, whose rule reads the surrogate's own value, so a second
-    order meets the rule again (`TangentKind`)."""
+    order meets the rule again (`TangentKind`). A protected kind that states the operation its primal
+    computes (`Protected.computes`) states it of the primal alone: the rule's span is protected stating
+    nothing, as partial evaluation splits it into pieces that compute no such one operation."""
     fixed = tuple(nondiff_argnums)
     rule = contracted("test_a_declared_derivative_holds_every_order")(
         jax.custom_jvp(bound_span(kind, primal, static=fixed), nondiff_argnums=fixed))
-    rule.defjvp(bound_span(kind, tangent, static=range(len(fixed))), symbolic_zeros=symbolic_zeros)
+    ruled = Protected() if isinstance(kind, Protected) else kind
+    rule.defjvp(bound_span(ruled, tangent, static=range(len(fixed))), symbolic_zeros=symbolic_zeros)
     return rule
 
 

@@ -1114,19 +1114,19 @@ def test_a_gated_norms_gate_gradient_is_a_number_where_its_exp_overflows(activat
 @pytest.mark.parametrize("gate", [17.0, 20.0, -17.0])
 def test_a_kernels_logistic_slope_is_the_declared_tangents_past_its_value_rounding_to_one(gate):
     """A kernel's slope of the one logistic (`precision.activation_and_slope`, the recurrence conv's
-    backward) is `s(x) s(-x)`, as `activations.logistic` declares it: at an fp32 gate of 17, where `s(x)`
-    rounds to one and `s (1 - s)` made the slope zero, it is float64's 4.1e-8 to fp32's rounding. Each
-    logistic rounds an exp (`accurate_exp`, within an ulp), a sum and a quotient (half an ulp each), two
-    ulps; the slope's product of two, four and a half; silu's slope adds `g` times it to `s`, six: within
-    2^-20, eight ulps of fp32's 2^-23."""
+    backward) is the declared tangent's, `s(x) s(-x)` (`activations.logistic`'s, as JAX differentiates it),
+    bit for bit, and a number past zero at an fp32 gate of 17, where `s(x)` rounds to one and `s (1 - s)`
+    made the slope zero; silu's is `s + g s(x) s(-x)`, the product rule over it. Their values against
+    float64 are the logistic's contract's (`test_silu_holds_every_order`)."""
     from dew.nn.activations import logistic
-    from dew.nn.precision import activation_and_slope
+    from dew.nn.precision import activation_and_slope, logistic_value
 
     value = jnp.asarray([gate], jnp.float32)
-    exact = 1.0 / (1.0 + np.exp(-gate)) / (1.0 + np.exp(gate))
-    for name in ("sigmoid", "silu"):
-        _, slope = activation_and_slope(value, name)
-        expected = exact if name == "sigmoid" else 1.0 / (1.0 + np.exp(-gate)) + gate * exact
-        np.testing.assert_allclose(np.asarray(slope), [expected], rtol=2 ** -20, atol=0)
-    np.testing.assert_allclose(np.asarray(jax.grad(lambda g: logistic(g)[0])(value)), [exact], rtol=2 ** -20,
-                               atol=0)
+    declared = jax.grad(lambda g: logistic(g)[0])(value)
+    _, slope = activation_and_slope(value, "sigmoid")
+    np.testing.assert_array_equal(np.asarray(slope), np.asarray(declared))
+    product = logistic_value(value) * logistic_value(-value)
+    np.testing.assert_array_equal(np.asarray(slope), np.asarray(product))
+    assert float(slope[0]) > 0
+    _, silu_slope = activation_and_slope(value, "silu")
+    np.testing.assert_array_equal(np.asarray(silu_slope), np.asarray(logistic_value(value) + value * slope))

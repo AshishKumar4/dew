@@ -534,6 +534,11 @@ def test_a_programs_sigmoid_and_dews_one_logistic_reach_one_normal_form():
     # A span of Dew's error-free arithmetic names no operation: kept as written.
     kept = canonical(jax.make_jaxpr(lambda a, b: two_sum(a, b))(x, x))
     assert marked_call_p in primitives_of(kept)
+    # Its derivative's spans state nothing (`declared_tangent`): a gradient's program, whose partial
+    # evaluation splits the rule's span into a piece of the logistic and its slope, has a normal form of its
+    # outputs, where the split piece read as one logistic gave one output for its two.
+    graded = jax.make_jaxpr(jax.value_and_grad(lambda x: jnp.sum(activations.logistic(x))))(x)
+    assert len(canonical(graded).outvars) == len(graded.jaxpr.outvars)
 
 
 def test_a_logistic_turned_back_into_code_is_dews_one_logistic():
