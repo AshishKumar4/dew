@@ -503,6 +503,63 @@ def test_a_gpu_lanes_groups_run_each_test_of_the_tips_file_once_their_rows_their
     assert {name: (tmp_path / f"ran-{name}").read_text() for name in names} == dict.fromkeys(names, "11")
 
 
+def test_a_gpu_lane_given_test_nodes_grades_each_by_its_own_cases(ci, tmp_path, monkeypatch, cache_worker):
+    """A lane given single tests by node id (`file::test`, a parametrized one among them, as a lane's own GPU
+    run names them) grades each by its own cases: one that passed is green, one whose case failed red with
+    it, none "never ran" (2026-11-17: every node id a tier was given read "no evidence ran", its cases matched
+    against their file's name)."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    (tmp_path / "tests/test_nodes.py").write_text(
+        "import pytest\n"
+        "def test_walk():\n    pass\n"
+        "@pytest.mark.parametrize('form', ['pipeline', 'streamed'])\n"
+        "def test_pipeline(form):\n    assert form == 'pipeline'\n"
+        "def test_other():\n    raise SystemExit('not named')\n")
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    out = tmp_path / "verdict.json"
+    nodes = ["tests/test_nodes.py::test_walk", "tests/test_nodes.py::test_pipeline"]
+    ci.gpu_lane("3.12", nodes, out, cache="off", processes=1, deadline=600.0)
+    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+    assert {name: row["exitCode"] for name, row in rows.items()} == {
+        "3.12:tests/test_nodes.py::test_walk": 0, "3.12:tests/test_nodes.py::test_pipeline": 1}
+    assert "test_pipeline[streamed]" in rows["3.12:tests/test_nodes.py::test_pipeline"]["output"]
+    assert all("no evidence" not in row["output"] for row in rows.values())
+
+
+def test_a_test_nodes_green_run_keeps_a_record_its_next_lane_reuses(ci, tmp_path, monkeypatch, cache_worker):
+    """A test node's green run (`file::test`, its parametrized case's id outside the Worker's key alphabet)
+    keeps its file's record under a place the Worker takes (`rows.placed`), so a second lane on the same
+    inputs reuses it rather than run it again, and another node of the same file is no reuse of it (review of
+    the first node-id grading: a node row found no record of its process, and its place held a colon)."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    (tmp_path / "tests/test_nodes.py").write_text(
+        "import pytest\nfrom pathlib import Path\n"
+        "@pytest.mark.parametrize('form', ['a/b c'])\n"
+        "def test_walk(form):\n    Path('walked').write_text(form)\n"
+        "def test_other():\n    Path('othered').write_text('ran')\n")
+    out = tmp_path / "verdict.json"
+    walked, othered = tmp_path / "walked", tmp_path / "othered"
+
+    def lane(node: str) -> list[tuple[str, int]]:
+        walked.unlink(missing_ok=True)
+        othered.unlink(missing_ok=True)
+        assert ci.gpu_lane("3.12", [node], out, cache="on", processes=1, deadline=600.0) == 0
+        return [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]]
+
+    walk, other = "tests/test_nodes.py::test_walk", "tests/test_nodes.py::test_other"
+    assert lane(walk) == [(f"3.12:{walk}", 0)]
+    assert walked.read_text() == "a/b c"
+    assert lane(walk) == [(f"3.12:{walk}", 0)]
+    assert not walked.exists(), "the node's green run on the same inputs is reused"
+    assert lane(other) == [(f"3.12:{other}", 0)]
+    assert othered.is_file() and not walked.exists(), "another node of its file runs its own"
+
+
 def test_a_tier_cut_groups_green_row_is_reused_while_its_cut_holds_the_same_tests(
         ci, tmp_path, monkeypatch, cache_worker):
     """A group the tier cuts by its GPUs' own seconds (DEW_SPLIT_DURATIONS) keeps its green row under a key,

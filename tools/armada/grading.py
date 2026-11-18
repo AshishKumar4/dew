@@ -29,6 +29,37 @@ def file_of(case: ET.Element) -> str:
     return "/".join(parts[:module + 1]) + ".py"
 
 
+def owning(name: str) -> str:
+    """The test file a row's name is of: the file itself, or a test node's (`file::test`) file."""
+    return name.partition("::")[0]
+
+
+def holds(name: str, node: str) -> bool:
+    """Whether test node id `node` is of what a run named `name`: its file, or a test node in it
+    (`file::test`, a class's `file::Class`), each of its parametrized cases among them."""
+    if "::" not in name:
+        return owning(node) == name
+    return node == name or node.startswith((f"{name}[", f"{name}::"))
+
+
+def of(case: ET.Element, name: str) -> bool:
+    """Whether JUnit `case` is of what a run named `name` (`holds`): a case with no class path, a file that
+    did not collect, is of every name its file holds (2026-11-17: a tier given node ids read every one of
+    them as never run, its cases matched against their file's name)."""
+    if "::" not in name or not case.get("classname"):
+        return file_of(case) == owning(name)
+    return holds(name, node_of(case))
+
+
+def running_row(tests: list[str], running: str | None, reported: set[str]) -> str | None:
+    """Of a task's rows `tests`, the one its time was spent in at its deadline, given the file `running`
+    then (its executed log's last visit, which names files): the file's own row, or of the test nodes of it
+    the task ran, the last that reported no test (the one stopped), else its last; `running` itself where
+    no row is of it."""
+    of_it = [name for name in tests if owning(name) == running]
+    return next((name for name in reversed(of_it) if name not in reported), of_it[-1] if of_it else running)
+
+
 def red_as(kind: str, nodes: list[str]) -> dict:
     """What turned a red row red, for grading it again (`land.sh`, `suspect.sh`): `kind` "nodes", its
     `failed` tests alone, by node id; "collect", its file's collection; "deadline", its task's; or

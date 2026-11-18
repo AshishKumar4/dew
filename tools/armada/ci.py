@@ -429,8 +429,11 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
     one reading read each input once, however many rows name it."""
     digest = hashlib.sha256(common.encode())
     reading = Reading() if reading is None else reading
-    for path in inputs(name, depends):
+    # A test node's (`file::test`) inputs are its file's, the node named beside them.
+    for path in inputs(grading.owning(name), depends):
         digest.update(path.encode() + reading.part(path))
+    if "::" in name:
+        digest.update(name.encode())
     if session.SITE.fullmatch(split):
         digest.update(split.encode())
     elif split and split != COLLECT:
@@ -1664,13 +1667,17 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # "at 0.0 s").
     # A task stalled before any test started (its collection) has no such file: each of its rows is the
     # deadline's.
+    # A row named by a test node (`file::test`) is graded by its own cases, its file's collection and visits
+    # its own (`grading.of`, `grading.running_row`).
     stood = followed.visited(followed.log_events(log)) if expired or not report.is_file() else []
     running = stood[-1] if stood else None
+    stopped = grading.running_row(tests, running, {name for name in tests
+                                                   if any(grading.of(case, name) for case in cases)})
     for name in tests:
-        own = [case for case in cases if grading.file_of(case) == name]
-        red, failed, cause = grading.graded(name, own, cases, counts.get(name, {}), report.is_file(),
-                                            returncode, deadline if expired else None, running, pid.is_file(),
-                                            running)
+        own = [case for case in cases if grading.of(case, name)]
+        red, failed, cause = grading.graded(name, own, cases, counts.get(grading.owning(name), {}),
+                                            report.is_file(), returncode, deadline if expired else None,
+                                            stopped if running is not None else None, pid.is_file(), running)
         # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
         # row is `unobserved`, and armada weighs no plan by it.
         unobserved = name not in shares
@@ -1690,7 +1697,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      # A pytest a signal ended, its file's red whole: the signal, for whoever it routes to.
                      **({"signal": -returncode} if red and returncode < 0 and not expired else {}),
                      "tests": {**{node: seconds for node, seconds in done_before.items()
-                                  if node.split("::", 1)[0] == name},
+                                  if grading.holds(name, node)},
                                **{grading.node_of(case): float(case.get("time") or 0) for case in own}},
                      "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
                      # A judge's, beside its pooling, what its map tasks' records say they paid
@@ -1715,14 +1722,16 @@ def task_seconds(tests: list[str], cases: list[ET.Element], log: Path, wall: flo
     own times (`apportioned`); where the task ran out of time (`expired`), the file running at its deadline
     (its executed `log`'s last visit) at least what it needs, and one that never started none
     (`deadline_shares`)."""
-    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if grading.file_of(case) == name)
+    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if grading.of(case, name))
                    for name in tests}
     if not expired:
         return apportioned(own_seconds, wall, len(tests))
-    # The file whose test started last is the one running at the deadline (executed.py logs each visit).
+    # The file whose test started last is the one running at the deadline (executed.py logs each visit),
+    # its row the one stopped (`grading.running_row`).
     stood = followed.visited(followed.log_events(log))
-    return deadline_shares(own_seconds, {grading.file_of(case) for case in cases}, wall,
-                           stood[-1] if stood else None)
+    reported = {name for name in tests if any(grading.of(case, name) for case in cases)}
+    return deadline_shares(own_seconds, reported, wall,
+                           grading.running_row(tests, stood[-1], reported) if stood else None)
 
 
 def resumed(tests: list[str]) -> dict[str, float]:
@@ -1846,7 +1855,9 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         opened = opened | native_inputs(opened, recorded)
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
-        ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
+        # A test node's row (`file::test`) keeps its file's record, the one its process's log holds.
+        file = grading.owning(name)
+        ran = executed.get(file, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
         site = session.SITE.fullmatch(parsed_row(row_["name"])[2])  # a check-1 judge reads not as its site
         read = (None if ran["depends"] is None or (site is not None and site["start"] is None) else
                 sorted({*ran["depends"], *(opened or ())}))
@@ -1854,13 +1865,13 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             inputs = None if opened is None else sorted({*ran["depends"], *opened})
             ran = {**ran, "depends": None if inputs is None or wrote_inputs(inputs, changed) else inputs}
         ran = {**ran, "depends": site_inputs(python, row_["name"], ran["depends"])}
-        if row_["exitCode"] == 0 and name not in executed:
+        if row_["exitCode"] == 0 and file not in executed:
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None
         # A group of a file the durations record does not wholly name (`unkeyed`, split.py) keeps no key: the
         # plan, which cuts by the record alone, may cut the file otherwise (`session.cut`).
         key = (cache_key(common, name, parsed_row(row_["name"])[2], ran["depends"])
-               if green and name not in unkeyed else None)
+               if green and file not in unkeyed else None)
         # A red run begins the row's next epoch first, so every green run recorded before it stands no
         # more (`epoch`); a green one keeps the epoch it ran in, begun where the row has none, or none where
         # neither was read or written.
@@ -2017,8 +2028,9 @@ def lane_units(python: str, tests: list[str], within: float | None = None) -> di
     for name in tests:
         file, _, group = name.partition("#")
         units[name] = (file, group, "")
+        # A test node's (`file::test`) collection counts under its file.
         units |= {f"{file}#{varied(group, variant)}": (file, group, variant)
-                  for variant, files_ in holding.items() if file in files_}
+                  for variant, files_ in holding.items() if grading.owning(file) in files_}
     return units
 
 
@@ -2091,8 +2103,12 @@ def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str
 
     def needs(name: str) -> dict | None:
         file, group, variant = units[name]
-        return recorded(record_key(python, row(python, file, varied("" if cut else group, variant)), held),
-                        token)
+        found = recorded(record_key(python, row(python, file, varied("" if cut else group, variant)), held),
+                         token)
+        # A test node (`file::test`) no run measured holds no more than its file's process.
+        if found is None and (whole := grading.owning(file)) != file:
+            found = recorded(record_key(python, row(python, whole, varied("", variant)), held), token)
+        return found
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         records = dict(zip(units, pool.map(needs, units), strict=True))
@@ -2108,10 +2124,11 @@ def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str
                    else most.get((units[name][0], units[name][2]), found) for name, found in records.items()}
     # A group no run on this class measured borrows the most its file held on another, which holds at least
     # its own; a file's process under other flags, its tests a part of the file's, the lane's own's first.
-    borrowed = borrowed_records(sorted({units[name][0] for name, found in records.items() if found is None}),
+    borrowed = borrowed_records(sorted({grading.owning(units[name][0]) for name, found in records.items()
+                                        if found is None}),
                                 python, held, token)
-    return {name: records[name] or records.get(f"{file}#{group}" if group else file) or borrowed.get(file)
-            for name, (file, group, _) in units.items()}
+    return {name: records[name] or records.get(f"{file}#{group}" if group else file)
+            or borrowed.get(grading.owning(file)) for name, (file, group, _) in units.items()}
 
 
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,

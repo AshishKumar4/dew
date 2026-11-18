@@ -3,6 +3,7 @@
 (`<file>#G/N@users`), and its record's place on a device class, in the cache Worker's key alphabet (no colon,
 no hash)."""
 
+import hashlib
 from collections.abc import Mapping
 
 
@@ -50,13 +51,31 @@ def cut_of(group: str) -> str:
     return group.partition(VARIED)[0]
 
 
+NODE_PLACE = 160
+"""The most characters a test node's part of its record's place (`placed`) spells out; a longer one is its
+digest."""
+
+
+def placed(name: str) -> str:
+    """A row's file or test node (`file::test`) in the Worker's key alphabet: a node's part after its file,
+    each character outside letters, digits, `.`, `_` and `-` as `=XX` of its UTF-8 bytes (a parametrized
+    case's brackets, a class's colons), or past `NODE_PLACE` characters its digest; a file's as it is."""
+    file, colons, node = name.partition("::")
+    if not colons:
+        return name
+    spelled = "".join(char if char.isascii() and (char.isalnum() or char in "._-")
+                      else "".join(f"={byte:02X}" for byte in char.encode()) for char in colons + node)
+    digest = "=" + hashlib.sha256(node.encode()).hexdigest()[:32]
+    return file + (spelled if len(spelled) <= NODE_PLACE else digest)
+
+
 def row_place(row_name: str, held: str) -> str:
     """Row `row_name`'s place on class `held` under a record prefix: `<class>/<test file>/<group>`, a group
     `whole` or a split's `<index>-of-<count>` (`key_parts`), a process variant's (`varied`) with
     `-as-<variant>` after it, in the Worker's key alphabet."""
     _, name, split = parsed_row(row_name)
     variant = split.partition(VARIED)[2]
-    return (f"{held}/{name}/" + ("-of-".join(cut.split("/")) if (cut := cut_of(split)) else "whole")
+    return (f"{held}/{placed(name)}/" + ("-of-".join(cut.split("/")) if (cut := cut_of(split)) else "whole")
             + (f"-as-{variant}" if variant else ""))
 
 
