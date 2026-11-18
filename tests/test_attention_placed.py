@@ -51,6 +51,24 @@ def test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted(call, natural, w
                    value_width=width, tiles=ROWS_TILES, target=generation.gpu_target("sm100"))
 
 
+ROWS_PAIR_TILES = attention_mosaic.Tiles(128, 64, 2, 2, family="tcgen05.rows")
+"""tcgen05's rows at two consumers: two query tiles of 128 rows a program over its one key walk, their
+products issued in turn (FlashAttention 4's two softmax warpgroups), each turn's weights over its logits."""
+
+
+@INTERPRETS
+@pytest.mark.parametrize("tokens", [192, 320])
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_forward_on_tcgen05s_rows_at_two_consumers_holds_check_1_interpreted(call, tokens):
+    """The forward on a B200's tcgen05 rows at two consumers (`ROWS_PAIR_TILES`: the issuer serving each
+    consumer's logits and weighted values in turn on one key and value slot a step, a causal walk's later
+    query tile walking more of the program's keys than its partner, `placed.issuing`'s `reaches`), its
+    query tiles padded, under the interpreter, which models tensor memory and its turns' weights over their
+    logits: on par with the reference (check 1)."""
+    _check_forward(call, jnp.bfloat16, (1, tokens, 2, 1), natural=False, interpret=True, width=64,
+                   value_width=64, tiles=ROWS_PAIR_TILES, target=generation.gpu_target("sm100"))
+
+
 @INTERPRETS
 @pytest.mark.parametrize("tokens", [64, 128, 256, 320])
 def test_the_forward_on_tcgen05s_rows_holds_check_1_over_short_walks_interpreted(tokens):
