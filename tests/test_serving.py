@@ -1226,20 +1226,24 @@ parallel recurrent state, requests alone or mixed mid-flight, speculative blocks
 form (packed, quantized, adapted, reloaded) is none of them: served and lone run the same weights. A
 quantized cache (`KVCache.quantized`), which rounds every step's attention operands, has cells of its own
 (`QUANTIZED_CACHES`)."""
-ARITHMETIC_SEEDS = {"sampled": 256, "several-steps-over-pages": 64, "a-parallel-hybrid": 128,
-                    "speculative-blocks": 64}
+ARITHMETIC_SEEDS = {"sampled": 256, "several-steps-over-pages": 64, "a-parallel-hybrid": 128}
 PREFILL_MESH_SEEDS = 64
 """Each cell's declared seeds and the prefill mesh's, sized paired by `seeds_for` on armada's CPUs
-(2026-11-12, eg-serving-cells at 6d599746e47)."""
+(2026-11-12, eg-serving-cells at 6d599746e47); the speculative blocks' 64 their mark's, their sites drawn
+in armada's map tasks of 32 (`check1_shards`: whole, CI's took 158 s, train 1003 at de27b8e32, row 7446)."""
 
 
-@pytest.mark.parametrize("cell", list(ARITHMETIC))
-def test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic(cell):
+@pytest.mark.parametrize("cell", [
+    *ARITHMETIC_SEEDS,
+    pytest.param("speculative-blocks", id="speculative-blocks",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32))])
+def test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic(cell, request):
     """Each cell of `ARITHMETIC`: every request draws what the lone task draws, and its likelihoods are on
     par with a full forward's from the float64 twin (check 1)."""
     bound, serving, requests, budget = ARITHMETIC[cell]
+    seeds = ARITHMETIC_SEEDS[cell] if cell in ARITHMETIC_SEEDS else marked_seeds(request)
     assert_served_as_exact(bound(), requests, f"served arithmetic: {cell}", serving=serving, budget=budget,
-                           seeds=(ARITHMETIC_SEEDS[cell],) * 2)
+                           seeds=(seeds,) * 2)
 
 
 QUANTIZED_CACHES = {
@@ -1681,16 +1685,18 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
         return held.tokens, held.raw_log_probs
 
     def by_itself(dtype):
+        # Each adapter's task widened once for every draw, where each draw's every request widened and
+        # placed its variables again (row 7446).
+        tasks = alone if dtype == "float32" else {
+            name: dataclasses.replace(task, model=task.model.clone(dtype=jnp.float64),
+                                      variables=widened(task.variables)) for name, task in alone.items()}
+
         @as_given
         def drawn_alone(keys):
             out = []
             for prompt, name, key in zip(prompts, names, keys, strict=True):
-                task = alone[name]
-                if dtype == "float64":
-                    task = dataclasses.replace(task, model=task.model.clone(dtype=jnp.float64),
-                                               variables=widened(task.variables))
                 with jax.enable_x64(new_val=dtype == "float64"):
-                    out.append(drawn_of(task(np.asarray([prompt]), 6, key=int(key))))
+                    out.append(drawn_of(tasks[name](np.asarray([prompt]), 6, key=int(key))))
             return tuple(out)
 
         return drawn_alone

@@ -28,7 +28,7 @@ class Counted:
     volatile: bool = False
     rejects: frozenset[int] = frozenset()
     costly: bool = True
-    calls: list[int] = field(default_factory=list, repr=False)
+    calls: list[int] = field(default_factory=list, compare=False, repr=False)
 
     def __call__(self, row):
         self.calls.append(int(row["id"]))
@@ -54,7 +54,7 @@ class IndexedVolatile:
 
     volatile: bool = True
     costly: bool = True
-    calls: list[int] = field(default_factory=list, repr=False)
+    calls: list[int] = field(default_factory=list, compare=False, repr=False)
 
     def __call__(self, index, row):
         self.calls.append(index)

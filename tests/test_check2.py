@@ -1199,10 +1199,21 @@ def test_the_recurrence_step_witness_holds_the_fused_inference_walk_and_refuses_
 
 
 @INTERPRETS
-def test_the_recurrence_step_witness_holds_the_delta_rules_fast_backward():
-    """The step witness (row 2084 (e)) of the delta rule's fast backward (`rw.assert_backward_witnessed`):
-    every record each of its launches keeps, for a bf16 call of three chunks, inside its step's enclosure."""
-    rw.assert_backward_witnessed(rw.interpreted_lane())
+@pytest.mark.parametrize("form", list(rw.BACKWARD_FORMS))
+def test_the_recurrence_step_witness_holds_the_fast_backward(form):
+    """The step witness (row 2084 (e)) of the fast backward in one of its forms
+    (`rw.assert_backward_form_witnessed`): every record each of its launches keeps, for a call of three
+    chunks, inside its step's enclosure. A form a cell, each under the group target (together 179 s, row
+    5543)."""
+    if not rw.assert_backward_form_witnessed(rw.interpreted_lane(), form):
+        pytest.skip(f"the template trains no {form} call on this device")
+
+
+@INTERPRETS
+def test_the_recurrence_step_witness_refuses_a_backward_that_read_other_gradients():
+    """The step witness refuses a fast backward that read another output's and final memory's gradients
+    (`rw.assert_claimed_gradients_refused`): its records, claimed for those given."""
+    rw.assert_claimed_gradients_refused(rw.interpreted_lane())
 
 
 @INTERPRETS

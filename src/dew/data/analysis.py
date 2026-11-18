@@ -763,9 +763,13 @@ def _volatile(stage: Stage) -> bool:
 def _drops(stage: Stage) -> bool:
     """Whether a stage can drop or make rows, so the rows after it are not
     the rows before it, one for one."""
-    return isinstance(stage, (Filter, FlatMap, Pack, Windows, Native, Batched)) or (
-        isinstance(stage, (Map, MapWithIndex, RandomMap)) and stage.rejects
-    )
+    return isinstance(stage, (Filter, FlatMap, Pack, Windows, Native, Batched)) or rejects(stage)
+
+
+def rejects(stage: Stage) -> bool:
+    """Whether `stage` drops a record it cannot make (`rejects`: a decode's failure), keeping every other
+    one for one."""
+    return isinstance(stage, (Map, MapWithIndex, RandomMap)) and stage.rejects
 
 
 def _written(source: Source, stages: Sequence[Stage]) -> tuple[Stage, ...]:

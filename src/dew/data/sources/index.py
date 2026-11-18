@@ -23,7 +23,7 @@ class ArrayIndex:
     file or its copy in the mirror."""
 
     url: str
-    storage_options: Mapping[str, object] | None = field(default=None, repr=False)
+    storage_options: Mapping[str, object] | None = field(default=None, compare=False, repr=False)
     declared: Declared | None = field(default=None, repr=False)
 
     @locked_cached_property

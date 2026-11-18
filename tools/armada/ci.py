@@ -96,8 +96,9 @@ mark `generations`; none, a file every generation runs). A GPU
 node runs them with `gpu-lane`, each as a task of a CUDA lane, whose rows are
 recorded and reused on the GPU's class as a CPU task's are on the CPU's. With `--prepare`, a lane's files
 run first on the node's CPU, no GPU drawn, for what their GPU run reads and must not compute while it holds
-the GPU (`gpu_prepared`: the tests marked `prepares`, their float64 truths and their programs compiled for
-the node's GPU), nothing of it recorded. With `--network`, a GPU node that
+the GPU (`gpu_prepared`: every test of its part, under the prepare's word, each preparing its float64
+truths and its programs compiled for the node's GPU or skipped, as tests/conftest.py decides), nothing of it
+recorded. With `--network`, a GPU node that
 reaches the Hub runs every file's network-marked tests, which every other task sets aside, as one lane of
 their own, recorded on a class of their own, so each train reruns only the files whose inputs changed.
 
@@ -700,7 +701,8 @@ def reused_classes(network: bool = False) -> list[str]:
 def reused(python: str, name: str, split: str, common: str, network: bool = False,
            kept: tuple[str, str] | None = None, reading: Reading | None = None) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on a class this host reuses
-    (`reused_classes`), if it ran green there on exactly these inputs; else None. A file its plan kept
+    (`reused_classes`), if it ran green there on exactly these inputs, `cached` with that run's key (armada
+    counts it reused and times no file by it); else None. A file its plan kept
     (`kept`: its green run's class and key, `reusable`) reads that run, fresh here; any other, the record of
     the last run on these shared inputs: a key hashes them (`cache_key`), so no run on others, whose record
     the last run's may be, can be fresh here, all from one reading of the inputs (`Reading`)."""
@@ -717,12 +719,12 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
         if found is not None and found["key"] == kept[1] and fresh(found, name, common, reading) and standing(
                 found, current):
             named_at_commit(python, place, kept[0], kept[1], token)
-            return found["row"]
+            return {**found["row"], "cached": found["key"]}
     hit = green_record(python, name, split, common, token, reused_classes(network), reading, [])
     if hit is None:
         return None
     named_at_commit(python, place, hit[1], hit[0]["key"], token)
-    return hit[0]["row"]
+    return {**hit[0]["row"], "cached": hit[0]["key"]}
 
 
 def fresh(recorded: dict, name: str, common: str, reading: Reading | None = None) -> bool:
@@ -1558,7 +1560,7 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
         spent = time.monotonic() - reading
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
-    if left := child_groups.stop(done, grace=max(grace - spent, 0.0) if expired else 0.0,
+    if left := child_groups.stop([done], grace=max(grace - spent, 0.0) if expired else 0.0,
                                  interrupt=signal.SIGINT, settle=SETTLE):
         print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
     # A process of the group still running may yet open a file: no record of this task keeps a key.

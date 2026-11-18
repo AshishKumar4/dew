@@ -1130,3 +1130,36 @@ def test_a_kernels_logistic_slope_is_the_declared_tangents_past_its_value_roundi
     assert float(slope[0]) > 0
     _, silu_slope = activation_and_slope(value, "silu")
     np.testing.assert_array_equal(np.asarray(silu_slope), np.asarray(logistic_value(value) + value * slope))
+
+
+def _ones(digits: int, exponent: int) -> float:
+    """A float of `digits` significant bits all ones, times `2^exponent`."""
+    return (2 ** digits - 1) / 2 ** (digits - 1) * 2.0 ** exponent
+
+
+@pytest.mark.parametrize(("dtype", "left", "right"), [
+    (jnp.float32, _ones(24, 60), _ones(24, 59) - 2.0 ** (59 - 22)),
+    (jnp.float64, _ones(53, 500), _ones(53, 499) - 2.0 ** (499 - 51)),
+    (jnp.float64, _ones(53, 1023), _ones(53, -1) - 2.0 ** (-1 - 51)),
+    (jnp.float16, _ones(11, 15), _ones(11, -1) - 2.0 ** (-1 - 9)),
+    (jnp.bfloat16, _ones(8, 60), _ones(8, 59) - 2.0 ** (59 - 6)),
+    (jnp.float64, _ones(53, 511), _ones(53, 511)),
+    (jnp.float16, _ones(11, 7), _ones(11, 7)),
+], ids=["fp32 edge", "float64 edge", "float64 top", "float16 top", "bfloat16 edge", "float64 top product",
+        "float16 top product"])
+def test_an_exact_product_at_a_dtypes_edge_keeps_its_residual(dtype, left, right):
+    """`precision.two_product`'s range-safe split (`bit_split`) at the top of each dtype's range, its
+    operands' significands all ones (and two less): their product and its residual sum to the exact
+    rational product, a product in the top binade's too.
+    A Veltkamp split multiplies by `2^(p/2) + 1` first and overflows to NaN (past 2^115 in fp32, 2^996 in
+    float64; base reviews 9bc4326dd F1, 1fe546a10 F1); an odd significand's truncated cut left its low parts'
+    product past `p` bits, rounded (float64's 27 and 26 bits; the precision owner's review); the top binade's
+    rounded cut carried past the largest float, and two cuts rounded up a product in it ((2 - 2^-52)
+    2^511 squared, 255.875 squared in float16: train 1018's review F1)."""
+    from dew.nn.precision import two_product
+
+    with jax.enable_x64(new_val=dtype == jnp.float64):
+        a, b = jnp.asarray(left, dtype), jnp.asarray(right, dtype)
+        product, residual = two_product(a, b, bit_split=True)
+        exact = Fraction(float(a)) * Fraction(float(b))
+        assert Fraction(float(product)) + Fraction(float(residual)) == exact

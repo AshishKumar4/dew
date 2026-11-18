@@ -1533,8 +1533,7 @@ class Displayed:
 def test_a_rung_key_states_its_modules_configuration_not_their_display():
     """A rung record's key states its modules as plain data (`dew._stated.stated`), not as they print: two
     equal configurations whose displays differ name one record, another width another; a module holding an
-    array of JAX's, which no plain form states, keeps no record, its run deciding its rung
-    as it compiles, never refused."""
+    array of JAX's by its values, the same values one record and others another."""
     from dew.training.rungs import rung_key
 
     trainer = lm()
@@ -1544,7 +1543,8 @@ def test_a_rung_key_states_its_modules_configuration_not_their_display():
         return rung_key([module], (state, BATCH), [1, 2], trainer.device_mesh)
 
     assert key(Displayed(4)) == key(Displayed(4)) != key(Displayed(8))
-    assert key(Displayed(4, held=jnp.zeros(2))) is None
+    zeros, ones = (key(Displayed(4, held=values)) for values in (jnp.zeros(2), jnp.ones(2)))
+    assert zeros is not None and zeros == key(Displayed(4, held=jnp.zeros(2))) != ones
 
 
 def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():

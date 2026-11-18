@@ -2,6 +2,7 @@
 read by this Dew as its own; and one of 7, which it reads none of."""
 
 import dataclasses
+import itertools
 import json
 from pathlib import Path
 
@@ -75,10 +76,10 @@ def test_a_position_saved_under_14_resumes_where_it_stopped(read):
         changed.close()
 
 
-def test_a_position_saved_under_14_resumes_and_saves_one_of_15_that_resumes_again():
+def test_a_position_saved_under_14_resumes_and_saves_one_of_this_dews_that_resumes_again():
     """A seeded mix's position main saved under plan 14 resumes in this Dew's read onto the rows read next,
-    and the position it saves in turn, of plan 15, holds each stage of its order once, at the step of its
-    manifest that describes it, and resumes again onto the rows after."""
+    and the position it saves in turn, of this Dew's plan (16), holds each stage of its order once, at the
+    step of its manifest that describes it, and resumes again onto the rows after."""
     from saved_positions_support import mixture
 
     ids = _read(mixture(), 0, 8)
@@ -93,7 +94,7 @@ def test_a_position_saved_under_14_resumes_and_saves_one_of_15_that_resumes_agai
             resumed.close()
         plan = json.loads(saved)["dew_data_plan"]
         stages = plan["order"]["stages"]
-        assert plan["version"] == 15 and stages and all(isinstance(stage, int) for stage in stages)
+        assert plan["version"] == 16 and stages and all(isinstance(stage, int) for stage in stages)
 
 
 SAVED_BEFORE_THE_MOVE = Path(__file__).with_name("fixtures") / "positions" / "main-cdc45f8f9"
@@ -101,24 +102,44 @@ SAVED_BEFORE_THE_MOVE = Path(__file__).with_name("fixtures") / "positions" / "ma
 chains whose steps depend on one (`saved_positions_support.Conditioned`)."""
 
 
-@pytest.mark.parametrize("name", ["conditioned_phases", "conditioned_mixture"])
-def test_a_position_saved_before_an_encoder_moved_resumes_where_it_stopped(name):
-    """A position saved while a step's encoder was dew.inputs's resumes onto the rows a read of the same
-    chain reads next: a phased read past its first phase, whose finished phase's identity hashed its steps,
-    and a mix whose member holding the step is kept by its digest. Each holds the class's earlier path, in the
-    mix's manifest or hashed in a digest, which this Dew reads as its path now and hashes as the path it
-    had (`dew._records.MOVED_PATHS`)."""
-    import saved_positions_support
+SAVED_UNDER_15 = Path(__file__).with_name("fixtures") / "positions" / "main-966b2031c"
+"""Positions main saved at 966b2031c, under plan 15, which described a step without the fields its repr
+hides, of the chains `hidden_field_positions` builds: a read and phases through such a step
+(`Remapped`), and a global order and phases of global orders batched by such a function (`Stacked`)."""
 
-    loader, steps = saved_positions_support.SAVED[name]
-    after = _read(loader(), steps, 3)
-    saved = (SAVED_BEFORE_THE_MOVE / f"{name}.position").read_bytes()
-    resumed = loader().train(DataPartition())
-    try:
-        resumed.set_state(saved)
-        assert _ids(resumed, 3) == after
-    finally:
-        resumed.close()
+SAVED_UNDER_16 = Path(__file__).with_name("fixtures") / "positions" / "main-47a76d52d"
+"""A position main saved at 47a76d52d, under plan 16, before a phases' position's version was read from its
+phase's reader: phases through a step whose table its repr hides (`hidden_field_positions`)."""
+
+
+@pytest.mark.parametrize(("saved_at", "module", "name"), [
+    (SAVED_BEFORE_THE_MOVE, "saved_positions_support", "conditioned_phases"),
+    (SAVED_BEFORE_THE_MOVE, "saved_positions_support", "conditioned_mixture"),
+    (SAVED_UNDER_15, "hidden_field_positions", "hidden"),
+    (SAVED_UNDER_15, "hidden_field_positions", "hidden_phases"),
+    (SAVED_UNDER_15, "hidden_field_positions", "hidden_global"),
+    (SAVED_UNDER_15, "hidden_field_positions", "hidden_global_phases"),
+    (SAVED_UNDER_16, "hidden_field_positions", "hidden_phases")])
+def test_a_position_an_earlier_dew_saved_resumes_where_it_stopped(saved_at, module, name):
+    """A position an earlier Dew saved resumes onto the rows a read of the same chain stopped where it
+    stopped reads next. Saved while a step's encoder was dew.inputs's: a phased read past its first phase,
+    whose finished phase's identity hashed its steps, and a mix whose member holding the step is kept by its
+    digest, each holding the class's earlier path, which this Dew reads as its path now and hashes as the
+    path it had (`dew._records.MOVED_PATHS`). Saved under plan 15, which described a step without the fields
+    its repr hides: a read and phases through such a step, and a global order and phases of global orders
+    batched by such a function, read by the plan, and compared with the order, as 15 described its steps
+    (`Plan.under`, `Plan.order_under`), where the record of a run saved since plan 15 hit PlanChanged on its
+    steps (train 1013's review, F3) and a global order's position on its order (train 1016's review, F1;
+    phases of them, train 1018's, F2). Saved under plan 16 with no version of its own, phases through such a
+    step, read as its phase's reader's plan records (train 1018's review, F3)."""
+    import importlib
+
+    from resumed_support import resumed_as_read
+
+    loader, steps = importlib.import_module(module).SAVED[name]
+    stopped, restored = resumed_as_read(loader, steps, (saved_at / f"{name}.position").read_bytes(),
+                                        lambda batch: np.asarray(batch["id"]).tolist(), 3)
+    assert restored == stopped and stopped
 
 
 def _saved(chain, **options) -> tuple[bytes, list[list[int]]]:
@@ -256,3 +277,33 @@ def test_a_position_saved_before_reached_code_is_refused_exact_and_read_on_relax
         assert _ids(relaxed, 2) == _read(loader(), steps, 2)
     finally:
         relaxed.close()
+
+
+def test_a_phases_position_saved_now_refuses_a_finished_phase_whose_hidden_field_changed():
+    """A phases' position this Dew saves is read as the plan version its phase's reader records (16), so a
+    finished phase whose step's table its repr hides changed since is refused, as every field that decides
+    equality states the step (train 1015's review, F6)."""
+    from hidden_field_positions import Remapped
+    from saved_positions_support import READ, source
+
+    from dew.data import phases
+
+    def stepped(scale: int):
+        table = np.arange(8, dtype=np.int32) * scale
+        return compile(phases((source(1).map(Remapped(table)), 3), (source(2), None)), read="indexed",
+                       loading=READ).train(DataPartition())
+
+    stream = stepped(1)
+    try:
+        list(itertools.islice(stream, 5))
+        saved = stream.get_state()
+    finally:
+        stream.close()
+    same, changed = stepped(1), stepped(3)
+    try:
+        same.set_state(saved)
+        with pytest.raises(ValueError):
+            changed.set_state(saved)
+    finally:
+        same.close()
+        changed.close()

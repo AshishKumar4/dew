@@ -359,7 +359,8 @@ class Pretrained:
         """Return what the bundle's tasks encode and decode text with.
 
         That is the source's processor, or a run processor over a saved run's tokenizer (its held copy,
-        `dew.inference.tasks.saved_tokenizer`) or the vocabulary `tokenizer` names (Dew's byte vocabulary).
+        `dew.data.text.tokenizer_for(..., held=run)`) or the vocabulary `tokenizer` names (Dew's byte
+        vocabulary).
         """
         from dew.data.text import HFTokenizer, tokenizer_for
         from dew.inference.tasks import RunProcessor
@@ -394,7 +395,7 @@ class Pretrained:
         `param_dtype` where given. A decoder no family's layout writes (`dew.interop.layouts.source_layout`)
         is held in its native layout: the bundle a run starts from, whose `export` refuses with the
         layout's reason (row 4785)."""
-        from dew.data.text import ByteTokenizer
+        from dew.data.text import ByteTokenizer, tokenizer_for
         from dew.inference.tasks import (
             BlockSettings,
             MaskedSettings,
@@ -402,7 +403,6 @@ class Pretrained:
             TextSettings,
             saved_model,
             saved_settings,
-            saved_tokenizer,
         )
         from dew.registry import models
 
@@ -415,10 +415,10 @@ class Pretrained:
         held = None if run.objective.settings is None else saved_settings(run.record, run.objective.settings)
         task = held if isinstance(held, TaskSettings) else None
         budget = None if task is None else task.max_new_tokens
-        # A run's tokenizer as its loaders build it, the copy the run holds (`saved_tokenizer`), which its
+        # A run's tokenizer as its loaders build it, the copy the run holds (`tokenizer_for`), which its
         # export writes and a run started from it encodes with; the byte vocabulary by its name.
-        found = None if task is None or task.tokenizer is None else saved_tokenizer(
-            task.tokenizer, task.tokenizer_files, run.directory)
+        found = None if task is None or task.tokenizer is None else tokenizer_for(
+            task.tokenizer, files=task.tokenizer_files, held=run.directory)
         tokenizer = found.name if isinstance(found, ByteTokenizer) else found
         # A run over a source's own processor records its source, and the bundle writes its files.
         processor = None if task is None or task.processor is None else load_processor(task.processor, model)

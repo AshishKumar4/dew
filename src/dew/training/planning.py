@@ -190,9 +190,12 @@ class Relowered:
 
 class SampledStep(NamedTuple):
     """A step that also summarizes what the run inspects (`Candidate.sampled`): the program it compiled
-    from (its lowering) and its executable."""
+    from (its lowering), which a run compiled ahead names it by (`program_digest`), and its executable.
+    A plan the run steps by lets the lowering go (`Planned.released`): JAX holds every executable
+    compiled from a lowering while the lowering lives, so a kept one held the sampled module resident
+    through the run (base review of 2ffc61c8c, F2)."""
 
-    lowered: jax.stages.Lowered
+    lowered: jax.stages.Lowered | None
     executable: jax.stages.Compiled
 
 
@@ -508,11 +511,14 @@ class Planned:
                                    profiled=(runs, len(profile)))
 
     def released(self) -> Planned:
-        """This plan as the run keeps it once admitted: its executable without the program it was lowered
-        from. JAX keeps each executable compiled from a lowering while the lowering lives (its in-memory
-        compilation cache, keyed by the lowered module), so releasing it lets every executable the search
-        or a guided compile made of it go, the one the run steps alone held."""
-        return dataclasses.replace(self, candidate=dataclasses.replace(self.candidate, program=None))
+        """This plan as the run keeps it once admitted: its executables without the programs they were
+        lowered from, the step's and its sampled step's. JAX keeps each executable compiled from a lowering
+        while the lowering lives (its in-memory compilation cache, keyed by the lowered module), so
+        releasing them lets every executable the search or a guided compile made of them go, the ones the
+        run steps alone held."""
+        sampled = None if self.sampled is None else self.sampled._replace(lowered=None)
+        return dataclasses.replace(self, candidate=dataclasses.replace(self.candidate, program=None),
+                                   sampled=sampled)
 
 
 def released(trees) -> None:

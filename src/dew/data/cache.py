@@ -152,7 +152,7 @@ class Cache:
     upload_workers: int = 2
     retry: int = 3
     shard_bytes: int | str = 16 * 2**20
-    storage_options: Mapping[str, object] | None = field(default=None, repr=False)
+    storage_options: Mapping[str, object] | None = field(default=None, compare=False, repr=False)
     optional: bool = False
     """Whether a run reads on without it where its storage fails (no room, no permission, its
     index's database full or read-only): a cache the compiler placed (`dew.data.compile._automatic`),

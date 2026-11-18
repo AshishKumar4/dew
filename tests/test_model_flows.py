@@ -20,7 +20,7 @@ import pytest
 import tier_wire
 from process_support import relayed
 from reference_error import assert_as_exact, over_windows, windows
-from truths_ahead import MissingTruth, compiled_truths
+from truths_ahead import UNPREPARED, MissingTruth, compiled_truths
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
@@ -184,30 +184,41 @@ def _site(salt: int = 5461):
 
 
 def test_a_prepared_site_judges_as_one_that_computes_its_truth_and_refuses_a_missing_or_stale_one(tmp_path):
-    """A site prepared (`compiled_truths(prepare=True)`) compiles its truth's programs for every shape its
-    stages' draws take and runs no arm; judged from that store it passes as it passes computing its own; a
-    store of another stamp, of another site, or of other shapes than a draw's is a red (`MissingTruth`),
-    never a program compiled in its place."""
+    """A site prepared (`compiled_truths(prepare=True)`) compiles its truth's programs and its arms' for every
+    shape its stages' draws take and runs no arm; judged from that store it passes as it passes computing
+    its own; a store of another stamp, of other shapes than a draw's, or of another Dew arm than the run's is
+    a red (`MissingTruth`), never a program compiled in its place; a site its prepare did not reach runs
+    unprepared, every draw judged, recorded in the store (`UNPREPARED`)."""
     dew, reference, draw = _site()
+    def scaled(factor):
+        def arm(a, b):
+            return dew(a, b) * factor
+
+        return arm
+
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
-        assert_as_exact(None, reference, draw, "a prepared product", seeds=8)
+        assert_as_exact(scaled(1.0), reference, draw, "a prepared product", seeds=8)
         with pytest.raises(ValueError):
-            assert_as_exact(None, reference, draw, "a prepared product", seeds=8)
-    assert len(list(tmp_path.iterdir())) == 1
-    assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
+            assert_as_exact(scaled(1.0), reference, draw, "a prepared product", seeds=8)
+    assert_as_exact(scaled(1.0), reference, draw, "a prepared product", seeds=8)
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
-        assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
+        assert_as_exact(scaled(1.0), reference, draw, "a prepared product", seeds=8)
     with compiled_truths(tmp_path, prepare=False, stamp="b"), pytest.raises(MissingTruth):
-        assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
-    with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
-        assert_as_exact(dew, reference, draw, "another product", seeds=8)
+        assert_as_exact(scaled(1.0), reference, draw, "a prepared product", seeds=8)
+    # A site its prepare did not reach runs unprepared, every draw judged, recorded in the store.
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(scaled(1.0), reference, draw, "another product", seeds=8)
+    assert (tmp_path / UNPREPARED).is_file()
 
     def wider(seed):
         a, b = draw(seed)
         return np.concatenate([a, a]), b
 
     with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
-        assert_as_exact(dew, reference, wider, "a prepared product", seeds=8)
+        assert_as_exact(scaled(1.0), reference, wider, "a prepared product", seeds=8)
+    # The same function closing over another factor: another computation, never the prepared one's.
+    with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
+        assert_as_exact(scaled(1.0 + 2.0 ** -8), reference, draw, "a prepared product", seeds=8)
 
 
 def test_a_compiled_sites_run_traces_none_of_its_truth(tmp_path):
@@ -222,7 +233,7 @@ def test_a_compiled_sites_run_traces_none_of_its_truth(tmp_path):
         return jnp.dot(a, b)
 
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
-        assert_as_exact(None, reference, draw, "a product's truth", seeds=8, truth_fn=truth)
+        assert_as_exact(dew, reference, draw, "a product's truth", seeds=8, truth_fn=truth)
     assert traced
     traced.clear()
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
@@ -230,6 +241,57 @@ def test_a_compiled_sites_run_traces_none_of_its_truth(tmp_path):
     assert not traced
     assert_as_exact(dew, reference, draw, "a product's truth", seeds=8, truth_fn=truth)
     assert traced
+
+
+ARM_FACTOR = 1.0
+"""A module's flag an arm reads (`test_an_arm_reading_another_flag_than_its_prepares_is_a_red`), as a test's
+backend read at import is one."""
+
+
+def test_an_arm_reading_another_flag_than_its_prepares_is_a_red(tmp_path, monkeypatch):
+    """An arm whose module's flag reads otherwise in its run than in its prepare (a backend read at import:
+    the prepare's CPU, the run's GPU) is another arm: its run finds none of it (`MissingTruth`), never the
+    prepare's program in its place; read alike, it passes."""
+    dew, reference, draw = _site()
+
+    def flagged(a, b):
+        return dew(a, b) * ARM_FACTOR
+
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(flagged, reference, draw, "a flagged product", seeds=8)
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(flagged, reference, draw, "a flagged product", seeds=8)
+    monkeypatch.setattr(sys.modules[__name__], "ARM_FACTOR", 1.0 + 2.0 ** -8)
+    with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
+        assert_as_exact(flagged, reference, draw, "a flagged product", seeds=8)
+
+
+def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
+    """Judged from programs compiled ahead (`compiled_truths(prepare=False)`), a site's run computes every
+    draw's arms with them and runs none of its arms' code, which its prepare alone traced (a GPU run then
+    traces, lowers and compiles none of them); computing its own, a site traces both. Its verdict is the
+    one a site computing its arms reaches."""
+    dew, reference, draw = _site()
+    dew_traced, reference_traced = [], []
+
+    def dew_arm(a, b):
+        dew_traced.append(None)
+        return dew(a, b)
+
+    def reference_arm(a, b):
+        reference_traced.append(None)
+        return reference(a, b)
+
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
+    assert dew_traced and reference_traced
+    dew_traced.clear()
+    reference_traced.clear()
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
+    assert not dew_traced and not reference_traced
+    assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
+    assert dew_traced and reference_traced
 
 
 def test_a_window_loops_truth_is_computed_window_by_window_from_its_windows_program(tmp_path):
@@ -249,10 +311,12 @@ def test_a_window_loops_truth_is_computed_window_by_window_from_its_windows_prog
         return jnp.matmul(*(operand.astype(jnp.bfloat16).astype(operand.dtype) for operand in (a, b)))
 
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
-        assert_as_exact(None, over_windows(reference), windowed, "a product over windows", seeds=8)
-        assert_as_exact(None, over_windows(reference), windowed, "a product over windows, its terms",
-                        seeds=8, terms=terms)
-        assert_as_exact(None, over_windows(stacked), windowed, "a product over windows, walked", seeds=8,
+        assert_as_exact(over_windows(dew), over_windows(reference), windowed, "a product over windows",
+                        seeds=8)
+        assert_as_exact(over_windows(dew), over_windows(reference), windowed,
+                        "a product over windows, its terms", seeds=8, terms=terms)
+        assert_as_exact(over_windows(dew), over_windows(stacked), windowed, "a product over windows, walked",
+                        seeds=8,
                         terms=True)
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(over_windows(dew), over_windows(reference), windowed, "a product over windows",
@@ -282,14 +346,15 @@ def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
         return cancelling(a, b).at[16].add(a[0, 0] * b[0, :])
 
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
-        assert_as_exact(None, cancelling, draw, "a cancelling product", seeds=8)
+        assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
+        assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product, a term left", seeds=8)
     assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
     with pytest.raises(GateFailure) as computing:
         assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product", seeds=8)
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
         with pytest.raises(GateFailure) as stored:
-            assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product", seeds=8)
+            assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product, a term left", seeds=8)
     # Sized by its terms the row fails the sized rows' rule; read without them it would fail the rule of
     # rows of float64 zero.
     assert [finding.rule for finding in stored.value.findings] == [

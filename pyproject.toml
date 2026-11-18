@@ -23,7 +23,7 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     # Dew's JAX build: 0.12.0.1 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post108; a release sorts below it, so an
+    # first build with every fix is post109; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). Its jaxlib, and the CUDA and
     # PJRT plugins the cuda12 and cuda13 extras name, are Dew's builds of its
@@ -32,7 +32,7 @@ dependencies = [
     # (Compiled.peak_live). Elsewhere jaxlib is the release's own. A bump runs
     # the GPU checks docs/installation.md lists under "Bumping JAX" first: CI
     # is CPU-only.
-    "jax>=0.12.0.1.post108,<0.12.1",
+    "jax>=0.12.0.1.post109,<0.12.1",
     "jaxlib==0.12.0.1.post103; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
     "jaxlib==0.12.0.1; sys_platform != 'linux' or (platform_machine != 'x86_64' and platform_machine != 'aarch64')",
     # optax 0.2.8's Muon: the preconditionings Dew's Muon iterates by (`preconditioning`, its AOL and Schatten
@@ -388,7 +388,7 @@ markers = [
     "gpu(reason): tests only a cuda device runs; tests/conftest.py skips them on any other backend, and a GPU session runs them with -m gpu",
     "users_process: a GPU test that runs in a process computing as a user's does (DEW_TEST_USERS_ARITHMETIC=1, tests/lane_environment.py: no deterministic ops or matmul precision of the suite's), which the GPU tier starts for it beside the lane's; tests/conftest.py skips it in any other process, and skips every other GPU test in that one",
     "generations(name, ...): a GPU test whose every cell runs on those GPU generations alone (sm80, sm90, ...); a GPU tier gives a kind every file but those whose tests are all pinned to others (tools/armada/pins.py, ci.py gpu-tier)",
-    "prepares: a GPU test its part's prepare runs on the node's CPU before the GPU run (DEW_TIER_PREPARE=1, tests/model_flows.py): its programs and its float64 truths' programs compiled for the node's GPU (tests/truths_ahead.py); under that prepare tests/conftest.py skips every other test",
+    "prepares: a GPU test that prepares its own store on the node's CPU before the GPU run (DEW_TIER_PREPARE=1, tests/model_flows.py: a model flow, its programs and its float64 truths' programs compiled for the node's GPU, tests/truths_ahead.py); every other test of the part prepares its check-1 sites there into the part's store (tests/conftest.py's compiled_ahead), the node's compile-only GPU its default device, on which nothing computes",
     "tpu(reason): tests only a tpu runs; tests/conftest.py skips them on any other backend, and the TPU tier (dew-ops' dewops.node.tpu, a Colab TPU at main's tip after each train) runs them with -m tpu",
     "torchax: tests whose code imports torchax, which renames torch's privateuse1 backend process-wide; CI runs these files in tasks of their own (tools/armada/ci.py)",
     "check1_shards(seeds, per_task, conditioning, conditioning_per_task): a check-1 site too long for one task, which CI runs as armada's map and judge: its (1 + REDRAW) times seeds draws sharded across map tasks of per_task each, a weighed check's (1 + REDRAW) times conditioning units in later map tasks of conditioning_per_task each (both declared where the site weighs, neither otherwise), and one judge that pools them and reports the site's row; written on the test's own decorator, of literal counts, as the plan reads it (tools/armada/ci.py `sites`)",
