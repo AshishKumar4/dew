@@ -1611,6 +1611,56 @@ def vanishing(dtype, base2: bool = False) -> float:
     return math.floor(least / (math.log(2.0) if base2 else 1.0)) - 1
 
 
+def _pow2(exponent: jax.Array) -> jax.Array:
+    """`2^exponent` for a float32 array of whole numbers within float32's normal exponents ([-126, 127]),
+    from its bits."""
+    return jax.lax.bitcast_convert_type((exponent.astype(jnp.int32) + 127) << 23, jnp.float32)
+
+
+def _binades(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """A float32 `x` as its significand in [1, 2) (its sign kept; a subnormal's below one, zero's zero) and
+    its binary exponent as a float32 whole number, a subnormal's the least normal binade's: exactly
+    `x = significand 2^exponent`."""
+    bits = jax.lax.bitcast_convert_type(x, jnp.int32)
+    biased = (bits >> 23) & 0xFF
+    significand = jax.lax.bitcast_convert_type((bits & -0x7F800001) | 0x3F800000, jnp.float32)
+    lifted = x * _pow2(jnp.full(x.shape, 126.0, jnp.float32))
+    return (jnp.where(biased == 0, lifted, significand),
+            (jnp.maximum(biased, 1) - 127).astype(jnp.float32))
+
+
+def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...] | None = None) -> jax.Array:
+    """The float32 sum of `terms`, each the broadcast product of its factors, summed over `axis` of each
+    product too where given (kept): every product formed as its factors' significands' (each below two)
+    times a power of two, aligned to the largest's binade before the sum and scaled back after in steps each
+    within float32's normal exponents, so a sum in range is its value though its terms leave float32's
+    range: entry writes of keys of +-2^60 and values of 2^-20 under a weight of 2^100, each term 2^140 and
+    their sum zero, where summed as formed it was inf - inf, NaN (base review ead11c83a F1). A product a
+    term at a time (`twice_scaled`) holds each term's range, not a sum's. The roundings are a plain sum's,
+    but a term below the largest by more than float32's normal exponents is dropped, below the sum's error
+    bound. Elementwise and over a 2-D array's axes, so a Pallas TPU kernel forms it in place."""
+    parts = [[_binades(jnp.asarray(factor, jnp.float32)) for factor in term] for term in terms]
+    products = []
+    for term in parts:
+        significand, exponent = term[0]
+        for more, power in term[1:]:
+            significand, exponent = significand * more, exponent + power
+        products.append((significand, exponent))
+
+    def reduced(x, op):
+        return x if axis is None else op(x, axis=axis, keepdims=True)
+
+    top = functools.reduce(jnp.maximum, [reduced(jnp.where(significand != 0, exponent, -1024.0), jnp.max)
+                                         for significand, exponent in products])
+    total = sum(reduced(jnp.where(exponent - top >= -126.0,
+                                  significand * _pow2(jnp.maximum(exponent - top, -126.0)), 0.0), jnp.sum)
+                for significand, exponent in products)
+    top = jnp.where(top < -900.0, 0.0, top)
+    first = jnp.clip(top, -126.0, 127.0)
+    second = jnp.clip(top - first, -126.0, 127.0)
+    return total * _pow2(first) * _pow2(second) * _pow2(jnp.clip(top - first - second, -126.0, 127.0))
+
+
 def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax.Array:
     """`product` times two scales, each entry in the order whose intermediate is a normal float32: an
     input's block scale near float32's largest (2**113 for inputs near 2**122) overflows the codes' product

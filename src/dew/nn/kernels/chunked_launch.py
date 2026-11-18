@@ -24,6 +24,7 @@ from jax.experimental import pallas as pl
 from dew.batch import document_firsts
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.tables import Column, column, packed, unpacked
+from dew.nn.precision import aligned_sum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -541,4 +542,6 @@ class ForkedChunks:
         # an elementwise product summed after: the SSD port's weight gradient took 1.6 to 1.9 times the
         # error each document alone takes from float64 summed after (armada, 11-11).
         weighed = jnp.where((self.taken >= 0)[:, None], weight, 0)
-        return jnp.einsum('crhk,crhv,ch->chkv', key, value, weighed)
+        # Its terms summed aligned to the largest, which may leave fp32's range where the sum is in it.
+        return aligned_sum([(weighed[..., None, None], key[:, r, :, :, None], value[:, r, :, None, :])
+                            for r in range(key.shape[1])])

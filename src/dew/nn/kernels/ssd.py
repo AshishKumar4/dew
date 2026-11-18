@@ -37,7 +37,7 @@ from jax.typing import DTypeLike
 
 from dew.nn import derivatives
 from dew.nn.kernels import launches
-from dew.nn.precision import twice_scaled
+from dew.nn.precision import aligned_sum
 
 from ..precision import exact_float32
 from . import generation
@@ -253,7 +253,9 @@ def _opened(given_ref, table, entry, load, document, zero):
     if entry is None:
         return taken
     key, value, weight = (ref[document] for ref in entry)
-    return taken + sum(twice_scaled(weight, value[:, r:r + 1], key[r:r + 1, :]) for r in range(key.shape[0]))
+    # Its terms' outer products summed aligned to the largest, which may leave fp32's range where the
+    # sum is in it (`precision.aligned_sum`).
+    return taken + aligned_sum([(weight, value[:, r:r + 1], key[r:r + 1, :]) for r in range(key.shape[0])])
 
 
 def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, a_ref, state_ref, given_ref,
@@ -375,17 +377,14 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, 
                 key, value, weight = (ref[document] for ref in entries)
                 dkey, dvalue, dweight = gradients
                 # Each term's gradients, its key row's, its value column's and the weight's, each a sum of
-                # three-factor products formed range-preserving (`_product`), no two-factor partial of them.
+                # three-factor products summed aligned to the largest (`precision.aligned_sum`).
                 rows = range(key.shape[0])
                 dkey[document] = dkey[document] + jnp.concatenate(
-                    [jnp.sum(twice_scaled(weight, value[:, r:r + 1], dmemory), axis=0, keepdims=True)
-                     for r in rows], axis=0)
+                    [aligned_sum([(weight, value[:, r:r + 1], dmemory)], axis=0) for r in rows], axis=0)
                 dvalue[document] = dvalue[document] + jnp.concatenate(
-                    [jnp.sum(twice_scaled(weight, key[r:r + 1, :], dmemory), axis=1, keepdims=True)
-                     for r in rows], axis=1)
-                dweight[document] = dweight[document] + sum(
-                    jnp.sum(twice_scaled(value[:, r:r + 1], key[r:r + 1, :], dmemory), keepdims=True)
-                    for r in rows)
+                    [aligned_sum([(weight, key[r:r + 1, :], dmemory)], axis=1) for r in rows], axis=1)
+                dweight[document] = dweight[document] + aligned_sum(
+                    [(value[:, r:r + 1], key[r:r + 1, :], dmemory) for r in rows], axis=(0, 1))
         return (jnp.where(inside, dx + wx, dx), jnp.where(inside, db + wb, db),
                 jnp.where(inside, dc + wc, dc), jnp.where(within, da + wa, da),
                 jnp.where(load < 0, dmemory, dprev))

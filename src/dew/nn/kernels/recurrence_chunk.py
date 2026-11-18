@@ -42,7 +42,14 @@ from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed_at
 from dew.nn.inputs import cu_seqlens
 from dew.nn.nested import nested
-from dew.nn.precision import asks_default_precision, at_least_fp32, exact_products, l2norm, rounds_products
+from dew.nn.precision import (
+    aligned_sum,
+    asks_default_precision,
+    at_least_fp32,
+    exact_products,
+    l2norm,
+    rounds_products,
+)
 from dew.nn.residuals import Residual
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, shard_shapes, varying_like
 
@@ -831,7 +838,9 @@ def _opened(given, table, slot, entry, document):
     key, value, weight = (x[document] for x in entry)
     # The weight inside the contraction, so its gradient is one too (`dot_general`'s accumulation): summed
     # after, the SSD port's took 1.6 to 1.9 times the error each document alone takes from float64.
-    return taken + jnp.einsum('rk,rv,->kv', key, value, weight).astype(taken.dtype)
+    # Its terms summed aligned to the largest, which may leave fp32's range where the sum is in it.
+    written = aligned_sum([(weight, key[r][:, None], value[r][None, :]) for r in range(key.shape[0])])
+    return taken + written.astype(taken.dtype)
 
 
 def _hooks(given, entry, loads, stores, begun):
