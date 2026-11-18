@@ -1442,6 +1442,10 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
             unsigned, mask, _ = _split_bits(np.float32)
             high = (constant.view(unsigned) & unsigned(mask)).view(np.float32)
             return jnp.asarray(high), jnp.asarray(constant - high)
+        # The value read as one (`uncontracted`): its split reads it twice (its high part from its bits or a
+        # scaled copy, then `value - high`), which a multiply that made it, contracted into the subtraction,
+        # would read exactly at one and rounded at the other, a spurious low part.
+        (value,) = uncontracted(value)
         if bit_split:
             unsigned, mask, low = _split_bits(value.dtype)
             mask = np.array(mask, unsigned)
@@ -1456,12 +1460,6 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
             high = scaled - (scaled - value)
         return high, rounded(value - high)
 
-    # Each array operand read as one value (`uncontracted`): its split reads it twice (its high part from
-    # its bits or a scaled copy, then `value - high`), which a multiply that made it, contracted into the
-    # subtraction, would read exactly at one and rounded at the other, a spurious low part. A constant splits
-    # where it is known, on the host.
-    left, right = (operand if isinstance(operand, np.generic | np.ndarray) else uncontracted(operand)[0]
-                   for operand in (left, right))
     scale = None
     if bit_split and _odd(jnp.result_type(left, right)):
         # A rounded cut of the top binade's last values carries past the largest float, and two cuts
