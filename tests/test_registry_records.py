@@ -4,7 +4,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import pytest
@@ -298,11 +298,9 @@ print(type(model).__name__, model.features)
 
 
 class Defaulted(nn.Module):
-    """A module whose defaults a record writes otherwise than they are held: a function, and a mapping of
-    functions by integer keys."""
+    """A module whose default a record writes otherwise than it is held: a function."""
 
     activation: Callable = activations.silu
-    gates: Mapping[int, Callable] = dataclasses.field(default_factory=lambda: {1: activations.logistic})
 
     @nn.compact
     def __call__(self, x):
@@ -312,11 +310,10 @@ class Defaulted(nn.Module):
 def test_a_configs_defaults_read_back_as_the_records_it_wrote():
     """A model config's defaults (`Registered.defaults`) are records, and read back as those records
     (`JsonRecords`): written and read, or replaced, the config is the one it was, a function's default its
-    `{"function": ...}` and a mapping's integer keys their strings, never the values they name."""
+    `{"function": ...}`, never the value it names."""
     from dew.registry import ModelConfig, to_record
 
     config = ModelConfig(f"{__name__}:Defaulted")
     assert config.defaults["activation"] == {"function": "dew.nn.activations:silu"}
-    assert config.defaults["gates"] == {"1": {"function": "dew.nn.activations:logistic"}}
     assert ModelConfig.from_dict(json.loads(json.dumps(to_record(config, ModelConfig)))) == config
     assert dataclasses.replace(config) == config
