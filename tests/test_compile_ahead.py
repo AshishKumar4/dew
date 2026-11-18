@@ -2115,3 +2115,20 @@ def test_a_step_compiled_ahead_is_admitted_at_the_loading_runs_pool_share_not_th
         assert limits == {int(memory * share)}
     with pytest.raises(ValueError):
         AheadTarget("sm90", 2, capacity_gib=80, share=1.5)
+
+
+def test_a_program_compiled_for_a_compile_only_gpu_is_refused_by_the_keeper_not_crashed_on():
+    """A program a process compiles at Dew's compile point for a compile-only GPU (`gpus`), as a GPU cell's
+    prepare does on its host's CPU, is no program of the process's default backend: the keeper
+    (`keeping`) refuses it by name, its executable never loaded, where reading its loaded devices raised
+    AttributeError and failed the A100 tier's recurrence cells (rows 7323, 7866, 7867)."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.options import owned_program
+    from dew.training.ahead import keeping
+
+    placed = jax.ShapeDtypeStruct((3,), jnp.float32, sharding=NamedSharding(
+        Mesh(np.asarray(gpus("sm80")), ("data",)), PartitionSpec()))
+    with keeping() as programs:
+        owned_program(lambda values: values * 2).executable(placed)
+    assert programs.kept == {} and len(programs.refused) == 1
