@@ -173,6 +173,51 @@ def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
         np.testing.assert_array_equal(tokens, discrete["whole"][key][1])
 
 
+PAGE = 2
+"""The page a model the scheduler cells declare holds (`KVCache.page_size`): a cohort's later turns extend
+whole pages of their rows' histories."""
+
+
+@pytest.mark.parametrize("searched", [False, True], ids=["sampled", "beams"])
+@pytest.mark.parametrize("kind", sorted(MODELS))
+def test_an_episode_schedulers_cohort_draws_what_its_policy_draws_whole(kind, searched):
+    """An episode scheduler over a `TextGeneration` policy (`RolloutScheduler.episodes`): one drawing a row a
+    prompt by sampling, its model declaring pages, it serves over those pages (`served_layout`), its later
+    turns extending whole pages of their rows' histories, which they read back and prefill only what
+    follows; one searching beams, which a server over pages does not draw, it draws whole, its policy's
+    decode over its model's cache unpaged (`Regrouping`, row 7934). Either way its cohort is what the policy
+    collects prefilling every turn whole: every turn's context and action token for token, over drawn
+    weights (row 7905); a served cohort's likelihoods are held to check 1 beside."""
+    from dew.objectives.rl import GRPOObjective
+    from dew.objectives.rl.scheduler import RolloutScheduler, Synchronous
+    from dew.sampling.strategies import Beam
+
+    model = MODELS[kind]().with_kv_cache(KVCache(page_size=PAGE))
+    # Every token but the pad ends a turn, so each episode runs its turns and its contexts grow past pages.
+    sampling = replace(GREEDY if searched else SAMPLED, eos_token_ids=tuple(range(1, VOCAB)))
+    initialized = jax.jit(model.init)
+    for seed in range(4):
+        variables = nn.unbox(initialized(jax.random.key(seed), jnp.ones((1, 2), jnp.int32)))
+        policy = TextGeneration(model, variables, **({"strategy": Beam(width=2)} if searched else {}))
+        acquisition = RolloutScheduler.episodes(
+            policy, conversations, lambda episode: 1.0,
+            objective=GRPOObjective(model, seq_len=PROMPT + RESPONSE), max_prompt_tokens=PROMPT,
+            max_new_tokens=RESPONSE, max_turns=TURNS, sampling=sampling).acquisition
+        assert isinstance(acquisition, Synchronous) and isinstance(acquisition.collector, EpisodeCollector)
+        layout = acquisition.collector.kv_cache
+        if searched:
+            assert layout is None, "a policy searching beams is drawn whole"
+        else:
+            assert layout is not None and layout.page_size == PAGE, "the cohort served over its model's pages"
+        scheduled = collected(acquisition.collector, variables)
+        whole = collected(EpisodeCollector(policy, conversations, lambda episode: 1.0, PROMPT, RESPONSE,
+                                           TURNS, sampling=sampling), variables)
+        # A later turn's history holds whole pages, which a served one reads back.
+        assert int(np.max(np.sum(scheduled["contexts"] >= 0, axis=-1))) > 2 * PAGE
+        for name in ("contexts", "tokens"):
+            np.testing.assert_array_equal(scheduled[name], whole[name], err_msg=f"seed {seed}: {name}")
+
+
 def test_a_served_row_whose_context_does_not_continue_its_last_turn_is_prefilled_whole(caplog):
     """A served cohort's row whose next context does not begin with the history its last turn left (a
     context the environment rewrote) is prefilled whole, its draws the policy's whole draws, and says so: a

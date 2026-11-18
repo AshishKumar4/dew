@@ -1,0 +1,347 @@
+"""Whether a fresh run streams its parameters from the host (row 1880): the plan its devices hold, priced
+against the step that keeps the state on the host (`Layout(host=("variables",))`), each as a step time
+(`dew.training.memory.StepPrice`).
+
+A run whose devices hold no plan of its step trains streamed where the devices hold that one; where they
+hold both, the cheaper step is taken: the device plan's step is its compute, a remat rung's recompute
+among it, and the streamed step its compute or its host link's transfers, whichever is longer, the two
+overlapping layer by layer, and then its update on the host (`StepPrice.seconds`). A run that states its
+layout keeps it, and so does one the streamed step cannot run: a state streamed lives on a CPU companion
+of the devices, which a process holds only where it was started with one (training.md, "Parameters on the
+host"), and a part that states no host link (`GpuTarget.host_links`) prices no streamed step. Each refusal
+is said by name where the plans are chosen (`refusal`, `Choice`)."""
+
+from __future__ import annotations
+
+import contextlib
+import dataclasses
+import logging
+import math
+from collections.abc import Iterator
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from dew._coordination import agreed_same, broadcast_from_process_zero
+from dew._records import JSON, listed, record, text
+from dew.batch import FROZEN
+from dew.distributed.batches import placed_abstract, prefetched_bytes, split_fields
+from dew.distributed.host import companion_mesh
+from dew.distributed.placement import Layout
+from dew.mesh import LayoutRefused
+from dew.nn.kernels.generation import gpu_target
+from dew.nn.protocols import ComputesIn
+from dew.telemetry.instrumentation import step_flops
+from dew.training._fit import Start, closes_window
+from dew.training.distributed import microbatch_shapes
+from dew.training.execution import HostExecution, frozen_trees, stack_sites
+from dew.training.memory import (
+    StepPrice,
+    Unpriced,
+    device_price,
+    host_memory_rate,
+    layer_gathers,
+    local_devices,
+    step_fits,
+    streamed_price,
+)
+from dew.training.model_flops import model_batch
+from dew.training.planning import PlanRefused, Rung
+from dew.training.profiling import pgle_runs
+from dew.training.transaction import loss_arguments
+
+_log = logging.getLogger(__name__)
+
+STREAMED = ("variables",)
+"""The layout's host fields of a streamed run: its whole state the host's (`Layout.host`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Choice:
+    """The plans a run chose its layout among: whether its devices hold a plan of its given layout's step
+    (`held`) and whether they hold the streamed step (`fits`), each one's step price where its part rates
+    it (`device`, `streamed`; None otherwise), why the streamed one was not a candidate (`refused`), and
+    whether it was taken (`streams`); or, for a run resuming a checkpoint (`resumed`), the layout that
+    checkpoint trained in, laid out alike (`resumed_layout`), no plan priced."""
+
+    held: bool
+    fits: bool
+    device: StepPrice | None
+    streamed: StepPrice | None
+    refused: str | None
+    streams: bool
+    resumed: bool = False
+
+    def record(self) -> dict[str, JSON]:
+        return {"held": self.held, "fits": self.fits,
+                "device": None if self.device is None else self.device.record(),
+                "streamed": None if self.streamed is None else self.streamed.record(),
+                "refused": self.refused, "streams": self.streams, "resumed": self.resumed}
+
+    def noted(self, error: BaseException) -> None:
+        """`error`, a plan or a layout the devices do not hold, noted with what this choice found of the
+        streamed step: why it was no candidate, or that the devices do not hold it either."""
+        if self.refused is not None:
+            error.add_note(f"Streaming the parameters from the host (Layout(host=('variables',))) was not "
+                           f"considered: {self.refused}.")
+        elif not self.streams and not self.fits:
+            error.add_note("Streaming the parameters from the host (Layout(host=('variables',))) was "
+                           "considered: the devices do not hold that step either.")
+
+
+NOT_BUILT = 7908
+"""The ledger row of the runs the streamed step is not built for yet (`refusal`)."""
+
+
+def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
+    """Why `trainer`'s run cannot stream its parameters from the host, None where it can. What the streamed
+    step cannot be: a layout the run states (`stated`), a custom step, which owns its execution, or a process
+    holding no CPU companion of the devices, which JAX makes only before it initializes. And what it is not
+    built for yet (`NOT_BUILT`): a rollout, an inspected step, DiLoCo, a step compiled `ahead`,
+    a lowering for another target, AutoPGLE, and a part whose table
+    states no host link to price it by (`GpuTarget.host_links`: a TPU's). Read before any plan is built."""
+    unbuilt = (
+        (trainer.rollout is not None, "a rollout"),
+        (trainer.inspection is not None, "an inspected step"),
+        (trainer.diloco is not None, "DiLoCo's groups"),
+        (ahead, "a step compiled ahead"),
+        (trainer.lower_for is not None, "a lowering for another target"),
+        (pgle_runs() > 0, "AutoPGLE"),
+    )
+    if stated:
+        return "the run states its layout"
+    if trainer.step is not None:
+        return "a custom step owns its execution"
+    for refused, what in unbuilt:
+        if refused:
+            return f"the streamed step is not built for {what} yet (row {NOT_BUILT})"
+    target = gpu_target()
+    if target.host_link_rate is None:
+        return (f"the streamed step is not priced on {target.device_kind} yet: no host-link rate is stated "
+                f"for it (`GpuTarget.host_links`; row {NOT_BUILT})")
+    try:
+        companion_mesh(trainer.device_mesh)
+    except ValueError as missing:
+        return f"the process holds no CPU companion of its devices: {missing}"
+    return None
+
+
+def priced(plan, dtype) -> StepPrice:
+    """The step of the device plan `plan` (`StepCompiler.planned_unplaced`'s), priced (`device_price`):
+    its executable runs once a microbatch, `plan.split` of them a step."""
+    flops = step_flops(plan.executable)
+    return device_price(None if flops is None else plan.split * flops, gpu_target(), dtype)
+
+
+def streamed(trainer, start: Start, batch, dtype, device_steps: tuple) -> tuple[bool, StepPrice | None]:
+    """Whether the devices hold the step of `trainer`, laid out streamed, that streams `start`'s parameters
+    from the host over `batch`, the loader's `device_steps` run in it, traced in the run's own context
+    (`Trainer._traced_on`; `HostExecution.compiled_whole`), admitted before anything is placed as a
+    plan's candidate is (`_candidates._candidate`: `step_fits`, the inputs each realization places counted
+    as built, and the batches the run prefetches beside them, `prefetched_bytes`), and its price
+    (`streamed_price`), None where its part rates no step computing in `dtype`. Its bytes are each device's:
+    the shards its link moves, and the shards its process's update reads and writes on its host, every local
+    device's."""
+    mesh, abstract = trainer.device_mesh, start.abstract
+    # The batch read in the split the run states, each microbatch an attempt of its own that fetches the
+    # parameters again (`StepCompiler._compile_host`).
+    split = trainer.split or 1
+    whole_batch, batch = batch, microbatch_shapes(batch, split)
+    # The CPU companion read before the devices' mesh is in place: its probe runs a CPU program, which no
+    # trace under a GPU's mesh may (M-MC-24b: refused on a GH200).
+    companion = companion_mesh(mesh)
+    with trainer._traced_on(mesh):
+        variables, step = loss_arguments(trainer.objective, abstract, batch, split * trainer.accumulation,
+                                         split)
+        execution = HostExecution(trainer.objective, trainer.layout, mesh, companion,
+                                  stack_sites(trainer.objective, abstract.variables), device=device_steps,
+                                  gathered=layer_gathers(trainer.objective, abstract.variables,
+                                                         mesh.devices.size))
+        compiled, (primal, frozen, rest, _, here) = execution.compiled_whole(variables, batch, step)
+    devices = local_devices(mesh)
+    built = max(_shard_bytes((primal, frozen, rest, here), device) for device in devices)
+    prefetched = prefetched_bytes(whole_batch, jax.tree.map(lambda leaf: leaf.sharding, whole_batch),
+                                  trainer._shape.prefetch)
+    # A process whose compile XLA refused for memory (None) takes part in the agreement as one that does
+    # not fit, as a plan's candidate's does: every process answers alike, and none waits on another.
+    fits, _ = step_fits(compiled, mesh, prefetched + built, built, placed=False)
+    if not fits or compiled is None:
+        return False, None
+    # The parameters the step trains, the vjp's primal, moved there and back each attempt.
+    parameters = max(_shard_bytes(primal, device, memory=None) for device in devices)
+    # Read once an attempt, beside them, and differentiated by nothing: the averaged weights the step reads
+    # (an EMA reference, `Step.ema`), and the banks of every frozen tree the host keeps, its frozen
+    # parameters' (a LoRA base, the run's frozen collection) and its frozen roots' (`frozen_trees`: a
+    # distillation's teacher whole), each forward's fetch of them from host memory; their other leaves stay
+    # resident on the devices, which the admission counts.
+    # The run's own frozen collection is among the primal's frozen leaves (`frozen`), the snapshot's
+    # parameters holding it; its nested roots' trees are the snapshot's other collections' (`rest`).
+    banked = [frozen, *(tree for path, tree, _ in frozen_trees(rest, execution.sites) if path != (FROZEN,))]
+    averaged = max(_shard_bytes(here.ema, device, memory=None)
+                   + _shard_bytes(banked, device, memory="pinned_host") for device in devices)
+    # The update, on the host's CPUs: each of this process's companion devices reads and writes its shards
+    # of the parameters, the optimizer's state and the averaged weights, and reads the gradient's.
+    weights, held = abstract.variables["params"], start.shardings.variables["params"]
+    updated = sum(_shard_bytes((weights, abstract.opt_state, abstract.ema), device,
+                               (held, start.shardings.opt_state, start.shardings.ema), memory=None)
+                  + _shard_bytes(weights, device, held, memory=None)
+                  for device in local_devices(companion))
+    try:
+        flops = step_flops(compiled)
+        price = streamed_price(None if flops is None else split * flops, gpu_target(), dtype,
+                               split * parameters, updated, host_memory_rate(), read_once=split * averaged)
+    except Unpriced:
+        price = None
+    return fits, price
+
+
+def _shard_bytes(tree, device, placement=None, *, memory: str | None = "device") -> int:
+    """The bytes `device` holds of `tree`'s leaves (shapes, each placed by its own sharding or by
+    `placement`'s): each leaf's shard there, those in `memory` alone (a device's own memory: a bank in its
+    host's pinned memory is none of it), or every one where `memory` is None."""
+    shardings = (jax.tree.leaves(placement) if placement is not None
+                 else [leaf.sharding for leaf in jax.tree.leaves(tree)])
+    total = 0
+    for leaf, sharding in zip(jax.tree.leaves(tree), shardings, strict=True):
+        held = memory is None or (sharding.memory_kind or "device") == memory
+        sized = hasattr(leaf, "dtype") and not jnp.issubdtype(leaf.dtype, jax.dtypes.extended)
+        if held and sized and device in sharding.device_set:
+            total += math.prod(sharding.shard_shape(leaf.shape)) * np.dtype(leaf.dtype).itemsize
+    return total
+
+
+def chosen(held: bool, fits: bool, device: StepPrice | None, stream: StepPrice | None) -> bool:
+    """Whether the run streams: where its devices hold the streamed step (`fits`) and no plan of the given
+    layout's (`held`), or hold both and the streamed step is priced the cheaper (a part that rates neither
+    keeps its devices' plan)."""
+    if not fits:
+        return False
+    if not held:
+        return True
+    return device is not None and stream is not None and stream.seconds < device.seconds
+
+
+@contextlib.contextmanager
+def noting(trainer) -> Iterator[None]:
+    """Within the block, a plan or a layout the devices do not hold (`PlanRefused`, `LayoutRefused`) is noted
+    with what the run's layout choice found of the streamed step (`Choice.noted`): a run never ends short of
+    memory without saying whether streaming was considered, and why not."""
+    try:
+        yield
+    except (PlanRefused, LayoutRefused) as refused:
+        if trainer.layout_choice is not None:
+            trainer.layout_choice.noted(refused)
+        raise
+
+
+def compute_dtype(trainer, start: Start) -> np.dtype:
+    """The dtype the run's step computes in: its trained modules' compute dtype, each as its model states it
+    (`dew.nn.protocols.ComputesIn`), the widest of them; a module that states none computes in its
+    parameters' as `start` holds them (the run's `param_dtype` applied, loaded parameters their own), as Flax
+    does."""
+    stated = [entry.module.dtype for entry in trainer.objective.program_key()
+              if entry.trained and isinstance(entry.module, ComputesIn) and entry.module.dtype is not None]
+    found = stated or [leaf.dtype for leaf in jax.tree.leaves(start.abstract.variables["params"])]
+    return np.dtype(jnp.result_type(*found))
+
+
+def resumed_layout(trainer, resume) -> Layout | None:
+    """The layout of the checkpoint `trainer`'s run resumes (as `resume` asks, `Checkpoints.resumed`, the
+    step every process agrees), the given one's with the host fields its rung recorded (`host`,
+    `Trainer._checkpoint_envelope`); None for a fresh run. A checkpoint that recorded none trained on the
+    devices."""
+    checkpoints = trainer.checkpoints
+    if checkpoints is None or resume == "never":
+        return None
+    step = agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume))
+    if step is None:
+        return None
+    rung = checkpoints.rung(step)
+    host = () if rung is None else listed(record(rung, "rung").get("host", []), "rung host", read=text,
+                                          what="the layout's host fields")
+    return dataclasses.replace(trainer._given_layout, host=host)
+
+
+def said(choice: Choice) -> None:
+    """The choice, said once a run: which plan it took and what each costs, the checkpoint's it resumed, or
+    why the streamed one was not priced."""
+    if choice.resumed:
+        _log.info("the run resumes its checkpoint's layout: the parameters %s",
+                  "streamed from the host" if choice.streams else "on the devices")
+    elif choice.refused is not None:
+        _log.info("the step does not stream its parameters from the host: %s", choice.refused)
+    elif choice.streams:
+        _log.warning("the step streams its parameters from the host (Layout(host=('variables',))): %s",
+                     choice.record())
+    else:
+        _log.info("the step keeps its parameters on the devices: %s", choice.record())
+
+
+def laid_start(trainer, run, dataset, resume) -> Start:
+    """A run's start (`Trainer._started`) in its layout. A run resuming a checkpoint trained in its
+    checkpoint's layout (`resumed_layout`), laid out alike. A fresh one in the layout its step is cheaper in:
+    the plan its devices hold of the given layout's step (`Trainer._planned_unplaced`, which the run's first
+    compile takes), priced, against the step that streams its parameters from the host, priced where its
+    devices hold it, over the run's first batch (`Trainer._primed_first`, which the run then reads as its
+    first), the choice every process's first's (`broadcast_from_process_zero`), said and kept
+    (`Trainer.layout_choice`). A run that states a layout (any but the default `Layout()`), or one the
+    streamed step cannot run, keeps its layout, said by name."""
+    stated = trainer._given_layout != Layout()
+    resumed = None if stated else resumed_layout(trainer, resume)
+    if resumed is not None:
+        trainer._laid_out(resumed)
+        trainer.layout_choice = Choice(held=False, fits=False, device=None, streamed=None, refused=None,
+                                       streams=resumed.host == STREAMED, resumed=True)
+        said(trainer.layout_choice)
+        return trainer._started(resume)
+    refused = refusal(trainer, stated=stated, ahead=trainer._compiler.ahead is not None)
+    if refused is not None:
+        trainer.layout_choice = Choice(held=False, fits=False, device=None, streamed=None, refused=refused,
+                                       streams=False)
+        said(trainer.layout_choice)
+        return trainer._started(resume)
+    # Each fit chooses afresh, from the layout it was given (a refit's of a run that streamed among them).
+    given = trainer._given_layout
+    trainer._laid_out(given)
+    first = run.primed[2] if run.primed is not None else trainer._primed_first(run, dataset)
+    placed = split_fields(placed_abstract(trainer.device_mesh, first))[0]
+    batch = closes_window(placed, trainer._shape.examples)
+    # The step's phase the first batch's, as the run's first compile takes it (`Trainer._compiled_fresh`),
+    # and its objective, at that phase's pass count, as it stands before the device plan's search climbs
+    # its ladder: the streamed layout starts from it where it is taken, both plans priced at that count.
+    phases = trainer.phase_passes
+    active = phases.objective_for(phases.at(first))
+    rung = Rung.of(active, xla_defaults=False, narrow=True)
+    try:
+        start = trainer._started(resume)
+        trainer._planned_unplaced(start, batch)
+    except LayoutRefused:
+        start = None
+    plan = trainer._compiler.unplaced if start is not None else None
+    trainer._laid_out(dataclasses.replace(given, host=STREAMED))
+    # The device plan's climb and plans undone: the streamed step is priced at the objective's own rung.
+    devices_compiler, devices_rung = trainer._compiler, Rung.of(active, xla_defaults=False, narrow=True)
+    rung.put(active)
+    trainer._compiler = devices_compiler.anew()
+    laid = trainer._started(resume)
+    dtype = compute_dtype(trainer, laid)
+    try:
+        device = None if plan is None else priced(plan, dtype)
+    except Unpriced:
+        device = None
+    with phases.scoped(trainer, trainer._compiler):
+        fits, price = streamed(trainer, laid, model_batch(batch), dtype, trainer._shape.device)
+    held = plan is not None
+    trainer.layout_choice = Choice(held, fits, device, price, None,
+                                   streams=broadcast_from_process_zero(chosen(held, fits, device, price)))
+    said(trainer.layout_choice)
+    if trainer.layout_choice.streams:
+        return laid
+    # The device plan taken: its compiler, which holds the plan the run's first compile takes, and its rung.
+    trainer._compiler = devices_compiler
+    devices_rung.put(active)
+    trainer._laid_out(given)
+    # The given layout's start, which its first compile takes the plan above over; or, its devices holding
+    # none, its refusal, as a run that streams nothing refuses.
+    return start if start is not None else trainer._started(resume)

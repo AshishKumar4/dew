@@ -347,15 +347,18 @@ def _span(span_ref, length: int, chunk: int, aligned: bool) -> Span:
 class Forked:
     """A forked call's documents as its walks read them (`recurrence_chunk.Chunk.loads`): each document's
     first slot (`firsts` `[B, D]`, `S` past a row's last), the table slot it enters and the stored slot it
-    leaves its final in (`loads`, `stores` `[B, D]`), the stored slots' count (`held`), and its entry write,
+    leaves its final in (`loads`, `stores` `[B, D]`), the stored slots' count (`held`), its entry write,
     where the call gives one (`entry`, its `[B, D, Hv, Dk, Dv]` never formed: each walk forms a chunk's
-    own)."""
+    own), and where a turned call gives it, the rotation `(cos, sin)` `[B, D, Hv, A]` each document turns
+    the memory it takes up by as its walk loads it, its first `A` key pairs (`turning`,
+    `templates.recurrence.turned`: minus the document's own turns)."""
 
     firsts: jax.Array
     loads: jax.Array
     stores: jax.Array
     entry: tuple | None
     held: int = dataclasses.field(metadata={'static': True})
+    turning: tuple | None = None
 
     @classmethod
     def of(cls, operands, starts, firsts, work) -> "Forked":
@@ -375,12 +378,15 @@ class Forked:
 
     @property
     def walked(self) -> tuple:
-        """The operands a walk takes beside the call's (`carrying`): the documents' slots and entry write."""
-        return (self.firsts, self.loads, self.stores, *(() if self.entry is None else self.entry))
+        """The operands a walk takes beside the call's (`carrying`): the documents' slots, entry write and
+        load rotation."""
+        return (self.firsts, self.loads, self.stores, *(() if self.entry is None else self.entry),
+                *(() if self.turning is None else self.turning))
 
-    def carrying(self, firsts, loads, stores, *entry) -> "Forked":
+    def carrying(self, firsts, loads, stores, *rest) -> "Forked":
         """This call's documents from the operands a product's walk was handed (`walked`)."""
-        return Forked(firsts, loads, stores, entry or None, self.held)
+        entry, turning = ((rest[:3], rest[3:]) if self.entry is not None else ((), rest))
+        return Forked(firsts, loads, stores, tuple(entry) or None, self.held, tuple(turning) or None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -443,6 +449,16 @@ class AlignedDocuments:
     def unlaid(self, out):
         """`out` `[B, length, ...]` back at the call's slots `[B, S, ...]`."""
         return jax.vmap(lambda row, at: row[at])(out, self.slots)
+
+    def turning(self, forked: Forked):
+        """Each aligned chunk's load rotation (`Forked.turning`), the document it takes up's, none (a unit
+        turn) for none: `(cos, sin)` `[B, chunks, Hv, A]`; None where the call gives none."""
+        if forked.turning is None:
+            return None
+        live = (self.takes >= 0)[..., None, None]
+        taken = jnp.maximum(self.takes, 0)
+        cos, sin = (gather_positions(part, taken) for part in forked.turning)
+        return jnp.where(live, cos, 1.0), jnp.where(live, sin, 0.0)
 
     def entries(self, forked: Forked, transposed: bool = False):
         """Each aligned chunk's entry write (`recurrence_chunk.Chunk.entry_key`), the document it takes up's,

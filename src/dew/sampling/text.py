@@ -56,6 +56,7 @@ from dew.nn.kv_cache import (
     on_device,
     refuse_unassigned,
     row_axis,
+    unpaged,
     with_rounding_keys,
     with_rounding_keys_of,
     write_cache,
@@ -96,7 +97,7 @@ from dew.sampling.decoding import (
     TopP,
     Typical,
 )
-from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Speculative, Strategy
+from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Regrouping, Sample, Speculative, Strategy
 from dew.sampling.trees import TreeBlock
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
@@ -1080,8 +1081,12 @@ def generate(model: nn.Module, params: Variables,
     means the chain ``sampling`` compiles to, and ``()`` runs no transform.
     ``stopping`` adds criteria beside the policy's EOS criterion and never
     replaces it. ``strategy`` replaces the per-row draw loop; ``None`` uses
-    ``Sample``. A policy with ``stop`` strings raises ``ValueError``,
-    because ``generate`` has no tokenizer to compile them against.
+    ``Sample``. A strategy that reparents its rows (``Regrouping``: ``Beam``)
+    decodes over the model's cache unpaged, each row's whole, since a paged
+    pool's shared pages cannot hold a regrouped row; its memory is the dense
+    model's, not the pages'. A policy with ``stop`` strings
+    raises ``ValueError``, because ``generate`` has no tokenizer to compile
+    them against.
 
     ``trips``, at least ``max_new_tokens``, scans that many draws, so calls
     of several budgets share one compiled loop (``TextGeneration`` buckets
@@ -1105,6 +1110,9 @@ def generate(model: nn.Module, params: Variables,
         raise ValueError("stop strings compile against a tokenizer's vocabulary, which generate does not "
                          "have; generate through a TextGeneration with a processor, or pass "
                          "stopping=(decoding.stop_strings(tokenizer, strings, vocab_size),)")
+    if isinstance(strategy, Regrouping) and isinstance(model, Layered):
+        # A search reparenting its rows holds them whole, which a paged pool's shared pages cannot.
+        model = model.with_kv_cache(unpaged(model.kv_cache))
     scanned = max_new_tokens if trips is None else trips
     request, components = Request.prepare(
         inputs, key, mesh_of(params),
@@ -1117,7 +1125,7 @@ def generate(model: nn.Module, params: Variables,
         refuse_unassigned(model.kv_cache, plan.count, capacity)
     from dew.nn.projections import pending
 
-    compiled = program(_checked, model, static_argnames=("model", "trips", "pad_id", "n", "packing"),
+    compiled = program(_checked, static_argnames=("model", "trips", "pad_id", "n", "packing"),
                        in_shardings=(None, plan.sharding, plan.sharding, None, None, None, None, None),
                        out_shardings=(None, plan.sharding))
     # A tree a loader owns arrives packed; one borrowed from a live objective packs in the call.

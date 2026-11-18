@@ -90,7 +90,12 @@ from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.selection import Unlowerable
 from dew.registry import models
 from dew.telemetry.benchmark import carried
-from dew.telemetry.instrumentation import BOUND_MARKS, compilation_cache_counts, count_compilation_cache
+from dew.telemetry.instrumentation import (
+    BOUND_MARKS,
+    compilation_cache_counts,
+    count_compilation_cache,
+    logged_utilization,
+)
 from dew.telemetry.profile import Profiler
 from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.training import Trainer
@@ -388,8 +393,8 @@ def rates(trainer: Trainer, rows: int, steps: int, elapsed: float,
     scalars = throughput(elapsed, steps, rows * steps, None if flops is None else steps * flops,
                          trainer.device_mesh.devices.size,
                          training_flops=None if work is None else steps * work)
-    bound = "" if flops is None else flops.bound
-    return scalars.get(f"train/hfu{bound}"), scalars.get("train/mfu")
+    hfu = logged_utilization(scalars, "hfu")
+    return None if hfu is None else hfu[0], scalars.get("train/mfu")
 
 
 def measured_row(case: Case, config: BenchmarkConfig) -> Row:

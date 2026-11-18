@@ -894,7 +894,7 @@ def grown_limits(saved: dict[str, JSON] | list[JSON] | str | int | float | bool 
     each limit the order `current` sets higher than `saved` does, where `current` is `saved` but for them;
     None where it differs otherwise. Only the run's own chain's limit grows (never a mixed corpus's or a
     phase's, which the mixture's own stages read after it), and only where nothing after it but a batch
-    reads the records it holds, as the examples clock's bound (`dew.data.compile._bounded`) of a chain that
+    reads the records it holds, as the examples clock's bound (`dew.data.bounds._bounded`) of a chain that
     neither packs nor windows: its first records are the saved one's, read further, where a repeat, a
     shuffle, a split, a pack or windows after it would read them anew (row 2649)."""
     if not (isinstance(saved, dict) and isinstance(current, dict)) or saved.keys() != current.keys():

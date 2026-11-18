@@ -364,8 +364,15 @@ class Completed:
     terminated: jax.Array
 
 
+class Regrouping:
+    """A strategy whose decode reparents its rows (`DecodeOps.reindex`: a beam's branches), which a paged
+    cache's shared pool cannot hold: `generate` decodes it over its model's layout unpaged
+    (`dew.nn.kv_cache.unpaged`), its memory the dense model's. `Beam` is such; your own strategy that
+    regroups its rows inherits it."""
+
+
 @struct.dataclass
-class Beam:
+class Beam(Regrouping):
     """Runs deterministic beam search over one shared prefill.
 
     The bookkeeping follows `_beam_search` in Transformers 5.16.1. Each step

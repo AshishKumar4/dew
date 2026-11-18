@@ -2221,6 +2221,25 @@ def mode_host_training(args) -> dict:
     return reports
 
 
+def mode_streamed_refused(args) -> dict:
+    """A fresh fit choosing its layout across two processes on stand-in H100s that hold both steps, process
+    1's streamed compile refused for memory as XLA refuses one (`compiled_if_it_fits` answering None there):
+    each process's choice and whether it streams."""
+    import jax
+    from test_host_training import assumed_on_cpu, streaming_data, streaming_decoder
+
+    from dew.training import execution
+    from dew.training.ahead import stand_in_gpus
+
+    whole = execution.HostExecution.compiled_whole
+    if args.process_id == 1:
+        execution.HostExecution.compiled_whole = lambda self, *given: (None, whole(self, *given)[1])
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.local_devices(), 80 * 2 ** 30):
+        trainer = streaming_decoder()
+        trainer.fit(streaming_data(), steps=1, log_every=100)
+    return {"streams": trainer.host_master, "choice": trainer.layout_choice.record()}
+
+
 def mode_step_fits(args) -> dict:
     """Each process's own headroom for a step, and the pool's answer: process
     0 has room, process 1 is short, and a process that reads no memory
@@ -2379,6 +2398,7 @@ def mode_matrix(args) -> dict:
 MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit": mode_schedule_fit,
          "decision_publish": mode_decision_publish,
          "host_training": mode_host_training, "step_fits": mode_step_fits,
+         "streamed_refused": mode_streamed_refused,
          "whole_validation": mode_whole_validation, "host_fields": mode_host_fields,
          "topology": mode_topology, "data": mode_data, "online_data": mode_online_data,
          "packed": mode_packed,

@@ -8,9 +8,14 @@ tests/fixtures/fetched/, under its SHA-256, and pinned beside where it would sit
 license. `fetch` fills the local store before the tests run (armada's environment build,
 tools/armada/install.sh, whose key holds every pin, or by hand), and the tests read it offline
 (`local`), checking every file against its pin as they read it: CI's tests never reach the Hub
-(tools/armada/ci.py's CLOSED_HUB). `upload`, run by whoever holds the store's token, commits every pin
-awaiting its revision, with the store's catalog of every file it has held and the card made from it,
-reads each file back anonymously at that commit and checks it before the pin takes the revision.
+(tools/armada/ci.py's CLOSED_HUB). A file for GitHub's store never passes through the machine that holds
+the store's token: `stage`, on the recording's own host, puts each due file in the GPU outputs bucket and
+answers a presigned URL of an hour; `dispatch`, where the token is, asks the store's own workflow
+(upload.yml, in GITHUB) to fetch it, check its sha256, upload it as its asset and read it back anonymously,
+and pins the release GitHub then holds it in at its sha256 (bible §8: no data routed through the PC).
+`upload`, run by whoever holds the Hub store's token, commits every Hub pin awaiting its revision, with the
+store's catalog of every file it has held and the card made from it, reads each file back anonymously at
+that commit and checks it before the pin takes the revision.
 `check` is check.sh's rule: no recording over IN_GIT in git, and every pin whole and uploaded.
 A release's own file a test reads offline (a remote-code release's modeling code, its config) is the
 store's second kind (`RELEASE`, `pin_release`): kept whole whatever its size, under
@@ -24,7 +29,9 @@ reads it from as it reads the store's, and which `upload` leaves alone.
 Usage, from the checkout:
   python tools/fetched_fixtures.py fetch
   python tools/fetched_fixtures.py check
-  python tools/fetched_fixtures.py upload
+  python tools/fetched_fixtures.py upload   # the Hub store's pins
+  python tools/fetched_fixtures.py stage --settings <outputs bucket settings> > staged.jsonl  # on the host
+  python tools/fetched_fixtures.py dispatch staged.jsonl                                   # where gh is
   python tools/fetched_fixtures.py move     # the Hub store's re-hostable pins to GitHub's, their upload due
 """
 
@@ -52,9 +59,8 @@ GITHUB = "AshishKumar4/dew-fixtures"
 lets it be re-hosted (`REHOSTED`), an asset named by its content (`_asset`), never overwritten, read
 anonymously over HTTPS (owner, 2026-11-16: GitHub rather than R2)."""
 GITHUB_RELEASE = re.compile(r"store-[1-9][0-9]*")
-"""A release of GitHub's store, `store-N`; a new one opens as the last holds `ASSETS_PER_RELEASE`."""
-ASSETS_PER_RELEASE = 1000
-"""The most assets GitHub keeps in one release."""
+"""A release of GitHub's store, `store-N`; the store's upload workflow (dew-fixtures'
+.github/workflows/upload.yml) opens the next as the last fills."""
 REHOSTED = frozenset({"apache-2.0", "mit", "mit and apache-2.0", "the owner's own code"})
 """The licenses, as a pin names them in any case, under which GitHub's store re-hosts a file; a file under any
 other stays in the Hub's store or at its release's own origin (`ORIGINS`)."""
@@ -337,61 +343,118 @@ def card(catalog: dict[str, dict]) -> str:
 
 
 def github(*arguments: str) -> str:
-    """The GitHub CLI's answer to `arguments`, through the credential it holds: the store's one way to GitHub."""
+    """The GitHub CLI's answer to `arguments`, through the credential it holds: the store's one way to
+    GitHub."""
     return subprocess.run(["gh", *arguments], capture_output=True, text=True, check=True).stdout
 
 
-def upload_github(due: dict[str, dict], root: Path = REPO_ROOT) -> None:
-    """Every pin of `due` (GitHub's store's, with no revision) uploaded as its asset (`_asset`) to the open
-    release of GitHub's store, `store-N`, the next opened once it holds `ASSETS_PER_RELEASE`; an asset of its
-    name already held is taken only where GitHub's digest of it is the pin's sha256, and none is ever
-    overwritten (`gh release upload` without --clobber). Each asset is read back anonymously, as a fetch reads
-    it, and checked before its pin takes its release. The repository is the owner's to create, public: none is
-    created here."""
+STAGED = "fixtures"
+"""Where `stage` puts a due file in the GPU outputs bucket: STAGED/<sha256>/<asset>."""
+STAGED_SECONDS = 3600
+"""How long a staged file's presigned URL reads: an hour, the workflow's to take it in."""
+DISPATCH_SECONDS = 1800
+"""How long `dispatch` waits for GitHub to hold a dispatched file at its sha256 before it gives up on it."""
+
+
+def scratch() -> Path:
+    """Where this tool keeps what it writes for a moment: DEW_SCRATCH, else the checkout's .scratch/, never
+    /tmp (bible §8: the PC's /tmp is RAM)."""
+    path = Path(os.environ.get("DEW_SCRATCH") or REPO_ROOT / ".scratch")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def bucket(settings: Path):
+    """The GPU outputs bucket's S3 client and name, from its settings file (endpoint, bucket, access_key_id,
+    secret_access_key), as a GPU node holds them."""
+    import boto3
+    from botocore.config import Config
+
+    held = json.loads(settings.read_text())
+    # No checksum header but those asked for: botocore's default (a CRC32 on every part of a multipart upload,
+    # which upload_file makes of a file past 8 MiB) is one R2 refuses, as the node's own adapter records.
+    client = boto3.client("s3", endpoint_url=held["endpoint"], aws_access_key_id=held["access_key_id"],
+                          aws_secret_access_key=held["secret_access_key"], region_name="auto",
+                          config=Config(retries={"max_attempts": 5, "mode": "standard"}, connect_timeout=10,
+                                        read_timeout=120, request_checksum_calculation="when_required"))
+    return client, held["bucket"]
+
+
+def stage(settings: Path, root: Path = REPO_ROOT) -> list[dict]:
+    """Every GitHub store pin with no revision put in the GPU outputs bucket (STAGED/<sha256>/<asset>, its
+    sha256 in its metadata) from this host's local store, each checked against its pin first, and a
+    presigned URL of STAGED_SECONDS for each: what `dispatch` hands the store's workflow, with no byte of
+    it on the way."""
+    client, name_of_bucket = bucket(settings)
+    staged = []
+    for name, pin in sorted(pins(root).items()):
+        if pin["revision"] or pin.get("origin") != "github":
+            continue
+        asset = _asset(pin, name)
+        if pin["path"] != asset:
+            raise SystemExit(f"{name}: its pin names {pin['path']!r}, not its asset {asset!r}")
+        _checked(_stored(pin, root).read_bytes(), pin, name)
+        key = f"{STAGED}/{pin['sha256']}/{asset}"
+        client.upload_file(str(_stored(pin, root)), name_of_bucket, key,
+                           ExtraArgs={"Metadata": {"sha256": pin["sha256"]}})
+        url = client.generate_presigned_url("get_object", Params={"Bucket": name_of_bucket, "Key": key},
+                                            ExpiresIn=STAGED_SECONDS)
+        staged.append({"fixture": name, "asset": asset, "sha256": pin["sha256"], "bytes": pin["bytes"],
+                       "url": url})
+    return staged
+
+
+def held_assets() -> dict[str, tuple[str, str]]:
+    """Every asset GitHub's store holds, by its name, to its release and GitHub's digest of its bytes; the
+    store refused where it is private or missing, as a fetch reads it anonymously and none is created
+    here."""
     try:
         if json.loads(github("api", f"repos/{GITHUB}"))["private"]:
             raise SystemExit(f"{GITHUB} is private, and a fetch reads it anonymously")
         pages = json.loads(github("api", "--paginate", "--slurp", f"repos/{GITHUB}/releases"))
     except subprocess.CalledProcessError as error:
-        raise SystemExit(f"{GITHUB} could not be read ({error.stderr.strip()[-200:]}): the owner creates it, "
-                         "public, before its first upload") from error
-    releases = sorted((release for page in pages for release in page
-                       if GITHUB_RELEASE.fullmatch(release["tag_name"])),
-                      key=lambda release: int(release["tag_name"].removeprefix("store-")))
-    held = {asset["name"]: (release["tag_name"], asset.get("digest") or "")
-            for release in releases for asset in release["assets"]}
-    counts = {release["tag_name"]: len(release["assets"]) for release in releases}
-    with tempfile.TemporaryDirectory() as directory:
-        for name, pin in sorted(due.items()):
-            # The asset's name is the pin's content's, never a path the pin carries (review).
-            asset = _asset(pin, name)
-            if pin["path"] != asset:
-                raise SystemExit(f"{name}: its pin names {pin['path']!r}, not its asset {asset!r}")
-            if asset in held:
-                release, said = held[asset]
-                if said != f"sha256:{pin['sha256']}":
-                    raise SystemExit(f"{name}: {asset} in {GITHUB}'s {release} is not its pin's bytes "
-                                     f"({said})")
-            else:
-                release = next((tag for tag, count in counts.items() if count < ASSETS_PER_RELEASE), None)
-                if release is None:
-                    # After the highest, whatever releases were removed between (review).
-                    highest = max((int(tag.removeprefix("store-")) for tag in counts), default=0)
-                    release = f"store-{highest + 1}"
-                    github("release", "create", release, "--repo", GITHUB, "--title", release, "--notes",
-                        "Dew's recorded test fixtures (https://github.com/AshishKumar4/dew): each asset is "
-                        "named by its SHA-256, pinned beside the fixture it stands for in Dew's "
-                        "tests/fixtures/, and licensed as the reference it records, as its pin names.")
-                    counts[release] = 0
-                written = Path(directory) / asset
-                written.write_bytes(_checked(_stored(pin, root).read_bytes(), pin, name))
-                github("release", "upload", release, str(written), "--repo", GITHUB)
-                written.unlink()
-                counts[release] += 1
-                held[asset] = (release, f"sha256:{pin['sha256']}")
-            _checked(downloaded(_url(GITHUB, release, asset)), pin, name)
-            print(f"{pin['sha256']}  {asset} read back at {GITHUB}'s {release}", flush=True)
-            _pinned(name, {**pin, "revision": release}, root)
+        raise SystemExit(f"{GITHUB} could not be read ({error.stderr.strip()[-200:]}): the owner creates "
+                         "it, public, before its first upload") from error
+    # A draft release's assets are no fetch's: listed to the token's holder, never read anonymously.
+    return {asset["name"]: (release["tag_name"], asset.get("digest") or "")
+            for page in pages for release in page
+            if GITHUB_RELEASE.fullmatch(release["tag_name"]) and not release.get("draft")
+            for asset in release["assets"]}
+
+
+def dispatch(staged: list[dict], root: Path = REPO_ROOT, waited: float = DISPATCH_SECONDS) -> None:
+    """Each staged file (`stage`'s lines) put in GitHub's store by the store's own workflow (upload.yml:
+    fetch from its URL, check its sha256, upload as its asset, read it back anonymously), and its pin
+    given the release GitHub then holds it in, at the pin's sha256 by GitHub's own digest; one held
+    already at its sha256 is pinned without a dispatch, one held at other bytes refused. No byte of a file
+    passes through here."""
+    import time
+
+    current = pins(root)
+    held = held_assets()
+    for entry in staged:
+        name, pin = entry["fixture"], current[entry["fixture"]]
+        if pin["revision"]:
+            continue
+        if (entry["asset"], entry["sha256"]) != (_asset(pin, name), pin["sha256"]):
+            raise SystemExit(f"{name}: staged as {entry['asset']} at {entry['sha256']}, not as its pin")
+        expected = f"sha256:{pin['sha256']}"
+        if entry["asset"] not in held:
+            github("workflow", "run", "upload.yml", "--repo", GITHUB, "-f", f"url={entry['url']}",
+                   "-f", f"sha256={pin['sha256']}", "-f", f"asset={entry['asset']}")
+            deadline = time.monotonic() + waited
+            while entry["asset"] not in held and time.monotonic() < deadline:
+                time.sleep(15)
+                held = held_assets()
+        if entry["asset"] not in held:
+            raise SystemExit(f"{name}: {GITHUB} holds no {entry['asset']} {waited:.0f} s after its upload "
+                             "was asked: its workflow run says why (gh run list --workflow upload.yml)")
+        release, said = held[entry["asset"]]
+        if said != expected:
+            raise SystemExit(f"{name}: {entry['asset']} in {GITHUB}'s {release} is not its pin's bytes "
+                             f"({said})")
+        print(f"{pin['sha256']}  {entry['asset']} held at {GITHUB}'s {release}", flush=True)
+        _pinned(name, {**pin, "revision": release}, root)
 
 
 def moved(root: Path = REPO_ROOT) -> list[str]:
@@ -414,8 +477,9 @@ def upload(root: Path = REPO_ROOT) -> None:
     if not due:
         print("every pin holds its revision")
         return
-    if github := {name: pin for name, pin in due.items() if pin.get("origin") == "github"}:
-        upload_github(github, root)
+    if waiting := sorted(name for name, pin in due.items() if pin.get("origin") == "github"):
+        print(f"{len(waiting)} pins of {GITHUB} wait for `stage` on their recording's host and `dispatch`: "
+              f"{', '.join(waiting[:5])}", flush=True)
     due = {name: pin for name, pin in due.items() if pin.get("origin") != "github"}
     if not due:
         return
@@ -445,7 +509,7 @@ def upload(root: Path = REPO_ROOT) -> None:
                    CommitOperationAdd("README.md", card(catalog).encode())]
     revision = api.create_commit(STORE, operations, commit_message=f"{len(due)} recorded fixtures",
                                  repo_type="dataset").oid
-    with tempfile.TemporaryDirectory() as directory:
+    with tempfile.TemporaryDirectory(dir=scratch()) as directory:
         for name, pin in sorted(due.items()):
             back = Path(hf_hub_download(pin["repo"], pin["path"], repo_type="dataset", revision=revision,
                                         cache_dir=directory, force_download=True, token=False))
@@ -505,8 +569,22 @@ def check(root: Path = REPO_ROOT) -> list[str]:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("fetch", "check", "upload", "move"))
-    command = parser.parse_args(argv).command
+    parser.add_argument("command", choices=("fetch", "check", "upload", "move", "stage", "dispatch"))
+    parser.add_argument("staged", nargs="?", type=Path, help="dispatch: stage's lines")
+    parser.add_argument("--settings", type=Path, help="stage: the GPU outputs bucket's settings")
+    parsed = parser.parse_args(argv)
+    command = parsed.command
+    if command == "stage":
+        if parsed.settings is None:
+            parser.error("stage takes --settings, the GPU outputs bucket's settings file")
+        for entry in stage(parsed.settings):
+            print(json.dumps(entry), flush=True)
+        return 0
+    if command == "dispatch":
+        if parsed.staged is None:
+            parser.error("dispatch takes the file of stage's lines")
+        dispatch([json.loads(line) for line in parsed.staged.read_text().splitlines() if line.strip()])
+        return 0
     if command == "move":
         moving = moved()
         print(f"{len(moving)} pins moved to {GITHUB}, their upload due: `upload` once it exists")

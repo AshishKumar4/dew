@@ -32,6 +32,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.nn.activations import logistic, silu
 from dew.nn.dense import Dense
 from dew.nn.flops import projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
@@ -47,7 +48,7 @@ from dew.nn.residuals import Residual
 LIGHTNING = recurrence.Hooks(decay='scalar', delta=False)
 """The recurrence's form: one log decay a head, no delta rule, no write gate, no scale."""
 
-ACTIVATIONS = {'silu': nn.silu}
+ACTIVATIONS = {'silu': silu}
 """The activations the projection takes, by the config's `hidden_act`: every release's SiLU."""
 
 
@@ -177,7 +178,7 @@ class LightningAttention(nn.Module):
                                (batch, self.num_heads, self.head_dim, self.head_dim), wide)
             out = forked_scan((query, key, value), forked_rule, tokens, start)
             out = self.norm(out.reshape(batch, length, self.features).astype(qkv.dtype))
-            return self.out_proj(nn.sigmoid(self.output_gate(x)) * out)
+            return self.out_proj(logistic(self.output_gate(x)) * out)
         if shards > 1:
             # Each shard runs its slice from the memory the earlier ones leave it (`_sequence_memory`); a
             # call split so is no decode call and holds no cache (`sequence_split`).
@@ -201,7 +202,7 @@ class LightningAttention(nn.Module):
         # The recurrence's output under both names a remat policy reads it by (`RESIDUALS`).
         out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
         out = self.norm(out.reshape(batch, length, self.features).astype(qkv.dtype))
-        return self.out_proj(nn.sigmoid(self.output_gate(x)) * out)
+        return self.out_proj(logistic(self.output_gate(x)) * out)
 
 
 def _sequence_memory(query, key, value, log_decay, starts, *, chunk_size: int, max_segments: int):

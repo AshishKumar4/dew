@@ -643,19 +643,20 @@ def rated(seconds: float, steps: int, rows: int, hlo_flops, model_flops: float |
     bf16 `peak` (the device's own by default): the objective's work over the whole mesh's peak, and the
     compiled work named by what its count is (`StepFlops.bound`: a lower bound where a launch's went
     uncounted, an upper bound where a loop was counted at its stated bound)."""
+    from dew.telemetry.instrumentation import logged_utilization
     from dew.training.interval import throughput
 
     rates = throughput(seconds, steps, rows, hlo_flops, devices, training_flops=model_flops, peak=peak)
-    bound = "" if hlo_flops is None else hlo_flops.bound
+    hfu = logged_utilization(rates, "hfu")
     return {"model_mfu_bf16_peak": rates.get("train/mfu"),
             "model_flops_scope": "objective.training_flops on real host lengths and layout, over the mesh's "
                                  "dense bf16 peak; custom image-mean model and frozen legacy API have no "
                                  "analytic count",
-            "hlo_utilization_bf16_peak": rates.get(f"train/hfu{bound}"),
+            "hlo_utilization_bf16_peak": None if hfu is None else hfu[0],
             # What it is (`StepFlops.bound`): "_lower_bound" where a launch's work went uncounted
             # (unsized_kernels_per_step), "_upper_bound" where a loop was counted at its stated bound,
             # "_estimate" where both, "" the step's own count.
-            "hlo_utilization_bound": None if hlo_flops is None else bound,
+            "hlo_utilization_bound": None if hfu is None else hfu[1],
             "unsized_kernels_per_step": None if hlo_flops is None else hlo_flops.unsized / steps,
             "utilization_scope": "optimized executable work, including padding, over dense bf16 peak, "
                                  "bounded as hlo_utilization_bound names; not an analytic real-token MFU"}

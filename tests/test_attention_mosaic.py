@@ -1106,7 +1106,8 @@ def test_a_training_forwards_output_scales_exactly_with_its_values_however_large
 
 UNSEEN = {
     "hopper-class": generation.GpuTarget("sm90", "Unmeasured Hopper-class GPU", shared_limit=180 * 1024,
-                                         multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12),
+                                         multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12,
+                                         host_links={}),
 }
 """A GPU no row measured of this mainloop's family (`test_grouped_gemm.UNSEEN`'s Hopper-class one): fewer
 multiprocessors, a smaller block and another L2 bandwidth than an H100's."""

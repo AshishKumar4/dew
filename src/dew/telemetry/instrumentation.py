@@ -1056,7 +1056,7 @@ class StepFlops:
         each named by what the counts are (`bound`), beside train/unsized_kernels, the launches a step,
         where any launch's work went uncounted."""
         bound = self.bound
-        scalars = {f"train/{name}{bound}": utilization
+        scalars = {_logged_name(name, bound): utilization
                    for name, counted in (("hlo_flops_util", self.model), ("hfu", self.hardware))
                    if (utilization := model_flops_utilization(counted / steps, step_time, peak))
                    is not None}
@@ -1071,8 +1071,14 @@ def logged_utilization(scalars: Mapping[str, float], name: str) -> tuple[float, 
     """Utilization `name` (`hfu`, `hlo_flops_util`) of an interval's logged `scalars` (`train/...`), under
     whichever name its count's bound gave it (`StepFlops.utilizations`), with that bound (`BOUND_MARKS`);
     None where the interval logged none."""
-    return next(((scalars[f"train/{name}{bound}"], bound) for bound in BOUND_MARKS
-                 if f"train/{name}{bound}" in scalars), None)
+    return next(((scalars[_logged_name(name, bound)], bound) for bound in BOUND_MARKS
+                 if _logged_name(name, bound) in scalars), None)
+
+
+def _logged_name(name: str, bound: str) -> str:
+    """The name an interval logs utilization `name` under (`StepFlops.utilizations`), read back by
+    `logged_utilization`: its count's bound its suffix (`StepFlops.bound`)."""
+    return f"train/{name}{bound}"
 
 
 class CompiledMemory(NamedTuple):

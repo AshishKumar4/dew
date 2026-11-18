@@ -144,7 +144,7 @@ def audit_sessions(lines: Sequence[str]) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     template = commands.add_parser("template", help="render a tool episode with a chat template")
     template.add_argument("--tokenizer", required=True, help="Hugging Face tokenizer name or directory")

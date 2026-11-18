@@ -330,13 +330,12 @@ def _cegis(shape, symbols, target, inputs: int):
     for _ in range(64):
         solver = z3.Solver()
         solver.set("timeout", 2000)
-        program_unknowns = None
+        # The program's unknowns, the same constants at every example (named by its steps alone, `_program`).
+        program_unknowns = _program(shape, symbols, "")[1]
         for example in examples:
             values = [z3.BitVecVal(value, 32) for value in example]
-            program, unknowns = _program(shape, values, "")
-            program_unknowns = unknowns
             expected = z3.substitute(target, *zip(symbols, values, strict=True))
-            solver.add(program == expected)
+            solver.add(_program(shape, values, "")[0] == expected)
         solver.add(*_bounded(program_unknowns, inputs))
         for (op, _), (immediate, table, _, _) in zip(shape, program_unknowns, strict=True):
             if op in _SHIFTS:
@@ -467,7 +466,8 @@ REFERENCES = {"e4m3": lambda words: bits.encoded(words, bits.E4M3),
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(
+        description="A bit form's windows superoptimized by counterexample-guided synthesis, proven by Z3.")
     parser.add_argument("name", choices=sorted(REFERENCES))
     parser.add_argument("--seconds", type=float, default=60.0, help="each window's search bound")
     parser.add_argument("--window", type=int, help="search the seed's window of this index alone")

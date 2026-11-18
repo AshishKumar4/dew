@@ -8,6 +8,7 @@ import dataclasses
 import functools
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -248,6 +249,10 @@ ARM_FACTOR = 1.0
 """A module's flag an arm reads (`test_an_arm_reading_another_flag_than_its_prepares_is_a_red`), as a test's
 backend read at import is one."""
 
+ARM_OPTIONS = {"factor": 1.0}
+"""A module's options an arm reads (`test_an_arm_reading_other_options_than_its_prepares_is_a_red`), as a
+test's options read off its backend are."""
+
 
 def test_an_arm_reading_another_flag_than_its_prepares_is_a_red(tmp_path, monkeypatch):
     """An arm whose module's flag reads otherwise in its run than in its prepare (a backend read at import:
@@ -265,6 +270,59 @@ def test_an_arm_reading_another_flag_than_its_prepares_is_a_red(tmp_path, monkey
     monkeypatch.setattr(sys.modules[__name__], "ARM_FACTOR", 1.0 + 2.0 ** -8)
     with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
         assert_as_exact(flagged, reference, draw, "a flagged product", seeds=8)
+
+
+def test_an_arm_reading_other_options_than_its_prepares_is_a_red(tmp_path, monkeypatch):
+    """An arm reading a dict whose contents are others in its run than in its prepare (options read off the
+    backend: the prepare's CPU, the run's GPU, each process its own dict) is another arm: its run finds none
+    of it (`MissingTruth`), never the prepare's program in its place; with the same contents it passes (row
+    7674: a container stated by its type alone named one arm in both, and the run computed the prepare's
+    program)."""
+    dew, reference, draw = _site()
+
+    def optioned(a, b):
+        return dew(a, b) * ARM_OPTIONS["factor"]
+
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(optioned, reference, draw, "an optioned product", seeds=8)
+    monkeypatch.setattr(sys.modules[__name__], "ARM_OPTIONS", {"factor": 1.0})
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(optioned, reference, draw, "an optioned product", seeds=8)
+    monkeypatch.setattr(sys.modules[__name__], "ARM_OPTIONS", {"factor": 1.0 + 2.0 ** -8})
+    with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
+        assert_as_exact(optioned, reference, draw, "an optioned product", seeds=8)
+
+
+def test_a_record_a_trace_fills_is_named_as_first_found_inside_another_container(tmp_path, monkeypatch):
+    """A list an arm's trace fills (a test's record of its calls), named first by one site's arm and read by a
+    later site's arm inside a dict, beside an alias of itself, is stated there as it was first found, so the
+    later arm's run, a process of its own whose earlier site's executable fills none of it, finds its program
+    (the reviews of row 7674's fix: the dict stated the list as the prepare's trace had filled it, and then
+    its alias inside another dict did)."""
+    import reference_error
+
+    dew, reference, draw = _site()
+    calls: list = []
+
+    def recording(a, b):
+        calls.append(None)
+        return dew(a, b)
+
+    # The record inside the dict, and beside an alias of itself inside another (the review's).
+    held = {"direct": calls, "nested": {"calls": calls}}
+
+    def holding(a, b):
+        return dew(a, b) * (1.0 + 0.0 * len(held))
+
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(recording, reference, draw, "a recorded product", seeds=8)
+        assert_as_exact(holding, reference, draw, "a held product", seeds=8)
+    # The run's own process: its record empty and every container first named in it.
+    calls.clear()
+    monkeypatch.setattr(reference_error, "_FIRST_NAMED", {})
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(recording, reference, draw, "a recorded product", seeds=8)
+        assert_as_exact(holding, reference, draw, "a held product", seeds=8)
 
 
 def test_a_prepared_sites_needs_are_filed_under_its_unit(tmp_path, monkeypatch):
@@ -448,17 +506,33 @@ def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
         finding.rule for finding in computing.value.findings]
 
 
-def test_a_gpu_tier_parts_prepare_runs_under_its_runs_flags():
-    """A GPU tier part's prepare (`DEW_TIER_PREPARE`, on the node's CPU) is configured under the XLA flags
-    its run is (`lane_environment.configure_lane`'s cuda lane), so the programs it compiles load where the
-    run holds them to its own (`dew.training.ahead.BuildTarget.held`: the prepare's CPU lane's devices and
-    scheduler beside the run's deterministic GPU ops refused test_gpu_numerics' vocabulary cell)."""
+@pytest.mark.parametrize("held", ["0", "0,1"], ids=["one GPU", "two GPUs"])
+def test_a_gpu_tier_parts_prepare_runs_under_its_runs_flags(held):
+    """A GPU tier part's prepare (`DEW_TIER_PREPARE`, on the node's CPU, which hides its GPUs from it) is
+    configured under the XLA flags
+    that decide what its run's programs compute (`lane_environment.configure_lane`'s cuda lane,
+    `dew.training.ahead.computation_flags`), whatever GPUs its run holds, so the programs it compiles load
+    where the run holds them to its own (`BuildTarget.held`: the prepare's CPU lane's devices and scheduler
+    beside the run's deterministic GPU ops refused test_gpu_numerics' vocabulary cell); and its CPU client
+    opens, with a host device (one configured for a GPU of none failed every GPU part's prepare: "Could not
+    determine process_index").
+
+    The prepare's environment is the one its node and lane give it, mirrored, as Dew reads nothing of dew-ops
+    (dew-ops reads Dew's `tier_wire`, never the reverse): dew-ops' session hides every GPU from every job's
+    prepare (dewops/node/session.py's prepare environment, `"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS":
+    "cpu"`, line 2388 at ops 945f3032f), and the lane's prepare names itself (tools/armada/ci.py,
+    `gpu_prepared`: `JAX_PLATFORMS` cpu and `tier_wire.PREPARE`)."""
     import lane_environment
 
-    node = {"CUDA_VISIBLE_DEVICES": "0"}
-    prepare = lane_environment.configured({**node, "JAX_PLATFORMS": "cpu", "DEW_TIER_PREPARE": "1"})
-    run = lane_environment.configured({**node, "JAX_PLATFORMS": "cuda"})
-    assert prepare["XLA_FLAGS"] == run["XLA_FLAGS"]
+    from dew.training.ahead import computation_flags
+
+    prepare = lane_environment.configured(
+        {"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu", "DEW_TIER_PREPARE": "1"})
+    run = lane_environment.configured({"CUDA_VISIBLE_DEVICES": held, "JAX_PLATFORMS": "cuda"})
+    assert computation_flags(prepare["XLA_FLAGS"]) == computation_flags(run["XLA_FLAGS"])
+    opened = subprocess.run([sys.executable, "-c", "import jax; print(len(jax.devices('cpu')))"],
+                            env={**os.environ, **prepare}, capture_output=True, text=True, timeout=300)
+    assert (opened.returncode, opened.stdout.split()[-1:]) == (0, ["1"]), opened.stderr[-2000:]
 
 
 def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):

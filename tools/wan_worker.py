@@ -48,7 +48,7 @@ def flows(model, inputs: dict[str, np.ndarray], dtype, *, gradients: bool) -> di
 
 def run(site: str, directory: Path, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's flow (and gradients), at the site's narrow precision and in float64."""
-    from diffusers import WanTransformer3DModel
+    from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
 
     from _dew_torch.precision import float64_twin, widened
 

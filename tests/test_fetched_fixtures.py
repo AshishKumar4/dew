@@ -18,7 +18,8 @@ HUB_ONLY = "lfm1.0"
 
 
 @pytest.fixture
-def store(monkeypatch):
+def store(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEW_SCRATCH", str(tmp_path / "scratch"))
     fetched = load("fetched_fixtures")
     monkeypatch.setattr(fetched, "IN_GIT", 4096)
     return fetched
@@ -327,14 +328,21 @@ def test_a_release_file_kept_at_its_origin_is_fetched_from_its_release_and_never
     assert store.check(root)
 
 
-def _github(store, monkeypatch, releases: list[dict], private: bool = False, exists: bool = True) -> list:
+RELEASE_ASSETS = 1000
+"""The most assets GitHub keeps in one release, past which the store's upload workflow (dew-fixtures'
+upload.yml), which `_github` stands in for, opens the next."""
+
+
+def _github(store, monkeypatch, releases: list[dict], private: bool = False, exists: bool = True,
+            uploads: dict[str, bytes] | None = None) -> list:
     """GitHub's store stood in for `gh`, its releases `releases` (each its tag and assets), the repository
-    private or missing as told: every `gh` call it is asked appended to the list returned, an upload adding
-    the asset with GitHub's digest of its bytes and a create adding an empty release."""
+    private or missing as told: every `gh` call it is asked is appended to the list returned. A dispatch
+    of the store's workflow does what upload.yml does: the bytes `uploads` holds for its URL, if their
+    sha256 is the one asked, become its asset in the open release (a full one opening the next) with
+    GitHub's digest."""
     import hashlib
 
     asked: list[tuple[str, ...]] = []
-    served: dict[str, bytes] = {}
 
     def gh(*arguments: str) -> str:
         asked.append(arguments)
@@ -344,21 +352,42 @@ def _github(store, monkeypatch, releases: list[dict], private: bool = False, exi
             return json.dumps({"private": private})
         if arguments[:3] == ("api", "--paginate", "--slurp"):
             return json.dumps([releases])
-        if arguments[:2] == ("release", "create"):
-            releases.append({"tag_name": arguments[2], "assets": []})
-            return ""
-        if arguments[:2] == ("release", "upload"):
-            path = Path(arguments[3])
-            [release] = [release for release in releases if release["tag_name"] == arguments[2]]
-            release["assets"].append({"name": path.name,
-                                      "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"})
-            served[f"{arguments[2]}/{path.name}"] = path.read_bytes()
+        if arguments[:3] == ("workflow", "run", "upload.yml"):
+            given = dict(argument.split("=", 1) for argument in arguments[6::2])
+            data = (uploads or {}).get(given["url"])
+            if data is None or hashlib.sha256(data).hexdigest() != given["sha256"]:
+                return ""
+            open_ = next((release for release in releases
+                          if len(release["assets"]) < RELEASE_ASSETS), None)
+            if open_ is None:
+                highest = max((int(release["tag_name"].removeprefix("store-")) for release in releases),
+                              default=0)
+                open_ = {"tag_name": f"store-{highest + 1}", "assets": []}
+                releases.append(open_)
+            open_["assets"].append({"name": given["asset"], "digest": f"sha256:{given['sha256']}"})
             return ""
         raise AssertionError(arguments)
 
     monkeypatch.setattr(store, "github", gh)
-    monkeypatch.setattr(store, "downloaded", lambda url: served["/".join(url.split("/")[-2:])])
-    return asked, served
+    return asked
+
+
+def _bucket(store, monkeypatch) -> dict[str, bytes]:
+    """The GPU outputs bucket stood in for `bucket`: each object `stage` puts kept by its key, a presigned URL
+    `https://outputs/<key>` read back from it."""
+    held: dict[str, bytes] = {}
+
+    class Client:
+        def upload_file(self, path, bucket, key, ExtraArgs):
+            assert bucket == "outputs" and ExtraArgs["Metadata"]["sha256"] == key.split("/")[1]
+            held[key] = Path(path).read_bytes()
+
+        def generate_presigned_url(self, method, Params, ExpiresIn):
+            assert method == "get_object" and ExpiresIn == store.STAGED_SECONDS
+            return f"https://outputs/{Params['Key']}"
+
+    monkeypatch.setattr(store, "bucket", lambda settings: (Client(), "outputs"))
+    return held
 
 
 def test_a_rehostable_file_is_kept_in_githubs_store_and_any_other_in_the_hubs(store, tmp_path):
@@ -397,55 +426,73 @@ def test_a_rehostable_file_is_kept_in_githubs_store_and_any_other_in_the_hubs(st
                       root=root, reference=f"org/site@{'c' * 40}/model code.py")
 
 
-def test_upload_puts_each_due_file_as_an_asset_reads_it_back_and_never_overwrites_one(store, tmp_path,
-                                                                                       monkeypatch):
-    """Upload to GitHub's store opens its first release where none is, uploads each due file as its asset
-    without overwriting, reads it back anonymously and only then pins the release; an asset of its name
-    already held is taken without an upload only where GitHub's digest is the pin's, and refused otherwise;
-    a full release opens the next. A private or missing repository is refused before anything is uploaded,
-    and none is ever created."""
+def test_a_githubs_store_file_is_staged_on_its_host_and_dispatched_as_its_asset_with_no_byte_through_here(
+        store, tmp_path, monkeypatch):
+    """`stage`, on the recording's host, puts each due GitHub pin's file in the outputs bucket under its
+    sha256 and answers its presigned URL, refusing a local file that is not its pin's; `dispatch`, where
+    the store's token is, asks the store's workflow to take each URL and pins the release GitHub then
+    holds the asset in at the pin's sha256, reading no byte of it. An asset held already at its sha256 is
+    pinned with no dispatch, one at other bytes refused; a workflow that leaves no asset pins nothing; a
+    private or missing store is refused before anything is asked; `upload` leaves GitHub's pins to these
+    two (bible §8: no data routed through the PC, Main, 2026-11-18)."""
     root = _checkout(tmp_path)
     stored = _saved(store, root, license="MIT")
     pin = store.pins(root)[LARGE]
+    held = _bucket(store, monkeypatch)
+    [entry] = store.stage(tmp_path / "settings.json", root)
+    key = f"{store.STAGED}/{pin['sha256']}/{pin['path']}"
+    assert entry == {"fixture": LARGE, "asset": pin["path"], "sha256": pin["sha256"], "bytes": pin["bytes"],
+                     "url": f"https://outputs/{key}"}
+    assert held[key] == stored.read_bytes()
     for private, exists in ((True, True), (False, False)):
-        asked, _ = _github(store, monkeypatch, [], private=private, exists=exists)
+        asked = _github(store, monkeypatch, [], private=private, exists=exists)
         with pytest.raises(SystemExit):
-            store.upload(root)
-        assert not [call for call in asked if call[0] == "release"] and store.pins(root)[LARGE] == pin
-    releases: list[dict] = []
-    asked, served = _github(store, monkeypatch, releases)
-    # A read back that is not the pin's bytes pins nothing; the next upload takes the asset held, uploading
-    # none.
-    monkeypatch.setattr(store, "downloaded", lambda url: _flipped(stored.read_bytes()))
-    with pytest.raises(AssertionError):
-        store.upload(root)
+            store.dispatch([entry], root)
+        assert not [call for call in asked if call[0] == "workflow"] and store.pins(root)[LARGE] == pin
+    # A workflow that leaves no asset (its fetch failed) pins nothing, past the wait.
+    asked = _github(store, monkeypatch, [])
+    with pytest.raises(SystemExit):
+        store.dispatch([entry], root, waited=0)
     assert store.pins(root)[LARGE]["revision"] is None
-    [upload] = [call for call in asked if call[:2] == ("release", "upload")]
-    assert "--clobber" not in upload
-    asked, served = _github(store, monkeypatch, releases)
-    served[f"store-1/{pin['path']}"] = stored.read_bytes()
-    store.upload(root)
+    assert [call[:3] for call in asked if call[0] == "workflow"] == [("workflow", "run", "upload.yml")]
+    releases: list[dict] = []
+    asked = _github(store, monkeypatch, releases, uploads={entry["url"]: held[key]})
+    store.dispatch([entry], root)
     assert store.pins(root)[LARGE]["revision"] == "store-1" and store.check(root) == []
-    assert not [call for call in asked if call[:2] == ("release", "upload")]
-    [asset] = releases[0]["assets"]
-    assert asset["name"] == pin["path"] and served[f"store-1/{pin['path']}"] == stored.read_bytes()
+    # Held already at its sha256: pinned with no dispatch; at other bytes: refused.
+    store._pinned(LARGE, pin, root)
+    asked = _github(store, monkeypatch, releases)
+    store.dispatch([entry], root)
+    assert store.pins(root)[LARGE]["revision"] == "store-1" and not [c for c in asked if c[0] == "workflow"]
     releases[0]["assets"][0]["digest"] = "sha256:" + "0" * 64
     store._pinned(LARGE, pin, root)
     with pytest.raises(SystemExit):
-        store.upload(root)
+        store.dispatch([entry], root)
     assert store.pins(root)[LARGE]["revision"] is None
-    # A full release opens the one after the highest, whatever releases are missing between.
-    full = [{"tag_name": "store-2", "assets": [{"name": f"{index}.npz", "digest": ""}
-                                               for index in range(store.ASSETS_PER_RELEASE)]}]
-    _github(store, monkeypatch, full)
-    store.upload(root)
-    assert store.pins(root)[LARGE]["revision"] == "store-3"
-    # A pin whose path is not its asset's name writes nothing anywhere.
-    store._pinned(LARGE, {**pin, "path": "../outside.npz"}, root)
-    asked, _ = _github(store, monkeypatch, [])
+    # An asset only a draft release holds is no fetch's: it is dispatched again, never pinned from the draft.
+    store._pinned(LARGE, pin, root)
+    draft = [{"tag_name": "store-1", "draft": True, "assets": [{"name": entry["asset"],
+                                                                "digest": f"sha256:{pin['sha256']}"}]}]
+    asked = _github(store, monkeypatch, draft)
     with pytest.raises(SystemExit):
-        store.upload(root)
-    assert not [call for call in asked if call[0] == "release"] and not (root.parent / "outside.npz").exists()
+        store.dispatch([entry], root, waited=0)
+    assert [call[:3] for call in asked if call[0] == "workflow"] == [("workflow", "run", "upload.yml")]
+    # A full release opens the one after the highest.
+    full = [{"tag_name": "store-2", "assets": [{"name": f"{index}.npz", "digest": ""}
+                                               for index in range(RELEASE_ASSETS)]}]
+    _github(store, monkeypatch, full, uploads={entry["url"]: held[key]})
+    store.dispatch([entry], root)
+    assert store.pins(root)[LARGE]["revision"] == "store-3"
+    # A local file that is not its pin's is staged nowhere; `upload` stages nothing of GitHub's.
+    store._pinned(LARGE, pin, root)
+    stored.write_bytes(_flipped(stored.read_bytes()))
+    held.clear()
+    with pytest.raises(AssertionError):
+        store.stage(tmp_path / "settings.json", root)
+    assert held == {}
+    asked = _github(store, monkeypatch, [])
+    store.upload(root)
+    assert asked == [] and store.pins(root)[LARGE]["revision"] is None
 
 
 def test_fetch_reads_a_githubs_store_file_anonymously_and_takes_it_only_as_its_pin(store, tmp_path,

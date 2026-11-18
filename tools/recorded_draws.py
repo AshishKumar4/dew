@@ -27,6 +27,8 @@ class Tape:
     def next(self, draw=None, shape=None):
         """The record's next draw, or while recording `draw()`, kept."""
         if self.replayed is None:
+            if draw is None:
+                raise ValueError("a recording tape draws each value by the `draw` it is given")
             value = draw()
             self.drawn.append(value)
         else:

@@ -28,7 +28,7 @@ from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import Encoded, Labels
 from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.decision.shared_state import over_one_state_row
-from dew.nn.activations import gelu_exact_torch
+from dew.nn.activations import gelu_exact_torch, logistic
 from dew.nn.attention import AttentionImpl
 from dew.nn.attention_blocks import NormalAttention
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, decoder_norm
@@ -511,7 +511,7 @@ class JointSchemaHead(Head):
         features = jnp.concatenate([repeated, options, repeated * options, jnp.abs(repeated - options)], -1)
         residual = self.scorer_out(gelu_exact_torch(self.scorer_hidden(features)))[..., 0]
         joint = jnp.exp(jnp.minimum(self.joint_logit_scale, math.log(100.0))) * joint_cosine + residual
-        scores = prior + jax.nn.sigmoid(self.residual_gate) * joint
+        scores = prior + logistic(self.residual_gate) * joint
         return _laid_back(scores.astype(at_least_fp32(scores.dtype)), inputs)
 
 
