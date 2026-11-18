@@ -1260,6 +1260,10 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
     @pl.when(taken)
     def _():
+        # The first consumer's closing turn of the walk it leaves unstored, which every other's turn ahead
+        # of the second matches, as at the first's start (ring_protocol's rare interleavings deadlocked
+        # without it).
+        pl.when(consumer == 0)(turn)
         scaled = dataclasses.replace(spec, headroom=True)
         store(scaled, *walk(scaled, streamed[1] - streamed[0]))
 
