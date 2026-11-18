@@ -170,7 +170,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, keeps=False,
                                  rounded=rounded, apart=apart, values_gated=values_gated,
-                                     unit_keys=unit_keys, ranged=ranged, skip=skip, forked=forked)
+                                 unit_keys=unit_keys, ranged=ranged, skip=skip, forked=forked)
     return out, final
 
 
@@ -314,12 +314,9 @@ def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool,
 
 
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
-             firsts=None,
-             inverse=None, kept=None, keeps: bool = True,
-             rounded: bool = False, apart: int = 0, values_gated: bool = False, unit_keys: bool = False,
-                 ranged: bool = False, scans: bool = False,
-             forked=None,
-             out_dtype=None, skipped: bool = False) -> _Run:
+             firsts=None, inverse=None, kept=None, keeps: bool = True, rounded: bool = False, apart: int = 0,
+             values_gated: bool = False, unit_keys: bool = False, ranged: bool = False, scans: bool = False,
+             forked=None, out_dtype=None, skipped: bool = False) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
     `kept` values, `(w, h, corrected, stored)`, are (`kept_forward`'s; its final memory then None), or but the
@@ -331,8 +328,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     landing in `out_dtype` (the operands' where None), or in fp32 where a skip is added to it after the
     launches (`skipped`, `kept_forward`), so it rounds once (`_Run.landed`); `_Run.scans` says which. A
     skip is a call's without the delta rule alone (`skipped` with `delta` refused). The solve stores its
-    inverse
-    where the call `keeps` it (`_solved`). A forked call's documents, laid as a packed call's are (its
+    inverse where the call `keeps` it (`_solved`). A forked call's documents, laid as a packed call's are (its
     `starts`, `firsts` and `max_segments`), give `forked` (`tabled`): each row's walk takes up each document's
     memory from its table (`table.Table`)."""
     dtype, per_key = jnp.result_type(q, k, v), g.ndim == 4
@@ -373,8 +369,8 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
                                   "portable math takes the rest")
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                 interpret, generation.gpu_target(), tiles.chunk, ranged=ranged, apart=apart,
-                    values_gated=values_gated, unit_keys=unit_keys,
-                producers=tiles.producers, residents=tiles.residents)
+                values_gated=values_gated, unit_keys=unit_keys, producers=tiles.producers,
+                residents=tiles.residents)
     table = None if forked is None else tabled(forked, width, columns)
     # A skip reads the values a launch holds as given (`Call.gated_keys`); else it is added after them.
     landed = jnp.dtype(jnp.float32 if skipped and not call.gated_keys else out_dtype or dtype)

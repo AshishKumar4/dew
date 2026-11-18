@@ -109,7 +109,7 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: mosaic.
                 mainloop_backward.gradients(q, k, v, g, beta, h0, out, final, tiles=tiles, starts=starts,
                                             max_segments=max_segments, family=family, inverse=inverse,
                                             kept=kept, delta=delta, rounded=rounded, apart=apart,
-                                                values_gated=values_gated, unit_keys=unit_keys,
+                                            values_gated=values_gated, unit_keys=unit_keys,
                                             ranged=ranged, skip=skip, forked=forked)
         finally:
             mainloop.PLANNED.reset(token)
@@ -141,7 +141,7 @@ def holds(launches: tuple[mainloop.Launch, ...], family: mosaic.Family, shared: 
 def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: mosaic.Family,
                    target: generation.GpuTarget, starts=None, max_segments: int | None = None,
                    delta: bool = True, rounded: bool = False, apart: int = 0, values_gated: bool = False,
-                       unit_keys: bool = False, wide: bool = False,
+                   unit_keys: bool = False, wide: bool = False,
                    ranged: bool = False, skip=None,
                    forked: chunk_forward.ForkedTable | None = None) -> bool:
     """Whether the launches a fast backward runs (`mainloop_backward.gradients`'s and the forward it takes,
@@ -157,7 +157,7 @@ def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: 
                      for x in (q, k, v, g, beta, h0, starts, skip))
     both = _planned(tuple(shapes), tiles, family, target, max_segments, delta, backward=True,
                     rounded=rounded, apart=apart, values_gated=values_gated, unit_keys=unit_keys, wide=wide,
-                        ranged=ranged, skip=skip, forked=_shaped(forked))
+                    ranged=ranged, skip=skip, forked=_shaped(forked))
     return holds(both, family, generation.shared_budget(target))
 
 PLANS_KEPT = 1024
@@ -233,7 +233,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 max_segments: int | None = None, scale: float | None = None, delta: bool = True,
                 wide: bool = False, family=None, bound: float | None = None,
                 firsts=None, rounded: bool = False, apart: int = 0, values_gated: bool = False,
-                    unit_keys: bool = False, skip=None, recomputed: bool = False,
+                unit_keys: bool = False, skip=None, recomputed: bool = False,
                 forked: chunked_launch.Forked | None = None):
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop (`chunk_forward.forward`): the
@@ -283,7 +283,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 query, key, value, g, beta, state, tiles=tiles, family=issuing,
                 target=Mosaic.launched(), starts=starts,
                 max_segments=max_segments, delta=delta, rounded=rounded, apart=apart,
-                    values_gated=values_gated, unit_keys=unit_keys, wide=wide,
+                values_gated=values_gated, unit_keys=unit_keys, wide=wide,
                 ranged=run["ranged"],
                 skip=skip, forked=table))
 
@@ -299,7 +299,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         return chunk_forward.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
                                 max_segments=max_segments, scale=scale, delta=delta, wide=wide,
                                 rounded=rounded, apart=apart, values_gated=values_gated,
-                                    unit_keys=unit_keys, skip=skip, forked=table, **alone)
+                                unit_keys=unit_keys, skip=skip, forked=table, **alone)
 
     def forward(*operands):
         if not fast:
@@ -312,8 +312,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                                                             firsts=operands[7], max_segments=max_segments,
                                                             scale=scale, delta=delta, wide=wide,
                                                             rounded=rounded, apart=apart,
-                                                                values_gated=values_gated,
-                                                                    unit_keys=unit_keys, skip=operands[8],
+                                                            values_gated=values_gated,
+                                                            unit_keys=unit_keys, skip=operands[8],
                                                             forked=operands[9], **run)
         kept = None if recomputed else checkpoint_name(kept, Residual.DELTA_MEMORY)
         return (out, final), (operands, (checkpoint_name(inverse, Residual.DELTA_INVERSE), kept))

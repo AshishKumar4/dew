@@ -156,6 +156,23 @@ class Chunk(recurrence.Gated):
     held: int = dataclasses.field(default=0, metadata={'static': True})
 
 
+def _read_checked(hooks: recurrence.Hooks, operands: Chunk) -> dict:
+    """`operands` as `hooks` read them (`recurrence.read`, the decode step's checks), a call of the conv's
+    output, each key head serving a whole number of value heads, its decay of its kind's rank."""
+    if hooks.conv is not None:
+        raise ValueError("the chunked op takes the conv's output: its queries, keys and values")
+    given = recurrence.read(hooks, operands, optional=('state',))
+    key, value = given['key'], given['value']
+    if value.shape[2] % key.shape[2]:
+        raise ValueError(f"{value.shape[2]} value heads over {key.shape[2]} key heads: each key head serves "
+                         "a whole number of value heads")
+    ranks = {'scalar': 3, 'vector': 4}
+    if 'log_decay' in given and given['log_decay'].ndim != ranks[hooks.decay]:
+        raise ValueError(f"a {hooks.decay} decay is {ranks[hooks.decay]}-dimensional, [B, S, Hv"
+                         f"{', Dk' * (hooks.decay == 'vector')}], not {given['log_decay'].shape}")
+    return given
+
+
 def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_SIZE,
           max_segments: int | None = None, dtype=None):
     """`(output [B, S, Hv, Dv], final memory [B, Hv, Dk, Dv])` of a sequence through the recurrence of
@@ -179,17 +196,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     fla's chunked form does (row 2344: on par at 2^96 through a token's decay of exp2(-124.8), a write gate's
     output 150 times the recurrence's distance at 2^110). A call names a kernel through `generation.chosen`
     alone, the recurrence template's 'mosaic_gpu' among them (row 959: the selectors decide every call)."""
-    if hooks.conv is not None:
-        raise ValueError("the chunked op takes the conv's output: its queries, keys and values")
-    given = recurrence.read(hooks, operands, optional=('state',))
+    given = _read_checked(hooks, operands)
     query, key, value = given['query'], given['key'], given['value']
-    if value.shape[2] % key.shape[2]:
-        raise ValueError(f"{value.shape[2]} value heads over {key.shape[2]} key heads: each key head serves "
-                         "a whole number of value heads")
-    ranks = {'scalar': 3, 'vector': 4}
-    if 'log_decay' in given and given['log_decay'].ndim != ranks[hooks.decay]:
-        raise ValueError(f"a {hooks.decay} decay is {ranks[hooks.decay]}-dimensional, [B, S, Hv"
-                         f"{', Dk' * (hooks.decay == 'vector')}], not {given['log_decay'].shape}")
     dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
     work = at_least_fp32(jnp.result_type(query, key, value))
     if hooks.l2norm:
@@ -245,8 +253,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                product=product, forked=forked, delta=hooks.delta,
                                decayed=hooks.decay != 'none', skip=None if hooks.delta else skip,
                                rounded=rounded, firsts=firsts, readout=readout, apart=apart,
-                                   values_gated=values_gated, unit_keys=unit_keys,
-                               turns=hooks.turns)
+                               values_gated=values_gated, unit_keys=unit_keys, turns=hooks.turns)
 
         def run(kernel, query, key, value, g, beta, skip, state, starts, firsts, turn, *walked):
             # Every kernel walks the packed rows, each document from its own memory, its values read once
@@ -1094,7 +1101,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                 bound: float | None = None, product: str = 'forward', report: bool = True, delta: bool = True,
                 decayed: bool = True, forked: Forked | None = None, skip=None, rounded: bool | None = None,
                 firsts=None, readout: bool = True, apart: int = 0, values_gated: bool = False,
-                    unit_keys: bool = False, turns: int = 0) -> str:
+                unit_keys: bool = False, turns: int = 0) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
     ('forward', 'training'), of the form `delta` and `decayed` state and the chunk inverse's `bound` its form
     proves (`recurrence.Hooks.inverse_bound`; `PortCase`), the template's
@@ -1113,7 +1120,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                          max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound,
                          rounded=(chunk_rounding(delta, jnp.result_type(query, key, value))
                                   if rounded is None else rounded), apart=apart, values_gated=values_gated,
-                                      unit_keys=unit_keys)
+                         unit_keys=unit_keys)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1],
