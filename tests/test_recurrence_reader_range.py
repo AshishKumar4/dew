@@ -37,3 +37,23 @@ def test_packed_delta_derivatives_keep_representable_values(order):
     for index, (made, exact) in enumerate(zip(jax.tree.leaves(narrow), jax.tree.leaves(truth), strict=True)):
         held = normal_float32(exact) & np.isfinite(exact)
         assert np.all(np.isfinite(made[held])), (order, index, np.argwhere(held & ~np.isfinite(made)))
+
+
+def test_delta_derivative_keeps_a_small_write_after_large_read_factors():
+    """A reader's scale also precedes a contraction whose small value brings it into range."""
+    shape = (1, 1, 1, 8)
+    primals = (jnp.full(shape, 2.0 ** 63), jnp.full(shape, 2.0 ** 63),
+               jnp.full(shape, 2.0 ** -63), jnp.full((1, 1, 1), -1.0), jnp.ones((1, 1, 1)))
+    direction = (*primals[:3], jnp.zeros_like(primals[3]), jnp.zeros_like(primals[4]))
+
+    def rule(*operands):
+        return recurrence_chunk.xla_mainloop(
+            recurrence_chunk.Tiles(16), *operands, scale=8 ** -0.5, delta=True,
+            dtype=operands[0].dtype)[0]
+
+    narrow = jax.jit(lambda *x: jax.jvp(rule, x, direction)[1])(*primals)
+    with jax.enable_x64(True):
+        wide, along = jax.tree.map(lambda x: x.astype(jnp.float64), (primals, direction))
+        truth = np.asarray(jax.jit(lambda *x: jax.jvp(rule, x, along)[1])(*wide))
+    assert np.all(normal_float32(truth) & np.isfinite(truth))
+    assert np.all(np.isfinite(np.asarray(narrow)))
