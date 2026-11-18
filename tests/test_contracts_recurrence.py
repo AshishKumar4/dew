@@ -10,7 +10,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, FORWARD_ORDERS, REVERSE_ONLY, assert_contract, normal_draw
+from contract_support import (
+    EDGES,
+    FORWARD_ORDERS,
+    REVERSE_ONLY,
+    assert_contract,
+    normal_draw,
+    normal_float32,
+    orders,
+)
 from ssd_support import stepwise_scan
 
 from dew.algebra import SATURATION, scan
@@ -172,6 +180,61 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
     # one or two ops, 109 of the case's 156 s near float32's largest (cProfile on armada, row 4433).
     assert_contract(jax.jit(rule), primals, direction, cotangent, f"the chunked delta rule {edge}",
                     truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain), without=outside(taken))
+
+
+@pytest.mark.parametrize("order", ("jvp", "vjp", "jvp of grad", "grad of grad"))
+def test_the_chunked_delta_rules_reader_scale_holds_every_order(order):
+    """The packed chunked delta rule at the input that exposed row 8428 (queries, keys and values of 2^63,
+    drawn from `fold_in(key(1861), 0)`): each order finite wherever float64's is a normal float32, where the
+    queries' second orders formed `dB r` at a document's first read before the reader's scale `8^-1/2` brought
+    it back, past float32's largest (`scan._read`'s scaled contraction applies it first)."""
+    rows, length, heads, width = 1, 37, 2, 8
+    scale = 2.0 ** 63
+    starts_key = jax.random.split(jax.random.key(1861), 8)[5]
+    starts = jax.random.bernoulli(starts_key, 0.1, (rows, length))
+    keys = jax.random.split(jax.random.fold_in(jax.random.key(1861), 0), 8)
+    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) * scale for k in keys[:3])
+    g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
+    primals = (query, key, value, g, beta)
+    direction = tuple(jax.random.normal(keys[6], x.shape) * (scale if at < 3 else 1.0)
+                      for at, x in enumerate(primals))
+    cotangent = jax.random.normal(keys[7], query.shape)
+
+    def rule(query, key, value, g, beta):
+        return recurrence_chunk.xla_mainloop(
+            recurrence_chunk.Tiles(16), query, key, value, g[..., 0], beta, None, starts,
+            scale=width ** -0.5, delta=True, dtype=query.dtype)[0]
+
+    narrow = jax.tree.map(np.asarray, jax.jit(orders(rule, primals, direction, cotangent)[order])())
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda x: x.astype(jnp.float64), (primals, direction, cotangent))
+        truth = jax.tree.map(np.asarray, jax.jit(orders(rule, *wide)[order])())
+    for index, (made, exact) in enumerate(zip(jax.tree.leaves(narrow), jax.tree.leaves(truth), strict=True)):
+        held = normal_float32(exact) & np.isfinite(exact)
+        assert np.all(np.isfinite(made[held])), (order, index, np.argwhere(held & ~np.isfinite(made)))
+
+
+def test_the_chunked_delta_rules_reader_scale_precedes_a_small_write():
+    """A one-token delta rule whose queries and keys are 2^63 and values 2^-63 (a write whose reader's
+    product passes float32's largest before its small value brings it back): its forward derivative finite
+    where float64's is, the reader's scale applied before the contraction's products (row 8428)."""
+    shape = (1, 1, 1, 8)
+    primals = (jnp.full(shape, 2.0 ** 63), jnp.full(shape, 2.0 ** 63),
+               jnp.full(shape, 2.0 ** -63), jnp.full((1, 1, 1), -1.0), jnp.ones((1, 1, 1)))
+    direction = (*primals[:3], jnp.zeros_like(primals[3]), jnp.zeros_like(primals[4]))
+
+    def rule(*operands):
+        return recurrence_chunk.xla_mainloop(
+            recurrence_chunk.Tiles(16), *operands, scale=8 ** -0.5, delta=True,
+            dtype=operands[0].dtype)[0]
+
+    narrow = jax.jit(lambda *x: jax.jvp(rule, x, direction)[1])(*primals)
+    with jax.enable_x64(new_val=True):
+        wide, along = jax.tree.map(lambda x: x.astype(jnp.float64), (primals, direction))
+        truth = np.asarray(jax.jit(lambda *x: jax.jvp(rule, x, along)[1])(*wide))
+    assert np.all(normal_float32(truth) & np.isfinite(truth))
+    assert np.all(np.isfinite(np.asarray(narrow)))
 
 
 def plain_delta_rule(query, key, value, g, beta, state, scale):
