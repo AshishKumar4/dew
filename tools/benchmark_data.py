@@ -368,6 +368,14 @@ def _dropping(config: Worker):
     return documents.pipe(presets.lm, None, seq_len=measured.seq_len, batch=measured.batch, bins=32)
 
 
+def array_records(grain, path: str):
+    """The ArrayRecord file at `path` as Grain reads it by index (`RandomAccessDataSource`)."""
+    source = grain.ArrayRecordDataSource([path])
+    if not isinstance(source, grain.RandomAccessDataSource):
+        raise TypeError(f"Grain reads {path} as a {type(source).__name__}, which it cannot index")
+    return source
+
+
 def grain_options(rows, config: Worker):
     measured = config.measurement
     import grain.experimental as gx
@@ -396,7 +404,7 @@ def grain_reader(config: Worker, objective, loading: Loading):
 
     read_options = grain.ReadOptions(loading.threads, loading.read_buffer)
     if config.workload == "image":
-        source = grain.ArrayRecordDataSource([str(config.source / "images.array_record")])
+        source = array_records(grain, str(config.source / "images.array_record"))
         rows = grain.MapDataset.source(source).shuffle(seed=measured.seed).repeat()
         # The images preset's own record steps, applied by Grain alone.
         rows = rows.map(images.DecodeImage("image", at_least=measured.image_size, rejects=False))
@@ -1144,7 +1152,7 @@ def run_declared_shard(config: DeclaredShard) -> None:
         started = time.perf_counter()
         # Held to the declared generation as Arrow's own clients are (`Declared.still_held`, `Files`).
         declared.still_held()
-        source = grain.ArrayRecordDataSource([config.url])
+        source = array_records(grain, config.url)
         order = np.random.default_rng(count).permutation(len(source))[:count]
         first = None
         for index in order:
@@ -1160,7 +1168,7 @@ def run_declared_shard(config: DeclaredShard) -> None:
             held = Store(config.url, options)
             local, pin = Declared(held, {**stated, "sha256": digest}).leased()
             with pin:
-                source = grain.ArrayRecordDataSource([local])
+                source = array_records(grain, local)
                 order = np.random.default_rng(count).permutation(len(source))[:count]
                 first = None
                 for index in order:

@@ -281,16 +281,20 @@ def train_and_reload(task, source, reference, key, given, noise):
         loaded = restored.model.apply(restored.variables, noise, jnp.asarray([10]), **given)
         np.testing.assert_array_equal(loaded, before)
         diffusers_reads(task, source.source, saved, restored.model, restored.variables, noise, given)
+        if restored.autoencoder is None or source.autoencoder is None:
+            raise ValueError(f"{directory} holds no autoencoder")
         np.testing.assert_array_equal(restored.autoencoder.decode(restored.variables["autoencoder"], noise),
                                       source.autoencoder.decode(trained["autoencoder"], noise))
-        if source.finish is not None:
+        if source.finish is not None and restored.finish is not None:
             images = jnp.asarray(reference["images"] * 2 - 1)
             np.testing.assert_array_equal(restored.finish(restored.variables, images), source.finish(trained, images))
             checker = {**trained["encoders"]["safety"], "concept_embeds_weights": jnp.full((17,), -2.0)}
             blocked = {**trained, "encoders": {**trained["encoders"], "safety": checker}}
             source.save(saved, variables=blocked)
-            restored = bundle(saved)
-            np.testing.assert_array_equal(restored.finish(restored.variables, images), -1)
+            blocking = bundle(saved)
+            if blocking.finish is None:
+                raise ValueError(f"{saved} lost its safety checker")
+            np.testing.assert_array_equal(blocking.finish(blocking.variables, images), -1)
     return {"loss_before": float(value), "loss_after": float(after)}
 
 

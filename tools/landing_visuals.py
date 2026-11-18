@@ -61,7 +61,7 @@ class Experiment:
     configs: dict[str, dict]
 
     @classmethod
-    def read(cls, path: Path) -> "Experiment":
+    def read(cls, path: str | Path) -> "Experiment":
         return cls(**json.loads(Path(path).read_text()))
 
     def prompt(self, name: str, variant: str) -> str:
@@ -208,14 +208,26 @@ class Scorer:
         return self.clip.scores(pixels, list(prompts)), aesthetic
 
 
+def decoded(images):
+    """A task's decoded images, refused where it decoded none."""
+    if images is None:
+        raise ValueError("the task decoded no images")
+    return images
+
+
 def load_pipe(experiment):
     """The run loaded as `dew.pipeline` loads a Hub run, at the commit its revision resolves, and that
     commit's metadata directory, whose run.json the provenance hashes."""
     import dew
     from dew.interop import sources
 
+    from dew.inference import TextToImage
+
     metadata = sources.snapshot(experiment.model, experiment.revision, weights=False)
-    return dew.pipeline(experiment.model, revision=metadata.name), metadata
+    pipe = dew.pipeline(experiment.model, revision=metadata.name)
+    if not isinstance(pipe, TextToImage):
+        raise TypeError(f"{experiment.model} serves a {type(pipe).__name__}, not text to image")
+    return pipe, metadata
 
 
 def provenance(experiment, pipe, directory):
@@ -317,7 +329,7 @@ def generate(args):
             images = batched(
                 pipe, [(experiment.prompt(name, variant), seed) for name, variant, seed in group], config
             )
-            pixels = uint8_pixels(images.host().images)
+            pixels = uint8_pixels(decoded(images.host().images))
             clip, aesthetic = scorer(pixels, [experiment.prompts[name] for name, _, _ in group])
             for row, (name, variant, seed) in enumerate(group):
                 identifier = f"{args.config}/{name}.{variant}.s{seed:02d}"
@@ -499,7 +511,7 @@ def verify(args):
     report = []
     for row in picks:
         config = experiment.call(row["config"])
-        pixels = uint8_pixels(single(pipe, row["prompt"], row["seed"], config).host().images)[0]
+        pixels = uint8_pixels(decoded(single(pipe, row["prompt"], row["seed"], config).host().images))[0]
         stored = np.asarray(Image.open(row["file"]).convert("RGB"))
         gap = np.abs(pixels.astype(np.int16) - stored.astype(np.int16))
         report.append({"id": row["id"], "max_abs": int(gap.max()), "mean_abs": float(gap.mean())})
@@ -550,13 +562,16 @@ def finals(args):
     out = args.out / "finals"
     save_json(out / "provenance.json", record)
     scorer = Scorer(aesthetic_weights(args.aesthetic, args.out))
-    decode = jax.jit(lambda params, z: jnp.clip(pipe.autoencoder.decode(params, z), -1.0, 1.0))
+    autoencoder = pipe.autoencoder
+    if autoencoder is None:
+        raise ValueError(f"{experiment.model} decodes in pixel space, with no autoencoder to replay")
+    decode = jax.jit(lambda params, z: jnp.clip(autoencoder.decode(params, z), -1.0, 1.0))
     picks = []
     for pick in selection["picks"]:
         name, variant, seed, config_name = pick["name"], pick["variant"], pick["seed"], pick["config"]
         config, prompt = experiment.call(config_name), experiment.prompt(name, variant)
         tick = time.monotonic()
-        pixels = uint8_pixels(single(pipe, prompt, seed, config).host().images)[0]
+        pixels = uint8_pixels(decoded(single(pipe, prompt, seed, config).host().images))[0]
         seconds = round(time.monotonic() - tick, 2)
         stem = f"{name}.{variant}.s{seed:02d}.{config_name}"
         target = out / "png" / f"{stem}.png"

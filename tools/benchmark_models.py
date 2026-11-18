@@ -353,8 +353,9 @@ def media_row(case: Case, tokens: np.ndarray, rng: np.random.Generator) -> Model
     indices = np.full(tokens.shape, -1, np.int32)
     indices[:, :slots] = np.arange(slots)
     pixels = rng.normal(size=(case.batch_size, images, *media_pixels(case)))
-    return ModelInputs(tokens, {"image_indices": indices},
-                       {"pixel_values": pixels.astype(np.float32)})
+    # Device arrays, as the model reads them.
+    return ModelInputs(jnp.asarray(tokens), {"image_indices": jnp.asarray(indices)},
+                       {"pixel_values": jnp.asarray(pixels, jnp.float32)})
 
 
 def global_batch(case: Case, seed: int = 0) -> Batch:
