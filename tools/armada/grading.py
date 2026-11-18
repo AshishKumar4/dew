@@ -2,6 +2,7 @@
 collection, its exit, and the task's deadline, what makes the row red and what turned it red (`graded`,
 `red_as`), each case by its node id (`node_of`) and its file (`file_of`). Loaded by ci.py by its path."""
 
+import json
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 
@@ -125,3 +126,31 @@ def graded(name: str, own: list[ET.Element], cases: list[ET.Element], counted: M
              else red_as("deadline", []) if spent
              else red_as("whole", []) if whole else red_as("nodes", nodes))
     return red, failed, cause
+
+
+def flow_cells(cases) -> dict[str, dict]:
+    """A GPU flow's counts by its cases (each case's JUnit property `cells`, tests/conftest.py from
+    tests/gpu_flow.py: passed, failed, skipped and the device), as every row a task runs carries them, an
+    empty object where its file runs no flow: the train's native gate reads a flow none of whose cells ran as
+    unqualified, and a reused row keeps its counts (ledger 2643)."""
+    return {node_of(case): json.loads(item.get("value") or "null") for case in cases
+            for item in case.iter("property") if item.get("name") == "cells"}
+
+
+def ynn_switched(cases) -> list[dict]:
+    """The accuracy gate's sites a file's cases moved onto YNNPACK's fusions (each case's JUnit property
+    `ynn_switched`, tests/conftest.py), green cases included: each its test node, label and XLA:CPU's
+    refusal, as every row a task runs carries them for the train report to count, an empty list where
+    nothing moved, so a row without the field is one recorded before it, uncounted."""
+    return [{"node": node_of(case), **site} for case in cases
+            for item in case.iter("property") if item.get("name") == "ynn_switched"
+            for site in json.loads(item.get("value") or "[]")]
+
+
+def compiled_cold(cases: list) -> list[str]:
+    """Of a file's JUnit `cases`, the node ids of those that compiled a program the shared compilation
+    cache did not hold (each case's property `compiled`, tests/conftest.py's count from
+    tests/remote_cache.py's watch, set only where a shared cache was installed)."""
+    return sorted(node_of(case) for case in cases
+                  if any(item.get("name") == "compiled" and int(item.get("value") or 0) > 0
+                         for item in case.iter("property")))

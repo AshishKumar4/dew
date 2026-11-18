@@ -155,7 +155,7 @@ _COMPILE_MARK = pytest.StashKey[tuple]()
 def pytest_runtest_teardown(item, nextitem):
     """A test's programs compiled that the shared cache did not hold, from its setup through its teardown, as
     its JUnit property `compiled` (where known): a test that compiled ran cold, its seconds a cold run's,
-    which CI's durations record keeps apart (tools/armada/ci.py `compiled_cold`, row 7939). None is
+    which CI's durations record keeps apart (tools/armada/grading.py `compiled_cold`, row 7939). None is
     recorded where no shared cache is installed, so a local run's JUnit is as it was."""
     yield
     if _remote is not None and (mark := item.stash.get(_COMPILE_MARK, None)) is not None:

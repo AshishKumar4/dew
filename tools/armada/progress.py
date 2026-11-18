@@ -6,6 +6,7 @@ writes nothing outside a task."""
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 PROGRESS = "progress.jsonl"
@@ -63,3 +64,31 @@ def pytest_runtest_logreport(report) -> None:
             with (Path(artifacts) / PROGRESS).open("a") as progress:
                 progress.write(json.dumps({"node": report.nodeid, "seconds": seconds,
                                            **({"cold": True} if cold else {})}) + "\n")
+
+
+def resumed(tests: list[str], owning: Callable[[str], str]) -> tuple[dict[str, float], set[str]]:
+    """The tests of `tests` (each node's file as `owning` reads it) an earlier attempt of this task passed
+    before the fleet recalled it (armada keeps a recalled attempt's artifacts and hands them to the next as
+    ARMADA_RESUME, #4544), each with its seconds, as this plugin kept them, and those of them that ran cold
+    (`cold`); copied into this attempt's progress, so a second recall keeps them too. Read by ci.py, which
+    runs a task's pytest. None outside a resumed task."""
+    kept = Path(os.environ.get("ARMADA_RESUME", "/nonexistent")) / PROGRESS
+    if not kept.is_file():
+        return {}, set()
+    passed, cold = {}, set()
+    for line in kept.read_text().splitlines():
+        found = json.loads(line)
+        if owning(found["node"]) in tests:
+            passed[found["node"]] = float(found["seconds"])
+            if found.get("cold"):
+                cold.add(found["node"])
+    artifacts = os.environ.get("ARMADA_ARTIFACTS")
+    if artifacts and passed:
+        Path(artifacts).mkdir(parents=True, exist_ok=True)
+        lines = ({"node": node, "seconds": seconds, **({"cold": True} if node in cold else {})}
+                 for node, seconds in passed.items())
+        with (Path(artifacts) / PROGRESS).open("a") as carried:
+            carried.writelines(json.dumps(line) + "\n" for line in lines)
+    if passed:
+        print(f"resumed: {len(passed)} tests an earlier attempt passed set aside", flush=True)
+    return passed, cold
