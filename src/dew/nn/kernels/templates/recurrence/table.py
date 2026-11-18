@@ -103,8 +103,14 @@ class Memories:
         call, family = self.call, self.call.family
         span = pl.ds(self.head * call.width + i * call.block, call.block)
         rows, after, before = (family.rows_of(part.at[n, span])[:, None] for part in turning)
-        return (rows * self.read(ref, base, i) + sign * after * family.tile_of(self.view(ref, base, i, 1))
-                + sign * before * family.tile_of(self.view(ref, base, i, -1)))
+
+        def partner(coefficient, by):
+            # Selected, not multiplied, where a row has no partner: the row a step on or back may be one no
+            # walk wrote yet (a slot's neighbour, a pad), whose bits are anything.
+            near = family.tile_of(self.view(ref, base, i, by))
+            return jnp.where(coefficient != 0, sign * coefficient * near, 0.0)
+
+        return rows * self.read(ref, base, i) + partner(after, 1) + partner(before, -1)
 
     def zero(self):
         return self.call.family.zeros((self.call.block, self.bv))

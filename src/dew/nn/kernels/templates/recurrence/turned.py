@@ -170,7 +170,7 @@ def _turned_forward(launch, scale, group, held, query, key, value, g, beta, stat
     local = frames(turn, starts)
     (cos, sin), owned = _in_last_frame(local, starts, documents)
     turned = [scan.rotated(_wide(x), cos, sin).astype(x.dtype) for x in (query, key)]
-    turning, given_entry = None, entry
+    turning, given_entry, given_state = None, entry, state
     if documents is None:
         if state is not None:
             # The memory entering, its first document's, in that document's last frame.
@@ -184,8 +184,8 @@ def _turned_forward(launch, scale, group, held, query, key, value, g, beta, stat
     (out, final), pullback = jax.vjp(lambda *operands: launch(*operands, turning), *turned, value, g, beta,
                                      state, skip, entry)
     kind = jnp.zeros((), turn.dtype)
-    return (out, final), (pullback, query, key, value, g, beta, state, given_entry, turn, starts, documents,
-                          cos, sin, owned, kind)
+    return (out, final), (pullback, query, key, value, g, beta, given_state, given_entry, turn, starts,
+                          documents, cos, sin, owned, kind)
 
 
 def _rooted(query, key, state, entry, turn, starts, documents):
