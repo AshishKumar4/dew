@@ -191,6 +191,50 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
                          interpret=interpret, name="fed")(p, x)
 
 
+def _fed_staged_over_rings(p, x, *, interpret):
+    """Two consumers without a producer walk `_fed_products`' ring, each its share of a step's rows, and
+    stage their partial products after their walks in a tile over the ring's slots
+    (`Family.stages_over_rings`: the slots and the tile one union), each its own `[64, 128]` fp32 part, past
+    the barrier every consumer passes first (`walked`): `[2, 64, 128]` partials, `p @ x` their sum."""
+    from dew.nn.kernels.templates import mosaic_sm90
+    family, consumers = mosaic_sm90.FED, 2
+    share = FED_ROWS // consumers
+    swizzle = swizzling.swizzle_for(jnp.bfloat16, share)
+
+    def body(p_gmem, x_gmem, out_gmem):
+        allocated = family.streams({'p': ((FED_ROWS, FED_ROWS), jnp.bfloat16),
+                                    'x': ((FED_ROWS, FED_WIDTH), jnp.bfloat16)}, STAGES, consumers,
+                                   swizzles={'p': swizzle, 'x': swizzle})
+        wg = jax.lax.axis_index("wg")
+
+        def program(*, streams, after, walked):
+            views = {'p': (p_gmem, lambda j: (0, j)), 'x': (x_gmem, lambda j: (j, 0))}
+            feed = family.fed(family.opened(streams), views, jnp.int32(0), jnp.int32(FED_STEPS), wg)
+
+            def step(at, slots, carry, accumulators):
+                del at
+                (acc,) = accumulators
+                block, rows = slots['p'], slots['x']
+                return carry, (family.products(acc, block.at[:, pl.ds(wg * share, share)],
+                                               rows.at[pl.ds(wg * share, share)]),)
+
+            (part,) = family.walk(feed, ((step, 0, FED_STEPS),), (), ((FED_ROWS, FED_WIDTH),), interpret)[1]
+            walked()
+
+            def staged(stage):
+                stage.at[wg][...] = part
+                out_gmem.at[wg][...] = stage.at[wg][...]
+
+            after(staged)
+
+        family.scoped(program, streams=allocated,
+                      after_walks=(plgpu.SMEM((consumers, FED_ROWS, FED_WIDTH), jnp.float32),))
+
+    out = jax.ShapeDtypeStruct((consumers, FED_ROWS, FED_WIDTH), jnp.float32)
+    return family.kernel(body, out_type=(out,), grid=(1,), grid_names=("programs",), consumers=consumers,
+                         interpret=interpret, name="fed_over_rings")(p, x)
+
+
 def _fed_operands():
     """Small integers, so the product is exact in fp32 whatever its order."""
     keys = jax.random.split(jax.random.key(1))
@@ -202,6 +246,21 @@ def _fed_operands():
 def _fed_expected(p, x):
     product = np.asarray(p, np.float32) @ np.asarray(x, np.float32)
     return product, 2 * product
+
+
+@INTERPRETS
+def test_consumers_staging_over_their_rings_write_only_past_every_consumers_reads_interpreted():
+    """Interpreted with the interpreter's race detection: two consumers that stage their partial products
+    over their ring's slots after their walks (`_fed_staged_over_rings`: a consumer's tile shares bytes with
+    the slots its partner reads in its last step) write none of it while either reads a slot, each passing
+    the barrier of their walks' ends first (`Family.walked`), and their partials sum to `p @ x` exactly
+    (small integers). Without the barrier the interpreter finds a write unordered with a read."""
+    from jax._src.pallas.mosaic_gpu.interpret import interpret_pallas_call as interpreter
+
+    p, x = _fed_operands()
+    (parts,) = _fed_staged_over_rings(p, x, interpret=plgpu.InterpretGPUParams(detect_races=True))
+    assert not interpreter.get_races().races_found
+    np.testing.assert_array_equal(np.asarray(parts).sum(axis=0), _fed_expected(p, x)[0])
 
 
 @INTERPRETS
