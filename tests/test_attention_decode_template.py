@@ -101,9 +101,9 @@ def test_a_decode_steps_rows_whose_sums_pass_fp32s_largest_walk_again_scaled_int
     def reference(query, key, value):
         # The reference path's first row's sums pass fp32's largest too: that row run at its values' scale
         # (2^-124 each, exact) and its output taken back by it, the same path at a scale its sums hold.
-        scaled = value.at[0].set((value[0].astype(jnp.float32) * 2.0 ** -124).astype(value.dtype))
-        out = template.reference(query, key, scaled, spans).astype(jnp.float32)
-        return out.at[0].multiply(2.0 ** 124)
+        scaled = value.at[0].multiply(jnp.asarray(2.0 ** -124, value.dtype))
+        out = template.reference(query, key, scaled, spans)
+        return out.at[0].multiply(jnp.asarray(2.0 ** 124, out.dtype))
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template decode {device} past fp32's largest",
                     seeds=SEEDS)
