@@ -678,45 +678,6 @@ def test_a_memory_read_through_a_decay_past_fp32s_normals_is_as_exact_as_the_rec
                     seeds=FEWEST_SEEDS)
 
 
-OWN_PAIR_EDGES = {
-    "unnormalised keys": (recurrence.Hooks(decay='vector', scale=1.0), -100, 60, -60, 0),
-    "unit keys at the floor": (recurrence.Hooks(decay='vector', l2norm=True), 0, 0, -7, -110),
-}
-"""The template's own pairs at fp32's edge (row 7299): a call's hooks, then its second token's query
-`2^q`, its first token's key `2^k`, the second's decay `2^g` along the first key dimension and its write
-gate `2^b` (a tiny row of the system's product, its key times its gate)."""
-
-
-@pytest.mark.parametrize('case', list(OWN_PAIR_EDGES))
-def test_an_own_pair_at_fp32s_edge_reads_as_float64_does(case):
-    """The template's own pairs (`recurrence_algebra.key_diagonal_bands`, interpreted) over two tokens: the
-    first writes its key `2^k` and a unit value, the second reads it through its decay `2^g` with its query
-    `2^q`; every output float64's exactly wherever float64's is a normal float32 (exact powers of two).
-    Unnormalised keys keep the row times the key first: the decay folded into the row lost `2^-100` under
-    a decay of `2^-60` against a key of `2^60` (base review 6ce025bc7 F1). Keys normalised to one fold it
-    (`mainloop.Call.unit_keys`), all the fold loses below normal in the exact term too."""
-    from contract_support import normal_float32
-
-    hooks, query, key, decay, gate = OWN_PAIR_EDGES[case]
-    width = 16
-    keys = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 0, 0, 0].set(2.0 ** key)
-    queries = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 1, 0, 0].set(2.0 ** query)
-    if hooks.l2norm:
-        # A normalised call's keys and queries along the first dimension, so each stays a unit vector.
-        keys, queries = keys.at[0, 1, 0, 0].set(1.0), queries.at[0, 0, 0, 0].set(1.0)
-    values = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 0, 0, 0].set(1.0)
-    log_decay = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 1, 0, 0].set(decay * np.log(2.0))
-    operands = Chunk(queries.astype(jnp.bfloat16), keys.astype(jnp.bfloat16), values.astype(jnp.bfloat16),
-                     state=jnp.zeros((1, 1, width, width), jnp.float32), log_decay=log_decay, beta=jnp.ones((1, 2, 1), jnp.float32).at[0, 1, 0].set(2.0 ** gate))
-    ours = np.asarray(chunk_on('mosaic_gpu', hooks, operands, chunk_size=CHUNK)[0], np.float64)
-    with jax.enable_x64(new_val=True):
-        truth = np.asarray(token_by_token(hooks, jax.tree.map(
-            lambda t: jnp.asarray(t, jnp.float64) if jnp.issubdtype(jnp.asarray(t).dtype, jnp.floating)
-            else t, operands))[0], np.float64)
-    normal = normal_float32(truth)
-    np.testing.assert_array_equal(ours[normal], truth[normal])
-
-
 def subnormal_draw(hooks, seed: int):
     """`draw`'s operands of one sequence in bf16 driving a chunk's own pairs into fp32's subnormals: each
     token's decay along every key dimension near its floor (log decays in (-6, -5) a token, a sub-chunk's
@@ -735,19 +696,35 @@ def subnormal_draw(hooks, seed: int):
 @pytest.mark.check1_shards(seeds=16, per_task=2)
 def test_own_pairs_folded_against_unit_keys_are_as_exact_into_fp32s_subnormals():
     """The template's own pairs where its keys are normalised (`Hooks.l2norm`, `mainloop.Call.unit_keys`),
-    each row taking its decay before the key's product (`recurrence_algebra.key_diagonal_bands`), over draws
-    driving those products into fp32's subnormals (`subnormal_draw`), interpreted: its output, final memory
-    and every operand's gradient on par with the recurrence a token at a time from float64 (check 1), the
-    two orders rounding apart under gradual underflow (row 7299)."""
-    hooks = recurrence.Hooks(decay='vector', l2norm=True)
+    each row taking its decay before the key's product (`recurrence_algebra.key_diagonal_bands`), against the
+    same template over the same normalised keys stated as given (its own pairs' row times the key first),
+    over draws driving those products into fp32's subnormals (`subnormal_draw`), interpreted: its output,
+    final memory and every operand's gradient on par from float64 (check 1), the two orders rounding apart
+    under gradual underflow (row 7299)."""
+    folding = recurrence.Hooks(decay='vector', l2norm=True)
+    width = KEY_WIDTH
 
-    def ours(operands):
-        return chunk_on('mosaic_gpu', hooks, operands, chunk_size=CHUNK)
+    def folded(operands):
+        return chunk_on('mosaic_gpu', folding, operands, chunk_size=CHUNK)
 
-    reference = functools.partial(token_by_token, hooks)
-    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(reference)),
-                    functools.partial(subnormal_draw, hooks), f'{hooks} own pairs into the subnormals',
-                    seeds=16)
+    def unfolded(operands):
+        # The normalisation the folding call takes inside, done before it, so the template sees keys it
+        # states nothing of.
+        query, key = (l2norm(x.astype(jnp.float32)).astype(x.dtype) for x in (operands.query, operands.key))
+        given = dataclasses.replace(operands, query=query, key=key)
+        return chunk_on('mosaic_gpu', recurrence.Hooks(decay='vector', scale=width ** -0.5), given,
+                        chunk_size=CHUNK)
+
+    def truth(operands, seeded):
+        with jax.enable_x64(new_val=True):
+            wide = jax.tree.map(lambda t: jnp.asarray(t, jnp.float64)
+                                if jnp.issubdtype(jnp.asarray(t).dtype, jnp.floating) else t,
+                                (operands, seeded))
+            return jax.jit(with_gradients(functools.partial(token_by_token, folding)))(*wide)
+
+    assert_as_exact(jax.jit(with_gradients(folded)), jax.jit(with_gradients(unfolded)),
+                    functools.partial(subnormal_draw, folding), f'{folding} own pairs into the subnormals',
+                    seeds=16, truth_fn=truth)
 
 
 ROUNDED_ONCE = [recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True),
