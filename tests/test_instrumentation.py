@@ -411,6 +411,24 @@ def test_a_loop_bounded_by_a_counter_beside_a_predicate_counts_at_most_its_trips
     assert compiled_flops(jax.jit(uncounted).lower(*arguments).compile()) is None
 
 
+def test_each_bounds_logged_utilization_reads_back_with_its_bound():
+    """A utilization the trainer logs under the name its count's bound gives it (`StepFlops.utilizations`:
+    train/hfu_upper_bound where a loop was counted at its stated bound) is read back, value and bound alike,
+    by the one reader of logged utilizations (`logged_utilization`, the profile report's), for every bound;
+    an interval that logged none reads none (train 1025's F3: the report read train/hfu alone, so a bounded
+    step's HFU was None)."""
+    from dew.telemetry.instrumentation import BOUND_MARKS, logged_utilization
+
+    for unsized, bounded in itertools.product((0.0, 1.0), repeat=2):
+        flops = StepFlops(1.0, 2.0, unsized, bounded)
+        logged = flops.utilizations(1, 1.0, peak=1.0)
+        assert logged_utilization(logged, "hfu") == (2.0, flops.bound)
+        assert logged_utilization(logged, "hlo_flops_util") == (1.0, flops.bound)
+    assert {StepFlops(1.0, 2.0, unsized, bounded).bound
+            for unsized, bounded in itertools.product((0.0, 1.0), repeat=2)} == set(BOUND_MARKS)
+    assert logged_utilization({"train/mfu": 0.5}, "hfu") is None
+
+
 def test_a_conditional_counts_the_branch_of_the_most_flops():
     """A conditional runs one of its branches (an XLA `conditional`): its FLOPs are its largest branch's,
     two matmuls where the other branch runs one, not the three every branch summed counts (the scaled

@@ -1009,6 +1009,11 @@ def _merged_call_counts(computation: _Computation,
     return merged
 
 
+BOUND_MARKS = {"": "", "_lower_bound": "≥", "_upper_bound": "≤", "_estimate": "≈"}
+"""Each name a count's figures end with (`StepFlops.bound`), in its order, and the mark a figure so named is
+shown with: the value itself, at least, at most or about it."""
+
+
 @dataclass(frozen=True)
 class StepFlops:
     """One step's FLOPs: the `model`'s, the forward a remat recomputes counted
@@ -1043,8 +1048,7 @@ class StepFlops:
         """What the counts are, as a reported figure's name ends: `_lower_bound` where a launch's work went
         uncounted (`unsized`), `_upper_bound` where a loop was counted at its stated bound (`bounded`),
         `_estimate` where both (neither bound), else nothing (the step's own count)."""
-        return {(False, False): "", (True, False): "_lower_bound", (False, True): "_upper_bound",
-                (True, True): "_estimate"}[bool(self.unsized), bool(self.bounded)]
+        return tuple(BOUND_MARKS)[bool(self.unsized) + 2 * bool(self.bounded)]
 
     def utilizations(self, steps: int, step_time: float, peak: float | None = None) -> dict[str, float]:
         """The interval's HLO utilizations of `steps` steps of `step_time` seconds each, of `peak`
@@ -1061,6 +1065,14 @@ class StepFlops:
 
 NO_FLOPS = StepFlops(0.0, 0.0)
 """The FLOPs of no step, where an interval's sum starts."""
+
+
+def logged_utilization(scalars: Mapping[str, float], name: str) -> tuple[float, str] | None:
+    """Utilization `name` (`hfu`, `hlo_flops_util`) of an interval's logged `scalars` (`train/...`), under
+    whichever name its count's bound gave it (`StepFlops.utilizations`), with that bound (`BOUND_MARKS`);
+    None where the interval logged none."""
+    return next(((scalars[f"train/{name}{bound}"], bound) for bound in BOUND_MARKS
+                 if f"train/{name}{bound}" in scalars), None)
 
 
 class CompiledMemory(NamedTuple):

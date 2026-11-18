@@ -90,7 +90,7 @@ from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.selection import Unlowerable
 from dew.registry import models
 from dew.telemetry.benchmark import carried
-from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
+from dew.telemetry.instrumentation import BOUND_MARKS, compilation_cache_counts, count_compilation_cache
 from dew.telemetry.profile import Profiler
 from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.training import Trainer
@@ -682,8 +682,11 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "tokens_per_sec": round(case.batch_size * case.seq_len / step_time, 1) if case.is_lm else None,
             "flops_per_step": None if flops is None else flops.hardware,
             "utilization": utilization,
-            # The launches a step runs whose work no count holds; where any runs, `utilization` and
-            # `flops_per_step` are lower bounds, as the trainer's train/hfu_lower_bound is.
+            # What `utilization` and `flops_per_step` are (`StepFlops.bound`), as the trainer names its
+            # train/hfu: a lower bound where a launch's work went uncounted (`unsized_kernels`, the launches
+            # a step runs whose work no count holds), an upper bound where a loop was counted at its stated
+            # bound, an estimate where both, else "" (the step's own count).
+            "utilization_bound": None if flops is None else flops.bound,
             "unsized_kernels": None if flops is None else flops.unsized,
             "training_flops": training_flops,
             # Why the model counts no training work, where it counts none, so no MFU is reported.
@@ -735,9 +738,9 @@ def format_table(rows: list[Row]) -> str:
                 text = mesh_label(value)
             elif isinstance(value, (int, float)):
                 text = fmt.format(value * TABLE_SCALE.get(key, 1))
-                # A count some launch's work is missing from is a lower bound.
-                if key in ("flops_per_step", "utilization") and row.get("unsized_kernels"):
-                    text = ">=" + text
+                # A count shown as the bound it is (`BOUND_MARKS`).
+                if key in ("flops_per_step", "utilization"):
+                    text = BOUND_MARKS[row["utilization_bound"]] + text
             else:
                 text = fmt.format(value)
             cells.append(text.ljust(width) if key == "architecture" else text.rjust(width))

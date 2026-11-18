@@ -49,6 +49,7 @@ from dew._logging import display_console
 from dew.data.pipeline import cut_unit
 from dew.mesh import EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 from dew.objectives.base import Shown
+from dew.telemetry.instrumentation import BOUND_MARKS
 from dew.telemetry.records import FitStarted
 from dew.training.evaluation import Evaluation
 
@@ -261,7 +262,7 @@ TRAINER_SHOWN = {"loss": Shown(better="lower"),
                  **{f"{name}{bound}": Shown(better="higher", percent=True, group="throughput",
                                             label=f"{name} {mark}")
                     for name in ("hfu", "hlo_flops_util")
-                    for bound, mark in (("_lower_bound", "≥"), ("_upper_bound", "≤"), ("_estimate", "≈"))},
+                    for bound, mark in BOUND_MARKS.items() if bound},
                  "unsized_kernels": Shown(group="throughput", label="uncounted kernels"),
                  "tokens": Shown(group="throughput"),
                  "tokens_per_s": Shown(better="higher", group="throughput"),
