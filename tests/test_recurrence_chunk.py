@@ -853,6 +853,15 @@ def test_the_templates_documents_adding_a_slot_are_as_exact_as_each_alone_interp
     the_templates_forked_documents_are_as_exact_as_each_alone(hooks, added=True)
 
 
+def test_a_turned_forked_call_adding_a_slot_is_refused():
+    """A turned call's documents adding a second table slot (`Chunk.adds` under `Hooks.turns`) are refused:
+    its turns' gradient composes each document's frames from the one slot it loads (`turned._forked_frames`),
+    so an added slot's turns would take no gradient (row 8284)."""
+    operands, _ = entered_draw(TURNED, 0, entries=True)
+    with pytest.raises(ValueError):
+        chunk_on('xla', TURNED, entering_documents(operands, added=True), chunk_size=CHUNK)
+
+
 UNDELTA_HEADS = 8
 """The value heads of the no-delta gradient check's draws: a skip's gradient a value of each head, two of them
 left a site unresolved at 512 draws, eight at 64 (`seeds_for`, paired, on armada at 40ba1d89c6f)."""
