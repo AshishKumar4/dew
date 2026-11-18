@@ -506,14 +506,19 @@ PHASE_FLAGS = (*DUMP_FLAGS, "--xla_gpu_load_autotune_results",
                "--xla_gpu_require_complete_aot_autotune_results", "--xla_gpu_per_fusion_autotune_cache_dir")
 """XLA_FLAGS of one phase's own (where a run dumps, what a build loads), which compute nothing a program
 does."""
+HOST_FLAGS = ("--xla_force_host_platform_device_count",)
+"""XLA_FLAGS of a process's own host, which size its CPU client and compute nothing a program compiled in it
+does, its own devices compared apart (`BuildTarget`): JAX's compilation cache leaves them out of its key
+too (jax/_src/cache_key.py, `xla_flags_to_exclude_from_cache_key`). A GPU tier part's prepare sees no GPU
+and its run the GPUs it holds, each its host devices (tests/lane_environment.py)."""
 
 
 def computation_flags(flags: str | None = None) -> tuple[str, ...]:
     """The XLA flags, `XLA_FLAGS` by default, that decide what a program computes (Dew's rounding and
-    division, dew/__init__.py, among them): every one but a phase's own (`PHASE_FLAGS`), in their order, as
-    XLA reads a flag given twice by its last value."""
+    division, dew/__init__.py, among them): every one but a phase's own (`PHASE_FLAGS`) and its host's
+    (`HOST_FLAGS`), in their order, as XLA reads a flag given twice by its last value."""
     given = os.environ.get("XLA_FLAGS", "") if flags is None else flags
-    return tuple(setting for setting in given.split() if not setting.startswith(PHASE_FLAGS))
+    return tuple(setting for setting in given.split() if not setting.startswith((*PHASE_FLAGS, *HOST_FLAGS)))
 
 
 @dataclasses.dataclass(frozen=True)
