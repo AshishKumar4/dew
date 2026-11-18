@@ -2094,3 +2094,24 @@ def test_cudnn_attentions_gates_read_the_capability_of_the_gpus_a_program_is_tra
         assert cudnn.check_compute_capability("9.0") == (capability >= (9, 0))
         assert cudnn.is_cuda_compute_capability_equal("10.0") == (capability == (10, 0))
     assert not cudnn.check_compute_capability("8.0")
+
+
+@COMPILES_ON_CPU
+def test_a_step_compiled_ahead_is_admitted_at_the_loading_runs_pool_share_not_the_compilers(monkeypatch):
+    """A prepare whose own process holds a sliver of its GPU (a job packed beside others, its pool's
+    fraction 0.08) admits the run it compiles for at the share that run holds (`AheadTarget.share`): Dew's
+    own by default, the run's named one where it names another. It admitted an 80 GiB GPU's step against
+    6.78 GiB, its own share of its own GPU, and refused a state that fits the run (row 7644)."""
+    from dew._devices import DEW_SHARE, FRACTIONS, device_memory
+    from dew.training.ahead import AheadTarget
+
+    for name in FRACTIONS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(FRACTIONS[1], "0.08")
+    memory = 80 * 2**30
+    for target, share in ((AheadTarget("sm90", 2, capacity_gib=80), DEW_SHARE),
+                          (AheadTarget("sm90", 2, capacity_gib=80, share=0.5), 0.5)):
+        limits = {device_memory(device)["bytes_limit"] for device in target.compile_only()}
+        assert limits == {int(memory * share)}
+    with pytest.raises(ValueError):
+        AheadTarget("sm90", 2, capacity_gib=80, share=1.5)

@@ -21,7 +21,7 @@ from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding
 
 from dew import communicators
-from dew._devices import device_memory, fresh_pool, gpu_free_bytes, xla_flag
+from dew._devices import COMPILE_ONLY_SHARE, device_memory, fresh_pool, gpu_free_bytes, xla_flag
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
@@ -413,7 +413,8 @@ def needed(device, resident: int, beside: int, temporaries: int) -> int:
     pool of GPUs is sized by."""
 
     def headroom(memory: int) -> int:
-        spare = _admitted([device], [fresh_pool(memory, resident)], beside, temporaries)
+        spare = _admitted([device], [fresh_pool(memory, resident, COMPILE_ONLY_SHARE.get(device))], beside,
+                          temporaries)
         assert spare is not None
         return spare
 
