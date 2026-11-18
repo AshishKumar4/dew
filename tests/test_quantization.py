@@ -24,7 +24,7 @@ import pytest
 from lane_environment import without_flags
 from flax import linen as nn
 from flax.core import FrozenDict
-from interop_support import token_draw
+from interop_support import extract_fixture, token_draw
 from model_support import parameter_loss
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, with_gradients
 from token_support import token_rows
@@ -726,12 +726,10 @@ def flux_source(root: Path):
     is widened to 64 features over freshly drawn weights: the source's 24
     make int8 GEMMs cuBLAS 13 refuses on an A100, as do its 16-wide inputs
     and outputs, which `FLUX_BLOCKS` leaves in float."""
-    import tarfile
 
     from dew.interop.pretrained import Pretrained
 
-    with tarfile.open(Path(__file__).parent / "fixtures/flux_source.tar.xz") as archive:
-        archive.extractall(root, filter="data")
+    extract_fixture(Path(__file__).parent / "fixtures/flux_source.tar.xz", root)
     task = Pretrained.load(root / "pipeline", dtype="float32", attention_impl="xla").text_to_image()
     model = task.model.clone(heads=2, head_dim=32, axes_dims_rope=(8, 12, 12))
     example = task.prepare("", key=0, steps=1)
