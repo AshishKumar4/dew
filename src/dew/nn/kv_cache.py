@@ -1588,6 +1588,14 @@ class Append:
         return self.store.read_groups(name)
 
 
+def unpaged(layout: KVCache) -> KVCache:
+    """`layout` unpaged, each row's cache whole in its own slots (`page_size`, `pages` and `groups` dropped),
+    its format kept: a server's 'whole' rows (`dew.inference.serving`), and the cache a strategy that
+    regroups its rows decodes over (`dew.sampling.strategies.Regrouping`), which a paged pool's shared pages
+    cannot hold."""
+    return dataclasses.replace(layout, page_size=None, pages=None, groups=1)
+
+
 def gather_cache_rows(cache, rows):
     """A decode cache reindexed on its batch axis, one gather per leaf.
 
@@ -1601,8 +1609,9 @@ def gather_cache_rows(cache, rows):
     is refused, since gathered rows would write into each other's pages.
     """
     if is_paged(cache):
-        raise ValueError("beam search and speculative decoding regroup cache rows, which a "
-                         "paged cache's shared pool cannot do; decode them with a dense cache")
+        raise ValueError("a strategy regrouped cache rows, which a paged cache's shared pool cannot do; a "
+                         "strategy that regroups states it (dew.sampling.strategies.Regrouping), and "
+                         "generate decodes it over a dense cache")
     return jax.tree_util.tree_map_with_path(
         lambda path, leaf: on_device(lambda held: jnp.take(held, rows, axis=0), leaf,
                                      banked=bool(row_axis(path))), cache)

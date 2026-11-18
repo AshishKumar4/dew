@@ -498,3 +498,20 @@ def pair_law(model):
         pairs = jnp.concatenate([jnp.broadcast_to(prompt, (vocab, 3)), jnp.arange(vocab)[:, None]], axis=1)
         second = jax.nn.softmax(wide.apply(wide_params, pairs)[:, -1] / LAW_TEMPERATURE, axis=-1)
         return prompt, params, np.asarray(first[:, None] * second).reshape(-1)
+
+
+def test_speculation_over_a_paged_model_draws_what_it_draws_over_the_dense_one():
+    """Speculative decoding over a model that declares a paged cache, whose blocks' rollback regroups its
+    rows, decodes over its cache unpaged (`Regrouping`): its tokens and likelihoods are its draw's over the
+    dense model's, bit for bit (row 7934)."""
+    from dew.nn.kv_cache import KVCache
+
+    model = predictor()
+    prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
+    params = jax.jit(model.init)(jax.random.key(0), prompts)
+    found = {name: generate(held, params, prompts, 6, key=jax.random.key(1),
+                            sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+             for name, held in (("dense", model), ("paged", model.with_kv_cache(KVCache(page_size=2))))}
+    for field in ("tokens", "lengths", "raw_log_probs"):
+        np.testing.assert_array_equal(np.asarray(getattr(found["paged"], field)),
+                                      np.asarray(getattr(found["dense"], field)), err_msg=field)

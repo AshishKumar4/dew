@@ -151,7 +151,7 @@ from dew.nn.inputs import (
 )
 from dew.nn.kernels import generation
 from dew.nn.kernels.options import Fetched, compiler_options, program as outer_program
-from dew.nn.kv_cache import GROUPS, POOLED, ROUNDING_KEYS, KVCache, is_paged, leaf_name, row_axis
+from dew.nn.kv_cache import GROUPS, POOLED, ROUNDING_KEYS, KVCache, is_paged, leaf_name, row_axis, unpaged
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
 from dew.nn.projections import pack_projections, packed_layout
@@ -1819,7 +1819,7 @@ def _laid(model: nn.Module, kv_cache: KVCache | PageSize, capacity: int, strateg
         return kv_cache
     own = model.kv_cache if isinstance(model, Layered) else None
     if kv_cache == "whole":
-        return None if own is None else dataclasses.replace(own, page_size=None, pages=None, groups=1)
+        return None if own is None else unpaged(own)
     if kv_cache is None:
         return own
     if kv_cache != "shared":
