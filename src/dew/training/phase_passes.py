@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import itertools
 import math
 from collections.abc import Collection, Hashable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
@@ -324,20 +325,30 @@ def _about_mode(mode: float, count: int, location: float, dispersion: float) -> 
     """A count's integrand over the log rate (`SampledPasses.cumulative`) about its `mode`, scaled by its peak
     and by the normal density's width: the integral over the standardized log rate `z` (`x = mode +
     dispersion z`) of `exp(-exp(mode) (expm1(dispersion z) - dispersion z) - z² / 2)`, the peak's own terms
-    cancelled exactly by the mode's equation, so nothing in it is the difference of large values; over
-    `RATE_SPAN` either side, its peak's width (`1 / sqrt(1 + dispersion² exp(mode))`) a breakpoint of scipy's
-    adaptive quadrature."""
+    cancelled exactly by the mode's equation, so nothing in it is the difference of large values. In units
+    of its peak's width (`1 / sqrt(1 + dispersion² exp(mode))`, `u = z / width`): its log's curvature is at
+    least 1 in `u` above the mode and in `z` below it, so it is 0 beside its peak past `RATE_SPAN` units
+    above and `RATE_SPAN` deviations below; each side in panels doubling from one unit (scipy's adaptive
+    quadrature on each), so no panel is wider than the integrand's own scale where it starts."""
     from scipy import integrate
 
     scale = math.exp(mode)
     width = 1 / math.sqrt(1 + dispersion ** 2 * count + (location - mode))
 
-    def integrand(z: float) -> float:
+    def integrand(u: float) -> float:
+        z = width * u
         t = dispersion * z
         # expm1(t) - t, its series where the difference would cancel.
         lost = t * t / 2 * (1 + t / 3 + t * t / 12) if abs(t) < 1e-4 else math.expm1(min(t, 709.0)) - t
         exponent = scale * lost + z * z / 2
         return 0.0 if exponent > 745 else math.exp(-exponent)
 
-    return sum(integrate.quad(integrand, start, end, epsabs=0, epsrel=1e-13, limit=200)[0]
-               for start, end in ((-RATE_SPAN, -width), (-width, 0.0), (0.0, width), (width, RATE_SPAN)))
+    def panels(reach: float) -> list[float]:
+        edges = [0.0, 1.0]
+        while edges[-1] < reach:
+            edges.append(min(2 * edges[-1], reach))
+        return edges
+
+    above, below = panels(RATE_SPAN), [-edge for edge in panels(RATE_SPAN / width)]
+    return width * sum(integrate.quad(integrand, start, end, epsabs=0, epsrel=1e-13, limit=200)[0]
+                       for edges in (above, below[::-1]) for start, end in itertools.pairwise(edges))

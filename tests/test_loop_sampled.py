@@ -54,20 +54,27 @@ def probabilities(law: SampledPasses) -> np.ndarray:
     else:
         logs = []
         for n in range(law.cap):
+            # A rate past float64's range is a probability of 0 at every count, as the largest rate's is.
             def log_integrand(x, n=n):
-                return (n * x - math.exp(x) - special.gammaln(n + 1)
+                return (n * x - math.exp(min(x, 709.0)) - special.gammaln(n + 1)
                         - ((x - location) / law.dispersion) ** 2 / 2)
 
             def slope(x, n=n):
-                return n - math.exp(x) - (x - location) / law.dispersion ** 2
+                return n - math.exp(min(x, 709.0)) - (x - location) / law.dispersion ** 2
 
             reach = SPAN * law.dispersion
             mode = optimize.brentq(slope, min(location, math.log(max(n, 1))) - reach,
                                    max(location, math.log(max(n, 1))) + reach, xtol=1e-15)
             peak = log_integrand(mode)
+            # Breakpoints a peak's width apart near it, and doubling out to the span below it, so the
+            # quadrature samples a peak far narrower than the span.
+            width = 1 / math.sqrt(math.exp(mode) + law.dispersion ** -2)
+            points = sorted({mode + step * width for step in range(-60, 61)}
+                            | {mode - 2.0 ** power * width for power in range(6, 64)
+                               if 2.0 ** power * width < reach})
             logs.append(peak + math.log(integrate.quad(
                 lambda x, f=log_integrand, peak=peak: math.exp(f(x) - peak), mode - reach, mode + reach,
-                points=[mode], limit=500)[0]))
+                points=points, limit=4000)[0]))
         logs = np.asarray(logs)
     unbounded = np.exp(logs - logs.max())
     return unbounded / unbounded.sum()
@@ -111,6 +118,21 @@ def test_a_sampled_pass_count_of_a_vanishing_dispersion_is_its_means_poisson():
                            minlength=law.cap)
 
     assert_draws_as_declared(counts_of, poisson / poisson.sum(), f"law {law}", seeds=SEEDS)
+
+
+def test_a_broad_laws_draws_are_its_statements():
+    """A law whose counts' integrands over the log rate are far narrower than the rate's spread (mean e^450,
+    dispersion 30, cap 256: count 200's peak 0.0024 of a deviation wide) draws, at each position, the count
+    its statement's cumulative (`probabilities`, scipy's quadrature about each count's mode in the log rate
+    itself) gives at the draw's own uniform (`SampledPasses.count`'s Philox). The two cumulatives agree to
+    ~1e-12, so two fair readings part only where a uniform falls that near a step between counts: ~5e-6
+    likely over the draws. One that missed a peak's tails (row 8274's review) moved a count's mass by 15%."""
+    law = SampledPasses(mean=math.exp(450), dispersion=30.0, cap=256)
+    stated = np.cumsum(probabilities(law))
+    stated[-1] = 1.0
+    for position in range(DRAWS):
+        uniform = np.random.Generator(np.random.Philox(np.random.SeedSequence([0, 7, position]))).random()
+        assert law.count((0, 7), position) == 1 + int(np.searchsorted(stated, uniform, side="right"))
 
 
 def test_a_sampled_pass_count_is_its_key_and_position_alone():
