@@ -24,6 +24,7 @@ nothing (spans, a score hook) guards its maxima and denominators against an empt
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable, Iterator, Mapping
 from typing import Any, NamedTuple
 
@@ -2276,22 +2277,40 @@ KEY_BINADES = 31
 """The binades a call's key count stays below: its positions are int32."""
 
 
-def lazy_margin(spec: Forward, weights) -> float | None:
-    """The margin, in the walk's logits' units (binades where it folds to base 2, `Forward.base2`, else
-    nats), by which a tile's maximum may pass a row's kept one before the walk
-    moves its anchor (`lazy_anchor`), or None where it moves on every larger maximum: the accurate form's
-    (`Forward.natural`), whose held weights assume their anchor at least every logit (`derive`'s select of
-    `exp(x - b)` under `b >= x`), and a compensated walk's. A kept anchor leaves each weight at most
-    `2^margin`, so the margin is the least of the binades above 1 its product's narrowed weights hold
-    (`weights`' largest exponent: fp16's 15) and those the scaled walk's bound leaves for its keys
-    (`BOUND_UNIT` less `KEY_BINADES`: each term of `weighed_reach` a weight times a value below 2^128, held at
-    `2^-BOUND_UNIT`, summed over fewer than `2^KEY_BINADES` keys); an unscaled walk (fp16's values,
-    `headroom`) adds at most its keys times fp16's largest times that weight, far below fp32's largest. A
-    kept anchor's factor is exactly 1, so a mainloop whose sums live apart (tcgen05's tensor memory) skips
-    their rescale where no row's anchor moved."""
-    if spec.natural or spec.compensated:
+def lazy_binades(natural: bool, compensated: bool, weights, bound: float = 1.0) -> int | None:
+    """The binades by which a tile's maximum may pass a row's kept one before the walk moves its anchor
+    (`lazy_anchor`), or None where it moves on every larger maximum: the accurate form's (`natural`), whose
+    held weights assume their anchor at least every logit (`derive`'s select of `exp(x - b)` under
+    `b >= x`), and a compensated walk's. A kept anchor leaves each weight at most `2^binades`, a dropping
+    call's times its largest multiplier `bound`, so the binades are the least of those above 1 its
+    product's narrowed weights hold (`weights`' largest exponent: fp16's 15) and those the scaled walk's
+    bound leaves for its keys (`BOUND_UNIT` less `KEY_BINADES`: each term of `weighed_reach` a weight times
+    a value below 2^128, held at `2^-BOUND_UNIT`, summed over fewer than `2^KEY_BINADES` keys), each less
+    the multiplier's binades (a weight of 4 e^10 at a rate of 0.75 narrowed to fp16's infinity), none below
+    0, the exact anchor. An unscaled walk's sums reach `lazy_amplified` times a weight of 1's
+    (`may_scale`'s `amplified`)."""
+    if natural or compensated:
         return None
-    binades = min(jnp.finfo(weights).maxexp - 1, BOUND_UNIT - 1 - KEY_BINADES)
+    multiplied = math.ceil(math.log2(bound)) if bound > 1 else 0
+    return max(min(jnp.finfo(weights).maxexp - 1, BOUND_UNIT - 1 - KEY_BINADES) - multiplied, 0)
+
+
+def lazy_amplified(natural: bool, weights, bound: float = 1.0) -> float:
+    """The most a lazy walk's weight reaches (`lazy_binades`): `2^binades`, 1 where it anchors exactly. A
+    host's bound on an unscaled walk's sums takes it (`may_scale`'s `amplified`): a kept anchor's tile
+    whose maximum is past it by the margin weighs its values up to it (two tiles at logits 0 and 112, values
+    2^110: the second's sums 2^136 against a bound of 2^117 that took every weight at most 1)."""
+    binades = lazy_binades(natural, False, weights, bound)
+    return 1.0 if binades is None else 2.0 ** binades
+
+
+def lazy_margin(spec: Forward, weights, bound: float = 1.0) -> float | None:
+    """`lazy_binades` in the walk's logits' units (binades where it folds to base 2, `Forward.base2`, else
+    nats). A kept anchor's factor is exactly 1, so a mainloop whose sums live apart (tcgen05's tensor memory)
+    skips their rescale where no row's anchor moved."""
+    binades = lazy_binades(spec.natural, spec.compensated, weights, bound)
+    if binades is None:
+        return None
     return float(binades if spec.base2 else binades * np.log(2.0))
 
 
@@ -2360,7 +2379,7 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
 
     derived = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
                          stepped=None if held_by is None and plain and state.scale is None and drop is None
-                         else own, anchor=lazy_anchor(lazy_margin(spec, keys.values.dtype)))
+                         else own, anchor=lazy_anchor(lazy_margin(spec, keys.values.dtype, bound)))
     found = Partial(**dict(zip(fields, derived, strict=True)))
     return found if not after else found._replace(scale=after[0].scale, low=after[0].low)
 

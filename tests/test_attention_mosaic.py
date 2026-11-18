@@ -903,6 +903,78 @@ def test_the_forward_is_on_par_dropping_interpreted(call, training, dtype):
                    drop=True)
 
 
+def _rising_draw(dtype, rise: float, value: float):
+    """A full call's operands, one batch row and head, 256 queries over 128 keys 64 wide: every query's first
+    coordinate 1, the first 64 keys' first coordinate 0 and the last 64's `rise` (their logits that much
+    above the first tile's, times the call's scale), values `value` and the cotangent 0, in `dtype`."""
+    query = jnp.zeros((1, 256, 1, 64), dtype).at[..., 0].set(1)
+    key = jnp.zeros((1, 128, 1, 64), dtype).at[:, 64:, :, 0].set(rise)
+    return query, key, jnp.full((1, 128, 1, 64), value, dtype), jnp.zeros_like(query)
+
+
+LAZY_BOUND_TILES = {"sm100": attention_mosaic.Tiles(128, 64, 2, 2, family="tcgen05.rows"),
+                    "sm90": attention_mosaic.Tiles(64, 64, 2, 2, family=WGMMA)}
+"""The lazy bound's cell's pins: tcgen05's rows, whose launch decides no scaled walk, and wgmma."""
+
+
+@INTERPRETS
+@pytest.mark.parametrize("generation_name", sorted(LAZY_BOUND_TILES))
+def test_a_lazy_walks_kept_anchor_never_passes_the_bound_its_unscaled_walk_takes_interpreted(generation_name):
+    """A bf16 forward whose second key tile's logits pass the first's by 14 (112 times the call's scale, 20
+    binades: within the lazy walk's margin, `algebra.lazy_binades`, so its anchor stays) over values of 2^110,
+    interpreted on tcgen05's rows (whose launch decides no scaled walk) and on wgmma: on par with the
+    reference (check 1), its output 2^110 finite. Its host's bound takes the lazy weights' reach
+    (`algebra.lazy_amplified`), so the call walks scaled: the bound of weights at most 1 took 2^117 for
+    sums of 2^136, past fp32's largest (the base review of a59590b06, F1)."""
+    spans = template.spans(256, 128, 1)
+
+    def ours(query, key, value, dout):
+        del dout
+        pinned = _pinned(LAZY_BOUND_TILES[generation_name])
+        with _device(True, generation.gpu_target(generation_name)), pinned:
+            return attention_mosaic.forward(query, key, value, spans, natural=False, interpret=True)
+
+    def reference(query, key, value, dout):
+        del dout
+        return template.reference(query, key, value, spans)
+
+    def draw(seed):
+        del seed
+        return _rising_draw(jnp.bfloat16, 112.0, 2.0 ** 110)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"a lazy walk's bound {generation_name}",
+                    seeds=1)
+
+
+@INTERPRETS
+def test_a_lazy_walks_dropped_weights_stay_within_fp16_interpreted():
+    """An fp16 forward under probability dropout at 0.75 (each kept weight times 4) whose second key tile's
+    logits pass the first's by 10, interpreted on wgmma: its lazy margin is the binades fp16's weights hold
+    after the multiplier (`algebra.lazy_binades`: 13), so the anchor moves and a kept weight is at most 4,
+    on par with the reference (check 1). A margin before the multiplier kept the anchor, and a kept weight
+    of 4 e^10, 88106, narrowed to fp16's infinity (the base review of a59590b06, F2)."""
+    spans = template.spans(256, 128, 1)
+    seed, rows = jax.random.bits(jax.random.PRNGKey(7), (2,), jnp.uint32), jnp.arange(1, dtype=jnp.int32)
+    hooks = template.Hooks(drop=template.Dropout(seed, rows, rows, 0.75))
+    tiles = attention_mosaic.Tiles(64, 64, 2, 2, family=WGMMA)
+
+    def ours(query, key, value, dout):
+        del dout
+        with _device(True, generation.gpu_target("sm90")), _pinned(tiles):
+            return attention_mosaic.forward(query, key, value, spans, hooks, natural=True, interpret=True)
+
+    def reference(query, key, value, dout):
+        del dout
+        return template.reference(query, key, value, spans, hooks)
+
+    def draw(seed):
+        del seed
+        # Logits natural: the second tile's 10 above the first's at the call's scale of 1/8.
+        return _rising_draw(jnp.float16, 80.0, 1.0)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "a lazy walk's dropped weights", seeds=1)
+
+
 @INTERPRETS
 @on_each_family_for(("form", "dtype"),
                     [*((form, jnp.bfloat16) for form in (*HOOKED_FORMS, "fused")), ("derived", jnp.float16)],
