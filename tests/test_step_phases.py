@@ -410,17 +410,14 @@ def test_a_position_main_saved_under_plan_14_resumes_as_it_was_read(saved):
     own streams, in the first or past it (its finished phase named by its plan's identity, which held 14's
     version, `saved_identity`), or of a bounded mixture read while its layout or its held shuffle holds
     counts, resumes, and reads what a read of the same chain stopped where it stopped reads after it."""
+    from resumed_support import resumed_as_read
     from saved_positions_support import SAVED
 
     loader, steps = SAVED[saved]
-    streams = [loader().train(DataPartition()) for _ in range(2)]
-    list(itertools.islice(streams[0], steps))
-    streams[1].set_state((SAVED_BY_MAIN / f"{saved}.position").read_bytes())
     # The rest of each read, the stopped one's and the restored one's, batch by batch, eight steps on.
-    after = [[_ids(batch) for batch in itertools.islice(stream, 8)] for stream in streams]
-    for stream in streams:
-        stream.close()
-    assert after[1] == after[0] and after[0]
+    stopped, restored = resumed_as_read(loader, steps, (SAVED_BY_MAIN / f"{saved}.position").read_bytes(),
+                                        _ids, 8)
+    assert restored == stopped and stopped
 
 
 def test_a_profile_window_in_a_phase_that_reads_an_earlier_phases_batches_names_that_program(tmp_path):

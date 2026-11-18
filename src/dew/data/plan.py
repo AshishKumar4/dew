@@ -771,6 +771,13 @@ def _digests(value: dict[str, JSON] | list[JSON] | str | int | float | bool | No
     return fingerprint(value)[:12]
 
 
+def saved_version(plan: Mapping[str, object] | None) -> int | None:
+    """The plan version a saved position's plan records (`Plan.record`), None where it holds no plan or no
+    version."""
+    version = None if plan is None else plan.get("version")
+    return version if isinstance(version, int) else None
+
+
 def same_order(saved: str, current: str) -> bool:
     """Whether two orders, as a saved position and a stream state them in JSON, are one order:
     compared without their sources' descriptions, which name where a host mounted them, as a
@@ -1076,6 +1083,13 @@ class Plan:
             return earlier.identity()
         order = unplaced(self.spelled_order())
         return f"{json.dumps(order, sort_keys=True)} under plan {json.dumps(self.parts(), sort_keys=True)}"
+
+    def order_under(self, version: int | None) -> str:
+        """The order as a position names it (`spelled_order`, as JSON text), its stages described as the
+        plan `version` described them (`described_under`): what a position saved under it is compared
+        with; this Dew's where `version` is None."""
+        with described_under(DECIDED if version is None else version):
+            return json.dumps(self.spelled_order(), sort_keys=True)
 
     def spelled_order(self) -> JSON:
         """The order as a position names it and a plan compares it (`described`): its stages, each the stage
