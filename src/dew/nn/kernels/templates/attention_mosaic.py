@@ -1510,11 +1510,23 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
         walk = _query_walk(config.block_k if config.block_k in fewer_rows(family) else None)
-        regime = (self.register_budget(config), self.resident(ba, config, target))
+        regime = self._regime(ba, config, target)
         smaller = (dataclasses.replace(config, block_q=block)
                    for block in walk(family, query.dtype, query.shape[1]) if block < config.block_q)
-        return tuple(rung for rung in smaller if self.takes(ba, rung, target)
-                     and (self.register_budget(rung), self.resident(ba, rung, target)) == regime)
+        return tuple(rung for rung in smaller
+                     if self.takes(ba, rung, target) and self._regime(ba, rung, target) == regime)
+
+    def _regime(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget
+                ) -> tuple:
+        """The assembler's conditions at `config`: each launch's register cap and whether its program moves
+        registers, as its kernels' models state them (`resources.register_model` at the registers its
+        emission states, `_launch_registers`), and the launch's residency."""
+        dtype = ba.arguments["query"].dtype
+        dq, dkv = self._launch_registers(ba, config)
+        launches = ((config.dkv, dkv),) if config.fused else ((config, dq), (config.dkv, dkv))
+        models = [resources.register_model(bundle_of(tiles, dtype), tiles.consumers, registers)
+                  for tiles, registers in launches]
+        return (*((model.cap(1), model.moves) for model in models), self.resident(ba, config, target))
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
         """Its tiles from the facts (`_derived`): each dK/dV consumer a unit of keys, the query tile both
