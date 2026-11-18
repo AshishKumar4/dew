@@ -108,6 +108,7 @@ class ForkedTable:
     entries: jax.Array | None
     rows: jax.Array
     held: int = dataclasses.field(metadata={'static': True})
+    adds: jax.Array | None = None
 
 
 def tabled(forked: ForkedTable, width: int, columns: int) -> Table:
@@ -120,7 +121,7 @@ def tabled(forked: ForkedTable, width: int, columns: int) -> Table:
     entries = None if forked.entries is None else laid(forked.entries)
     return Table(laid(forked.given), forked.loads.reshape(-1).astype(jnp.int32),
                  forked.stores.reshape(-1).astype(jnp.int32), entries, forked.rows, forked.given.shape[1],
-                 forked.held)
+                 forked.held, None if forked.adds is None else forked.adds.reshape(-1).astype(jnp.int32))
 
 def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None,
             max_segments: int | None = None,

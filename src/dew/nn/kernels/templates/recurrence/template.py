@@ -358,7 +358,7 @@ def forked_table(given, forked: chunked_launch.Forked, batch: int, length: int, 
     entries = chunks.entries(forked)
     table = chunk_forward.ForkedTable(given.astype(jnp.float32), chunks.loads, chunks.stores,
                                       None if entries is None else entries.astype(jnp.float32), chunks.rows,
-                                      forked.held)
+                                      forked.held, chunks.added(forked))
     return table, forked.tokens(length)[0] >= 0, forked.firsts, forked.loads.shape[1]
 
 
