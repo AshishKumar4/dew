@@ -13,6 +13,7 @@ import subprocess
 import sys
 from uuid import uuid4
 
+import jax
 import numpy as np
 import pytest
 from reader_support import resumed_changes, saved_after_one
@@ -1027,3 +1028,34 @@ def test_a_step_whose_fields_lead_back_to_it_compiles_and_resumes_exactly(hidden
 
     state = saved_after_one(reader)
     assert resumed_changes(reader(), state) == ()
+
+
+def _bumped(ids):
+    return ids + 1
+
+
+BUMPED = jax.jit(_bumped)
+"""A jitted function of this module's own, which a step's code reads."""
+
+
+def shifted_by(key):
+    """A step made inside a function: each id bumped (`BUMPED`) and shifted by a draw of its typed `key`."""
+    def shift(row):
+        return {**row, "id": np.int32(BUMPED(row["id"]) + int(jax.random.randint(key, (), 0, 3)))}
+    return shift
+
+
+def test_a_step_made_inside_a_function_resumes_exactly_by_its_code_closure_and_reads():
+    """A step made inside a function, which reads a jitted function of the user's and closes over a typed
+    PRNG key, is stated by its code and what it reads (`dew._stated.stated`): its run resumes exactly where
+    its key is the same, and is refused where its key changed. Such a step was inexact (its name's
+    `<locals>`), a jitted function of the user's had no statement, and a typed key crashed the statement
+    that fetched its bits (row 7814; train 1019's review, F1 and F3)."""
+    def reader(key):
+        pipeline = Pipeline(ROWS).map(shifted_by(key)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(lambda: reader(jax.random.key(0)))
+    assert resumed_changes(reader(jax.random.key(0)), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(jax.random.key(1)), state)
