@@ -135,7 +135,9 @@ def test_check_refuses_a_large_recording_in_git_and_a_pin_not_uploaded_or_not_wh
     assert len(store.check(root)) == 1
 
 
-def test_fetch_keeps_a_whole_file_and_takes_a_download_only_as_its_pin(store, tmp_path, monkeypatch):
+def _on_the_hub(store, tmp_path, monkeypatch) -> tuple[Path, Path, Path, list]:
+    """An uploaded recording's checkout, its stored file, the Hub's copy `hf_hub_download` answers with, and each
+    download it was asked for (repo, path, where)."""
     import huggingface_hub
 
     root = _checkout(tmp_path)
@@ -146,6 +148,11 @@ def test_fetch_keeps_a_whole_file_and_takes_a_download_only_as_its_pin(store, tm
     asked = []
     monkeypatch.setattr(huggingface_hub, "hf_hub_download",
                         lambda repo, path, **where: asked.append((repo, path, where)) or str(hub))
+    return root, stored, hub, asked
+
+
+def test_fetch_keeps_a_whole_file_and_takes_a_download_only_as_its_pin(store, tmp_path, monkeypatch):
+    root, stored, hub, asked = _on_the_hub(store, tmp_path, monkeypatch)
     store.fetch(root)
     assert asked == []
     stored.unlink()
@@ -161,16 +168,7 @@ def test_fetch_keeps_a_whole_file_and_takes_a_download_only_as_its_pin(store, tm
 
 def test_an_absent_fetch_downloads_only_the_pins_the_store_lacks_and_reads_no_stored_file(store, tmp_path,
                                                                                          monkeypatch):
-    import huggingface_hub
-
-    root = _checkout(tmp_path)
-    stored = _saved(store, root)
-    _uploaded(store, root)
-    hub = tmp_path / "hub.npz"
-    hub.write_bytes(stored.read_bytes())
-    asked = []
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
-                        lambda repo, path, **where: asked.append(path) or str(hub))
+    root, stored, hub, asked = _on_the_hub(store, tmp_path, monkeypatch)
     assert store.absent(root) == {}
     # A stored file is kept unread: one damaged in place is no download (every read checks it, `local`).
     stored.write_bytes(_flipped(stored.read_bytes()))
