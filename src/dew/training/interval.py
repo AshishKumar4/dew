@@ -35,7 +35,6 @@ from dew.telemetry.instrumentation import (
     StepFlops,
     compilation_cache_counts,
     model_flops_utilization,
-    step_miss_counts,
 )
 from dew.training.diloco import rated
 from dew.training.display import EXAMPLES_CONSUMED_SCALAR, TrainingDisplay
@@ -250,6 +249,10 @@ class Interval:
     waited: float = 0.0
     compiling: float = 0.0
     compiles: int = 0
+    step_misses: int | None = None
+    """The programs this fit's host steps compiled past their startup passes (`HostRun`), every HostRun the
+    fit steps on counted (a phase planned afresh among them); None for a fit whose steps are no host's,
+    which logs none."""
     inspected: tuple[jax.Array, Summaries] | None = None
     """The latest sampled commit's count and summaries since the last log (`Committed.inspected`)."""
     consumed: int = 0
@@ -641,7 +644,8 @@ def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int
             scalars['train/grad_norm'] = float(norms / commits)
     scalars['train/compiles'] = float(counts.compiles)
     scalars.update(compilation_cache_counts())
-    scalars.update(step_miss_counts())
+    if counts.step_misses is not None:
+        scalars['train/step_misses'] = float(counts.step_misses)
     peak = peak_memory_gib()
     if peak is not None:
         scalars['train/peak_memory_gib'] = peak
