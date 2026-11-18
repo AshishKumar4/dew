@@ -1225,6 +1225,11 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         # (`Family.walk_own`), `turns` past the rings' first.
         state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
                                          between=lambda: (turn(), turn()), counted=turns)
+        # The first consumer's closing turn, which every other's turn ahead matches, at its walk's end: before
+        # any barrier every consumer passes after its walk (a decided walk's verdicts, `mosaic.Decided`; the
+        # stages over the rings, `walked`), which a partner's last turn would wait on otherwise (the ring
+        # protocol's rare interleavings deadlocked so).
+        pl.when(consumer == 0)(turn)
         return state, trained, merged
 
     def store(spec: algebra.Forward, state: algebra.Partial, trained, merged: bool) -> None:
@@ -1241,7 +1246,6 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                 family.stored((_kept_rows(family, keep, state.acc, others),), (others,), smem=stage)
 
             out_stage(split_sums)
-        pl.when(consumer == 0)(turn)
         _status_stored(family, spec, state, stored().status, row_smem, first)
         _stored_walk(program, spec, state, trained, hooked, (row, head, first), hooks=hooks,
                      training=training, out=(out_view, out_stage), rows=(stored, row_smem), keep=keep)
@@ -1260,10 +1264,6 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
     @pl.when(taken)
     def _():
-        # The first consumer's closing turn of the walk it leaves unstored, which every other's turn ahead
-        # of the second matches, as at the first's start (ring_protocol's rare interleavings deadlocked
-        # without it).
-        pl.when(consumer == 0)(turn)
         scaled = dataclasses.replace(spec, headroom=True)
         store(scaled, *walk(scaled, streamed[1] - streamed[0]))
 
