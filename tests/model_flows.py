@@ -32,7 +32,7 @@ import numpy as np
 from gpu_flow import Cell, run_cells
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact
-from tier_wire import PREPARE, TRUTHS, UNIT, needs_file
+from tier_wire import TRUTHS, UNIT, needs_file, preparing
 from truths_ahead import compiled_memory, compiled_truths
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -74,11 +74,6 @@ def reference_kernels() -> dict[str, str]:
                              "the reference arm runs one")
         found[str(choice)] = names.pop()
     return found
-
-
-def preparing() -> bool:
-    """Whether this process prepares the tier's flows (`PREPARE`)."""
-    return os.environ.get(PREPARE) == "1"
 
 
 @dataclasses.dataclass(frozen=True)

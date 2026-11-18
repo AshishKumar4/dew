@@ -10,7 +10,6 @@ lowering a generation's Mosaic GPU kernels runs on a CPU or on a GPU that copies
 """
 
 import importlib.util
-import os
 
 import jax
 import pytest
@@ -42,16 +41,14 @@ def _here() -> str:
     GPU tier part's prepare (`model_flows.node_target`), whose default device, a compile-only GPU, states no
     generation of its own, so a cell pinned to the node's generation prepares there as its run runs it
     (train 1013's review F4); else its device's."""
-    if _preparing():
+    if tier_wire.preparing():
         import model_flows
 
         return model_flows.node_target().generation
     return generation.device_generation()
 
 
-def _preparing() -> bool:
-    """Whether this process is a GPU tier part's prepare (`tier_wire.PREPARE`)."""
-    return os.environ.get(tier_wire.PREPARE) == "1"
+
 
 
 def runnable(name: str) -> bool:
@@ -68,7 +65,7 @@ def runnable(name: str) -> bool:
         return name == here
     return (generation.capability(name) <= generation.capability(here)
             and generation.shared_budget(generation.gpu_target(name))
-            <= generation.shared_budget(generation.gpu_target(here if _preparing() else None)))
+            <= generation.shared_budget(generation.gpu_target(here if tier_wire.preparing() else None)))
 
 
 def runs(name: str):

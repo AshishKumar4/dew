@@ -572,7 +572,8 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     # Each arm named as each process first finds it, before any call of it here (`_arm_role`); one no
     # statement holds runs unprepared in its run.
     named_arms = {role: (named_role, fn, reference) for role, (fn, reference) in arms.items()
-                  if fn is not None and (named_role := _arm_role(role, fn, label)) is not None}
+                  if fn is not None and _holds_program(fn)
+                  and (named_role := _arm_role(role, fn, label)) is not None}
     if store.target is None:
         # An arm computing in NumPy refused as a run refuses it, by a call on a draw; for a GPU's store the
         # prepare computes nothing on its host (bible §8), and its trace refuses an arm that cannot trace.
@@ -681,6 +682,14 @@ def _local_functions_known(value, at: str, known: dict[int, Any], walking: tuple
         return
     for part in parts:
         _local_functions_known(part, at, known, walking)
+
+
+def _holds_program(fn) -> bool:
+    """Whether arm `fn`, within a run-to-run declaration and a window loop, is one the store holds programs
+    of (`_compile_arms`): none an arm the gate runs as given or one running Dew's own programs."""
+    while isinstance(fn, (_RunToRun, _Windowed)):
+        fn = fn.fn
+    return not (_given(fn) or getattr(fn, "dew_programs", False))
 
 
 def _ahead_arm(given, compiled, call: Callable, role: str):
@@ -1543,7 +1552,9 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
         # arm computing in NumPy.
         def from_store(given_fn, arm, role: str):
             # Named as its prepare named it, before any call of it (`_compile_arms`); one no statement holds
-            # runs unprepared, named.
+            # runs unprepared, named; one that holds no program (run as given, Dew's own) as it is.
+            if not _holds_program(given_fn):
+                return arm
             named_role = _arm_role(role, given_fn, label)
             if named_role is None:
                 ahead[0].unprepared(f"{label}: its {role} arm has no statement of what it computes")
