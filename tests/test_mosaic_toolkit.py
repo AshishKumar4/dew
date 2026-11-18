@@ -45,7 +45,8 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
         def _(smem, full, consumed, out_smem):
             ring = rings.Ring(smem, full, consumed)
 
-            def producer():
+            def producer(index):
+                del index  # one producer warpgroup
                 @plgpu.nd_loop((TILES,), collective_axes="sm")
                 def _(loop: plgpu.NDLoopInfo):
                     tile = loop.index[0]
@@ -460,6 +461,20 @@ def test_a_handoffs_barriers_count_the_arrivals_of_its_roles():
     with pytest.raises(ValueError):
         handoffs.Schedule((handoffs.Role("consumer"), handoffs.Role("producer", weight=0),
                            *mosaic_sm100.ISSUING))
+
+
+def test_warp_roles_take_their_warps_in_turn_within_one_warpgroup():
+    """A schedule's warp roles each take `count` warps of its last warpgroup in turn (`Schedule.places`):
+    tcgen05's load warps every warp its product warp leaves, then the product warp; warp roles of more
+    warps than a warpgroup holds are refused."""
+    from dew.nn.kernels.templates import mosaic_sm100
+
+    schedule = handoffs.Schedule((handoffs.Role("epilogue"), *mosaic_sm100.ISSUING))
+    assert schedule.places() == {"load": 0, "mma": handoffs.WARPS - 1}
+    assert schedule.role("load").count + schedule.role("mma").count == handoffs.WARPS
+    with pytest.raises(ValueError):
+        every_warp = handoffs.Role("load", handoffs.WARPS, warp=True, weight=0)
+        handoffs.Schedule((handoffs.Role("epilogue"), every_warp, mosaic_sm100.PRODUCTS)).places()
 
 
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
@@ -935,12 +950,15 @@ def _relayed_products(q, k, v, *, interpret, weighed=lambda scores, side: scores
                 plgpu.copy_smem_to_gmem(o_smem, o_gmem)
                 plgpu.wait_smem_to_gmem(0)
 
-            def load():
+            def load(index):
+                if index:  # the first load warp's copies alone: one arrival each at `loaded`
+                    return
                 for at, (gmem, smem) in enumerate(zip((q_gmem, k_gmem, v_gmem, *side_gmem),
                                                       (q_smem, k_smem, v_smem, *side_smem), strict=True)):
                     plgpu.copy_gmem_to_smem(gmem, smem, loaded.at[at])
 
-            def products():
+            def products(index):
+                del index  # one product warp
                 for at in range(3):
                     plgpu.barrier_wait(loaded.at[at], phase=0)
                 family.products(s, q_smem, k_smem)

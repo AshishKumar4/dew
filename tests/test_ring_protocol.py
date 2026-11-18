@@ -1,8 +1,9 @@
 """The Mosaic GPU toolkit's ring protocol model-checked (`ring_protocol`): the sm90 ring family's persistent
 walk (`mosaic.RingFamily.persist`: its producer's loads at a counter running across tiles, its drains, its
 consumers' walks with their slots acquired and released, a step's products in flight or not, a rotation
-unrolled or a step a trip), traced as the toolkit builds it and explored over every interleaving, within the
-bounds below: no deadlock, no aliased parity, no early arrival, no read before its write lands, no overwrite
+unrolled or a step a trip) and the tcgen05 family's over a gathered ring (its load warps' gathers, its product
+warp's commits), traced as the toolkit builds it and explored over every interleaving, within the bounds
+below: no deadlock, no aliased parity, no early arrival, no read before its write lands, no overwrite
 before its read. And the checker catches each class it names: a flipped parity, a missing arrival, an early
 release, each a counterexample trace."""
 
@@ -15,7 +16,8 @@ import pytest
 import ring_protocol
 from ring_protocol import Event, Violation, explore, programs
 
-from dew.nn.kernels.templates import mosaic_sm90, rings
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import mosaic_sm90, mosaic_sm100, rings
 
 BLOCK = (64, 64)
 
@@ -47,6 +49,11 @@ SEGMENT_CASES = [
 """One walk's six steps in one segment or adjacent segments, including empty and short segments."""
 
 
+def _at(tile, values):
+    """A tile's value of `values`, scalars alone (a kernel closes over no array)."""
+    return sum(jnp.where(tile == index, jnp.int32(value), jnp.int32(0)) for index, value in enumerate(values))
+
+
 @functools.cache
 def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: bool,
            streams: tuple = ("a",), pingpong: bool = False, empty_active: bool = False, joined: bool = False,
@@ -61,18 +68,13 @@ def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: 
     starts = [sum(tiles[:index]) for index in range(len(tiles))]
     names = streams  # the streams' names, not their allocations' keys (a joined pair's one)
 
-    def at(tile, values):
-        # A tile's value of `values`, scalars alone (a kernel closes over no array).
-        return sum(jnp.where(tile == index, jnp.int32(value), jnp.int32(0))
-                   for index, value in enumerate(values))
-
     def body(x_gmem, out_gmem):
         def scope(*, streams):
             def schedule(index):
                 tile = index[0]
-                steps = at(tile, tiles)
+                steps = _at(tile, tiles)
                 source = rings.Among(tile % 2, (x_gmem, x_gmem)) if among else x_gmem
-                views = {name: (source, lambda step: (at(tile, starts) + step, 0)) for name in names}
+                views = {name: (source, lambda step: (_at(tile, starts) + step, 0)) for name in names}
                 return (steps > 0) | empty_active, steps, views, tile
 
             def issue(wg, tile, walk, *, active):
@@ -360,3 +362,172 @@ def test_the_programs_are_the_toolkits_events():
         assert sum(event.kind == "arrive" for event in consumer) == total
     assert all(isinstance(event, Event) for program in threads for event in program)
     assert sorted(set(arrivals.values())) == [1, 2]
+
+
+GATHERED = (32, 64)
+"""A gathered step's block: four 8-row tiles (`swizzling.TILE_ROWS`), one more than the issuing warpgroup's
+three load warps, so the first issues two (`gathered.Gathers.tiles`); its rows the product's contraction (a
+kernel gradient's gathered tokens)."""
+
+PLAIN = (128, 32)
+"""The plain stream's step: the product's left operand, a tcgen05 accumulator's 128 rows over the gathered
+block's rows."""
+
+ACCUMULATOR = (128, 64)
+"""A tile's accumulator in tensor memory, the plain block times the gathered one, which the walk's turns
+hold."""
+
+
+@functools.cache
+def gathered_walk(stages: int, tiles: tuple):
+    """The tcgen05 family's persistent walk (`mosaic_sm100.RINGS.persist`) over a gathered stream
+    (`gathered.Committed`: each step's rows where a table says, its tiles spread over the issuing
+    warpgroup's load warps) and a plain one the first load warp copies whole, each step a tcgen05 product of
+    the plain slot times the gathered one, the products' commit releasing them: each program, the epilogue
+    warpgroup's and each of the issuing warpgroup's warps' (`ring_protocol.programs`), and the barriers'
+    arrivals."""
+    family = mosaic_sm100.RINGS
+    starts = [sum(tiles[:index]) for index in range(len(tiles))]
+    height, width = GATHERED
+
+    def body(x_gmem, table_gmem, w_gmem, out_gmem):
+        def scope(*, streams):
+            def schedule(index):
+                tile = index[0]
+                steps = _at(tile, tiles)
+                views = {"x": (x_gmem, lambda step: rings.Rows(table_gmem, tile * height, (step,), 1)),
+                         "w": (w_gmem, lambda step: (_at(tile, starts) + step, 0))}
+                return steps > 0, steps, views, tile
+
+            def issue(index, tile, walk, *, active):
+                def step(at, slots, carry, accumulators):
+                    (accumulator,) = accumulators
+                    return carry, (family.products(accumulator, slots["w"], slots["x"]),)
+
+                return walk(step, None, (ACCUMULATOR,))
+
+            def finish(*_, **__):
+                pass
+
+            family.persist(streams, (len(tiles),), schedule, issue, finish, consumers=1, axis="programs",
+                           outputs=(), interpret=False, accumulators=(ACCUMULATOR,))
+
+        blocks = {"x": (GATHERED, jnp.bfloat16), "w": (PLAIN, jnp.bfloat16)}
+        family.scoped(scope, streams=family.streams(blocks, stages, 1, gathered=("x",)))
+
+    operands = (jnp.zeros((len(tiles) * height, width * max(tiles)), jnp.bfloat16),
+                jnp.zeros((len(tiles) * height,), jnp.int32),
+                jnp.zeros((max(sum(tiles), 1) * PLAIN[0], PLAIN[1]), jnp.bfloat16))
+    with generation.assumed("sm100"):
+        kernel = family.kernel(body, out_type=jax.ShapeDtypeStruct((8, 8), jnp.float32), grid=(1,),
+                               grid_names=("programs",), consumers=1, interpret=False, name="gathered_model")
+        return programs(kernel, *operands, threads=2)
+
+
+GATHERED_CASES = [(1, (2,)), (2, (3,)), (2, (1, 0, 2))]
+"""A gathered walk's slots and each persistent tile's steps (an empty tile among them)."""
+
+
+@pytest.mark.parametrize(("stages", "tiles"), GATHERED_CASES, ids=[
+    f"stages{stages}-tiles{'-'.join(map(str, tiles))}" for stages, tiles in GATHERED_CASES])
+def test_a_gathered_walk_over_the_load_warps_holds_every_property_in_every_interleaving(stages, tiles):
+    """The tcgen05 family's walk over a gathered ring as the toolkit builds it, each step's gathers spread
+    over the issuing warpgroup's load warps, the first alone arriving at the slot's load barrier expecting
+    every tile's copy (`gathered.Gathers`), a plain ring beside it, the product warp's products reading both
+    slots until its commit releases them: every interleaving explored, the other warps' copies landing
+    before that arrival among them (the barrier's transaction count below zero, the phase complete only once
+    the arrival is made and the count is back at zero), each property held: no early or missing arrival, no
+    copy into a slot a product still reads."""
+    threads, arrivals = gathered_walk(stages, tiles)
+    assert explore(threads, arrivals) > 0
+
+
+def test_the_gathered_programs_are_the_load_warps_own_gathers():
+    """The traced programs are the gathered ring's own, a program a warp of the issuing warpgroup: each load
+    warp copying its share of each step's four tiles (two, one and one: tile t warp t mod three's), the
+    first alone arriving at the slot's load barrier expecting all four; the product warp's tcgen05 product
+    reading each step's slot of each ring once its fill completes."""
+    steps = 3
+    threads, _ = gathered_walk(2, (steps,))
+    assert len(threads) == 5  # the epilogue warpgroup, the issuing warpgroup's four warps
+    loaders = [program for program in threads if any(event.kind == "copy" for event in program)]
+    copies = [sum(event.kind == "copy" for event in program) for program in loaders]
+    assert copies == [2 * steps, steps, steps]
+    assert [[event.argument for event in program if event.kind == "expect"]
+            for program in loaders] == [[4] * steps, [], []]
+    # Each step's product reads the plain ring's slot (the first load warp's TMA load's) and the gathered one.
+    [plain] = {event.at[0] for event in loaders[0] if event.kind == "load"}
+    [gathered] = {event.at[0] for program in loaders for event in program if event.kind == "copy"}
+    [products] = [program for program in threads if any(event.kind == "product" for event in program)]
+    assert [event.argument for event in products if event.kind == "product"] == [
+        ((plain, step % 2), (gathered, step % 2)) for step in range(steps)]
+
+
+def _first_release(threads) -> tuple[int, int, int]:
+    """The product warp of a gathered walk's programs (`gathered_walk`), and the places in its program of its
+    first product and of the first commit after it, which releases the product's slots."""
+    [at] = [index for index, program in enumerate(threads)
+            if any(event.kind == "product" for event in program)]
+    program = threads[at]
+    product = next(position for position, event in enumerate(program) if event.kind == "product")
+    release = next(position for position, event in enumerate(program)
+                   if position > product and event.kind == "committed")
+    return at, product, release
+
+
+def test_a_tcgen05_release_committed_before_its_product_is_caught():
+    """The gathered walk's programs with the product warp's first commit releasing a slot moved before the
+    product that reads it (a release before its product, `CommittedRing.release` ahead of `products`): the
+    load warps refill the slot while the product may still read it, which the explorer finds."""
+    threads, arrivals = gathered_walk(1, (2,))
+    at, product, release = _first_release(threads)
+    program, mutated = threads[at], [*threads]
+    mutated[at] = [*program[:product], *program[product + 1:release + 1], program[product],
+                   *program[release + 1:]]
+    with pytest.raises(Violation):
+        explore(mutated, arrivals)
+
+
+def test_a_slot_written_after_its_products_commit_issues_but_before_it_completes_is_caught():
+    """The gathered walk's programs with the product warp writing its first product's left slot right after
+    the commit that releases it: a commit completes asynchronously (`tcgen05.commit`), so its issue orders
+    nothing of its thread's after it, and the write may land while the product still reads the slot, which
+    the explorer finds; a thread orders itself after the product only by a wait observing the commit's
+    arrival."""
+    threads, arrivals = gathered_walk(1, (2,))
+    at, product, release = _first_release(threads)
+    program, mutated = threads[at], [*threads]
+    mutated[at] = [*program[:release + 1], Event("write", program[product].argument[0]),
+                   *program[release + 1:]]
+    with pytest.raises(Violation):
+        explore(mutated, arrivals)
+
+
+def test_a_write_between_two_commits_is_unordered_with_a_read_after_the_first_commits_wait():
+    """A product warp's product, a commit to `A`, a write of `y`, a commit to `B` and its wait on `B`, beside
+    a thread that waits on `A` and reads `y`: the write follows `A`'s issue, not the product's completion,
+    so the read is unordered with it whichever commit completes first. Where `B` completed first, its whole
+    clock stood for the product's completion, and `A`'s then ordered the write before the reader's wait
+    (row 8474)."""
+    products = [Event("product", (), (("x", None),)), Event("committed", ("A", None)),
+                Event("write", ("y", None)), Event("committed", ("B", None)), Event("wait", ("B", None), 0)]
+    reader = [Event("wait", ("A", None), 0), Event("read", ("y", None))]
+    with pytest.raises(Violation):
+        explore([products, reader], {"A": 1, "B": 1})
+
+
+def test_a_gathered_load_warp_skipping_its_slots_release_wait_is_caught():
+    """The gathered walk's programs with the second load warp's waits for its slots' release left out (the
+    waits `Committed.load` makes first, `rings.Ring.free`), the first warp's arrival still in order: its copy
+    of a step lands in a slot whose last step's products may still read it, which the explorer finds."""
+    threads, arrivals = gathered_walk(1, (2,))
+    loaders = [index for index, program in enumerate(threads)
+               if any(event.kind == "copy" for event in program)]
+    program = threads[loaders[1]]
+    last = max(position for position, event in enumerate(program) if event.kind == "copy")
+    mutated = [*threads]
+    mutated[loaders[1]] = [event for position, event in enumerate(program)
+                           if event.kind != "wait" or position > last]
+    assert len(mutated[loaders[1]]) < len(program)
+    with pytest.raises(Violation):
+        explore(mutated, arrivals)

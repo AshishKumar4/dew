@@ -60,6 +60,25 @@ def test_accurate_exp_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_an_aligned_sum_holds_every_order(edge):
+    """`precision.aligned_sum` of three-factor terms summed along an axis (a forked call's entry write, its
+    terms aligned to the largest before the sum, its tangent the terms' own): every order finite wherever
+    float64 is a normal float32 and the plain sum of products is."""
+    primals = normal_draw(7951, (2, 1, 1), (2, 6, 1), (2, 1, 5), scale=EDGES[edge])
+    directions = normal_draw(7952, (2, 1, 1), (2, 6, 1), (2, 1, 5), scale=EDGES[edge])
+    (cotangent,) = normal_draw(7953, (1, 6, 5))
+
+    def aligned(weight, value, key):
+        return precision.aligned_sum([(weight, value, key)], axis=0)
+
+    def plain(weight, value, key):
+        return jnp.sum(weight * value * key, axis=0, keepdims=True)
+
+    assert_contract(aligned, primals, directions, cotangent, f"an aligned sum {edge}", truth_fn=plain,
+                    plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_softplus_holds_every_order(edge):
     """`precision.softplus` (its log1p by its own series, its derivative the logistic, row 7062): every
     order finite wherever float64 is a normal float32 and the plain formula, log(1 + exp(x)) as JAX writes

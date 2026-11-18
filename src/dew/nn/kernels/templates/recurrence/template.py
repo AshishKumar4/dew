@@ -81,7 +81,8 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: mosaic.
             max_segments: int | None = None, delta: bool = True, backward: bool = False,
             training_forward: bool = False,
             target: generation.GpuTarget | None = None,
-            rounded: bool = False, values_gated: bool = False, wide: bool = False, ranged: bool = False,
+            rounded: bool = False, values_gated: bool = False,
+            unit_keys: bool = False, wide: bool = False, ranged: bool = False,
             skip=None, forked: chunk_forward.ForkedTable | None = None) -> tuple[mainloop.Launch, ...]:
     """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `chunk_forward.forward`'s)
     runs at `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in
@@ -101,14 +102,15 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: mosaic.
         try:
             out, final, (inverse, kept) = chunk_forward.kept_forward(
                 q, k, v, g, beta, h0, tiles=tiles, starts=starts, max_segments=max_segments, delta=delta,
-                family=family, rounded=rounded, values_gated=values_gated, wide=wide, ranged=ranged,
+                family=family, rounded=rounded, values_gated=values_gated,
+                unit_keys=unit_keys, wide=wide, ranged=ranged,
                 skip=skip,
                 keeps=backward or training_forward, forked=forked)
             if backward:
                 mainloop_backward.gradients(q, k, v, g, beta, h0, out, final, tiles=tiles, starts=starts,
                                             max_segments=max_segments, family=family, inverse=inverse,
                                             kept=kept, delta=delta, rounded=rounded,
-                                            values_gated=values_gated,
+                                            values_gated=values_gated, unit_keys=unit_keys,
                                             ranged=ranged, skip=skip, forked=forked)
         finally:
             mainloop.PLANNED.reset(token)
@@ -139,7 +141,8 @@ def holds(launches: tuple[mainloop.Launch, ...], family: mosaic.Family, shared: 
 
 def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: mosaic.Family,
                    target: generation.GpuTarget, starts=None, max_segments: int | None = None,
-                   delta: bool = True, rounded: bool = False, values_gated: bool = False, wide: bool = False,
+                   delta: bool = True, rounded: bool = False, values_gated: bool = False,
+                   unit_keys: bool = False, wide: bool = False,
                    ranged: bool = False, skip=None,
                    forked: chunk_forward.ForkedTable | None = None) -> bool:
     """Whether the launches a fast backward runs (`mainloop_backward.gradients`'s and the forward it takes,
@@ -154,7 +157,8 @@ def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: 
     *shapes, skip = (None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype)
                      for x in (q, k, v, g, beta, h0, starts, skip))
     both = _planned(tuple(shapes), tiles, family, target, max_segments, delta, backward=True,
-                    rounded=rounded, values_gated=values_gated, wide=wide, ranged=ranged, skip=skip,
+                    rounded=rounded, values_gated=values_gated,
+                    unit_keys=unit_keys, wide=wide, ranged=ranged, skip=skip,
                     forked=_shaped(forked))
     return holds(both, family, generation.shared_budget(target))
 
@@ -178,7 +182,7 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
              rounded: bool = False, wide: bool = False,
              ranged: bool = False, skip: jax.ShapeDtypeStruct | None = None,
              forked: chunk_forward.ForkedTable | None = None, training_forward: bool = False,
-             values_gated: bool = False) -> tuple[mainloop.Launch, ...]:
+             values_gated: bool = False, unit_keys: bool = False) -> tuple[mainloop.Launch, ...]:
     """`planned` of a call over `shapes` (`jax.ShapeDtypeStruct`s or None) by `family`'s
     bundle on `target`, cached by the facts a plan reads of it (two targets of one family share no plan: an
     sm87's and an sm80's multiprocessors and shared memory differ), `PLANS_KEPT` of them. A ring's depth
@@ -193,7 +197,7 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
     training_forward = training_forward and not backward
     traced = dataclasses.replace(tiles, stages=1)
     key = (shapes, traced, family, facts, max_segments, delta, backward, training_forward, rounded,
-           values_gated, wide, ranged, skip, forked)
+           values_gated, unit_keys, wide, ranged, skip, forked)
     with _PLANNING:
         depths = _PLANS.get(key)
         if depths is not None:
@@ -204,7 +208,8 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
         *operands, starts = shapes
         depths = {1: planned(*operands, tiles=traced, family=family, starts=starts, max_segments=max_segments,
                              delta=delta, backward=backward, training_forward=training_forward, target=target,
-                             rounded=rounded, values_gated=values_gated, wide=wide, ranged=ranged, skip=skip,
+                             rounded=rounded, values_gated=values_gated,
+                             unit_keys=unit_keys, wide=wide, ranged=ranged, skip=skip,
                              forked=forked)}
     found = tuple(launch.deepened(tiles.stages, target) for launch in depths[1])
     with _PLANNING:
@@ -227,7 +232,8 @@ def ranged(dtype, delta: bool, bound: float | None) -> bool:
 def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 max_segments: int | None = None, scale: float | None = None, delta: bool = True,
                 wide: bool = False, family=None, bound: float | None = None,
-                firsts=None, rounded: bool = False, values_gated: bool = False, skip=None,
+                firsts=None, rounded: bool = False, values_gated: bool = False,
+                unit_keys: bool = False, skip=None,
                 recomputed: bool = False,
                 forked: chunked_launch.Forked | None = None):
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
@@ -248,9 +254,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     `chunk_forward.forward`). Where `recomputed`, its fast backward forms the forward's memories again rather
     than keeping them (a remat rung recomputing 'delta_memory', `recurrence_chunk.RECOMPUTED`, resolved at its
     route). A `forked` call's documents (`recurrence_chunk.Chunk.loads`), `state` its table's given memories
-    `[B, S', HV, Dk, Dv]`, are laid from its chunks' edges (`chunked_launch.AlignedDocuments`), each taking
-    its memory up from the table there in the walks (`chunk_forward.ForkedTable`): the laying and the entry
-    write differentiated by JAX, the table's memories by the walks."""
+    `[B, S', HV, Dk, Dv]`, are laid as a packed call's are (`forked_table`), each row's walk taking each
+    document's memory up from the table at its first chunk (`chunk_forward.ForkedTable`): a forked row costs
+    its packed row at its documents' bound; the entry write is differentiated by JAX, the table's memories by
+    the walks."""
 
     dtype = jnp.result_type(query, key, value)
     device, interpret = mainloop.issued(dtype)
@@ -266,17 +273,18 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                                   f"{generation.family(generation.device_generation())!r} family")
     run = {"family": issuing, "interpret": interpret, "tiles": tiles,
            "ranged": ranged(dtype, delta, bound)}
-    aligned, table = None, None
+    table = None
     if forked is not None:
-        (query, key, value, g, beta), table, aligned = forked_laid(query, key, value, g, beta, state, forked,
-                                                                   tiles.chunk)
-        state = starts = firsts = max_segments = None
+        batch, length = query.shape[:2]
+        table, starts, firsts, max_segments = forked_table(state, forked, batch, length, tiles.chunk)
+        state = None
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
     fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=wide)
             and backward_holds(
                 query, key, value, g, beta, state, tiles=tiles, family=issuing,
                 target=Mosaic.launched(), starts=starts,
-                max_segments=max_segments, delta=delta, rounded=rounded, values_gated=values_gated, wide=wide,
+                max_segments=max_segments, delta=delta, rounded=rounded, values_gated=values_gated,
+                unit_keys=unit_keys, wide=wide,
                 ranged=run["ranged"],
                 skip=skip, forked=table))
 
@@ -291,7 +299,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         alone = {**run, "tiles": tiles.forward or tiles}
         return chunk_forward.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
                                 max_segments=max_segments, scale=scale, delta=delta, wide=wide,
-                                rounded=rounded, values_gated=values_gated, skip=skip, forked=table, **alone)
+                                rounded=rounded, values_gated=values_gated,
+                                unit_keys=unit_keys, skip=skip, forked=table, **alone)
 
     def forward(*operands):
         if not fast:
@@ -304,6 +313,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                                                             firsts=operands[7], max_segments=max_segments,
                                                             scale=scale, delta=delta, wide=wide,
                                                             rounded=rounded, values_gated=values_gated,
+                                                            unit_keys=unit_keys,
                                                             skip=operands[8],
                                                             forked=operands[9], **run)
         kept = None if recomputed else checkpoint_name(kept, Residual.DELTA_MEMORY)
@@ -324,9 +334,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
             *grads, dh0, dskip, dentries = mainloop_backward.gradients(
                 query, key, value, g, beta, state, out_grad, final_grad, starts=starts, firsts=firsts,
                 max_segments=max_segments, scale=scale, inverse=inverse, kept=kept, delta=delta,
-                rounded=rounded, values_gated=values_gated, skip=skip, forked=table, **run)
+                rounded=rounded, values_gated=values_gated,
+                unit_keys=unit_keys, skip=skip, forked=table, **run)
         # A forked call's given memories' gradient its table's first, its slots' none.
-        tabled_grads = None if table is None else dataclasses.replace(table, given=dh0, loads=None,
+        tabled_grads = None if table is None else dataclasses.replace(table, given=dh0, loads=None, rows=None,
                                                                        stores=None, entries=dentries)
         # The skip's gradient formed in its dtype before the inputs' cotangents leave (row 6027).
         (grads, dh0, tabled_grads), dskip = derivatives.with_gradients_formed(
@@ -335,24 +346,20 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
 
     rule = derivatives.contracted("test_the_template_rule_holds_its_orders")(
         derivatives.declared_derivative(derivatives.KernelGlue(), primal, forward, backward))
-    out, final = rule(query, key, value, g, beta, state, starts, firsts, skip, table)
-    return (out, final) if aligned is None else (aligned.unlaid(out), final)
+    return rule(query, key, value, g, beta, state, starts, firsts, skip, table)
 
 
-def forked_laid(query, key, value, g, beta, given, forked: chunked_launch.Forked, chunk: int) -> tuple:
-    """A forked call's operands laid from its `chunk`-token chunks' edges (`chunked_launch.AlignedDocuments`,
-    `mosaic_rule`'s), its table as the walks take it, `(given, loads, stores, entries)` with its memories
-    fp32 (`chunk_forward.ForkedTable`), and the laying."""
-    aligned = chunked_launch.AlignedDocuments.of(forked, query.shape[1], chunk)
-    entries = aligned.entries(forked)
-    table = chunk_forward.ForkedTable(given.astype(jnp.float32), aligned.loads, aligned.stores,
-                                      None if entries is None else entries.astype(jnp.float32), forked.held)
-    return aligned.laid(query, key, value, g, beta), table, aligned
-
-
-def _laid_shapes(query, key, value, g, beta, given, forked, *, chunk: int) -> tuple:
-    """`forked_laid`'s operands and table alone, the arrays a plan's shapes read."""
-    return forked_laid(query, key, value, g, beta, given, forked, chunk)[:2]
+def forked_table(given, forked: chunked_launch.Forked, batch: int, length: int, chunk: int) -> tuple:
+    """A forked call (`mosaic_rule`'s) as a packed call of its documents: its table as the walks take it,
+    `(given, loads, stores, entries)` on its documents' chunks with its memories fp32
+    (`chunk_forward.ForkedTable`, `chunked_launch.ForkedChunks`), its documents' first tokens, their firsts
+    and its documents' bound, the packed call's `starts`, `firsts` and `max_segments`."""
+    chunks = chunked_launch.ForkedChunks.of(forked, batch, length, chunk)
+    entries = chunks.entries(forked)
+    table = chunk_forward.ForkedTable(given.astype(jnp.float32), chunks.loads, chunks.stores,
+                                      None if entries is None else entries.astype(jnp.float32), chunks.rows,
+                                      forked.held, chunks.added(forked))
+    return table, forked.tokens(length)[0] >= 0, forked.firsts, forked.loads.shape[1]
 
 
 def walk_roles(family: mosaic.Family) -> int:
@@ -382,14 +389,16 @@ class Mosaic(base.Template[mainloop.Tiles]):
              state: jax.Array | None = None, starts: jax.Array | None = None, *,
              firsts: jax.Array | None = None, max_segments: int | None = None, scale: float | None = None,
              delta: bool = True, wide: bool = False, bound: float | None = None,
-             rounded: bool = False, values_gated: bool = False, skip: jax.Array | None = None,
+             rounded: bool = False, values_gated: bool = False,
+             unit_keys: bool = False, skip: jax.Array | None = None,
              recomputed: bool = False,
              forked: chunked_launch.Forked | None = None, config: mainloop.Tiles,
              return_residuals: bool = False):
         del return_residuals
         return mosaic_rule(query, key, value, g, beta, state, tiles=config, starts=starts, firsts=firsts,
                            max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound,
-                           rounded=rounded, values_gated=values_gated, skip=skip, recomputed=recomputed,
+                           rounded=rounded, values_gated=values_gated,
+                           unit_keys=unit_keys, skip=skip, recomputed=recomputed,
                            forked=forked), None
 
     @staticmethod
@@ -426,15 +435,19 @@ class Mosaic(base.Template[mainloop.Tiles]):
         skip = arguments.get("skip")
         forked, table, max_segments = arguments.get("forked"), None, arguments.get("max_segments")
         if forked is not None:
-            # A forked call's walks over its documents laid at the config's chunk, and its table.
-            laid, table = jax.eval_shape(functools.partial(_laid_shapes, chunk=config.chunk), *given[:6],
-                                         forked)
-            shapes, max_segments = (*laid, None, None), None
+            # A forked call's walks over its documents laid as a packed call's at the config's chunk, and
+            # its table.
+            batch, length = arguments["query"].shape[:2]
+            table, starts, _, _ = jax.eval_shape(
+                functools.partial(forked_table, batch=batch, length=length, chunk=config.chunk), given[5],
+                forked)
+            shapes, max_segments = (*shapes[:5], None, starts), forked.loads.shape[1]
         return _planned(shapes, config, family, target, max_segments, delta, bool(fast) and backward,
                         arguments.get("rounded", False), arguments.get("wide", False),
                         ranged(dtype, delta, arguments.get("bound")),
                         None if skip is None else jax.ShapeDtypeStruct(skip.shape, skip.dtype), forked=table,
-                        training_forward=bool(fast), values_gated=arguments.get("values_gated", False))
+                        training_forward=bool(fast), values_gated=arguments.get("values_gated", False),
+                        unit_keys=arguments.get("unit_keys", False))
 
     GENERATES: ClassVar[bool] = True
 
@@ -858,7 +871,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
                   target: generation.GpuTarget, *, training: bool = True) -> int:
         """The walk's value blocks at `tiles`, its launch's grid as planned (`_states`): a block of each laid
         sequence and head, `tiles.walkers` of them a program, a forward's values padded as it pads them;
-        a forked call's sequences its laid rows, each walking its documents in turn (`forked_laid`)."""
+        a forked call's sequences its rows, each walking its documents in turn (`forked_table`)."""
         return self._states(ba, tiles, target, training=training).programs * tiles.walkers
 
     def _one_wave(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,

@@ -747,10 +747,12 @@ def _prefetched(tiles: Tiles, grid: tuple, steps: int, transpose_rhs: bool, inte
         # take no table), the matrices side by side next.
         del lhs_gmem
         _, column_tile = tail_of.planar_snake(lax.axis_index("programs"), grid, 1, tiles.grid_block_n)
-        others = () if beside is None else refs[:len(beside.starts) - 1]
-        columns = (_matrix_columns(matrix_gmem.at[0], column_tile, block_n=tiles.block_n,
-                                   transpose_rhs=transpose_rhs) if beside is None
-                   else BesideRefs(beside, (matrix_gmem, *others)).columns(0, column_tile))
+        if beside is None:
+            columns = _matrix_columns(matrix_gmem.at[0], column_tile, block_n=tiles.block_n,
+                                      transpose_rhs=transpose_rhs)
+        else:
+            (side_by_side,), _ = beside.read((matrix_gmem,), refs)  # its refs bound as the body binds them
+            columns = side_by_side.columns(0, column_tile)
         view = (columns, _rhs_index(transpose_rhs))
         return [rings.viewed(view, block, step) for step in range(min(tiles.stages, steps))]
 

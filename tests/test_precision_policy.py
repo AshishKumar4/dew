@@ -25,11 +25,16 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.precision import (
     ACCURATE,
     Numerics,
+    _binades,
     _rounded_significand,
+    aligned_sum,
+    binade_of,
     compensated_add,
     compensated_difference,
     exact_products,
+    float_bits,
     fp32_result_dot_general,
+    raised_exactly,
     two_product,
     two_sum,
 )
@@ -1088,3 +1093,125 @@ def test_a_float64_value_asked_for_without_x64_fails_rather_than_computing_in_fl
         jnp.ones(3, jnp.float64)
     with jax.enable_x64(new_val=True):
         assert jnp.ones(3, jnp.float64).dtype == jnp.float64
+
+
+ALIGNED_CASES = {
+    "cancelling": ([(2.0 ** 100, 2.0 ** -20, 2.0 ** 60), (2.0 ** 100, 2.0 ** -20, -(2.0 ** 60))], 0.0),
+    "in range though its terms are not": ([(1 + 2.0 ** -20, 2.0 ** 70, 2.0 ** 70),
+                                           (-1.0, 2.0 ** 70, 2.0 ** 70)], 2.0 ** 120),
+    "past the largest": ([(1.0, 2.0 ** 70, 2.0 ** 70), (1.0, 2.0 ** 70, 2.0 ** 70)], float("inf")),
+}
+"""`aligned_sum`'s cases: three-factor terms whose products leave fp32's range, and their sum, exact in any
+order of summing (two terms, their sum a float32)."""
+
+
+@pytest.mark.parametrize("case", list(ALIGNED_CASES))
+def test_an_aligned_sum_is_exact_where_its_terms_leave_fp32s_range(case):
+    """`aligned_sum` of fp32 terms each past fp32's range where their sum is in it or past it: exactly the
+    sum, as a float32 holds it (a subnormal sum is no case: XLA:CPU flushes subnormals to zero). Summed as
+    formed, two terms of +-2^140 were inf - inf, NaN (base review ead11c83a F1)."""
+    terms, total = ALIGNED_CASES[case]
+    found = aligned_sum([tuple(jnp.float32(factor) for factor in term) for term in terms])
+    assert float(found) == total
+
+
+@pytest.mark.parametrize("terms", [[(0.0, 0.5, 0.5)], [(0.0, 0.0, 0.0), (0.0, 2.0 ** 100, 2.0 ** 100)]],
+                         ids=["one zero term", "zero terms past fp32's range"])
+def test_an_aligned_sum_of_zero_terms_is_zero(terms):
+    """`aligned_sum` of terms whose products are all zero, one beside factors past fp32's range: zero, where
+    its largest binade's sentinel aligned a zero term by 2^896 and wrapped it to -inf, its sum NaN (base
+    review 820eaf429 F1)."""
+    found = aligned_sum([tuple(jnp.float32(factor) for factor in term) for term in terms])
+    assert float(found) == 0.0
+
+
+def test_an_aligned_sum_of_float64_terms_keeps_float64():
+    """`aligned_sum` of float64 terms sums in float64: an entry weight of `1 + 2^-30` written at unit key and
+    value is itself, where cast to fp32 it was 1 (base review 820eaf429 F2)."""
+    with jax.enable_x64(new_val=True):
+        found = aligned_sum([(jnp.float64(1 + 2.0 ** -30), jnp.float64(1.0), jnp.float64(1.0))])
+        assert found.dtype == jnp.float64 and float(found) == 1 + 2.0 ** -30
+
+
+def test_an_aligned_sums_derivative_reduces_each_term_before_it_adds():
+    """`aligned_sum` along an axis of terms of different shapes (`x` `[2, 1]` and `y` `[1, 1]`, unit
+    values and directions): its tangent is 3, and `y`'s gradient 1, each term reduced over the axis before
+    the terms add, as its value is; summed broadcast first, `y`'s direction counted on both rows gave 4, its
+    gradient 2 (base review 675f2c056 F1)."""
+    x, y = jnp.ones((2, 1), jnp.float32), jnp.ones((1, 1), jnp.float32)
+
+    def summed(x, y):
+        return aligned_sum([(x,), (y,)], axis=0)
+
+    _, tangent = jax.jvp(summed, (x, y), (x, y))
+    assert float(tangent[0, 0]) == 3.0
+    assert float(jax.grad(lambda y: summed(x, y)[0, 0])(y)[0, 0]) == 1.0
+
+
+def test_an_aligned_sum_of_a_subnormal_factor_raises_it_by_its_bits():
+    """`aligned_sum` of a term whose factor is fp32-subnormal (`2^-140`) and whose product is in range
+    (`2^-140 2^100`): `2^-40` exactly, the factor normalized by its bits, where lifted by a multiply XLA:CPU
+    flushes it to zero (base review 675f2c056 F2)."""
+    found = aligned_sum([(jnp.float32(2.0 ** -140), jnp.float32(2.0 ** 100), jnp.float32(1.0))])
+    assert float(found) == 2.0 ** -40
+
+
+def test_an_aligned_sum_along_an_axis_sums_each_rows_terms():
+    """`aligned_sum` over an axis: each row's two columns `(1 + 2^-20) 2^(140 + i)` and `-2^(140 + i)`, each
+    past fp32's range, summed along the row to `2^(120 + i)` exactly."""
+    rows = np.arange(6)
+    first = np.stack([np.full(6, 1 + 2.0 ** -20), np.full(6, -1.0)], axis=1).astype(np.float32)
+    second = np.broadcast_to(np.float32(2.0 ** 70), (6, 2))
+    third = np.broadcast_to((2.0 ** (70 + rows)).astype(np.float32)[:, None], (6, 2))
+    found = aligned_sum([(jnp.asarray(first), jnp.asarray(second), jnp.asarray(third))], axis=1)
+    np.testing.assert_array_equal(np.asarray(found)[:, 0], 2.0 ** (120 + rows))
+
+
+def _edge_values(dtype) -> np.ndarray:
+    """A dtype's normal, subnormal and zero values of both signs: its least and largest normals, values
+    between, its least subnormal and subnormals of every leading bit's place."""
+    limits = np.finfo(dtype)
+    width = limits.nmant
+    subnormals = [float(limits.smallest_subnormal) * 2.0 ** i * (1 + (i % 3) / 4) for i in range(width)]
+    normals = [float(limits.tiny), 1.0, 1.5, 3.0 ** 5, float(limits.max), 2.0 ** -100, 2.0 ** 100 * 1.25]
+    values = np.asarray([0.0, *subnormals, *normals], np.float64).astype(dtype)
+    return np.concatenate([values, -values])
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["fp32", "float64"])
+def test_a_floats_bits_read_as_its_exponent_and_significand(dtype):
+    """`float_bits` and `_binades` of normal, subnormal and zero values of both signs: each nonzero value's
+    exponent `floor(log2 |x|)` (numpy's `frexp`, less one) and its significand in [1, 2) with its sign, the
+    value exactly their product, a subnormal's read from its bits; zero's significand zero."""
+    with jax.enable_x64(new_val=dtype == np.float64):
+        values = _edge_values(dtype)
+        significand, exponent = (np.asarray(part, np.float64) for part in _binades(jnp.asarray(values)))
+        reported = np.asarray(float_bits(jnp.asarray(values))[4])
+    nonzero = values != 0
+    expected = np.frexp(values.astype(np.float64))[1] - 1
+    np.testing.assert_array_equal(exponent[nonzero], expected[nonzero])
+    np.testing.assert_array_equal(reported[nonzero], expected[nonzero])
+    np.testing.assert_array_equal(np.ldexp(significand, exponent.astype(np.int64)), values.astype(np.float64))
+    assert np.all((np.abs(significand[nonzero]) >= 1) & (np.abs(significand[nonzero]) < 2))
+    np.testing.assert_array_equal(significand[~nonzero], 0.0)
+
+
+def test_binade_of_reads_an_fp32s_exponent_minus_1024_at_zero():
+    """`binade_of` of fp32's normal, subnormal and zero values: numpy's `frexp` exponent less one, a
+    subnormal's by its leading bit, -1024 at zero, int32."""
+    values = _edge_values(np.float32)
+    found = np.asarray(binade_of(jnp.asarray(values)))
+    expected = np.where(values == 0, -1024, np.frexp(values.astype(np.float64))[1] - 1)
+    assert found.dtype == np.int32
+    np.testing.assert_array_equal(found, expected)
+
+
+def test_raised_exactly_raises_an_fp32_by_a_power_of_two_without_a_flush():
+    """`raised_exactly` of fp32's normal, subnormal and zero values by powers of two to its largest: each
+    `x 2^k` exactly (numpy's `ldexp` in float64, every one an fp32), a subnormal raised from its bits, where
+    a multiply XLA's CPU flushes read zero, zero kept zero."""
+    values = _edge_values(np.float32)
+    exponents = np.where(values == 0, -1024, np.frexp(values.astype(np.float64))[1] - 1)
+    raises = np.clip(127 - np.maximum(exponents, -149), 0, 60).astype(np.int32)
+    found = np.asarray(raised_exactly(jnp.asarray(values), jnp.asarray(raises)), np.float64)
+    np.testing.assert_array_equal(found, np.ldexp(values.astype(np.float64), raises))
