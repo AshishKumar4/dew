@@ -613,9 +613,9 @@ class Store:
     """
 
     url: str
-    storage_options: Mapping[str, object] | None = field(default=None, repr=False)
-    retention: LocalRetention | None = field(default=None, repr=False)
-    idle_seconds: float = field(default=IDLE_SECONDS, repr=False)
+    storage_options: Mapping[str, object] | None = field(default=None, compare=False, repr=False)
+    retention: LocalRetention | None = field(default=None, compare=False, repr=False)
+    idle_seconds: float = field(default=IDLE_SECONDS, compare=False, repr=False)
     """How long a GCS transfer may go without a byte before it fails (`IDLE_SECONDS`), where its options
     bound it otherwise."""
 

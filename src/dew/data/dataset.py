@@ -1986,8 +1986,7 @@ class StepPhases(Forwarding):
         from dew.data.plan import saved_identity
 
         identities = [saved_identity(held) for held in strings(saved["identities"], "saved phase identities")]
-        if phase >= len(self._make) or ends != self._ends[:phase] or identities[:phase] != [
-                self._identity(index) for index in range(phase)]:
+        if phase >= len(self._make) or ends != self._ends[:phase] or not self._read_alike(identities, phase):
             raise _position.PlanChanged(
                 ("phases",), f"the saved run finished phases ending at steps {ends}, and this run's phases "
                 f"end at {self._ends[:phase]}, or read them otherwise; a phase the run has read cannot "
@@ -2034,6 +2033,17 @@ class StepPhases(Forwarding):
         encoded = boolean(saved["encoded"], "the saved position's encoding")
         stream.set_state(own if encoded else json.loads(own))
         self._steps = steps
+
+    def _read_alike(self, saved: Sequence[str], phase: int) -> bool:
+        """Whether the phases before `phase` read what the `saved` identities say: as this Dew describes
+        their steps, or as plan version 15 did (`dew.data.plan.described_under`), whose identities a phase's
+        position holds without its version."""
+        from dew.data.plan import REFERENCED, described_under
+
+        if list(saved[:phase]) == [self._identity(index) for index in range(phase)]:
+            return True
+        with described_under(REFERENCED):
+            return list(saved[:phase]) == [self._identity(index) for index in range(phase)]
 
     def _identity(self, phase: int) -> str:
         """What phase `phase`'s reader reads, as the pool agrees it (`stream_identity`): its plan as this
