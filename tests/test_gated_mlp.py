@@ -207,22 +207,30 @@ def _activation_spans(jaxpr) -> list:
     return found
 
 
+@pytest.mark.parametrize("implementation", ["xla", "pallas"])
 @pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
-def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype):
-    """A gated product's XLA arithmetic (`gated_product`, 'swiglu' at 'xla') is one region of its
-    activation (`derivatives.Activation('swiglu', gated=True)`), a fusion pass's epilogue's, over its gate
-    and up projection: inlined, it computes what its arithmetic unmarked computes, its value and its
-    operands' gradients bit for bit (`activations._gated`). An ungated MLP's named activation is one region
-    of it ungated."""
+def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, implementation):
+    """A gated product (`gated_product`, 'swiglu'), its XLA arithmetic or SwiGLU's Pallas kernel where it
+    is named (on an H100's routes, interpreted on a CPU), is one region of its activation
+    (`derivatives.Activation('swiglu', gated=True)`) over its gate and up projection, whichever route it
+    takes, the seam a fusion pass's epilogue replaces: inlined, it computes what the route unmarked
+    computes, its value and its operands' gradients bit for bit. An ungated MLP's named activation is one
+    region of it ungated."""
     from dew.nn import derivatives
+    from dew.nn.kernels import norm_swiglu
     from dew.nn.mlp import GatedMLP
 
     rng = np.random.default_rng(0)
     gate, up = (jnp.asarray(rng.standard_normal((4, 64)) * 3, dtype) for _ in range(2))
-    product = activations.gated_product("swiglu", implementation="xla")
-    plain = activations._gated(activations.silu)
-    assert _activation_spans(jax.make_jaxpr(product)(gate, up).jaxpr) == [
-        derivatives.Activation("swiglu", gated=True)]
+    product = activations.gated_product("swiglu", implementation=implementation)
+    portable = activations._portable(activations.silu, lambda gate, up: (gate, up))
+    plain = portable if implementation == "xla" else (
+        lambda gate, up: norm_swiglu.swiglu(gate, up, portable))
+    with generation.assumed("sm90"):
+        traced = str(jax.make_jaxpr(product)(gate, up))
+        assert _activation_spans(jax.make_jaxpr(product)(gate, up).jaxpr) == [
+            derivatives.Activation("swiglu", gated=True)]
+    assert ("pallas_call" in traced) == (implementation == "pallas")
 
     def summed(function):
         return jax.jit(jax.value_and_grad(lambda g, u: jnp.sum(function(g, u).astype(jnp.float32)),

@@ -346,7 +346,7 @@ def gated_product(activation: GatedActivation, *, implementation: str = 'auto',
     the operands' logical axes, place the kernel on a mesh."""
     if isinstance(activation, Situ):
         return activation
-    portable = _portable(activation, _gate_function(activation, implementation), lambda gate, up: (gate, up))
+    portable = _portable(_gate_function(activation, implementation), lambda gate, up: (gate, up))
     return _dispatched(activation, portable,
                        lambda gate, up: norm_swiglu.swiglu_kernel(implementation, gate, up, axes=axes),
                        lambda gate, up, portable: norm_swiglu.swiglu(gate, up, portable, axes=axes))
@@ -359,21 +359,19 @@ def packed_gated_product(activation: str, *, implementation: str = 'auto',
     writes the packed layout (`norm_swiglu.packed_swiglu`), and XLA's product
     recomputes from the packed output itself, so neither copies a half out.
     `axes` are the product's logical axes, `[..., H]`'s."""
-    portable = _portable(activation, _gate_function(activation, implementation),
+    portable = _portable(_gate_function(activation, implementation),
                          lambda gate_up: (gate_up[..., 0, :], gate_up[..., 1, :]))
     return _dispatched(activation, portable,
                        lambda gate_up: norm_swiglu.packed_swiglu_kernel(implementation, gate_up, axes=axes),
                        lambda gate_up, portable: norm_swiglu.packed_swiglu(gate_up, portable, axes=axes))
 
 
-def _portable(activation: str, activate, halves):
+def _portable(activate, halves):
     """The XLA product of a gate and up projection that `halves(*operands)` reads from the operands
     (the two projections, or one packed output's two halves): `activate(gate) * up` at fp32 and
     wider, else rounded where torch rounds it (`_rounded`) and recomputed from the operands
-    themselves in the backward, so a packed output is never copied into halves. The product of the
-    gate and up projection is one region, `activation`'s gated one (`derivatives.Activation`, a
-    fusion pass's epilogue's)."""
-    product = marked(derivatives.Activation(activation, gated=True), _gated(activate))
+    themselves in the backward, so a packed output is never copied into halves."""
+    product = _gated(activate)
     rounded_product = _recomputed(lambda *operands: product(*halves(*operands)))
 
     def portable(*operands: jax.Array) -> jax.Array:
@@ -385,9 +383,12 @@ def _portable(activation: str, activate, halves):
 def _dispatched(activation, portable, kernel_choice, kernel):
     """The product over the operands: SwiGLU's Pallas `kernel(*operands, portable)` where
     `kernel_choice(*operands)` chooses it (every order of its derivative is the portable product's;
-    every level runs the kernels), else `portable`, which every other activation runs."""
+    every level runs the kernels), else `portable`, which every other activation runs. Whichever runs is
+    one region of `activation`'s gated product over the operands (`derivatives.Activation`), the seam a
+    fusion pass's epilogue replaces from its kind (`_gate_function`'s activation and the rounded product,
+    `_gated`); inlined, it is what the dispatcher emits."""
     def product(*operands: jax.Array) -> jax.Array:
         chosen = 'xla' if activation != 'swiglu' else kernel_choice(*operands)
         return kernel(*operands, portable) if chosen == 'pallas' else portable(*operands)
 
-    return product
+    return marked(derivatives.Activation(activation, gated=True), product)
