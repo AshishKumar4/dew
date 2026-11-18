@@ -921,9 +921,6 @@
 "tests/test_barren_reads.py::test_workers_whose_inputs_a_filter_drops_read_on_from_their_shares_others[indexed-written after the filter]",
 "tests/test_barren_reads.py::test_workers_whose_inputs_a_filter_drops_read_on_from_their_shares_others[memory-the share's own]"
 ],
-"tests/test_beam_search.py": [
-"tests/test_beam_search.py::test_beams_are_transformers_beam_search[qwen3-tiny]"
-],
 "tests/test_benchmark_step.py": [
 "tests/test_benchmark_step.py::test_a_case_names_a_checkpoints_config_on_the_command_line[qwen35-native-tiny-config.json]",
 "tests/test_benchmark_step.py::test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer[diffusion_gemma-False]",
@@ -955,9 +952,6 @@
 "tests/test_block_sft.py::test_image_sft_uses_media_validity_groups_and_positions",
 "tests/test_block_sft.py::test_official_sft_loss_and_every_parameter_gradient",
 "tests/test_block_sft.py::test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target"
-],
-"tests/test_block_visibility.py": [
-"tests/test_block_visibility.py::test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_does"
 ],
 "tests/test_cache_opening.py": [
 "tests/test_cache_opening.py::test_a_stage_local_stores_cache_opens_a_layer_at_a_time_as_its_decode_opens_and_writes_it[memory]",
@@ -1962,7 +1956,7 @@
 "tests/test_imports.py::test_a_module_imports_its_own_domain_alone[dew.config]"
 ],
 "tests/test_indexer_training.py": [
-"tests/test_indexer_training.py::test_packing_carried_by_the_model_inputs_scores_the_same_kl[warmup-None]"
+"tests/test_indexer_training.py::test_padding_the_model_inputs_mask_leaves_out_counts_no_query[sparse-4]"
 ],
 "tests/test_inference.py": [
 "tests/test_inference.py::test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds",
@@ -2183,9 +2177,6 @@
 "tests/test_kimi_k3.py::test_greedy_generation_and_decode_steps_match_the_reference",
 "tests/test_kimi_k3.py::test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference",
 "tests/test_kimi_k3.py::test_situ_matches_the_released_activation"
-],
-"tests/test_kv_cache.py": [
-"tests/test_kv_cache.py::test_a_quantized_caches_scales_and_codes_are_its_formats_quotients[float8_e4m3fn]"
 ],
 "tests/test_layer_stack.py": [
 "tests/test_layer_stack.py::test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop",
@@ -2431,9 +2422,6 @@
 "tests/test_mla.py::test_decode_matches_prefill[mla_v32]",
 "tests/test_mla.py::test_the_deepseek_stack_fits_on_the_mesh[2-1]"
 ],
-"tests/test_model_flops.py": [
-"tests/test_model_flops.py::test_analytical_count_equals_every_forward_dot_and_convolution[jepa]"
-],
 "tests/test_model_flops_families.py": [
 "tests/test_model_flops_families.py::test_diffusion_objective_counts_one_real_encoder_and_the_conditioned_denoiser",
 "tests/test_model_flops_families.py::test_each_family_matches_every_traced_forward_product[uvit]",
@@ -2576,10 +2564,6 @@
 ],
 "tests/test_mosaic_toolkit.py": [
 "tests/test_mosaic_toolkit.py::test_a_quantized_stage_converts_into_the_tile_its_products_read[sm80-int8-unscaled]"
-],
-"tests/test_mtp.py": [
-"tests/test_mtp.py::test_the_depths_read_a_packed_rows_layout_as_its_coordinates_alone",
-"tests/test_mtp.py::test_the_term_adds_the_weighted_mean_depth_cross_entropy[plain_trunk]"
 ],
 "tests/test_multimodal_model.py": [
 "tests/test_multimodal_model.py::test_a_drawn_site_is_on_par_with_its_reference[llama4]",
@@ -3637,9 +3621,6 @@
 "tests/test_speculative.py::test_tree_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk[attention]",
 "tests/test_speculative.py::test_tree_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk[recurrent]",
 "tests/test_speculative.py::test_tree_speculation_reproduces_the_greedy_walk_to_the_end_of_its_cache[three-2]"
-],
-"tests/test_ssd_kernel.py": [
-"tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk-resets]"
 ],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
