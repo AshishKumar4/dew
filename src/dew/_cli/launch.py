@@ -550,12 +550,12 @@ def oom_kills(membership: Path = Path("/proc/self/cgroup"),
     """How many processes the kernel's OOM killer has killed in this process's cgroup (cgroup v2's
     `memory.events` `oom_kill`, its own and its children's), None where the host keeps no such count (cgroup
     v1, a host that is not Linux)."""
-    try:
-        line = next(line for line in membership.read_text().splitlines() if line.startswith("0::"))
-        events = (root / line.removeprefix("0::").lstrip("/") / "memory.events").read_text()
-    except (OSError, StopIteration):
+    held = membership.read_text().splitlines() if membership.exists() else []
+    unified = next((line.removeprefix("0::") for line in held if line.startswith("0::")), None)
+    events = None if unified is None else root / unified.lstrip("/") / "memory.events"
+    if events is None or not events.exists():
         return None
-    counts = dict(line.split() for line in events.splitlines() if line.strip())
+    counts = dict(line.split() for line in events.read_text().splitlines() if line.strip())
     return int(counts["oom_kill"]) if "oom_kill" in counts else None
 
 
