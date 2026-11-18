@@ -105,8 +105,8 @@ class _Interpreter:
             # A register layout's statement (`plgpu.layout_cast`), its value its operand's.
             return [values[0]]
         if name == "marked_call" and isinstance(params["kind"], derivatives.Rare):
-            # A rare span's verdict (a decided walk's, `derivatives.Rare`): the run's own (`programs`' `rare`),
-            # each program's alike.
+            # A rare span's verdict (a decided walk's, `derivatives.Rare`): the run's own (`programs`'
+            # `rare`), each program's alike.
             return [np.bool_(self.rare)]
         # A call's program, read where every reader reads it (`dew.nn.programs.called`).
         inner = called(equation)
