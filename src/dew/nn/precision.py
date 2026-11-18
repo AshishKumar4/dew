@@ -134,6 +134,7 @@ __all__ = [
     "twice_scaled",
     "two_product",
     "two_sum",
+    "uncontracted",
     "weighted_total",
     "wide_cpu_arithmetic",
     "widened_reduction",
@@ -1301,10 +1302,23 @@ def _protected(transform: Callable) -> Callable:
 
 @_protected
 def two_sum(left, right):
-    """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum)."""
+    """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum). Each operand is read as
+    one value (`uncontracted`): a compiler that fused the multiply making an operand into the sum (an FMA,
+    XLA's CPU and GPU contract one) would add its exact product where the steps after read its rounded
+    one, counting that rounding twice."""
+    left, right = uncontracted(left, right)
     total = left + right
     part = total - left
     return total, (left - (total - part)) + (right - part)
+
+
+def uncontracted(*values):
+    """`values` each read as the one value it is, never fused into the arithmetic that reads it: an error-free
+    transform reads each operand more than once and holds only where every read sees the same rounded value,
+    which a compiler's contraction of a multiply into an add (an FMA, XLA's CPU and GPU, Triton's) breaks by
+    reading the exact product at one place and the rounded one at another (a two_product's product added in a
+    compensated sum, its residual then counted twice). An optimization barrier, which no fusion crosses."""
+    return jax.lax.optimization_barrier(values)
 
 
 def binade_of(x: jax.Array) -> jax.Array:
@@ -1441,7 +1455,11 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         lost = rounded(lost - term if subtract else lost + term)
     tail = rounded(ll * rl)
     residual = rounded(tail - lost if subtract else lost + tail)
-    return (product, residual) if scale is None else (product * scale, residual * scale)
+    # The pair each read as one value (`uncontracted`): a sum reading the product would otherwise take its
+    # multiply into an FMA and add the exact product beside a residual that holds its rounding.
+    if scale is not None:
+        product, residual = product * scale, residual * scale
+    return uncontracted(product, residual)
 
 
 def _correctly_rounded_divide(numerator: jax.typing.ArrayLike,
