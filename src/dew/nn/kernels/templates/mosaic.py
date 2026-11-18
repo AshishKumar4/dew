@@ -1752,10 +1752,7 @@ class Transport[Allocated, Opened](abc.ABC):
 
     def decided_scratch(self, consumers: int) -> dict:
         """A decided walk's verdicts' allocations (`after_walk.Decided`), none where one consumer feeds."""
-        if consumers == 1 and self.feeds_itself:
-            return {}
-        return {"words": plgpu.SMEM((consumers,), jnp.int32),
-                "barrier": plgpu.Barrier(num_arrivals=consumers)}
+        return {} if consumers == 1 and self.feeds_itself else after_walk.verdicts(consumers)
 
     @abc.abstractmethod
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
@@ -2148,22 +2145,19 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
             # own value, both stayed live through the merge (267 registers at a 128 x 256 dW tile, EM-probe2).
             pl.when(last == 1)(lambda: combined(read(opening, first)))
 
-    def scoped(self, body, *allocations, streams, after_walks: tuple = (), over_rings: bool = False,
-               products: tuple | None = None):
-        """`Transport.scoped`, and with `products`, `(consumers, widths, lefts)`, the issuer's product scratch
-        (`product_scratch`) scoped beside `allocations`, `body` traced within it (`products_in`), where the
-        issuer keeps any; `product_held` its account."""
+    def scoped(self, body, *allocations, streams, products: tuple | None = None, **after):
+        """`Transport.scoped` (`after` its `after_walks` and `over_rings`), and with `products`, `(consumers,
+        widths, lefts)`, the issuer's product scratch (`product_scratch`) scoped beside `allocations`, `body`
+        traced within it (`products_in`), where the issuer keeps any; `product_held` its account."""
         scratch = () if products is None else self.product_scratch(*products)
         if not scratch:
-            return super().scoped(body, *allocations, streams=streams, after_walks=after_walks,
-                                  over_rings=over_rings)
+            return super().scoped(body, *allocations, streams=streams, **after)
 
         def within(*refs, **named):
             with self.products_in(refs[-1]):
                 return body(*refs[:-1], **named)
 
-        return super().scoped(within, *allocations, scratch, streams=streams, after_walks=after_walks,
-                              over_rings=over_rings)
+        return super().scoped(within, *allocations, scratch, streams=streams, **after)
 
 
 class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
