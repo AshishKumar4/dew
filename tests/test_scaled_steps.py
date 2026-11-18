@@ -27,11 +27,11 @@ class ScaledObjective(Objective):
         return jnp.sum(variables["params"]["w"] ** 2) * batch["scale"][0], Aux({})
 
 
-def host(state):
+def held_weights(state):
     return np.array(state.variables["params"]["w"]), np.array(state.ema["params"]["w"])
 
 
-def unscaled(accum: int, microsteps: int):
+def unscaled_weights(accum: int, microsteps: int):
     """The weights and their average after `microsteps` good microbatches of the same trainer with no
     dynamic scale: what a scaled run's accepted steps must equal bit for bit, its scale a power of two
     that multiplies the loss and divides the gradients exactly."""
@@ -41,7 +41,7 @@ def unscaled(accum: int, microsteps: int):
     step = trainer.compile(state, good)
     for _ in range(microsteps):
         state, *_ = step(state, good)
-    return host(state)
+    return held_weights(state)
 
 
 def test_a_rejected_dynamic_scale_step_leaves_adams_state_as_it_was():
@@ -88,9 +88,9 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     step = trainer.compile(state, good)
     for _ in range(2 * accum - 1):
         state, *_ = step(state, good)
-    w, ema = host(state)
+    w, ema = held_weights(state)
     assert np.all(w != 1.0)
-    for got, want in zip((w, ema), unscaled(accum, 2 * accum - 1), strict=True):
+    for got, want in zip((w, ema), unscaled_weights(accum, 2 * accum - 1), strict=True):
         np.testing.assert_array_equal(got, want)
     # the step consumes the state
     counted, advanced, scaled = int(state.step), int(state.microstep), float(state.scale.scale)
@@ -104,9 +104,9 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     np.testing.assert_array_equal(state.ema["params"]["w"], ema)
     for _ in range(accum):
         state, *_ = step(state, good)
-    w, ema = host(state)
+    w, ema = held_weights(state)
     # Two accepted updates: the rejection dropped its window, the pending microbatch with it.
-    for got, want in zip((w, ema), unscaled(accum, 2 * accum), strict=True):
+    for got, want in zip((w, ema), unscaled_weights(accum, 2 * accum), strict=True):
         np.testing.assert_array_equal(got, want)
     assert int(state.microstep) == 2 * accum
 

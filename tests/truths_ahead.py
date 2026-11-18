@@ -42,6 +42,7 @@ from pathlib import Path
 
 import jax
 import numpy as np
+from tool_support import load
 
 
 class MissingTruth(AssertionError):
@@ -317,7 +318,8 @@ def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], wh
     record = directory / UNPREPARED
     if record.exists():
         return
-    path = Path(test.split("::", 1)[0])
+    # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
+    path = Path(load("grading", "tools/armada").owning(test))
     lines = [line for file, line in frames if Path(file).name == path.name]
     directory.mkdir(parents=True, exist_ok=True)
     record.write_text(json.dumps({"test": test, "where": f"{path}:{lines[0]}" if lines else str(path),

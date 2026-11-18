@@ -531,9 +531,11 @@ def ragged_draw(seed):
 
 UNSEEN = {
     "ampere-class": generation.GpuTarget("sm80", "Unmeasured Ampere-class GPU", shared_limit=99 * 1024,
-                                         multiprocessors=46, clock_hz=1.4e9, memory_bandwidth=0.45e12),
+                                         multiprocessors=46, clock_hz=1.4e9, memory_bandwidth=0.45e12,
+                                         host_links={}),
     "hopper-class": generation.GpuTarget("sm90", "Unmeasured Hopper-class GPU", shared_limit=180 * 1024,
-                                         multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12),
+                                         multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12,
+                                         host_links={}),
 }
 """GPUs no row measured, one of each family: an Ampere-class part with fewer multiprocessors and the
 smaller block of an sm86 than an A100's, and a Hopper-class one with fewer multiprocessors, a smaller
