@@ -1529,8 +1529,7 @@ class Transport[Allocated, Opened](abc.ABC):
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
 
     stages_over_rings: bool = False
-    """Whether tiles a program scopes after its walks may share its rings' slots, its rings the program's
-    and its consumers their only readers (`after_walk.over_rings_scoped`: sm120's forward at width 256)."""
+    """Whether a program's tiles past its walks may take its rings' slots (`after_walk.over_rings_scoped`)."""
 
     ring_slots: int | None = None
     """The slots each stream's ring holds whatever stages a launch asks (`streams`), where it fixes them (a
@@ -2149,9 +2148,8 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
             pl.when(last == 1)(lambda: combined(read(opening, first)))
 
     def scoped(self, body, *allocations, streams, products: tuple | None = None, **after):
-        """`Transport.scoped` (`after` its `after_walks` and `over_rings`), and with `products`, `(consumers,
-        widths, lefts)`, the issuer's product scratch (`product_scratch`) scoped beside `allocations`, `body`
-        traced within it (`products_in`), where the issuer keeps any; `product_held` its account."""
+        """`Transport.scoped` (`after`), and with `products`, `(consumers, widths, lefts)`, the issuer's
+        product scratch beside `allocations`, `body` within it (`products_in`; `product_held` its account)."""
         scratch = () if products is None else self.product_scratch(*products)
         if not scratch:
             return super().scoped(body, *allocations, streams=streams, **after)
