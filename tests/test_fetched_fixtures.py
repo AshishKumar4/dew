@@ -464,6 +464,14 @@ def test_a_githubs_store_file_is_staged_on_its_host_and_dispatched_as_its_asset_
     with pytest.raises(SystemExit):
         store.dispatch([entry], root)
     assert store.pins(root)[LARGE]["revision"] is None
+    # An asset only a draft release holds is no fetch's: it is dispatched again, never pinned from the draft.
+    store._pinned(LARGE, pin, root)
+    draft = [{"tag_name": "store-1", "draft": True, "assets": [{"name": entry["asset"],
+                                                                "digest": f"sha256:{pin['sha256']}"}]}]
+    asked = _github(store, monkeypatch, draft)
+    with pytest.raises(SystemExit):
+        store.dispatch([entry], root, waited=0)
+    assert [call[:3] for call in asked if call[0] == "workflow"] == [("workflow", "run", "upload.yml")]
     # A full release opens the one after the highest.
     full = [{"tag_name": "store-2", "assets": [{"name": f"{index}.npz", "digest": ""}
                                                for index in range(store.ASSETS_PER_RELEASE)]}]

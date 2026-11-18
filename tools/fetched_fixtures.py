@@ -369,10 +369,15 @@ def bucket(settings: Path):
     """The GPU outputs bucket's S3 client and name, from its settings file (endpoint, bucket, access_key_id,
     secret_access_key), as a GPU node holds them."""
     import boto3
+    from botocore.config import Config
 
     held = json.loads(settings.read_text())
+    # No checksum header but those asked for: botocore's default (a CRC32 on every part of a multipart upload,
+    # which upload_file makes of a file past 8 MiB) is one R2 refuses, as the node's own adapter records.
     client = boto3.client("s3", endpoint_url=held["endpoint"], aws_access_key_id=held["access_key_id"],
-                          aws_secret_access_key=held["secret_access_key"], region_name="auto")
+                          aws_secret_access_key=held["secret_access_key"], region_name="auto",
+                          config=Config(retries={"max_attempts": 5, "mode": "standard"}, connect_timeout=10,
+                                        read_timeout=120, request_checksum_calculation="when_required"))
     return client, held["bucket"]
 
 
@@ -411,9 +416,11 @@ def held_assets() -> dict[str, tuple[str, str]]:
     except subprocess.CalledProcessError as error:
         raise SystemExit(f"{GITHUB} could not be read ({error.stderr.strip()[-200:]}): the owner creates "
                          "it, public, before its first upload") from error
+    # A draft release's assets are no fetch's: listed to the token's holder, never read anonymously.
     return {asset["name"]: (release["tag_name"], asset.get("digest") or "")
             for page in pages for release in page
-            if GITHUB_RELEASE.fullmatch(release["tag_name"]) for asset in release["assets"]}
+            if GITHUB_RELEASE.fullmatch(release["tag_name"]) and not release.get("draft")
+            for asset in release["assets"]}
 
 
 def dispatch(staged: list[dict], root: Path = REPO_ROOT, waited: float = DISPATCH_SECONDS) -> None:
