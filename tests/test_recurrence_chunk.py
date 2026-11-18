@@ -355,7 +355,12 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
 
 TURNED = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, skip=True, turns=KEY_WIDTH // 2 - 2)
 """Mamba-3's form: a decay a head's, a write gate, the skip, and the state's first key pairs turned each token
-(`Hooks.turns`), two pairs unturned."""
+(`Hooks.turns`), two pairs unturned. Its sites' oracle is the recurrence a token at a time, the spec's own
+where the upstream has no form at the cell's dtype (docs/design/testing.md's recurrence cells): mamba_ssm's
+Mamba-3 (`mamba3_siso_combined`, state-spaces/mamba e9594ce1c) casts its queries, keys, values, trapezoid
+and angles to bf16 (mamba_ssm/ops/triton/mamba3/mamba3_siso_combined.py:384-392) and turns a token by
+`tanh(angle) pi dt` (angle_dt.py:94, bounded), so an fp32 call's arbitrary turns have none there; its bf16
+layer sites are held to it recorded (row 7923)."""
 
 
 @pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
@@ -364,7 +369,8 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
     math in `CHUNK`-token chunks against the same recurrence a token at a time: output, final memory and
     every operand's gradient, the turns' among them, from float64 (check 1). A turn's gradient is the
     replay's, of the state entering its token and the cotangent leaving it (row 7419: a turn read as an
-    angle summed over a document cancelled across its tokens to 120 times the recurrence's error)."""
+    angle summed over a document cancelled across its tokens to 120 times the recurrence's error).
+    Its oracle the recurrence: `TURNED`'s note."""
     def turned(operands, starts=None):
         return chunk_on('xla', TURNED, dataclasses.replace(operands, starts=starts), chunk_size=CHUNK)
 
@@ -382,9 +388,10 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
 def test_a_turned_states_forked_documents_are_as_exact_as_each_alone():
     """A state that turns its key pairs (`Hooks.turns`) over a forked call through the portable math, each
     document taking up its table slot's memory with its entry write added, its stored finals in the walk's
-    table (Mamba-3's prefix and its questions, a true-frame memory each: `scan.Scan.turn`'s walk turns each
-    chunk's leaving memory back from its frame), against each document a sequence of its own the recurrence
-    a token at a time (`assert_forked_on_par`, check 1)."""
+    table (Mamba-3's prefix and its questions, a true-frame memory each: each document read in its own last
+    token's frame, the memory it takes up turned in as its walk loads it, `templates.recurrence.turned`),
+    against each document a sequence of its own the recurrence a token at a time (`assert_forked_on_par`,
+    check 1). Its oracle the recurrence: `TURNED`'s note."""
     assert_forked_on_par('xla', TURNED, functools.partial(entered_draw, TURNED, entries=True),
                          f'xla {TURNED} a forked call\'s documents', seeds=32)
 
@@ -415,10 +422,10 @@ def test_a_turned_states_long_documents_under_a_short_memory_are_as_exact_as_the
     `LONG_DOCUMENTS`) under a decay keeping a few tokens (`short_memory_draw`), through the portable math,
     against the recurrence a token at a time (each document alone from its table slot's memory where
     forked): output, final memory and every operand's gradient from float64 (check 1). Every document reads
-    in frames from its root's first token and the final memory is turned back by the row's last token's,
-    so a recent write takes two roundings of a whole turn the recurrence's takes none of: read so where a
-    row's last token's frame had been read, the final memory was 1.9 times the recurrence's error (row
-    7419)."""
+    in its own last token's frame (`templates.recurrence.turned`): read in frames from its root's first
+    token and turned back, a recent write took two roundings of a whole turn the recurrence's takes none of,
+    the final memory's worst row 9.6 times the recurrence's (main's per-chunk frames 8.9; row 7419). Its
+    oracle the recurrence: `TURNED`'s note."""
     if layout == 'forked':
         assert_forked_on_par('xla', TURNED, functools.partial(short_memory_draw, forked=True),
                              f'xla {TURNED} long forked documents under a short memory', seeds=32,
