@@ -1747,10 +1747,10 @@ def resumed(tests: list[str]) -> tuple[dict[str, float], set[str]]:
     artifacts = os.environ.get("ARMADA_ARTIFACTS")
     if artifacts and passed:
         Path(artifacts).mkdir(parents=True, exist_ok=True)
+        lines = ({"node": node, "seconds": seconds, **({"cold": True} if node in cold else {})}
+                 for node, seconds in passed.items())
         with (Path(artifacts) / progress.PROGRESS).open("a") as carried:
-            carried.writelines(
-                json.dumps({"node": node, "seconds": seconds, **({"cold": True} if node in cold else {})}) + "\n"
-                for node, seconds in passed.items())
+            carried.writelines(json.dumps(line) + "\n" for line in lines)
     if passed:
         print(f"resumed: {len(passed)} tests an earlier attempt passed set aside", flush=True)
     return passed, cold
