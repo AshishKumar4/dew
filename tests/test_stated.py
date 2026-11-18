@@ -1,6 +1,7 @@
-"""One statement of a user's code and the values it reads (`dew._stated.stated`), which every identity built on
-it reads alike (a data step's exact resume, a program's digest, a rung's key, the accuracy gate's arms): a
-function `jax.jit` wraps, an array of JAX's and a function made inside another are stated by what they are."""
+"""One statement of a user's code and the values it reads (`dew._stated.stated`), which every identity built
+on it reads alike (a data step's exact resume, a program's digest, a rung's key, the accuracy gate's
+arms): a function `jax.jit` wraps, an array of JAX's and a function made inside another are stated by what
+they are."""
 
 import jax
 import jax.numpy as jnp
@@ -9,23 +10,25 @@ import numpy as np
 from dew._stated import stated
 
 
-def scaled(x, factor):
+def times(x, factor):
     return x * factor
 
 
-def shifted(x, factor):
+def plus(x, factor):
     return x + factor
 
 
 def test_a_jitted_function_is_what_it_wraps_and_how_it_is_wrapped():
-    """Two wrappings of one function under the same options state alike; another function, or another
-    static argument, states otherwise. A jitted function of the user's was refused, so a program or an arm
+    """Two wrappings of one function under the same options state alike, a static argument named or
+    placed; another function, no static argument, or a donated one, states otherwise. A jitted function of the user's was refused, so a program or an arm
     that called one had no identity (train 1015's review)."""
-    one = stated(jax.jit(scaled, static_argnums=(1,)), "jit")
-    assert one == stated(jax.jit(scaled, static_argnums=(1,)), "jit")
-    assert one != stated(jax.jit(shifted, static_argnums=(1,)), "jit")
-    assert one != stated(jax.jit(scaled, static_argnames=("factor",)), "jit")
-    assert one != stated(jax.jit(scaled, static_argnums=(1,), donate_argnums=(0,)), "jit")
+    one = stated(jax.jit(times, static_argnums=(1,)), "jit")
+    # A static argument named or placed is one option: JAX reads each from the other by the signature.
+    assert one == stated(jax.jit(times, static_argnums=(1,)), "jit") == stated(
+        jax.jit(times, static_argnames=("factor",)), "jit")
+    assert one != stated(jax.jit(plus, static_argnums=(1,)), "jit")
+    assert one != stated(jax.jit(times), "jit")
+    assert one != stated(jax.jit(times, static_argnums=(1,), donate_argnums=(0,)), "jit")
 
 
 def test_an_array_of_jaxs_is_its_values_and_sharding():
