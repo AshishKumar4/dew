@@ -34,7 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec as P
 
-from dew.algebra import derive
+from dew.algebra import derive, scan
 from dew.algebra.derive import FORMS_HELD
 from dew.algebra.scan import RESET_DECAY, Reads
 from dew.batch import document_firsts
@@ -251,19 +251,19 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             wide, own = _read_once(value, work)
             fused = kernel == 'mosaic_gpu' and not hooks.delta
             if kernel == 'mosaic_gpu':
-                out, final = template_rule(query, key, own, g, beta, state, starts, firsts,
-                                           skip if fused else None, forked=carried,
-                                           max_segments=max_segments, scale=scale, delta=hooks.delta,
-                                           wide=fused_wide, bound=hooks.inverse_bound, rounded=rounded,
-                                           apart=apart)
+                out, final = _on_template(query, key, own, g, beta, state, skip if fused else None, turn,
+                                          starts=starts, firsts=firsts, forked=carried,
+                                          max_segments=max_segments, scale=scale, delta=hooks.delta,
+                                          wide=fused_wide, bound=hooks.inverse_bound, rounded=rounded,
+                                          apart=apart)
             elif kernel == 'fla':
                 out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
                                       max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
             else:
-                size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
-                out, final = _portable(hooks, Tiles(size), query, key, wide, g, beta, state, starts, firsts,
-                                       scale=scale, dtype=work, forked=carried,
-                                       own=given['own'] if hooks.own_weight else None, turn=turn)
+                out, final = _on_portable(hooks, query, key, wide, g, beta, state, turn, starts=starts,
+                                          firsts=firsts, forked=carried, scale=scale, dtype=work,
+                                          own=given['own'] if hooks.own_weight else None,
+                                          chunk_size=chunk_size)
             out = out.astype(work)
             return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
 
@@ -360,9 +360,10 @@ READOUT_HANDOFF = ("a readout of the state entering its token, or weighing its t
 """Why a kernel of the chunked op hands a call of another readout over to the portable math."""
 
 TURN_HANDOFF = ("a state that turns its key pairs (`recurrence.Hooks.turns`: Mamba-3's rotating basis), "
-                "whose turns the portable math's forms read (`scan.Scan.turn`) and neither the port's "
-                "kernels nor the template's mainloop turn")
-"""Why a kernel of the chunked op hands a turned call over to the portable math."""
+                "which the template's and the portable math's turned wrapper takes "
+                "(`templates.recurrence.turned`) and the port's kernels do not")
+"""Why a port's kernel hands a turned call over to the portable math."""
+
 
 
 PORT_FORKED = Refusal('forked', "a forked call, whose documents enter earlier documents' finals of the same "
@@ -519,7 +520,6 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
                 "run's fast forms (`fast_rounding`)", row=INHERENT, kind='handoff'),
     Requirement('readout', lambda case: case.readout or case.apart > 0, READOUT_HANDOFF, row='ledger 6128',
                 kind='handoff'),
-    Requirement('turns', lambda case: not case.turns, TURN_HANDOFF, row='ledger 7419', kind='handoff'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
 call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Template.eligible`: dtypes,
@@ -589,8 +589,7 @@ def _chunked(named: dict, starts, chunk_size: int, work) -> dict:
 
 def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, firsts=None, *,
                  scale: float, delta: bool, dtype=None, bound: float | None = None,
-                 forked: Forked | None = None, reads: Reads = 'after', own=None, group: int = 1,
-                 turn=None):
+                 forked: Forked | None = None, reads: Reads = 'after', own=None, group: int = 1):
     """The recurrence template's plain-JAX mainloop: the recurrence over `config.chunk`-token chunks by the
     forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
@@ -609,29 +608,23 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     the declaration's range facts (`scan.Scan.ranges`). The readout reads the memory entering its token where
     `reads` is 'before' (`recurrence.Hooks.reads`), or after its decay apart from every write of its `group`
     where 'apart' (`scan.Scan.group`: Mamba-3's ranks), and `own` `[Hv, Dk]`, where given, weighs the token's
-    own write in it (`Hooks.own_weight`), each head's given every chunk. `turn` `[B, S, Hv, A]`, where given,
-    turns each value head's state's first `A` key pairs each token before its decay (`Hooks.turns`, the
-    forms' `scan.Scan.turn`)."""
+    own write in it (`Hooks.own_weight`), each head's given every chunk. A turned call's turns are its
+    wrapper's (`templates.recurrence.turned`), which launches this unturned."""
     dtype, work, query, key = _grouped(query, key, value, dtype)
     rows, length, heads, columns = value.shape
     aligned = None
     if forked is not None:
         aligned = AlignedDocuments.of(forked, length, config.chunk)
-        query, key, value, g, beta, *turned = aligned.laid(query, key, value, g, beta,
-                                                           *(() if turn is None else (turn,)))
-        turn = turned[0] if turned else None
+        query, key, value, g, beta = aligned.laid(query, key, value, g, beta)
         starts = None
     width = key.shape[-1]
     declared = (_delta_forms, (("delta", delta), ("scale", scale), ("per_key", g.ndim == 4),
                                 ("width", width), ("columns", columns), ("work", jnp.dtype(work)),
                                 ("reset", starts is not None), ("bound", bound), ("reads", reads),
-                                ("own", own is not None), ("group", group),
-                                ("turns", 0 if turn is None else turn.shape[-1])))
+                                ("own", own is not None), ("group", group)))
     held = 0 if forked is None else forked.held
     given: dict[str, jax.Array] = dict(zip(("q", "k", "v", "g", "beta"), (query, key, value, g, beta),
                                            strict=True))
-    if turn is not None:
-        given["turn"] = turn
     operands = _chunked(given, starts, config.chunk, work)
     if own is not None:
         # Each head's weight every chunk, as the walk maps a row's and head's chunks.
@@ -640,7 +633,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     # The memory entering, and each carry below, typed as every operand varies (a checked `shard_map`'s
     # manual axes; an explicit axis's rows, as the portable math's): a step's outputs vary wherever its inputs
     # do, keys, gates or resets replicated or not.
-    varying = (query, key, value, g, beta, starts, turn)
+    varying = (query, key, value, g, beta, starts)
     if aligned is not None and forked is not None and state is not None:
         # The table's given memories `[B, Hv, S', Dk, Dv]`, and the slot each chunk takes up and leaves its
         # memory in, and its entry write `[B, Hv, chunks, Dk, Dv]`, where the call gives one.
@@ -649,12 +642,14 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
         def headed(x):
             return jnp.broadcast_to(x[:, None], (rows, heads, chunks))
 
-        entries = aligned.entries(forked)
+        entries, turning = aligned.entries(forked), aligned.turning(forked)
         walked = (varying_like(jnp.moveaxis(state.astype(work), 1, 2), *varying), headed(aligned.loads),
                   headed(aligned.stores),
-                  *(() if entries is None else (varying_like(jnp.moveaxis(entries, 2, 1), *varying),)))
+                  *(() if entries is None else (varying_like(jnp.moveaxis(entries, 2, 1), *varying),)),
+                  *(() if turning is None else
+                    (varying_like(jnp.moveaxis(part, 2, 1).astype(work), *varying) for part in turning)))
         outputs, final = _walk_once(*declared, width=width, recomputed=recomputed_memory(), held=held,
-                                    context=derive.context())(operands, walked)
+                                    turned=turning is not None, context=derive.context())(operands, walked)
         out = jnp.moveaxis(outputs.reshape(*outputs.shape[:2], -1, columns), 1, 2)
         return aligned.unlaid(out).astype(dtype), final
     entering = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), work), value) if state is None
@@ -668,16 +663,14 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
 
 @functools.lru_cache(maxsize=FORMS_HELD)
 def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, columns: int, work: jnp.dtype,
-                 reset: bool, bound: float | None, reads: Reads = 'after', own: bool = False, group: int = 1,
-                 turns: int = 0):
+                 reset: bool, bound: float | None, reads: Reads = 'after', own: bool = False, group: int = 1):
     """The delta rule's (or a plain linear recurrence's, without `delta`) chunk forms (`scan.derive_scan`) for
     these facts, every one its declaration reads: the update `h = D h - beta k (k^T D h) + beta k v^T` (`D h
     + beta k v^T` without the delta rule) of a `[width, columns]` state in `work`, `D = exp(g)` a head's or
     each key's (`per_key`), read `scale q^T h` (of the state entering the token where `reads` is 'before',
     after its decay apart from every write of its `group` where 'apart', `scan.Scan.reads`, `Scan.group`;
     with the token's own write weighed a key, `scale ((q own) . (beta k)) v`, where
-    `own`), packed documents' resets where `reset`, its state's first `turns` key pairs turned each token
-    (`scan.Scan.turn`, its operand `turn`), and the range facts `bound` proves. Derived once for
+    `own`), packed documents' resets where `reset`, and the range facts `bound` proves. Derived once for
     equal facts, the latest `FORMS_HELD` kept: built from a call's fresh
     closures, every layer's call derived its own forms, their decomposition and carry splits (`derive_scan`'s
     caches a declaration's) again, 0.25 s a split (a 4B decoder's plan, row 5556)."""
@@ -699,30 +692,30 @@ def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, column
 
     axes = {"q": ("time", "key"), "k": ("time", "key"), "v": ("time", "value"),
             "g": ("time", "key") if per_key else ("time",), "beta": ("time",),
-            **({"own": ("key",)} if own else {}), **({"turn": ("time", "pair")} if turns else {})}
+            **({"own": ("key",)} if own else {})}
     declared = {**axes, RESET: ("time",)} if reset else axes
     # A log decay at most 0 (its decay at most 1); with a bound, keys of unit norm and gates at most it, so
     # two tokens' corrections overlap by at most it (Cauchy-Schwarz).
     ranges = {"g": (-math.inf, 0.0), **({} if bound is None else {"k": 1.0, "beta": bound, "overlap": bound})}
     declaration = scan.Scan(update, readout, declared, walked="time", state=((width, columns), work),
-                            reset=RESET if reset else None, ranges=ranges, reads=reads, group=group,
-                            turn="turn" if turns else None)
+                            reset=RESET if reset else None, ranges=ranges, reads=reads, group=group)
     return scan.derive_scan(declaration, saturation=SATURATION)
 
 
 @functools.lru_cache(maxsize=FORMS_HELD)
-def _walk_once(declare: Callable, facts: tuple, *, width: int, recomputed: bool, held: int, context: tuple):
+def _walk_once(declare: Callable, facts: tuple, *, width: int, recomputed: bool, held: int, context: tuple,
+               turned: bool = False):
     """The walk (`_walk`) by the forms `declare(**dict(facts))` derives (`_delta_forms`, `_oja_forms`) as one
     nested program (`dew.nn.nested`), traced once for equal shapes within a trace (`jax.jit`'s cache, keyed
     on the function and its operands' types) and compiled by the enclosing program, the latest `FORMS_HELD`
     kept. Keyed on every fact the walk reads:
-    its declaration's, `width`, `recomputed` and `held` (`_walk`'s), and `context`, what the forms'
+    its declaration's, `width`, `recomputed`, `held` and `turned` (`_walk`'s), and `context`, what the forms'
     derivation reads (`derive.context`: the mesh, target, numerics, precision and checks a split is priced
     and traced under), which the walk reads no other way: JAX's trace cache keys on none of Dew's, and the
     split one context derives is no other's. Traced at every call, each layer's walk took 0.65 s of a trace
     again (jsf-gdn-layers: 8 equal layers' training step 5.2 s, 1 layer's 0.63 s)."""
     del context
-    walked = _walk(declare(**dict(facts)), width, recomputed, held)
+    walked = _walk(declare(**dict(facts)), width, recomputed, held, turned)
 
     def recurrence_walk(operands, h):
         return walked(operands, h)
@@ -834,41 +827,54 @@ def recurrent_gated_oja_rule(query, key, value, gv, beta, state=None, *, starts=
     return jnp.moveaxis(out, 0, 1).astype(dtype), state
 
 
-def _taken_up(h):
+def _taken_up(h, turned: bool = False):
     """A walk's memory entering (`_walk`'s `h`), and its forked operands where it walks a forked call (`h` a
-    tuple: the given memories, the loads, the stores and, where given, the entry writes)."""
+    tuple: the given memories, the loads, the stores and, where given, the entry writes and, `turned`, the
+    load rotation's `(cos, sin)`)."""
     if isinstance(h, tuple):
-        given, loads, stores, *entries = h
-        return given, (loads, stores, entries[0] if entries else None)
+        given, loads, stores, *rest = h
+        turning = tuple(rest[-2:]) if turned else None
+        entries = rest[:-2] if turned else rest
+        return given, (loads, stores, entries[0] if entries else None, turning)
     return h, None
 
 
-def _opened(given, table, load, entry):
-    """The memory a walk's chunk taking a document up enters (`_walk`): its table slot's (`table_read`), its
-    entry write added where the call gives one."""
+def _opened(given, table, load, entry, turning):
+    """The memory a walk's chunk taking a document up enters (`_walk`): its table slot's (`table_read`),
+    turned by its document's load rotation where the call gives one (`Forked.turning`), its entry write
+    added where the call gives one (its keys turned so already)."""
     taken = table_read(given, table, load)
+    if turning is not None:
+        taken = scan.rotated(taken, *turning, axis=-2)
     return taken if entry is None else taken + entry.astype(taken.dtype)
 
 
 def _forked_chunks(operands, forked):
-    """A forked walk's per-chunk operands (`_walk`): the chunks, their loads and stores, and their entry
-    writes, an empty column a chunk where the call gives none."""
-    loads, stores, entries = forked
-    return (operands, loads, stores, jnp.zeros((loads.shape[0], 0)) if entries is None else entries)
+    """A forked walk's per-chunk operands (`_walk`): the chunks, their loads and stores, their entry writes
+    and load rotations, an empty column a chunk where the call gives none."""
+    loads, stores, entries, turning = forked
+    empty = jnp.zeros((loads.shape[0], 0))
+    return (operands, loads, stores, empty if entries is None else entries,
+            *((empty, empty) if turning is None else turning))
+
+
+def _chunk_opened(memory, table, laid, forked):
+    """`_opened` for a forked walk's chunk (a row of `_forked_chunks`)."""
+    _, load, _, entry, cos, sin = laid
+    return _opened(memory, table, load, None if forked[2] is None else entry,
+                   None if forked[3] is None else (cos, sin))
 
 
 def _forked_steps(step, prepared, memory, forked, held: int, decayed):
     """A forked walk forward (`_walk`): each chunk's memory entering `(decay, memory)` and the row's last
     memory, a chunk taking a document up entering its table slot's memory, the walk's decay from nothing,
     and one ending a storing document leaving its memory in its stored slot."""
-    entries = forked[2]
-
-    def loading(carried, chunk):
+    def loading(carried, laid):
         (decay, h), table = carried
-        chunk, load, store, entry = chunk
+        chunk, load, store = laid[:3]
         taking = load >= 0
         taken = (jnp.where(taking, jnp.zeros_like(decay), decay),
-                 jnp.where(taking, _opened(memory, table, load, None if entries is None else entry), h))
+                 jnp.where(taking, _chunk_opened(memory, table, laid, forked), h))
         after = step(taken, chunk)
         return (after, table_stored(table, store, after[1])), taken
 
@@ -880,12 +886,10 @@ def _forked_steps(step, prepared, memory, forked, held: int, decayed):
 
 def _forked_replay(replay, operands, memory, forked, held: int):
     """A forked walk token by token (`_walk`'s replay): its outputs and the row's last memory."""
-    entries = forked[2]
-
-    def loading(carried, chunk):
+    def loading(carried, laid):
         h, table = carried
-        chunk, load, store, entry = chunk
-        taken = jnp.where(load >= 0, _opened(memory, table, load, None if entries is None else entry), h)
+        chunk, load, store = laid[:3]
+        taken = jnp.where(load >= 0, _chunk_opened(memory, table, laid, forked), h)
         outputs, after = replay(chunk, taken)
         return (after, table_stored(table, store, after)), outputs
 
@@ -900,34 +904,40 @@ def _forked_adjoint(backward, operands, memory, forked, held: int, entering, d_o
     slot, the slot's cotangent (each later chunk that took it up's) joins the walk's; at a chunk taking a
     document up, the cotangent of the memory it entered is its slot's (and its entry write's), and the walk
     before it carries none. Returns the chunks' cotangents and the walk's operands' (`(given, loads, stores,
-    entries?)`, the integers held in their place)."""
-    loads, stores, entries = forked
+    entries?, turning?)`, the integers held in their place, the load rotation's cotangent none: a turned
+    call's turns take theirs in the crossing form, `templates.recurrence.turned`). A load rotation turns a
+    slot's cotangent back into its slot's frame."""
+    loads, stores, entries, turning = forked
     count = memory.shape[0]
+    unit = jnp.zeros((loads.shape[0], 0))
+    cos, sin = (unit, unit) if turning is None else turning
 
     def loading(carried, chunk):
         d_h, d_table, d_given = carried
-        chunk, h, d_out, load, store = chunk
+        chunk, h, d_out, load, store, cos, sin = chunk
         if held:
             at = jnp.maximum(store - 1, 0)
             d_h = d_h + jnp.where(store > 0, d_table[at], 0)
             d_table = d_table.at[at].set(jnp.where(store > 0, 0, d_table[at]))
         d_entering, d_chunk = backward(chunk, (None, h), d_h, d_out)
         taking = load >= 0
+        d_slot = d_entering if turning is None else scan.rotated(d_entering, cos, -sin, axis=-2)
         given_slot = taking & (load > 0) & (load <= count)
-        d_given = d_given.at[jnp.clip(load - 1, 0, count - 1)].add(jnp.where(given_slot, d_entering, 0))
+        d_given = d_given.at[jnp.clip(load - 1, 0, count - 1)].add(jnp.where(given_slot, d_slot, 0))
         if held:
             d_table = d_table.at[jnp.clip(load - count - 1, 0, held - 1)].add(
-                jnp.where(taking & (load > count), d_entering, 0))
+                jnp.where(taking & (load > count), d_slot, 0))
         carried = (jnp.where(taking, 0, d_entering), d_table, d_given)
         return carried, (d_chunk, jnp.where(taking, d_entering, 0))
 
     start = (d_final, jnp.zeros((held, *memory.shape[1:]), d_final.dtype), jnp.zeros_like(memory))
     (_, _, d_given), (d_operands, d_entered) = jax.lax.scan(
-        loading, start, (operands, entering, d_outputs, loads, stores), reverse=True)
-    return d_operands, (d_given, loads, stores, *(() if entries is None else (d_entered,)))
+        loading, start, (operands, entering, d_outputs, loads, stores, cos, sin), reverse=True)
+    return d_operands, (d_given, loads, stores, *(() if entries is None else (d_entered,)),
+                        *(() if turning is None else tuple(jnp.zeros_like(part) for part in turning)))
 
 
-def _walk(forms, width: int, recomputed: bool, held: int = 0):
+def _walk(forms, width: int, recomputed: bool, held: int = 0, turned: bool = False):
     """`xla_mainloop`'s walk over every row's and head's chunks (`[rows, heads, chunks, C, ...]` operands and
     the memory entering), by the token update's derived `forms` (`dew.algebra.scan`): each chunk's values
     that read no memory at once, the memory alone in sequence, then each chunk's outputs from the memory
@@ -945,7 +955,7 @@ def _walk(forms, width: int, recomputed: bool, held: int = 0):
     the chunk that stored it; a given memory's is its own, the walk's last memory's cotangent the row's."""
     def entered(operands, h):
         prepared = jax.vmap(forms.prepare)(operands)
-        memory, forked = _taken_up(h)
+        memory, forked = _taken_up(h, turned)
         # The walk's decay in the forms' own carry dtype (`Derived.init`'s, the state's float32 at least).
         empty = forms.init({})[0]
         decayed = varying_like(jnp.zeros((width,), empty.dtype), *jax.tree.leaves(operands))
@@ -964,7 +974,7 @@ def _walk(forms, width: int, recomputed: bool, held: int = 0):
 
     def replayed_one(operands, h):
         # The walk token by token (`Derived.replay`), the derivative's arithmetic at every order.
-        memory, forked = _taken_up(h)
+        memory, forked = _taken_up(h, turned)
         if forked is None:
             def one(h, chunk):
                 outputs, h = forms.replay(chunk, h)
@@ -977,7 +987,7 @@ def _walk(forms, width: int, recomputed: bool, held: int = 0):
     def adjoint_one(operands, h, entering, d_outputs, d_final):
         if entering is None:
             entering = entered(operands, h)[1][1]
-        memory, forked = _taken_up(h)
+        memory, forked = _taken_up(h, turned)
         if forked is None:
             def one(d_h, chunk):
                 chunk, h, d_out = chunk
@@ -1036,19 +1046,19 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
 
 
 def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta, state, starts, firsts, *,
-              scale: float, dtype, forked, own, turn=None):
-    """The portable math's chunked op (`xla_mainloop`) under `hooks`' readout: a readout apart from its
-    group's writes (`Hooks.reads` 'apart', the group a token's `Hooks.ranks`) the scan's own
+              scale: float, dtype, forked, own):
+    """The portable math's unturned chunked op (`xla_mainloop`) under `hooks`' readout: a readout apart from
+    its group's writes (`Hooks.reads` 'apart', the group a token's `Hooks.ranks`) the scan's own
     (`scan.Scan.group`: each rank reads the state after its token's decay less every rank's write of its
     token, no write read and taken back off), its walk's chunk the largest multiple of the group within the
-    call's, so no chunk cuts a group (a rank-three call's 64 tokens, 63); its state's key pairs turned by
-    `turn` where given (`Hooks.turns`)."""
+    call's, so no chunk cuts a group (a rank-three call's 64 tokens, 63). A turned call's turns are
+    `_turned_or_plain`'s."""
     group = hooks.ranks if hooks.reads == 'apart' else 1
     if tiles.chunk % group:
         tiles = dataclasses.replace(tiles, chunk=max(group, tiles.chunk // group * group))
     return xla_mainloop(tiles, query, key, value, g, beta, state, starts, firsts, scale=scale,
                         delta=hooks.delta, dtype=dtype, bound=hooks.inverse_bound, forked=forked,
-                        reads=hooks.reads, own=own, group=group, turn=turn)
+                        reads=hooks.reads, own=own, group=group)
 
 
 def _read_once(value, work) -> tuple[jax.Array, jax.Array]:
@@ -1265,6 +1275,72 @@ def template_call(query, key, value, g, beta, state=None, starts=None, firsts=No
                                                  forked, **options)
     arguments, keywords = bound(*shard_shapes(operands, specs))
     return base.call((template.MOSAIC,), *arguments, **keywords)
+
+
+def _launched_template(query, key, value, g, beta, state, skip, entry, turning, *, starts, firsts, forked,
+                       **options):
+    """`template_rule`'s `(output, final memory)` with its operands first (`turned.call`'s launch), a forked
+    call's entry write `entry` and load rotation `turning` its documents' (`Forked.entry`,
+    `Forked.turning`)."""
+    if forked is not None:
+        forked = dataclasses.replace(forked, entry=entry, turning=turning)
+    return template_rule(query, key, value, g, beta, state, starts, firsts, skip, forked=forked, **options)
+
+
+def _on_template(query, key, value, g, beta, state, skip, turn, *, starts, firsts, forked, scale: float,
+                 apart: int, **options):
+    """The chunked op's `(output, final memory)` on the template (`template_rule`, a turned call's through
+    `_turned_or_plain`)."""
+    launch = functools.partial(_launched_template, starts=starts, firsts=firsts, forked=forked, scale=scale,
+                               apart=apart, **options)
+    return _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, starts=starts,
+                            forked=forked, scale=scale, group=max(apart, 1))
+
+
+def _on_portable(hooks: recurrence.Hooks, query, key, value, g, beta, state, turn, *, starts, firsts, forked,
+                 scale: float, dtype, own, chunk_size: int):
+    """The chunked op's `(output, final memory)` on the portable math (`_portable`, its chunk `held_chunk`'s
+    under the delta rule; a turned call's through `_turned_or_plain`)."""
+    size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
+    launch = functools.partial(_portable_launch, hooks, Tiles(size), starts=starts, firsts=firsts,
+                               scale=scale, dtype=dtype, forked=forked, own=own)
+    return _turned_or_plain(launch, query, key, value, g, beta, state, None, turn, starts=starts,
+                            forked=forked, scale=scale, group=hooks.ranks if hooks.reads == 'apart' else 1)
+
+
+def _portable_launch(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta, state, skip, entry,
+                     turning, *, starts, firsts, scale: float, dtype, forked, own):
+    """`_portable`'s `(output, final memory)` with its operands first (`turned.call`'s launch), a forked
+    call's entry write `entry` and load rotation `turning` its documents' (`Forked.entry`,
+    `Forked.turning`), the skip the caller's."""
+    del skip
+    if forked is not None:
+        forked = dataclasses.replace(forked, entry=entry, turning=turning)
+    return _portable(hooks, tiles, query, key, value, g, beta, state, starts, firsts, scale=scale,
+                     dtype=dtype, forked=forked, own=own)
+
+
+def _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, *, starts, forked, scale: float,
+                     group: int):
+    """`launch(query, key, value, g, beta, state, skip, entry, turning)`'s `(output, final memory)`, a
+    kernel's unturned chunked op, a forked call's entry write its documents' (`Forked.entry`); a turned
+    call's (`turn`
+    given, `Hooks.turns`) every kernel's alike, its keys and queries turned into its documents' frames, a
+    value head's each (its turns'), a forked one's documents' entry keys too, and its turns' gradient in the
+    crossing form (`templates.recurrence.turned`): the kernel's own speed and its turns' gradient exact."""
+    from .templates.recurrence import turned
+
+    entry = None if forked is None else forked.entry
+    if turn is None:
+        return launch(query, key, value, g, beta, state, skip, entry, None)
+    heads = value.shape[2]
+    query, key = (jnp.repeat(t, heads // t.shape[2], axis=2) for t in (query, key))
+    if entry is not None:
+        entry = (jnp.repeat(entry[0], heads // entry[0].shape[3], axis=3), *entry[1:])
+    documents = None if forked is None else (forked.firsts, forked.loads, forked.stores)
+    held = 0 if forked is None else forked.held
+    return turned.call(launch, query, key, value, g, beta, state, skip, turn, starts, scale=scale,
+                       group=group, documents=documents, held=held, entry=entry)
 
 
 def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, forked: Forked | None,

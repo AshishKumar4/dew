@@ -34,7 +34,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     scan_holds,
 )
 from dew.nn.kernels.templates.recurrence.output import output_launch
-from dew.nn.kernels.templates.recurrence.table import Table
+from dew.nn.kernels.templates.recurrence.table import Table, turning_rows
 
 
 def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=None, *, chunk: int):
@@ -97,17 +97,30 @@ class ForkedTable:
     stores: jax.Array
     entries: jax.Array | None
     held: int = dataclasses.field(metadata={'static': True})
+    turning: tuple | None = None
+    """Each chunk's load rotation `(cos, sin)` `[B, NC, HV, A]` (`chunked_launch.AlignedDocuments.turning`),
+    where a turned call gives one."""
 
 
 def tabled(forked: ForkedTable, width: int, columns: int) -> Table:
     """`forked` as the walks take it (`table.Table`): its memories padded to the call's key and value
-    widths and laid as the memories are, its slots a chunk's."""
+    widths and laid as the memories are, a row past each end where it turns them (`Table.pad`), its slots
+    a chunk's, its load rotation a key row's coefficients (`table.turning_rows`)."""
+    pad = 0 if forked.turning is None else 1
+
     def laid(x):
-        return zero_padded(zero_padded(x.astype(jnp.float32), 3, width), 4, columns).reshape(-1, columns)
+        rows = zero_padded(zero_padded(x.astype(jnp.float32), 3, width), 4, columns).reshape(-1, columns)
+        return jnp.pad(rows, ((pad, pad), (0, 0)))
 
     entries = None if forked.entries is None else laid(forked.entries)
+    turning = None
+    if forked.turning is not None:
+        cos, sin = forked.turning
+        turning = tuple(part.reshape(-1, part.shape[2] * width).astype(jnp.float32)
+                        for part in turning_rows(cos, sin, width))
     return Table(laid(forked.given), forked.loads.reshape(-1).astype(jnp.int32),
-                 forked.stores.reshape(-1).astype(jnp.int32), entries, forked.given.shape[1], forked.held)
+                 forked.stores.reshape(-1).astype(jnp.int32), entries, forked.given.shape[1], forked.held,
+                 turning)
 
 def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None,
             max_segments: int | None = None,

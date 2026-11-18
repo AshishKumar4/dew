@@ -339,9 +339,10 @@ def forked_laid(query, key, value, g, beta, given, forked: chunked_launch.Forked
     `mosaic_rule`'s), its table as the walks take it, `(given, loads, stores, entries)` with its memories
     fp32 (`chunk_forward.ForkedTable`), and the laying."""
     aligned = chunked_launch.AlignedDocuments.of(forked, query.shape[1], chunk)
-    entries = aligned.entries(forked)
+    entries, turning = aligned.entries(forked), aligned.turning(forked)
     table = chunk_forward.ForkedTable(given.astype(jnp.float32), aligned.loads, aligned.stores,
-                                      None if entries is None else entries.astype(jnp.float32), forked.held)
+                                      None if entries is None else entries.astype(jnp.float32), forked.held,
+                                      turning)
     return aligned.laid(query, key, value, g, beta), table, aligned
 
 

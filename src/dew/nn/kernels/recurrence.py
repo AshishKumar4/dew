@@ -110,8 +110,9 @@ class Hooks:
     * own * beta k) . 1) v` (`own` `[Hv, Dk]`, RWKV6's bonus `u` read before the update), each alone a form
     of any recurrence. The chunked op (`recurrence_chunk.chunk`) takes the same form. `turns`, where past
     zero, turns the state's first `2 turns` key rows each token, `turns` adjacent pairs each multiplied as a
-    complex number by `e^{-i turn}` (`Gated.turn`) before the decay, a head's (Mamba-3's rotating basis,
-    `scan.Scan.turn`), unrated, without the delta rule or an own write's weight."""
+    complex number by `e^{-i turn}` (`Gated.turn`) before the decay, a head's (Mamba-3's rotating basis; the
+    chunked op's every kernel reads it through frames, `templates.recurrence.turned`), unrated, without the
+    delta rule or an own write's weight."""
     conv: Conv | None = None
     l2norm: bool = False
     scale: float | None = None

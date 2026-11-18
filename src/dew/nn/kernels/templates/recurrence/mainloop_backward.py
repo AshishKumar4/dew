@@ -241,8 +241,20 @@ def _taken_up(run, taken):
     `[B, NC, HV, Dk, Dv]`, zero at a chunk that takes nothing up (which the walk wrote nothing to)."""
     call, table = run.call, run.table
     taking = (table.loads >= 0).reshape(run.batch, -1)
+    taken = taken[table.pad:taken.shape[0] - table.pad]
     taken = taken.reshape(*taking.shape, call.heads, call.width, call.value_width)
     return jnp.where(taking[..., None, None, None], taken, 0.0)
+
+
+def _turned_back(run, taken):
+    """`taken` (`_taken_up`'s) turned back by each chunk's load rotation (`table.Table.turning`), its slots'
+    own frames; as it is where the call turns none."""
+    table = run.table
+    if table.turning is None:
+        return taken
+    rows, after, before = (part.reshape(*taken.shape[:3], -1)[..., None] for part in table.turning)
+    shifted = jnp.pad(taken, ((0, 0),) * 3 + ((1, 1), (0, 0)))
+    return rows * taken - after * shifted[..., 2:, :] - before * shifted[..., :-2, :]
 
 
 def _tabled_gradients(run, grads: tuple, taken) -> tuple:
@@ -255,7 +267,7 @@ def _tabled_gradients(run, grads: tuple, taken) -> tuple:
     loads = table.loads.reshape(run.batch, -1)
     slots = jnp.arange(1, table.count + 1)
     given = jnp.einsum("bcs,bchkv->bshkv", (loads[..., None] == slots).astype(jnp.float32),
-                       _taken_up(run, taken))
+                       _turned_back(run, _taken_up(run, taken)))
     return (*grads[:5], given[..., :run.key_width, :run.value_width])
 
 
@@ -618,7 +630,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                 *refs, streams, staging, landing):
         skip_ref, refs = (refs[0], refs[1:]) if skips else (None, refs)
         entered_ref, refs = (refs[0], refs[1:]) if call.per_key else (None, refs)
-        table_refs, refs = refs[:2 * (table is not None)], refs[2 * (table is not None):]
+        taken = 0 if table is None else len(table.returning)
+        table_refs, refs = refs[:taken], refs[taken:]
         refs, returned_refs = refs[:len(refs) - returns], refs[len(refs) - returns:]
         dh_ref, dv_ref, dh0_ref, *gated_ref = refs
         j, s, h = at["blocks"], at["sequences"], at["heads"]
@@ -696,7 +709,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                                  table=table)(
         q, k, k if w is None else w, do, local, hi, lo, dht, sequences, k if v is None else v,
         hi if beta is None else beta, *(() if skip is None else (skip.astype(jnp.float32),)),
-        *(() if memory is None else (memory,)), *(() if table is None else (table.loads, table.stores)))
+        *(() if memory is None else (memory,)), *(() if table is None else table.returning))
     # A forked call's stored slots' gathered gradients the walk alone reads.
     return launched[:-1] if returns == 2 else launched
 
