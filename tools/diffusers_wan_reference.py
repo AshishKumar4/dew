@@ -252,6 +252,7 @@ def scheduler_replay() -> dict[str, np.ndarray]:
     its timesteps and every step's sample, in float32 and widened."""
     from diffusers.schedulers import scheduling_unipc_multistep
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
+    from diffusers.schedulers.scheduling_utils import SchedulerOutput
 
     config = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
     arrays: dict[str, np.ndarray] = {}
@@ -270,7 +271,8 @@ def scheduler_replay() -> dict[str, np.ndarray]:
                 scheduler.set_timesteps(steps)
                 x, latents = x_T.to(dtype), []
                 for index, time in enumerate(scheduler.timesteps):
-                    x = scheduler.step(outputs[index].to(dtype), time, x).prev_sample
+                    stepped = scheduler.step(outputs[index].to(dtype), time, x)
+                    x = returned(stepped, SchedulerOutput).prev_sample
                     latents.append(x)
             arrays[f"replay.{steps}.{precision}.latents"] = torch.stack(latents).numpy()
             arrays[f"replay.{steps}.{precision}.timesteps"] = scheduler.timesteps.numpy()

@@ -93,6 +93,8 @@ def published(*, wide: bool = False) -> dict:
     holder = ast.parse("class DiffusionSampler:\n"
                        "    def __init__(self, noise_schedule):\n"
                        "        self.noise_schedule = noise_schedule\n").body[0]
+    if not isinstance(holder, ast.ClassDef):
+        raise TypeError("the holder parsed as no class")
     holder.body.extend(methods)
     ran([holder], scope, "flaxdiff/samplers/common.py")
     for path, name in SAMPLERS.values():
