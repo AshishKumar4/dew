@@ -1489,7 +1489,7 @@ def test_peft_reads_the_adapter_dew_writes_at_dews_logits(name, decoder, tmp_pat
     theirs, truth = transformers_arms((peft, merged), both, twin=(wide, merged_wide))
     draw = fixture_ids(LLAMA)
     variables = adapter.variables
-    weights = {weight: _source_tensor(decoder, merged_tree, weight) for weight in adapted}
+    weights = {weight: jnp.asarray(_source_tensor(decoder, merged_tree, weight)) for weight in adapted}
     assert_as_exact(lambda ids: {"adapted": adapter.model.apply(variables, ids),
                                  "merged": decoder.model.apply(adapter.merge(variables), ids),
                                  "weights": weights},
