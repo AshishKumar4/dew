@@ -879,13 +879,14 @@ def _reductions() -> dict:
     """Dew's variadic reductions check 2 holds, each by its combine, to its contract over all its results
     together. A `reduce` equation carries the combine it was given (its `computation`, the function its
     owner handed `jax.lax.reduce`), and each of these owners hands a function of its module: the
-    compensated pair sum (`dew.nn.precision.compensated_add`) and a row's online softmax with and without
-    its maximum's column (`dew.objectives.lm.chunked`). A reduction is one of these where its combine is
-    that function, whatever its traced program prints as."""
-    from dew.nn.precision import compensated_add
+    compensated pair sum (`dew.nn.precision.compensated_add`, and the renormalization a compensated
+    reduction combines its pairs by, `_renormalized`, its values read as one before it) and a row's online
+    softmax with and without its maximum's column (`dew.objectives.lm.chunked`). A reduction is one of
+    these where its combine is that function, whatever its traced program prints as."""
+    from dew.nn.precision import _renormalized, compensated_add
     from dew.objectives.lm import chunked
 
-    return {compensated_add: _pair_held, chunked._online_softmax: _softmax_held,
+    return {compensated_add: _pair_held, _renormalized: _pair_held, chunked._online_softmax: _softmax_held,
             chunked._online_softmax_predicted: _softmax_held}
 
 
