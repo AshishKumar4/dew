@@ -1225,6 +1225,29 @@ def compensated_primitives_hold_under_jit(shape: str) -> None:
     assert_as_exact(function, as_given(function), draw, f"a compensated {shape} under jit", seeds=8)
 
 
+@pytest.mark.parametrize("interpret", [False, True], ids=["compiled", "interpreted"])
+def test_an_error_free_transform_on_a_tpu_keeps_its_barrier_but_in_a_compiled_kernels_body(interpret):
+    """On a TPU (`generation.assumed`) an error-free transform's operands pass an optimization barrier in an
+    XLA program, as on every platform, and in an interpreted kernel's body, which lowers to one; in a
+    compiled Pallas TPU kernel's body, whose lowering takes no barrier before the fork's post111 (row 7954),
+    they pass as they are (`precision.uncontracted`)."""
+    from test_cache_opening import primitives
+
+    from dew.nn import precision
+    from dew.nn.kernels.launches import pallas_call
+
+    def kernel(x_ref, y_ref, out_ref):
+        out_ref[...] = precision.two_sum(x_ref[...], y_ref[...])[0]
+
+    x = jax.ShapeDtypeStruct((8, 128), jnp.float32)
+    launch = pallas_call(kernel, name="two_sum", out_shape=x, interpret=interpret)
+    with generation.assumed("v5e"):
+        program = primitives(jax.make_jaxpr(lambda a, b: precision.two_sum(a, b))(x, x).jaxpr)
+        launched = primitives(jax.make_jaxpr(launch)(x, x).jaxpr)
+    assert "optimization_barrier" in program
+    assert ("optimization_barrier" in launched) == interpret
+
+
 @pytest.mark.parametrize("shape", COMPENSATED_SHAPES)
 def test_a_compensated_primitive_under_jit_is_its_eager_arithmetic(shape):
     """`compensated_primitives_hold_under_jit` on the CPU (a GPU's in tests/test_gpu_numerics.py)."""

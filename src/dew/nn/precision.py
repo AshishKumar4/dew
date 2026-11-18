@@ -1327,14 +1327,16 @@ def uncontracted(*values):
     the value where it is made, so every reader sees the one rounded value (`two_sum`'s operands,
     `two_product`'s product).
 
-    On a TPU (`generation.backend`) the values as they are: Pallas TPU's Mosaic lowering takes no barrier
-    (post108, whose attention forms reach `two_product` and `two_sum` in a kernel body, `natural_exp` and
-    `natural_carried`), and whether a TPU's compilers contract a multiply into an add is unmeasured: a v5e
-    run of `x y - barrier(x y)` decides it, with the fork's lowering of the barrier in Pallas TPU, which
-    retires this branch."""
+    In a Pallas TPU kernel's body (`launches.interpreting` False, a launch compiled for a TPU,
+    `generation.backend`) the values as they are: Pallas TPU's Mosaic lowering takes no barrier (post108 to
+    post110, whose attention forms reach `two_product` and `two_sum` in a kernel body, `natural_exp` and
+    `natural_carried`), which the fork's post111 lowers (row 7954 retires this branch). XLA's TPU programs,
+    and an interpreted kernel's body, which lowers to them, keep the barrier."""
     from dew.nn.kernels.generation import backend
+    from dew.nn.kernels.launches import interpreting
 
-    return values if backend() == "tpu" else jax.lax.optimization_barrier(values)
+    in_tpu_kernel = interpreting() is False and backend() == "tpu"
+    return values if in_tpu_kernel else jax.lax.optimization_barrier(values)
 
 
 def binade_of(x: jax.Array) -> jax.Array:
