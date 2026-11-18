@@ -873,7 +873,8 @@ class MosaicForward(_Mainloop[Tiles]):
         arguments = ba.arguments
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
         reduced = reducing(family, config.consumers, self.score_reduces or self.output_mod is not None,
-                           magnitudes=cached and self.scales_in_kernel(ba))
+                           magnitudes=(cached and self.scales_in_kernel(ba)) or self.deciding(
+                               ba.arguments.get("residuals"), ba.arguments["value"].dtype, family))
         return resources.shared_bytes(family, launch_scope(family, allocations, reduced,
                                                            reduces=forward_reduces(family, reduced),
                                                            products=self._products(ba, config)))
