@@ -9,12 +9,13 @@ pass starts from the cache as the step entered it and only the last pass's write
 (`SharedPassView`): the passes before it carry the cache through the scan, each reading the step's
 entering cache in place of the one the pass before left, and the carry is dropped; the last runs after
 the scan, as the first does. What a pass sows, a router's or attention's statistics or captured
-intermediates, extends the step's sows pass by pass, as the unrolled passes' did. The passes before
-the last `backprop_steps` pass no gradient back: the cut is static, the passes before it scanned, the
-pass it cuts traced on its own and those after it scanned, so no pass before it keeps residuals or runs
-a backward. Where every pass exits (`Loop.exiting`: an exit gate, or `exits`) each pass's exit state
-leaves as the last pass's does, the coda run on its output under its own cache entries, so the later
-passes are traced one by one.
+intermediates, extends the step's sows pass by pass, as the unrolled passes' did, a router's and
+attention's at the block's own layer names (`OBSERVED`), each pass a call of the same weights. The
+passes before the last `backprop_steps` pass no gradient back: the cut is static, the passes before it
+scanned, the pass it cuts traced on its own and those after it scanned, so no pass before it keeps
+residuals or runs a backward. Where every pass exits (`Loop.exiting`: an exit gate, or `exits`) each
+pass's exit state leaves as the last pass's does, the coda run on its output under its own cache
+entries, so the later passes are traced one by one.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from flax.core.scope import DenyList
 
 from ..precision import at_least_fp32, softplus
 from ..protocols import EXITS
-from .decoder_stack import WRITTEN, Loop, PassView, SharedPassView
+from .decoder_stack import OBSERVED, WRITTEN, Loop, PassView, SharedPassView, sows_appended
 from .layer_names import group_layers
 
 
@@ -104,8 +105,9 @@ def _stepped(loop: Loop, out, x, injected):
 class PassStack:
     """What later passes write, stacked on a leading pass axis as a scan over `views`' passes reads it,
     and each pass's back where the unrolled passes put it. A collection a stack writes (`WRITTEN`) holds
-    a pass's layer entries under the names its view (`PassView`) stores them by; under `shared` every
-    pass's entries are the block's own, its sows extending them in pass order, and the cache is the
+    a pass's layer entries under the names its view (`PassView`) stores them by, but for what a pass
+    observes of the block's weights (`OBSERVED`); under `shared`, and for those, every pass's entries are
+    the block's own, its sows extending them in pass order, and under `shared` the cache is the
     scan's carry, which comes back dropped. What a pass sows elsewhere (`appended`: captured
     intermediates, a name of no layer) extends the tuples it sows into at each leaf, pass by pass, as
     the unrolled passes' sows did. Flax calls `inside` before `outside` within one trace, which holding
@@ -117,8 +119,9 @@ class PassStack:
     held: dict = dataclasses.field(default_factory=dict)
 
     def _per_pass(self, collection: str) -> bool:
-        """Whether `collection` keeps each pass's layer entries apart, under the pass's own names."""
-        return collection in WRITTEN and not self.shared
+        """Whether `collection` keeps each pass's layer entries apart, under the pass's own names: none of
+        what a pass observes of the block's weights (`OBSERVED`), which every pass sows at their names."""
+        return collection in WRITTEN and collection not in OBSERVED and not self.shared
 
     def inside(self, variables: Mapping[str, Mapping]) -> dict:
         self.held = {collection: dict(tree) for collection, tree in variables.items()}
@@ -152,26 +155,8 @@ class PassStack:
                         {view._moved(name, view.offset - view.first): value
                          for name, value in entries.items() if group_layers(name) is not None})
                     entries = {name: value for name, value in entries.items() if group_layers(name) is None}
-                out[collection] = _merged(out.get(collection, {}), entries)
+                out[collection] = sows_appended(out.get(collection, {}), entries)
         return out
-
-
-def _merged(held: Mapping, sown: Mapping) -> dict:
-    """A collection's `held` entries with a pass's `sown` ones appended (`_appended`)."""
-    return {**held, **{name: _appended(held.get(name), value) for name, value in sown.items()}}
-
-
-def _appended(held, sown):
-    """`held` with `sown` appended at each leaf: a sown tuple extends the held one, a mapping merges
-    key by key, and any other value replaces the held one, as a sow's reduction does."""
-    if isinstance(sown, Mapping):
-        merged: dict[str, object] = dict(held or {})
-        for name, value in sown.items():
-            merged[name] = _appended(merged.get(name), value)
-        return merged
-    if isinstance(sown, tuple):
-        return (*(held or ()), *sown)
-    return sown
 
 
 def pass_offset(loop: Loop, layers: int, step: int) -> int:
