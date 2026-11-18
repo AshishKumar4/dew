@@ -753,7 +753,7 @@ class Keeping:
             self.refused[named] = f"its executable does not serialize: {refusal}"
             return
         runtime = executable.runtime_executable()
-        if not isinstance(runtime, xla_client.LoadedExecutable):
+        if runtime is None or not isinstance(runtime, xla_client.LoadedExecutable):
             # Compiled for devices this process has not loaded (a compile-only GPU's,
             # `dew.nn.kernels.generation.compile_only_gpus`): no program of its default backend.
             self.refused[named] = "it was compiled for devices this process has not loaded (a compile-only " \

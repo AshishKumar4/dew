@@ -2110,5 +2110,5 @@ def test_a_program_compiled_for_a_compile_only_gpu_is_refused_by_the_keeper_not_
     placed = jax.ShapeDtypeStruct((3,), jnp.float32, sharding=NamedSharding(
         Mesh(np.asarray(gpus("sm80")), ("data",)), PartitionSpec()))
     with keeping() as programs:
-        owned_program(lambda values: values * 2).lower(placed).compile()
+        owned_program(lambda values: values * 2).executable(placed)
     assert programs.kept == {} and len(programs.refused) == 1
