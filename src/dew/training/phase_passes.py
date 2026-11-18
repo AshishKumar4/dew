@@ -297,8 +297,7 @@ class SampledPasses:
             units = _mode(counts, location, self.dispersion) @ (weights / 2)
             modes = _mode(below.astype(float), location, self.dispersion)
             logs = (np.concatenate([[0.0], np.cumsum(units)]) - factorials
-                    + np.array([_about_mode(float(mode), count, location, self.dispersion)
-                                for count, mode in enumerate(modes)]))
+                    + np.array([_about_mode(float(mode), self.dispersion) for mode in modes]))
         probabilities = np.exp(logs - logs.max())
         cumulative = np.cumsum(probabilities / probabilities.sum())
         # The sum's last partial is 1 but for its rounding, which a uniform draw past it must not reach.
@@ -325,7 +324,7 @@ def _mode(counts: np.ndarray, location: float, dispersion: float) -> np.ndarray:
             low, high = np.where(rising, middle, low), np.where(rising, high, middle)
 
 
-def _about_mode(mode: float, count: int, location: float, dispersion: float) -> float:
+def _about_mode(mode: float, dispersion: float) -> float:
     """The log of a count's integrand over the log rate (`SampledPasses.cumulative`) about its `mode`, scaled
     by its peak and by the normal density's width: the integral over the standardized log rate `z` (`x = mode
     + dispersion z`) of `exp(-exp(mode) (expm1(dispersion z) - dispersion z) - z² / 2)`, the peak's own terms
