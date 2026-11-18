@@ -1413,6 +1413,10 @@ class GlobalStream:
         """The order's description, which a saved position is compared against."""
         return self._order
 
+    def order_under(self, version: int | None) -> str:
+        """The order as the plan `version` described its stages (`Plan.order_under`)."""
+        return self._plan.order_under(version)
+
     def identity(self) -> str:
         """The plan's identity (`Plan.identity`), which a pool agrees before it
         reads: hosts whose copies of a corpus hold other records, or whose
@@ -1430,9 +1434,10 @@ class GlobalStream:
                 f"past {len(saved.completed)} phase(s), and this run reads one order "
                 f"({self._order}); resume it with the phases that wrote it"
             )
-        from dew.data.plan import same_order
+        from dew.data.plan import same_order, saved_version
 
-        if not same_order(saved.order, self._order):
+        # The saved order as its plan's version described its stages (`Plan.order_under`).
+        if not same_order(saved.order, self._plan.order_under(saved_version(saved.plan))):
             raise ValueError(
                 f"the saved data position is {saved.records} records into "
                 f"{saved.order}, and this run reads {self._order}; a record count "
@@ -1457,6 +1462,7 @@ class GlobalReader(Protocol):
     def records(self) -> int: ...
     @property
     def order(self) -> str: ...
+    def order_under(self, version: int | None) -> str: ...
     def __next__(self) -> Batch: ...
     def get_state(self) -> Position: ...
     def set_state(self, state: bytes) -> None: ...
@@ -1680,7 +1686,7 @@ class PhasedStream:
 
     def set_state(self, state: bytes) -> None:
         saved = _position.read(state)
-        from dew.data.plan import same_order
+        from dew.data.plan import same_order, saved_version
 
         if self._tokens is not None:
             if len(saved.completed) > len(self._ends):
@@ -1715,8 +1721,15 @@ class PhasedStream:
                     )
                 )
 
+        # Each phase's order as the version its saved plan records described its stages (`Plan.order_under`).
+        held = [] if saved.plan is None else saved.plan.get("phases", [saved.plan])
+        versions = [saved_version(plan) if isinstance(plan, Mapping) else None for plan in held]
+
+        def ordered(index: int) -> str:
+            return self._stream(index).order_under(versions[index] if index < len(versions) else None)
+
         for index, (order, end) in enumerate(saved.completed):
-            if (index >= len(self._ends) or not same_order(order, self._stream(index).order)
+            if (index >= len(self._ends) or not same_order(order, ordered(index))
                     or self._ends[index] != end):
                 raise _position.PlanChanged(
                     (f"phases.{index}",),
@@ -1725,7 +1738,7 @@ class PhasedStream:
                     f"run has read cannot change under it"
                 )
         phase = len(saved.completed)
-        if phase >= len(self._open) or not same_order(saved.order, self._stream(phase).order):
+        if phase >= len(self._open) or not same_order(saved.order, ordered(phase)):
             raise _position.PlanChanged(
                 (f"phases.{phase}",),
                 f"the saved position is {saved.records} records into phase {phase}, "

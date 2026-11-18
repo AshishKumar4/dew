@@ -264,9 +264,7 @@ def generated_instance(value) -> bool:
 def field_names(held: type) -> list[str]:
     """The names of the fields a class generator recorded for `held` (`generated`), in order: what an
     instance of it holds, a record's parts."""
-    if dataclasses.is_dataclass(held):
-        return [field.name for field in dataclasses.fields(held)]
-    return [field.name for field in vars(held)["__attrs_attrs__"]]
+    return [field.name for field in instance_fields(held)]
 
 
 def _setattr_hooks(held: type) -> Mapping[str, Callable]:

@@ -96,6 +96,11 @@ class _Host(_CheckpointableMapping):
             raise TypeError("host-stage parent has no global order")
         return self._global.order
 
+    def order_under(self, version: int | None) -> str:
+        if self._global is None:
+            raise TypeError("host-stage parent has no global order")
+        return self._global.order_under(version)
+
 
 class _CanonicalPass:
     def __init__(self, reader: Reader, partition: DataPartition, batch: int):
