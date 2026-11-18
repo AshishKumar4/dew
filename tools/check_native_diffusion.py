@@ -24,6 +24,7 @@ from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import DenoisingInputs
 from dew.inputs import Field, unit_range
 from dew.interop import Pretrained
+from dew.interop.pretrained import PretrainedPipeline
 from dew.nn.kernels.options import program
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
@@ -35,8 +36,11 @@ def bundle(directory, streamed: bool = False):
     """The pipeline, loaded whole, or streamed onto a mesh a leaf at a time."""
     from dew.training import MeshSpec
 
-    return Pretrained.load(str(directory), dtype="float32", attention_impl="xla",
-                           **({"mesh": MeshSpec()} if streamed else {}))
+    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla",
+                             mesh=MeshSpec() if streamed else None)
+    if not isinstance(loaded, PretrainedPipeline):
+        raise TypeError(f"{directory} loads as a {type(loaded).__name__}, not a diffusion pipeline")
+    return loaded
 
 
 RECORDINGS = Path(__file__).resolve().parents[1] / "tests/fixtures/native_diffusion"
@@ -645,13 +649,12 @@ def model_site(directory):
     from reference_error import with_gradients
 
     from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
-    from dew.nn.backbones.unet_condition import UNet2DCondition
     from dew.nn.inputs import DenoisingCondition
     from tools.diffusers_consumer import flax_unet
 
     directory = Path(directory)
     config = json.loads((directory / "unet/config.json").read_text())
-    model = UNet2DCondition(**unet_fields(config, attention_impl="xla"))
+    model = unet_fields(config, attention_impl="xla").value
     parameters, _ = translate_unet_weights(component_tensors(directory, "unet"), model)
     ids = TIME_IDS.get(directory.name)
     time_ids = None if ids is None else jnp.asarray([ids] * MODEL_ROWS, jnp.int32)

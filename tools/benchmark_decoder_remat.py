@@ -75,15 +75,15 @@ def main():
     parser.add_argument("--mlp", type=int, default=None, help="the MLP's width, twice the model's if absent")
     parser.add_argument("--attention-impl", default="xla")
     args = parser.parse_args()
-    mixer = {} if args.mixer == "attention" else {"mixer": mixers.build("mamba2", {
+    mixer = None if args.mixer == "attention" else mixers.build("mamba2", {
         "num_heads": 2 * args.width // 64, "head_dim": 64, "state_size": 128, "n_groups": 1,
-        "conv_kernel": 4})}
+        "conv_kernel": 4})
     model = CausalTransformer(
         vocab_size=args.vocab, emb_features=args.width, num_layers=args.depth,
         num_heads=args.heads, num_kv_heads=args.kv_heads,
         mlp_features=2 * args.width if args.mlp is None else args.mlp,
         max_seq_len=args.length, dtype=jnp.dtype(args.dtype), attention_impl=args.attention_impl,
-        scan_layers=args.scan, remat=args.remat, **mixer,
+        scan_layers=args.scan, remat=args.remat, mixer=mixer,
         mixture=Mixture(experts=4, top_k=2) if args.case == "sparse" else None,
         kv_shared_layers=tuple(range(args.depth // 2, args.depth)) if args.case == "shared" else None)
     objective = LMObjective(model, args.length)
@@ -98,7 +98,8 @@ def main():
 
     kept = saved_residuals(lambda variables: loss(variables, tokens)[0], shapes)
     activation_bytes = sum(aval.size * aval.dtype.itemsize for aval, source in kept
-                           if not source.startswith("from the argument"))
+                           if isinstance(aval, jax.core.ShapedArray)
+                           and not source.startswith("from the argument"))
 
     def step(params, opt_state, tokens):
         (value, _), grads = jax.value_and_grad(loss, has_aux=True)(params, tokens)
@@ -119,7 +120,7 @@ def main():
     def stepped(carry):
         return jitted(carry[0], carry[1], tokens)
 
-    warm, _ = carried(stepped, (params, opt_state, None), 3)
+    warm, _ = carried(stepped, (params, opt_state, jnp.zeros((), jnp.float32)), 3)
     (params, opt_state, value), (seconds,) = carried(stepped, warm, args.steps)
     milliseconds = 1000 * seconds / args.steps
     allocated_after = device.memory_stats()

@@ -5,11 +5,12 @@ import dataclasses
 import functools
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Any
+from typing import Any, TypedDict
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import flax.linen as nn
 import optax
 from benchmark_cases import (
     TEXT_FEATURES,
@@ -35,6 +36,7 @@ from dew.distributed.batches import DevicePrefetchIterator
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.condition import ConditionEncoder
 from dew.nn.attention import AttentionImpl
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.flux2 import Flux2Transformer
 from dew.nn.backbones.qwen_image import QwenImageTransformer
@@ -101,7 +103,14 @@ class _DenoisingTextTable(ConditionEncoder[str]):
                 "pooled_features": self.pooled_features, "guidance": self.guidance, "masked": self.masked}
 
 
-def trainer_mesh(mesh: Mapping[str, int]) -> dict[str, object]:
+class TrainerMesh(TypedDict):
+    """The trainer's fields a case's mesh record names (`trainer_mesh`)."""
+
+    mesh: MeshSpec
+    microbatches: int | None
+
+
+def trainer_mesh(mesh: Mapping[str, int]) -> TrainerMesh:
     """The trainer's `mesh` and `microbatches` a case's mesh record names: its
     MeshSpec fields and the pipeline's microbatches, refusing a field it lacks."""
     fields = {f.name for f in dataclasses.fields(MeshSpec)}
@@ -109,8 +118,8 @@ def trainer_mesh(mesh: Mapping[str, int]) -> dict[str, object]:
     if unknown:
         raise ValueError(f"mesh has no field {unknown}; it names MeshSpec's fields {sorted(fields)} "
                          f"and microbatches")
-    return {"mesh": MeshSpec(**{name: value for name, value in mesh.items() if name != "microbatches"}),
-            "microbatches": mesh.get("microbatches")}
+    sizes = {name: value for name, value in mesh.items() if name != "microbatches"}
+    return {"mesh": dataclasses.replace(MeshSpec(), **sizes), "microbatches": mesh.get("microbatches")}
 
 
 def media_values(case: Case) -> tuple[str, TowerBase, ProjectorBase, int]:
@@ -120,14 +129,15 @@ def media_values(case: Case) -> tuple[str, TowerBase, ProjectorBase, int]:
     family = media.get("family")
     if not isinstance(family, str) or not family:
         raise ValueError(f"a media case names its checkpoint family, got {family!r}")
-    for name in ("tower", "projector"):
-        if not isinstance(media.get(name), Mapping):
-            raise ValueError(f"a media case's {name} is a record, got {media.get(name)!r}")
+    tower, projector = media.get("tower"), media.get("projector")
+    if not isinstance(tower, Mapping):
+        raise ValueError(f"a media case's tower is a record, got {tower!r}")
+    if not isinstance(projector, Mapping):
+        raise ValueError(f"a media case's projector is a record, got {projector!r}")
     token = media.get("image_token_id")
     if type(token) is not int or token < 0:
         raise ValueError(f"a media case's image_token_id is an id, got {token!r}")
-    return (family, towers.from_record(media["tower"]),
-            projectors.from_record(media["projector"]), token)
+    return family, towers.from_record(tower), projectors.from_record(projector), token
 
 
 def image_tokens(case: Case) -> int:
@@ -147,7 +157,7 @@ def image_tokens(case: Case) -> int:
     return features.shape[1]
 
 
-def objective_keywords(case: Case, constructor: Callable[..., Objective]) -> Mapping[str, Any]:
+def objective_keywords(case: Case, constructor: type) -> Mapping[str, Any]:
     """The case's own objective keywords (`Case.objective`), with its head chunking where it names one:
     what every language-model objective it builds, a decoder's or a canvas's, is given, each read against
     `constructor`'s arguments as a run's record is (`dew.registry.read_arguments`)."""
@@ -178,8 +188,16 @@ def decoder_objective(
                                             **objective_keywords(case, MaskedDiffusionObjective))
 
 
+def decoder_trunk(case: Case, trunk: nn.Module) -> CausalTransformer:
+    """`trunk`, the decoder a canvas or a media wrapper takes, refused where the case's trunk builds another."""
+    if not isinstance(trunk, CausalTransformer):
+        raise TypeError(f"{case.label}'s trunk {case.trunk} builds a {type(trunk).__name__}, not the decoder "
+                        "a canvas or a media wrapper takes")
+    return trunk
+
+
 def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
-                    widened: bool = False) -> Objective:
+                    widened: bool = False) -> Objective[Any, Any]:
     """The objective a recipe would train for this case.
 
     The case's dtype, attention kernel and matmul precision go into the
@@ -202,9 +220,9 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
     def built(architecture: str, config: Mapping[str, object]):
         declared = {field.name for field in dataclasses.fields(models[architecture])}
         settings = {"attention_impl": attention_impl, "precision": case.matmul_precision}
-        return models.build(architecture, **config, dtype=jnp.float64 if widened else dtype,
-                            **{key: value for key, value in settings.items()
-                               if value is not None and key in declared})
+        return models.build(architecture, {**config, "dtype": jnp.float64 if widened else dtype,
+                                           **{key: value for key, value in settings.items()
+                                              if value is not None and key in declared}})
 
     sample_key = "video" if case.frames else "image"
     fields = case.trunk_fields()
@@ -212,7 +230,7 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
 
     if case.canvas is not None:
         prompt, width, count = canvas_split(case)
-        model = DiffusionGemma(text=trunk, canvas_length=width)
+        model = DiffusionGemma(text=decoder_trunk(case, trunk), canvas_length=width)
         if case.decoder_objective != "lm":
             raise ValueError(f"{case.label} trains canvases, which BlockDiffusionObjective scores; "
                              f"it names decoder_objective={case.decoder_objective!r}")
@@ -222,7 +240,7 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
     elif case.media is not None:
         family, tower, projector, token = media_values(case)
         # The decoder carries the attention kernel; the wrapper reads none.
-        model = MultimodalTransformer(trunk, tower, projector, family, token,
+        model = MultimodalTransformer(decoder_trunk(case, trunk), tower, projector, family, token,
                                       dtype=jnp.float64 if widened else resolve_dtype(dtype))
         objective = decoder_objective(case, model)
     elif case.is_lm:
@@ -240,6 +258,7 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
     else:
         model = trunk
         preset = presets.EDM(regime="pixel")
+        encoder: ConditionEncoder[Any, Any]
         if isinstance(model, QwenImageTransformer):
             keyword = "conditioning"
             encoder = _DenoisingTextTable.from_pretrained()
@@ -284,15 +303,17 @@ def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
     batch, so the step reads it whole and climbs the remat ladder where it must.
     `ahead`, its step compiled ahead (`ahead_of`), runs as its first step where it
     is that program, so the GPU compiles nothing for it."""
+    fields = trainer_mesh(case.mesh)
     trainer = Trainer(
         build_objective(case, attention_impl),
         optimizer or OptimConfig(optimizer=case.optimizer, learning_rate=1e-4).build(None),
         key=0,
-        **trainer_mesh(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
+        mesh=fields["mesh"], microbatches=fields["microbatches"],
+        layout=Layout(min_shard=case.fsdp_min_param_size),
         accumulation=case.accumulation, split=1, checkpoints=None, tracker=None, ahead=ahead)
     if case.device_order is not None:
         by_id = {device.id: device for device in jax.devices()}
-        trainer.device_mesh = trainer.mesh.build([by_id[index] for index in case.device_order])
+        trainer.device_mesh = fields["mesh"].build([by_id[index] for index in case.device_order])
     return trainer
 
 
@@ -302,7 +323,7 @@ def ahead_of(case: Case, generation: str, capacity: int,
     `generation` of `capacity` bytes of memory (`dew.training.ahead.compile_ahead`), on any host: what a GPU
     node's prepare hands its run (`build_trainer`'s `ahead`), and what perf_gate's compile rows time."""
     trainer = build_trainer(case, attention_impl)
-    trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus(generation, 1, capacity)))
+    trainer.device_mesh = trainer_mesh(case.mesh)["mesh"].build(list(compile_only_gpus(generation, 1, capacity)))
     return compile_ahead(trainer, global_batch(case))
 
 
