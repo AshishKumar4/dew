@@ -1863,9 +1863,14 @@ def _theta_rows(variables, passes: int):
         if not named or len(leaf.shape) != 1:
             return leaf
         shape = (passes - 1, *leaf.shape)
-        # A source held as shapes alone (`weights=False`, a resume's) rows its shape.
+        # A source held as shapes alone (`weights=False`, a resume's) rows its shape, its channels placed as
+        # its one θ's were and its rows whole.
         if isinstance(leaf, jax.ShapeDtypeStruct):
-            return jax.ShapeDtypeStruct(shape, leaf.dtype, sharding=leaf.sharding)
+            placed = leaf.sharding
+            if isinstance(placed, jax.sharding.NamedSharding):
+                placed = jax.sharding.NamedSharding(placed.mesh,
+                                                    jax.sharding.PartitionSpec(None, *placed.spec))
+            return jax.ShapeDtypeStruct(shape, leaf.dtype, sharding=placed)
         return jnp.broadcast_to(leaf, shape)
 
     return jax.tree_util.tree_map_with_path(rowed, variables)

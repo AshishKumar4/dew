@@ -211,10 +211,20 @@ def test_a_theta_per_pass_over_a_checkpoints_implicit_loop_starts_each_row_at_it
     rowed = asked.looped(shaped).variables
     (shape,) = [leaf for name, leaf in named_leaves_of(rowed) if "loop_theta" in name]
     assert isinstance(shape, jax.ShapeDtypeStruct) and shape.shape == (2, *held.shape)
+    # Its channels placed as its one θ's, over a mesh, its rows whole.
+    mesh = jax.make_mesh((2,), ("x",), devices=jax.devices()[:2])
+    channels = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("x"))
+    placed = dataclasses.replace(implicit, variables=jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jax.ShapeDtypeStruct(np.shape(leaf), np.asarray(leaf).dtype, sharding=channels)
+        if "loop_theta" in jax.tree_util.keystr(path) else leaf, shaped.variables))
+    (rowed_placed,) = [leaf for name, leaf in named_leaves_of(asked.looped(placed).variables)
+                       if "loop_theta" in name]
+    assert rowed_placed.sharding.spec == jax.sharding.PartitionSpec(None, "x")
     # A checkpoint holding rows for three passes keeps them, run at two.
     fewer = dataclasses.replace(asked, loop_steps=2).looped(per_pass)
     assert fewer.model.loop.theta_passes == 3 and fewer.model.loop.steps == 2
-    assert np.all(np.isfinite(np.asarray(fewer.model.apply(fewer.variables, ids))))
+    np.testing.assert_array_equal(np.asarray(fewer.model.apply(fewer.variables, ids)),
+                                  np.asarray(per_pass.model.with_passes(2).apply(per_pass.variables, ids)))
     with pytest.raises(ValueError):
         dataclasses.replace(asked, loop_steps=4).looped(per_pass)
 
