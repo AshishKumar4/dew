@@ -1352,13 +1352,9 @@ def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, fo
     P = jax.sharding.PartitionSpec
     walked = ()
     if forked is not None:
-        # The documents' slots a row's, the entry write's key, value and weight its terms' heads, and a
-        # turned call's load rotation (`Forked.turning`, `[B, D, Hv, A]`) its rows' and heads', in
-        # `Forked.walked`'s order.
+        # The table's memories a row's and head's, and the documents' operands as `Forked` places them.
         memory = P(four[0], None, four[2], None, None)
-        walked = (resets,) * 3 + ((P(four[0], None, None, four[2], None),) * 2 + (three,)
-                                  if forked.entry is not None else ()) + (
-            (P(four[0], None, four[2], None),) * 2 if forked.turning is not None else ())
+        walked = forked.specs(four[0], four[2])
     optional = [(state, memory), (starts, resets), (firsts, resets), (skip, P(four[2]))]
     operands = (query, key, value, g, beta, *(x for x, _ in optional if x is not None),
                 *(() if forked is None else forked.walked))
@@ -1967,7 +1963,7 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, load
         if forked is not None:
             operands = (x, dt, A, B, C, D, state, *walked)
             specs = (three, three, P(None, None), three, three, P(None), P(rows, None, None, None),
-                     *(P(rows, None),) * len(walked))
+                     *forked.specs(rows, None))
             return manual_map(template, specs, (three, three))(*operands)
         held = state if state is not None else jnp.zeros((x.shape[0], x.shape[-1], A.shape[-1]), x.dtype)
         operands = (x, dt, A, B, C, D, held, *([] if starts is None else [starts]))
