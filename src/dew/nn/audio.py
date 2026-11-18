@@ -24,7 +24,7 @@ from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import accumulated, at_least_fp32, capped_logits, float32_dot_general, softplus
 from dew.nn.rope import sinusoid_frequencies, sinusoids
 
-from .activations import activation
+from .activations import activation, logistic
 from .conv import Conv
 from .norms import LayerNorm, RMSNorm
 from .vision import TowerBase, TowerGeometry
@@ -423,7 +423,7 @@ class AudioLightConv(nn.Module):
         x = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="pre_layer_norm")(x)
         x = self.linear(self.width * 2, name="linear_start")(x)
         first, gate = jnp.split(x, 2, axis=-1)
-        x = first * jax.nn.sigmoid(gate)
+        x = first * logistic(gate)
         x = Conv(
             self.width,
             (self.kernel_size,),

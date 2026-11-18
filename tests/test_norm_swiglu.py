@@ -278,6 +278,26 @@ def test_a_norms_activation_choosing_a_branch_runs_on_the_tile(taken):
             SEEDS[(2, 3, 31)])
 
 
+def a_norm_with_dews_silu_after_it_holds_the_float64_gate():
+    """The fused fp32 norm with Dew's own silu after it (`activations.silu`, `x` times the one logistic, a
+    declared tangent over a marked span the kernel's lowering runs as its body), its output and its input's
+    and weight's gradients on par with XLA's (check 1): interpreted on a CPU, and compiled through Pallas's
+    Triton lowering on a GPU (tests/test_gpu_numerics.py), where a span the lowering cannot take fails the
+    launch (row 7371)."""
+    from dew.nn import activations
+
+    assert norm_swiglu.elementwise(activations.silu, (2, 3, 31))
+    fused, plain = _fused_norm(activations.silu)
+    compare((functools.partial(plain, jnp.float32), fused, functools.partial(plain, jnp.float64)),
+            lambda draw: norm_operands((2, 3, 31), jnp.float32, jnp.float32, draw), ("y", "x", "weight"),
+            SEEDS[(2, 3, 31)])
+
+
+def test_a_norm_with_dews_silu_after_it_holds_the_float64_gate():
+    """`a_norm_with_dews_silu_after_it_holds_the_float64_gate`, interpreted on a CPU."""
+    a_norm_with_dews_silu_after_it_holds_the_float64_gate()
+
+
 def test_a_norms_activation_keeps_its_own_derivative():
     """A custom derivative after the fused norm stays its own: relu's is 0 at 0, where its primal's maximum
     splits its slope in half. A row of zeros norms to zeros, whose cotangent relu stops: the fused norm's

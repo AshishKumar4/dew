@@ -549,11 +549,11 @@ def _merged(a, b, carried, issue: Callable) -> Walk:
     # The state before the later walk turned by its tokens' turns, then decayed (a pair's decay one).
     entering = a.h if b.turn is None else rotated(a.h, *b.turn, axis=0)
     if b.transfer is None:
-        h = jnp.exp(b.decay)[:, None] * entering + b.h
-        transfer = None if a.transfer is None else jnp.exp(b.decay)[:, None] * a.transfer
+        h = accurate_exp(b.decay)[:, None] * entering + b.h
+        transfer = None if a.transfer is None else accurate_exp(b.decay)[:, None] * a.transfer
     else:
         h = issue("transfer_apply", b.transfer, a.h) + b.h
-        transfer = (issue("transfer_decay", jnp.exp(a.decay), b.transfer) if a.transfer is None
+        transfer = (issue("transfer_decay", accurate_exp(a.decay), b.transfer) if a.transfer is None
                     else issue("transfer_compose", b.transfer, a.transfer))
     turn = _composed(a.turn, b.turn)
     if carried is None:

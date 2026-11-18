@@ -23,7 +23,7 @@ from jax.extend.core import primitives
 
 from dew.algebra import terms
 from dew.algebra.forms import aval
-from dew.nn.derivatives import marked_call_p
+from dew.nn.derivatives import marked_call_p, stated_operation
 from dew.nn.programs import called, entrywise, host_evaluated, live, on_host
 
 
@@ -122,9 +122,13 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | No
     for equation in jaxpr.eqns:
         operands = [read(atom) for atom in equation.invars]
         # A marked span stays as written: a boundary the algebra reads by its kind
-        # (`dew.nn.derivatives.marked`, a protected span's inside no rule touches), so no region crosses it.
+        # (`dew.nn.derivatives.marked`, a protected span's inside no rule touches), so no region crosses it;
+        # one that states the operation it computes is that operation (`_computed`).
         body = None if equation.primitive is marked_call_p else called(equation)
-        if body is not None:
+        made = _computed(equation, operands)
+        if made is not None:
+            outputs = made
+        elif body is not None:
             # What the call computes, the primal of a custom derivative's: its own derivative rule bars its
             # region (`BARRIERS`); a declaration's is the call's, kept where the call is written.
             outputs = _evaluated(body, body.consts, *operands, forms=forms)
@@ -146,6 +150,25 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | No
                                or _normal(equation, operands, widened, laid))
         env.update(zip(equation.outvars, outputs, strict=True))
     return [read(atom) for atom in jaxpr.outvars]
+
+
+def _computed(equation: jcore.JaxprEqn, operands: list) -> list | None:
+    """A marked span's outputs as the operation it states it computes (`derivatives.stated_operation`): Dew's
+    one logistic (`precision.logistic_value`) the logistic, `logistic_p`, of its operand widened to float32
+    where narrower and its result converted back (one convert, the logistic, one convert, as the span
+    computes and rounds it; at float32 or wider the logistic alone), so a program's own sigmoid and Dew's
+    reach one normal form; None for any other equation, a span stating nothing kept as written. The form
+    holds the node; turned back into code it is Dew's arithmetic again (`terms.value_of`)."""
+    from dew.nn.precision import at_least_fp32, logistic_value
+
+    if stated_operation(equation) is not logistic_value or len(operands) != 1:
+        return None
+    (operand,) = operands
+    dtype = jnp.result_type(operand)
+    # The logistic node a program's own sigmoid binds, its parameters with it (its accuracy unstated, as
+    # `jax.lax.logistic` binds it by default): a bare bind carries none, which no program's equation equals.
+    return [jax.lax.logistic_p.bind(jnp.asarray(operand).astype(at_least_fp32(dtype)), accuracy=None)
+            .astype(dtype)]
 
 
 FOLDED = frozenset({jax.lax.iota_p, jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.transpose_p,

@@ -35,7 +35,7 @@ from flax.typing import Dtype
 
 from .derivatives import Protected, contracted, declared_tangent
 from .kernels import norm_swiglu
-from .precision import at_least_fp32, capped_logits, rounded_to, softplus
+from .precision import at_least_fp32, capped_logits, divided, logistic_value, rounded_to, softplus
 
 
 def gelu_exact(x: jax.Array) -> jax.Array:
@@ -61,23 +61,49 @@ def gelu_tanh(x: jax.Array) -> jax.Array:
     relative to its size on an A100 where this form lay 1.1e-7 (each alone 5.6e-8 and 4.9e-8). The
     sigmoid also keeps the tail `1 + tanh` cancels: on a CPU the form lies 3.5e-8 from float64 against
     `jax.nn.gelu`'s 4.5e-8 and torch's 2.8e-8, and 3.1e-7 against 1.3e-4 and 3.4e-5 below x = -3,
-    over 2^22 normal inputs at scale 3. The sigmoid is `lax.logistic` at its highest accuracy, whose
-    derivative is `s(z) s(-z)`: the default `s (1 - s)` reads the rounded `s(z)`, which from x near 5
-    in fp32 rounds to 1 and drops the derivative's `x s(z) s(-z) z'`, a derivative of 1 where
-    float64's is 1.0000016. The forward is the default's on a CPU and a GPU, which lower either alike."""
+    over 2^22 normal inputs at scale 3. The sigmoid is Dew's one `logistic`, whose derivative is
+    `s(z) s(-z)`: `s (1 - s)` reads the rounded `s(z)`, which from x near 5 in fp32 rounds to 1 and drops
+    the derivative's `x s(z) s(-z) z'`, a derivative of 1 where float64's is 1.0000016."""
     work = x.astype(at_least_fp32(x.dtype))
     inner = math.sqrt(8 / math.pi) * (work + 0.044715 * work ** 3)
-    return (work * jax.lax.logistic(inner, accuracy=jax.lax.AccuracyMode.HIGHEST)).astype(x.dtype)
+    return (work * logistic(inner)).astype(x.dtype)
 
 
 def quick_gelu(x: jax.Array) -> jax.Array:
     """CLIP's activation, `x * sigmoid(1.702 x)`, ACT2FN's `quick_gelu`."""
-    return x * jax.nn.sigmoid(1.702 * x)
+    return x * logistic(1.702 * x)
+
+
+def _logistic_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
+    """`logistic`'s value `s(x)` and tangent `s(x) s(-x)`, each order finite where `e^-x` overflows (`s`
+    zero): `s (1 - s)` reads the rounded `s(x)`, one past x near 17 in fp32, its derivative then zero."""
+    (x,), (tangent,) = primals, tangents
+    s = logistic(x)
+    return s, s * logistic(-x) * tangent.astype(s.dtype)
+
+
+def _logistic(x) -> jax.Array:
+    given = jnp.asarray(x)
+    return logistic_value(given).astype(given.dtype)
+
+
+logistic = contracted("test_silu_holds_every_order")(
+    declared_tangent(Protected(computes=logistic_value), _logistic, _logistic_jvp))
+"""Dew's one logistic, `1 / (1 + e^-x)` formed in at least float32 (`precision.logistic_value`) and rounded
+once to `x`'s dtype, its exp accurate (`precision.accurate_exp`: a target's own where it is, Dew's on one
+whose is not, a v5e's) and a true division: a backend's logistic is no part of it, a v5e's approximate even
+at HIGHEST. Every silu (`silu`), gelu (`gelu_tanh`), sigmoid and softplus's derivative
+(`precision.softplus`) of Dew's reads it; a kernel's body, which differentiates nothing, its arithmetic
+(`precision.logistic_value`)."""
 
 
 def silu(x: jax.Array) -> jax.Array:
-    """`x * sigmoid(x)` in at least fp32, in `x`'s dtype."""
-    return jax.nn.silu(x.astype(at_least_fp32(x.dtype))).astype(x.dtype)
+    """`x * sigmoid(x)` as `x` times Dew's one `logistic`, in at least fp32 and rounded once to `x`'s dtype,
+    its derivative through the logistic's declared tangent: a backend's logistic, a v5e's approximate even at
+    HIGHEST, held Mamba-2's layer at 3.5 times its CPU float32 through its conv's and its gate's silus, where
+    this holds it at 0.89 times (row 7062, M-JS-136). Every silu of Dew's, an MLP's and a mixer's alike."""
+    work = x.astype(at_least_fp32(x.dtype))
+    return (work * logistic(work)).astype(x.dtype)
 
 
 def relu2(x: jax.Array) -> jax.Array:
@@ -89,6 +115,22 @@ Activation = Callable[[jax.Array], jax.Array]
 HIDDEN_ACT: dict[str, Activation] = {'gelu': gelu_exact, 'gelu_pytorch_tanh': gelu_tanh,
                                      'quick_gelu': quick_gelu, 'silu': silu, 'relu': jax.nn.relu}
 """The activations Hugging Face's `hidden_act` names, as Dew computes them."""
+
+
+GATE_ACTIVATIONS: dict[str, Activation] = {
+    'sigmoid': logistic,
+    'silu': silu,
+    # torch's softplus at beta log 2, log(1 + exp(x log 2)) / log 2.
+    'softplus2': lambda gate: divided(softplus(gate * math.log(2)), math.log(2)),
+    # torch's softplus in at least float32, Laguna's `F.softplus(g_proj(x).float())`, which the branch's
+    # product casts back (modeling_laguna.py:410).
+    'softplus': lambda gate: softplus(gate.astype(at_least_fp32(gate.dtype))),
+}
+"""A gate's activations by name, as JAX differentiates them: an attention output gate's
+(`MixerContext.output_gate_activation`) and a gated norm's, 'silu' or 'sigmoid' (`norms.gated_rms_norm`, the
+recurrence's gated output norm; their kernels refuse the softplus gates), Dew's one logistic and its silu
+their tangents declared, where a kernel's body takes their arithmetic (`precision.activation_and_slope`),
+whose derivative JAX's autodiff makes no number where `e^-x` overflows."""
 
 
 def activation(name: str) -> Activation:
@@ -198,7 +240,7 @@ class Situ:
     def __call__(self, gate: jax.Array, up: jax.Array) -> jax.Array:
         wide = at_least_fp32(gate.dtype)
         work_gate, work_up = gate.astype(wide), up.astype(wide)
-        activated = capped_logits(work_gate, self.beta) * jax.nn.sigmoid(work_gate)
+        activated = capped_logits(work_gate, self.beta) * logistic(work_gate)
         if self.linear_beta is not None:
             work_up = capped_logits(work_up, self.linear_beta)
         return (activated * work_up).astype(gate.dtype)

@@ -26,6 +26,7 @@ from jax.experimental import pallas as pl
 
 from dew._hashing import fmix32
 from dew.algebra.scan import Reads, turned
+from dew.nn.activations import GATE_ACTIVATIONS, logistic, silu
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels import launches
 from dew.nn.precision import (
@@ -35,7 +36,6 @@ from dew.nn.precision import (
     l2norm,
     rms_statistics,
     rms_weighted,
-    silu,
     softplus,
     stochastic_bf16,
 )
@@ -266,18 +266,18 @@ def gated(gates: Gates, gate, log_a, bias, beta):
     sigmoid write gate the gated delta rule's (`_gated_decay`, `sigmoid(beta)`), with the step's
     Mamba2's (`-exp(log_a)` times the clipped step, and the step)."""
     if gates.write == 'sigmoid' and gates.limit is None:
-        return _gated_decay(gate, log_a, bias), jax.nn.sigmoid(beta)
+        return _gated_decay(gate, log_a, bias), logistic(beta)
     step = softplus(gate + bias)
     if gates.limit is not None:
         step = jnp.clip(step, *gates.limit)
-    return -accurate_exp(log_a) * step, step if gates.write == 'step' else jax.nn.sigmoid(beta)
+    return -accurate_exp(log_a) * step, step if gates.write == 'step' else logistic(beta)
 
 
 def gated_rms(out, z, weight, norm: OutputNorm):
     """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`, its
     inverse RMS the one statistic every norm takes (`rms_statistics`)."""
     inverse = rms_statistics(out, norm.epsilon)[1]
-    return rms_weighted(out, inverse, weight=weight, gate=z, activation=norm.activation)
+    return rms_weighted(out, inverse, weight=weight, gate=GATE_ACTIVATIONS[norm.activation](z))
 
 
 ROW = {"rows": True}
@@ -511,7 +511,7 @@ def _gates(hooks: Hooks, given: dict, work, key_width: int):
     if g is None:
         decay = jnp.ones((rows, heads, 1), work)
     else:
-        decay = jnp.exp(g)
+        decay = accurate_exp(g)
         decay = (decay[..., None] if hooks.decay == 'scalar'
                  else jnp.broadcast_to(decay, (rows, heads, key_width)))
     write = jnp.ones((rows, heads), work) if beta is None else beta

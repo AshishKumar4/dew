@@ -511,9 +511,10 @@ def test_a_gated_norm_broadcasts_its_gate_in_either_order(scale_wide):
     in float64 over fp32 inputs (ledger 3627), bit for bit: norm first, each group normalized in fp32 and
     weighted, the weighted norm rounded to fp32 before a gate broadcast over it multiplies it; gate first,
     over a gate broadcasting the input's leading axis, the norm of the gated values' shape. The gate's silu
-    is the module's own (`precision.silu`)."""
+    is the module's own (`activations.silu`)."""
+    from dew.nn.activations import silu
     from dew.nn.mixers.mamba2 import MambaRMSNormGated
-    from dew.nn.precision import rms_statistics, silu
+    from dew.nn.precision import rms_statistics
 
     rng = np.random.default_rng(0x3627)
     with jax.enable_x64(new_val=True):
