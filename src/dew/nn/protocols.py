@@ -763,13 +763,15 @@ class Looping(Protocol):
     `layers`, [first, end), which gives a model with no loop one; None where they cannot.
     `backprop_steps` trains through the final passes, `remat` checkpoints each pass, `implicit`
     takes each later pass by the θ-method, `exit_gate` weighs each pass's exit, `exit_threshold`
-    exits each token where they reach it and `exits` gives every pass its exit; None keeps an existing
+    exits each token where they reach it, `exits` gives every pass its exit and `theta_passes` gives an
+    implicit loop a θ row for each later pass of that many (`Loop.theta_passes`); None keeps an existing
     loop's value, or a fresh loop's default."""
 
     def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
                     backprop_steps: int | None = None, remat: bool | None = None,
                     implicit: bool | None = None, exit_gate: bool | None = None,
-                    exit_threshold: float | None = None, exits: bool | None = None) -> Self | None: ...
+                    exit_threshold: float | None = None, exits: bool | None = None,
+                    theta_passes: int | None = None) -> Self | None: ...
 
 
 @runtime_checkable

@@ -126,6 +126,33 @@ def test_a_decision_run_whose_passes_grow_by_phase_resumes_as_one(tmp_path):
     assert loaded.model.backbone.loop.steps == STEPS[-1]
 
 
+def test_a_phased_run_with_a_theta_per_pass_keeps_its_rows_through_its_phases_and_resumes(tmp_path):
+    """The phased run with a θ per later pass (`loop_theta_per_pass`, rows for its largest count): its θ
+    holds its rows through the phase of one pass, whose steps move none, and moves from the second; stopped
+    inside the second phase and resumed, it lands where the run nobody stopped lands, bit for bit; its
+    record states the choice and its saved run loads with its rows; and the choice without an implicit loop
+    is refused before anything loads (row 7661)."""
+    from dew.decision.config import DecisionRunConfig as Config
+
+    data = phased(tmp_path)
+
+    def per_pass(name: str, steps: int):
+        return trained(dataclasses.replace(run(tmp_path, STEPS, data), loop_theta_per_pass=True), tmp_path,
+                       name, trainer={"steps": steps, "checkpoint_every": 1})[0]
+
+    whole = per_pass("whole", 4)
+    assert theta(whole).shape[0] == STEPS[-1] - 1 and np.any(theta(whole))
+    per_pass("stopped", 3)
+    resumed = per_pass("stopped", 4)
+    for name, leaf in parameters(whole).items():
+        np.testing.assert_array_equal(leaf, parameters(resumed)[name], err_msg=name)
+    assert Config.load(str(tmp_path / "runs" / "stopped")).loop_theta_per_pass
+    loaded = Decide.from_run(str(tmp_path / "runs" / "stopped"))
+    assert loaded.model.backbone.loop.theta_passes == STEPS[-1]
+    with pytest.raises(ValueError):
+        dataclasses.replace(run(tmp_path, STEPS, data), loop_implicit=False, loop_theta_per_pass=True)
+
+
 @pytest.mark.parametrize("phase", range(len(STEPS)), ids=[f"{passes}-passes" for passes in STEPS])
 def test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_counts_its_flops(tmp_path,
                                                                                                phase):

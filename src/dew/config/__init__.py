@@ -1742,6 +1742,10 @@ class DecoderRunConfig(RunConfig):
     """Relax each later pass toward the block's input by a per-channel θ drawn
     at zero (`Loop.implicit`), so the looped decoder starts as the one loaded
     computes; False keeps a checkpoint's own choice."""
+    loop_theta_per_pass: bool = False
+    """Give each later pass of an implicit loop (`loop_implicit`) a θ of its own (`Loop.theta_passes`),
+    rows for the largest count the run takes (`loop_steps`, or a phase's largest), each drawn at zero;
+    False keeps a checkpoint's own choice."""
     loop_exit_gate: bool = False
     """Weigh each pass's exit by a gate drawn at zeros over its states (`Loop.exit_gate`), which the
     objective's `exit_entropy` trains as Ouro does, at `EXIT_ENTROPY` where the run states none
@@ -1752,6 +1756,9 @@ class DecoderRunConfig(RunConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.loop_theta_per_pass and not self.loop_implicit:
+            raise ValueError("--loop-theta-per-pass gives each later pass of an implicit loop its own θ: it "
+                             "needs --loop-implicit")
         if isinstance(self.loop_steps, tuple) and self.data is not None:
             # Refused before anything loads: a count a phase the data reads in.
             phases = self.data.phase_count
@@ -1777,7 +1784,7 @@ class DecoderRunConfig(RunConfig):
         """Whether the run asks anything of a loop (`looped`)."""
         return (self.loop_steps is not None or self.loop_layers is not None
                 or self.loop_backprop_steps is not None or self.loop_remat or self.loop_implicit
-                or self.loop_exit_gate or self.loop_exit_threshold is not None)
+                or self.loop_theta_per_pass or self.loop_exit_gate or self.loop_exit_threshold is not None)
 
     def exit_settings(self) -> dict[str, float]:
         """The exit objective's weight an objective that trains a gate the run draws (`loop_exit_gate`)
@@ -1801,28 +1808,32 @@ class DecoderRunConfig(RunConfig):
         """`start` with its block run as the run asks (`looping`), as loaded where it asks nothing."""
         if not self.loops:
             return start
+        counts = self.loop_steps if isinstance(self.loop_steps, tuple) else (self.handed_passes,)
+        rows = max((count for count in counts if count is not None), default=None)
         return looping(start, self.handed_passes, self.loop_layers, backprop_steps=self.loop_backprop_steps,
                        remat=self.loop_remat or None, implicit=self.loop_implicit or None,
                        exit_gate=self.loop_exit_gate or None, exit_threshold=self.loop_exit_threshold,
-                       key=self.trainer.key)
+                       theta_passes=rows if self.loop_theta_per_pass else None, key=self.trainer.key)
 
 
 def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | None, *,
             backprop_steps: int | None = None, remat: bool | None = None,
             implicit: bool | None = None, exit_gate: bool | None = None,
-            exit_threshold: float | None = None, key: int | jax.Array = 0) -> "Pretrained":
+            exit_threshold: float | None = None, theta_passes: int | None = None,
+            key: int | jax.Array = 0) -> "Pretrained":
     """A loaded checkpoint whose block runs `steps` passes: a looped one's own block, or `layers`,
     which gives a decoder with no loop one over its own layers. Refused where neither names a block,
     or a new block's passes are not stated. `backprop_steps` and `remat` choose
     the loop's backward memory, `implicit` its later passes' rule (`Loop.implicit`), and `exit_gate` and
-    `exit_threshold` its exits (`Loop.exit_gate`); None keeps a looped checkpoint's own value. A loop
+    `exit_threshold` its exits (`Loop.exit_gate`) and `theta_passes` its θ's rows (`Loop.theta_passes`);
+    None keeps a looped checkpoint's own value. A loop
     that gives its layers parameters of their own (an implicit loop's θ, an exit gate) draws them from
     `key` beside the loaded weights, fresh (`Pretrained.with_model`)."""
     from dew.nn.protocols import Looping
 
     looped = (start.model.with_passes(steps, layers, backprop_steps=backprop_steps, remat=remat,
                                       implicit=implicit, exit_gate=exit_gate,
-                                      exit_threshold=exit_threshold)
+                                      exit_threshold=exit_threshold, theta_passes=theta_passes)
               if isinstance(start.model, Looping) else None)
     if looped is None:
         raise ValueError(f"this {type(start.model).__name__} has no loop: --loop-layers names the block of "
