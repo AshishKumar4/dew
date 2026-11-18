@@ -418,8 +418,8 @@ def test_a_tasks_peak_bounds_its_tests_and_a_heavy_files_tasks_run_large(ci, tmp
     assert ci.durations_record()["tests/test_ranks.py::test_b"] == 30.0
     assert ci.heavy_files() == {"tests/test_ranks.py"}
     entries = [entry for entry in ci.plan(240.0, {"files": {}}) if entry["python"] == "3.12"]
-    sized = {entry["tests"]: entry.get("size") for entry in entries}
-    assert sized["tests/test_ranks.py"] == "large" and sized["tests/test_light.py"] is None
+    # The task that runs the heavy file, light files packed beside it or not, is large.
+    assert [entry.get("size") for entry in entries if "tests/test_ranks.py" in entry["tests"]] == ["large"]
     # A newer, lighter task (a group of its own) lowers its tests' peak.
     rows = [{**rows[0], "peak": light}]
     verdict.write_text(json.dumps({"sha": commit(tmp_path, "main"), "part": "all", "rows": rows}))
@@ -427,3 +427,4 @@ def test_a_tasks_peak_bounds_its_tests_and_a_heavy_files_tasks_run_large(ci, tmp
     lowered = json.loads((tmp_path / "tests/test_durations.json").read_text())
     assert lowered["tests/test_ranks.py::test_a"][2] == light
     assert ci.heavy_files() == set()
+    assert all("size" not in entry for entry in ci.plan(240.0, {"files": {}}))
