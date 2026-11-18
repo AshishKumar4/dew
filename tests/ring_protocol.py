@@ -6,11 +6,11 @@ those programs explored under CUDA's mbarrier and asynchronous-copy semantics.
 
 The events are the kernel's own equations: an `mbarrier` wait (`barrier_wait`, at its named phase, or
 without one, Mosaic's tracked phase), an arrival (`barrier_arrive`, or a tcgen05 commit's,
-`tcgen05_commit_arrive`, once the products its thread issued before it have read their operands), a TMA
+`tcgen05_commit_arrive`, asynchronous, once the products its thread issued before it complete), a TMA
 load (`copy_gmem_to_smem`: an arrival with its transaction at issue, its bytes landing later, out of order
 with other copies), a TMA store (`copy_smem_to_gmem`, reading shared memory until `wait_smem_to_gmem`
 retires it), a generic proxy's fence (`commit_smem`), a warpgroup product (`wgmma`, reading shared memory
-until `wgmma_wait` retires it) or a tcgen05 one (`tcgen05_mma`, until its thread's next commit), a
+until `wgmma_wait` retires it) or a tcgen05 one (`tcgen05_mma`, until its thread's next commit completes), a
 shared-memory read or write (`get`, `swap`), and an inlined body's (`inline_mgpu`, lane-level code the
 jaxpr does not show) as its body's own fields state them (`INLINED`: a gathered ring's barriers' arrivals,
 its parity waits, and each load warp's gathers and the first's expecting arrival). Index arithmetic, loops
@@ -26,6 +26,9 @@ The semantics assumed (PTX ISA, `mbarrier`, `cp.async.bulk`, `fence.proxy.async`
   the transaction completes;
 - a TMA store reads its shared-memory source asynchronously until a `wait_smem_to_gmem` retires it, and
   reads a generic write only after a `commit_smem` (`fence.proxy.async`) that follows it;
+- a tcgen05 commit completes asynchronously (`tcgen05.commit`): once the products its thread issued before
+  it complete, their operands' reads ending then, it arrives at its barrier, ordered to every thread, its
+  own too, only through a wait that observes that arrival;
 - the scheduler is weakly fair: a thread that can move eventually does. A state where none can and some
   program has not ended is a deadlock.
 
@@ -275,16 +278,16 @@ def _wait(self: _Interpreter, equation, values) -> list:
     return self.emit("wait", at, phase)
 
 
-def _arrival(tree_name: str) -> Callable:
-    """An arrival at its barrier's slot, its transforms' tree the equation's `tree_name`: a `barrier_arrive`,
-    or a tcgen05 commit's (`_tcgen05_commit`)."""
+def _arrival(tree_name: str, kind: str = "arrive") -> Callable:
+    """An arrival at its barrier's slot, an event of `kind`, its transforms' tree the equation's `tree_name`:
+    a `barrier_arrive`, or a tcgen05 commit's (`committed`: `tcgen05_commit_arrive`, asynchronous)."""
     def arrive(self: _Interpreter, equation, values) -> list:
         tree = equation.params[tree_name]
         count = tree.num_leaves
         if equation.params.get("has_user_predicate") and not bool(
                 np.asarray(_governing(values[1 + count], "an arrival's predicate"))):
             return []
-        return self.emit("arrive", _slot(values[0], tree, values[1:1 + count]))
+        return self.emit(kind, _slot(values[0], tree, values[1:1 + count]))
 
     return arrive
 
@@ -343,8 +346,9 @@ def _product_wait(self: _Interpreter, equation, values) -> list:
 
 
 def _tcgen05_product(self: _Interpreter, equation, values) -> list:
-    """A tcgen05 product (`tcgen05_mma`): its operands, each at its slot, read asynchronously until a commit
-    of its thread retires it (`_tcgen05_commit`); its accumulator tensor memory's. Refused where it arrives
+    """A tcgen05 product (`tcgen05_mma`): its operands, each at its slot, read asynchronously until the
+    completion of a commit of its thread after it (a `committed` event); its accumulator tensor memory's.
+    Refused where it arrives
     at a barrier of its own once it completes (`arrive`), an asynchronous arrival the checker does not
     order."""
     params = equation.params
@@ -360,11 +364,10 @@ def _tcgen05_product(self: _Interpreter, equation, values) -> list:
     return self.emit("product", (), sources)
 
 
-def _tcgen05_commit(self: _Interpreter, equation, values) -> list:
-    """A tcgen05 commit's arrival (`tcgen05_commit_arrive`): once every product its thread issued before it
-    completes, so their reads end first (each retired), then the arrival."""
-    self.emit("product_wait", (), 0)
-    return _arrival("barrier_transforms_tree")(self, equation, values)
+_tcgen05_commit = _arrival("barrier_transforms_tree", "committed")
+"""A tcgen05 commit (`tcgen05_commit_arrive`): asynchronous, completing once every product its thread issued
+before it completes, their reads ending then, and arriving at its barrier then: ordered to a thread, its own
+too, only through a wait that observes that arrival."""
 
 
 SYNC: dict[str, Callable] = {
@@ -617,7 +620,10 @@ class _State:
             made = self.copy()
             made.flight = self.flight - {flight}
             moved = [*trace, ("landed", (issuer, position))]
-            if barrier:
+            if threads[issuer][position].kind == "committed":
+                # A commit's completion: its arrival, the issuing thread's.
+                made.arrive(barrier, arrivals, issuer, moved)
+            elif barrier:
                 made.arrive(barrier, arrivals, issuer, moved, transaction=-1, count=False)
             yield made, moved
         for thread, program in enumerate(threads):
@@ -657,6 +663,8 @@ class _State:
             if event.kind == "load":
                 made.arrive(event.argument, arrivals, thread, trace, transaction=1)
             made.flight = self.flight | {(thread, self.positions[thread], event.argument)}
+        elif event.kind == "committed":
+            made.flight = self.flight | {(thread, self.positions[thread], event.at)}
         return made
 
     def check(self, awaited, trace) -> None:
@@ -710,6 +718,8 @@ class _Order:
         self.pending: list = [[] for _ in threads]
         self.unfenced: list = [set() for _ in threads]
         self.issued: dict = {}
+        self.committed: list = [[] for _ in threads]
+        self.committing: dict = {}
 
     def arrived(self, at, clock, *, counted: bool, transaction: int) -> None:
         joined, count, flying = self.accumulating.get(at, ({}, 0, 0))
@@ -732,9 +742,30 @@ class _Order:
                     raise Violation(
                         "unordered", f"write of {at} unordered with the read of {where} before it",
                                     [(None, prior_event), (None, event)])
+            # A read still in flight (a product's or a store's not retired, a tcgen05 product no commit's
+            # completion has ended) ends after this write, whatever orders the write.
+            flying = [entry for entries in self.pending for entry in entries]
+            flying += [entry for products in self.committed for entry, done in products if done is None]
+            for _, where, prior_event in flying:
+                if _overlaps(where, at):
+                    said = f"write of {at} while the {prior_event.kind} reading {where} is in flight"
+                    raise Violation("unordered", said, [(None, prior_event), (None, event)])
 
     def landed(self, thread, position, event) -> None:
         landing = _joined(self.issued[(thread, position)], {("load", thread, position): 1})
+        if event.kind == "committed":
+            # A commit's completion, after every product its thread issued before it completes: a product a
+            # commit landed before completed then, and one none did completes here, its reads ending.
+            covered = self.committing.pop((thread, position))
+            for _, done in covered:
+                if done is not None:
+                    landing = _joined(landing, done)
+            for product in covered:
+                if product[1] is None:
+                    product[1] = landing
+                    self.reads.append((product[0][1], landing, product[0][2]))
+            self.arrived(event.at, landing, counted=True, transaction=0)
+            return
         self.ordered(event.at, landing, event, write=True)
         self.writes.append((event.at, landing, event))
         if event.argument:
@@ -761,6 +792,14 @@ class _Order:
                 self.unfenced[thread].add(event.at)
         elif kind == "commit":
             self.unfenced[thread].clear()
+        elif kind == "committed":
+            # Every product its thread issued before it, each a read and its completion (None until a commit
+            # covering it lands, `landed`).
+            self.issued[(thread, position)] = dict(clock)
+            self.committed[thread] += [[entry, None] for entry in self.pending[thread]
+                                       if entry[0] == "product"]
+            self.pending[thread] = [entry for entry in self.pending[thread] if entry[0] != "product"]
+            self.committing[(thread, position)] = list(self.committed[thread])
         elif kind in ("store", "product"):
             self.asynchronous(thread, event, clock)
         elif kind in ("product_wait", "store_wait"):

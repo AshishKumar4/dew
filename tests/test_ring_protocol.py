@@ -463,19 +463,41 @@ def test_the_gathered_programs_are_the_load_warps_own_gathers():
         ((plain, step % 2), (gathered, step % 2)) for step in range(steps)]
 
 
-def test_a_tcgen05_release_committed_before_its_product_is_caught():
-    """The gathered walk's programs with the product warp's first commit releasing a slot moved before the
-    product that reads it (a release before its product, `CommittedRing.release` ahead of `products`): the
-    load warps refill the slot while the product may still read it, which the explorer finds."""
-    threads, arrivals = gathered_walk(1, (2,))
+def _first_release(threads) -> tuple[int, int, int]:
+    """The product warp of a gathered walk's programs (`gathered_walk`), and the places in its program of its
+    first product and of the first commit after it, which releases the product's slots."""
     [at] = [index for index, program in enumerate(threads)
             if any(event.kind == "product" for event in program)]
     program = threads[at]
     product = next(position for position, event in enumerate(program) if event.kind == "product")
     release = next(position for position, event in enumerate(program)
-                   if position > product and event.kind == "arrive")
-    mutated = [*threads]
+                   if position > product and event.kind == "committed")
+    return at, product, release
+
+
+def test_a_tcgen05_release_committed_before_its_product_is_caught():
+    """The gathered walk's programs with the product warp's first commit releasing a slot moved before the
+    product that reads it (a release before its product, `CommittedRing.release` ahead of `products`): the
+    load warps refill the slot while the product may still read it, which the explorer finds."""
+    threads, arrivals = gathered_walk(1, (2,))
+    at, product, release = _first_release(threads)
+    program, mutated = threads[at], [*threads]
     mutated[at] = [*program[:product], *program[product + 1:release + 1], program[product],
+                   *program[release + 1:]]
+    with pytest.raises(Violation):
+        explore(mutated, arrivals)
+
+
+def test_a_slot_written_after_its_products_commit_issues_but_before_it_completes_is_caught():
+    """The gathered walk's programs with the product warp writing its first product's left slot right after
+    the commit that releases it: a commit completes asynchronously (`tcgen05.commit`), so its issue orders
+    nothing of its thread's after it, and the write may land while the product still reads the slot, which
+    the explorer finds; a thread orders itself after the product only by a wait observing the commit's
+    arrival."""
+    threads, arrivals = gathered_walk(1, (2,))
+    at, product, release = _first_release(threads)
+    program, mutated = threads[at], [*threads]
+    mutated[at] = [*program[:release + 1], Event("write", program[product].argument[0]),
                    *program[release + 1:]]
     with pytest.raises(Violation):
         explore(mutated, arrivals)
