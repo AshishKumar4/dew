@@ -32,7 +32,6 @@ import time
 from collections.abc import Mapping
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import cast
 
 ROOT = Path(__file__).resolve().parents[1]
 AUTHOR_OVERRIDES = ROOT / "locks/reference/torch28-cu128-tf519-v1.override.txt"
@@ -186,7 +185,8 @@ def offloaded_model(directory, source, bundle, *, device):
     """The author's causal model with ordinary Accelerate offload, fed by the bank mapping."""
     import psutil
     import torch
-    from accelerate import cpu_offload, init_empty_weights
+    from accelerate import init_empty_weights
+    from accelerate.hooks import AlignDevicesHook, add_hook_to_module, attach_align_device_hook
     from block_override_reference import oracle_precision
     from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -204,9 +204,11 @@ def offloaded_model(directory, source, bundle, *, device):
                            f"{stored} bytes, and this host has {free} free")
     weights = TorchBankWeights(source, bundle, model)
     classes = sorted({type(layer).__name__ for layer in model.base_model.layers})
-    # Accelerate reads its state_dict by key alone (its annotation states a dict), which the banks serve.
-    model = cpu_offload(model, execution_device=device, state_dict=cast("dict[str, torch.Tensor]", weights),
-                        offload_buffers=True, preload_module_classes=classes)
+    # Accelerate's cpu_offload over the banks: its two hooks, whose weights map is any mapping by name (its
+    # own signature states a dict), the input moved back to its device and every weight read on its use.
+    add_hook_to_module(model, AlignDevicesHook(io_same_device=True), append=True)
+    attach_align_device_hook(model, execution_device=device, offload=True, offload_buffers=True,
+                             weights_map=weights, preload_module_classes=classes)
     return model, weights
 
 

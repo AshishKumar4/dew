@@ -117,7 +117,7 @@ What lands in tests/fixtures/gemma4, for tests/test_gemma4_moe.py:
 import json
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -816,10 +816,9 @@ class Glm5NextTextForCausalLM(Glm5NextPreTrainedModel):
                 labels: torch.Tensor | None = None) -> CausalLMOutputWithPast:
         hidden = self.model(input_ids=input_ids, use_cache=use_cache).last_hidden_state
         logits = self.lm_head(hidden)
-        loss = None if labels is None else torch.nn.functional.cross_entropy(
+        loss = None if labels is None else torch.nn.CrossEntropyLoss()(
             logits[:, :-1].reshape(-1, logits.shape[-1]), labels[:, 1:].reshape(-1))
-        # transformers types an output's loss as a FloatTensor, which no torch function returns as its type.
-        return CausalLMOutputWithPast(logits=logits, loss=cast("torch.FloatTensor | None", loss))
+        return CausalLMOutputWithPast(logits=logits, loss=loss)
 
 
 def tiny_glm5_next() -> Glm5NextTextForCausalLM:

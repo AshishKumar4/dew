@@ -372,6 +372,24 @@ def vllm_parallelism(mesh: dict[str, int] | None) -> dict[str, int | bool]:
     return {"tensor_parallel_size": mesh.get("tensor", 1) * expert, "enable_expert_parallel": expert > 1}
 
 
+async def stamped(stream, produced) -> list[float]:
+    """The time each of a request's tokens reached the client, from an in-process engine's stream of its
+    growing output, `produced(chunk)` the tokens each chunk holds so far."""
+    stamps: list[float] = []
+    async for chunk in stream:
+        stamps.extend([time.perf_counter()] * (produced(chunk) - len(stamps)))
+    return stamps
+
+
+async def engine_sweep(args, streamed, engine):
+    """An in-process engine's points over its requests (`streamed`), the engine shut down after."""
+    try:
+        points = await async_sweep(args, closed_loop(streamed), streamed)
+    finally:
+        engine.shutdown()
+    return {"label": args.hardware}, points
+
+
 def engine_of(backend: str):
     """`backend`'s points over its engine, each in-process engine's in a module of its own
     (`serving_vllm_engine`, `serving_sglang_engine`), whose interpreter alone has its engine."""

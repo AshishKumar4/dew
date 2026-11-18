@@ -3,9 +3,8 @@ interpreter (the fleet's DEW_SGLANG_PYTHON), the bench's clocks and sweep its ow
 
 from __future__ import annotations
 
-import time
 
-from benchmark_lm_serving import async_sweep, closed_loop
+from benchmark_lm_serving import engine_sweep, stamped
 
 COHORT = "sglang"
 """The releases this file runs against, which its type check reads (tools/reference_releases.RELEASES)."""
@@ -23,15 +22,8 @@ async def sglang_points(args):
 
     async def streamed(prompt, output):
         """The time each of a request's tokens reached the client, from SGLang's stream of growing output."""
-        stamps: list[float] = []
-        async for chunk in await engine.async_generate(input_ids=prompt.tolist(), stream=True,
-                                                       sampling_params={**policy, "max_new_tokens": output}):
-            arrived = chunk["meta_info"]["completion_tokens"] - len(stamps)
-            stamps.extend([time.perf_counter()] * arrived)
-        return stamps
+        stream = await engine.async_generate(input_ids=prompt.tolist(), stream=True,
+                                             sampling_params={**policy, "max_new_tokens": output})
+        return await stamped(stream, lambda chunk: chunk["meta_info"]["completion_tokens"])
 
-    try:
-        points = await async_sweep(args, closed_loop(streamed), streamed)
-    finally:
-        engine.shutdown()
-    return {"label": args.hardware}, points
+    return await engine_sweep(args, streamed, engine)

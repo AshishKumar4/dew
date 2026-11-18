@@ -4,10 +4,9 @@
 from __future__ import annotations
 
 import os
-import time
 import uuid
 
-from benchmark_lm_serving import async_sweep, closed_loop, vllm_parallelism
+from benchmark_lm_serving import engine_sweep, stamped, vllm_parallelism
 
 COHORT = "vllm"
 """The releases this file runs against, which its type check reads (tools/reference_releases.RELEASES)."""
@@ -35,15 +34,8 @@ async def engine_points(args):
         """The time each of a request's tokens reached the client."""
         policy = SamplingParams(temperature=0, top_p=1, top_k=-1, min_p=0, repetition_penalty=1,
                                 max_tokens=output, ignore_eos=True, detokenize=False)
-        stamps: list[float] = []
-        async for result in engine.generate(TokensPrompt(prompt_token_ids=prompt.tolist()), policy,
-                                            uuid.uuid4().hex):
-            arrived = len(result.outputs[0].token_ids) - len(stamps)
-            stamps.extend([time.perf_counter()] * arrived)
-        return stamps
+        return await stamped(engine.generate(TokensPrompt(prompt_token_ids=prompt.tolist()), policy,
+                                             uuid.uuid4().hex),
+                             lambda result: len(result.outputs[0].token_ids))
 
-    try:
-        points = await async_sweep(args, closed_loop(streamed), streamed)
-    finally:
-        engine.shutdown()
-    return {"label": args.hardware}, points
+    return await engine_sweep(args, streamed, engine)
