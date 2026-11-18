@@ -29,7 +29,6 @@ from jaxlib._jax import PjitFunction
 
 from dew import _hashing, _sources
 from dew._records import JSON
-from dew.algebra import terms
 
 
 class Unestablished(ValueError):
@@ -181,6 +180,11 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         return ["record", again(type(value), at=at),
                 [[name, again(getattr(value, name, None), at=f"{at}.{name}")]
                  for name in _sources.field_names(type(value))]]
+    # The algebra read where a value calls for it, never at load: importing any dew.algebra module runs the
+    # package's __init__, which imports cost, program and scan, and they reach dew.nn.kernels, whose compile
+    # point and coordination read this module (`Unestablished`, `stated`), a cycle at load.
+    from dew.algebra import terms
+
     key = terms.parameter_key(value)
     if isinstance(key, tuple) and key[0] != "object":
         return ["native", _plain(key, at)]
@@ -250,6 +254,8 @@ def _jax_array(value: jax.Array, at: str, again: Callable[..., JSON]) -> JSON:
     if not value.is_fully_addressable:
         raise Unestablished(f"{at}: an array of JAX's this process holds only part of")
     # A typed PRNG key's bits are its key data, its dtype the key type, which NumPy cannot read whole.
+    from dew.algebra import terms  # read where called, as `_stated` reads it
+
     dtype, bits = terms.held_bits(value)
     return ["jax array", again(dtype, at=f"{at}.dtype"), jax.typeof(value).weak_type, _data(bits, at),
             again(value.sharding, at=f"{at}.sharding")]

@@ -55,6 +55,17 @@ def memory_peak(level: Path) -> int | None:
     return int(peak.read_text()) if peak.is_file() else None
 
 
+def oom_kills(level: Path) -> int | None:
+    """How many processes the kernel's OOM killer has killed in `level` and below it (`memory.events`'
+    `oom_kill`), None where it states none (cgroup v1, a host that is not Linux): a pool's launcher names a
+    rank the kernel took (`dew._cli.launch`, row 6003)."""
+    events = level / "memory.events"
+    if not events.is_file():
+        return None
+    counts = dict(line.split() for line in events.read_text().splitlines() if line.strip())
+    return int(counts["oom_kill"]) if "oom_kill" in counts else None
+
+
 def memory_held(level: Path) -> int | None:
     """The bytes `level` holds that its kernel will not reclaim first: its charge (`memory.current`) less
     its inactive page cache (`memory.stat`'s `inactive_file`), as the kubelet counts a container's working
