@@ -770,14 +770,29 @@ def own_tests(name: str, tests: dict[str, float]) -> dict[str, float]:
     return session.own(session.standing(name, tests), sites(name))
 
 
+LARGE_FROM = 5 * 2**30
+"""A file's peak (`heavy_files`) past which its tasks run on a large container: half the memory a medium's
+tasks run under (armada's `tasksMemoryOf`, its 12 GiB less the 2 GiB the container keeps), so no two such
+tasks share a medium, which armada packs light tasks into by each task's own measures alone, and a regrouped
+file's new task has none (row 6003: a group's four ranks peaked at 7.17 GiB, and two packed on a medium had a
+rank killed). Through armada's own per-entry `size`; a large task armada still packs only by its measures."""
+
+
+def heavy_files(path: Path = session.DURATIONS) -> set[str]:
+    """The test files any of whose tests' recorded peaks (`session.peak`) passes `LARGE_FROM`: their tasks'
+    size large, whatever group a cut gives each test."""
+    return {grading.owning(node) for node, held in durations_entries(path).items()
+            if (measured := session.peak(held)) is not None and measured > LARGE_FROM}
+
+
 def durations_record(path: Path = session.DURATIONS) -> dict[str, float]:
     """The durations record (`session.DURATIONS`, or the one at `path`): each test's node id and its cost
     (`session.cost`)."""
     return session.costs(path)
 
 
-def durations_entries(path: Path = session.DURATIONS) -> dict[str, float | list[float]]:
-    """The durations record's entries as kept, each test's least warm and least cold seconds
+def durations_entries(path: Path = session.DURATIONS) -> dict[str, session.Entry]:
+    """The durations record's entries as kept, each test's least warm and least cold seconds and its peak
     (`session.entry`)."""
     return json.loads(path.read_text()) if path.is_file() else {}
 
@@ -1184,6 +1199,7 @@ def plan(target: float, timings: dict, census: bool = False, reach: dict | None 
         session.shared_setups(name)
     recorded = recorded_tests()
     stored = stored_weights()
+    heavy = heavy_files()
     entries = []
     for python in PYTHONS:
         # Every file on the floor, and on the census every file on every Python; on a pushed run, its cache's
@@ -1230,10 +1246,13 @@ def plan(target: float, timings: dict, census: bool = False, reach: dict | None 
             alone = held_rows[0][1] if len(held_rows) == 1 and held_rows[0] not in found else ""
             tokens = [kept_token(name, group, found[(name, group)]) if (name, group) in found else name
                       for name, group in held_rows]
+            # A task that runs a file past `LARGE_FROM` runs on a large container (`heavy_files`).
+            large = any(name in heavy and (name, group) not in found for name, group in held_rows)
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(tokens),
                             "split": alone, "rows": [row(python, name, group) for name, group in held_rows],
                             "weight": weight + (COLD_SECONDS if cache != "on" and any(
-                                each not in found for each in held_rows) else 0.0), **stamped})
+                                each not in found for each in held_rows) else 0.0),
+                            **({"size": "large"} if large else {}), **stamped})
         # The sites to run whose judge's last run needed its later map tasks draw them at once
         # (`eager_sites`).
         eager = eager_sites(python, [(name, test) for name, held in marked.items() for test in held
@@ -1502,6 +1521,18 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
     return rows
 
 
+def task_peak() -> int | None:
+    """This task's resident peak in bytes so far: its cgroup's (cgroup v2's memory.peak, which every process
+    the task started counts in, a test's ranks with it), each of its tests' bound above (row 6003: a test's
+    four ranks peaked at 7.17 GiB, packed beside another on a medium). None where the task runs in no
+    cgroup this process can read."""
+    try:
+        group = Path("/proc/self/cgroup").read_text().strip().split("\n")[0].split("::", 1)[1]
+        return int((Path("/sys/fs/cgroup") / group.lstrip("/") / "memory.peak").read_text())
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def task_files(out: Path) -> tuple[Path, Path, Path, Path, Path]:
     """The files beside a task's verdict `out` that its pytest writes, none left from an earlier run: the
     recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
@@ -1644,6 +1675,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
         command, environment, deadline, grace, pid, python, evidence_name(python, tests, group), began)
+    peak = task_peak()
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
@@ -1694,6 +1726,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      **({"cold": cold} if (cold := sorted(set(grading.compiled_cold(own)) | {
                          node for node in cold_before if grading.holds(name, node)})) else {}),
                      "ynn_switched": grading.ynn_switched(own), "cells": grading.flow_cells(own),
+                     # The task's resident peak, its tests' bound of their memory (`task_peak`).
+                     **({"peak": peak} if peak is not None else {}),
                      # A judge's, beside its pooling, what its map tasks' records say they paid
                      # (`site_costs`).
                      "timings": {row(python, name, group if site else ""): seconds,
@@ -2227,16 +2261,17 @@ def raised(record: dict[str, float], held: list[dict], marked: dict) -> dict[str
     return taken
 
 
-def folded_entries(record: dict[str, float | list[float]], verdict: dict, target: float) -> dict:
+def folded_entries(record: dict[str, session.Entry], verdict: dict, target: float) -> dict:
     """The durations `record`'s entries with main's CI `verdict` folded in (`session.entry`): each test's
     warm time as `folded` keeps the record, a run in which it compiled a program the shared cache lacked
     (a row's `cold`) timing it no warm time; its cold time the least of the green runs so, raised by a
-    red or cut-off row's past it, as `raised` raises an entry. A test the warm record drops loses its
-    cold time with it: one record, so no test is timed cold that the record no longer holds (Main,
-    2026-11-18, row 7939)."""
+    red or cut-off row's past it, as `raised` raises an entry; its peak the newest of its rows' (`peak`).
+    A test the warm record drops loses its cold time and peak with it: one record, so no test is timed
+    cold or sized that the record no longer holds (Main, 2026-11-18, rows 7939 and 6003)."""
     warm = {node: session.warm_cold(held)[0] for node, held in record.items()}
     cold = {node: found for node, held in record.items()
             if (found := session.warm_cold(held)[1]) is not None}
+    peaks = {node: found for node, held in record.items() if (found := session.peak(held)) is not None}
     # The warm fold sees each cold-timed test at its warm record, where it has one: a cold run moves no warm
     # time. A test no warm run has timed takes its cold time as its warm one, which a warm run lowers.
     calm = {**verdict, "rows": [
@@ -2252,7 +2287,13 @@ def folded_entries(record: dict[str, float | list[float]], verdict: dict, target
                     before = cold.get(node)
                     cold[node] = (seconds if before is None else min(before, seconds) if green
                                   else max(before, seconds))
-    return {node: session.entry(seconds, cold.get(node)) for node, seconds in kept.items()}
+            # Each test's peak, the newest task's that ran it, red or green: a bound that follows its test as
+            # it grows, never the least of runs it has outgrown (`task_peak`).
+            if (measured := row_.get("peak")) is not None:
+                for node in row_.get("tests", {}):
+                    if node in kept:
+                        peaks[node] = int(measured)
+    return {node: session.entry(seconds, cold.get(node), peaks.get(node)) for node, seconds in kept.items()}
 
 
 def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, float]:

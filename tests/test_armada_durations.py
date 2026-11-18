@@ -387,3 +387,43 @@ def test_a_file_armada_has_not_timed_weighs_no_less_than_its_tests_recorded_cost
     timings = {"files": {"3.12:tests/test_timed.py": 100.0}}
     assert ci.weights(["tests/test_timed.py", "tests/test_untimed.py"], timings) == {
         "tests/test_timed.py": 1000.0, "tests/test_untimed.py": 1000.0}
+
+
+def test_a_tasks_peak_bounds_its_tests_and_a_heavy_files_tasks_run_large(ci, tmp_path, monkeypatch):
+    """Each row's task peak (`task_peak`) is folded into its tests' entries as their newest, a later lighter
+    task lowering it and a heavier raising it, beside their warm and cold times; a file any of whose
+    tests' peaks passes `LARGE_FROM` has every task that runs it planned large, so no two share a medium,
+    and a file under it is left to armada's own sizing (row 6003: a test's ranks peaked at 7.17 GiB and
+    two packed on a medium were killed)."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
+    for name in ("test_ranks", "test_light"):
+        (tmp_path / "tests" / f"{name}.py").write_text("def test_a(): pass\ndef test_b(): pass\n")
+    record = {"tests/test_ranks.py::test_a": 10.0, "tests/test_ranks.py::test_b": [5.0, 30.0],
+              "tests/test_light.py::test_a": 1.0}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(record))
+    ranks, light = 7_700_000_000, 900_000_000
+    rows = [{"name": "3.12:tests/test_ranks.py", "exitCode": 0, "seconds": 40.0, "peak": ranks,
+             "tests": {"tests/test_ranks.py::test_a": 10.0, "tests/test_ranks.py::test_b": 30.0},
+             "cold": ["tests/test_ranks.py::test_b"]},
+            {"name": "3.12:tests/test_light.py", "exitCode": 0, "seconds": 1.0, "peak": light,
+             "tests": {"tests/test_light.py::test_a": 1.0}}]
+    verdict = tmp_path / "main.json"
+    verdict.write_text(json.dumps({"sha": commit(tmp_path, "main"), "part": "all", "rows": rows}))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
+    assert ci.main() == 0
+    folded = json.loads((tmp_path / "tests/test_durations.json").read_text())
+    assert folded == {"tests/test_ranks.py::test_a": [10.0, None, ranks],
+                      "tests/test_ranks.py::test_b": [5.0, 30.0, ranks],
+                      "tests/test_light.py::test_a": [1.0, None, light]}
+    assert ci.durations_record()["tests/test_ranks.py::test_b"] == 30.0
+    assert ci.heavy_files() == {"tests/test_ranks.py"}
+    entries = [entry for entry in ci.plan(240.0, {"files": {}}) if entry["python"] == "3.12"]
+    sized = {entry["tests"]: entry.get("size") for entry in entries}
+    assert sized["tests/test_ranks.py"] == "large" and sized["tests/test_light.py"] is None
+    # A newer, lighter task (a group of its own) lowers its tests' peak.
+    rows = [{**rows[0], "peak": light}]
+    verdict.write_text(json.dumps({"sha": commit(tmp_path, "main"), "part": "all", "rows": rows}))
+    assert ci.main() == 0
+    lowered = json.loads((tmp_path / "tests/test_durations.json").read_text())
+    assert lowered["tests/test_ranks.py::test_a"][2] == light
+    assert ci.heavy_files() == set()

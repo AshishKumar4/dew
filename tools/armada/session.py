@@ -18,22 +18,37 @@ from pathlib import Path
 DURATIONS = Path("tests/test_durations.json")
 """Each test's least seconds, by its node id: a number, its least warm time, where only runs whose programs
 the shared compilation cache held have timed it; [warm, cold] once a run that compiled its programs has,
-its least time so beside the least warm one (`entry`). Every cut and weight reads an entry's cost
-(`cost`)."""
+its least time so beside the least warm one; and [warm, cold or null, peak] once a task that ran it has
+measured its memory, the resident peak in bytes of the newest task that ran it (`entry`), a bound of its
+own above (row 6003). Every cut and weight reads an entry's cost (`cost`), every size its peak (`peak`)."""
 
 
-def entry(warm: float, cold: float | None) -> float | list[float]:
+type Entry = float | list[float | None]
+"""A durations record's entry (`DURATIONS`)."""
+
+
+def entry(warm: float, cold: float | None, peak: int | None = None) -> Entry:
     """A durations record's entry of a test timed `warm` at least warm and `cold` at least cold (None:
-    never timed cold)."""
+    never timed cold), its newest task's resident peak `peak` bytes (None: none measured)."""
+    if peak is not None:
+        return [round(warm, 3), None if cold is None else round(cold, 3), int(peak)]
     return round(warm, 3) if cold is None else [round(warm, 3), round(cold, 3)]
 
 
-def warm_cold(held: float | list[float]) -> tuple[float, float | None]:
+def warm_cold(held: Entry) -> tuple[float, float | None]:
     """An entry's least warm seconds and least cold ones, None where no cold run has timed it."""
-    return (float(held[0]), float(held[1])) if isinstance(held, list) else (float(held), None)
+    if not isinstance(held, list):
+        return float(held), None
+    return float(held[0]), None if held[1] is None else float(held[1])
 
 
-def cost(held: float | list[float]) -> float:
+def peak(held: Entry) -> int | None:
+    """An entry's resident peak in bytes, the newest task's that ran its test; None where none was
+    measured."""
+    return int(held[2]) if isinstance(held, list) and len(held) > 2 and held[2] is not None else None
+
+
+def cost(held: Entry) -> float:
     """What a test costs a task that runs it, by its entry: its cold time where one is recorded, else its
     warm one. Cuts and weights read this whatever the cache holds, so a cut is one function of the
     record, the same in the plan and in the task that recomputes its group (split.py), and a group runs
