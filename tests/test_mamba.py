@@ -11,7 +11,7 @@ import pytest
 from forks_support import LAYOUTS, assert_forks_as_own_rows
 from model_support import as_stepped, decode_through, float64_twin
 from reference_error import FEWEST_SEEDS, assert_as_exact
-from selective_support import near_the_largest, stepwise
+from selective_support import near_the_largest, rate_past_the_range, stepwise
 from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 
 from dew.interop import Pretrained
@@ -62,6 +62,33 @@ def test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence(ch
     exact = jax.jit(stepwise)
     assert_as_exact(jax.jit(scan), exact, draw, f"the chunked scan near float32's largest, chunks of {chunk}",
                     seeds=FEWEST_SEEDS, truth_fn=exact)
+
+
+def decayed(fn):
+    """`fn(x, dt, A, B, C, D, state)` as `run(x, dt, A, B, C, D, state, cotangent)`, which returns its output
+    and the gradients of the decay's step and rate `(dt, A)` under the cotangent: the operands a decay's form
+    reaches."""
+    def run(x, dt, A, B, C, D, state, cotangent):
+        out, pull = jax.vjp(lambda dt, A: fn(x, dt, A, B, C, D, state), dt, A)
+        return out, *pull(cotangent)
+
+    return run
+
+
+@pytest.mark.parametrize('chunk', [16, 64])
+def test_a_rate_past_float32s_range_scans_as_the_recurrence(chunk):
+    """A scan whose rate `A log2(e)` passes float32's range over a ragged chunk (`rate_past_the_range`): its
+    output, final state and its decay's step's and rate's gradients (`decayed`) on par from float64 with the
+    recurrence a token at a time (`stepwise`, check 1), where the rate taken to base 2 before the step was
+    -inf and a padded token's zero step made its decay NaN (row 8491). Its B's and C's gradients there are
+    row 8563's."""
+    def scan(x, dt, A, B, C, D, state):
+        return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=chunk)
+
+    exact = jax.jit(decayed(stepwise))
+    assert_as_exact(jax.jit(decayed(scan)), exact, rate_past_the_range,
+                    f"the chunked scan at a rate past float32's range, chunks of {chunk}", seeds=FEWEST_SEEDS,
+                    truth_fn=exact)
 
 
 def test_a_document_start_drops_the_state_entering_it():
