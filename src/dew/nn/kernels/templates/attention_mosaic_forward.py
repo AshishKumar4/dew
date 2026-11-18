@@ -1262,7 +1262,10 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         return
     # A row whose sums passed fp32's largest (inf, which every later add keeps, or a value's own NaN) has
     # every consumer walk its keys again scaled, its stores that walk's (`mosaic.Decided`); else the walk's.
-    taken = decided.stated(consumer, jnp.any(~jnp.isfinite(state.acc)))
+    # A row's verdict its sums times zero summed along it, no number exactly where one of them is none; the
+    # rows' then the warpgroup's vote (`bar.red.or.pred`, a vector's alone: a tile's own refused layouts).
+    rows = jnp.isnan(jnp.sum(state.acc * 0.0, axis=-1))
+    taken = decided.stated(consumer, jnp.any(rows))
     pl.when(jnp.logical_not(taken))(lambda: store(spec, state, trained, merged))
 
     @pl.when(taken)
