@@ -23,6 +23,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.training.evaluation import Episodes, EvalSuite, Evaluation
     from dew.training.inspection import Inspection, inspected
     from dew.training.observe import Observe
+    from dew.training.phase_passes import SampledPasses
     from dew.training.profiling import ProfileWindow, RunProfile
     from dew.training.runtime import Preempted, prepare_process, run_timestamp, share_pool
     from dew.training.selection import Best
@@ -65,6 +66,7 @@ _EXPORTS = {
     "Preempted": "dew.training.runtime",
     "ProfileWindow": "dew.training.profiling",
     "RunProfile": "dew.training.profiling",
+    "SampledPasses": "dew.training.phase_passes",
     "Rollout": "dew.training.trainer",
     "Step": "dew.objectives.base",
     "TensorBoardTracker": "dew.training.tracker",
@@ -111,6 +113,7 @@ __all__ = [
     "ProfileWindow",
     "Rollout",
     "RunProfile",
+    "SampledPasses",
     "Step",
     "TensorBoardTracker",
     "Tracker",

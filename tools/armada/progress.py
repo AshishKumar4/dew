@@ -6,6 +6,7 @@ writes nothing outside a task."""
 
 import json
 import os
+import types
 from collections.abc import Callable
 from pathlib import Path
 
@@ -63,24 +64,24 @@ def pytest_runtest_logreport(report) -> None:
             Path(artifacts).mkdir(parents=True, exist_ok=True)
             with (Path(artifacts) / PROGRESS).open("a") as progress:
                 # The attempt's peak by then, which bounds this test (`task_peak`).
-                peak = task_peak()
+                import host
+
+                peak = task_peak(host)
                 progress.write(json.dumps({"node": report.nodeid, "seconds": seconds,
                                            **({"cold": True} if cold else {}),
                                            **({"peak": peak} if peak is not None else {})}) + "\n")
 
 
-def task_peak() -> int | None:
+def task_peak(host: types.ModuleType) -> int | None:
     """This task's resident peak in bytes so far: its cgroup's (cgroup v2's memory.peak, which every process
     the task started counts in, a test's ranks with it), each of its tests' bound above (row 6003: a test's
-    four ranks peaked at 7.17 GiB, packed beside another on a medium). None where the task runs in no
-    cgroup this process can read."""
-    cgroup = Path("/proc/self/cgroup")
-    line = cgroup.read_text().split("\n")[0] if cgroup.is_file() else ""
-    # cgroup v2's one hierarchy, `0::<path>`; under v1 (no such line) no peak is kept.
-    if "::" not in line:
-        return None
-    peak = Path("/sys/fs/cgroup") / line.split("::", 1)[1].lstrip("/") / "memory.peak"
-    return int(peak.read_text()) if peak.is_file() else None
+    four ranks peaked at 7.17 GiB, packed beside another on a medium), read by Dew's one cgroup reader
+    through `host` (tools/armada/host.py: src/dew/data/cgroups.py, its root DEW_CGROUP_ROOT's where set),
+    which a task's pytest imports (tools/armada on its path) and ci.py loads. None where the task's cgroup
+    states no peak."""
+    reader = host.cgroups()
+    return reader.memory_peak(reader.own(host.cgroup_root()))
+
 
 
 def resumed(tests: list[str], owning: Callable[[str], str]) -> tuple[dict[str, float], set[str], int | None]:

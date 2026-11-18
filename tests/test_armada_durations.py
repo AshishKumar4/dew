@@ -474,3 +474,15 @@ def test_a_resumed_attempts_rows_carry_the_earlier_attempts_peak(tmp_path, monke
     assert (cold, peak) == (set(), 7_000)
     carried = [json.loads(line) for line in (tmp_path / "now" / progress.PROGRESS).read_text().splitlines()]
     assert {line["peak"] for line in carried} == {7_000}
+
+
+def test_a_tests_recorded_peak_moves_only_past_its_band_or_across_the_large_bound(ci):
+    """A task's exact bytes differ every run: the record keeps a test's peak until a newer one moves by more
+    than `PEAK_MOVES` of it or crosses `LARGE_FROM`, so a fold rewrites only the entries whose sizing could
+    change (train 1039's review F5)."""
+    moved, large = ci.session.moved_peak, ci.session.LARGE_FROM
+    assert moved(None, 1_000) == 1_000
+    assert moved(1_000_000_000, 1_200_000_000) == 1_000_000_000
+    assert moved(1_000_000_000, 1_300_000_000) == 1_300_000_000
+    assert moved(large - 10, large + 10) == large + 10
+    assert moved(large + 10, large - 10) == large - 10

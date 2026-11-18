@@ -141,10 +141,11 @@ def sample(pipe: TextToImage, key: int | jax.Array) -> tuple[np.ndarray, dict[st
     NaN), a pixel-space model's walk included, read back as its real rows
     without the padding that fills the devices (`Images.host`)."""
     images = pipe(list(PROMPTS), key=key, steps=STEPS, solver=DPMSolverMultistep(), guidance=GUIDANCE).host()
-    if images.latents is None or images.images is None:
-        raise ValueError("the task kept no latents or decoded no images")
-    found = {"latents": nonfinite(images.latents), "pixels": nonfinite(images.images)}
-    return uint8_pixels(images.images), found
+    pixels = images.decoded()
+    if images.latents is None:
+        raise ValueError("the task kept no latents")
+    found = {"latents": nonfinite(images.latents), "pixels": nonfinite(pixels)}
+    return uint8_pixels(pixels), found
 
 
 def quality(pipe: TextToImage) -> dict:

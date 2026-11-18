@@ -265,6 +265,28 @@ def test_a_casting_projection_is_the_identity_where_its_leaves_are_of_its_dtype_
         assert read(wide, None)["params"]["w"].dtype == jnp.float32
 
 
+
+def test_a_projecting_read_traces_its_projection_once_a_signature():
+    """A host step's read of its variables (`Read`) runs its projection's Python once per signature, in the
+    trace that tells which leaves it changes, and computes those leaves from that trace, where its
+    program's lowering traced the projection again (row 8397); a later call over arrays of the same
+    signature runs no projection's Python, its computed leaf the projection's."""
+    from dew.training.transaction import Read
+
+    calls = []
+
+    def projected(variables, compute):
+        calls.append(None)
+        return {"params": {"w": variables["params"]["w"] * 2.0, "b": variables["params"]["b"]}}
+
+    read = Read(projected)
+    variables = {"params": {"w": jnp.arange(3, dtype=jnp.float32), "b": jnp.ones(2, jnp.float32)}}
+    first = read(variables, None)
+    again = read(variables, None)
+    assert len(calls) == 1
+    assert first["params"]["b"] is variables["params"]["b"]
+    np.testing.assert_array_equal(np.asarray(again["params"]["w"]), np.arange(3, dtype=np.float32) * 2.0)
+
 def test_a_frozen_embeddings_host_steps_run_on_its_startups_programs_alone():
     """A host decoder whose embedding is frozen, outside its scanned stack (the run's frozen collection),
     runs its steps on the programs its startup compiled: the startup tells a frozen leaf by its path, as a

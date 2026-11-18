@@ -284,7 +284,9 @@ def train_and_reload(task, source, reference, key, given, noise):
             raise ValueError(f"the {task} pipeline holds no autoencoder")
         np.testing.assert_array_equal(restored.autoencoder.decode(restored.variables["autoencoder"], noise),
                                       source.autoencoder.decode(trained["autoencoder"], noise))
-        if source.finish is not None and restored.finish is not None:
+        if source.finish is not None:
+            if restored.finish is None:
+                raise ValueError(f"the {task} pipeline lost its safety checker on reload")
             images = jnp.asarray(reference["images"] * 2 - 1)
             np.testing.assert_array_equal(restored.finish(restored.variables, images), source.finish(trained, images))
             checker = {**trained["encoders"]["safety"], "concept_embeds_weights": jnp.full((17,), -2.0)}
@@ -592,10 +594,7 @@ def regress(directory, case):
 
     def generated(pipe, conditions) -> np.ndarray:
         """The images `pipe` makes of `conditions` at the regression's key, two steps and guidance 3."""
-        images = pipe(conditions, key=key, steps=2, guidance=3.0).host().images
-        if images is None:
-            raise ValueError("the pipeline decoded no images")
-        return images
+        return pipe(conditions, key=key, steps=2, guidance=3.0).host().decoded()
 
     if case == "prepared":
         prepared = task.prepare(["cat"], key=key, steps=2)

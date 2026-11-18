@@ -111,8 +111,9 @@ class Hooks:
     of any recurrence. The chunked op (`recurrence_chunk.chunk`) takes the same form. `turns`, where past
     zero, turns the state's first `2 turns` key rows each token, `turns` adjacent pairs each multiplied as a
     complex number by `e^{-i turn}` (`Gated.turn`) before the decay, a head's (Mamba-3's rotating basis; the
-    chunked op's every kernel reads it through frames, `templates.recurrence.turned`), unrated, without the
-    delta rule or an own write's weight."""
+    chunked op's every kernel reads it through frames, `templates.recurrence.turned`, each token's in its
+    turn's), unrated, without the delta rule or an own write's weight, its readout after the token's turn
+    ('after' or 'apart'; base review fbb1c2f71 F1)."""
     conv: Conv | None = None
     l2norm: bool = False
     scale: float | None = None
@@ -180,10 +181,10 @@ class Hooks:
         if self.rated and (self.decay != 'scalar' or self.gates is not None):
             raise ValueError('a rated decay is one a head without the gates, which rate their own')
         if self.turns < 0 or (self.turns and (self.delta or self.own_weight or self.rated
-                                              or self.decay != 'scalar')):
+                                              or self.decay != 'scalar' or self.reads == 'before')):
             raise ValueError(f"a state turns its key pairs under a decay a head's, unrated, without the "
-                             f"delta rule or an own write's weight, a count of none or more: not "
-                             f"{self.turns} under {self}")
+                             f"delta rule or an own write's weight, read after its token's turn, a count of "
+                             f"none or more: not {self.turns} under {self}")
 
 
 def round_to_bf16(state, key, value):

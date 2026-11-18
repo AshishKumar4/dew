@@ -27,10 +27,12 @@ from dew.registry import component, to_record
 Raw = TypeVar("Raw")
 """One item of a modality's raw data: a prompt, a waveform."""
 
-Encoded = TypeVar("Encoded", default=object)
+Encoded = TypeVar("Encoded", default=object, covariant=True)
 """The conditioning value a modality's encoder produces: a `TextContext`, a
 `DenoisingCondition`, an array. An encoder that leaves it unstated promises
-its callers nothing about the value beyond what it hands the model."""
+its callers nothing about the value beyond what it hands the model. An encoder
+only produces it (`encode`), so one of a narrower value serves where any
+encoder is asked for (covariant)."""
 
 
 class ConditionEncoder(ABC, Generic[Raw, Encoded]):

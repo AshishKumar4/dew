@@ -208,13 +208,6 @@ class Scorer:
         return self.clip.scores(pixels, list(prompts)), aesthetic
 
 
-def decoded(images):
-    """A task's decoded images, refused where it decoded none."""
-    if images is None:
-        raise ValueError("the task decoded no images")
-    return images
-
-
 def load_pipe(experiment):
     """The run loaded as `dew.pipeline` loads a Hub run, at the commit its revision resolves, and that
     commit's metadata directory, whose run.json the provenance hashes."""
@@ -328,7 +321,7 @@ def generate(args):
             images = batched(
                 pipe, [(experiment.prompt(name, variant), seed) for name, variant, seed in group], config
             )
-            pixels = uint8_pixels(decoded(images.host().images))
+            pixels = uint8_pixels(images.host().decoded())
             clip, aesthetic = scorer(pixels, [experiment.prompts[name] for name, _, _ in group])
             for row, (name, variant, seed) in enumerate(group):
                 identifier = f"{args.config}/{name}.{variant}.s{seed:02d}"
@@ -510,7 +503,7 @@ def verify(args):
     report = []
     for row in picks:
         config = experiment.call(row["config"])
-        pixels = uint8_pixels(decoded(single(pipe, row["prompt"], row["seed"], config).host().images))[0]
+        pixels = uint8_pixels(single(pipe, row["prompt"], row["seed"], config).host().decoded())[0]
         stored = np.asarray(Image.open(row["file"]).convert("RGB"))
         gap = np.abs(pixels.astype(np.int16) - stored.astype(np.int16))
         report.append({"id": row["id"], "max_abs": int(gap.max()), "mean_abs": float(gap.mean())})
@@ -570,7 +563,7 @@ def finals(args):
         name, variant, seed, config_name = pick["name"], pick["variant"], pick["seed"], pick["config"]
         config, prompt = experiment.call(config_name), experiment.prompt(name, variant)
         tick = time.monotonic()
-        pixels = uint8_pixels(decoded(single(pipe, prompt, seed, config).host().images))[0]
+        pixels = uint8_pixels(single(pipe, prompt, seed, config).host().decoded())[0]
         seconds = round(time.monotonic() - tick, 2)
         stem = f"{name}.{variant}.s{seed:02d}.{config_name}"
         target = out / "png" / f"{stem}.png"
