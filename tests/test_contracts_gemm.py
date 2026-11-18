@@ -107,9 +107,12 @@ def test_a_grouped_gemm_holds_every_order(edge):
     products near float32's ends."""
     sizes = jnp.asarray([3, 0, 5], jnp.int32)
     groups = jnp.repeat(jnp.arange(3), sizes, total_repeat_length=8)
-    primals = normal_draw(146, (8, 16), (3, 16, 4), scale=EDGES[edge])
-    direction = normal_draw(147, (8, 16), (3, 16, 4), scale=EDGES[edge])
-    (cotangent,) = normal_draw(148, (8, 4))
+    def draw(seed: int, scale: float = 1.0) -> tuple:
+        (cotangent,) = normal_draw(seed + 2, (8, 4))
+        return (normal_draw(seed, (8, 16), (3, 16, 4), scale=scale),
+                normal_draw(seed + 1, (8, 16), (3, 16, 4), scale=scale), cotangent)
+
+    primals, direction, cotangent = draw(146, EDGES[edge])
 
     def grouped(rows, matrices):
         return gemm.gemm(rows, matrices, sizes, out_dtype=rows.dtype)
@@ -118,7 +121,7 @@ def test_a_grouped_gemm_holds_every_order(edge):
         return jnp.einsum("rg,rk,gkn->rn", jax.nn.one_hot(groups, 3, dtype=rows.dtype), rows, matrices)
 
     assert_contract(grouped, primals, direction, cotangent, f"a grouped GEMM {edge}", truth_fn=plain,
-                    plain_fn=plain)
+                    plain_fn=plain, draw=draw if edge == "normal" else None)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -379,11 +382,14 @@ def test_a_gemm_prologue_holds_every_order(edge):
 
     prologued = _prologued(rms_producer, lambda *primals: lambda *tangents: jax.jvp(
         rms_producer, primals, tangents)[1])
-    primals = normal_draw(394, (6, 16), (16,), scale=EDGES[edge])
-    direction = normal_draw(395, (6, 16), (16,), scale=EDGES[edge])
-    (cotangent,) = normal_draw(396, (6, 16))
+    def draw(seed: int, scale: float = 1.0) -> tuple:
+        (cotangent,) = normal_draw(seed + 2, (6, 16))
+        return (normal_draw(seed, (6, 16), (16,), scale=scale),
+                normal_draw(seed + 1, (6, 16), (16,), scale=scale), cotangent)
+
+    primals, direction, cotangent = draw(394, EDGES[edge])
     assert_contract(prologued, primals, direction, cotangent, f"a GEMM prologue {edge}",
-                    truth_fn=rms_producer, plain_fn=rms_producer)
+                    truth_fn=rms_producer, plain_fn=rms_producer, draw=draw if edge == "normal" else None)
 
 
 @pytest.mark.parametrize("edge", EDGES)
