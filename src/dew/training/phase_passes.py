@@ -65,7 +65,8 @@ class PhasePasses[L, E]:
     built: dict[int, Objective[L, E]] = field(default_factory=dict)
     sampled: SampledPasses | None = None
     """The law a run draws its pass count from per microbatch, in place of a count a phase (`SampledPasses`):
-    its step one program a count from 1 to its cap, its cap the count the objective holds."""
+    its step one program a count from 1 to its cap, its cap the count the objective holds, whatever phase
+    its data reads (`count`), with no later phase's step of its own (`counts` none)."""
 
     @classmethod
     def of(cls, objective: Objective[L, E], stated: Sequence[int] | None,
@@ -77,7 +78,8 @@ class PhasePasses[L, E]:
             if stated is not None:
                 raise ValueError("a run states its loop's pass counts once: one a phase of its data "
                                  "(phase_passes) or one drawn per microbatch (sampled_passes)")
-            return replace(cls.of(objective, (sampled.cap,)), current=sampled.cap, sampled=sampled)
+            # Its loop holding the cap, checked as a phase's count is; no phase's count beside it.
+            return replace(cls.of(objective, (sampled.cap,)), counts=(), current=sampled.cap, sampled=sampled)
         if stated is None:
             return cls(objective)
         counts = tuple(int(count) for count in stated)
@@ -192,7 +194,7 @@ class PhasePasses[L, E]:
         prefetch worker) hold while validation and the model the run hands on read `base`. Read off
         `base`, never off a holder that holds a count's copy meanwhile; one copy a count, whichever thread
         asks first."""
-        if passes is None or passes == self.counts[-1]:
+        if passes is None or passes == (self.counts[-1] if self.sampled is None else self.sampled.cap):
             return self.base
         if passes not in self.built:
             self.built.setdefault(passes, self.base.substituted(_counted(self.base, passes)))

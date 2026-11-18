@@ -216,14 +216,20 @@ def test_a_window_saved_a_qk_call_each_steps_on_as_its_largest():
     from test_data_mixtures import assert_same, parameters
     from test_pass_weights import phased_draw, phased_loader
 
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_stack import Loop
     from dew.optim import scale_by_qk_clip
     from dew.training import Layout, Trainer
 
     tokens, _ = phased_draw(0)
+    # Un-normed queries and keys, whose scale QK-Clip bounds.
+    model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
+                              max_seq_len=128, attention_impl="xla", qk_norm=False,
+                              loop=Loop(CAP, layers=(1, 2)))
 
     def fitted(state, steps):
         clipped = optax.chain(scale_by_qk_clip(1.0), optax.sgd(0.1))
-        trainer = Trainer(LMObjective(looped(steps=CAP), 16), clipped, key=jax.random.key(0),
+        trainer = Trainer(LMObjective(model, 16), clipped, key=jax.random.key(0),
                           layout=Layout(min_shard=1, tolerance=1.0), accumulation=2)
         return trainer.fit(phased_loader(tokens), state=state, steps=steps, log_every=100)
 
