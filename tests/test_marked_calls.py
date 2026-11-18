@@ -23,7 +23,7 @@ STATED = {derivatives.Activation: [derivatives.Activation("swiglu", gated=True),
 activation's name, gated and ungated."""
 
 KINDS = [stated for kind in typing.get_args(derivatives.Kind.__value__)
-         for stated in STATED.get(kind, [kind()])]
+         for stated in (STATED[kind] if kind in STATED else [kind()])]
 """Every kind a span is marked as, each through either builder (`derivatives.Kind`'s)."""
 
 
