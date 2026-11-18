@@ -233,32 +233,36 @@ def _unlike(cap: Planned, other: Planned) -> list[str]:
 
 @dataclasses.dataclass
 class DrawingStep:
-    """The step of a run that draws its looped model's pass count per microbatch (`SampledPasses`): each
-    count's plan at its cap's (`StepCompiler.admitted_at`) and its FLOPs a step, by count (`plans`,
-    `flops`), the call running each of its `split` microbatches by its drawn count's program (`counts`,
-    `drawn`) over the one state."""
+    """The step of a run that draws its looped model's pass count per microbatch (`sampled`): each count's
+    plan at its cap's (`StepCompiler.admitted_at`) and its FLOPs a step, by count (`plans`, `flops`), the
+    call running each of its `split` microbatches by its drawn count's program (`counts`) over the one
+    state. Each call draws its counts at the global position of its first microbatch under the run's `key`
+    (`SampledPasses.count`), which it holds (`position`): a fit sets it from the microbatches the run
+    dispatched (`drawn`), and a call no fit drew for, as `Trainer.compile`'s caller makes (`dew inspect`, a
+    step called by hand), draws its own from where it stands, its first at its state's step's."""
 
     plans: Mapping[int, Planned]
     flops: Mapping[int, StepFlops | None]
     split: int
+    sampled: SampledPasses
+    key: tuple[int, ...]
+    """The run's key's words (`jax.random.key_data`), which every draw reads."""
     run: CompiledStep | None = None
     counts: list[int] = dataclasses.field(default_factory=list)
-    key: tuple[int, ...] | None = None
+    position: int | None = None
+    """The global position of the next call's first microbatch; None until a fit or the first call sets it."""
 
-    def drawn(self, sampled: SampledPasses, key: jax.Array, interval: Interval,
-              step: int) -> StepFlops | None:
-        """The counts of the next call's microbatches, each drawn at its global position under the run's
-        `key` (`SampledPasses.count`), the run's dispatched microbatches past them (`Interval.microbatches`;
-        a checkpoint that counted none resumes at its `step`'s, said); and the call's FLOPs, each
-        microbatch's at its count's program's."""
-        if self.key is None:
-            self.key = tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
+    def drawn(self, interval: Interval, step: int) -> StepFlops | None:
+        """The counts of the next call's microbatches at the run's dispatched microbatches
+        (`Interval.microbatches`; a checkpoint that counted none resumes at its `step`'s, said), the
+        interval's count past them; and the call's FLOPs, each microbatch's at its count's program's."""
         if interval.microbatches is None:
             interval.microbatches = step * self.split
             _log.info("the run's checkpoint counted none of its dispatched microbatches: its pass counts "
                       "draw on from step %d's, microbatch %d", step, interval.microbatches)
-        start, interval.microbatches = interval.microbatches, interval.microbatches + self.split
-        self.counts = [sampled.count(self.key, start + part) for part in range(self.split)]
+        self.position = interval.microbatches
+        interval.microbatches += self.split
+        self._draw()
         total: StepFlops | None = None
         for count in self.counts:
             each = self.flops[count]
@@ -267,9 +271,24 @@ class DrawingStep:
             total = (1 / self.split) * each if total is None else total + (1 / self.split) * each
         return total
 
+    def _draw(self) -> None:
+        """The next call's counts, drawn at `position`, which moves past them."""
+        assert self.position is not None
+        self.counts = [self.sampled.count(self.key, self.position + part) for part in range(self.split)]
+        self.position += self.split
+
     def __call__(self, state: TrainState, batch: Batch, /, sampled: bool = False):
-        assert self.run is not None and len(self.counts) == self.split, "a call's counts are drawn first"
-        return self.run(state, batch, sampled)
+        assert self.run is not None
+        if not self.counts:
+            # A call no fit drew for draws its own, its first at its state's step's microbatches.
+            if self.position is None:
+                self.position = int(state.step) * self.split
+            self._draw()
+        try:
+            return self.run(state, batch, sampled)
+        finally:
+            # Each call's counts its own: the next draws again.
+            self.counts = []
 
 
 class StepCompiler[L, E]:
@@ -574,25 +593,26 @@ class StepCompiler[L, E]:
         return planned, compiled
 
     def drawing(self, holder: Holding[L, E], stepping: Callable[[], Stepping], compiled: Compiled,
-                state: TrainState, batch: Batch) -> CompiledStep:
+                state: TrainState, batch: Batch, key: jax.Array) -> CompiledStep:
         """`compiled`'s step, or where the run draws its pass count per microbatch (`PhasePasses.sampled`)
-        its every count's step at its cap's plan (`sampled_step`)."""
+        its every count's step at its cap's plan, drawing under the run's `key` (`sampled_step`)."""
         assert compiled.step is not None
         if self.phase_passes.sampled is None:
             return compiled.step
-        return self.sampled_step(holder, stepping, compiled, state, batch)
+        return self.sampled_step(holder, stepping, compiled, state, batch, key)
 
-    def drawn(self, held: tuple[CompiledStep, StepFlops | None], key: jax.Array, interval: Interval,
+    @staticmethod
+    def drawn(held: tuple[CompiledStep, StepFlops | None], interval: Interval,
               step: int) -> tuple[CompiledStep, StepFlops | None]:
         """A compiled step and its FLOPs (`held`), a drawing step's (`DrawingStep`) its next call's counts
         drawn at the microbatches `interval` counted, its FLOPs theirs."""
         compiled, flops = held
-        if isinstance(compiled, DrawingStep) and (sampled := self.phase_passes.sampled) is not None:
-            flops = compiled.drawn(sampled, key, interval, step)
+        if isinstance(compiled, DrawingStep):
+            flops = compiled.drawn(interval, step)
         return compiled, flops
 
     def sampled_step(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Compiled,
-                     state: TrainState, batch: Batch) -> DrawingStep:
+                     state: TrainState, batch: Batch, key: jax.Array) -> DrawingStep:
         """The step of a run that draws its pass count per microbatch (`PhasePasses.sampled`) over `batch`:
         `cap`, its cap's step (`compile`), and every other count's admitted at its plan (`admitted_at`), each
         traced under its count's objective, `holder`'s and the compiler's (`PhasePasses.scoped`), by
@@ -621,7 +641,8 @@ class StepCompiler[L, E]:
         self.phase_passes.current = sampled.cap
         with self.phase_passes.scoped(holder, self):
             capped = stepping()
-        step = DrawingStep(plans, flops, planned.split)
+        words = tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
+        step = DrawingStep(plans, flops, planned.split, sampled, words)
         step.run = self.runner(capped, planned, capped.settings.device_mesh,
                                parted=lambda: [plans[count] for count in step.counts])
         return step

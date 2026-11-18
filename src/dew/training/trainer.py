@@ -1107,7 +1107,7 @@ class Trainer(Generic[Loss, Effects]):
         with self.phase_passes.scoped(self, self._compiler):
             compiled = self._took(self._compiler.compile(self._stepping(), state, batch, trials))
         assert compiled.step is not None
-        return self._compiler.drawing(self, self._stepping, compiled, state, batch)
+        return self._compiler.drawing(self, self._stepping, compiled, state, batch, self.key)
 
     @ruled
     def _planned_unplaced(self, start: Start, batch: Batch) -> None:
@@ -2320,7 +2320,7 @@ class Trainer(Generic[Loss, Effects]):
             self._unproven = True
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
-        return (*self._compiler.drawn(compiled[signature], self.key, interval, run.current), trials.state)
+        return (*self._compiler.drawn(compiled[signature], interval, run.current), trials.state)
 
     def _saved_checkpoint(
         self,
