@@ -63,7 +63,6 @@ from dew.data.dataset import (
     Loading,
     Ranges,
     Records,
-    logged_run,
     record_batch,
     stacked,
     take_batch,
@@ -986,7 +985,7 @@ def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *,
 
 
 def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, reseed: bool = True,
-              certain: bool = True, barren: bool = False) -> Rows:
+              certain: bool = True, barren: bool = False, varying: tuple[str, ...] = ()) -> Rows:
     """`rows` read `epochs` times over, or endlessly, by Grain's repeat. An indexed repeat draws
     each pass afresh (`reseed`) as Grain's does, unless it stands for a repeat of a stream, whose
     passes replay the first. An endless repeat of a pass that holds nothing is refused, as it
@@ -994,7 +993,8 @@ def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, re
     a row and nothing before the repeat drops one, or every step before it makes the same rows each
     pass (`certain`, `_same_each_pass`): a share whose records a filter or a rejecting step keeps none
     of, which read on forever. A pass a step emptied that may yield rows next time (a fetch that failed
-    for now, a draw, a reseeded shuffle) is read on, logging its empty passes. Every pass of a stream
+    for now, a draw, a reseeded shuffle, `varying` naming those steps) is read on, saying so at each
+    empty pass after the first: the share, the passes so far and those steps. Every pass of a stream
     goes on counting its corpus (`_Passes`). A worker's pass of its inputs and the markers of what they
     dropped that holds nothing (`barren`) holds no input at all, which ends it (`_Barren`)."""
     if isinstance(rows, pygrain.MapDataset):
@@ -1002,23 +1002,25 @@ def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, re
             raise ValueError(f"a pass of {name} holds no rows, so repeating it reads nothing forever")
         return rows.repeat(epochs, reseed_each_epoch=reseed)
     parent = _as_iter(rows, loading)
-    passes = _Passes(parent, name, endless=epochs is None, certain=certain, barren=barren)
+    passes = _Passes(parent, name, endless=epochs is None, certain=certain, barren=barren, varying=varying)
     return gx.RepeatIterDataset(passes, epochs)
 
 
 class _Passes(pygrain.IterDataset):
     """A stream a repeat reads pass after pass, each going on counting its corpus. Endlessly read
     (`endless`), a pass that yields no row is refused where that is certain to repeat (`certain`),
-    and logged at each doubling of a run of them otherwise."""
+    and said at each empty pass after the first otherwise, naming the steps that may yield another row
+    on a later pass (`varying`)."""
 
     def __init__(self, parent: pygrain.IterDataset, name: str, *, endless: bool, certain: bool,
-                 barren: bool = False):
+                 barren: bool = False, varying: tuple[str, ...] = ()):
         super().__init__(parent)
         self._rows, self._name, self._endless, self._certain = parent, name, endless, certain
-        self._barren = barren
+        self._barren, self._varying = barren, varying
 
     def __iter__(self) -> pygrain.DatasetIterator:
-        return _PassesIterator(self._rows.__iter__(), self._name, self._endless, self._certain, self._barren)
+        return _PassesIterator(self._rows.__iter__(), self._name, self._endless, self._certain, self._barren,
+                               self._varying)
 
 
 class _PassesIterator(pygrain.DatasetIterator):
@@ -1028,10 +1030,10 @@ class _PassesIterator(pygrain.DatasetIterator):
     ended, lands where its position says, with the counts it holds."""
 
     def __init__(self, parent: pygrain.DatasetIterator, name: str, endless: bool, certain: bool,
-                 barren: bool = False):
+                 barren: bool = False, varying: tuple[str, ...] = ()):
         super().__init__(parent)
         self._rows, self._name, self._endless, self._certain = parent, name, endless, certain
-        self._barren = barren
+        self._barren, self._varying = barren, varying
         self._yielded = self._ended = False
         self._empty = 0
         self._opening: object | None = None
@@ -1047,10 +1049,11 @@ class _PassesIterator(pygrain.DatasetIterator):
                     raise ValueError(f"a pass of {self._name} yields no rows, so repeating it reads "
                                      "nothing forever") from None
                 self._empty += 1
-                # From the first: a pass of no rows is no ordinary filter's run.
-                if logged_run(self._empty):
-                    _log.warning("%s yielded no row in its last %d passes; the read goes on until one does",
-                                 self._name, self._empty)
+                # Every empty pass after the first, loudly: a read that is not moving says why it reads on.
+                if self._empty > 1:
+                    _log.warning("%s yielded no row in its last %d passes; it reads on, as %s may make "
+                                 "a row on a later pass", self._name, self._empty,
+                                 ", ".join(self._varying) or "a step before its repeat")
             self._ended = True
             raise
         self._yielded, self._empty = True, 0
@@ -1912,8 +1915,10 @@ class _Build:
             return self.block_shuffle(rows, stage, pipeline, partition)
         if isinstance(stage, Repeat):
             before = pipeline.stages[:at]
-            certain = not any(_drops(written) for written in before) or all(map(_same_each_pass, before))
-            return _repeated(rows, stage.epochs, _name(pipeline), self.loading, certain=certain)
+            varying = tuple(_identity(written).name for written in before if not _same_each_pass(written))
+            certain = not any(_drops(written) for written in before) or not varying
+            share = f"{_name(pipeline)} (share {partition.index} of {partition.count})"
+            return _repeated(rows, stage.epochs, share, self.loading, certain=certain, varying=varying)
         from dew.data.ordering import WindowShuffle
 
         if isinstance(stage, Shuffle) and _completes(pipeline, at, self.counting(pipeline)):

@@ -2,6 +2,7 @@
 record it drops as a marker, which the reading process drops, so a worker whose own inputs are
 all dropped never holds up the others' (row 883)."""
 
+import dataclasses
 import json
 from dataclasses import dataclass
 
@@ -297,3 +298,42 @@ def test_a_share_whose_records_a_step_keeps_none_of_is_refused_not_read_forever(
     finally:
         kept.close()
         empty.close()
+
+
+def _jitter(row, rng):
+    """A draw a record's generator makes, kept beside the record: a step that may make other rows on a
+    later pass."""
+    return {**row, "draw": np.int64(rng.integers(0, 2**31))}
+
+
+@dataclass(frozen=True)
+class _KeptFromFifthPass:
+    """Rejects every record of a six-record source's first four passes, keeping them after: a step whose
+    rows a later pass makes, as a fetch that failed for now does."""
+
+    calls: list = dataclasses.field(default_factory=list)
+    identity = "kept-from-fifth@1"
+    rejects = True
+
+    def __call__(self, row):
+        self.calls.append(None)
+        return Rejected("not yet") if len(self.calls) <= 24 else row
+
+
+def test_a_read_whose_passes_keep_nothing_after_a_draw_says_so_at_every_empty_pass(caplog):
+    """A repeated read whose draw before its repeat may make other rows on a later pass, whose first four
+    passes its rejecting step keeps none of, reads on, as a later pass may yield, and does: it says so at
+    each empty pass after the first, naming the share, the passes so far and the step that makes it read
+    on, so a run that is not moving says why, where it logged only at each doubling of its empty passes."""
+    ids = Pipeline(Memory({"id": np.arange(1, 7, dtype=np.int32)})).random_map(_jitter, identity="jitter@1")
+    stream = compile(ids.filter_map(_KeptFromFifthPass()).read("indexed").repeat().batch(2),
+                     loading=Loading(workers=0)).train(DataPartition())
+    caplog.set_level("WARNING", logger="dew.data.lowering")
+    try:
+        assert len(next(stream)["id"]) == 2
+    finally:
+        stream.close()
+    told = [record.args for record in caplog.records if record.name == "dew.data.lowering"
+            and isinstance(record.args, tuple) and len(record.args) == 3]
+    assert [passes for _, passes, _ in told] == [2, 3, 4]
+    assert all("share 0 of 1" in share and "jitter" in steps for share, _, steps in told)
