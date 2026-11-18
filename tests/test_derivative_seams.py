@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import LessFinite, assert_contract, normal_draw
+from contract_support import EDGES, LessFinite, assert_contract, assert_drawn_contract, normal_draw
 
 
 def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
@@ -70,14 +70,14 @@ def test_the_contract_runs_every_order_on_trainings_mesh():
         assert_contract(_split_over_the_mesh(1), x, x, cotangent, "a product a spec short")
 
     # A sum of 1024 products, its rounding errors check 1's to resolve (four of them resolve no ratio).
-    def draw(seed):
-        summed = normal_draw(seed, (1024,), (1,))
-        return summed, normal_draw(seed + 1, (1024,), (1,)), normal_draw(seed + 2, (1,))[0]
+    def inputs(seed, scale):
+        summed = normal_draw(seed, (1024,), (1,), scale=scale)
+        return summed, normal_draw(seed + 1, (1024,), (1,), scale=scale), normal_draw(seed + 2, (1,))[0]
 
-    summed = draw(0)
-    assert_contract(_summed_over_the_mesh(1), *summed, "a split sum", draw=draw)
+    assert_drawn_contract(_summed_over_the_mesh(1), inputs, EDGES["normal"], "a split sum")
     with pytest.raises(AssertionError):
-        assert_contract(_summed_over_the_mesh(2), *summed, "a split sum counted twice", draw=draw)
+        assert_drawn_contract(_summed_over_the_mesh(2), inputs, EDGES["normal"],
+                              "a split sum counted twice")
 
 
 def test_the_contract_refuses_a_bfloat16_formula_less_finite_than_the_plain_one():
