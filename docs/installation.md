@@ -101,7 +101,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post106,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post112,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. They are post103's on x86_64 and aarch64 (a GH200's Grace) alike, which add the fixes below of a GPU compile stopped after buffer assignment, the executable metadata that carries its buffer assignment, a compile's memory limit, a program's Mosaic GPU kernels compiled in parallel and XLA:CPU's bf16 reductions to post96's, and the `kernel-compile` extra's (x86_64 only) are post103's too. On Linux x86_64 and aarch64 jaxlib is Dew's build too, `jaxlib==0.12.0.1.post103`, whose client of a plugin reads that metadata, and libtpu 0.0.50 loads into it as into the stock one; elsewhere it is the stock `jaxlib==0.12.0.1`. Each GPU lock (`locks/cuda12.txt`, `locks/cuda13.txt`) carries each machine's pins under its markers, so a GH200 installs the same file. Every other package comes from PyPI. The fixes:
