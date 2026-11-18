@@ -389,7 +389,7 @@ def test_an_arm_of_its_own_compiler_options_is_prepared_whole(tmp_path):
     program, the prepare refused it, 'compiler_options can only be passed to top-level jax.jit', and its test
     ran unprepared). Its truth its own float64 function, as such a site's is (`blockwise_matrix`'s cuBLASLt
     reference beside its truth): a truth is walked by its trace, which no jit of compiler options lives in."""
-    from arm_forms import without_ynn
+    from arm_forms import WITHOUT_YNN, without_ynn
 
     dew, reference, draw = _site()
     traced: list[None] = []
@@ -398,7 +398,8 @@ def test_an_arm_of_its_own_compiler_options_is_prepared_whole(tmp_path):
         traced.append(None)
         return reference(a, b)
 
-    whole = without_ynn(counted, compiler_options={"xla_cpu_use_thunk_runtime": True})
+    # Its own compiler options, YNNPACK's off, whatever the census (`arm_forms.switched_off`).
+    whole = without_ynn(counted, compiler_options=dict(WITHOUT_YNN))
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
         assert_as_exact(dew, whole, draw, "a product of a compiled reference", seeds=8, truth_fn=reference)
     traced.clear()
