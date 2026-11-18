@@ -827,12 +827,14 @@ def test_an_offloaded_banks_regrouped_page_copies_lower_with_the_bank_in_host_me
     compile_programs({"regrouped": (regrouped, shapes)}, "sm80")
 
 
-@pytest.mark.parametrize(("layout", "rebuilds"), [(KVCache(page_size=2, groups=2), False),
-                                                   (KVCache(page_size=2), True)], ids=["groups", "rebuilds"])
-def test_a_search_regrouping_rows_unpaged_says_so(layout, rebuilds, caplog):
+@pytest.mark.parametrize(("layout", "rebuilds", "row"), [(KVCache(page_size=2, groups=2), False, 8493),
+                                                          (KVCache(page_size=2), True, 8494)],
+                         ids=["groups", "rebuilds"])
+def test_a_search_regrouping_rows_unpaged_says_so(layout, rebuilds, row, caplog):
     """A search that regroups its rows decodes a pool split among groups, or a model that rebuilds its cache,
-    unpaged (`regrouped_layout`), each row's cache whole, and says so in the log, never silently."""
+    unpaged (`regrouped_layout`), each row's cache whole (no page size, no pool, its format kept), and says
+    so in the log with the gap's row, never silently."""
     with caplog.at_level("INFO", logger="dew.nn.kv_cache"):
         chosen = regrouped_layout(layout, 2, 3, 5, 6, 24, rebuilds=rebuilds)
-    assert chosen.page_size is None and chosen.quantized == layout.quantized
-    assert [record.name for record in caplog.records] == ["dew.nn.kv_cache"]
+    assert (chosen.page_size, chosen.pages, chosen.quantized) == (None, None, layout.quantized)
+    assert [getattr(record, "row", None) for record in caplog.records] == [row]

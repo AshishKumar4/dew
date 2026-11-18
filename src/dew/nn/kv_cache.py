@@ -1633,9 +1633,10 @@ def regrouped_layout(layout: KVCache, prompts: int, width: int, prompt: int, new
     if layout.page_size is None:
         return layout
     if layout.groups > 1 or rebuilds:
+        row = 8494 if rebuilds else 8493
         _log.info("a search that regroups its rows decodes its paged cache unpaged, each row's cache "
-                  "whole: %s", "its model rebuilds its cache past a position (row 8494)" if rebuilds
-                  else f"its pool is split among {layout.groups} groups (row 8493)")
+                  "whole: %s (row %d)", "its model rebuilds its cache past a position" if rebuilds
+                  else f"its pool is split among {layout.groups} groups", row, extra={"row": row})
         return unpaged(layout)
     size = layout.page_size
     per_row, own = capacity // size, -(-new_tokens // size) + 1
