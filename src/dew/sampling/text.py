@@ -1081,10 +1081,10 @@ def generate(model: nn.Module, params: Variables,
     means the chain ``sampling`` compiles to, and ``()`` runs no transform.
     ``stopping`` adds criteria beside the policy's EOS criterion and never
     replaces it. ``strategy`` replaces the per-row draw loop; ``None`` uses
-    ``Sample``. A strategy that reparents its rows (``Regrouping``: ``Beam``,
-    ``Speculative``) decodes over the model's cache unpaged, each row's whole,
-    since a paged pool's shared pages cannot hold a regrouped row; its memory
-    is the dense model's, not the pages'. A policy with ``stop`` strings
+    ``Sample``. A strategy that reparents its rows (``Regrouping``: ``Beam``)
+    decodes over the model's cache unpaged, each row's whole, since a paged
+    pool's shared pages cannot hold a regrouped row; its memory is the dense
+    model's, not the pages'. A policy with ``stop`` strings
     raises ``ValueError``, because ``generate`` has no tokenizer to compile
     them against.
 

@@ -501,9 +501,9 @@ def pair_law(model):
 
 
 def test_speculation_over_a_paged_model_draws_what_it_draws_over_the_dense_one():
-    """Speculative decoding over a model that declares a paged cache, whose blocks' rollback regroups its
-    rows, decodes over its cache unpaged (`Regrouping`): its tokens and likelihoods are its draw's over the
-    dense model's, bit for bit (row 7934)."""
+    """Speculative decoding over a model that declares a paged cache keeps its pages, its blocks' rollback
+    moving its rows' cursors and regrouping none (no `Regrouping`): its tokens and likelihoods are its
+    draw's over the dense model's, bit for bit (row 7934)."""
     from dew.nn.kv_cache import KVCache
 
     model = predictor()

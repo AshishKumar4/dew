@@ -365,10 +365,10 @@ class Completed:
 
 
 class Regrouping:
-    """A strategy whose decode reparents its rows (`DecodeOps.regroup`: a beam's branches, a speculative
-    block's rollback), which a paged cache's shared pool cannot hold: `generate` decodes it over its model's
-    layout unpaged (`dew.nn.kv_cache.unpaged`), its memory the dense model's. `Beam` and the speculative
-    strategies are such; your own strategy that regroups its rows inherits it."""
+    """A strategy whose decode reparents its rows (`DecodeOps.reindex`: a beam's branches), which a paged
+    cache's shared pool cannot hold: `generate` decodes it over its model's layout unpaged
+    (`dew.nn.kv_cache.unpaged`), its memory the dense model's. `Beam` is such; your own strategy that
+    regroups its rows inherits it."""
 
 
 @struct.dataclass
@@ -650,7 +650,7 @@ def _beam_draws(done: Completed, start: StepState, prompts: int, n: int, budget:
                  (done.terminated[:, :n] & start.active[:, None]).reshape(prompts * n), boundaries)
 
 
-class _Speculating(Regrouping):
+class _Speculating:
     """What a speculative strategy's call is, a chain's (`Speculative`) or a tree's (`TreeSpeculative`):
     its drafter refused where the model has none (`refused`), then each continuation's loop of blocks
     (`_speculate`)."""
