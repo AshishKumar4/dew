@@ -701,10 +701,6 @@ class StepCompiler[L, E]:
             if self.ahead is not None:
                 raise ValueError("a step compiled ahead runs where the devices hold the state; this layout "
                                  "keeps the variables on the host")
-            if self.phase_passes.sampled is not None:
-                raise ValueError("a pass count drawn per microbatch (sampled_passes) runs each count's step "
-                                 "at its cap's plan where the devices hold the state; this layout keeps the "
-                                 "variables on the host (row 8271)")
             return Compiled(stepping.shape.split, step=self._compile_host(stepping, state, batch))
         held, self._unplaced = self._unplaced, None
         mesh = settings.device_mesh

@@ -99,7 +99,7 @@ def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
     step cannot be: a layout the run states (`stated`), a custom step, which owns its execution, or a process
     holding no CPU companion of the devices, which JAX makes only before it initializes. And what it is not
     built for yet (`NOT_BUILT`): a rollout, DiLoCo, a step compiled `ahead`,
-    a lowering for another target, AutoPGLE, and a part whose table
+    a lowering for another target, AutoPGLE, a pass count drawn per microbatch, and a part whose table
     states no host link to price it by (`GpuTarget.host_links`: a TPU's). Read before any plan is built."""
     unbuilt = (
         (trainer.rollout is not None, "a rollout"),
@@ -107,6 +107,7 @@ def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
         (ahead, "a step compiled ahead"),
         (trainer.lower_for is not None, "a lowering for another target"),
         (pgle_runs() > 0, "AutoPGLE"),
+        (trainer.phase_passes.sampled is not None, "a pass count drawn per microbatch (sampled_passes)"),
     )
     if stated:
         return "the run states its layout"
