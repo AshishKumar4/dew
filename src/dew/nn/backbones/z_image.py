@@ -26,6 +26,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.activations import silu
 from dew.nn.attention import AttentionImpl
 from dew.nn.blocks import modulation, sinusoidal_time
 from dew.nn.dense import Dense
@@ -219,7 +220,7 @@ class ZImageTransformer(nn.Module):
         features = sinusoidal_time(source_time, FREQUENCIES, dtype=width).astype(dtype)
         maps = self.projections(0, 0)
         mlp = GatedMLP(maps['t_embedder_1'][1], maps['t_embedder_2'][1], in_features=features.shape[-1],
-                        activation=nn.silu, use_bias=True, names=("t_embedder_1", "t_embedder_2"),
+                        activation=silu, use_bias=True, names=("t_embedder_1", "t_embedder_2"),
                         named_axes=(("t_embedder_1", (None, "mlp")), ("t_embedder_2", ("mlp", None))),
                         dtype=self.dtype, precision=self.precision)
         nn.share_scope(self, mlp)

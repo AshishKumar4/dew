@@ -28,6 +28,7 @@ from flax import linen as nn
 
 from dew.batch import Batch, Variables, unboxed
 from dew.inference.models import ModelSettings, ReleasesModel
+from dew.nn.activations import silu
 from dew.nn.kernels.options import program
 from dew.nn.precision import softplus
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, own_objective, traced_update_flops
@@ -53,7 +54,7 @@ class _MLP(nn.Module):
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
         for width in self.layers:
-            x = nn.swish(nn.Dense(width, kernel_init=nn.initializers.lecun_uniform())(x))
+            x = silu(nn.Dense(width, kernel_init=nn.initializers.lecun_uniform())(x))
         return nn.Dense(self.out, kernel_init=nn.initializers.lecun_uniform())(x)
 
 

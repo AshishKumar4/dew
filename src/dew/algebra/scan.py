@@ -475,11 +475,11 @@ def _merged(a, b, carried, issue: Callable) -> Walk:
     if not (isinstance(a, Walk) and isinstance(b, Walk)):
         raise Refused("a merge of walks init did not start from their operands' shapes")
     if b.transfer is None:
-        h = jnp.exp(b.decay)[:, None] * a.h + b.h
-        transfer = None if a.transfer is None else jnp.exp(b.decay)[:, None] * a.transfer
+        h = accurate_exp(b.decay)[:, None] * a.h + b.h
+        transfer = None if a.transfer is None else accurate_exp(b.decay)[:, None] * a.transfer
     else:
         h = issue("transfer_apply", b.transfer, a.h) + b.h
-        transfer = (issue("transfer_decay", jnp.exp(a.decay), b.transfer) if a.transfer is None
+        transfer = (issue("transfer_decay", accurate_exp(a.decay), b.transfer) if a.transfer is None
                     else issue("transfer_compose", b.transfer, a.transfer))
     if carried is None:
         return Walk(_held(a.decay + b.decay), h, transfer)

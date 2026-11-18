@@ -4,13 +4,13 @@ import dataclasses
 from collections.abc import Callable, Sequence
 from functools import partial
 
-import jax
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import AttentionImpl
 
+from ..activations import silu
 from ..attention_blocks import Stage, stage_attention
 from ..blocks import Downsample, FourierEmbedding, ResidualBlock, TimeProjection, Upsample
 from ..conv import Conv
@@ -115,7 +115,7 @@ class Unet(nn.Module):
     None is a stage with no attention."""
     num_res_blocks:int=2
     num_middle_res_blocks:int=1
-    activation:Callable = jax.nn.swish
+    activation:Callable = silu
     norm_groups:int=8
     dtype: Dtype | None = None
     precision: PrecisionLike = None

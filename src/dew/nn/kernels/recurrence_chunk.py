@@ -42,7 +42,14 @@ from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed_at
 from dew.nn.inputs import cu_seqlens
 from dew.nn.nested import nested
-from dew.nn.precision import asks_default_precision, at_least_fp32, exact_products, l2norm, rounds_products
+from dew.nn.precision import (
+    accurate_exp,
+    asks_default_precision,
+    at_least_fp32,
+    exact_products,
+    l2norm,
+    rounds_products,
+)
 from dew.nn.residuals import Residual
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, shard_shapes, varying_like
 
@@ -671,6 +678,8 @@ def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, column
 
     def update(h, q, k, v, g, beta, own=None):
         del q, own
+        # The language's exp, which the algebra reads as the decay `exp(z)` and evaluates by `scan._exp`
+        # (accurate on every backend): Dew's own on a TPU is a protected span it reads no operation of.
         decayed = jnp.exp(g).reshape(-1, 1) * h
         written = v - k @ decayed if delta else v
         return decayed + beta * k[:, None] * written[None, :]
@@ -773,6 +782,7 @@ def _oja_forms(*, scale: float, width: int, columns: int, work: jnp.dtype, reset
 
     def update(h, q, k, v, g, beta):
         del q
+        # The language's exp, the algebra's decay (`_delta_forms`' update).
         decayed = jnp.exp(g).reshape(-1, 1) * h
         return decayed + v[:, None] * (beta * k - beta * (v @ decayed))[None, :]
 
@@ -802,7 +812,7 @@ def recurrent_gated_oja_rule(query, key, value, gv, beta, state=None, *, starts=
     query = query * (key.shape[-1] ** -0.5 if scale is None else scale)
 
     def one_token(h, step):
-        h = jnp.where(step['start'][:, None, None, None], 0.0, h) * jnp.exp(step['g'])[:, :, None, :]
+        h = jnp.where(step['start'][:, None, None, None], 0.0, h) * accurate_exp(step['g'])[:, :, None, :]
         erased = step['k'] - jnp.einsum('bhkv,bhv->bhk', h, step['v'])
         h = h + erased[..., :, None] * (step['beta'][..., None] * step['v'])[..., None, :]
         return h, jnp.einsum('bhk,bhkv->bhv', step['q'], h)
@@ -1448,7 +1458,7 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None)
 
     def one_token(s, step):
         s = jnp.where(step['start'][:, None, None, None], 0.0, s)
-        out, s = recurrence.update(s, step['q'], step['k'], step['v'], jnp.exp(step['g']),
+        out, s = recurrence.update(s, step['q'], step['k'], step['v'], accurate_exp(step['g']),
                                    step['beta'][..., None], delta=True)
         return s, out
     # The scan stacks along the first axis, so the operands go time-major.

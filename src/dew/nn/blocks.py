@@ -457,7 +457,7 @@ class ResidualBlock(nn.Module):
     norms."""
     features: int
     kernel_size: tuple = (3, 3)
-    activation: Callable = jax.nn.swish
+    activation: Callable = activations.silu
     norm_groups: int = 8
     dtype: Dtype | None = None
     precision: PrecisionLike = None

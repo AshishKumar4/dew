@@ -20,6 +20,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
 from dew.batch import Coordinates
+from dew.nn.activations import GATE_ACTIVATIONS, logistic
 from dew.nn.attention import (
     AttentionImpl,
     attention_case,
@@ -83,7 +84,7 @@ from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import at_least_fp32, divided, float32_dot_general, l2norm, rounded_to, scaled, softplus
+from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.qsa import QSA, QSAIndexer, qsa_selection
 from dew.nn.residuals import QKV_RESIDUALS, Residual
@@ -350,17 +351,6 @@ class _Masking(NamedTuple):
     whose blocks they read whole past their window, or None where its queries are its last keys."""
 
 
-
-GATE_ACTIVATIONS = {
-    'sigmoid': jax.nn.sigmoid,
-    'silu': jax.nn.silu,
-    # torch's softplus at beta log 2, log(1 + exp(x log 2)) / log 2.
-    'softplus2': lambda gate: divided(softplus(gate * math.log(2)), math.log(2)),
-    # torch's softplus in at least float32, Laguna's `F.softplus(g_proj(x).float())`, which the branch's
-    # product casts back (modeling_laguna.py:410).
-    'softplus': lambda gate: softplus(gate.astype(at_least_fp32(gate.dtype))),
-}
-"""The output gate's activations (`MixerContext.output_gate_activation`)."""
 
 INDEX_KEYS, INDEX_PLACES = "index_keys", "index_places"
 """QSA's cache leaves beside a layer's keys: each slot's raw indexer key and its rotary place."""
@@ -1892,7 +1882,7 @@ class CausalSelfAttention(nn.Module):
             wide = at_least_fp32(jnp.result_type(gate, attention))
             scale = gain(self.s_gate, self.ctx.ngpt.gate(self.ctx.emb_features), wide)
             logits = gate.astype(wide) * jnp.square(scale).reshape(self.ctx.num_heads, self.ctx.head_dim)
-            attention = (attention.astype(wide) * jax.nn.sigmoid(logits)).astype(attention.dtype)
+            attention = (attention.astype(wide) * logistic(logits)).astype(attention.dtype)
         elif gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects (modeling_qwen3_5.py:701,
             # modeling_qwen4_exp.py:836 the same), or by K2 Horizon's SiLU or softplus at beta log 2
