@@ -1435,7 +1435,8 @@ class GlobalStream:
 
         # The saved order as its plan's version described its stages (`Plan.order_under`).
         if not same_order(saved.order, self._plan.order_under(saved_version(saved.plan))):
-            raise ValueError(
+            raise _position.PlanChanged(
+                ("order",),
                 f"the saved data position is {saved.records} records into "
                 f"{saved.order}, and this run reads {self._order}; a record count "
                 f"is a place in one order and another place in another, so resume "
@@ -1712,13 +1713,8 @@ class PhasedStream:
                 # Each phase's saved order and plan to its own stream, which compares them as the version
                 # the plan records described its stages (`GlobalStream.set_state`, `Plan.order_under`).
                 order = saved.completed[index][0] if index < len(saved.completed) else saved.order
-                try:
-                    self._stream(index).set_state(_position.encode(_position.Global(
-                        records=end - self._start(index) - shift, order=order, plan=plan)))
-                except _position.PlanChanged:
-                    raise
-                except ValueError as refused:
-                    raise _position.PlanChanged((f"phases.{index}",), str(refused)) from refused
+                self._stream(index).set_state(_position.encode(_position.Global(
+                    records=end - self._start(index) - shift, order=order, plan=plan)))
 
         # A position with no plan, its orders as this Dew describes them.
         planless = saved.plan is None
@@ -1993,9 +1989,9 @@ class StepPhases(Forwarding):
         from dew.data.plan import saved_identity, saved_version
 
         identities = [saved_identity(held) for held in strings(saved["identities"], "saved phase identities")]
+        own = base64.b64decode(text(saved["position"], "the saved phase's position"))
         # The plan version its phase's own reader recorded, which its identities describe their steps by.
-        embedded = _position.phase_position(state)
-        version = saved_version(None if embedded is None else _position.saved_plan(embedded))
+        version = saved_version(_position.saved_plan(own))
         if phase >= len(self._make) or ends != self._ends[:phase] or not self._read_alike(identities, phase,
                                                                                             version):
             raise _position.PlanChanged(
@@ -2016,7 +2012,6 @@ class StepPhases(Forwarding):
                               f"{self.CONTINUES if any(self._shared) else None!r} "
                               "(docs/design/data.md, the rules): resume it by the data plan version it was "
                               "saved under, as a run config's resume does")
-        own = base64.b64decode(text(saved["position"], "the saved phase's position"))
         # What a position saved before phases shared corpora holds of them: none.
         from dew.data.mixing import Left
 

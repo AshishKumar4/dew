@@ -198,18 +198,21 @@ the phase it stands in, the steps it has read, the phases it finished and how, a
 reader's position (`position`, base64), which is what a process count reads."""
 
 
+def per_share(position: bytes) -> Mapping[str, object]:
+    """A per-share read's saved position (`dew.data.readers`): its data plan's record (`PLAN`) and its
+    iterator, under an elastic read's envelope (`REPLICATED`) or bare, as the share wrote it."""
+    held = replicated(position)
+    return record(json.loads(position), "saved per-share position") if held is None else held
+
+
 def saved_plan(position: bytes) -> Mapping[str, object] | None:
     """The data plan's record a reader's `position` holds (`dew.data.plan.Plan.record`): a global position's,
-    a per-share one's or a replicated one's (`PLAN`); None where it holds none."""
+    or a per-share or elastic one's (`per_share`, `PLAN`); None where it holds none."""
     place = decode(position)
     if place is not None:
         return place.plan
-    match json.loads(position):
-        case {"dew_data_plan": Mapping() as plan}:
-            return plan
-        case {"dew_replicated_position": {"dew_data_plan": Mapping() as plan}}:
-            return plan
-    return None
+    plan = per_share(position).get(PLAN)
+    return plan if isinstance(plan, Mapping) else None
 
 
 def phase_position(position: bytes) -> bytes | None:

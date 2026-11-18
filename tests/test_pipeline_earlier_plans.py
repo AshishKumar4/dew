@@ -307,3 +307,24 @@ def test_a_phases_position_saved_now_refuses_a_finished_phase_whose_hidden_field
     finally:
         same.close()
         changed.close()
+
+
+def test_a_phased_position_whose_finished_phase_is_damaged_is_refused_not_restarted():
+    """A phased position whose finished phase's saved plan is damaged (its manifest no record) is refused as
+    damage, a ValueError no resume may read past, not as a plan that changed (`PlanChanged`), which a
+    relaxed resume restarts the data on (train 1021's review, F2)."""
+    from hidden_field_positions import SAVED
+
+    from dew import _position
+
+    saved = json.loads((SAVED_UNDER_15 / "hidden_global_phases.position").read_bytes())
+    plans = saved[_position.ENVELOPE]["plan"]["phases"]
+    plans[0] = {**plans[0], "manifest": 5}
+    loader, _ = SAVED["hidden_global_phases"]
+    stream = loader().train(DataPartition())
+    try:
+        with pytest.raises(ValueError) as refused:
+            stream.set_state(json.dumps(saved).encode())
+    finally:
+        stream.close()
+    assert not isinstance(refused.value, _position.PlanChanged)
