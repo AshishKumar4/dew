@@ -27,6 +27,7 @@ from run_kinds import (
     masked,
     merged,
     prefixed,
+    published,
     requested,
     shared,
     trained_by_cli,
@@ -340,7 +341,8 @@ a context's encoder encodes it for context layers, which read a row's context.""
 
 TASK_RUNS = {"TextSettings": ((prefixed, "lm"),),
              "MaskedSettings": ((masked, "masked_diffusion"), (dreamed, "masked_diffusion")),
-             "ImageSettings": ((diffusion, "diffusion"),), "BlockSettings": ((blockwise, "block_diffusion"),),
+             "ImageSettings": ((diffusion, "diffusion"), (published, "diffusion")),
+             "BlockSettings": ((blockwise, "block_diffusion"),),
              "DecideSettings": ((decision, "decision"), (blocked, "decision"), (lettered, "decision"),
                                 (merged, "decision"), (shared, "decision")),
              "ModelSettings": ((jepa, "jepa"),)}
@@ -348,7 +350,8 @@ TASK_RUNS = {"TextSettings": ((prefixed, "lm"),),
 decision release's, which exports, a fresh head's over a backbone that reads blocks, a fresh letter
 readout's, whose labels its layout takes, a fresh head's over a tokenizer that merges, whose unit a row
 shows, and a letter readout's whose rows ask a request's questions over one state, each continuing it;
-a masked run over a release, whose walk it takes; a JEPA encoder's, whose native release records no settings
+a masked run over a release, whose walk it takes; a run over a published pipeline naming no preset, which
+trains the pipeline's own process over its grid; a JEPA encoder's, whose native release records no settings
 of its own (`dew.inference.models.ModelSettings`)."""
 
 

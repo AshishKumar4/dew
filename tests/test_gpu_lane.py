@@ -112,8 +112,8 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
     interpreter(tmp_path, "3.12")
     fetched = fetcher(tmp_path)
     monkeypatch.setenv(tier_wire.TRUTHS, str(tmp_path / "truths"))
-    # The harness's side, as the suite's own conftest has it: a prepare skips every test but those it
-    # prepares.
+    # The suite's conftest's side, which decides what a test prepares: here, a test not marked
+    # `prepares` prepares nothing and is skipped.
     (tmp_path / "tests/conftest.py").write_text(
         "import os, pytest\n"
         "def pytest_configure(config):\n"

@@ -54,7 +54,7 @@ import time
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from concurrent.futures import Future
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.experimental.topologies as topologies
@@ -825,33 +825,62 @@ def kept(path: str | Path) -> Iterator[AheadPrograms]:
         yield programs
 
 
+class Compile(Protocol):
+    """A program's compile, as `compile_programs` makes each (`compiled`): `function` a program whose results
+    it places (`out_shardings`), which `lower` lowers: Dew's compile point (`owned_program`), or `jax.jit`
+    where the program's run compiles it so."""
+
+    def __call__(self, function: Callable, /, *,
+                 out_shardings: jax.sharding.Sharding) -> OuterProgram | jax.stages.Wrapped: ...
+
+
+def _gpu_mesh(generation: str, multiprocessors: int | None) -> jax.sharding.Mesh:
+    """One mesh axis over the compile-only GPUs of `generation` (`compile_only_gpus`)."""
+    return jax.sharding.Mesh(np.asarray(compile_only_gpus(generation, multiprocessors=multiprocessors)),
+                             ("devices",))
+
+
+@contextlib.contextmanager
+def lowering_for(generation: str, multiprocessors: int | None = None) -> Iterator[None]:
+    """Within the block, programs trace and lower as `compile_programs` lowers them for one GPU of the CUDA
+    `generation`: their launches derived for that GPU's facts (`assumed`, any GPU of the generation), on the
+    compile-only GPUs' abstract mesh, certified on the first (`report.certifying`). A program traced in it
+    holds the arrays a compile of it ahead holds (a prepare's, `tests/truths_ahead.py`)."""
+    mesh = _gpu_mesh(generation, multiprocessors)
+    with (assumed(built_target(generation, multiprocessors), portable=True),
+          jax.sharding.use_abstract_mesh(mesh.abstract_mesh), report.certifying(mesh.devices.flat[0])):
+        yield
+
+
 def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDtypeStruct]]],
-                     generation: str, multiprocessors: int | None = None) -> AheadPrograms:
-    """`programs`, each a function and the shapes and dtypes of its arguments, by its name, compiled ahead for
+                     generation: str, multiprocessors: int | None = None, *,
+                     compiled: Compile = owned_program) -> AheadPrograms:
+    """`programs`, each a function and its arguments' shapes, dtypes and weak types (each a
+    `ShapeDtypeStruct` or an abstract value), by its name, compiled ahead for
     one GPU of the CUDA `generation`, of the `multiprocessors` it states (`built_target`), on any host holding
-    the CUDA plugin (`compile_only_gpus`), its launches derived for that GPU's facts (`assumed`), and
+    the CUDA plugin (`compile_only_gpus`), its launches derived for that GPU's facts (`lowering_for`), and
     serialized: a CPU host builds what a GPU node then
     only loads and runs (`AheadPrograms.loaded`, ledger 2716). Arguments and results are placed whole on that
     GPU, whatever the function reads. A function takes and returns arrays (a backward is a program of its own
     over its residuals); one whose program holds arrays it closed over is refused, named, as no executable
     serializes them, as is one holding a kernel this host cannot lower for any GPU of the generation
     (`selection.Unlowerable`: cuDNN's, whose plan holds to its GPU's model). Each is lowered in turn and all
-    compile at once (`report.compiled_at_once`)."""
+    compile at once (`report.compiled_at_once`). `compiled(function, out_shardings=)` makes each program
+    lowered: Dew's compile point (`owned_program`), or the compile the program's run takes where that is
+    another (check 1's arms, `jax.jit`)."""
     target = built_target(generation, multiprocessors)
-    devices = compile_only_gpus(generation, multiprocessors=multiprocessors)
-    mesh = jax.sharding.Mesh(np.asarray(devices), ("devices",))
-    placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    placed = jax.sharding.NamedSharding(_gpu_mesh(generation, multiprocessors), jax.sharding.PartitionSpec())
     lowerings = []
     for name, (function, arguments) in programs.items():
-        shapes = tuple(jax.ShapeDtypeStruct(argument.shape, argument.dtype, sharding=placed)
+        shapes = tuple(jax.ShapeDtypeStruct(argument.shape, argument.dtype, sharding=placed,
+                                            weak_type=argument.weak_type)
                        for argument in arguments)
 
         def lowered(function=function, shapes=shapes, name=name) -> jax.stages.Lowered:
             """The program lowered for the target, afresh at each call (a relowering's, past a spill)."""
             try:
-                with (assumed(target, portable=True), jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
-                      report.certifying(mesh.devices.flat[0])):
-                    return owned_program(function, out_shardings=placed).lower(*shapes)
+                with lowering_for(generation, multiprocessors):
+                    return compiled(function, out_shardings=placed).lower(*shapes)
             except Unlowerable as refused:
                 raise refused.refusing(name) from refused
         lowerings.append((lowered(), None, lowered))
@@ -1392,7 +1421,7 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         raise refused.refusing("step") from refused
     # The sampled step as the search compiled it, its program what it lowered then.
     sampled = (None if planned.sampled is None
-               else AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable))
+               else AheadProgram.of(planned.sampled.digest, planned.sampled.executable))
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     memory = compiled_memory(compiled)

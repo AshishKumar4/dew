@@ -676,8 +676,8 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     from diffusion_stubs import batch_for
     from diffusion_support import images_of, saved_after_one_step
 
-    from dew.config import ObjectiveConfig, TrainerConfig
-    from dew.config.diffusion import DiffusionRunConfig
+    from dew.config import ObjectiveConfig, SourceOptions, TrainerConfig
+    from dew.config.diffusion import DEFAULT_MODEL_CONFIG, DiffusionRunConfig
     from dew.inputs import TextCondition
     from dew.interop.autoencoders.pretrained import PretrainedAutoencoder
     from dew.registry import ModelConfig
@@ -715,6 +715,23 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(restored(["a red bird"], key=9).host().images, expected)
+
+    # A run that starts from the tuned run (`--pretrained <run>`) records its tuned autoencoder and holds
+    # its weights and running statistics (ledger 2791): its own saved task decodes with them, the weights
+    # stored as a storage override asks, the statistics as the run kept them.
+    started = replace(config, pretrained=str(run), source=SourceOptions(step="latest"), text=None,
+                      model=ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)), autoencoder=None,
+                      objective=ObjectiveConfig("diffusion", {
+                          "solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
+    saved_after_one_step(started, lambda task: batch_for(task, 32), tmp_path / "started", 1e-2)
+    again = TextToImage.from_run(str(tmp_path / "started"))
+    assert isinstance(again.autoencoder, TunedAutoEncoder)
+    for got, want in zip(jax.tree.leaves(again.variables["autoencoder"]), jax.tree.leaves(restored_tuned),
+                         strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    stored = TextToImage.from_run(str(tmp_path / "started"), param_dtype="bfloat16").variables["autoencoder"]
+    assert {leaf.dtype for leaf in jax.tree.leaves(stored[TUNED_WEIGHTS])} == {jnp.dtype(jnp.bfloat16)}
+    assert {leaf.dtype for leaf in jax.tree.leaves(stored[LATENT_STATS])} == {jnp.dtype(jnp.float32)}
 
 
 BUILT_INS = tuple(entry.wrapper for entry in REGISTRATIONS)

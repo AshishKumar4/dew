@@ -10,9 +10,11 @@ lowering a generation's Mosaic GPU kernels runs on a CPU or on a GPU that copies
 """
 
 import importlib.util
+import os
 
 import jax
 import pytest
+import tier_wire
 from flax.linen.dtypes import canonicalize_dtype
 
 from dew.nn.kernels import gemm, generation
@@ -35,13 +37,30 @@ SUMS_IN_IEEE = pytest.mark.skipif(
            "truncating each add, do not")
 
 
+def _here() -> str:
+    """This process's device generation as its kernels run (`runnable`, `lowers_as`): the node's GPU's in a
+    GPU tier part's prepare (`model_flows.node_target`), whose default device, a compile-only GPU, states no
+    generation of its own, so a cell pinned to the node's generation prepares there as its run runs it
+    (train 1013's review F4); else its device's."""
+    if _preparing():
+        import model_flows
+
+        return model_flows.node_target().generation
+    return generation.device_generation()
+
+
+def _preparing() -> bool:
+    """Whether this process is a GPU tier part's prepare (`tier_wire.PREPARE`)."""
+    return os.environ.get(tier_wire.PREPARE) == "1"
+
+
 def runnable(name: str) -> bool:
     """Whether this process runs the kernels `generation.assumed(name)` routes to: a CPU any (it
     interprets them); a TPU its own generation's; a GPU Hopper's warpgroup kernels only if it is that
     generation (capability 9.0 alone has the instructions), and any other generation's only if no newer than
     itself and its block
     holds the shared memory `name`'s launches are sized to (an L4's 99 KiB do not an A100's 163)."""
-    here = generation.device_generation()
+    here = _here()
     if not here.startswith("sm") or generation.capability(name) is None:
         # A TPU's launches a CPU interprets, and that TPU runs.
         return here in ("cpu", name)
@@ -49,7 +68,7 @@ def runnable(name: str) -> bool:
         return name == here
     return (generation.capability(name) <= generation.capability(here)
             and generation.shared_budget(generation.gpu_target(name))
-            <= generation.shared_budget(generation.gpu_target()))
+            <= generation.shared_budget(generation.gpu_target(here if _preparing() else None)))
 
 
 def runs(name: str):
@@ -68,7 +87,7 @@ def lowers_as(name: str) -> bool:
     709ddea7a)."""
     if not runnable(name):
         return False
-    here = generation.device_generation()
+    here = _here()
     return here == "cpu" or generation.architecture(name).tma == generation.architecture(here).tma
 
 

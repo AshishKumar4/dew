@@ -421,23 +421,38 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
                for rollout in watched.rollouts if int(rollout.task) % 5 == 1)
 
 
-def test_a_served_rollouts_server_shares_its_prompts_pages_by_default():
-    """A served rollout's server (`RolloutScheduler.serve`) that names no page size pages its cache where
-    paging computes what the model computes, its prefix cache on as a paged server keeps one, so a group's
-    samples of one prompt prefill it once (row 5375); a model whose LongRoPE rebuilds a crossing request,
-    and one whose max_seq_len holds no row in whole pages, keeps each row's cache whole."""
+def test_a_server_whose_requests_repeat_prompts_shares_their_pages():
+    """A server whose caller says its requests repeat prompts (`Server.from_task`'s `kv_cache='shared'`), as a
+    served rollout's group of samples does, pages its cache wherever a server over pages keeps a prefix
+    cache, so a group's samples of one prompt prefill it once (row 5375); one that names no layout keeps the
+    model's own whole rows, which serve prompts no two of which share faster (M-IG-12); a model whose
+    LongRoPE rebuilds a crossing request, one whose loop shares a cache its later passes rewrite, which
+    shares no prompt over pages, and one whose max_seq_len holds no row in whole pages keep each row's cache
+    whole."""
     from model_support import serving_task
 
+    from dew.inference.serving import PAGE_SIZE, PagedRows
+    from dew.nn.backbones.decoder_stack import Loop
     from dew.nn.rope import LongRopeScaling
 
-    task = serving_task(capacity=64)
-    assert RolloutScheduler.serve(task, slots=4, capacity=64).reuses_prefixes
+    task = serving_task(capacity=2 * PAGE_SIZE)
+    assert not isinstance(Server.from_task(task, slots=2, capacity=2 * PAGE_SIZE).rows, PagedRows)
+    server = Server.from_task(task, slots=2, capacity=2 * PAGE_SIZE, kv_cache="shared")
+    assert server.reuses_prefixes
+    prompt = [1 + index % 11 for index in range(PAGE_SIZE + 6)]
+    server([prompt, prompt], 2, key=0)
+    # The second sample of the prompt read its first page from the first's.
+    assert server.prefix_hits == PAGE_SIZE
     # Factors for each of a head's 8 widths' rotated pairs.
     scaling = LongRopeScaling(short_factor=(1.0,) * 4, long_factor=(2.0,) * 4,
                               original_max_position_embeddings=16)
-    rebuilding = dataclasses.replace(task, model=task.model.clone(rope_scaling=scaling))
-    assert not RolloutScheduler.serve(rebuilding, slots=4, capacity=64).reuses_prefixes
-    assert not RolloutScheduler.serve(serving_task(capacity=12), slots=4, capacity=8).reuses_prefixes
+    looped = task.model.clone(loop=Loop(steps=2, shared_cache=True))
+    for model in (task.model.clone(rope_scaling=scaling), looped):
+        whole = Server.from_task(dataclasses.replace(task, model=model), slots=2, capacity=2 * PAGE_SIZE,
+                                 kv_cache="shared")
+        assert not isinstance(whole.rows, PagedRows) and not whole.reuses_prefixes
+    short = Server.from_task(serving_task(capacity=12), slots=2, capacity=8, kv_cache="shared")
+    assert not isinstance(short.rows, PagedRows)
 
 
 def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
@@ -464,14 +479,23 @@ def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
     paged = layout(task)
     assert paged is not None and paged.page_size == 64
     assert layout(dataclasses.replace(task, n=2)) is None
-    # A policy searching beams, which a server over pages does not draw, is drawn whole.
+    # A policy searching beams, which a server over pages does not draw, is drawn whole, its model's own
+    # pages too.
     assert layout(dataclasses.replace(task, strategy=Beam(width=2))) is None
+    declared = dataclasses.replace(task, model=task.model.with_kv_cache(KVCache(page_size=8)))
+    declared_layout = layout(declared)
+    assert declared_layout is not None and declared_layout.page_size == 8
+    assert layout(dataclasses.replace(declared, strategy=Beam(width=2))) is None
+    # A model whose max_seq_len holds no row of the cohort's 12 slots in its own whole pages of 8 is drawn
+    # whole, which a server over them would refuse.
+    short = serving_task(capacity=12)
+    assert layout(dataclasses.replace(short, model=short.model.with_kv_cache(KVCache(page_size=8)))) is None
 
 
 def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):
     """A served rollout whose run names its page size 'whole' (`--rollout.served.page-size whole`,
     `ServedRollout.page_size`) serves over each row's whole cache, no prompt page shared, where one naming
-    none pages wherever pages serve the policy (`RolloutScheduler.serve`, row 5375); the run records the
+    none pages wherever pages serve the policy (`Server.from_task`, row 5375); the run records the
     choice and loads with it."""
     import rl_support
     from model_support import serving_task
@@ -484,10 +508,10 @@ def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):
     served = config.rollout.served
     assert served is not None and served.page_size == "whole"
     task = serving_task(capacity=64)
-    assert not RolloutScheduler.serve(task, slots=4, capacity=64, page_size=served.page_size).reuses_prefixes
+    assert not Server.from_task(task, slots=4, capacity=64, kv_cache=served.page_size).reuses_prefixes
     # A model that declares pages of its own is served whole all the same.
     paged = dataclasses.replace(task, model=task.model.with_kv_cache(KVCache(page_size=8)))
-    assert RolloutScheduler.serve(paged, slots=4, capacity=64).reuses_prefixes
-    assert not RolloutScheduler.serve(paged, slots=4, capacity=64, page_size="whole").reuses_prefixes
+    assert Server.from_task(paged, slots=4, capacity=64, kv_cache="shared").reuses_prefixes
+    assert not Server.from_task(paged, slots=4, capacity=64, kv_cache="whole").reuses_prefixes
     config.save(str(tmp_path / "whole"))
     assert LMRunConfig.load(str(tmp_path / "whole")).rollout == config.rollout

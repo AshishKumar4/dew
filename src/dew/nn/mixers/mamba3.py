@@ -46,7 +46,7 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels.recurrence import Hooks, skip_added
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
-from dew.nn.linear import forked_scan
+from dew.nn.linear import forked_scan, sequence_split
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.mixers.mamba2 import MambaRMSNormGated
@@ -54,7 +54,6 @@ from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, compensated_add, float32_dot_general, softplus, two_product
 from dew.nn.residuals import Residual
 from dew.nn.scatter import gather_positions
-from dew.nn.sharding import sequence_shards
 
 CHUNK_SIZE = 64
 """mamba_ssm's Mamba-3 `chunk_size` for a single input and output."""
@@ -85,13 +84,16 @@ def _wrapped(angle):
     """A double-float angle `(hi, lo)` less its whole turns (`TWO_PI`, each turn's product exact, Dekker's),
     about [0, 2 pi): its rounding a turn's however long the document, as mamba_ssm's `angle_dt` holds it."""
     turns = jnp.floor(angle[0] * np.float32(1 / (2 * np.pi)))
-    whole, dropped = two_product(-turns, jnp.full_like(turns, TWO_PI[0]))
+    whole, dropped = two_product(-turns, jnp.full_like(turns, TWO_PI[0]),
+                                 bit_split=turns.dtype == jnp.float32)
     return compensated_add(angle, (whole, dropped - turns * TWO_PI[1]))
 
 
 def _angles(dt, theta, continues):
     """Each token's angle `[B, S, H, R]` over its document as a double-float `(hi, lo)` pair: `dt theta`
-    (each its exact product, `two_product`) summed from the document's first token through the token (`dt`
+    (each its exact product, `two_product`'s bit split in fp32: a Veltkamp split multiplies `dt` by 4097
+    first, inf past 2^115, base review 9bc4326dd F1; float64's splitter overflows past 2^996 alone) summed
+    from the document's first token through the token (`dt`
     zero where a token's turn acts on no state, `chunk_mamba3`) and less its whole turns once summed
     (`_wrapped`), in `dt`'s dtype: a double float's 48 bits hold a document's sum of turns of at most pi to
     fp32's rounding past 2^20 tokens, so the scan's combines wrap nothing. The recurrence turns a token's
@@ -100,7 +102,8 @@ def _angles(dt, theta, continues):
     and its gradients to 2.1 times, where a double-float angle and its rotation of it (`rotated`'s
     `residual`) hold them under (row 7402)."""
     rates = jnp.broadcast_to(jnp.asarray(theta, dt.dtype), (*dt.shape, theta.shape[-1]))
-    high, low = two_product(jnp.broadcast_to(dt[..., None], rates.shape), rates)
+    high, low = two_product(jnp.broadcast_to(dt[..., None], rates.shape), rates,
+                            bit_split=dt.dtype == jnp.float32)
     # A segmented sum: a token that begins a document drops what came before it.
     restarts = jnp.broadcast_to(~continues[:, :, None, None], high.shape)
     return _wrapped(scan.compensated(high, low=low, axis=1, restarts=restarts))
@@ -471,7 +474,8 @@ class Mamba3(nn.Module):
     The decode cache holds `Carried`'s four in at least fp32 (`ssm_state` `[B, H, P, N]`, `angle_state` `[B,
     H, A]`, `k_state` `[B, H, R, N]`, `v_state` `[B, H, R, P]`): a one-token call runs the step and a longer
     one the chunked form from them. Padded slots (`attention_metadata.valid`) take a zero step and packed
-    documents (`starts`) run as if alone; a call under a mesh sequence axis above one is refused.
+    documents (`starts`) run as if alone; under a mesh sequence axis above one a decode call and one over
+    forks run whole (`dew.nn.linear.sequence_split`), and a training call is refused.
     """
 
     reads: ClassVar[frozenset[str]] = frozenset({"forks"})
@@ -597,9 +601,11 @@ class Mamba3(nn.Module):
         batch, length, _ = x.shape
         tokens = coordinates_of(call.metadata, batch, length)
         valid = tokens.valid
-        if (shards := sequence_shards()) > 1:
-            raise LayoutRefused(f"mamba3 runs a sequence on one shard; this mesh splits it over {shards}. "
-                                "Run it on a mesh with sequence=1.")
+        if (shards := sequence_split(call.decode, tokens)) > 1:
+            # A decode call and one over forks run whole (`sequence_split`); a training call's split is
+            # refused.
+            raise LayoutRefused(f"mamba3 runs a training sequence on one shard; this mesh splits it over "
+                                f"{shards}. Run it on a mesh with sequence=1.")
         if valid is not None:
             x = jnp.where(valid[:, :, None], x, 0)
         projected = self.in_proj(x)

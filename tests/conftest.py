@@ -165,6 +165,23 @@ def pytest_runtest_makereport(item, call):
     `gate_findings`, a JSON list of each finding's leaf, rule, measure (an infinite one `Infinity`) and
     the phase it failed: what a promotion matches a candidate's failures to its parent's by."""
     outcome = yield
+    # A part's test that failed in its prepare before any check-1 site (`compiled_ahead`) computed before its
+    # sites, on a device that computes nothing: it is recorded where it did (`truths_ahead.UNPREPARED`, the
+    # tier's list of unprepared tests read from these records alone, a ledger row each), and its run runs
+    # it unprepared, compiling its sites on its GPU as a test outside a part does, every site judged; one
+    # that prepared any site is strict, a site it reaches unprepared a red (`truths_ahead.MissingTruth`).
+    if (call.when == "call" and call.excinfo is not None and os.environ.get(tier_wire.PREPARE) == "1"
+            and (store := _sites_store(item)) is not None and not any(store.glob("*/site.json"))):
+        from truths_ahead import UNPREPARED
+
+        where = _computed_at(item, call.excinfo)
+        store.mkdir(parents=True, exist_ok=True)
+        (store / UNPREPARED).write_text(json.dumps({"test": item.nodeid, "where": where,
+                                                    "error": call.excinfo.exconly().splitlines()[0][:400]}))
+        report = outcome.get_result()
+        report.outcome, report.longrepr = "skipped", (str(item.path), item.location[1] or 0,
+                                                      f"computes before its first check-1 site, at {where}: "
+                                                      "its run runs it unprepared")
     # A map task's sites of this test, written as its manifest once its call is done, whatever it ended in
     # (`map_judge.manifested`): its judge judges the test from them. Only a test that loaded the map judge
     # reached a site.
@@ -233,9 +250,17 @@ def pytest_sessionfinish(session, exitstatus):
         _remote.drain()
 
 
+UNPREPARED_RUN = pytest.StashKey[list]()
+"""This run's tests run unprepared (`compiled_ahead`, `truths_ahead.UNPREPARED`): their records, in the
+order they ran."""
+
+
 def pytest_terminal_summary(terminalreporter):
     if _remote is not None:
         terminalreporter.write_line(_remote.summary())
+    for record in terminalreporter.config.stash.get(UNPREPARED_RUN, []):
+        terminalreporter.write_line(f"unprepared, its sites compiled on its GPU: {record['test']} computes "
+                                    f"before its first check-1 site at {record['where']}")
 
 
 def pytest_runtest_setup(item):
@@ -252,15 +277,76 @@ def pytest_runtest_setup(item):
         pytest.skip("runs in the lane's process" if users else "runs in a process that computes as a user's "
                     f"does ({lane_environment.USERS_ARITHMETIC}=1)")
     if os.environ.get(tier_wire.PREPARE) == "1":
-        # A GPU part's prepare, on its node's CPU (tests/model_flows.py): a flow prepares there; every other
-        # test of the part, a GPU's or not, has nothing to prepare and runs in the part's run.
-        if item.get_closest_marker("prepares") is None:
-            pytest.skip("a GPU tier's prepare runs the flows that prepare alone")
+        # A GPU part's prepare, on its node's CPU (tests/model_flows.py): a flow prepares there, and every
+        # other test of the part's files compiles its check-1 sites' programs (`compiled_ahead`), however it
+        # is marked: the part's run runs each of them on its GPU. One that prepares none runs in the run.
         return
     for backend, device in (("gpu", "a cuda device"), ("tpu", "a tpu")):
         marker = item.get_closest_marker(backend)
         if marker and jax.default_backend() != backend:
             pytest.skip(marker.kwargs.get("reason", f"runs on {device}"))
+
+
+def _computed_at(item, excinfo) -> str:
+    """Where a test computed before its first site (`truths_ahead.UNPREPARED`): the deepest frame of its own
+    file, else its failure's deepest frame, as `path:line`, its path from the suite's root
+    (`tests/test_x.py:104`)."""
+    entries = list(excinfo.traceback)
+    own = [entry for entry in entries if Path(str(entry.path)) == Path(str(item.path))]
+    entry = (own or entries)[-1]
+    path = Path(str(entry.path))
+    root = item.config.rootpath
+    return f"{path.relative_to(root) if path.is_relative_to(root) else path}:{entry.lineno + 1}"
+
+
+def _sites_store(item) -> Path | None:
+    """A test's directory of its GPU tier part's store of programs compiled ahead (`compiled_ahead`), by its
+    node id; None for a flow's (which opens its own), or outside a part with a store."""
+    if item.get_closest_marker("prepares") is not None or tier_wire.TRUTHS not in os.environ:
+        return None
+    digest = hashlib.sha256(item.nodeid.encode()).hexdigest()[:24]
+    return Path(os.environ[tier_wire.TRUTHS]) / "sites" / digest
+
+
+@pytest.fixture(autouse=True)
+def compiled_ahead(request):
+    """A GPU tier part's test's check-1 sites on the part's store of programs compiled ahead
+    (tests/truths_ahead.py, its own directory of the part's, `DEW_TIER_TRUTHS`), whatever marks the test (a
+    `gpu`, `kernel` or `runs` test alike: the part runs each on its GPU), but a flow's, which opens its own
+    (tests/model_flows.py): its prepare, on the node's CPU, compiles each site's truths and arms for the
+    node's GPU with that GPU's compile-only device this process's default, on which nothing computes, so a
+    test computing more than its draws before its sites fails there (bible §8: no dense math on a node's
+    CPU), recorded where (`truths_ahead.UNPREPARED`); its run reads them, tracing, lowering and compiling
+    none, and runs a test so recorded unprepared, every site judged, named in its summary. Outside a part
+    with a store, nothing."""
+    store = _sites_store(request.node)
+    if store is None:
+        # Outside a part's store the gate's modules stay unloaded (a test outside the gate loads none).
+        yield
+        return
+    import model_flows
+    from truths_ahead import UNPREPARED, compiled_truths
+
+    if not model_flows.preparing():
+        record = store / UNPREPARED
+        if record.exists():
+            # Its prepare computed before its first site: it runs unprepared, named in the run's summary.
+            request.config.stash.setdefault(UNPREPARED_RUN, []).append(json.loads(record.read_text()))
+            yield
+            return
+        with compiled_truths(store, prepare=False, stamp=model_flows.stamp()):
+            yield
+        if record.exists():
+            # A site its prepare did not reach, or an arm no statement names, ran unprepared
+            # (`truths_ahead.running`).
+            request.config.stash.setdefault(UNPREPARED_RUN, []).append(json.loads(record.read_text()))
+        return
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    target = model_flows.node_target()
+    with (compiled_truths(store, prepare=True, stamp=model_flows.stamp(), target=target),
+          jax.default_device(compile_only_gpus(target.generation, 1)[0])):
+        yield
 
 
 @pytest.fixture(autouse=True)

@@ -949,3 +949,31 @@ def test_a_shared_cross_attention_reads_a_configured_encoder_of_the_backbones_wi
     narrow = dataclasses.replace(run, context_text=table)
     with pytest.raises(ValueError):
         trained(narrow, tmp_path, "narrow")
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_configured_encoder_is_placed_by_its_own_axes_frozen_or_trained(tmp_path):
+    """A run's configured context encoder (a CLIP tower) is placed on a mesh with a tensor axis by the axes
+    its towers declare (`DecisionObjective.tower_axes`), in the collection the run holds it in, frozen or
+    trained, some of its weights split over tensor as a diffusion run's frozen towers are: its weights are
+    no module's draw, and the layout replicated them (the base review of fcc9f98cc, F3)."""
+    from placement_cases import LAYOUT, MIN_SHARD
+    from run_kinds import decision
+    from test_text_encoders import TINY
+
+    from dew.distributed.placement import Layout as Placement
+    from dew.inputs.spec import TextCondition
+    from dew.mesh import TENSOR_AXIS, mesh_axes
+
+    text = TextCondition(encoder="clip_text", checkpoint=str(TINY))
+    for trains in (False, True):
+        run = dataclasses.replace(decision(tmp_path, drawn=False), context_layers=(0,), context_length=32,
+                                  context_text=text, context_text_trained=trains, calibrate=False)
+        objective = run.prepare().objective
+        trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), mesh=LAYOUT,
+                          layout=Placement(min_shard=MIN_SHARD), tracker=None)
+        trainer.device_mesh = LAYOUT.build(jax.devices()[:8])
+        placed = trainer.shardings(jax.eval_shape(trainer.initial_state)).variables
+        held = placed["params" if trains else FROZEN]["context"]
+        assert any(TENSOR_AXIS in mesh_axes(entry) for sharding in jax.tree.leaves(held)
+                   for entry in sharding.spec)

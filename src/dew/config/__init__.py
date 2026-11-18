@@ -1230,9 +1230,12 @@ class RunConfig:
         if not set(self.val_every) <= set(splits):
             raise ValueError(f"val_every times {sorted(self.val_every)}, and the run validates "
                              f"{sorted(splits) or 'none'}")
+        # A split's cadence is read as the run's is (`TrainerConfig.interval`): its `epoch` and `passes` too.
+        every = {split: self.trainer.interval(value, dataset, f"--val-every {split}")
+                 for split, value in self.val_every.items()}
         return {split: EvalSuite(reader, tuple(metrics) if self.val_metrics is None else tuple(
                     self.metric(config) for config in self.val_metrics if config.split in (None, split)),
-                                 self.val_every.get(split))
+                                 every.get(split))
                 for split, reader in splits.items()}
 
     def chain(self) -> Dataset:
@@ -1399,10 +1402,11 @@ class RunConfig:
         named = dataclasses.replace(self, trainer=dataclasses.replace(self.trainer, name=name))
         planned = named.resumed(("data_plan_version",))
         dataset, held = planned.compiled(objective.data(), dataset, validation)
-        # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
-        suites = planned.suites(dataset, held, metrics)
         sized, dataset, steps = planned.trainer.resolved(dataset)
         run = dataclasses.replace(planned, trainer=sized)
+        # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's, at its
+        # cadence read as the run's is: over the sized trainer and the loader its batch ramp reads.
+        suites = run.suites(dataset, held, metrics)
         if run.trainer.quantization is not None:
             quantize_trunk(objective, run.trainer.quantization)
         # The record names the run's directory, so its run.json trains the same run again.

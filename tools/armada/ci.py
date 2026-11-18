@@ -96,8 +96,9 @@ mark `generations`; none, a file every generation runs). A GPU
 node runs them with `gpu-lane`, each as a task of a CUDA lane, whose rows are
 recorded and reused on the GPU's class as a CPU task's are on the CPU's. With `--prepare`, a lane's files
 run first on the node's CPU, no GPU drawn, for what their GPU run reads and must not compute while it holds
-the GPU (`gpu_prepared`: the tests marked `prepares`, their float64 truths and their programs compiled for
-the node's GPU), nothing of it recorded. With `--network`, a GPU node that
+the GPU (`gpu_prepared`: every test of its part, under the prepare's word, each preparing its float64
+truths and its programs compiled for the node's GPU or skipped, as tests/conftest.py decides), nothing of it
+recorded. With `--network`, a GPU node that
 reaches the Hub runs every file's network-marked tests, which every other task sets aside, as one lane of
 their own, recorded on a class of their own, so each train reruns only the files whose inputs changed.
 
