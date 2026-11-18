@@ -36,11 +36,14 @@ def test_the_categorical_losses_hold_every_order(edge):
         "probabilities": (categorical.probabilities, lambda x: jax.nn.softmax(x, axis=-1), (3, 6)),
         "cross entropy": (lambda x: categorical.cross_entropy(x, labels),
                           lambda x: -jax.nn.log_softmax(x, axis=-1)[rows, labels], (3,)),
-        "soft cross entropy": (lambda x: categorical.soft_cross_entropy(x, targets),
-                               lambda x: -jnp.sum(targets * jax.nn.log_softmax(x, axis=-1), axis=-1), (3,)),
-        "kl divergence": (lambda x: categorical.kl_divergence(x, reference), lambda x: jnp.sum(
-            jax.nn.softmax(reference, axis=-1)
-            * (jax.nn.log_softmax(reference, axis=-1) - jax.nn.log_softmax(x, axis=-1)), axis=-1), (3,)),
+        # The targets and the reference in the logits' own precision, a float64 truth's in float64.
+        "soft cross entropy": (lambda x: categorical.soft_cross_entropy(x, targets.astype(x.dtype)),
+                               lambda x: -jnp.sum(targets.astype(x.dtype) * jax.nn.log_softmax(x, axis=-1),
+                                                  axis=-1), (3,)),
+        "kl divergence": (lambda x: categorical.kl_divergence(x, reference.astype(x.dtype)),
+                          lambda x: jnp.sum(jax.nn.softmax(reference.astype(x.dtype), axis=-1)
+                                            * (jax.nn.log_softmax(reference.astype(x.dtype), axis=-1)
+                                               - jax.nn.log_softmax(x, axis=-1)), axis=-1), (3,)),
     }
     for name, (fn, plain, shape) in sites.items():
         (cotangent,) = normal_draw(2647, shape)
@@ -190,14 +193,9 @@ def test_a_node_perturbation_estimate_holds_every_order(edge):
     primals = tuple(leaf * EDGES[edge] for leaf in normal_draw(2708, *shapes))
     direction = normal_draw(2709, *shapes, scale=EDGES[edge])
     (cotangent,) = normal_draw(2710, ())
-
-    def draw(seed):
-        """A seed's parameters, direction and cotangent at unit scale (the mesh order's check 1)."""
-        return normal_draw([2708, seed], *shapes), normal_draw([2709, seed], *shapes), normal_draw(
-            [2710, seed], ())[0]
-
-    assert_contract(loss, primals, direction, cotangent, f"a node perturbation estimate {edge}",
-                    draw=draw if edge == "normal" else None)
+    # No seeded draw for the mesh order's check 1: the objective draws its jitter in float32 inside the
+    # loss (perturbation.py's NOISE), which check 1 refuses as a narrow truth (NarrowTruth).
+    assert_contract(loss, primals, direction, cotangent, f"a node perturbation estimate {edge}")
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -215,11 +213,8 @@ def test_a_probes_tap_holds_its_orders(edge):
     def tapped(activation, probed):
         return inspection.tapped(activation, probed, where, jnp.float32(2.0), histogram=True)
 
-    def draw(seed):
-        """A seed's activations, direction and cotangent at unit scale (the mesh order's check 1)."""
-        drawn, along, back = normal_draw([3143, seed], (4, 16), (4, 16), (4, 16))
-        return (drawn, probe), (along, jnp.ones_like(probe)), back
-
+    # No seeded draw for the mesh order's check 1: its truth states float32 inside the operation
+    # (inspection.py:192, the statistics' sum), which check 1 refuses (NarrowTruth).
     assert_contract(tapped, (x, probe), (direction, jnp.ones_like(probe)), cotangent, f"a probe's tap {edge}",
-                    without=FORWARD_ORDERS, draw=draw if edge == "normal" else None)
+                    without=FORWARD_ORDERS)
 
