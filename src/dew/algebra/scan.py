@@ -820,6 +820,7 @@ def _scaled_contract(subscripts: str, scale: float):
     from jax.custom_derivatives import SymbolicZero
 
     from dew.nn.kernels import generation
+    from dew.nn.sharding import varying_like
 
     inputs, output = subscripts.split("->")
     axes = inputs.split(",")
@@ -839,19 +840,24 @@ def _scaled_contract(subscripts: str, scale: float):
                        for index, direction in zip(live, directions, strict=True))
 
         def pulled(held, cotangent):
-            results = []
+            cotangents = []
             for index in live:
                 others = tuple(part for at, part in enumerate(held) if at != index)
                 remaining = [axis for at, axis in enumerate(axes) if at != index]
                 transposed = ",".join((*remaining, output)) + "->" + axes[index]
-                results.append(_scaled_contract(transposed, scale)(*others, cotangent))
-            return tuple(results)
+                cotangents.append(_scaled_contract(transposed, scale)(*others, cotangent))
+            return tuple(cotangents)
 
         return out, generation.linear_map(applied, pulled, primals, moving)
 
     rule = contracted("test_the_chunked_delta_rule_holds_every_order")(
         declared_tangent(Protected(), value, tangent, symbolic_zeros=True))
-    return rule
+
+    def contraction(*operands):
+        # The casts' transposes sum a varying cotangent back to each whole operand.
+        return rule(*(varying_like(operand, *operands) for operand in operands))
+
+    return contraction
 
 
 def _pairing_role(left) -> str:
