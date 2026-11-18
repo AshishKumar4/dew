@@ -1,6 +1,7 @@
 """CI's GPU lane (tools/armada/ci.py `gpu-lane`): each test file in a process of its own, admitted on the
 GPU memory its runs measured, and tools/armada/gpu_holds.py, what a lane needs to run a file."""
 
+import functools
 import itertools
 import json
 import os
@@ -44,10 +45,19 @@ def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_
     assert fetched.is_file() and not (tmp_path / "read").exists()
 
 
+def lane_machine(root: Path, monkeypatch, url: str, name: str, source: str) -> None:
+    """A GPU lane's machine at `root` with the test cache at `url` (`gpu_lane_at`), its Python and fetcher, and
+    test file `name` holding `source`."""
+    gpu_lane_at(root, monkeypatch, url, 0)
+    interpreter(root, "3.12")
+    fetcher(root)
+    (root / name).write_text(source)
+
+
 def lane_rows(ci, root: Path, tests: list[str], marks: list[Path],
               **network: bool) -> list[tuple[str, int]]:
-    """A lane's rows over `tests` at `root`, each name and exit, with the cache on, the files its tests mark that
-    they ran (`marks`) cleared first."""
+    """A lane's rows over `tests` at `root`, each name and exit, with the cache on, the files its tests
+    mark that they ran (`marks`) cleared first."""
     for mark in marks:
         mark.unlink(missing_ok=True)
     out = root / "verdict.json"
@@ -62,11 +72,7 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
     runs its other tests and is no reuse of the network lane's run, and a second network lane on the same
     inputs reuses its own (the maintainer, 2026-10-25: no CI run reached the published checkpoints' parity
     tests)."""
-    url, _, _ = cache_worker
-    gpu_lane_at(tmp_path, monkeypatch, url, 0)
-    interpreter(tmp_path, "3.12")
-    fetcher(tmp_path)
-    (tmp_path / "tests/test_hub.py").write_text(
+    lane_machine(tmp_path, monkeypatch, cache_worker[0], "tests/test_hub.py",
         "import os, pytest\nfrom pathlib import Path\n"
         "@pytest.mark.network\ndef test_reads_the_hub():\n"
         "    assert not {'HF_HUB_OFFLINE', 'HF_ENDPOINT'} & set(os.environ), 'the Hub is closed'\n"
@@ -75,10 +81,7 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
         "    assert os.environ['HF_HUB_OFFLINE'] == '1'\n"
         "    Path('offline').write_text('ran')\n")
     hub, offline = tmp_path / "hub", tmp_path / "offline"
-
-    def lane(**network: bool) -> list[tuple[str, int]]:
-        return lane_rows(ci, tmp_path, ["tests/test_hub.py"], [hub, offline], **network)
-
+    lane = functools.partial(lane_rows, ci, tmp_path, ["tests/test_hub.py"], [hub, offline])
     assert lane(network=True) == [("3.12:tests/test_hub.py", 0)]
     assert hub.is_file() and not offline.exists()
     assert lane() == [("3.12:tests/test_hub.py", 0)]
@@ -539,11 +542,7 @@ def test_a_test_nodes_green_run_keeps_a_record_its_next_lane_reuses(ci, tmp_path
     keeps its file's record under a place the Worker takes (`rows.placed`), so a second lane on the same
     inputs reuses it rather than run it again, and another node of the same file is no reuse of it (review of
     the first node-id grading: a node row found no record of its process, and its place held a colon)."""
-    url, _, _ = cache_worker
-    gpu_lane_at(tmp_path, monkeypatch, url, 0)
-    interpreter(tmp_path, "3.12")
-    fetcher(tmp_path)
-    (tmp_path / "tests/test_nodes.py").write_text(
+    lane_machine(tmp_path, monkeypatch, cache_worker[0], "tests/test_nodes.py",
         "import pytest\nfrom pathlib import Path\n"
         "@pytest.mark.parametrize('form', ['a/b c'])\n"
         "def test_walk(form):\n    Path('walked').write_text(form)\n"
@@ -552,7 +551,6 @@ def test_a_test_nodes_green_run_keeps_a_record_its_next_lane_reuses(ci, tmp_path
 
     def lane(node: str) -> list[tuple[str, int]]:
         return lane_rows(ci, tmp_path, [node], [walked, othered])
-
     walk, other = "tests/test_nodes.py::test_walk", "tests/test_nodes.py::test_other"
     assert lane(walk) == [(f"3.12:{walk}", 0)]
     assert walked.read_text() == "a/b c"
