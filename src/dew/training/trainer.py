@@ -154,7 +154,7 @@ from dew.training._fit import (
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau
 from dew.training.cadence import Counted
-from dew.training.compiler import Compiled, CompiledStep, SampledStep, StepCompiler, freshly_held
+from dew.training.compiler import Compiled, CompiledStep, DrawingStep, StepCompiler, freshly_held
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -199,7 +199,6 @@ from dew.training.transaction import (
     pooled_by_mean,
     refuse_unpassed_progress,
     traced_loss,
-    window_calls_folded,
 )
 
 _log = logging.getLogger(__name__)
@@ -959,7 +958,7 @@ class Trainer(Generic[Loss, Effects]):
                 qk_stats=jax.tree.map(
                     lambda x: jnp.full(x.shape, -jnp.inf, at_least_fp32(x.dtype))
                     if jnp.issubdtype(x.dtype, jnp.inexact) else zeros(x),
-                    compact_qk(jax.tree.map(zeros, aux.qk_stats))),
+                    compact_qk(jax.tree.map(zeros, aux.qk_stats), self.phase_passes.sampled is not None)),
                 batches=None if shared else buffer(records),
                 variables=None if mutable is None else buffer(mutable),
                 attempts=None if shared else jnp.zeros((slots,), jnp.int32),
@@ -1040,7 +1039,7 @@ class Trainer(Generic[Loss, Effects]):
                                split=split, record=self.record, resting=resting,
                                examples=self._shape.examples,
                                inspection=self.inspection if sampled else None, placed=placed,
-                               skip=self.skip_nonfinite).step()
+                               skip=self.skip_nonfinite, calls=self.phase_passes.sampled is not None).step()
         # A custom step need not run the objective's loss, which passes a model the run's progress.
         refuse_unpassed_progress(objective, passes=isinstance(self.step, PassesProgress))
         custom = self.step(objective, self.optimizer)
@@ -1169,9 +1168,7 @@ class Trainer(Generic[Loss, Effects]):
         """`state` to run step `step`: its window of `window_size` microbatches dropped where the step, of
         the attempt count a resumed run restores, begins a ramp's stage after the first and a rejection
         left the window part filled, so an update pools one stage's batches. Only the window's fields
-        are compiled (`window_dropped`), so a host-master state's resident weights stay where they are. A
-        window saved holding a layer's QK maxima a call each holds their largest (`window_calls_folded`)."""
-        state = window_calls_folded(state)
+        are compiled (`window_dropped`), so a host-master state's resident weights stay where they are."""
         if step not in self._shape.stage_starts or state.window is None:
             return state
         return dropped(state)
@@ -2275,7 +2272,7 @@ class Trainer(Generic[Loss, Effects]):
         schedule's stage gets its state with the window a rejection left part filled dropped (`_staged`), the
         state an AutoPGLE trial steps on too. A compile reports at `reported`, a cooldown branch's at the
         run's step, else at the state's. A step that draws its pass counts per microbatch draws its call's
-        at the microbatches `interval` counted (`SampledStep.drawn`), its FLOPs theirs.
+        at the microbatches `interval` counted (`DrawingStep.drawn`), its FLOPs theirs.
         """
         state = self._staged(state, run.current)
         signature = self.phase_passes.key(batch_signature(batch))
@@ -2320,7 +2317,7 @@ class Trainer(Generic[Loss, Effects]):
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
         step, flops = compiled[signature]
-        if isinstance(step, SampledStep) and (sampled := self.phase_passes.sampled) is not None:
+        if isinstance(step, DrawingStep) and (sampled := self.phase_passes.sampled) is not None:
             flops = step.drawn(sampled, self.key, interval, run.current)
         return step, flops, trials.state
 

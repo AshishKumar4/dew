@@ -36,18 +36,29 @@ def _looped(module: nn.Module) -> bool:
     return isinstance(module, Looped) and isinstance(module, Looping) and module.loop is not None
 
 
-def _counted[L, E](objective: Objective[L, E], passes: int) -> list[nn.Module]:
-    """`objective`'s modules (`program_key`) with each looped one run `passes` times."""
-    return [_passed(entry.module, passes) for entry in objective.program_key()]
+def _horizons[L, E](objective: Objective[L, E]) -> tuple[int | None, ...]:
+    """The final passes each of `objective`'s modules (`program_key`) trains through
+    (`Loop.backprop_steps`), None for one that loops through every pass or loops not at all."""
+    return tuple(entry.module.loop.backprop_steps if _looped(entry.module) else None
+                 for entry in objective.program_key())
 
 
-def _passed(module: nn.Module, passes: int) -> nn.Module:
-    """`module` run `passes` times where it loops (`Looping.with_passes`), else as it is; a count below the
-    final passes its loop trains through (`Loop.backprop_steps`) trains through them all."""
+def _counted[L, E](objective: Objective[L, E], passes: int,
+                   horizons: Sequence[int | None]) -> list[nn.Module]:
+    """`objective`'s modules (`program_key`) with each looped one run `passes` times, each training through
+    its run's configured final passes (`horizons`, `_horizons` of the run's own objective) or all of them
+    where `passes` is fewer: a module a rung restored at another count keeps the run's horizon, not the one
+    that count clamped it to."""
+    return [_passed(entry.module, passes, horizon)
+            for entry, horizon in zip(objective.program_key(), horizons, strict=True)]
+
+
+def _passed(module: nn.Module, passes: int, trained: int | None) -> nn.Module:
+    """`module` run `passes` times where it loops (`Looping.with_passes`), else as it is, training through
+    its final `trained` passes (`Loop.backprop_steps`), or all of them where `passes` is fewer."""
     if not _looped(module):
         return module
-    assert isinstance(module, Looping) and isinstance(module, Looped) and module.loop is not None
-    trained = module.loop.backprop_steps
+    assert isinstance(module, Looping)
     passed = module.with_passes(passes, backprop_steps=None if trained is None else min(trained, passes))
     assert isinstance(passed, nn.Module), "a looped module keeps its loop"
     return passed
@@ -63,6 +74,8 @@ class PhasePasses[L, E]:
     counts: tuple[int, ...] = ()
     current: int | None = None
     built: dict[int, Objective[L, E]] = field(default_factory=dict)
+    horizons: tuple[int | None, ...] = ()
+    """The final passes each of `base`'s modules trains through (`_horizons`), which every count keeps."""
     sampled: SampledPasses | None = None
     """The law a run draws its pass count from per microbatch, in place of a count a phase (`SampledPasses`):
     its step one program a count from 1 to its cap, its cap the count the objective holds, whatever phase
@@ -94,7 +107,7 @@ class PhasePasses[L, E]:
         if held != {counts[-1]}:
             raise ValueError(f"the objective's loop runs {sorted(held)} passes and the last phase "
                              f"{counts[-1]}: it holds the count the run hands on")
-        return cls(objective, counts)
+        return cls(objective, counts, horizons=_horizons(objective))
 
     def count(self, batch: Batch) -> int | None:
         """The count of the phase `batch` was read in (its host `PHASE`, phase 0 where its data has none);
@@ -148,7 +161,7 @@ class PhasePasses[L, E]:
 
     def run(self, objective: Objective[L, E], passes: int) -> None:
         """Run `objective`'s looped modules `passes` times, each keeping its other choices, the rest as is."""
-        objective.substitute(_counted(objective, passes))
+        objective.substitute(_counted(objective, passes, self.horizons))
 
     def restored(self, objective: Objective[L, E]) -> None:
         """`objective`'s looped modules at the step's count again (`current`), where a rung restored the
@@ -173,8 +186,9 @@ class PhasePasses[L, E]:
         count, kept by no one else (`built` holds none of it), which a compile off the loop builds and
         climbs its step's rungs on (`dew.training.ahead.LaterPlans`) while the loop's objectives stay as
         they are."""
-        objective = self.base.substituted(_counted(self.base, passes))
-        return PhasePasses(objective, self.counts, passes, dict.fromkeys(self.counts, objective))
+        objective = self.base.substituted(_counted(self.base, passes, self.horizons))
+        return PhasePasses(objective, self.counts, passes, dict.fromkeys(self.counts, objective),
+                           self.horizons)
 
     def begun(self, first: int, phases: Sequence[int]) -> list[int]:
         """Those of `phases` whose step is planned at its boundary, after the run's `first` phase: each the
@@ -197,7 +211,7 @@ class PhasePasses[L, E]:
         if passes is None or passes == (self.counts[-1] if self.sampled is None else self.sampled.cap):
             return self.base
         if passes not in self.built:
-            self.built.setdefault(passes, self.base.substituted(_counted(self.base, passes)))
+            self.built.setdefault(passes, self.base.substituted(_counted(self.base, passes, self.horizons)))
         return self.built[passes]
 
 

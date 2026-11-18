@@ -11,10 +11,13 @@ import numpy as np
 import optax
 import pytest
 from scipy import integrate, stats
-from test_pass_weights import looped
+from test_pass_weights import looped, phased_trainer
 
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_stack import Loop
+from dew.objectives.base import Ratio
 from dew.objectives.lm.objective import LMObjective
-from dew.training.compiler import SampledStep
+from dew.training.compiler import DrawingStep
 from dew.training.interval import DISPATCHED_MICROBATCHES, Interval
 from dew.training.phase_passes import SampledPasses
 
@@ -93,14 +96,6 @@ TRAINED = SampledPasses(mean=2.0, dispersion=0.5, cap=CAP)
 """The trainer cells' law."""
 
 
-def trainer_of(model, **options):
-    """A trainer of `model`'s LM over 16 tokens, the phased runs' of test_pass_weights."""
-    from dew.training import Layout, Trainer
-
-    return Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0),
-                   layout=Layout(min_shard=1, tolerance=1.0), **options)
-
-
 def token_batch(seed: int = 2) -> dict:
     """Two rows a device of 17 tokens."""
     rows = jax.device_count() * 2
@@ -129,13 +124,13 @@ def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count(trai
     model = looped(steps=CAP).with_passes(CAP, backprop_steps=trained)
     assert model is not None
     batch = token_batch()
-    sampled = trainer_of(model, sampled_passes=TRAINED, accumulation=2)
+    sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, accumulation=2)
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
-    assert isinstance(step, SampledStep)
+    assert isinstance(step, DrawingStep)
     interval = Interval(time.time(), None, microbatches=0)
-    alone = {count: trainer_of(model.with_passes(count, backprop_steps=trained and min(trained, count)),
-                               accumulation=2) for count in range(1, CAP + 1)}
+    alone = {count: phased_trainer(model.with_passes(count, backprop_steps=trained and min(trained, count)),
+                                   0, None, accumulation=2) for count in range(1, CAP + 1)}
     programs: dict = {}
     drawn = []
     for index in range(8):
@@ -168,7 +163,7 @@ def test_a_sampled_runs_draws_go_on_through_another_split_and_a_resume():
     step's microbatches, at the split its step reads."""
     key = jax.random.key(0)
     flops = dict.fromkeys(range(1, CAP + 1))
-    four, two = SampledStep({}, flops, 4), SampledStep({}, flops, 2)
+    four, two = DrawingStep({}, flops, 4), DrawingStep({}, flops, 2)
     interval = Interval(time.time(), None, microbatches=0)
     drawn = []
     for index in range(10):
@@ -198,7 +193,7 @@ def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path):
     tokens, _ = phased_draw(0)
 
     def fitted(directory, steps):
-        return trainer_of(looped(steps=CAP), sampled_passes=TRAINED,
+        return phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED,
                           checkpoints=Checkpoints(str(directory), keep=8)).fit(
             phased_loader(tokens), steps=steps, log_every=100, checkpoint_every=1)
 
@@ -209,44 +204,51 @@ def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path):
     assert_same(parameters(whole), parameters(resumed), "the resumed sampled run is not the run unstopped")
 
 
-def test_a_window_saved_a_qk_call_each_steps_on_as_its_largest():
-    """A looped run under QK-Clip whose window an earlier format saved holding each pass's logit maxima a
-    call each, its pooled maxima their largest, steps on as the run holding them as one does
-    (`calls_folded`): its update lands bit for bit where the uninterrupted run's does."""
-    from test_data_mixtures import assert_same, parameters
+def unnormed() -> CausalTransformer:
+    """A tiny decoder whose middle layer a loop of `CAP` passes runs, its queries and keys un-normed, whose
+    scale QK-Clip bounds."""
+    return CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
+                             max_seq_len=128, attention_impl="xla", qk_norm=False,
+                             loop=Loop(CAP, layers=(1, 2)))
+
+
+def test_a_sampled_run_under_qk_clip_pools_its_counts_logit_maxima_in_one_window():
+    """A sampled run under QK-Clip, two microbatches an update, whose looped layer's attention a microbatch
+    calls as many times as its count: its window holds each layer's maxima as one call, their largest
+    (`compact_qk`'s `calls`), so every count's step pools into it, and the run steps."""
     from test_pass_weights import phased_draw, phased_loader
 
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.backbones.decoder_stack import Loop
     from dew.optim import scale_by_qk_clip
     from dew.training import Layout, Trainer
 
     tokens, _ = phased_draw(0)
-    # Un-normed queries and keys, whose scale QK-Clip bounds.
-    model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
-                              max_seq_len=128, attention_impl="xla", qk_norm=False,
-                              loop=Loop(CAP, layers=(1, 2)))
+    trainer = Trainer(LMObjective(unnormed(), 16), optax.chain(scale_by_qk_clip(1.0), optax.sgd(0.1)),
+                      key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0), accumulation=2,
+                      sampled_passes=TRAINED)
+    assert int(trainer.fit(phased_loader(tokens), steps=4, log_every=100).step) == 4
 
-    def fitted(state, steps):
-        clipped = optax.chain(scale_by_qk_clip(1.0), optax.sgd(0.1))
-        trainer = Trainer(LMObjective(model, 16), clipped, key=jax.random.key(0),
-                          layout=Layout(min_shard=1, tolerance=1.0), accumulation=2)
-        return trainer.fit(phased_loader(tokens), state=state, steps=steps, log_every=100)
 
-    whole = fitted(None, 2)
-    half = fitted(None, 1)
-    window = half.accumulation
-    assert window is not None and window.qk_stats is not None
+def test_a_phased_run_keeps_its_loops_horizon_at_every_count():
+    """A run whose loop trains through its last two passes (`backprop_steps`) and runs one pass in its first
+    phase and three in its second steps each phase as a run of the model at that count steps it, the first
+    through its one pass and the second through its last two, bit for bit: the count a phase clamped the
+    horizon to is not the next phase's."""
+    from dew.batch import PHASE, Phase
 
-    def called_twice(node):
-        if isinstance(node, dict):
-            return {name: called_twice(value) for name, value in node.items()}
-        (held,) = node
-        return (held, held - 1) if jnp.issubdtype(held.dtype, jnp.inexact) else (held, held)
-
-    earlier = dataclasses.replace(half, accumulation=dataclasses.replace(
-        window, qk_stats=called_twice(window.qk_stats)))
-    assert_same(parameters(whole), parameters(fitted(earlier, 2)), "the window saved a call each")
+    model = looped(steps=CAP).with_passes(CAP, backprop_steps=2)
+    assert model is not None
+    batch = token_batch()
+    phased = phased_trainer(model, 0, (1, CAP))
+    for phase, passes in enumerate((1, CAP)):
+        assert phased.phase_passes.at({**batch, PHASE: Phase(phase)}) == passes
+        state, _, _ = phased.place()
+        stepped, loss, *_ = phased.compile(state, batch)(state, batch)
+        alone = phased_trainer(model.with_passes(passes, backprop_steps=min(2, passes)), 0, None)
+        start, _, _ = alone.place()
+        own, own_loss, *_ = alone.compile(start, batch)(start, batch)
+        np.testing.assert_array_equal(np.asarray(loss), np.asarray(own_loss), err_msg=f"phase {phase}")
+        assert jax.tree.all(jax.tree.map(lambda a, b: bool(np.array_equal(a, b)),
+                                         jax.device_get(stepped.variables), jax.device_get(own.variables)))
 
 
 def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
@@ -259,17 +261,17 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
 
     model = looped(steps=CAP)
     host = {"text": np.asarray(token_batch()["text"])}
-    sampled = trainer_of(model, sampled_passes=TRAINED, split=2)
+    sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, split=2)
     counted = prepare_counts(sampled.objective, host, count_model=True,
                              at_counts=sampled.phase_passes.counted_at())
     for count in range(1, CAP + 1):
-        alone = trainer_of(model.with_passes(count))
+        alone = phased_trainer(model.with_passes(count), 0, None)
         np.testing.assert_array_equal(counted[TRAINING_FLOPS][:, count - 1],
                                       prepare_counts(alone.objective, host, count_model=True)[TRAINING_FLOPS])
     batch = {name: jnp.asarray(value) for name, value in counted.items()}
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
-    assert isinstance(step, SampledStep)
+    assert isinstance(step, DrawingStep)
     interval = Interval(time.time(), None, microbatches=0)
     flops = step.drawn(TRAINED, sampled.key, interval, 0)
     _, _, metrics, *_ = step(state, batch)
@@ -279,7 +281,7 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
     np.testing.assert_array_equal(np.asarray(metrics[TRAINING_FLOPS]), np.asarray(expected))
     own = {}
     for count in set(step.counts):
-        alone = trainer_of(model.with_passes(count), split=2)
+        alone = phased_trainer(model.with_passes(count), 0, None, split=2)
         start, _, _ = alone.place()
         alone.compile(start, batch)
         own[count] = alone.step_flops
@@ -301,7 +303,7 @@ def test_each_count_of_a_sampled_run_steps_at_its_caps_plan(monkeypatch):
 
     def needed(model, split):
         free(monkeypatch, LIMIT)
-        trainer = trainer_of(model, split=split)
+        trainer = phased_trainer(model, 0, None, split=split)
         state, _, _ = trainer.place()
         trainer.compile(state, batch)
         options.unhold()
@@ -311,12 +313,12 @@ def test_each_count_of_a_sampled_run_steps_at_its_caps_plan(monkeypatch):
     once, whole, halves = needed(model.with_passes(1), 1), needed(model, 1), needed(model, 2)
     assert max(once, halves) < whole, (once, halves, whole)
     free(monkeypatch, (max(once, halves) + whole) // 2)
-    sampled = trainer_of(model, sampled_passes=TRAINED)
+    sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED)
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
-    assert isinstance(step, SampledStep) and step.split == 2
+    assert isinstance(step, DrawingStep) and step.split == 2
     assert {count: plan.split for count, plan in step.plans.items()} == dict.fromkeys(range(1, CAP + 1), 2)
-    alone = trainer_of(model.with_passes(1))
+    alone = phased_trainer(model.with_passes(1), 0, None)
     start, _, _ = alone.place()
     alone.compile(start, batch)
     assert alone.plan["split"] == 1
@@ -325,8 +327,6 @@ def test_each_count_of_a_sampled_run_steps_at_its_caps_plan(monkeypatch):
 def test_a_sampled_count_whose_step_returns_other_outputs_is_refused():
     """A count whose step returns outputs other than its cap's (here a metric named by its count) cannot
     pass the one state and pool its step's outputs with the other counts': its admission is refused."""
-    import dataclasses
-
     class ByCount(LMObjective):
         def loss(self, variables, batch, step):
             stats, aux = super().loss(variables, batch, step)
@@ -342,35 +342,42 @@ def test_a_sampled_count_whose_step_returns_other_outputs_is_refused():
         trainer.compile(state, token_batch())
 
 
-def test_a_sampled_run_whose_window_replays_its_microbatches_is_refused():
-    """A looped mixture whose loss adds its routers' balance terms (`RoutedStatistics`), no mean its window
-    pools, replays each microbatch of an update at the count closing it: a sampled run of two microbatches a
-    step is refused (row 7884); read one microbatch an update, it steps."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.backbones.decoder_block import Mixture
-    from dew.nn.backbones.decoder_stack import Loop
-    from dew.objectives.routing import ExpertBalance
+class Replayed(LMObjective):
+    """The LM objective, its statistics its loss's total and mass as a pair, no `Ratio`: a window replays
+    them (`pooled_by_mean`), whatever the step's pass count."""
+
+    def loss(self, variables, batch, step):
+        stats, aux = super().loss(variables, batch, step)
+        return (stats.total, stats.mass), aux
+
+    def reduce_loss(self, stats):
+        total, mass = stats
+        return super().reduce_loss(Ratio(total, mass))
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["own-window", "diloco"])
+def test_a_sampled_run_whose_window_replays_its_microbatches_is_refused(grouped):
+    """A loss whose statistics are no mean its window pools replays each microbatch of an update at the
+    count closing it: a sampled run of two microbatches a step is refused (row 7884), its own window and
+    DiLoCo's groups' alike (`TrainState.window`), the statistics alike at every count; read one microbatch
+    an update, it steps."""
     from dew.training import Layout, Trainer
     from dew.training.diloco import DiLoCo
 
-    model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
-                              max_seq_len=128, attention_impl="xla", mixture=Mixture(experts=4, top_k=2),
-                              loop=Loop(CAP, layers=(1, 2)))
-
-    def trainer(split, **options):
-        return Trainer(LMObjective(model, 16, balance=ExpertBalance(aux_loss_alpha=0.01)), optax.sgd(0.1),
-                       key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
-                       sampled_passes=TRAINED, split=split, **options)
+    def trainer(split):
+        grouping = {"diloco": DiLoCo(every=2, rate=0.7, momentum=0.9)} if grouped else {}
+        return Trainer(Replayed(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
+                       layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED, split=split,
+                       **grouping)
 
     batch = token_batch()
-    # A run's own window, and DiLoCo's groups' (`TrainState.window`).
-    for replayed in (trainer(2), trainer(2, diloco=DiLoCo(every=2, rate=0.7, momentum=0.9))):
-        state, _, _ = replayed.place()
-        with pytest.raises(ValueError):
-            replayed.compile(state, batch)
+    replayed = trainer(2)
+    state, _, _ = replayed.place()
+    with pytest.raises(ValueError):
+        replayed.compile(state, batch)
     whole = trainer(1)
     state, _, _ = whole.place()
-    assert isinstance(whole.compile(state, batch), SampledStep)
+    assert isinstance(whole.compile(state, batch), DrawingStep)
 
 
 @pytest.mark.parametrize("fields", [{"loop_steps_mean": 2.0},

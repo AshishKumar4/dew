@@ -226,7 +226,7 @@ def _unlike(cap: Planned, other: Planned) -> list[str]:
 
 
 @dataclasses.dataclass
-class SampledStep:
+class DrawingStep:
     """The step of a run that draws its looped model's pass count per microbatch (`SampledPasses`): each
     count's plan at its cap's (`StepCompiler.admitted_at`) and its FLOPs a step, by count (`plans`,
     `flops`), the call running each of its `split` microbatches by its drawn count's program (`counts`,
@@ -551,7 +551,7 @@ class StepCompiler[L, E]:
         return planned, compiled
 
     def sampled_step(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Compiled,
-                     state: TrainState, batch: Batch) -> SampledStep:
+                     state: TrainState, batch: Batch) -> DrawingStep:
         """The step of a run that draws its pass count per microbatch (`PhasePasses.sampled`) over `batch`:
         `cap`, its cap's step (`compile`), and every other count's admitted at its plan (`admitted_at`), each
         traced under its count's objective, `holder`'s and the compiler's (`PhasePasses.scoped`), by
@@ -580,7 +580,7 @@ class StepCompiler[L, E]:
         self.phase_passes.current = sampled.cap
         with self.phase_passes.scoped(holder, self):
             capped = stepping()
-        step = SampledStep(plans, flops, planned.split)
+        step = DrawingStep(plans, flops, planned.split)
         step.run = self.runner(capped, planned, capped.settings.device_mesh,
                                parted=lambda: [plans[count] for count in step.counts])
         return step

@@ -617,17 +617,17 @@ def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
     return flags
 
 
-def compact_qk(tree):
+def compact_qk(tree, calls: bool = False):
     """Reduce every sowed `max_logits` leaf over its rows, keeping the heads, and a layer's geometry
-    (`kv_heads`, `head_dim`, `qk_nope`) to the one count it is; and a layer's calls to one, their largest
-    (`dew.batch.sown_calls`: a looped layer's passes, each over the same weights).
+    (`kv_heads`, `head_dim`, `qk_nope`) to the one count it is; and with `calls`, a layer's calls to one,
+    their elementwise largest (`dew.batch.sown_calls`: a looped layer's passes, each over the same
+    weights), the window of a run that draws its pass count per microbatch, whose microbatches call a
+    looped layer as many times as their counts.
 
     The clip reads each head's strongest logit alone, so a retained window
-    holds one row per layer instead of the batch's, and one call: a run that
-    draws its pass count per microbatch holds one window whatever each
-    microbatch's count. A pipelined layer sows its geometry once a
-    microbatch (`StackView`), the same count each time, and the clip reads it
-    as one.
+    holds one row per layer instead of the batch's. A pipelined layer sows its
+    geometry once a microbatch (`StackView`), the same count each time, and
+    the clip reads it as one.
     """
     def compact(path, leaf):
         is_maximum = any(isinstance(entry, jax.tree_util.DictKey) and entry.key == "max_logits"
@@ -636,31 +636,13 @@ def compact_qk(tree):
             return jnp.max(leaf, axis=-2, keepdims=True) if leaf.ndim > 1 else leaf
         return jnp.max(leaf) if leaf.ndim else leaf
 
-    return calls_folded(jax.tree_util.tree_map_with_path(compact, tree))
-
-
-def calls_folded(tree):
-    """`tree`, a QK tree, its layers' sown tuples of several calls (`dew.batch.sown_calls`) held as one,
-    their elementwise largest, a shape's as its first call's: the tree `compact_qk` makes."""
     def folded(node: Mapping) -> dict:
         return {name: folded(value) if isinstance(value, Mapping) else
-                ((value[0],) if isinstance(value[0], jax.ShapeDtypeStruct)
-                 else (functools.reduce(jnp.maximum, value),)) if isinstance(value, tuple) and value
-                else value for name, value in node.items()}
-    return folded(tree) if isinstance(tree, Mapping) else tree
+                (functools.reduce(jnp.maximum, value),) if isinstance(value, tuple) and value else value
+                for name, value in node.items()}
 
-
-def window_calls_folded(state: TrainState) -> TrainState:
-    """`state` with its window (`TrainState.window`) holding its QK maxima as `compact_qk` makes them
-    (`calls_folded`), from one a run saved a call each (a looped layer's passes, before windows held one),
-    its pooled maxima kept; `state` itself where it holds them so."""
-    def called(node) -> bool:
-        return isinstance(node, Mapping) and any(
-            called(value) or (isinstance(value, tuple) and len(value) > 1) for value in node.values())
-    window = state.window
-    if window is None or not called(window.qk_stats):
-        return state
-    return state.with_window(dataclasses.replace(window, qk_stats=calls_folded(window.qk_stats)))
+    compacted = jax.tree_util.tree_map_with_path(compact, tree)
+    return folded(compacted) if calls and isinstance(compacted, Mapping) else compacted
 
 
 def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_scale_lib.DynamicScale | None:
@@ -855,7 +837,7 @@ class Transaction:
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
                  record: bool = False, resting: Mapping[str, object] | None = None,
                  inspection: Inspection | None = None, examples: int | None = None, placed=None,
-                 skip: bool = False):
+                 skip: bool = False, calls: bool = False):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -878,8 +860,11 @@ class Transaction:
         placement, which the commit's gradient is constrained to (`placed_as`). `examples`
         is a run's bound in source examples, where it counts no updates ahead: each update hands its
         optimizer the run's progress, the share of them its state has consumed (`TrainState.consumed`),
-        which a schedule over the run reads (`dew.optim_schedules.ScheduleBase.progressed`).
+        which a schedule over the run reads (`dew.optim_schedules.ScheduleBase.progressed`). `calls` folds
+        a looped layer's QK calls into the window as one (`compact_qk`), a run's that draws its pass count
+        per microbatch.
         """
+        self.calls = calls
         self.resting = dict(resting or {})
         self.placed = placed
         # Whether a step with no loss scale whose loss or gradient is not finite is skipped (the run's
@@ -982,7 +967,7 @@ class Transaction:
         everything = (loss, stats, aux.variables, aux.effects, *(() if unscaled else (gradient,)))
         local_finite = all_finite(loss) if unscaled and not self.skip else all_finite(everything)
         local_ok = jnp.asarray(a=True) if state.scale is None else local_finite
-        qk = compact_qk(aux.qk_stats)
+        qk = compact_qk(aux.qk_stats, self.calls)
         effects = tuple(jax.tree.leaves(aux.effects))
         candidate, pooled = previous, stats
         replay_required = jnp.asarray(a=False)
