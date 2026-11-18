@@ -1086,7 +1086,7 @@ def test_a_step_is_priced_at_the_longer_of_its_products_and_its_shared_traffic()
     cooperative = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, family="wgmma")
     tensor = cost.rates(h100, device=False)[0]
     assert pricing.step_seconds(cooperative, h100, (2, 2)) == 2 * 128 * 256 * 64 / tensor
-    walk = pricing.split_walk(pair, groups=1, rows=24576, depth=9216, width=2560, itemsizes=(2, 2),
+    walk = pricing.split_walk(pair, groups=1, rows=24576, depth=9216, width=2560, itemsizes=(2, 2), stored=2,
                                  multiprocessors=148, step_seconds=1.0, bandwidth=1.0, launch_seconds=None)
     assert walk.output * pair.block_m * 2 * pair.block_n == 9216 * 2560
 
