@@ -7,6 +7,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A layout that keeps the variables on the host (`Layout(host=("variables",))`) reads each step's batch in
+  the split the run states, each microbatch an attempt of its own, as a device step does; it read every
+  step's batch whole, refusing a stated split.
+
 - A step over several GPUs compiles without XLA's rematerialization pass (`dew.training.memory.COLLECTIVES`),
   as MaxText runs it: its plan fits it by Dew's ladder, and XLA's pass, against a limit of its own below the
   plan's, recomputed what it picked at a rung that already fit, a sharded weight's all-gather among them.

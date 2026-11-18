@@ -89,14 +89,15 @@ _log = logging.getLogger(__name__)
 def read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
                rollout: Rollout | None, mesh: MeshSpec | Mesh) -> str | None:
     """Why every step of a trainer reads its batch whole, or None where a plan may split it (`splits`):
-    a custom `step`, a layout that keeps the variables on the host, a `rollout` or an Explicit mesh
-    axis. Refuses the arguments no Trainer takes together."""
+    a custom `step`, a layout that keeps the variables on the host where the run states no split (no plan
+    splits the host's step: it reads its batch in the split stated, `StepCompiler._compile_host`), a
+    `rollout` or an Explicit mesh axis. Refuses the arguments no Trainer takes together."""
     if accumulation < 1:
         raise ValueError(f"accumulation must be at least 1, got {accumulation}")
     # Split under an Explicit axis, a step met a cotangent the split typed
     # float32[16@data,16,16] against its forward's float32[16,16,16].
     whole = ("a custom step owns its execution" if step is not None else
-             "the layout keeps the variables on the host" if "variables" in layout.host else
+             "the layout keeps the variables on the host" if "variables" in layout.host and split is None else
              "a rollout writes a batch of its own" if rollout is not None else
              "an Explicit mesh axis types the step's rows" if explicit_axes(mesh) else None)
     if split is not None and (split < 1 or (whole is not None and split > 1)):
