@@ -299,7 +299,6 @@ class PortCase:
     per_key: bool = False
     forked: bool = False
     readout: bool = True
-    added: bool = False
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -350,11 +349,6 @@ READOUT_HANDOFF = ("a readout of the state entering its token, or weighing its t
                    "forms derive (`scan.Scan.reads`) and neither the port's kernels nor the template's "
                    "mainloop form")
 """Why a kernel of the chunked op hands a call of another readout over to the portable math."""
-
-ADDS_HANDOFF = ("a forked call whose documents add a second table slot to the memory they enter "
-                "(`Chunk.adds`), which the portable math's walk and the template take and the TPU scan's "
-                "table does not yet (row 7662)")
-"""Why the TPU's scan hands a forked call that adds a slot over to the portable math."""
 
 
 PORT_FORKED = Refusal('forked', "a forked call, whose documents enter earlier documents' finals of the same "
@@ -484,9 +478,6 @@ class Templated(Protocol):
 
     @property
     def readout(self) -> bool: ...
-
-    @property
-    def added(self) -> bool: ...
 
 
 TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
@@ -1076,8 +1067,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1],
                     heads=(key.shape[-2], value.shape[-2], value.shape[-1]), call=call, family=family,
                     product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4,
-                    forked=forked is not None, readout=readout,
-                    added=forked is not None and forked.adds is not None)
+                    forked=forked is not None, readout=readout)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
 
@@ -1579,7 +1569,6 @@ class ScanCase:
     product: str = 'forward'
     forked: bool = False
     readout: bool = True
-    added: bool = False
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -1616,14 +1605,13 @@ TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
     Requirement('precision', lambda case: exact_products(None, at_least_fp32(case.dtype)),
                 "a dot algorithm the run declares that narrows the scan's fp32 products, which the TPU's "
                 "scan takes whole (`ssd._mm`, HIGHEST)", row=INHERENT, kind='handoff'),
-    Requirement('adds', lambda case: not case.added, ADDS_HANDOFF, row='7662', kind='handoff'),
 )
 """What the TPU's Pallas scan (`dew.nn.kernels.ssd`) needs: its tiling over the geometry
 (`ssd_kernel_runs`), and a declaration its whole fp32 products compute (`exact_products`)."""
 
 
 def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | None = None,
-              product: str = 'forward', forked: bool = False, added: bool = False) -> ScanCase:
+              product: str = 'forward', forked: bool = False) -> ScanCase:
     """The `ScanCase` of a scan over values `x` `[B, S, H, P]` and keys `B` `[B, S, G, N]` in
     `chunk_size` chunks, their widths as the port and the TPU's scan take them where `padded`
     (`_scan_widths`, `_rated_scan`); on a TPU, the platform its Pallas scan builds for
@@ -1636,7 +1624,7 @@ def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | 
                     dtype=jnp.dtype(x.dtype), widths=widths,
                     tpu=(ssd_kernel_platform(chunk_size, widths[0], widths[1], dtype=at_least_fp32(x.dtype))
                          if generation.backend() == 'tpu' else None),
-                    call=call, family=family, product=product, forked=forked, added=added)
+                    call=call, family=family, product=product, forked=forked)
 
 
 def fast_rounding(dtype) -> bool:
@@ -1697,7 +1685,7 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
                          rounded=(fast_rounding(jnp.result_type(query, key, value))
                                   if rounded is None else rounded))
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product,
-                     forked=forked is not None, added=forked is not None and forked.adds is not None)
+                     forked=forked is not None)
     return select(SCAN, case).kernel
 
 
@@ -1765,13 +1753,18 @@ def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
 def _tpu_documents(state, forked: Forked, length: int, chunk_size: int, work, widths: tuple[int, int]):
     """A forked call's documents as the TPU's Pallas scan walks them in place (`ssd._ssd_scan`'s `forked`):
     `(given [B, S', H, P, N] float32, tokens, entry)`, the table's given memories (`state` `[B, S', H, N, P]`,
-    the SSD's `[P, N]` transposed), each token's load, store and document (`Forked.tokens`, a padded token
-    taking up none) and the entry write's operands each value head's (its keys `[B, D, R, H, N]`, values
-    `[B, D, R, H, P]` and weights `[B, D, H]`; None where the call gives none); the memories and the entry
-    write padded with zero columns to the scan's `widths` (`_scan_widths`), heads' then states'."""
+    the SSD's `[P, N]` transposed), each token's load, store, document (`Forked.tokens`) and added slot
+    (`Chunk.adds`, at a document's first token), a padded token taking up none, and the entry write's
+    operands each value head's (its keys `[B, D, R, H, N]`, values `[B, D, R, H, P]` and weights `[B, D,
+    H]`; None where the call gives none); the memories and the entry write padded with zero columns to the
+    scan's `widths` (`_scan_widths`), heads' then states'."""
     padding = -length % chunk_size
+    loads, stores, begun = forked.tokens(length)
+    # The slot each document's first token adds (`Chunk.adds`), zero at every other token and for none.
+    adds = jnp.zeros_like(loads) if forked.adds is None else jnp.where(
+        loads >= 0, jnp.take_along_axis(jnp.asarray(forked.adds, jnp.int32), begun, axis=1), 0)
     tokens = tuple(jnp.pad(t, ((0, 0), (0, padding)), constant_values=fill)
-                   for t, fill in zip(forked.tokens(length), (-1, 0, 0), strict=True))
+                   for t, fill in zip((loads, stores, begun, adds), (-1, 0, 0, 0), strict=True))
     given = zero_padded(zero_padded(jnp.swapaxes(state, -1, -2).astype(work), 3, widths[0]), 4, widths[1])
     entry = None
     if forked.entry is not None:
