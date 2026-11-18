@@ -2009,8 +2009,10 @@ def borrowed_records(names: list[str], python: str, held: str, token: str,
     a first lane on a class takes as its share. One no class measured is absent. Its run on `held`
     records its own, which every later lane reads."""
     wanted = set(names)
-    return largest_records(python, token, lambda at, name, _: name if at != held and name in wanted else None,
-                           strict=strict) if names else {}
+    # A test node's records (`file::test`) count as its file's.
+    return largest_records(python, token, lambda at, name, _: (
+        grading.owning(name) if at != held and grading.owning(name) in wanted else None), strict=strict) \
+        if names else {}
 
 
 VARIANTS = {"users": ("users_process", {"DEW_TEST_USERS_ARITHMETIC": "1"})}
@@ -2120,8 +2122,9 @@ def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str
     # child it did not follow, no report) stays the file's, which so takes the lane's whole share.
     if cut:
         files = {grading.owning(file) for file, _, _ in units.values()}
+        # A test node's records (`file::test`) among its file's: the most any of its runs held.
         most = largest_records(python, token, under=f"{held}/", measures=lambda _, name, group: (
-            (name, place_variant(group)) if name in files else None))
+            (grading.owning(name), place_variant(group)) if grading.owning(name) in files else None))
         records = {name: found if found is not None and not gpu_measures.measured(found)
                    else most.get((grading.owning(units[name][0]), units[name][2]), found)
                    for name, found in records.items()}
