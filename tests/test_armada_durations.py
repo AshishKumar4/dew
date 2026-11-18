@@ -395,7 +395,7 @@ def test_a_tasks_peak_bounds_its_tests_and_a_heavy_files_tasks_run_large(ci, tmp
     tests' peaks passes `LARGE_FROM` has every task that runs it planned large, so no two share a medium,
     and a file under it is left to armada's own sizing (row 6003: a test's ranks peaked at 7.17 GiB and
     two packed on a medium were killed)."""
-    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240, "environment": {}}))
     for name in ("test_ranks", "test_light"):
         (tmp_path / "tests" / f"{name}.py").write_text("def test_a(): pass\ndef test_b(): pass\n")
     record = {"tests/test_ranks.py::test_a": 10.0, "tests/test_ranks.py::test_b": [5.0, 30.0],
