@@ -226,22 +226,22 @@ def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, 
     portable = activations._portable(activations.silu, lambda gate, up: (gate, up))
     plain = portable if implementation == "xla" else (
         lambda gate, up: norm_swiglu.swiglu(gate, up, portable))
-    with generation.assumed("sm90"):
-        traced = str(jax.make_jaxpr(product)(gate, up))
-        assert _activation_spans(jax.make_jaxpr(product)(gate, up).jaxpr) == [
-            derivatives.Activation("swiglu", gated=True)]
-    assert ("pallas_call" in traced) == (implementation == "pallas")
 
     def summed(function):
         return jax.jit(jax.value_and_grad(lambda g, u: jnp.sum(function(g, u).astype(jnp.float32)),
                                           argnums=(0, 1)))
 
-    (value, gradients), (own, own_gradients) = summed(product)(gate, up), summed(plain)(gate, up)
-    np.testing.assert_array_equal(np.asarray(value), np.asarray(own))
-    for mine, theirs in zip(gradients, own_gradients, strict=True):
-        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
-    np.testing.assert_array_equal(np.asarray(jax.jit(product)(gate, up)),
-                                  np.asarray(jax.jit(plain)(gate, up)))
+    # Off a GPU the selector takes XLA's arithmetic, a kernel named too: both arms take the H100's route.
+    with generation.assumed("sm90", interpreted=True):
+        traced = jax.make_jaxpr(product)(gate, up)
+        assert _activation_spans(traced.jaxpr) == [derivatives.Activation("swiglu", gated=True)]
+        assert ("pallas_call" in str(traced)) == (implementation == "pallas")
+        (value, gradients), (own, own_gradients) = summed(product)(gate, up), summed(plain)(gate, up)
+        np.testing.assert_array_equal(np.asarray(value), np.asarray(own))
+        for mine, theirs in zip(gradients, own_gradients, strict=True):
+            np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+        np.testing.assert_array_equal(np.asarray(jax.jit(product)(gate, up)),
+                                      np.asarray(jax.jit(plain)(gate, up)))
     mlp = GatedMLP(hidden_features=128, out_features=64, activation="gelu")
     x = jnp.asarray(rng.standard_normal((2, 64)), dtype)
     params = mlp.init(jax.random.key(0), x)
