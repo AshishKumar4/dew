@@ -1111,6 +1111,24 @@ def test_an_aligned_sum_is_exact_where_its_terms_leave_fp32s_range(case):
     assert float(found) == total
 
 
+@pytest.mark.parametrize("terms", [[(0.0, 0.5, 0.5)], [(0.0, 0.0, 0.0), (0.0, 2.0 ** 100, 2.0 ** 100)]],
+                         ids=["one zero term", "zero terms past fp32's range"])
+def test_an_aligned_sum_of_zero_terms_is_zero(terms):
+    """`aligned_sum` of terms whose products are all zero, one beside factors past fp32's range: zero, where
+    its largest binade's sentinel aligned a zero term by 2^896 and wrapped it to -inf, its sum NaN (base
+    review 820eaf429 F1)."""
+    found = aligned_sum([tuple(jnp.float32(factor) for factor in term) for term in terms])
+    assert float(found) == 0.0
+
+
+def test_an_aligned_sum_of_float64_terms_keeps_float64():
+    """`aligned_sum` of float64 terms sums in float64: an entry weight of `1 + 2^-30` written at unit key and
+    value is itself, where cast to fp32 it was 1 (base review 820eaf429 F2)."""
+    with jax.enable_x64(new_val=True):
+        found = aligned_sum([(jnp.float64(1 + 2.0 ** -30), jnp.float64(1.0), jnp.float64(1.0))])
+        assert found.dtype == jnp.float64 and float(found) == 1 + 2.0 ** -30
+
+
 def test_an_aligned_sum_along_an_axis_sums_each_rows_terms():
     """`aligned_sum` over an axis: each row's two columns `(1 + 2^-20) 2^(140 + i)` and `-2^(140 + i)`, each
     past fp32's range, summed along the row to `2^(120 + i)` exactly."""
