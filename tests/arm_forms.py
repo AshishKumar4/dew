@@ -82,8 +82,9 @@ class _RunToRun:
         return self.fn(*inputs, **options)
 
     def __getattr__(self, name):
-        # Its arm's attributes (its marks, its mode); its own field, before it is set, none.
-        if name == "fn":
+        # Its arm's marks and mode; its own field, before it is set, and no dunder (a jit's `__wrapped__`,
+        # which would state the record as the wrapper it is not, `dew._stated.stated`).
+        if name == "fn" or name.startswith("__"):
             raise AttributeError(name)
         return getattr(self.fn, name)
 

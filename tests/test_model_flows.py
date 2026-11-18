@@ -308,7 +308,8 @@ def test_a_compiled_sites_window_loop_and_run_to_run_arms_are_traced_by_its_prep
     def windowed(seed):
         return tuple(np.stack([x, x]) for x in draw(seed))
 
-    arm = run_to_run(over_windows(dew_arm), "a product summed in arrival order")
+    # A jitted arm under both adapters: each a record of its arm, never stated as the wrapper it holds.
+    arm = run_to_run(over_windows(jax.jit(dew_arm)), "a product summed in arrival order")
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
         assert_as_exact(arm, over_windows(reference), windowed, "a product's adapted arms", seeds=8)
     assert traced
@@ -316,6 +317,7 @@ def test_a_compiled_sites_window_loop_and_run_to_run_arms_are_traced_by_its_prep
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(arm, over_windows(reference), windowed, "a product's adapted arms", seeds=8)
     assert not traced
+    assert not (tmp_path / UNPREPARED).exists()
 
 
 def test_a_window_loops_truth_is_computed_window_by_window_from_its_windows_program(tmp_path):
