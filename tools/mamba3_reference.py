@@ -131,22 +131,11 @@ def merged(units: list[Path]) -> Path:
 
 
 def main() -> None:
-    """`--serve`: the torch side. `--list`: the sites, a line each. `--merge <units>`: the fixture from the
-    recording's units. Else `<torch python> <out> <site>...`: those sites' unit, written to `out`."""
-    if sys.argv[1] == "--serve":
-        serve()
-    elif sys.argv[1] == "--list":
-        from mamba3_sites import sites
+    """The recorder's command line (`reference_worker.recording_command`), its sites `mamba3_sites`'s."""
+    from reference_worker import recording_command
 
-        print("\n".join(sites()), flush=True)
-    elif sys.argv[1] == "--merge":
-        written = merged([Path(unit) for unit in sys.argv[2:]])
-        print(f"wrote {FIXTURE.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
-    else:
-        from reference_worker import session
-
-        with session([sys.argv[1], __file__, "--serve"]) as worker:
-            write_seeded(worker, sys.argv[3:], Path(sys.argv[2]))
+    recording_command(__file__, "mamba3_sites", serve=serve, merged=merged, write_seeded=write_seeded,
+                      fixture=FIXTURE)
 
 
 if __name__ == "__main__":
