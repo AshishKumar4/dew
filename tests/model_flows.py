@@ -346,12 +346,14 @@ def packed_variables(variables) -> dict:
     """`variables`' parameters with each routed expert matrix (`EXPERT_BANKS`) packed into an NVFP4 bank
     (`NvFp4.quantized`) in `QUANTIZATION` at its path, taken out of the parameters, as a packed load holds
     it (`quantized_loads.with_banks`), which the expert layers read (`dew.quantization.expert_matrix`)."""
+    from flax import linen as nn
     from flax.traverse_util import flatten_dict, unflatten_dict
 
     from dew.nn.kernels.formats import NvFp4
     from dew.quantization import QUANTIZATION
 
-    params = flatten_dict(dict(variables["params"]))
+    # Its parameters' values, each partitioning's box taken off, as a load holds them.
+    params = flatten_dict(dict(nn.unbox(variables["params"])))
     banks = {path: NvFp4.quantized(jnp.asarray(params.pop(path))) for path in list(params)
              if path[-1] in EXPERT_BANKS}
     return {"params": unflatten_dict(params), QUANTIZATION: unflatten_dict(banks)}
