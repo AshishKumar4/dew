@@ -935,28 +935,24 @@ def test_a_decode_steps_price_reads_its_keys_and_a_paged_pool_walks_no_fewer_ste
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100"])
-def test_a_forward_deciding_its_scaled_walk_holds_the_larger_walks_registers(generation_name):
-    """A bf16 inference forward that decides its scaled walk in its launch (`MosaicForward.deciding`: its
-    unscaled walk, then the scaled one where a row's sums passed fp32's largest), compiled for a compile-only
-    A100, H100 and B200 (`kernel_compile.compile_mosaic_kernels`): every kernel holds its registers spilling
-    nothing, at no more than the scaled walk's launch alone takes, the larger of its two loops, not their
-    sum (row 5274)."""
+@pytest.mark.parametrize("width", [128, 256])
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
+def test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides(generation_name, width):
+    """A bf16 inference forward compiled for a compile-only A100, H100, B200 and RTX PRO 6000
+    (`kernel_compile.compile_mosaic_kernels`): every kernel spills nothing, whether its launch decides its
+    scaled walk itself (`MosaicForward.decided`: the scaled walk's registers held at the unscaled walk's
+    config, priced at them) or takes the fallback, the scaled op its own launch (row 5274)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    query = jax.ShapeDtypeStruct((1, 64, 4, 128), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((1, 1024, 2, 128), jnp.bfloat16)
-    spans = template.spans(64, 1024, 1, causal=False)
+    query = jax.ShapeDtypeStruct((1, 256, 8, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 2048, 2, width), jnp.bfloat16)
+    spans = template.spans(256, 2048, 1, causal=False)
 
-    def launched(scaled):
-        return lambda q, k, v: attention_mosaic.forward(q, k, v, spans, natural=False, scaled=scaled)
+    def forward(q, k, v):
+        return attention_mosaic.forward(q, k, v, spans, natural=False)
 
     with generation.assumed(generation_name):
-        found = compile_mosaic_kernels([KernelCase("deciding", lambda: (launched(False), (query, key, key))),
-                                        KernelCase("scaled", lambda: (launched(True), (query, key, key)))],
+        found = compile_mosaic_kernels([KernelCase("inference", lambda: (forward, (query, key, key)))],
                                        generation_name)
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
-    deciding, scaled = ({kernel["kernel"]: kernel["registers"] for kernel in record["kernels"]}
-                        for record in found)
-    assert max(deciding.values()) <= max(scaled.values()), (deciding, scaled)

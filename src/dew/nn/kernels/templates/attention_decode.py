@@ -117,10 +117,12 @@ def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | 
 class Plan:
     """A decode walk's work list as the derivation shapes it: the forward's config (`attention_mosaic.Tiles`)
     and the slices each query tile's keys are cut into (`MosaicForward.splits`), the config the launch's own
-    op's at those slices."""
+    op's at those slices, and whether its launch decides its scaled walk itself (`MosaicForward.deciding`),
+    the step's one walk then."""
 
     config: attention_mosaic.Tiles
     slices: int
+    decides: bool = False
 
 
 class Walk(NamedTuple):
@@ -170,13 +172,17 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     if found is None:
         return None
     config, op, ba = found
+
+    def planned(config, op, ba, slices: int) -> Plan:
+        return Plan(config, slices, op.deciding(ba, config))
+
     processors = target.multiprocessors or 1
     tiles = math.ceil(query.shape[1] / (config.consumers * config.block_q))
     # Its launch's programs: a float32 call's operands as their parts stack along the rows
     # (`MosaicForward.parts`), as many programs again each (a merging launch's every one resident).
     programs = op.parts * query.shape[0] * query.shape[2] * tiles
     if programs >= processors:
-        return Plan(config, 1)
+        return planned(config, op, ba, 1)
 
     def sliced(config, op, ba) -> int:
         # The most slices whose programs keep the device's stream in flight at once (`MosaicForward.streamed`,
@@ -187,7 +193,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
         return max(1, min(processors * op.streamed(ba, config, target) // programs, longest))
 
     if sliced(config, op, ba) == 1:
-        return Plan(config, 1)
+        return planned(config, op, ba, 1)
     walked = None if hooks is None else dataclasses.replace(hooks, initial=None)
     streamed = functools.partial(_streamed, query, key, value, spans, walked, scale=scale, target=target,
                                  table=table, sources=sources, out_dtype=jnp.float32, scales=scales,
@@ -196,7 +202,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     slices = 1 if found is None else sliced(*found)
     # The sliced launch's own op, at its slices.
     found = None if slices == 1 else streamed(splits=slices)
-    return Plan(config, 1) if found is None else Plan(found[0], slices)
+    return planned(config, op, ba, 1) if found is None else planned(*found, slices)
 
 
 def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
@@ -261,10 +267,12 @@ def planned(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     target = generation.gpu_target()
     planned_walk = functools.partial(plan, rows, key, value, row_spans, whole, scale=scale, target=target,
                                      table=table, sources=sources, scales=scales, in_key=in_key)
-    # The plain walk first: where its family decides a scaled second walk in its launch
-    # (`MosaicForward.deciding`), it is the step's one walk, whatever its rows' sums can reach.
+    # The plain walk first: where its launch decides a scaled second walk itself (`Plan.decides`), it is the
+    # step's one walk, whatever its rows' sums can reach; else the scaled and the bounded walks, which its
+    # values' bounds choose between (`WALKS`), the one fallback of a launch whose scaled walk's registers its
+    # unscaled walk's config does not hold (`MosaicForward.decided`).
     plain = planned_walk(walk="plain")
-    if plain is not None and not attention_mosaic.bundle_of(plain.config, rows.dtype).places_on_role:
+    if plain is not None and plain.decides:
         return {"plain": plain}, rows, row_spans, whole
     work = {}
     for walk in launched(query, value, scales):

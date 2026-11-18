@@ -473,18 +473,30 @@ class MosaicForward(_Mainloop[Tiles]):
     slot held until the values' product is issued, the keys read once: its inference walk's (a training
     walk's anchored launches stream the value array the call gives, the keys' columns sliced)."""
 
-    def _decides(self, residuals: Kept, value_dtype) -> bool:
-        """`deciding` but its family's part: an inference launch whose rows' sums can pass fp32's largest."""
-        return (residuals is not Kept.SPLIT and not self.scaled and self.rounds is None
-                and algebra.headroom(value_dtype))
+    def deciding(self, ba: tokamax.BoundArguments, config: Tiles) -> bool:
+        """`decided` of the call of `ba` at `config`."""
+        arguments = ba.arguments
+        return self.decided(arguments["query"], arguments["value"], arguments["score_params"],
+                            arguments.get("residuals"), config, arguments.get("table"),
+                            arguments.get("sources"), arguments.get("scales"), arguments.get("initial"))
 
-    def deciding(self, residuals: Kept, value_dtype, family: mosaic.Family) -> bool:
-        """Whether its launch walks unscaled and decides a second, scaled walk of a program whose rows' sums
-        passed fp32's largest (`mosaic.Decided`): an inference launch whose rows' sums can pass it
-        (`algebra.headroom`), so no pass over its values chooses its kernels before it and no branch is read
-        on the host. A family whose issuing role walks the rings (tcgen05's rows) takes none: its issuer
-        would wait on the verdicts too."""
-        return self._decides(residuals, value_dtype) and not family.places_on_role
+    def decided(self, query, value, score_params, residuals: Kept, config: Tiles, table=None, sources=None,
+                scales=None, initial=None) -> bool:
+        """Whether its launch at `config` walks unscaled and decides a scaled second walk of a program whose
+        rows' sums passed fp32's largest (`mosaic.Decided`), no pass over its values before it and no branch
+        read on the host: an inference launch whose rows' sums can pass it (`algebra.headroom`), on a family
+        whose consumers walk its rings (tcgen05's rows' issuer would wait on the verdicts too), where the
+        scaled walk's registers at the config the unscaled walk derives hold within the family's budget, by
+        the model that prices the launch (`registered`, `register_budget`): the common walk never pays the
+        scaled walk's (sm80's and sm120's at width 128 would split their columns). Every other such launch
+        takes the one fallback, `_fwd`'s bound pass and guard (`algebra.may_scale`, the scaled op)."""
+        family = bundle_of(config, query.dtype)
+        if (residuals is Kept.SPLIT or self.scaled or self.rounds is not None
+                or not algebra.headroom(value.dtype) or family.places_on_role):
+            return False
+        registered = self.registered(query, value, score_params, residuals, table, sources, scales, initial)
+        priced = dataclasses.replace(registered, scaled=True).at(family, config)
+        return priced is None or priced <= self.register_budget(config)
 
     def _hooks(self, score_params, output_params, initial, drop, query_params=()) -> Hooks:
         """The call's hooks from its parameters, state and draw, its static hooks the op's."""
@@ -502,13 +514,13 @@ class MosaicForward(_Mainloop[Tiles]):
         spans = self.spans(start, end, query_ids, key_ids)
         # A rare call's scaled op states no work to Dew's FLOP count, as the fold's rewalk does not: the
         # common op's is the step's (`_launch_flops`).
+        decides = self.decided(query, value, score_params, residuals, config, table, sources, scales, initial)
+        registered = self.registered(query, value, score_params, residuals, table, sources, scales, initial)
+        # A deciding launch's kernel stated at its scaled walk's registers, the larger of its two loops.
         form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret,
                 "counts": not self.scaled,
-                "registered": self.registered(query, value, score_params, residuals, table, sources, scales,
-                                              initial)}
-        scaled = self.scaled or (self.cached(table, sources, scales) and not self.bounded)
-        decides = self.deciding(residuals, value.dtype, bundle_of(config, query.dtype))
-        scaled = scaled and not decides
+                "registered": dataclasses.replace(registered, scaled=True) if decides else registered}
+        scaled = (self.scaled or (self.cached(table, sources, scales) and not self.bounded)) and not decides
 
         def launched():
             match residuals:
@@ -869,16 +881,14 @@ class MosaicForward(_Mainloop[Tiles]):
                                            codes=_codes_of(ba.arguments["key"], ba.arguments.get("scales")),
                                            parts=self.parts, params=self.score_types,
                                            in_key=self.reads_key_slot(family),
-                                           decides=self.deciding(ba.arguments.get("residuals"),
-                                                                 ba.arguments["value"].dtype, family))
+                                           decides=self.deciding(ba, config))
         # A cache's scaled walk reads its keys' value magnitudes from its value slots (`algebra.SCALED_WALK`;
         # another scaled walk the call's, `attention_mosaic_forward._largest`), a reduction across warps
         # (`reducing`).
         arguments = ba.arguments
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
         reduced = reducing(family, config.consumers, self.score_reduces or self.output_mod is not None,
-                           magnitudes=(cached and self.scales_in_kernel(ba)) or self.deciding(
-                               ba.arguments.get("residuals"), ba.arguments["value"].dtype, family))
+                           magnitudes=(cached and self.scales_in_kernel(ba)) or self.deciding(ba, config))
         return resources.shared_bytes(family, launch_scope(family, allocations, reduced,
                                                            reduces=forward_reduces(family, reduced),
                                                            products=self._products(ba, config)))
@@ -958,8 +968,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                 merged=initial is not None and residuals is not Kept.SPLIT,
                                 started=initial is not None and residuals is Kept.SPLIT,
                                 prologue=(None if self.query_mod is None
-                                          else (self.query_mod, self.query_kinds, self.query_dtypes)),
-                                decides=self._decides(residuals, value.dtype))
+                                          else (self.query_mod, self.query_kinds, self.query_dtypes)))
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
