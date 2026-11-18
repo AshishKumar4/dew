@@ -607,15 +607,21 @@ class Decided:
         """Consumer `wg`'s `verdict` (a scalar, uniform over its warpgroup) published, and whether any
         consumer's takes the walk again (`taken`)."""
         if self.words is None:
-            return verdict
+            return _rare(verdict)
         self.words[wg] = verdict.astype(jnp.int32)
         plgpu.barrier_arrive(self.barrier)
         return self.taken()
 
     def taken(self) -> jax.Array:
-        """Whether some consumer's published verdict takes the walk again, read once every consumer's is."""
+        """Whether some consumer's published verdict takes the walk again, read once every consumer's is: a
+        rare verdict (`derivatives.Rare`), which a count of the kernel's work reads as not taken."""
         plgpu.barrier_wait(self.barrier)
-        return functools.reduce(operator.or_, (self.words[index] for index in range(self.consumers))) != 0
+        published = (self.words[index] for index in range(self.consumers))
+        return _rare(functools.reduce(operator.or_, published) != 0)
+
+
+_rare = derivatives.marked(derivatives.Rare(), lambda verdict: verdict)
+"""A decided walk's verdict marked rare (`derivatives.Rare`)."""
 
 
 @dataclasses.dataclass(frozen=True)
