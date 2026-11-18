@@ -102,20 +102,23 @@ def _prefix(values, restarts) -> tuple[jax.Array, jax.Array]:
 
 def call(launch: Callable, query, key, value, g, beta, state, skip, turn, starts, *, scale: float,
          group: int, documents=None, held: int = 0, entry=None) -> tuple[jax.Array, jax.Array]:
-    """`launch(query, key, value, g, beta, state, skip, entry)`'s `(output, final memory)` (the template's,
+    """`launch(query, key, value, g, beta, state, skip, entry, turning)`'s `(output, final memory)` (the
+    template's,
     its memories `[B, H, K, V]`) of a call whose state turns its first `A` key pairs each token by `turn` `[B,
     T, H, A]` (`recurrence.Hooks.turns`), `starts` `[B, T]` each document's first token or None, a readout
-    `apart` from its token's `group` of writes where `group` is past one (`mainloop.Call.apart`): its
-    queries and keys turned into their documents' frames (`frames`, `_in_last_frame`), in at least fp32 and
-    rounded once to their dtype, its memory entering in its first document's first frame as given, and its
-    final memory turned back by the row's last token's frame. A forked call
-    (`documents`, its `(firsts, loads, stores)` `[B, D]` and `held` stored slots, `chunked_launch.Forked`'s;
-    `state` its table's given memories `[B, S', H, K, V]`; `entry` its documents' entry writes `(key [B, D,
-    R, H, K], value [B, D, R, H, V], weight [B, D, H])` or None) runs each document's frame on from the one
-    its source left (`_forked_frames`), so a memory a document stores is in the frame a document entering it
-    starts in, and turns its entry keys into it. Its gradient takes the template's through the frames and its
-    turns' in the crossing form (`turn_gradient`); a given memory is in the frame of its document's first
-    token, as given."""
+    `apart` from its token's `group` of writes where `group` is past one (`mainloop.Call.apart`): each
+    document read in its own last token's frame, its queries and keys turned by their own turns less its
+    last's (`frames`, `_in_last_frame`), in at least fp32 and rounded once to their dtype, and the memory it
+    enters turned in by minus its own turns, so a document's arithmetic reads no other's turns and the final
+    memory each leaves is in its own last frame, the recurrence's. A forked call (`documents`, its `(firsts,
+    loads, stores)` `[B, D]` and `held` stored slots, `chunked_launch.Forked`'s; `state` its table's given
+    memories `[B, S', H, K, V]`; `entry` its documents' entry writes `(key [B, D, R, H, K], value [B, D, R,
+    H, V], weight [B, D, H])` or None) has its walk turn each memory a document takes up as it loads it
+    (`launch`'s `turning`, `chunked_launch.Forked.turning`) and its entry keys with it. Its gradient takes
+    the launch's through the frames, its cotangents halved into the launch and its gradients doubled out
+    (exact), so a gradient's components in a frame, up to its norm, stay finite where the true frame's
+    are; its turns' in the crossing form (`turn_gradient`) from frames each root's first token composes
+    (`_forked_frames`), its final memory's cotangent turned into them."""
     return _turned(launch, scale, group, held, query, key, value, g, beta, state, skip, entry, turn, starts,
                    documents)
 
@@ -126,17 +129,31 @@ def _turned_primal(launch, scale, group, held, query, key, value, g, beta, state
                            starts, documents)[0]
 
 
-def _in_last_frame(tokens, opening):
-    """Each token's frame and each document's opening frame (`frames`, `_forked_frames`) as rotations `(cos,
-    sin)`, and the rotation `[B, 1, H, A]` by `-Psi`, the row's last token's frame, which turns the row's
-    final memory back into it. Every document reads in frames its own and its ancestors' turns compose from
-    its root's first token (a packed document's from its own first, the memory entering in the first
-    document's frame as given), so no document's arithmetic reads another's turns: read in the row's last
-    token's frame, a document's outputs moved by a rounding with and without the documents beside it, an
-    independent tree's or a later sibling's (test_mixers' no-token-reaches-another-document, row 7419)."""
-    back = tuple(-part[:, -1:] for part in tokens)
-    opened = None if opening is None else scan.rotation(*opening)
-    return scan.rotation(*tokens), opened, scan.rotation(*back)
+def _in_last_frame(local, starts, documents):
+    """Each token's frame in its document's last token's (`local`, `frames`' each document's own turns from
+    its first token, less its last's) as rotations `(cos, sin)` `[B, T, H, A]`, and the rotation each
+    document turns the memory it enters by, minus its own turns: a forked call's documents' `[B, D, H, A]`
+    (`documents`' firsts), else the first document's `[B, 1, H, A]`. Read so, a recent write's key turns by
+    nearly nothing and a final memory is its document's last frame's, the recurrence's own: read in frames
+    from a document's first token and turned back, the final memory under a decay keeping a few tokens was
+    9.6 times the recurrence's worst row from float64 (test_recurrence_chunk's long documents); read in a
+    row's last token's, a document read later documents' turns (row 7419)."""
+    batch, length = local[0].shape[:2]
+    place = jnp.arange(length)
+    ends = (jnp.ones((batch, length), bool).at[:, :-1].set(jnp.asarray(starts, bool)[:, 1:])
+            if starts is not None else place[None] == length - 1)
+    lasts = jax.lax.cummin(jnp.where(ends, place[None], length), axis=1, reverse=True)
+    last = tuple(_taken(part, lasts) for part in local)
+    relative = compensated_add(local, tuple(-part for part in last))
+    if documents is None:
+        # The first document's last token, whose frame the memory entering is turned into.
+        ending = lasts[:, :1]
+    else:
+        firsts = jnp.asarray(documents[0], jnp.int32)
+        following = jnp.concatenate([firsts[:, 1:], jnp.full((batch, 1), length, jnp.int32)], axis=1)
+        ending = jnp.clip(following - 1, 0, length - 1)
+    owned = tuple(-_taken(part, ending) for part in local)
+    return scan.rotation(*relative), scan.rotation(*owned)
 
 
 def _memory_axis(rotation, memory):
@@ -150,41 +167,74 @@ def _memory_axis(rotation, memory):
 def _turned_forward(launch, scale, group, held, query, key, value, g, beta, state, skip, entry, turn, starts,
                     documents) -> tuple[tuple[jax.Array, jax.Array], tuple]:
     del scale, group, held
+    local = frames(turn, starts)
+    (cos, sin), owned = _in_last_frame(local, starts, documents)
+    turned = [scan.rotated(_wide(x), cos, sin).astype(x.dtype) for x in (query, key)]
+    turning, given_entry = None, entry
+    if documents is None:
+        if state is not None:
+            # The memory entering, its first document's, in that document's last frame.
+            state = scan.rotated(_wide(state), *_memory_axis(owned, state), axis=-2).astype(state.dtype)
+    else:
+        # Each document's memory turned in as its walk takes it up, its entry keys with it.
+        turning = owned
+        if entry is not None:
+            keys = scan.rotated(_wide(entry[0]), *(part[:, :, None] for part in owned))
+            entry = (keys.astype(entry[0].dtype), *entry[1:])
+    (out, final), pullback = jax.vjp(lambda *operands: launch(*operands, turning), *turned, value, g, beta,
+                                     state, skip, entry)
+    kind = jnp.zeros((), turn.dtype)
+    return (out, final), (pullback, query, key, value, g, beta, state, given_entry, turn, starts, documents,
+                          cos, sin, owned, kind)
+
+
+def _rooted(query, key, state, entry, turn, starts, documents):
+    """`turn_gradient`'s operands: the queries and keys turned into frames each root's first token composes
+    (`_forked_frames`; a packed call's each document's own, `frames`), a forked call's entry keys into its
+    documents' opening frames, and the rotation by minus the row's last token's frame, which turns the final
+    memory's cotangent into them."""
     if documents is None:
         tokens, opening = frames(turn, starts), None
     else:
         tokens, opening = _forked_frames(turn, starts, documents, given=state.shape[1])
-    (cos, sin), opened, leaving = _in_last_frame(tokens, opening)
-    turned = [scan.rotated(_wide(x), cos, sin).astype(x.dtype) for x in (query, key)]
-    if entry is not None and opened is not None:
-        # The entry keys in the frame their document opens in.
-        keys = scan.rotated(_wide(entry[0]), *(part[:, :, None] for part in opened))
+    cos, sin = scan.rotation(*tokens)
+    rooted = [scan.rotated(_wide(x), cos, sin).astype(x.dtype) for x in (query, key)]
+    if entry is not None and opening is not None:
+        keys = scan.rotated(_wide(entry[0]), *(part[:, :, None] for part in scan.rotation(*opening)))
         entry = (keys.astype(entry[0].dtype), *entry[1:])
-    (out, final), pullback = jax.vjp(launch, *turned, value, g, beta, state, skip, entry)
-    # The row's final memory, read in its documents' frames, turned back into its last token's.
-    final = scan.rotated(_wide(final), *_memory_axis(leaving, final), axis=-2).astype(final.dtype)
-    kind = jnp.zeros((), turn.dtype)
-    return (out, final), (pullback, *turned, value, g, beta, state, entry, starts, documents, cos, sin,
-                          opened, leaving, kind)
+    return (*rooted, entry, scan.rotation(*(-part[:, -1:] for part in tokens)))
 
 
 def _turned_backward(launch, scale, group, held, residuals, cotangents):
     del launch
-    (pullback, query, key, value, g, beta, state, entry, starts, documents, cos, sin, opened, leaving,
+    (pullback, query, key, value, g, beta, state, entry, turn, starts, documents, cos, sin, owned,
      turn_kind) = residuals
     d_out, d_final = cotangents
-    # The final memory's cotangent in the frame the launch left it in.
+
+    def doubled(x):
+        return None if x is None else x * 2
+
+    # Halved into the launch, doubled out after their frames: exact, and a gradient's components in a
+    # document's frame (each up to its norm) stay finite where the true frame's do (the turned contract near
+    # fp32's largest, test_contracts_recurrence).
+    d_query, d_key, d_value, d_g, d_beta, d_state, d_skip, d_entry = pullback(
+        tuple(d * 0.5 for d in (d_out, d_final)))
+    unturned = [doubled(scan.rotated(_wide(d), cos, -sin).astype(d.dtype)) for d in (d_query, d_key)]
+    if d_state is not None and documents is None:
+        cos_in, sin_in = _memory_axis(owned, d_state)
+        d_state = scan.rotated(_wide(d_state), cos_in, -sin_in, axis=-2).astype(d_state.dtype)
+    if d_entry is not None:
+        keys = scan.rotated(_wide(d_entry[0]), owned[0][:, :, None], -owned[1][:, :, None])
+        d_entry = tuple(doubled(part) for part in (keys.astype(d_entry[0].dtype), *d_entry[1:]))
+    rooted_query, rooted_key, rooted_entry, leaving = _rooted(query, key, state, entry, turn, starts,
+                                                              documents)
     cos_back, sin_back = _memory_axis(leaving, d_final)
-    d_final = scan.rotated(_wide(d_final), cos_back, -sin_back, axis=-2).astype(d_final.dtype)
-    d_query, d_key, d_value, d_g, d_beta, d_state, d_skip, d_entry = pullback((d_out, d_final))
-    unturned = [scan.rotated(_wide(d), cos, -sin).astype(d.dtype) for d in (d_query, d_key)]
-    if d_entry is not None and opened is not None:
-        keys = scan.rotated(_wide(d_entry[0]), opened[0][:, :, None], -opened[1][:, :, None])
-        d_entry = (keys.astype(d_entry[0].dtype), *d_entry[1:])
-    d_turn = turn_gradient(query, key, value, d_out, g, beta, state, d_final, starts, scale=scale,
-                           group=group, pairs=cos.shape[-1], documents=documents, held=held, entry=entry)
-    return (*unturned, d_value, d_g, d_beta, d_state, d_skip, d_entry, d_turn.astype(turn_kind.dtype),
-            None, None)
+    d_rooted = scan.rotated(_wide(d_final), cos_back, -sin_back, axis=-2).astype(d_final.dtype)
+    d_turn = turn_gradient(rooted_query, rooted_key, value, d_out, g, beta, state, d_rooted, starts,
+                           scale=scale, group=group, pairs=cos.shape[-1], documents=documents, held=held,
+                           entry=rooted_entry)
+    return (*unturned, *(doubled(d) for d in (d_value, d_g, d_beta, d_state, d_skip)), d_entry,
+            d_turn.astype(turn_kind.dtype), None, None)
 
 
 _turned = contracted("test_a_turned_template_call_holds_every_order")(
