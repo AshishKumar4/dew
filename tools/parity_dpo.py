@@ -25,6 +25,7 @@ import dataclasses
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 
@@ -62,9 +63,10 @@ def trl_loss(arrays: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
     import torch
     from trl import DPOConfig, DPOTrainer
 
-    defaults = {field.name: field.default if field.default is not dataclasses.MISSING
-                else field.default_factory() if field.default_factory is not dataclasses.MISSING else None
-                for field in dataclasses.fields(DPOConfig)}
+    defaults: dict[str, Any] = {
+        field.name: field.default if field.default is not dataclasses.MISSING
+        else field.default_factory() if field.default_factory is not dataclasses.MISSING else None
+        for field in dataclasses.fields(DPOConfig)}
     policy = torch.tensor(arrays["policy_logits"], dtype=dtype, requires_grad=True)
     reference = torch.tensor(arrays["ref_logits"], dtype=dtype)
 

@@ -69,10 +69,14 @@ def author_models(directory: Path, quantize: Callable = nvfp4_qdq, device: str =
     from _dew_torch.precision import float64_twin
 
     stored = load_file(directory / "model.safetensors", device=device)
-    config = Qwen3Config.from_pretrained(directory)
-    del config.quantization_config
-    config._attn_implementation = "eager"
-    reference = Qwen3ForCausalLM(config).to(device).eval()
+    # The checkpoint's config but its quantization (the reference holds the stored tensors itself), its
+    # attention eager.
+    stored_config = Qwen3Config.from_pretrained(directory).to_dict()
+    config = Qwen3Config.from_dict({key: value for key, value in stored_config.items()
+                                    if key != "quantization_config"}, attn_implementation="eager")
+    reference = Qwen3ForCausalLM(config).eval()
+    # Moved in place, as a module moves (transformers' own `to` is typed for a dtype's casts).
+    torch.nn.Module.to(reference, device)
     quantized = [name.removesuffix('.weight_scale') for name in stored if name.endswith('.weight_scale')]
     suffixes = (".weight_scale", ".weight_scale_2", ".input_scale")
     parts = {stem + suffix for stem in quantized for suffix in suffixes}

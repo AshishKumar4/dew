@@ -117,6 +117,7 @@ What lands in tests/fixtures/gemma4, for tests/test_gemma4_moe.py:
 import json
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -817,7 +818,8 @@ class Glm5NextTextForCausalLM(Glm5NextPreTrainedModel):
         logits = self.lm_head(hidden)
         loss = None if labels is None else torch.nn.functional.cross_entropy(
             logits[:, :-1].reshape(-1, logits.shape[-1]), labels[:, 1:].reshape(-1))
-        return CausalLMOutputWithPast(logits=logits, loss=loss)
+        # transformers types an output's loss as a FloatTensor, which no torch function returns as its type.
+        return CausalLMOutputWithPast(logits=logits, loss=cast("torch.FloatTensor | None", loss))
 
 
 def tiny_glm5_next() -> Glm5NextTextForCausalLM:
@@ -984,7 +986,7 @@ def write_llama4_blocks(directory: Path) -> None:
     hidden = torch.randn(2, 12, config.hidden_size, generator=generator)
     positions = torch.arange(12)[None]
     rotary = Llama4TextRotaryEmbedding(config)
-    arrays = {"hidden": hidden.numpy()}
+    arrays: dict[str, Any] = {"hidden": hidden.numpy()}
     # Layer 0 rotates and chunks, layer 3 is the global layer of the pattern.
     for name, index in (("local", 0), ("global", 3)):
         attention = Llama4TextAttention(config, layer_index := index).eval()
@@ -1005,7 +1007,7 @@ def write_llama4_blocks(directory: Path) -> None:
     scatter_weights(moe, seed=43)
     with torch.no_grad():
         output, _ = moe(hidden)
-    arrays = {"hidden": hidden.numpy(), "output": output.numpy()}
+    arrays: dict[str, Any] = {"hidden": hidden.numpy(), "output": output.numpy()}
     arrays.update({f"feed_forward.{tensor_name}": tensor.detach().numpy()
                    for tensor_name, tensor in moe.named_parameters()})
     np.savez(directory / "moe.npz", **arrays)

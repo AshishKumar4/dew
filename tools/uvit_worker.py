@@ -37,7 +37,8 @@ def uvit():
     """U-ViT's libs at `COMMIT`, as the package `uvit_libs`, in its math attention."""
     package("uvit_libs", published_files(REPO, COMMIT, FILES) / "libs")
     t2i = importlib.import_module("uvit_libs.uvit_t2i")
-    t2i.ATTENTION_MODE = "math"
+    # U-ViT reads its attention's mode from its module's global as it attends.
+    vars(t2i)["ATTENTION_MODE"] = "math"
     return t2i
 
 
