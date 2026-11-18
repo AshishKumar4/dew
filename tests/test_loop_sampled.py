@@ -22,8 +22,11 @@ from dew.training.interval import DISPATCHED_MICROBATCHES, Interval
 from dew.training.phase_passes import SampledPasses
 
 LAWS = [SampledPasses(mean=2.0, dispersion=0.5, cap=4), SampledPasses(mean=4.0, dispersion=0.5, cap=8),
-        SampledPasses(mean=3.0, dispersion=0.0, cap=6)]
-"""The note's law (mean 2, dispersion 0.5, cap 4), a wider one, and a Poisson count (no dispersion)."""
+        SampledPasses(mean=3.0, dispersion=0.0, cap=6), SampledPasses(mean=32.0, dispersion=0.0, cap=3),
+        SampledPasses(mean=32.0, dispersion=1.0, cap=3)]
+"""The note's law (mean 2, dispersion 0.5, cap 4), a wider one, a Poisson count (no dispersion), and two
+whose cap holds little of their unbounded mass (a Poisson count of mean 32 is at most 3 with chance
+~2e-11: a count redrawn past the cap would be drawn ~5e10 times)."""
 
 DRAWS = 2_500
 """The microbatches a seed's key draws a law's counts at."""
@@ -134,7 +137,7 @@ def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count(trai
     programs: dict = {}
     drawn = []
     for index in range(8):
-        step.drawn(TRAINED, sampled.key, interval, index)
+        step.drawn(interval, index)
         (count,) = step.counts
         drawn.append(count)
         placement = jax.tree.map(lambda leaf: leaf.sharding, state)
@@ -163,22 +166,76 @@ def test_a_sampled_runs_draws_go_on_through_another_split_and_a_resume():
     step's microbatches, at the split its step reads."""
     key = jax.random.key(0)
     flops = dict.fromkeys(range(1, CAP + 1))
-    four, two = DrawingStep({}, flops, 4), DrawingStep({}, flops, 2)
+    four, two = (DrawingStep({}, flops, split, TRAINED, words(key)) for split in (4, 2))
     interval = Interval(time.time(), None, microbatches=0)
     drawn = []
     for index in range(10):
-        four.drawn(TRAINED, key, interval, index)
+        four.drawn(interval, index)
         drawn += four.counts
     control = {DISPATCHED_MICROBATCHES: interval.microbatches}
     resumed = Interval.resumed(dict(control), last_saved=10)
     for index in range(10, 15):
-        two.drawn(TRAINED, key, resumed, index)
+        two.drawn(resumed, index)
         drawn += two.counts
     assert drawn == [TRAINED.count(words(key), position) for position in range(50)]
     lacking = Interval.resumed({}, last_saved=7)
-    two.drawn(TRAINED, key, lacking, 7)
+    two.drawn(lacking, 7)
     assert two.counts == [TRAINED.count(words(key), position) for position in (14, 15)]
     assert lacking.microbatches == 16
+
+
+def test_a_sampled_step_called_by_hand_draws_each_calls_counts_itself():
+    """A sampled run's step as `Trainer.compile` returns it, called by hand with no fit drawing for it (a
+    script's loop, `dew inspect`'s sampled window), draws each call's counts itself (row 8268): its first
+    call's at its state's step's microbatches, each next call's past the last, the counts the run's key
+    draws there, a call a fit drew for (`drawn`) running the fit's."""
+    batch = token_batch()
+    sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, split=2)
+    state, _, _ = sampled.place()
+    step = sampled.compile(state, batch)
+    assert isinstance(step, DrawingStep) and step.split == 2
+    drawn = []
+    for _ in range(3):
+        state, *_ = step(state, batch)
+        drawn += step.counts
+    assert drawn == [TRAINED.count(words(sampled.key), position) for position in range(6)]
+    step.drawn(Interval(time.time(), None, microbatches=40), int(state.step))
+    step(state, batch)
+    assert step.counts == [TRAINED.count(words(sampled.key), position) for position in (40, 41)]
+
+
+def test_a_fresh_sampled_run_draws_from_its_first_microbatch_unsaid(caplog):
+    """A fresh run's first step, no checkpoint before it, draws from microbatch 0 and says nothing of a
+    checkpoint (row 8276); a checkpoint that counted none of its microbatches is said."""
+    key = jax.random.key(0)
+    step = DrawingStep({}, dict.fromkeys(range(1, CAP + 1)), 2, TRAINED, words(key))
+    with caplog.at_level("INFO", logger="dew.training.compiler"):
+        fresh = Interval.resumed({}, last_saved=None)
+        step.drawn(fresh, 0)
+        assert fresh.microbatches == 2 and not caplog.records
+        lacking = Interval.resumed({}, last_saved=3)
+        step.drawn(lacking, 3)
+    assert lacking.microbatches == 8
+    assert [record.name for record in caplog.records] == ["dew.training.compiler"]
+
+
+def test_a_sampled_run_whose_variables_are_on_the_host_is_refused_by_name():
+    """A run drawing its pass count per microbatch whose layout keeps its variables on the host (a
+    host-master run, which no plan of the devices steps) is refused naming the pairing (row 8271)."""
+    from dew.training import Layout, Trainer
+
+    trainer = Trainer(LMObjective(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
+                      layout=Layout(host=("variables",), min_shard=1, tolerance=1.0), sampled_passes=TRAINED)
+    state, _, _ = trainer.place()
+    with pytest.raises(ValueError):
+        trainer.compile(state, token_batch())
+
+
+def test_a_sampled_pass_count_is_exported_where_the_trainer_is():
+    """`SampledPasses`, `Trainer(sampled_passes=...)`'s type, is public beside the trainer (row 8277)."""
+    import dew.training
+
+    assert dew.training.SampledPasses is SampledPasses and "SampledPasses" in dew.training.__all__
 
 
 def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path):
@@ -248,7 +305,7 @@ def test_a_fixed_and_a_sampled_run_of_one_config_each_trace_their_own_window(sam
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
         if isinstance(step, DrawingStep):
-            step.drawn(TRAINED, trainer.key, Interval(time.time(), None, microbatches=0), 0)
+            step.drawn(Interval(time.time(), None, microbatches=0), 0)
         step(state, batch)
 
     runs = [{}, {"sampled_passes": TRAINED}]

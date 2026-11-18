@@ -236,10 +236,11 @@ class DrawingStep:
     """The step of a run that draws its looped model's pass count per microbatch (`sampled`): each count's
     plan at its cap's (`StepCompiler.admitted_at`) and its FLOPs a step, by count (`plans`, `flops`), the
     call running each of its `split` microbatches by its drawn count's program (`counts`) over the one
-    state. Each call draws its counts at the global position of its first microbatch under the run's `key`
-    (`SampledPasses.count`), which it holds (`position`): a fit sets it from the microbatches the run
-    dispatched (`drawn`), and a call no fit drew for, as `Trainer.compile`'s caller makes (`dew inspect`, a
-    step called by hand), draws its own from where it stands, its first at its state's step's."""
+    state. Each call's counts are drawn at the global positions of its microbatches under the run's `key`
+    (`SampledPasses.count`), from the position it holds (`position`): a fit draws them before the call from
+    the microbatches the run dispatched (`drawn`), and a call no fit drew for, as `Trainer.compile`'s caller
+    makes (`dew inspect`, a step called by hand), draws its own from where it stands, its first at its
+    state's step's microbatches."""
 
     plans: Mapping[int, Planned]
     flops: Mapping[int, StepFlops | None]
@@ -249,20 +250,25 @@ class DrawingStep:
     """The run's key's words (`jax.random.key_data`), which every draw reads."""
     run: CompiledStep | None = None
     counts: list[int] = dataclasses.field(default_factory=list)
+    """The counts of the call in hand: the next call's where `pending`, else the last call's."""
+    pending: bool = False
     position: int | None = None
-    """The global position of the next call's first microbatch; None until a fit or the first call sets it."""
+    """The global position of the next draw's first microbatch; None until a fit or the first call sets it."""
 
     def drawn(self, interval: Interval, step: int) -> StepFlops | None:
         """The counts of the next call's microbatches at the run's dispatched microbatches
-        (`Interval.microbatches`; a checkpoint that counted none resumes at its `step`'s, said), the
-        interval's count past them; and the call's FLOPs, each microbatch's at its count's program's."""
+        (`Interval.microbatches`, the interval's count past them): a run's first step, its fresh start's
+        microbatch 0, a checkpoint's microbatches where it counted them, else (a checkpoint of a run that drew
+        none) its `step`'s, said; and the call's FLOPs, each microbatch's at its count's program's."""
         if interval.microbatches is None:
             interval.microbatches = step * self.split
-            _log.info("the run's checkpoint counted none of its dispatched microbatches: its pass counts "
-                      "draw on from step %d's, microbatch %d", step, interval.microbatches)
+            if interval.last_saved is not None:
+                _log.info("the run's checkpoint counted none of its dispatched microbatches: its pass counts "
+                          "draw on from step %d's, microbatch %d", step, interval.microbatches)
         self.position = interval.microbatches
         interval.microbatches += self.split
         self._draw()
+        self.pending = True
         total: StepFlops | None = None
         for count in self.counts:
             each = self.flops[count]
@@ -279,16 +285,13 @@ class DrawingStep:
 
     def __call__(self, state: TrainState, batch: Batch, /, sampled: bool = False):
         assert self.run is not None
-        if not self.counts:
+        if not self.pending:
             # A call no fit drew for draws its own, its first at its state's step's microbatches.
             if self.position is None:
                 self.position = int(state.step) * self.split
             self._draw()
-        try:
-            return self.run(state, batch, sampled)
-        finally:
-            # Each call's counts its own: the next draws again.
-            self.counts = []
+        self.pending = False
+        return self.run(state, batch, sampled)
 
 
 class StepCompiler[L, E]:
@@ -501,6 +504,10 @@ class StepCompiler[L, E]:
             if self.ahead is not None or settings.inspection is not None:
                 raise ValueError("a step compiled ahead or inspected runs where the devices hold the state; "
                                  "this layout keeps the variables on the host")
+            if self.phase_passes.sampled is not None:
+                raise ValueError("a pass count drawn per microbatch (sampled_passes) runs each count's step "
+                                 "at its cap's plan where the devices hold the state; this layout keeps the "
+                                 "variables on the host (row 8271)")
             return Compiled(stepping.shape.split, step=self._compile_host(stepping, state, batch))
         held, self._unplaced = self._unplaced, None
         mesh = settings.device_mesh

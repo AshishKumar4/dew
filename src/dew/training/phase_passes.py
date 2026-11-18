@@ -11,6 +11,7 @@ hands on.
 from __future__ import annotations
 
 import contextlib
+import functools
 import math
 from collections.abc import Collection, Hashable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
@@ -220,13 +221,26 @@ class PhasePasses[L, E]:
         return self.built[passes]
 
 
+RATE_SPAN = 39
+"""The standard deviations either side of a log rate's mean past which its normal density is 0 in float64
+(exp(-39² / 2) underflows past the least subnormal), the span `SampledPasses.cumulative` integrates over."""
+
+RATE_STEPS = 32
+"""The trapezoid steps `SampledPasses.cumulative` takes across the narrowest width of its integrand."""
+
+EXP_RANGE = 709.0
+"""The largest exponent whose exponential float64 holds (exp(709.78) overflows)."""
+
+
 @dataclass(frozen=True)
 class SampledPasses:
     """A looped model's pass count drawn afresh for each microbatch a run steps (`count`), from a named law
     bounded to `cap` (row 7660): `law` 'lognormal-poisson', the count `1 + N`, `N ~ Poisson(Λ)`,
     `log Λ ~ Normal(log(mean - 1) - dispersion² / 2, dispersion²)`, so `mean` is the count's mean before its
-    bound, conditioned on 1 to `cap` by rejection, as recurrent-depth training draws it (Geiping et al. 2025,
-    arXiv 2502.05171). A draw is a function of the run's key and the microbatch's global position alone,
+    bound, conditioned on 1 to `cap`, as recurrent-depth training draws it (Geiping et al. 2025, arXiv
+    2502.05171), by the bounded law's inverse cumulative (`cumulative`), one uniform a draw however little of
+    the unbounded law's mass the cap holds. A draw is a function of the run's key and the microbatch's global
+    position alone,
     its place among every microbatch the run dispatched: every process draws alike, and a resume, a replan
     or a step of another split draws on as the run would have."""
 
@@ -252,10 +266,34 @@ class SampledPasses:
 
     def count(self, key: Sequence[int], position: int) -> int:
         """The pass count of the run's microbatch at global `position` under the run's `key` (its words,
-        `jax.random.key_data`): a draw of the bounded law, a count past `cap` drawn again."""
+        `jax.random.key_data`): the bounded law's inverse cumulative (`cumulative`) at one uniform draw."""
         draws = np.random.Generator(np.random.Philox(np.random.SeedSequence([*map(int, key), int(position)])))
+        return 1 + int(np.searchsorted(self.cumulative, draws.random(), side="right"))
+
+    @functools.cached_property
+    def cumulative(self) -> np.ndarray:
+        """The bounded law's cumulative probability at each count 1 to `cap`, its last 1: the Poisson's
+        probability of each count less one, at the rate `exp(location)` without dispersion, else integrated
+        over the log rate's normal density in log space, by the trapezoid rule over `RATE_SPAN` standard
+        deviations either side (past which the density underflows float64), its step `RATE_STEPS` to the
+        narrower of the density's width and a Poisson's at the cap (`1 / sqrt(cap)` in the log rate), where an
+        integrand this smooth and this fast to vanish is exact to float64; then conditioned on the cap."""
+        below = np.arange(self.cap)
+        factorials = np.array([math.lgamma(n + 1) for n in below])
         location = math.log(self.mean - 1) - self.dispersion ** 2 / 2
-        while True:
-            drawn = 1 + int(draws.poisson(math.exp(draws.normal(location, self.dispersion))))
-            if drawn <= self.cap:
-                return drawn
+        if self.dispersion == 0:
+            logs = below * location - math.exp(location) - factorials
+        else:
+            reach = RATE_SPAN * self.dispersion
+            step = min(self.dispersion, 1 / math.sqrt(self.cap)) / RATE_STEPS
+            rates = np.linspace(location - reach, location + reach, 2 * math.ceil(reach / step) + 1)
+            # The rate's exponential past float64's range is a Poisson's probability of 0 at every count.
+            terms = (below[:, None] * rates - np.exp(np.minimum(rates, EXP_RANGE)) - factorials[:, None]
+                     - ((rates - location) / self.dispersion) ** 2 / 2)
+            peaks = terms.max(axis=1)
+            logs = peaks + np.log(np.exp(terms - peaks[:, None]).sum(axis=1))
+        probabilities = np.exp(logs - logs.max())
+        cumulative = np.cumsum(probabilities / probabilities.sum())
+        # The sum's last partial is 1 but for its rounding, which a uniform draw past it must not reach.
+        cumulative[-1] = 1.0
+        return cumulative
