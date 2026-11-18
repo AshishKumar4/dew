@@ -49,15 +49,16 @@ def _preamble(model, loop: Loop, x, injected, *, stop: bool, normed=None, theta=
     return x
 
 
-def _theta(model, loop: Loop, steps: range):
-    """The θ each later pass of `steps` reads, under `implicit`: `model.loop_theta`, one every pass reads, or
-    with `theta_passes` its row t - 1 for pass t, a pass's own (`[len(steps), d]`); None where the loop is
-    not implicit."""
-    if not loop.implicit:
+def _theta(model, loop: Loop, steps: range, *, rows: bool = False):
+    """The θ the later passes of `steps` read, under `implicit`: `model.loop_theta`, one every pass reads, or
+    with `theta_passes` its row t - 1 for pass t, a pass's own: one pass's row, or with `rows` the passes'
+    rows `[len(steps), d]` (None where they read one θ); None where the loop is not implicit."""
+    if not loop.implicit or (rows and loop.theta_passes is None):
         return None
     if loop.theta_passes is None:
         return model.loop_theta
-    return model.loop_theta[steps.start - 1:steps.stop - 1]
+    held = model.loop_theta[steps.start - 1:steps.stop - 1]
+    return held if rows else held[0]
 
 
 def exit_log_distribution(logits: Sequence[jax.Array]) -> jax.Array:
@@ -273,9 +274,8 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
             if logit is not None:  # a gated exit, which the threshold's choice weighs (`_exited`)
                 exited.append((leaving, logit))
             normed = output if end == layers and model.normed_output else None
-        theta = _theta(model, loop, range(step, step + 1))
         x = _preamble(model, loop, x, injected, stop=step == cut, normed=normed,
-                      theta=theta if theta is None or loop.theta_passes is None else theta[0])
+                      theta=_theta(model, loop, range(step, step + 1)))
         run = nn.map_variables(run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
                                trans_out_fn=view.outside, mutable=True)
         return _stepped(loop, run(model, x, **inputs), x, injected)
@@ -304,10 +304,6 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
         entering = None if shared is None else (shared.entering if shared.entering is not None
                                                else model.variables.get('cache') or None)
 
-        # Each pass's own θ row where it holds one (`_theta`), scanned beside the passes; one θ the scanned
-        # module reads itself.
-        per_pass = _theta(model, loop, steps) if loop.theta_passes is not None else None
-
         def later(module, x, theta):
             # The block's input, its per-layer inputs and the entering cache close over the scan.
             x = _preamble(module, loop, x, injected, stop=False,
@@ -326,7 +322,7 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
                        length=len(steps), metadata_params={nn.PARTITION_NAME: None})
         run = nn.map_variables(scan, mapped_collections=mapped, trans_in_fn=view.inside,
                                trans_out_fn=view.outside, mutable=True)
-        x, _ = run(model, x, per_pass)
+        x, _ = run(model, x, _theta(model, loop, steps, rows=True))  # each pass's own θ row, if it holds one
         return x
 
     # Under a shared cache the last pass keeps its writes and runs as the first does, after the scan.

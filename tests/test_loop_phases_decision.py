@@ -82,6 +82,12 @@ def phased(root: Path):
                   (asked(tickets(root, "second", "sales")), None))
 
 
+def named_leaves_of(variables) -> list:
+    """Each leaf of `variables`' parameters by its path, shapes held as they are."""
+    return [(jax.tree_util.keystr(path), leaf)
+            for path, leaf in jax.tree_util.tree_leaves_with_path(variables["params"])]
+
+
 def named_leaves(variables) -> dict:
     """Each leaf of `variables`' parameters by its path."""
     return {jax.tree_util.keystr(path): np.asarray(leaf)
@@ -199,6 +205,16 @@ def test_a_theta_per_pass_over_a_checkpoints_implicit_loop_starts_each_row_at_it
     plain = looping(loaded, 3, (1, 3))
     with pytest.raises(ValueError):
         asked.looped(plain)
+    # Held as shapes alone, as a resume loads its source, its θ rows as its shape.
+    shaped = dataclasses.replace(implicit, variables=jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), np.asarray(leaf).dtype), implicit.variables))
+    rowed = asked.looped(shaped).variables
+    (shape,) = [leaf for name, leaf in named_leaves_of(rowed) if "loop_theta" in name]
+    assert isinstance(shape, jax.ShapeDtypeStruct) and shape.shape == (2, *held.shape)
+    # A checkpoint holding rows for three passes keeps them, run at two.
+    fewer = dataclasses.replace(asked, loop_steps=2).looped(per_pass)
+    assert fewer.model.loop.theta_passes == 3 and fewer.model.loop.steps == 2
+    assert np.all(np.isfinite(np.asarray(fewer.model.apply(fewer.variables, ids))))
 
 
 @pytest.mark.parametrize("phase", range(len(STEPS)), ids=[f"{passes}-passes" for passes in STEPS])

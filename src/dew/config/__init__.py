@@ -1810,9 +1810,13 @@ class DecoderRunConfig(RunConfig):
 
         counts = self.loop_steps if isinstance(self.loop_steps, tuple) else (self.handed_passes,)
         rows = max((count for count in counts if count is not None), default=None)
-        if rows is None and isinstance(start.model, Looped) and start.model.loop is not None:
+        own = start.model.loop if isinstance(start.model, Looped) else None
+        if own is not None and own.theta_passes is not None:
+            # A checkpoint holding rows already keeps them, a count of fewer passes reading the first.
+            rows = max(own.theta_passes, rows or 0)
+        elif rows is None and own is not None:
             # The checkpoint's own count, where the run keeps it.
-            rows = start.model.loop.steps
+            rows = own.steps
         return looping(start, self.handed_passes, self.loop_layers, backprop_steps=self.loop_backprop_steps,
                        remat=self.loop_remat or None, implicit=self.loop_implicit or None,
                        exit_gate=self.loop_exit_gate or None, exit_threshold=self.loop_exit_threshold,
@@ -1829,8 +1833,8 @@ def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | No
     or a new block's passes are not stated. `backprop_steps` and `remat` choose
     the loop's backward memory, `implicit` its later passes' rule (`Loop.implicit`), and `exit_gate` and
     `exit_threshold` its exits (`Loop.exit_gate`) and `theta_passes` its θ's rows (`Loop.theta_passes`),
-    each row a checkpoint's one θ where it held one, so the loop computes what the checkpoint's did; None
-    keeps a looped checkpoint's own value. A loop
+    each row a checkpoint's one θ where it held one, so the loop computes what the checkpoint's did, a
+    source held as shapes alone rowed as its shape; None keeps a looped checkpoint's own value. A loop
     that gives its layers parameters of their own (an implicit loop's θ, an exit gate) draws them from
     `key` beside the loaded weights, fresh (`Pretrained.with_model`)."""
     from dew.nn.protocols import Looping
@@ -1855,7 +1859,13 @@ def _theta_rows(variables, passes: int):
 
     def rowed(path, leaf):
         named = isinstance(path[-1], jax.tree_util.DictKey) and path[-1].key == "loop_theta"
-        return jnp.broadcast_to(leaf, (passes - 1, *leaf.shape)) if named and leaf.ndim == 1 else leaf
+        if not named or len(leaf.shape) != 1:
+            return leaf
+        shape = (passes - 1, *leaf.shape)
+        # A source held as shapes alone (`weights=False`, a resume's) rows its shape.
+        if isinstance(leaf, jax.ShapeDtypeStruct):
+            return jax.ShapeDtypeStruct(shape, leaf.dtype, sharding=leaf.sharding)
+        return jnp.broadcast_to(leaf, shape)
 
     return jax.tree_util.tree_map_with_path(rowed, variables)
 
