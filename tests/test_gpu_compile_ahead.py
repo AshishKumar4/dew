@@ -111,9 +111,8 @@ SAMPLED_BUILD = """
 import sys
 
 import jax
-import numpy as np
 import optax
-from test_loop_sampled import TRAINED, token_batch
+from test_loop_sampled import TRAINED, token_draw
 from test_pass_weights import looped
 
 from dew.nn.kernels.generation import compile_only_gpus
@@ -127,7 +126,7 @@ target = MeshSpec().build(compile_only_gpus(generation, 1, memory, multiprocesso
                                             share=float(sys.argv[5])))
 trainer = Trainer(LMObjective(looped(steps=TRAINED.cap), 16), optax.sgd(0.1), key=jax.random.key(0),
                   mesh=target, layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED)
-compile_ahead(trainer, {"text": np.asarray(token_batch()["text"])}).save(path)
+compile_ahead(trainer, {"text": token_draw()}).save(path)
 """
 """A run that draws its looped model's pass count per microbatch, its step compiled ahead for the GPU of the
 generation argv[1] names (as `QUIET_BUILD`'s), every count's beside the cap's, saved at argv[2], in a
@@ -137,9 +136,8 @@ SAMPLED = """
 import sys
 
 import jax
-import numpy as np
 import optax
-from test_loop_sampled import TRAINED, token_batch
+from test_loop_sampled import TRAINED, token_draw
 from test_pass_weights import looped
 
 from dew.objectives.lm.objective import LMObjective
@@ -151,7 +149,7 @@ run = Trainer(LMObjective(looped(steps=TRAINED.cap), 16), optax.sgd(0.1), key=ja
               mesh=MeshSpec().build(jax.devices()[:1]), layout=Layout(min_shard=1, tolerance=1.0),
               sampled_passes=TRAINED, ahead=AheadOfTime.load(sys.argv[1]))
 with Compiles(None) as compiles:
-    state = run.fit({"text": np.asarray(token_batch()["text"])}, steps=4, log_every=2)
+    state = run.fit({"text": token_draw()}, steps=4, log_every=2)
 assert int(state.step) == 4
 compiled = [(program.name, program.where) for program in compiles.programs if program.kind == "compiled"]
 assert not compiled, compiled

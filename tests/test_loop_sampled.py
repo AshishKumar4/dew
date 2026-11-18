@@ -169,10 +169,16 @@ TRAINED = SampledPasses(mean=2.0, dispersion=0.5, cap=CAP)
 """The trainer cells' law."""
 
 
-def token_batch(seed: int = 2) -> dict:
-    """Two rows a device of 17 tokens, drawn as int32 on the host, so placing them compiles no cast."""
+def token_draw(seed: int = 2) -> np.ndarray:
+    """Two rows a device of 17 tokens, int32, on the host: a run handed them places them as it steps,
+    compiling nothing of its own to make them."""
     rows = jax.device_count() * 2
-    return {"text": jnp.asarray(np.random.default_rng(seed).integers(0, 256, (rows, 17), dtype=np.int32))}
+    return np.random.default_rng(seed).integers(0, 256, (rows, 17), dtype=np.int32)
+
+
+def token_batch(seed: int = 2) -> dict:
+    """`token_draw` on the default device."""
+    return {"text": jnp.asarray(token_draw(seed))}
 
 
 def held(leaf):
@@ -415,7 +421,7 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
     from dew.training.model_flops import TRAINING_FLOPS, prepare_counts
 
     model = looped(steps=CAP)
-    host = {"text": np.asarray(token_batch()["text"])}
+    host = {"text": token_draw()}
     sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, split=2)
     counted = prepare_counts(sampled.objective, host, count_model=True,
                              counts=sampled.phase_passes.counted())
@@ -588,7 +594,7 @@ def test_a_sampled_runs_step_compiled_ahead_holds_every_count(tmp_path):
 
     trainer = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED,
                              mesh=MeshSpec().build(gpus("sm90")))
-    ahead = compile_ahead(trainer, {"text": np.asarray(token_batch()["text"])})
+    ahead = compile_ahead(trainer, {"text": token_draw()})
     assert sorted(ahead.counts) == list(range(1, CAP))
     programs = {count: step.program for count, (step, _) in ahead.counts.items()}
     assert len({ahead.program, *programs.values()}) == CAP
