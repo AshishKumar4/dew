@@ -17,7 +17,6 @@ import bisect
 import dataclasses
 import functools
 import itertools
-import json
 import os
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -62,7 +61,6 @@ from dew.data.analysis import (
     _written,
     reach,
     rejects,
-    same_stage,
     written,
 )
 from dew.data.compilation import compiling, within
@@ -101,6 +99,7 @@ from dew.data.lowering import (
 from dew.data.materialize import _materialize, _Memory
 from dew.data.mixing import CorpusCounts, Proportions, _weights, mixed_indexed
 from dew.data.ordering import place_of
+from dew.data.phase_corpora import _alone_mixed, _corpora, _shared
 from dew.data.pipeline import (
     Artifact,
     Batched,
@@ -157,7 +156,6 @@ from dew.data.plan import (
     fingerprint,
     identified,
     rule_in_force,
-    structured,
 )
 from dew.data.readers import GRAIN, Replayed, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
@@ -1569,6 +1567,10 @@ def _compile_phases(
     # Phases on the step clock whose first reads per share (its order cut where each share reads it: a
     # stream batched by its tokens after steps that drop rows) read each its own stream (`StepPhases`).
     per_share = not tokens and not first.build.global_order
+    if per_share:
+        # A corpus a phase reads alone continues as one it reads in a mix of its own does (`_alone_mixed`),
+        # every phase staged from the phases so read (`staged_at` reads `source`).
+        source = _alone_mixed(source)
     shared = _shared(source) if per_share else tuple({} for _ in source.pipelines)
     staged = (_own_streams(source, first, shared, staged_at) if per_share
               else _in_one_order(source, first, staged_at))
@@ -1679,62 +1681,6 @@ def _ordered(index: int, phase: _Staged) -> _Staged:
     return phase
 
 
-def _corpus_key(chain: Pipeline) -> str:
-    """A corpus (`_corpora`) as phases share it, whatever a chain names it: its store's content
-    (`Source.fingerprint`); a concatenation's, its members' in order, each what it reads and the steps it
-    reads it through (`dew.data.plan.structured`)."""
-    def read_of(pipeline: Pipeline) -> JSON:
-        source = pipeline.source
-        if not isinstance(source, Combined):
-            return json.loads(json.dumps(source.fingerprint(), sort_keys=True, default=str))
-        weights = {"weights": list(source.weights)} if isinstance(source, Mixture) else {}
-        members = [[read_of(child), [structured(stage) for stage in child.stages]]
-                   for child in source.pipelines]
-        return json_value({type(source).__name__: members, **weights}, "a corpus's key")
-
-    return fingerprint(read_of(chain))
-
-
-def _shared(phases: Phases) -> tuple[dict[str, str], ...]:
-    """Each phase's mix members a phase on its own stream (`StepPhases`) reads on from another phase, by
-    member key, and the corpus each is (`_corpus_key`; a concatenation is one, its join): the next phase
-    that reads a corpus continues it from the draws the run trained of it (`dew.data.mixing.Stamping`).
-    Refuses a shared corpus a phase reads other than as a member of its own mix, whose position no key
-    names, and one two phases read through other steps before their mixes, where the earlier's draws are
-    no draws of the later's."""
-    reads: dict[str, list[tuple[int, Pipeline]]] = {}
-    for index, pipeline in enumerate(phases.pipelines):
-        for chain in _corpora(pipeline):
-            reads.setdefault(_corpus_key(chain), []).append((index, chain))
-    shared = {key: read for key, read in reads.items() if len({index for index, _ in read}) > 1}
-    members: list[dict[str, str]] = [{} for _ in phases.pipelines]
-    keyed: dict[str, str] = {}
-    for key, read in shared.items():
-        (first, chain), *_ = read
-        for index, held in read:
-            mix = phases.pipelines[index].source
-            if not isinstance(mix, Mixture) or not any(held is child for child in mix.pipelines):
-                raise ValueError(f"phases {first} and {index} both read {_name(held)}, and phase {index} "
-                                 "reads it other than as a member of its own mix, where a phase continues a "
-                                 "corpus it shares by the member's key: read it as one "
-                                 f"(`mix([({_name(held)}, 1.0)])` where the phase reads it alone)")
-            if len(held.stages) != len(chain.stages) or not all(
-                    same_stage(made, kept) for made, kept in zip(held.stages, chain.stages, strict=True)):
-                raise ValueError(f"phases {first} and {index} read {_name(held)} through other steps "
-                                 "before their mixes, so where the one left it is no place in the other's "
-                                 "read: give it the same steps in each, and the steps that differ after the "
-                                 "mix")
-            place = next(at for at, child in enumerate(mix.pipelines) if child is held)
-            member = _member_keys(_members(mix.pipelines))[place]
-            # A member's draws and its steps' randomness are keyed by its key in its mix (`_member_key`).
-            if keyed.setdefault(key, member) != member:
-                raise ValueError(f"phases {first} and {index} read {_name(held)} under other keys in their "
-                                 f"mixes ({keyed[key]}, {member}), which key its shuffles and draws: name it "
-                                 "(`.named(...)`) alike in each, or keep its place among the unnamed")
-            members[index][member] = key
-    return tuple(members)
-
-
 def _own_streams(source: Phases, first: _Staged, shared: Sequence[Mapping[str, str]],
                  staged_at: Callable[[int, Mapping[str, _Trained], Mapping[str, str]], _Staged]
                  ) -> list[tuple[_Staged, int | None]]:
@@ -1800,17 +1746,6 @@ def _skipping(staged: _Staged, consumed: Mapping[str, _Trained], pipeline: Pipel
     if not skipped:
         return staged
     return dataclasses.replace(staged, build=dataclasses.replace(staged.build, skipped=skipped))
-
-
-def _corpora(pipeline: Pipeline) -> Iterator[Pipeline]:
-    """Each corpus a phase's order places records of (`_Trained`): a chain under `pipeline`'s mixtures that
-    reads a store, or a concatenation, whose join is one corpus (`_continued` reads the join on)."""
-    source = pipeline.source
-    if isinstance(source, Mixture | Phases):
-        for child in source.pipelines:
-            yield from _corpora(child)
-    else:
-        yield pipeline
 
 
 def _delivered(pipeline: Pipeline, count: int, consumed: dict[str, _Trained]) -> None:

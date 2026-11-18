@@ -239,13 +239,32 @@ def test_elastic_phases_that_share_a_corpus_resume_inside_the_second_on_another_
         assert held == sorted(whole[step])
 
 
+@pytest.mark.parametrize("read_as", ["indexed", "streamed"])
+def test_phases_that_read_a_corpus_alone_continue_it_across_their_boundary(read_as):
+    """Two phases on their own streams each reading a corpus alone, in batches of their own: the second
+    continues it where the run left it, each record trained once and in order, as phases reading it as the
+    one member of a mix of their own do (`_alone_mixed`), where they were refused (row 5400); and a read
+    stopped in either phase or at their boundary, resumed, reads what the read never stopped reads."""
+    alone = phases((SHARED.repeat().batch(tokens=128), 3), (SHARED.repeat().batch(tokens=64), None))
+    loader = compile(alone, read=read_as, loading=READ)
+    whole, stream = read(loader, 24)
+    stream.close()
+    first, second = shared_ids(first_pass(whole, len(KEPT)))
+    assert first and second
+    assert first + second == KEPT[:len(first) + len(second)]
+    resumes_as_read(loader, whole, (2, 3, 4, 6))
+
+
 def test_phases_that_share_a_corpus_otherwise_than_as_one_member_each_are_refused():
-    """A phase that reads a corpus another reads other than as a member of its own mix, whose position no key
-    names, phases that read it through other steps before their mixes, where the one's draws are no draws of
-    the other's, and phases that read it under other keys, which draw and shuffle it otherwise, are refused,
-    as the run could not continue the corpus where it left it."""
+    """A phase that reads a corpus another reads other than alone or as a member of its own mix (a member
+    of a mix inside it), whose position no key names, phases that read it through other steps before their
+    mixes, where the one's draws are no draws of the other's, and phases that read it under other keys,
+    which draw and shuffle it otherwise, are refused, as the run could not continue the corpus where it
+    left it."""
+    nested = mix([mix([SHARED.repeat(), member(2, endless=True)]), member(3, endless=True)])
     with pytest.raises(ValueError):
-        compile(phases((source(1), 3), (source(1), None)), read="indexed", loading=READ)
+        compile(phases((SHARED.repeat().batch(tokens=128), 3), (nested.batch(tokens=64), None)),
+                read="indexed", loading=READ)
     other = mix([SHARED.map(lambda row: row), member(3, endless=True)]).batch(tokens=64)
     with pytest.raises(ValueError):
         compile(phases((mix([SHARED, member(2, endless=True)]).batch(tokens=128), 3), (other, None)),
