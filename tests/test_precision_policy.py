@@ -1237,11 +1237,15 @@ def _compensated_shapes():
     def scaled_into_pair(x, y, z):
         return compensated_add((x * jnp.full_like(x, TWO_PI_SPLIT[0]), jnp.zeros_like(x)), (z, y * z))
 
+    def multiplied_into_product(x, y, z):
+        return two_product(x * y, z, bit_split=True)
+
     return {"turned": turned, "product into sum": product_into_sum, "scaled into sum": scaled_into_sum,
-            "scaled into pair": scaled_into_pair}
+            "scaled into pair": scaled_into_pair, "multiplied into product": multiplied_into_product}
 
 
-COMPENSATED_SHAPES = ("turned", "product into sum", "scaled into sum", "scaled into pair")
+COMPENSATED_SHAPES = tuple(_compensated_shapes())
+"""Each of `_compensated_shapes`' names, the cases every platform's cell runs."""
 
 
 def compensated_primitives_hold_under_jit(shape: str) -> None:
@@ -1273,6 +1277,22 @@ def test_a_compensated_primitive_under_jit_on_a_tpu_is_its_eager_arithmetic(shap
     """`compensated_primitives_hold_under_jit` on a TPU, its XLA programs' (a compiled Pallas TPU kernel's
     body takes the barrier once the fork's post111 lowers it there, row 7954)."""
     compensated_primitives_hold_under_jit(shape)
+
+
+def test_a_sum_of_products_rounded_once_cancels_a_product_made_in_its_program():
+    """`summed_once` of `-q` and `1 * q`, `q` a square made in the same jitted program (`t = 1 + 2^-12`, whose
+    square's rounding drops `2^-24`), is 0 exactly: its products' splits read each operand as one value,
+    where a compiler that contracted the square into a split's subtraction read the exact square there and
+    the rounded one in the product, a spurious low part of `2^-24` the sum carried (row 7953)."""
+    from dew.nn.precision import summed_once
+
+    @jax.jit
+    def cancelled(t):
+        square = t * t
+        return summed_once((-square,), ((jnp.ones_like(square), square),))
+
+    t = jnp.full((4096,), 1 + 2.0 ** -12, jnp.float32)
+    np.testing.assert_array_equal(np.asarray(cancelled(t)), np.zeros(4096, np.float32))
 
 
 @pytest.mark.parametrize("shape", COMPENSATED_SHAPES)
