@@ -201,8 +201,8 @@ def sampling_modules(model: nn.Module, guidance: Guidance | None,
                      autoencoder: AutoEncoder | None) -> tuple[nn.Module, ...]:
     """Every network a walk of `model` under `guidance` that `autoencoder` decodes runs: the
     denoiser, an autoguide (`Guidance.modules`) and the autoencoder's towers (`AutoEncoder.towers`,
-    none for a network-free one), which the program that walks it compiles for (`compiler_options`), a
-    task's and an objective's alike."""
+    none for a network-free one), which key the objective's program that walks it
+    (`Objective.program`'s `modules`)."""
     return (model, *(() if guidance is None else guidance.modules()),
             *(() if autoencoder is None else autoencoder.towers()))
 

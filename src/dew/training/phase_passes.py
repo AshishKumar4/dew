@@ -11,10 +11,12 @@ hands on.
 from __future__ import annotations
 
 import contextlib
+import math
 from collections.abc import Collection, Hashable, Iterator, Sequence
-from dataclasses import dataclass, field
-from typing import Protocol
+from dataclasses import dataclass, field, replace
+from typing import ClassVar, Protocol
 
+import numpy as np
 from flax import linen as nn
 
 from dew.batch import PHASE, Batch
@@ -34,17 +36,30 @@ def _looped(module: nn.Module) -> bool:
     return isinstance(module, Looped) and isinstance(module, Looping) and module.loop is not None
 
 
-def _counted[L, E](objective: Objective[L, E], passes: int) -> list[nn.Module]:
-    """`objective`'s modules (`program_key`) with each looped one run `passes` times."""
-    return [_passed(entry.module, passes) for entry in objective.program_key()]
+def _horizons[L, E](objective: Objective[L, E]) -> tuple[int | None, ...]:
+    """The final passes each of `objective`'s modules (`program_key`) trains through
+    (`Loop.backprop_steps`), None for one that loops through every pass or loops not at all."""
+    return tuple(entry.module.loop.backprop_steps if _looped(entry.module) else None
+                 for entry in objective.program_key())
 
 
-def _passed(module: nn.Module, passes: int) -> nn.Module:
-    """`module` run `passes` times where it loops (`Looping.with_passes`), else as it is."""
+def _counted[L, E](objective: Objective[L, E], passes: int,
+                   horizons: Sequence[int | None]) -> list[nn.Module]:
+    """`objective`'s modules (`program_key`) with each looped one run `passes` times, each training through
+    its run's configured final passes (`horizons`, `_horizons` of the run's own objective) or all of them
+    where `passes` is fewer: a module a rung restored at another count keeps the run's horizon, not the one
+    that count clamped it to."""
+    return [_passed(entry.module, passes, horizon)
+            for entry, horizon in zip(objective.program_key(), horizons, strict=True)]
+
+
+def _passed(module: nn.Module, passes: int, trained: int | None) -> nn.Module:
+    """`module` run `passes` times where it loops (`Looping.with_passes`), else as it is, training through
+    its final `trained` passes (`Loop.backprop_steps`), or all of them where `passes` is fewer."""
     if not _looped(module):
         return module
     assert isinstance(module, Looping)
-    passed = module.with_passes(passes)
+    passed = module.with_passes(passes, backprop_steps=None if trained is None else min(trained, passes))
     assert isinstance(passed, nn.Module), "a looped module keeps its loop"
     return passed
 
@@ -59,11 +74,25 @@ class PhasePasses[L, E]:
     counts: tuple[int, ...] = ()
     current: int | None = None
     built: dict[int, Objective[L, E]] = field(default_factory=dict)
+    horizons: tuple[int | None, ...] = ()
+    """The final passes each of `base`'s modules trains through (`_horizons`), which every count keeps."""
+    sampled: SampledPasses | None = None
+    """The law a run draws its pass count from per microbatch, in place of a count a phase (`SampledPasses`):
+    its step one program a count from 1 to its cap, its cap the count the objective holds, whatever phase
+    its data reads (`count`), with no later phase's step of its own (`counts` none)."""
 
     @classmethod
-    def of(cls, objective: Objective[L, E], stated: Sequence[int] | None) -> PhasePasses[L, E]:
+    def of(cls, objective: Objective[L, E], stated: Sequence[int] | None,
+           sampled: SampledPasses | None = None) -> PhasePasses[L, E]:
         """`stated` checked: each count at least one, the objective's modules looping, the last phase's count
-        the one they hold, the model the run hands on. No counts where it states none."""
+        the one they hold, the model the run hands on. No counts where it states none; a run that draws its
+        count per microbatch (`sampled`) holds its cap's, and states no count a phase beside it."""
+        if sampled is not None:
+            if stated is not None:
+                raise ValueError("a run states its loop's pass counts once: one a phase of its data "
+                                 "(phase_passes) or one drawn per microbatch (sampled_passes)")
+            # Its loop holding the cap, checked as a phase's count is; no phase's count beside it.
+            return replace(cls.of(objective, (sampled.cap,)), counts=(), current=sampled.cap, sampled=sampled)
         if stated is None:
             return cls(objective)
         counts = tuple(int(count) for count in stated)
@@ -78,11 +107,14 @@ class PhasePasses[L, E]:
         if held != {counts[-1]}:
             raise ValueError(f"the objective's loop runs {sorted(held)} passes and the last phase "
                              f"{counts[-1]}: it holds the count the run hands on")
-        return cls(objective, counts)
+        return cls(objective, counts, horizons=_horizons(objective))
 
     def count(self, batch: Batch) -> int | None:
         """The count of the phase `batch` was read in (its host `PHASE`, phase 0 where its data has none);
-        None where the run states no counts. A phase past the counts is refused, naming both."""
+        None where the run states no counts; the cap where it draws one per microbatch, whatever phase its
+        data reads. A phase past the counts is refused, naming both."""
+        if self.sampled is not None:
+            return self.sampled.cap
         if not self.counts:
             return None
         phase = batch[PHASE].index if PHASE in batch else 0
@@ -90,6 +122,22 @@ class PhasePasses[L, E]:
             raise ValueError(f"a batch of the run's phase {phase} meets phase_passes of {len(self.counts)} "
                              "phase(s): one count a phase")
         return self.counts[phase]
+
+    def drawn_count(self) -> int | None:
+        """The count the step being compiled runs where the run draws one per microbatch
+        (`StepSettings.sampled_passes`); None for any other run."""
+        return None if self.sampled is None else self.current
+
+    def drawn_cap(self) -> int | None:
+        """The cap of the pass count a run draws per microbatch, a batch's counted work's width
+        (`prepare_counts`); None for any other run."""
+        return None if self.sampled is None else self.sampled.cap
+
+    def counted(self) -> list[Objective[L, E]] | None:
+        """The run's objective at each count from 1 to its cap where it draws one per microbatch, whose work
+        a batch counts at each (`prepare_counts`'s `counts`); None for any other run."""
+        return None if self.sampled is None else [self.objective_for(count)
+                                                  for count in range(1, self.sampled.cap + 1)]
 
     def begins(self, compiled: Collection[Hashable]) -> bool:
         """Whether the step being compiled (`current`) begins a phase whose count no step of `compiled`
@@ -118,7 +166,7 @@ class PhasePasses[L, E]:
 
     def run(self, objective: Objective[L, E], passes: int) -> None:
         """Run `objective`'s looped modules `passes` times, each keeping its other choices, the rest as is."""
-        objective.substitute(_counted(objective, passes))
+        objective.substitute(_counted(objective, passes, self.horizons))
 
     def restored(self, objective: Objective[L, E]) -> None:
         """`objective`'s looped modules at the step's count again (`current`), where a rung restored the
@@ -143,8 +191,9 @@ class PhasePasses[L, E]:
         count, kept by no one else (`built` holds none of it), which a compile off the loop builds and
         climbs its step's rungs on (`dew.training.ahead.LaterPlans`) while the loop's objectives stay as
         they are."""
-        objective = self.base.substituted(_counted(self.base, passes))
-        return PhasePasses(objective, self.counts, passes, dict.fromkeys(self.counts, objective))
+        objective = self.base.substituted(_counted(self.base, passes, self.horizons))
+        return PhasePasses(objective, self.counts, passes, dict.fromkeys(self.counts, objective),
+                           self.horizons)
 
     def begun(self, first: int, phases: Sequence[int]) -> list[int]:
         """Those of `phases` whose step is planned at its boundary, after the run's `first` phase: each the
@@ -164,8 +213,49 @@ class PhasePasses[L, E]:
         prefetch worker) hold while validation and the model the run hands on read `base`. Read off
         `base`, never off a holder that holds a count's copy meanwhile; one copy a count, whichever thread
         asks first."""
-        if passes is None or passes == self.counts[-1]:
+        if passes is None or passes == (self.counts[-1] if self.sampled is None else self.sampled.cap):
             return self.base
         if passes not in self.built:
-            self.built.setdefault(passes, self.base.substituted(_counted(self.base, passes)))
+            self.built.setdefault(passes, self.base.substituted(_counted(self.base, passes, self.horizons)))
         return self.built[passes]
+
+
+@dataclass(frozen=True)
+class SampledPasses:
+    """A looped model's pass count drawn afresh for each microbatch a run steps (`count`), from a named law
+    bounded to `cap` (row 7660): `law` 'lognormal-poisson', the count `1 + N`, `N ~ Poisson(Λ)`,
+    `log Λ ~ Normal(log(mean - 1) - dispersion² / 2, dispersion²)`, so `mean` is the count's mean before its
+    bound, conditioned on 1 to `cap` by rejection, as recurrent-depth training draws it (Geiping et al. 2025,
+    arXiv 2502.05171). A draw is a function of the run's key and the microbatch's global position alone,
+    its place among every microbatch the run dispatched: every process draws alike, and a resume, a replan
+    or a step of another split draws on as the run would have."""
+
+    mean: float
+    dispersion: float
+    cap: int
+    law: str = "lognormal-poisson"
+
+    LAWS: ClassVar[tuple[str, ...]] = ("lognormal-poisson",)
+
+    def __post_init__(self) -> None:
+        if self.law not in self.LAWS:
+            raise ValueError(f"a sampled pass count follows one of the laws {list(self.LAWS)}, "
+                             f"not {self.law!r}")
+        if not (math.isfinite(self.mean) and self.mean > 1):
+            raise ValueError("a log-normal Poisson pass count's mean is above 1, its least count, "
+                             f"not {self.mean}")
+        if not (math.isfinite(self.dispersion) and self.dispersion >= 0):
+            raise ValueError("a log-normal Poisson pass count's dispersion is at least 0, "
+                             f"not {self.dispersion}")
+        if self.cap < 1:
+            raise ValueError(f"a sampled pass count's cap is at least one pass, not {self.cap}")
+
+    def count(self, key: Sequence[int], position: int) -> int:
+        """The pass count of the run's microbatch at global `position` under the run's `key` (its words,
+        `jax.random.key_data`): a draw of the bounded law, a count past `cap` drawn again."""
+        draws = np.random.Generator(np.random.Philox(np.random.SeedSequence([*map(int, key), int(position)])))
+        location = math.log(self.mean - 1) - self.dispersion ** 2 / 2
+        while True:
+            drawn = 1 + int(draws.poisson(math.exp(draws.normal(location, self.dispersion))))
+            if drawn <= self.cap:
+                return drawn

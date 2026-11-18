@@ -41,7 +41,7 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
     """
 
     if TYPE_CHECKING:
-        # Each encoder is a dataclass, whose fields hold its towers (`dew.nn.kernels.options.Held`).
+        # Each encoder is a dataclass, which a run rebuilds with new fields (`dataclasses.replace`).
         __dataclass_fields__: ClassVar[dict[str, dataclasses.Field[object]]]
 
     params: Variables
