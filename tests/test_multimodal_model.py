@@ -688,9 +688,9 @@ SEEDS = {"gemma3": 256, "llama4": 512}
 """Each drawn site's declared seeds (multimodal_families.DRAWN), sized by `seeds_for` paired as its recording
 confirmed them."""
 SLIP_SEEDS = {"gemma3": 256, "llama4": 64}
-"""The seeds a site's slip draws (`test_a_drawn_sites_slip_fails_its_check`): a slip needs only the seeds that
-decide it, and fewer than that raise Inconclusive, which the test refuses; llama4's two slips are decided at 32
-on armada (row 6960), 64 holding them with room."""
+"""The seeds a site's slip draws (`test_a_drawn_sites_slip_fails_its_check`): a slip needs only the seeds
+that decide it, and fewer than that raise Inconclusive, which the test refuses; llama4's two slips are
+decided at 32 on armada (row 6960), 64 holding them with room."""
 
 
 def drawing(family: str):
