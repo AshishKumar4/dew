@@ -30,7 +30,7 @@ from jax._src import api_util, config as jax_config, core as jax_core
 from jax._src.array import ArrayImpl
 from jax._src.interpreters import pxla
 from jax.experimental.layout import Format
-from jax.sharding import Sharding
+from jax.sharding import AbstractMesh, NamedSharding, Sharding
 
 from dew import _cache, _stated, algebra
 from dew._devices import xla_flag
@@ -379,6 +379,55 @@ def collecting() -> Iterator[dict[str, jax.stages.Compiled]]:
         _COLLECTED.reset(token)
 
 
+_LOWERING: contextvars.ContextVar[tuple[tuple[str, ...], list[tuple[str, jax.stages.Lowered]]] | None] = (
+    _cache.untraced(contextvars.ContextVar("dew_lowering_programs", default=None)))
+
+
+@contextlib.contextmanager
+def lowering(platforms: tuple[str, ...]) -> Iterator[list[tuple[str, jax.stages.Lowered]]]:
+    """Within the block, a call of a program through Dew's compile point (`OuterProgram`) traces and lowers
+    it over its arguments, shapes where a caller hands shapes, and answers with its results' shapes, as a
+    call within `collecting` does, compiling and running nothing: one whose arguments sit on an abstract
+    mesh (the devices of a target this host is not, `generation.gpu_mesh`) lowers for `platforms`, any
+    other for its own devices' backend. The list it yields holds each lowering, in the order of the calls,
+    with its program's name (`OuterProgram.called`): a step lowered for another target whose programs are
+    several (a host step's, `Trainer(lower_for=)`)."""
+    lowered: list[tuple[str, jax.stages.Lowered]] = []
+    token = _LOWERING.set((platforms, lowered))
+    try:
+        yield lowered
+    finally:
+        _LOWERING.reset(token)
+
+
+type Around = Callable[["OuterProgram", jax.stages.Compiled], contextlib.AbstractContextManager]
+"""What `running` runs each call's executable inside: given its program and the executable, a context."""
+
+_RUNNING: contextvars.ContextVar[tuple[Around, ...]] = _cache.untraced(
+    contextvars.ContextVar("dew_running_programs", default=()))
+
+
+@contextlib.contextmanager
+def running(around: Around) -> Iterator[None]:
+    """Within the block, each executable a call through Dew's compile point runs over arrays (one its
+    program keeps, one compiled over shapes, one taken, or one compiled at the call) runs inside
+    `around(program, executable)`, and inside every enclosing block's, the outermost first: an admission
+    that refuses it by raising as it enters (a host run's rollout's, `dew.training.rollout.admitted`), or a
+    profile of its run. Nothing else of the call changes, and a call within `lowering`, which runs nothing,
+    enters none."""
+    token = _RUNNING.set((*_RUNNING.get(), around))
+    try:
+        yield
+    finally:
+        _RUNNING.reset(token)
+
+
+def _abstractly_placed(tree) -> bool:
+    """Whether a leaf of `tree` sits on an abstract mesh: a target's devices this process holds none of."""
+    return any(isinstance(getattr(leaf, "sharding", None), NamedSharding)
+               and isinstance(leaf.sharding.mesh, AbstractMesh) for leaf in jax.tree.leaves(tree))
+
+
 type Relowered = list[tuple[jax.stages.Wrapped, jax.stages.Lowered]]
 """The relowerings a spill made of a call (`OuterProgram.compiled`'s), each with the jit it traced by."""
 
@@ -618,6 +667,16 @@ class OuterProgram:
             return self._nested[_PASSING.get()](*args, **kwargs)
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
             return self._eager(*args, **kwargs)
+        if (lowering := _LOWERING.get()) is not None:
+            platforms, lowerings = lowering
+            traced = self.trace(*args, **kwargs)
+            target = platforms if _abstractly_placed((args, kwargs)) else None
+            lowered = traced.lower(lowering_platforms=target)
+            lowerings.append((self.called, lowered))
+            return jax.tree.map(
+                lambda shape, aval: jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=shape.sharding,
+                                                         weak_type=aval.weak_type),
+                shapes_of(lowered.out_info), traced.out_avals)
         if (collected := _COLLECTED.get()) is not None:
             abstract = self.abstract_of(args, kwargs)
             with self._compiling:
@@ -645,7 +704,12 @@ class OuterProgram:
         ready = self._ready.get(key)
         if ready is None:
             ready = self._shaped_for(key, args, kwargs) or self._kept(key, args, kwargs)
-        return ready(*dynamic, **named)
+        if not (arounds := _RUNNING.get()):
+            return ready(*dynamic, **named)
+        with contextlib.ExitStack() as stack:
+            for around in arounds:
+                stack.enter_context(around(self, ready))
+            return ready(*dynamic, **named)
 
     def _shaped_for(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled | None:
         """The executable a compile within `collecting` made for a call alike in its abstract signature

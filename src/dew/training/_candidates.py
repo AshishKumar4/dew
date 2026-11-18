@@ -386,11 +386,8 @@ def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tra
     devices, from which JAX's Pallas lowering reads the GPU, at the base rung its trainer put the
     objective at (`StepCompiler.at_base_rung`), its narrow copies where that rung keeps them (`narrow`), and
     the plan's first split: a run that does not fit splits its batch or recomputes more, no other kernel.
-    A CPU-owned state's step realizes its parameters on the host as it runs, and is not lowered."""
+    A step whose state the host holds lowers its programs apart (`StepCompiler._lowered_host`)."""
     settings = stepping.settings
-    if settings.host_master:
-        raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
-                         "the variables on the host")
     mesh = gpu_mesh(settings.device_mesh, generation)
     with assumed(generation), stepping.traced_on(mesh) as schedule:
         state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
