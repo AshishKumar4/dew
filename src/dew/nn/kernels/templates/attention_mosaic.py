@@ -491,8 +491,10 @@ class MosaicForward(_Mainloop[Tiles]):
         scaled walk's (sm80's and sm120's at width 128 would split their columns). Every other such launch
         takes the one fallback, `_fwd`'s bound pass and guard (`algebra.may_scale`, the scaled op)."""
         family = bundle_of(config, query.dtype)
+        # A quantized cache's values read in the query's dtype (`_Codes`), its codes' own no float's.
+        computed = query.dtype if scales is not None else value.dtype
         if (residuals is Kept.SPLIT or self.scaled or self.rounds is not None
-                or not algebra.headroom(value.dtype) or family.places_on_role):
+                or not algebra.headroom(computed) or family.places_on_role):
             return False
         registered = self.registered(query, value, score_params, residuals, table, sources, scales, initial)
         priced = dataclasses.replace(registered, scaled=True).at(family, config)
@@ -891,7 +893,8 @@ class MosaicForward(_Mainloop[Tiles]):
                            magnitudes=(cached and self.scales_in_kernel(ba)) or self.deciding(ba, config))
         return resources.shared_bytes(family, launch_scope(family, allocations, reduced,
                                                            reduces=forward_reduces(family, reduced),
-                                                           products=self._products(ba, config)))
+                                                           products=self._products(ba, config),
+                                                           over_rings=True))
 
     def _products(self, ba: tokamax.BoundArguments, config: Tiles) -> tuple:
         """The launch's products at `config` as its program scopes them (`forward_products`): its logits a

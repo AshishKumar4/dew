@@ -454,6 +454,9 @@ class _Counting:
             return self.cond(params["branches"], values)
         elif (region := _REGIONS.get(primitive)) is not None:
             return region(self, equation, values) or unknown
+        elif primitive is derivatives.marked_call_p and isinstance(params["kind"], derivatives.Rare):
+            # A rare span's verdict read as its common value (`derivatives.Rare`).
+            return [np.False_]
         elif primitive is derivatives.marked_call_p and isinstance(params["kind"], derivatives.WalkStep):
             if self.loops:
                 self.loops[-1].marks += 1

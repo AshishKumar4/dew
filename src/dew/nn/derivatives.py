@@ -42,6 +42,7 @@ __all__ = [
     "KernelGlue",
     "Kind",
     "Protected",
+    "Rare",
     "Surrogate",
     "TangentKind",
     "WalkStep",
@@ -330,7 +331,14 @@ class WalkStep:
     or unrolled rotation holds it; inlined, it lowers to its index."""
 
 
-type Kind = Protected | Surrogate | KernelGlue | Algebra | WalkStep
+class Rare:
+    """A kernel's verdict a rare span of it runs by (a decided walk's second, where its rows' sums passed
+    fp32's largest: `templates.mosaic.Decided`), through a marked call, which a count of the kernel's work by
+    emission reads as its common value, False (`templates.emission`): its launch states its common walk's
+    work, as a rare call's scaled launch states none; inlined, it lowers to its value."""
+
+
+type Kind = Protected | Surrogate | KernelGlue | Algebra | WalkStep | Rare
 """What a marked span is, read as an object, never a name: to the algebra pass, or to a kernel's count."""
 
 type TangentKind = Protected | KernelGlue | Algebra

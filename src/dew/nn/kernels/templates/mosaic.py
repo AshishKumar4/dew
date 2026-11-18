@@ -1628,15 +1628,17 @@ class Transport[Allocated, Opened](abc.ABC):
         across warps (`reduces`: a forward whose warps hold whole rows, `Issuer.rows_whole`, does not),
         reserving the family's reduction scratch (`reduction_scratch`) where it does."""
 
-    def scoped(self, body, *allocations, streams, after_walks: tuple = ()):
+    def scoped(self, body, *allocations, streams, after_walks: tuple = (), over_rings: bool = False):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
         (`streams`), and what it returns. With `after_walks`, allocations no walk reads, `body` takes
         `after` too: `after(fn)` runs `fn(*refs)` of them once a role's walks have ended, in a scope of their
         own where the family scopes its walks apart (`walks_scoped`: the walks' slots reused, as
-        `resources.Scope.after` counts them), the program's otherwise."""
+        `resources.Scope.after` counts them), over its rings' slots where the launch asks it (`over_rings`)
+        and the family stages so (`stages_over_rings`, `body` taking `walked` too), the program's
+        otherwise."""
         if not after_walks:
             return self.program_scoped(body, *allocations, streams=streams)
-        if self.stages_over_rings and not self.walks_scoped:
+        if over_rings and self.stages_over_rings and not self.walks_scoped:
             return self._scoped_over_rings(body, allocations, streams, after_walks)
         if self.walks_scoped:
             # The after-walks scope is the program's own kind (`program_scoped`: collective where its
@@ -2218,19 +2220,22 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
             # own value, both stayed live through the merge (267 registers at a 128 x 256 dW tile, EM-probe2).
             pl.when(last == 1)(lambda: combined(read(opening, first)))
 
-    def scoped(self, body, *allocations, streams, after_walks: tuple = (), products: tuple | None = None):
+    def scoped(self, body, *allocations, streams, after_walks: tuple = (), over_rings: bool = False,
+               products: tuple | None = None):
         """`Transport.scoped`, and with `products`, `(consumers, widths, lefts)`, the issuer's product scratch
         (`product_scratch`) scoped beside `allocations`, `body` traced within it (`products_in`), where the
         issuer keeps any; `product_held` its account."""
         scratch = () if products is None else self.product_scratch(*products)
         if not scratch:
-            return super().scoped(body, *allocations, streams=streams, after_walks=after_walks)
+            return super().scoped(body, *allocations, streams=streams, after_walks=after_walks,
+                                  over_rings=over_rings)
 
         def within(*refs, **named):
             with self.products_in(refs[-1]):
                 return body(*refs[:-1], **named)
 
-        return super().scoped(within, *allocations, scratch, streams=streams, after_walks=after_walks)
+        return super().scoped(within, *allocations, scratch, streams=streams, after_walks=after_walks,
+                              over_rings=over_rings)
 
 
 class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):

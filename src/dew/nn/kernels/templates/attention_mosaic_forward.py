@@ -31,6 +31,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
+from dew.nn import derivatives
 from dew.nn.kernels import generation, launches, tuning
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
@@ -1255,7 +1256,9 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # A row's verdict its sums times zero summed along it, no number exactly where one of them is none; the
     # rows' then the warpgroup's vote (`bar.red.or.pred`, a vector's alone: a tile's own refused layouts).
     rows = jnp.isnan(jnp.sum(state.acc * 0.0, axis=-1))
-    taken = decided.stated(consumer, jnp.any(rows))
+    # The verdict a rare walk's (`derivatives.Rare`): the launch states its common walk's work.
+    rare = derivatives.marked(derivatives.Rare(), lambda verdict: verdict)
+    taken = rare(decided.stated(consumer, jnp.any(rows)))
     pl.when(jnp.logical_not(taken))(lambda: store(spec, state, trained, merged))
 
     @pl.when(taken)
@@ -1778,7 +1781,7 @@ def _entry(program: _Program, layout: "_Layout", body: Callable, allocations: tu
 
     def scoped_body():
         program.family.scoped(functools.partial(body, *refs), *scoped, streams=rings, products=products,
-                              after_walks=tuple(after))
+                              after_walks=tuple(after), over_rings=True)
 
     walks = layout.read(refs).walks
     if walks is None:

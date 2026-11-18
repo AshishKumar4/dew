@@ -484,7 +484,7 @@ def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int
 
 
 def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True,
-                 products: tuple | None = None) -> resources.Scope:
+                 products: tuple | None = None, over_rings: bool = False) -> resources.Scope:
     """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s, and those it scopes after its
     walks where it has them, `after_walks`) by lifetime (`Family.lifetimes`), its issuer's product scratch
     where its `products` take one (`Family.product_held`, its tensor memory's addresses
@@ -494,8 +494,9 @@ def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups:
     scoped, streams, *after = allocations
     held, walks = family.lifetimes(streams)
     tiles = tuple((tile.shape, tile.dtype) for tile in (after[0] if after else ()))
-    # The tiles after the walks over the rings' slots where the family stages them so (`stages_over_rings`).
-    over = held if tiles and family.stages_over_rings and not family.walks_scoped else ()
+    # The tiles after the walks over the rings' slots where the launch asks it and its family stages them so
+    # (`Family.scoped`'s `over_rings`, `stages_over_rings`).
+    over = held if tiles and over_rings and family.stages_over_rings and not family.walks_scoped else ()
     return resources.Scope(program=(scoped, *family.product_held(products), *(() if over else held)),
                            walks=walks, after=tiles, over=over, reduces=reduces,
                            reducing_warpgroups=reducing_warpgroups,
