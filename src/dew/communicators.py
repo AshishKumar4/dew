@@ -482,13 +482,12 @@ def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...],
     return Collectives.of(positions.to_json(), gpus)
 
 
-def loaded(executable: jax.stages.Compiled) -> LoadedExecutable | None:
-    """`executable`'s program as this process loaded it, None for one compiled for devices it has not
-    (`dew.nn.kernels.generation.compile_only_gpus`), which is never loaded here: no devices, fingerprint
-    or room of this process's. The one reading of it `admit`, a kept program (`dew.training.ahead`) and a
-    step's flops (`dew.training.rungs`) take."""
-    runtime = executable.runtime_executable()
-    return runtime if isinstance(runtime, LoadedExecutable) else None
+def loaded_here(executable: jax.stages.Compiled) -> bool:
+    """Whether this process loaded `executable`'s program (its runtime a `LoadedExecutable`), not one
+    compiled for devices it has not (`dew.nn.kernels.generation.compile_only_gpus`), which is never loaded
+    here: no devices, fingerprint or room of this process's. The one reading of it `admit`, a kept program
+    (`dew.training.ahead`) and a step's flops (`dew.training.rungs`) take."""
+    return isinstance(executable.runtime_executable(), LoadedExecutable)
 
 
 def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = gpu_free_bytes) -> None:
@@ -499,9 +498,9 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
     host's room, as does a program on the host's CPU. Every program Dew compiles passes here
     (`dew.nn.kernels.templates.report`), the RL rollouts' among them (`dew.nn.kernels.options.OuterProgram`),
     and every executable it loads compiled ahead (`dew.training.ahead`)."""
-    runtime = loaded(executable)
-    if _HELD is None or runtime is None:
+    if _HELD is None or not loaded_here(executable):
         return
+    runtime = executable.runtime_executable()
     devices = runtime.local_devices()
     if not devices or any(device.platform != "gpu" for device in devices):
         # A program on the host's CPU makes no NCCL communicator and holds no GPU code.
