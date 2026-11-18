@@ -95,14 +95,19 @@ def test_a_sampled_pass_count_follows_its_bounded_law(law):
     assert_draws_as_declared(counts_of, probabilities(law), f"law {law}", seeds=SEEDS)
 
 
-@pytest.mark.parametrize("law", [SampledPasses(mean=1e20, dispersion=0.0, cap=4),
-                                 SampledPasses(mean=2.0, dispersion=1e-323, cap=1)],
-                         ids=["vast-mean", "subnormal-dispersion"])
-def test_a_sampled_pass_count_at_its_laws_extremes_draws_its_one_count(law):
-    """A law whose every draw is its cap: a Poisson count of mean 1e20, below 4 with chance ~1e-60, past any
-    uniform's least step (its counts' common term, rounded alike, read as four equal ones), and a cap of one
-    under a dispersion too small to step through (which divided by a step of 0)."""
-    assert {law.count((0, 7), position) for position in range(DRAWS)} == {law.cap}
+@pytest.mark.parametrize(("law", "count"), [(SampledPasses(mean=1e20, dispersion=0.0, cap=4), 4),
+                                            (SampledPasses(mean=2.0, dispersion=1e-323, cap=1), 1),
+                                            (SampledPasses(mean=2.0, dispersion=1e154, cap=3), 1),
+                                            (SampledPasses(mean=2.0, dispersion=1e300, cap=3), 1)],
+                         ids=["vast-mean", "subnormal-dispersion", "vast-dispersion",
+                              "unsquarable-dispersion"])
+def test_a_sampled_pass_count_at_its_laws_extremes_draws_its_one_count(law, count):
+    """A law whose every draw is one count: a Poisson count of mean 1e20, below 4 with chance ~1e-60, past
+    any uniform's least step, draws its cap (its counts' common term, rounded alike, read as four equal ones);
+    a cap of one under a dispersion too small to step through draws 1 (which divided by a step of 0); and a
+    dispersion so vast its rate is past its least value but with chance exp(-dispersion² / 8), 0 in float64,
+    draws 1 too, where its peak's width (its square overflowing) or its log rate's mean was out of range."""
+    assert {law.count((0, 7), position) for position in range(DRAWS)} == {count}
 
 
 def test_a_sampled_pass_count_of_a_vanishing_dispersion_is_its_means_poisson():

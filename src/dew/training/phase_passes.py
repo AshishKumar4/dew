@@ -284,7 +284,11 @@ class SampledPasses:
         far. Then conditioned on the cap."""
         below = np.arange(self.cap)
         factorials = np.array([math.lgamma(n + 1) for n in below])
-        location = math.log(self.mean - 1) - self.dispersion ** 2 / 2
+        location = math.log(self.mean - 1) - self.dispersion * self.dispersion / 2
+        if location == -math.inf:
+            # A dispersion whose square float64 cannot hold: a count past one is drawn with chance
+            # exp(-dispersion² / 8) or less (its rate past its least value), 0 in float64.
+            return np.ones(self.cap)
         if self.dispersion == 0:
             logs = below * location - factorials
         else:
@@ -293,8 +297,8 @@ class SampledPasses:
             units = _mode(counts, location, self.dispersion) @ (weights / 2)
             modes = _mode(below.astype(float), location, self.dispersion)
             logs = (np.concatenate([[0.0], np.cumsum(units)]) - factorials
-                    + np.log([_about_mode(float(mode), count, location, self.dispersion)
-                              for count, mode in enumerate(modes)]))
+                    + np.array([_about_mode(float(mode), count, location, self.dispersion)
+                                for count, mode in enumerate(modes)]))
         probabilities = np.exp(logs - logs.max())
         cumulative = np.cumsum(probabilities / probabilities.sum())
         # The sum's last partial is 1 but for its rounding, which a uniform draw past it must not reach.
@@ -322,33 +326,38 @@ def _mode(counts: np.ndarray, location: float, dispersion: float) -> np.ndarray:
 
 
 def _about_mode(mode: float, count: int, location: float, dispersion: float) -> float:
-    """A count's integrand over the log rate (`SampledPasses.cumulative`) about its `mode`, scaled by its peak
-    and by the normal density's width: the integral over the standardized log rate `z` (`x = mode +
-    dispersion z`) of `exp(-exp(mode) (expm1(dispersion z) - dispersion z) - z² / 2)`, the peak's own terms
+    """The log of a count's integrand over the log rate (`SampledPasses.cumulative`) about its `mode`, scaled
+    by its peak and by the normal density's width: the integral over the standardized log rate `z` (`x = mode
+    + dispersion z`) of `exp(-exp(mode) (expm1(dispersion z) - dispersion z) - z² / 2)`, the peak's own terms
     cancelled exactly by the mode's equation, so nothing in it is the difference of large values. In units
-    of its peak's width (`1 / sqrt(1 + dispersion² exp(mode))`, `u = z / width`): its log's curvature is at
-    least 1 in `u` above the mode and in `z` below it, so it is 0 beside its peak past `RATE_SPAN` units
-    above and `RATE_SPAN` deviations below; each side in panels doubling from one unit (scipy's adaptive
-    quadrature on each), so no panel is wider than the integrand's own scale where it starts."""
+    of its peak's width (`1 / sqrt(1 + dispersion² exp(mode))`, held as its log so no dispersion's square
+    overflows, `u = z / width`): its log's curvature is at least 1 in `u` above the mode and in `z` below it,
+    so it is 0 beside its peak past `RATE_SPAN` units above and `RATE_SPAN` deviations below, or where it
+    reaches 0 first; each side in panels doubling from one unit (scipy's adaptive quadrature on each), so no
+    panel is wider than the integrand's own scale where it starts."""
     from scipy import integrate
 
     scale = math.exp(mode)
-    width = 1 / math.sqrt(1 + dispersion ** 2 * count + (location - mode))
+    # log(1 + dispersion² exp(mode)) as a softplus of its log, finite however large the dispersion.
+    curvature = 2 * math.log(dispersion) + mode
+    log_width = -(curvature + math.log1p(math.exp(-curvature)) if curvature > 0
+                  else math.log1p(math.exp(curvature))) / 2
+    width, stride = math.exp(log_width), math.exp(math.log(dispersion) + log_width)
 
     def integrand(u: float) -> float:
-        z = width * u
-        t = dispersion * z
+        t = stride * u
         # expm1(t) - t, its series where the difference would cancel.
         lost = t * t / 2 * (1 + t / 3 + t * t / 12) if abs(t) < 1e-4 else math.expm1(min(t, 709.0)) - t
-        exponent = scale * lost + z * z / 2
+        exponent = scale * lost + (width * u) ** 2 / 2
         return 0.0 if exponent > 745 else math.exp(-exponent)
 
-    def panels(reach: float) -> list[float]:
-        edges = [0.0, 1.0]
-        while edges[-1] < reach:
-            edges.append(min(2 * edges[-1], reach))
+    def panels(side: float, reach: float) -> list[float]:
+        edges = [0.0, side]
+        while abs(edges[-1]) < reach and integrand(edges[-1]) > 0:
+            edges.append(side * min(2 * abs(edges[-1]), reach))
         return edges
 
-    above, below = panels(RATE_SPAN), [-edge for edge in panels(RATE_SPAN / width)]
-    return width * sum(integrate.quad(integrand, start, end, epsabs=0, epsrel=1e-13, limit=200)[0]
-                       for edges in (above, below[::-1]) for start, end in itertools.pairwise(edges))
+    halves = (panels(1.0, RATE_SPAN), panels(-1.0, RATE_SPAN / width if width > 0 else math.inf)[::-1])
+    total = sum(integrate.quad(integrand, start, end, epsabs=0, epsrel=1e-13, limit=200)[0]
+                for edges in halves for start, end in itertools.pairwise(edges))
+    return log_width + math.log(total)
