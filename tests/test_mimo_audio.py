@@ -21,8 +21,8 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import recorded_site
+from recorded_runs import assert_as_exact_as_recorded
 from reference_error import as_given, assert_as_exact, assert_rounds_where_the_reference_does, ieee_fixture
-from reference_runs import assert_as_exact_as_recorded
 from tool_support import run_from
 
 from dew.interop.towers.mimo_audio import (

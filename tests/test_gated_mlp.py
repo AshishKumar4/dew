@@ -2,6 +2,8 @@
 interpreted as a GPU on a CPU (its training step compiled within resources and under remat:
 tests/test_gemm_formed.py), and its selector's call site in `GatedMLP`."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -189,3 +191,77 @@ def test_a_gated_mlp_whose_hook_the_template_cannot_lower_runs_apart(generation_
 
     assert route("geglu") == ["fused"]
     assert route("geglu_exact") == ["apart"]
+
+
+def _activation_spans(jaxpr) -> list:
+    """The activation regions (`derivatives.Activation`) a program's jaxpr holds, its calls' bodies' too."""
+    from jax.extend.core import jaxprs_in_params
+
+    from dew.nn import derivatives
+
+    found = []
+    for equation in jaxpr.eqns:
+        if equation.primitive is derivatives.marked_call_p and isinstance(equation.params["kind"],
+                                                                          derivatives.Activation):
+            found.append(equation.params["kind"])
+        for inner in jaxprs_in_params(equation.params):
+            found += _activation_spans(inner)
+    return found
+
+
+@pytest.mark.parametrize("implementation", ["xla", "pallas"])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
+def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, implementation):
+    """A gated product (`gated_product`, 'swiglu'), its XLA arithmetic or SwiGLU's Pallas kernel where it
+    is named (on an H100's routes), is one region of its activation (`derivatives.Activation('swiglu',
+    gated=True)`) over its gate and up projection, whichever route it takes, the seam a fusion pass's
+    epilogue replaces, its body holding the route's launch; and the region computes what its route
+    computes unmarked, its value and its operands' gradients the route's own bit for bit: the public product
+    on the XLA route, and the dispatcher's region over the Pallas kernel (`activations._dispatched`),
+    interpreted on a CPU. An
+    ungated MLP's named activation is one region of it ungated, at each place it runs."""
+    from jax.experimental.pallas import pallas_call_p
+
+    from dew.nn import derivatives
+    from dew.nn.kernels import norm_swiglu
+    from dew.nn.mlp import GatedMLP
+    from dew.nn.programs import equations
+
+    rng = np.random.default_rng(0)
+    gate, up = (jnp.asarray(rng.standard_normal((4, 64)) * 3, dtype) for _ in range(2))
+    with generation.assumed("sm90"):
+        traced = jax.make_jaxpr(activations.gated_product("swiglu", implementation=implementation))(gate, up)
+    (span,) = traced.jaxpr.eqns
+    assert span.primitive is derivatives.marked_call_p
+    assert span.params["kind"] == derivatives.Activation("swiglu", gated=True)
+    launched = {equation.primitive for equation in equations(span.params["call_jaxpr"].jaxpr)}
+    assert (pallas_call_p in launched) == (implementation == "pallas")
+
+    portable = activations._portable(activations.silu, lambda gate, up: (gate, up))
+
+    def kernel(gate, up, portable):
+        return norm_swiglu.swiglu(gate, up, portable)
+
+    plain = portable if implementation == "xla" else functools.partial(kernel, portable=portable)
+    # The public product itself on the XLA route; the dispatcher's region over the kernel, interpreted, on the
+    # Pallas route a CPU's selector takes none of.
+    region = (activations.gated_product("swiglu", implementation="xla") if implementation == "xla"
+              else activations._dispatched("swiglu", portable, lambda gate, up: implementation, kernel))
+
+    def summed(function):
+        return jax.jit(jax.value_and_grad(lambda g, u: jnp.sum(function(g, u).astype(jnp.float32)),
+                                          argnums=(0, 1)))
+
+    (value, gradients), (own, own_gradients) = summed(region)(gate, up), summed(plain)(gate, up)
+    np.testing.assert_array_equal(np.asarray(value), np.asarray(own))
+    for mine, theirs in zip(gradients, own_gradients, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+    np.testing.assert_array_equal(np.asarray(jax.jit(region)(gate, up)), np.asarray(jax.jit(plain)(gate, up)))
+    # An ungated MLP's named activation, and its activation after the down projection too where it takes one
+    # (an in-context memory's projection pairs).
+    x = jnp.asarray(rng.standard_normal((2, 64)), dtype)
+    for after in (False, True):
+        mlp = GatedMLP(hidden_features=128, out_features=64, activation="gelu", activation_after=after)
+        params = mlp.init(jax.random.key(0), x)
+        spans = _activation_spans(jax.make_jaxpr(lambda v, mlp=mlp: mlp.apply(v, x))(params).jaxpr)
+        assert spans == [derivatives.Activation("gelu", gated=False)] * (2 if after else 1), (after, spans)

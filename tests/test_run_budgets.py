@@ -939,10 +939,12 @@ def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_row
     assert loader.example_steps(EXAMPLES) is not None or consumed == EXAMPLES
 
 
+@pytest.mark.check1_shards(seeds=64, per_task=16)
 def test_an_examples_run_trains_each_record_once_under_the_schedule_its_plan_sizes():
     """An examples run takes the steps its data plan counts, sizes its schedule's horizon from them and
     trains on each record as many times as the bound reaches it: its losses and weight match SGD on
-    the same records at a rate falling to 0 over those updates (check 1)."""
+    the same records at a rate falling to 0 over those updates (check 1). Each seed is a whole fit, about
+    3 s, so its 64 seeds are drawn by CI's map tasks, 16 a task (`check1_shards`, row 7440)."""
     assert_as_exact(trained, descended, records, "examples run", seeds=EXAMPLES_SEEDS)
 
 

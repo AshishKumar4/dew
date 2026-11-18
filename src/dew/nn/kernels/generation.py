@@ -885,7 +885,8 @@ TARGETS = {target.generation: target for target in (
               step_seconds=3.68e-6, kernel_step_seconds=137.7e-9,
               # PCIe Gen5 x16 (the Server Edition's datasheet, 128 GB/s both ways).
               host_links={'NVIDIA RTX PRO 6000 Blackwell': 64e9}),
-    # No TPU's host link is stated from a primary source: a TPU streams no parameter priced (`host_links`).
+    # A TPU's host link is stated where a primary source states it: v6e's alone (below); the others stream
+    # no parameter priced (`host_links`).
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}, host_links={}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}, host_links={}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}, host_links={}),
@@ -897,9 +898,11 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}},
               host_links={}),
     # One TensorCore a chip, of two 256 x 256 MXUs, 918 TF of bf16 and 1638 GB/s of HBM
-    # (cloud.google.com/tpu/docs/v6e); the clock is 918e12 / 524288, derived from the peak as v5e's.
+    # (cloud.google.com/tpu/docs/v6e); the clock is 918e12 / 524288, derived from the peak as v5e's. Its host
+    # link is "PCIe Gen5 x8 per chip" (the same page's system architecture): half a Gen5 x16's 64 GB/s each
+    # way.
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}, multiprocessors=1,
-              clock_hz=918e12 / 524288, memory_bandwidth=1638e9, host_links={}),
+              clock_hz=918e12 / 524288, memory_bandwidth=1638e9, host_links={'TPU v6 lite': 32e9}),
 )}
 
 

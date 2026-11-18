@@ -29,7 +29,7 @@ from dew import _cache
 from dew._cache import ALGEBRA, KERNEL_CHOICES
 from dew.algebra import cost, extract, fusion, rules, terms
 from dew.algebra.extract import Linear
-from dew.nn.derivatives import Algebra, KernelGlue, Surrogate, marked_call_p
+from dew.nn.derivatives import Activation, Algebra, KernelGlue, Surrogate, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
 from dew.nn.programs import called, control_flow, inlined, live, with_bodies
@@ -719,10 +719,10 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels:
     return jaxpr.replace(eqns=equations) if changed else jaxpr
 
 
-WITHIN = (Surrogate, KernelGlue)
+WITHIN = (Surrogate, KernelGlue, Activation)
 """The marked spans' kinds (`dew.nn.derivatives.marked`) whose body the pass rewrites within its call, as it
-rewrites a body (`_holds_regions`): a surrogate's bodies and a kernel derivative's glue
-(docs/design/algebra.md §1.2).
+rewrites a body (`_holds_regions`): a surrogate's bodies, a kernel derivative's glue, and an activation's
+gated or ungated product (the fusion seam its epilogue reads) (docs/design/algebra.md §1.2).
 A protected span is an opaque leaf, its body untouched; an Algebra span opens into the region around it
 (`_opened`)."""
 

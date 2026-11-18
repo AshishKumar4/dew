@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew.batch import FROZEN, PROBES, at_path, merge, placed_at, select, thaw
 from dew.distributed.batches import batch_shardings
@@ -259,7 +259,7 @@ def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
     return select(gradient, lambda path: path in trainable)
 
 
-def _spec_on(mesh: Mesh):
+def spec_on(mesh: Mesh):
     """Where `HostExecution`'s moves to `mesh` place a leaf: the partition spec it has, or replicated where
     it states none (a scalar clock, a key crossing the boundary)."""
     def placement(leaf):
@@ -300,7 +300,7 @@ class _Abstract:
         return jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype, sharding=sharding)
 
     def _moved(self, tree, mesh):
-        return self.placed(tree, jax.tree.map(_spec_on(mesh), tree))
+        return self.placed(tree, jax.tree.map(spec_on(mesh), tree))
 
     def rows(self, index, batch):
         placed = rows_spec(next(leaf for leaf in jax.tree.leaves(batch) if np.ndim(leaf)), 1)
@@ -318,6 +318,12 @@ class _Collected(_Abstract):
     def _stack_rows(self, rows, sharding):
         stacked = self.execution._stacked(*self._moved(rows, self.execution.cpu))
         return self.placed(stacked, sharding)
+
+
+def on_mesh(mesh: Mesh | AbstractMesh):
+    """`mesh` in context, as a program traced on it reads it: an abstract mesh (a target's devices this
+    process holds none of, `generation.gpu_mesh`) as JAX's abstract mesh, a mesh of devices as `set_mesh`."""
+    return jax.sharding.use_abstract_mesh(mesh) if isinstance(mesh, AbstractMesh) else jax.set_mesh(mesh)
 
 
 class HostExecution:
@@ -357,7 +363,7 @@ class HostExecution:
         weights, and the accelerator's devices."""
         shards = math.prod(self.accelerator.shape[axis] for axis in batch_axes(self.accelerator))
         options = step_compiler_options(self.objective, device_tokens(self.objective, batch, shards),
-                                        FROZEN in variables, self.accelerator.devices.size,
+                                        FROZEN in variables, self.accelerator.size,
                                         gathered=self.gathered)
         return dict(options or {})
 
@@ -443,8 +449,8 @@ class HostExecution:
 
     @staticmethod
     def _moved(tree, mesh):
-        """Move `tree` to `mesh`, each leaf keeping the partition spec it has (`_spec_on`)."""
-        return transfer(tree, jax.tree.map(_spec_on(mesh), tree))
+        """Move `tree` to `mesh`, each leaf keeping the partition spec it has (`spec_on`)."""
+        return transfer(tree, jax.tree.map(spec_on(mesh), tree))
 
     @staticmethod
     def rows(index, batch):
@@ -484,7 +490,7 @@ class HostExecution:
         held = tuple(path in frozen_paths for path, _ in named)
         primal = [leaf for leaf, known in zip(leaves, held, strict=True) if not known]
         frozen = [leaf for leaf, known in zip(leaves, held, strict=True) if known]
-        with jax.set_mesh(self.accelerator):
+        with on_mesh(self.accelerator):
             batch = moved.placed(batch, batch_shardings(self.accelerator, batch))
             here = moved._moved(step.replace(ema=None), self.accelerator).replace(ema=ema)
             if here.example_index is not None:
@@ -511,7 +517,7 @@ class HostExecution:
             return stats, aux, _trainable_cotangent(back, jax.tree.map(jnp.ones_like, stats), sites=self.own,
                                                     paths=moving, layout=layout)
 
-        with jax.set_mesh(self.accelerator):
+        with on_mesh(self.accelerator):
             compiled = owned_program(whole, step=self.step_options(variables, batch))
             arguments = (primal, frozen, rest, placed, here)
             refusals: list[RuntimeError] = []
@@ -553,7 +559,7 @@ class HostExecution:
         scale = None
         if watched is not None and watched.cotangents and (held := unscaling()) is not None:
             scale = moved._moved(held, self.accelerator)
-        with jax.set_mesh(self.accelerator):
+        with on_mesh(self.accelerator):
             options = self.step_options(variables, batch)
             stats, back, aux = self.forward(options)(primal, frozen, rest, batch, here, scale, layout=layout)
         stats, aux = moved._moved((stats, aux), self.cpu)
@@ -565,7 +571,7 @@ class HostExecution:
             def pulled(cotangent):
                 # A shared owner is one bank input, so native reverse mode already
                 # sums every use's contribution into it.
-                with jax.set_mesh(self.accelerator):
+                with on_mesh(self.accelerator):
                     # The pullback runs its int8 dots here, apart from the forward's program, with an
                     # int8 backward (`Quantization.bwd_qtype`) on the options that ask for it.
                     compiled = program(cotangent_of, step=options,

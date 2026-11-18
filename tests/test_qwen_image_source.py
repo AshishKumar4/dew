@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 from interop_support import extract_fixture
 from qwen_image_draws import case_draw, pipeline_draw, prompts_of
+from recorded_runs import assert_arms_as_recorded
 from reference_error import (
     GateFailure,
     as_given,
@@ -36,7 +37,6 @@ from reference_error import (
     recording,
     widened,
 )
-from reference_runs import assert_arms_as_recorded
 
 from dew.batch import coordinates
 from dew.interop.diffusion import component_tensors, qwen_image_fields, qwen_image_path, read_transformer

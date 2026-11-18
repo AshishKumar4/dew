@@ -114,6 +114,7 @@ from dew._sources import function_reads
 from dew._stated import Unestablished, stated
 from dew.algebra import passes
 from dew.nn import programs
+from dew.nn.kernels import generation
 from dew.parity import (
     CONFIDENCE,
     FACTOR,
@@ -617,9 +618,9 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
     (`_compiled`): within a run-to-run declaration and a window loop (at one window's inputs), a reference
     unrewritten but one of Dew's own paths (an arm that holds a program, `_holds_program`). Traced as its run
     traces it, and again where its compile lowers it (a launch a spill refused
-    derived at its next config), its constants the first trace's, by place (`_hold`); held under `role`, its
-    name with its fingerprint (`_arm_role`). Its outputs' shapes and dtypes at `inputs`, its trace's (a window
-    loop's at one window's)."""
+    derived at its next config), its constants the first trace's, by place (`_hold`), and the routes that
+    trace reported; held under `role`, its name with its fingerprint (`_arm_role`). Its outputs' shapes and
+    dtypes at `inputs`, its trace's (a window loop's at one window's)."""
     if isinstance(fn, _RunToRun):
         return _arm_program(programs, held, role, fn.fn, inputs, reference=reference)
     if isinstance(fn, _Windowed):
@@ -637,10 +638,12 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
             raise ValueError(f"{name}: an arm compiled with its own compiler options is held whole, over its "
                              "inputs as arrays, and these inputs are a tree of them")
         programs[name] = (_Whole(traced_fn), [*map(jax.typeof, leaves)])
-        out = traced_fn.trace(*inputs).out_info
-        held[name] = {"constants": [], "tree": jax.tree.structure(out)}
+        with generation.routes() as reported:
+            out = traced_fn.trace(*inputs).out_info
+        held[name] = {"constants": [], "tree": jax.tree.structure(out), "routes": list(reported)}
         return out
-    closed, shapes = jax.make_jaxpr(traced_fn, return_shape=True)(*inputs)
+    with generation.routes() as reported:
+        closed, shapes = jax.make_jaxpr(traced_fn, return_shape=True)(*inputs)
     structure = jax.tree.structure(inputs)
     schema = [jax.typeof(constant) for constant in closed.consts]
 
@@ -656,6 +659,9 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         return retraced
 
     _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
+    # The routes its trace reported, which its run, calling the program and tracing none, reports at each call
+    # (`truths_ahead.CompiledTruths.ran`).
+    held[name]["routes"] = list(reported)
     return shapes
 
 
@@ -771,7 +777,7 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str):
     if named_role is None:
         store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
         return arm
-    return _ahead_arm(given_fn, arm, functools.partial(store.called, armed(label)), named_role)
+    return _ahead_arm(given_fn, arm, functools.partial(store.ran, armed(label)), named_role)
 
 
 def _holds_program(fn) -> bool:
@@ -785,7 +791,7 @@ def _holds_program(fn) -> bool:
 def _ahead_arm(given, compiled, call: Callable, role: str):
     """A site's arm (`given`, as the site passed it) whose programs a store compiled ahead
     (`_compile_arms`), as the gate runs it (`compiled`, `_compiled`'s): each plain program's call its draw's
-    executable (`call(role, inputs)`, `truths_ahead.CompiledTruths.called`), within a run-to-run declaration
+    executable (`call(role, inputs)`, `truths_ahead.CompiledTruths.ran`), within a run-to-run declaration
     and a window loop (an arm that holds a program, `_holds_program`)."""
     if isinstance(given, _RunToRun):
         return _RunToRun(_ahead_arm(given.fn, compiled.fn, call, role), given.why)
@@ -1943,7 +1949,7 @@ def ahead_arm(fn: Callable, label: str) -> Callable:
     (`_arm_program` in the store's `tracing`, `_arm_compile`, held under `armed(label)` by Dew's statement of
     it, `_arm_role`) and gives zeros of its outputs' shapes, nothing computing there (a test's later failure
     in its prepare, past its stored program, judges nothing); in its run its call is that executable
-    (`CompiledTruths.called`), tracing, lowering and compiling none; outside a part, `fn` itself. One no
+    (`CompiledTruths.ran`), tracing, lowering and compiling none; outside a part, `fn` itself. One no
     statement holds, or one its prepare did not reach, runs unprepared, recorded and named (`unprepared`,
     as `running` records a site). One call a label: a second in one prepare is refused, as a second site
     of one label is (`compile_site`). Its inputs are host arrays, NumPy's: a prepare's default device
@@ -1968,7 +1974,7 @@ def ahead_arm(fn: Callable, label: str) -> Callable:
         if not store.holds(armed(label)):
             store.unprepared(f"{label}: its prepare did not reach this arm")
             return fn(*inputs)
-        return store.called(armed(label), role, inputs)
+        return store.ran(armed(label), role, inputs)
 
     return called
 
