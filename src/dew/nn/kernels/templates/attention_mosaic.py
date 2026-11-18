@@ -1655,21 +1655,26 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return None
         residing = [] if dq.products_overlap else [
             lambda config: fits(config) and self.resident(ba, config, target) >= 2]
-        for wanted in (*residing, fits):
-            for columns in (1, 2, 4):
-                fewer = fewer_rows(dq) if _fewer_hooked(self.score_mod, self.score_reads[0], dq) else ()
-                for rows in (None, *fewer):
-                    walks = extents if rows is None else functools.partial(_sides, rows)
-                    for staged in (False, True):
-                        def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
-                                  ) -> BackwardTiles:
-                            config = BackwardTiles(walked, rows, 2, consumers, family=dq.name,
-                                                   columns=columns, staged_logits=staged, **dkv)
-                            return dataclasses.replace(config, keyed_apart=self._keyed_apart(ba, config))
+        # The accurate form's keyed sums in a dQ launch of their own (`BackwardTiles.keyed_apart`) where no
+        # config of the one launch carrying both holds: each launch one accumulator, the keyed launch its
+        # logits' product alone (an H100's accurate dQ 64 wide under a score hook, a width no column split
+        # takes, spilled at every query tile, and the Pallas-Triton backward took the call, row 7938).
+        for apart in (False, True) if self.accurate else (False,):
+            for wanted in (*residing, fits):
+                for columns in (1, 2, 4):
+                    fewer = fewer_rows(dq) if _fewer_hooked(self.score_mod, self.score_reads[0], dq) else ()
+                    for rows in (None, *fewer):
+                        walks = extents if rows is None else functools.partial(_sides, rows)
+                        for staged in (False, True):
+                            def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged,
+                                      apart=apart) -> BackwardTiles:
+                                return BackwardTiles(walked, rows, 2, consumers, family=dq.name,
+                                                     columns=columns, staged_logits=staged, keyed_apart=apart,
+                                                     **dkv)
 
-                        if config := derive(dq, query.dtype, key.shape[1], query.shape[1], tiles, wanted,
-                                              overlapped=False, walks=walks, rows=rows):
-                            return config
+                            if config := derive(dq, query.dtype, key.shape[1], query.shape[1], tiles, wanted,
+                                                  overlapped=False, walks=walks, rows=rows):
+                                return config
         return None
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
@@ -1730,20 +1735,6 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         registered = self.registered(arguments["query"], arguments["value"], arguments["score_params"],
                                      arguments["drop"], config)
         return registered.at(config, dq=True), registered.at(config.dkv, dq=False)
-
-    def _keyed_apart(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> bool:
-        """Whether the accurate form's keyed sums walk in a dQ launch of their own at `config`
-        (`BackwardTiles.keyed_apart`): where the one launch's dQ consumer, carrying both sums, passes its
-        registers by the model (`backward_registers`). The keyed launch recomputes the logits' product
-        alone, where a column split recomputes both products in each share, and a width of one swizzle
-        splits into none (an H100's accurate dQ at width 64 spilled at every query tile the derivation
-        offered, each certified and refused before the Pallas-Triton backward took the call, row 7938)."""
-        if not self.accurate or not bundle_of(config, ba.arguments["query"].dtype).budgets_registers:
-            return False
-        arguments = ba.arguments
-        registered = self.registered(arguments["query"], arguments["value"], arguments["score_params"],
-                                     arguments["drop"], config)
-        return registered.at(config, dq=True) > self.register_budget(config)
 
     def registered(self, query, value, score_params, drop, config: BackwardTiles) -> BackwardRegisters:
         """The call's facts its launches' registers read at `config` (`BackwardRegisters`)."""

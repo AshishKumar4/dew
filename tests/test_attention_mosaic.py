@@ -2170,15 +2170,15 @@ def test_a_width_split_backward_writes_its_score_parameters_gradients_once_inter
 
 @ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize("hooks", [None, "alibi"], ids=["plain", "alibi"])
+@pytest.mark.parametrize("hooks", [None, "softcap"], ids=["plain", "softcap"])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 def test_an_accurate_backward_its_keyed_sums_apart_is_on_par_interpreted(hooks, dtype):
     """The accurate backward 64 wide whose keyed sums walk in a dQ launch of their own
     (`BackwardTiles.keyed_apart`, the form an H100's dQ takes where its two sums spill, row 7938): the dQ
     launch its sums alone, the keyed launch its logits' product and the keyed sums, their mass and exponent
-    into the dQ launch's rows; under no hook (the keyed sums of one product) and alibi (their row factor a
-    tile's, fp16's restored through their parts), in bf16 and fp16, every gradient the reference's (check 1),
-    under the interpreter."""
+    into the dQ launch's rows; under no hook (the keyed sums of one product) and a softcap (their row factor
+    a tile's, fp16's restored through their parts), in bf16 and fp16, every gradient the reference's (check
+    1), under the interpreter."""
     if hooks is None:
         _check_backward("causal", SHAPES["interpreted"], form="accurate-apart", interpret=True, width=64,
                         dtype=dtype)

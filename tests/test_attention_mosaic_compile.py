@@ -606,14 +606,14 @@ def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("hooks", ["none", "alibi"])
+@pytest.mark.parametrize("hooks", ["alibi", "softcap"])
 def test_an_accurate_backward_64_wide_is_claimed_on_an_h100(hooks):
-    """The accurate backward of the gate's causal call 64 wide (`_gated_backward`), under no hook and alibi,
+    """The accurate backward of the gate's causal call 64 wide (`_gated_backward`) under alibi and a softcap,
     certified as the route certifies it and compiled by ptxas for an H100 on this CPU: some config of the
     Mosaic backward holds, spilling nothing (its keyed sums in a dQ launch of their own,
     `BackwardTiles.keyed_apart`). Its one dQ launch carrying both sums spilled at every query tile the
-    derivation offered (stack frames of 72 to 4632 bytes at 64 to 256 queries), each certified and refused
-    before the Pallas-Triton backward took the call (row 7938)."""
+    derivation offered, each certified and refused before the Pallas-Triton backward took the call (row
+    7938)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
