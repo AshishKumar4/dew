@@ -53,11 +53,20 @@ from .grouped_cells import (
 )
 from .grouped_launch import INTERPRETED, _GroupedLaunch
 from .grouped_triton import Gmm, Tgmm, _gradient_sides, _product_sides
-from .templates import across, base, bundles, mosaic, report, resources, stores, swizzling
+from .templates import across, base, bundles, cost, mosaic, report, resources, stores, swizzling
 from .templates.axes import held as held_axes
 from .templates.gemm import derivation, mosaic_gpu, packed, pricing, producers, row_tiles
 from .templates.gemm.hooks import NO_HOOKS, Hooks, hooks_lower
 from .templates.product import SCALE_DEPTH, Product, eight
+
+
+def _stored_bytes(ba, rows: int, width: int) -> float:
+    """The bytes a product's epilogue moves an element of its `rows` x `width` output
+    (`pricing.split_walk`'s `stored`): each output's dtype's, and its epilogue operands' bytes over the
+    output's elements (an [rows, columns] operand's an element, a column vector's a row's share)."""
+    hooks = ba.arguments['hooks']
+    written = sum(jnp.dtype(dtype).itemsize for dtype in hooks.out_dtypes or (ba.arguments['out_dtype'],))
+    return written + cost.stored(*ba.arguments.get('epilogue_operands', ())) / max(rows * width, 1)
 
 
 def _matrix_extents(ba) -> tuple[int, int]:
@@ -914,7 +923,8 @@ class MosaicGmm(_Mosaic):
             columns=None if swapped is None else swapped.arguments['kernel'].shape[1],
             # A decode step's partials hold its rows, a TMA descriptor's whole 8s of them.
             held=-(-rows // row_tiles.TMA_ROWS) * row_tiles.TMA_ROWS,
-            operands=self._operand_bytes(ba, tile), multiprocessors=_multiprocessors(target))
+            operands=self._operand_bytes(ba, tile), stored=_stored_bytes(ba, rows, width),
+            multiprocessors=_multiprocessors(target))
 
     def _operand_bytes(self, ba, tile: mosaic_gpu.Tiles) -> tuple[tuple[float, float], tuple]:
         """The bytes an element of the products' left and right operands moves from device memory at `tile`
@@ -1354,9 +1364,11 @@ class MosaicTgmm(_Mosaic):
 
     def _walk(self, ba, tile: mosaic_gpu.Tiles, target) -> pricing.SplitWalk | None:
         """The walk `tile` runs the call in (`pricing.split_walk`): a split tile's over the partials' call
-        its slices run (`_partials`)."""
+        its slices run (`_partials`), its output stored at the call's own dtype (the partials' fp32 passes
+        `SplitWalk.passes`' apart)."""
         call = ba if tile.splits == 1 else self._partials(ba)
-        return pricing.split_walk(tile, **self._contraction(call, tile, target))
+        return pricing.split_walk(tile, **{**self._contraction(call, tile, target),
+                                           'stored': jnp.dtype(ba.arguments['out_dtype']).itemsize})
 
     def _contraction(self, ba, tile: mosaic_gpu.Tiles, target) -> dict:
         """The call's contraction as the split prices it at `tile` (`pricing.split_walk`'s facts): the call
@@ -1367,7 +1379,9 @@ class MosaicTgmm(_Mosaic):
         tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
         itemsizes = (tokens.dtype.itemsize, cotangent.dtype.itemsize)
         return {'groups': ba.arguments['sizes'].shape[0], 'rows': _rows_of(_TGMMS, ba.args), 'depth': depth,
-                'width': width, 'itemsizes': itemsizes, 'multiprocessors': _multiprocessors(target),
+                'width': width, 'itemsizes': itemsizes,
+                'stored': jnp.dtype(ba.arguments['out_dtype']).itemsize,
+                'multiprocessors': _multiprocessors(target),
                 'step_seconds': pricing.step_seconds(tile, target, itemsizes),
                 'bandwidth': target.memory_rate,
                 'launch_seconds': target.launch_seconds}
