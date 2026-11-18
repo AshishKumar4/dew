@@ -7,6 +7,16 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- `Trainer(lower_for=...)` lowers a step that keeps its variables on the host: its dry run's `Lowered`
+  holds each program its steady steps call (`Lowered.programs`), the realizations' lowered for the GPU and
+  the companion's for this host, none compiled. `Lowered.lowered` is a device step's one program.
+- A run that keeps its variables on the host samples its rollout from a copy of its weights on its
+  devices, made once a call; the copy and each program the rollout compiles beside it (a generation's KV
+  cache and activations) are refused by name where the devices cannot hold them. The streamed layout's
+  choice considers a run with a rollout, its plan's price counting the copy (`StepPrice.rollout`).
+- A TPU v6e states its host link (PCIe Gen5 x8 a chip, 32 GB/s each way), so its runs' streamed
+  layout is priced.
+
 - A run that keeps its variables on the host (`Layout(host=("variables",))`) can inspect
   (`Trainer(inspection=...)`): its sampled steps summarize what a device run's summarize, its watched
   outputs' activations and cotangents among them (their probes differentiated beside the parameters, under
@@ -18,7 +28,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   at its run's startup, over its state's and batch's shapes (`options.collecting`), its CPU companion's and
   its accelerator's alike, stepping on its own results' shapes until they settle; its steps then trace,
   lower and compile nothing, a window that replays included; a step that does (an input no pass
-  foresaw) compiles, each program named in a warning and counted in the fit's record (`train/step_misses`). Its
+  foresaw) compiles, each program named in a warning and counted in the fit's record
+  (`train/step_misses`). Its
   glue between the transaction's phases (an attempt's arithmetic, the replay's and the records', a
   microbatch's reading and its outcome) runs as programs of their own. The startup's programs and seconds
   are logged and kept (`StepCompiler.host_startup`). A program compiled over shapes within `collecting`

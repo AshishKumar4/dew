@@ -1046,8 +1046,8 @@ class Trainer(Generic[Loss, Effects]):
         (`dew.nn.sharding.tracing`) with the axes the modules declared (`_declared`) and the links of the
         axes the step measured, none by default. An abstract mesh is a GPU's this process lacks
         (`_candidates.lowered_for`)."""
-        on = jax.sharding.use_abstract_mesh(mesh) if isinstance(mesh, AbstractMesh) else jax.set_mesh(mesh)
-        with on, tracing(self.layout, self.layout.axis_rules, self.microbatches,
+        from dew.training.execution import on_mesh
+        with on_mesh(mesh), tracing(self.layout, self.layout.axis_rules, self.microbatches,
                          {} if links is None else links, self._declared()) as schedule:
             yield schedule
 

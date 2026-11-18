@@ -4,6 +4,7 @@ shape, and the links of its mesh's axes, and the compile of its step from what t
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import json
@@ -15,20 +16,21 @@ from typing import TYPE_CHECKING, NamedTuple, Protocol
 import jax
 import numpy as np
 from flax import linen as nn
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
 from dew._records import JSON, boolean, integer, json_value, listed, record
-from dew.batch import CLOSES_WINDOW, Batch
+from dew.batch import CLOSES_WINDOW, Batch, at_path, placed_at
 from dew.distributed.batches import batch_layout, batch_shardings, batch_signature
 from dew.distributed.placement import Validation
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
-from dew.nn.kernels.generation import gpu_target
+from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import (
     Spent,
     abstract_signature,
     collecting,
     hold,
+    lowering,
     owned_program,
     shapes_of,
     spending,
@@ -294,24 +296,53 @@ class HostRun:
         one the state the step before returned, whose types its programs state (a weak type among them):
         the pass steps on its own results' shapes until they are the shapes it stepped from. What it
         compiled (`HostStartup`)."""
-        from dew.training.execution import placed_as
-
         began = time.perf_counter()
         with collecting(), spending() as spent:
-            shaped = shapes_of(held)
-            for _ in range(STEADY):
-                returned = self.stepped(shaped, shapes_of(batch), placed_as, sampled)[0]
-                if abstract_signature(returned) == abstract_signature(shaped):
-                    break
-                shaped = returned
-            else:
-                raise ValueError(f"a host step's state takes other types at each of its first {STEADY} "
-                                 "steps: its programs settle on none to compile ahead of its first step")
+            self.settled(held, batch, sampled, contextlib.nullcontext)
         self.started.add((abstract_signature(batch), trace_context(), sampled))
         passed = HostStartup.of(spent, time.perf_counter() - began)
         _log.info("a host step's startup compiled %d programs over its state's shapes in %.1f s (%s): %s",
                   passed.programs, passed.seconds, passed.by_backend, ", ".join(passed.names))
         return passed
+
+    def settled(self, held: TrainState, batch: Batch, sampled: bool,
+                each: Callable[[], contextlib.AbstractContextManager]) -> None:
+        """Step over `held`'s and `batch`'s shapes, each step within `each()`: its first step reads the state
+        as given, each later one the state the step before returned, whose types its programs state (a weak
+        type among them), until a step returns the shapes it stepped from, its steady steps' programs; a
+        state whose types never settle is refused."""
+        from dew.training.execution import placed_as
+
+        shaped = shapes_of(held)
+        for _ in range(STEADY):
+            with each():
+                returned = self.stepped(shaped, shapes_of(batch), placed_as, sampled)[0]
+            if abstract_signature(returned) == abstract_signature(shaped):
+                return
+            shaped = returned
+        raise ValueError(f"a host step's state takes other types at each of its first {STEADY} steps: its "
+                         "programs settle on none to compile ahead of its first step")
+
+    def lowered(self, held: TrainState, batch: Batch, platforms: tuple[str, ...]
+                ) -> list[tuple[str, jax.stages.Lowered]]:
+        """Each program its steady steps call (`settled`), a sampled step's beside an unsampled one's where
+        the run inspects, lowered over `held`'s and `batch`'s shapes for `platforms` where it runs on the
+        accelerator and for the CPU where on its companion (`options.lowering`), none compiled: the step
+        `Trainer(lower_for=)` lowers for a target this host is not."""
+        programs: list[tuple[str, jax.stages.Lowered]] = []
+        for sampled in self.bodies:
+            last: list[tuple[str, jax.stages.Lowered]] = []
+            self.settled(held, batch, sampled, functools.partial(_lowered_into, last, platforms))
+            programs.extend(last)
+        return programs
+
+
+@contextlib.contextmanager
+def _lowered_into(last: list[tuple[str, jax.stages.Lowered]], platforms: tuple[str, ...]):
+    """A pass of `HostRun.lowered`'s, its lowerings `last`'s in place of an earlier pass's."""
+    with lowering(platforms) as lowered:
+        yield
+    last[:] = lowered
 
 
 def _opened(batch: Batch, part: jax.Array, *, split: int) -> tuple:
@@ -686,10 +717,13 @@ class StepCompiler[L, E]:
         """
         settings = stepping.settings
         if (target := settings.lower_for) is not None:
-            # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`); it lowers at
-            # the base rung.
+            # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`); a device step
+            # lowers at the base rung, a host step as its compile builds it.
+            if settings.host_master:
+                raise Lowered(target, *routed(lambda: self._lowered_host(stepping, state, batch, target)))
             self.at_base_rung(batch)
-            raise Lowered(target, *routed(lambda: lowered_for(stepping, state, batch, target, self.narrow)))
+            raise Lowered(target, *routed(
+                lambda: [("step", lowered_for(stepping, state, batch, target, self.narrow))]))
         # A state pools its window's microbatches where it holds one part filled: the window, laid out for
         # its split, binds it. Read on the host: a reduction on the devices compiles a program of the
         # occupancy's placement, a restored one's another than a fresh one's, which a resume compiles anew.
@@ -1166,20 +1200,50 @@ class StepCompiler[L, E]:
 
     def _compile_host(self, stepping: Stepping, state: TrainState, batch: Batch
                       ) -> CompiledStep:
+        """The host step over `state` and `batch` (`_host_run`), its startup run before its first step: each
+        of its steps' bodies, a sampled step's as well where the run inspects (`HostRun.startup`)."""
+        run, held, cpu_batch = self._host_run(stepping, state, batch, stepping.settings.device_mesh)
+        with stepping.traced_on(stepping.settings.state_mesh):
+            passes = [run.startup(held, cpu_batch, sampled) for sampled in run.bodies]
+        self.host_startup = HostStartup.joined(passes)
+        return run
+
+    def _lowered_host(self, stepping: Stepping, state: TrainState, batch: Batch, target: str
+                      ) -> list[tuple[str, jax.stages.Lowered]]:
+        """The host step's programs lowered for a GPU of the CUDA `target` this host is not (`lower_for`):
+        built as `_compile_host` builds it, under the target's choices (`generation.assumed`) and over an
+        abstract mesh of its devices (`gpu_mesh`) where its realizations run, its companion this host's CPUs,
+        each program its steady steps call lowered and none compiled (`HostRun.lowered`)."""
+        settings = stepping.settings
+        # Shapes alone, a placed state's too: a lowering builds nothing (a window an array state's first
+        # step would build among it).
+        state, batch = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype),
+                                    (state, batch))
+        with assumed(target):
+            run, held, cpu_batch = self._host_run(stepping, state, batch,
+                                                  gpu_mesh(settings.device_mesh, target))
+            with stepping.traced_on(settings.state_mesh):
+                return run.lowered(held, cpu_batch, ("cuda",))
+
+    def _host_run(self, stepping: Stepping, state: TrainState, batch: Batch, accelerator: Mesh | AbstractMesh
+                  ) -> tuple[HostRun, TrainState, Batch]:
+        """The host step over `state` and `batch`, its realizations on `accelerator`: the run, the state its
+        startup steps from (with the window its first step builds) and the batch on its CPU companion."""
         settings = stepping.settings
         from dew.distributed.host import transfer
-        from dew.training.execution import HostExecution, frozen_trees, stack_sites
+        from dew.training.execution import HostExecution, frozen_trees, placed_as, stack_sites
         cpu = settings.state_mesh
         sites = stack_sites(self.objective, state.variables)
-        execution = HostExecution(self.objective, settings.layout, settings.device_mesh, cpu, sites,
+        execution = HostExecution(self.objective, settings.layout, accelerator, cpu, sites,
                                   device=stepping.shape.device,
-                                  gathered=layer_gathers(self.objective, state.variables,
-                                                         settings.device_mesh.devices.size))
+                                  gathered=layer_gathers(self.objective, state.variables, accelerator.size))
         # The batch read in the split the run states (no plan chooses one: the step is the host's), its window
         # that many microbatches an update times the run's accumulation, as a device step's (`step_program`).
         split = stepping.shape.split or 1
         window = split * settings.accumulation
-        cpu_batch = transfer(batch, batch_shardings(cpu, batch))
+        # A batch of shapes alone (a lowering's, `_lowered_host`) placed as its arrays would be.
+        moved = placed_as if isinstance(jax.tree.leaves(batch)[0], jax.ShapeDtypeStruct) else transfer
+        cpu_batch = moved(batch, batch_shardings(cpu, batch))
         with stepping.traced_on(cpu) as schedule:
             micro = microbatch_shapes(cpu_batch, split)
             _, shapes = stepping.loss_shape(state, micro, window, split)
@@ -1188,6 +1252,14 @@ class StepCompiler[L, E]:
                                                         shape_only=True)
             placement = stepping.shardings(prepared)
             frozen = tuple(path for path, _, _ in frozen_trees(state.variables, sites))
+            if accelerator is not settings.device_mesh:
+                # The frozen trees beside the target's devices, as beside this host's (`execution.resident`).
+                variables = placement.variables
+                for path in frozen:
+                    variables = placed_at(variables, path, jax.tree.map(
+                        lambda held: NamedSharding(accelerator, held.spec, memory_kind=held.memory_kind),
+                        at_path(variables, path)))
+                placement = dataclasses.replace(placement, variables=variables)
             # Its step's body, and where the run inspects, a sampled step's (`Trainer.inspection`): the
             # one whose commit summarizes what it inspects, its forward differentiating the watched
             # outputs' probes beside its parameters (`HostExecution`), as a device run's sampled step.
@@ -1208,14 +1280,9 @@ class StepCompiler[L, E]:
         run = HostRun(stepping, bodies, placement, prepared, shapes, split, window, empty,
                       whole_step_program(self.objective))
         run.counted = lambda: self._counted
-        # The run's startup, before its first step, over its state with that window: each of its steps'
-        # bodies, a sampled step's as well where the run inspects.
         held = state if empty is None else dataclasses.replace(
             state, accumulation=empty, window_size=jax.device_put(np.int32(window)))
-        with stepping.traced_on(cpu):
-            passes = [run.startup(held, cpu_batch, sampled) for sampled in bodies]
-        self.host_startup = HostStartup.joined(passes)
-        return run
+        return run, held, cpu_batch
 
     # ------------------------------------------------------------------ The loop
     # ------------------------------------------------------------------
