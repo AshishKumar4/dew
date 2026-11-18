@@ -17,7 +17,6 @@ from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 from dew.nn.residuals import Residual
 
-from . import derivatives
 from .activations import (
     UNGATED,
     XIELU,
@@ -28,9 +27,9 @@ from .activations import (
     gated_product,
     packed_gated_product,
     swiglu_clamped,
+    ungated_activation,
 )
 from .blocks import normal_kernel
-from .derivatives import marked
 from .flops import projection_flops
 from .gated_mlp import fuses, gated_mlp
 from .joined import joined_dense, joins
@@ -244,10 +243,11 @@ class GatedMLP(nn.Module):
         axes = self._axes(x)
         if not isinstance(activation, (str, Situ)):
             up = checkpoint_name(self._placed(self.up_proj(x)), Residual.UP_PROJ)
-            # A named activation's region, a fusion pass's epilogue of the up projection's (`Activation`).
-            named = (marked(derivatives.Activation(self.activation, gated=False), activation)
-                     if isinstance(self.activation, str) and self.activation in UNGATED else activation)
-            out = self._down(named(up), train)
+            # A named activation is one region wherever it runs (`ungated_activation`), a fusion pass's
+            # epilogue of the projection before it, the down projection's too where it follows it.
+            if isinstance(self.activation, str) and self.activation in UNGATED:
+                activation = functools.partial(ungated_activation, self.activation)
+            out = self._down(activation(up), train)
             return activation(out) if self.activation_after else out
         # A packed MLP holds no gate_proj apart (`_fusable`): its projections are read past that.
         if (isinstance(activation, str) and self._fusable()

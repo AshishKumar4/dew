@@ -191,6 +191,42 @@ def test_a_gated_mlp_whose_hook_the_template_cannot_lower_runs_apart(generation_
     assert route("geglu_exact") == ["apart"]
 
 
+def assert_same_program(one, other) -> None:
+    """`one` and `other` (closed jaxprs, as `jax.make_jaxpr` returns them) are the same program: equation for
+    equation the same primitive over the same wiring of variables of the same avals, the same effects and
+    parameters, each nested program (a call's, a kernel's body) compared as a program again, closed ones
+    with their captured constants, and the same captured constants."""
+    closed, opened = type(one), type(one.jaxpr)
+
+    def same(left, right) -> None:
+        names = {}
+        assert len(left.invars) == len(right.invars) and len(left.eqns) == len(right.eqns), (left, right)
+        for mine, theirs in zip([*left.constvars, *left.invars], [*right.constvars, *right.invars],
+                                strict=True):
+            assert mine.aval == theirs.aval
+            names[mine] = theirs
+        for mine, theirs in zip(left.eqns, right.eqns, strict=True):
+            assert mine.primitive is theirs.primitive and mine.effects == theirs.effects, (mine, theirs)
+            assert [names.get(var, var) for var in mine.invars] == list(theirs.invars), (mine, theirs)
+            assert mine.params.keys() == theirs.params.keys(), (mine, theirs)
+            for key, value in mine.params.items():
+                if isinstance(value, closed):
+                    assert_same_program(value, theirs.params[key])
+                elif isinstance(value, opened):
+                    same(value, theirs.params[key])
+                else:
+                    assert value == theirs.params[key], (key, mine, theirs)
+            for out_mine, out_theirs in zip(mine.outvars, theirs.outvars, strict=True):
+                assert out_mine.aval == out_theirs.aval
+                names[out_mine] = out_theirs
+        assert [names.get(var, var) for var in left.outvars] == list(right.outvars)
+
+    same(one.jaxpr, other.jaxpr)
+    assert len(one.consts) == len(other.consts)
+    for mine, theirs in zip(one.consts, other.consts, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+
+
 def _activation_spans(jaxpr) -> list:
     """The activation regions (`derivatives.Activation`) a program's jaxpr holds, its calls' bodies' too."""
     from jax.extend.core import jaxprs_in_params
@@ -216,10 +252,13 @@ def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, 
     epilogue replaces: the region's body is the program the route unmarked traces, equation for equation,
     so inlined it computes what the route computes; and the XLA route's value and operands' gradients are
     that route's unmarked, bit for bit, run (a CPU runs no Pallas GPU kernel its selector takes). An
-    ungated MLP's named activation is one region of it ungated."""
+    ungated MLP's named activation is one region of it ungated, at each place it runs."""
+    from jax.experimental.pallas import pallas_call_p
+
     from dew.nn import derivatives
     from dew.nn.kernels import norm_swiglu
     from dew.nn.mlp import GatedMLP
+    from dew.nn.programs import equations
 
     rng = np.random.default_rng(0)
     gate, up = (jnp.asarray(rng.standard_normal((4, 64)) * 3, dtype) for _ in range(2))
@@ -233,8 +272,9 @@ def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, 
     body = span.params["call_jaxpr"]
     assert span.primitive is derivatives.marked_call_p
     assert span.params["kind"] == derivatives.Activation("swiglu", gated=True)
-    assert str(body.jaxpr) == str(unmarked.jaxpr)
-    assert ("pallas_call" in str(unmarked)) == (implementation == "pallas")
+    assert_same_program(body, unmarked)
+    launched = {equation.primitive for equation in equations(unmarked.jaxpr)}
+    assert (pallas_call_p in launched) == (implementation == "pallas")
     if implementation == "xla":
         def summed(function):
             return jax.jit(jax.value_and_grad(lambda g, u: jnp.sum(function(g, u).astype(jnp.float32)),
@@ -246,8 +286,11 @@ def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, 
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
         np.testing.assert_array_equal(np.asarray(jax.jit(product)(gate, up)),
                                       np.asarray(jax.jit(plain)(gate, up)))
-    mlp = GatedMLP(hidden_features=128, out_features=64, activation="gelu")
+    # An ungated MLP's named activation, and its activation after the down projection too where it takes one
+    # (an in-context memory's projection pairs).
     x = jnp.asarray(rng.standard_normal((2, 64)), dtype)
-    params = mlp.init(jax.random.key(0), x)
-    assert derivatives.Activation("gelu", gated=False) in _activation_spans(
-        jax.make_jaxpr(lambda v: mlp.apply(v, x))(params).jaxpr)
+    for after in (False, True):
+        mlp = GatedMLP(hidden_features=128, out_features=64, activation="gelu", activation_after=after)
+        params = mlp.init(jax.random.key(0), x)
+        spans = _activation_spans(jax.make_jaxpr(lambda v, mlp=mlp: mlp.apply(v, x))(params).jaxpr)
+        assert spans == [derivatives.Activation("gelu", gated=False)] * (2 if after else 1), (after, spans)
