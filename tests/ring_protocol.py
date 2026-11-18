@@ -746,7 +746,7 @@ class _Order:
             # completion has ended) ends after this write, whatever orders the write.
             flying = [entry for entries in self.pending for entry in entries]
             flying += [entry for products in self.committed for entry, done in products if done is None]
-            for _, where, prior_event in flying:
+            for _, where, prior_event, *_ in flying:
                 if _overlaps(where, at):
                     said = f"write of {at} while the {prior_event.kind} reading {where} is in flight"
                     raise Violation("unordered", said, [(None, prior_event), (None, event)])
@@ -754,16 +754,16 @@ class _Order:
     def landed(self, thread, position, event) -> None:
         landing = _joined(self.issued[(thread, position)], {("load", thread, position): 1})
         if event.kind == "committed":
-            # A commit's completion, after every product its thread issued before it completes: a product a
-            # commit landed before completed then, and one none did completes here, its reads ending.
-            covered = self.committing.pop((thread, position))
-            for _, done in covered:
-                if done is not None:
-                    landing = _joined(landing, done)
-            for product in covered:
+            # A commit's completion, after every product its thread issued before it completes. A product's
+            # completion is its own: after its issue and its token (`completed`), no later event of its
+            # thread's, its reads ending there, whichever covering commit lands first; each commit's arrival
+            # joins the completions it covers.
+            for product in self.committing.pop((thread, position)):
                 if product[1] is None:
-                    product[1] = landing
-                    self.reads.append((product[0][1], landing, product[0][2]))
+                    _, source, read, issued, key = product[0]
+                    product[1] = _joined(issued, {("completed", *key): 1})
+                    self.reads.append((source, product[1], read))
+                landing = _joined(landing, product[1])
             self.arrived(event.at, landing, counted=True, transaction=0)
             return
         self.ordered(event.at, landing, event, write=True)
@@ -801,20 +801,21 @@ class _Order:
             self.pending[thread] = [entry for entry in self.pending[thread] if entry[0] != "product"]
             self.committing[(thread, position)] = list(self.committed[thread])
         elif kind in ("store", "product"):
-            self.asynchronous(thread, event, clock)
+            self.asynchronous(thread, position, event, clock)
         elif kind in ("product_wait", "store_wait"):
             self.retired(thread, "product" if kind == "product_wait" else "store", int(event.argument), clock)
 
-    def asynchronous(self, thread, event, clock) -> None:
+    def asynchronous(self, thread, position, event, clock) -> None:
         """An asynchronous read issued: a store's source, fenced, or a product's operands, each read until
-        the wait that retires it (`retired`)."""
+        the wait that retires it (`retired`) or, a tcgen05 product's, its completion (`landed`); each held
+        with its issue's clock and place."""
         sources = (event.at,) if event.kind == "store" else event.argument
         if event.kind == "store" and any(_overlaps(event.at, at) for at in self.unfenced[thread]):
             raise Violation("unfenced", f"a store reads {event.at} past a generic write no fence follows",
                             [(thread, event)])
         for source in sources:
             self.ordered(source, clock, event, write=False)
-            self.pending[thread].append((event.kind, source, event))
+            self.pending[thread].append((event.kind, source, event, dict(clock), (thread, position)))
 
     def retired(self, thread, kind, kept: int, clock) -> None:
         """A wait retiring all but its `kept` latest asynchronous reads of `kind`: each read ends here."""
