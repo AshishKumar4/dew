@@ -920,7 +920,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     # Through Dew's compile point, as a run compiles them, at once (`report.compiled_at_once`): a launch
     # whose kernel spills there is derived again at its next config; for a node, tuned or refused.
     with report.for_devices() if topology is not None else contextlib.nullcontext():
-        tuned = report.autotuned(mesh.devices.flat)
+        tuned = report.autotuned(gpus[:1])
         try:
             executables = report.compiled_at_once(lowerings)
         except report.Untuned as untuned:
