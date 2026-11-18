@@ -57,6 +57,10 @@ CONSUMED_EXAMPLES = "consumed_examples"
 """The checkpoint control field that holds the examples a run's dispatched batches consumed, as its host
 counted them (`Interval.consumed`), where it counts them."""
 
+DISPATCHED_MICROBATCHES = "dispatched_microbatches"
+"""The checkpoint control field that holds the microbatches a run dispatched, as its host counted them
+(`Interval.microbatches`), where it draws a pass count per microbatch."""
+
 
 def committed_tokens(control: dict) -> int:
     """The tokens a checkpoint's `control` says its run's committed updates trained on, taken out of
@@ -230,6 +234,11 @@ class Interval:
     """The examples the run's dispatched batches consumed, the runs before this fit's included, as the host
     counted each batch (`dew.batch.ConsumedCount`): what its cadences and pause of examples read, the
     same as its state's clock (`TrainState.consumed`) without a read off the devices."""
+    microbatches: int | None = None
+    """The microbatches the run dispatched, the runs before this fit's included, rejected attempts among
+    them, as the host counted them: the global position of the next, which a run drawing its looped model's
+    pass count per microbatch draws at (`dew.training.phase_passes.SampledPasses`); None where it draws
+    none, or a checkpoint counted none."""
     consumed_before: int = 0
     """`consumed` before the latest step."""
     consumed_committed: int = 0
@@ -313,9 +322,11 @@ class Interval:
         `control` (`committed_tokens`), which it takes the clocks' fields out of."""
         consumed = int(control.pop(CONSUMED_EXAMPLES, 0))
         committed = int(control.pop(CONSUMED_COMMITTED, consumed))
+        dispatched = control.pop(DISPATCHED_MICROBATCHES, None)
         return cls(time.time(), last_saved=last_saved, tokens_before_log=committed_tokens(control),
                    resumable=last_saved, consumed=consumed, consumed_before=consumed,
-                   consumed_committed=committed, skips_nonfinite=skips_nonfinite)
+                   consumed_committed=committed, skips_nonfinite=skips_nonfinite,
+                   microbatches=None if dispatched is None else int(dispatched))
 
     def consumption(self, examples: int | None) -> dict[str, float]:
         """The examples a run on the examples clock (bounded to `examples`) has consumed, as its log
@@ -324,11 +335,13 @@ class Interval:
 
     @property
     def token_control(self) -> dict[str, int]:
-        """The clocks a checkpoint keeps (`Checkpoints.control`): the committed updates' real tokens, and
-        the examples consumed where the run counts them."""
+        """The clocks a checkpoint keeps (`Checkpoints.control`): the committed updates' real tokens, the
+        examples consumed where the run counts them, and the microbatches dispatched where it draws a pass
+        count per microbatch."""
         consumed = ({CONSUMED_EXAMPLES: self.consumed, CONSUMED_COMMITTED: self.consumed_committed}
                     if self.consumed else {})
-        return {COMMITTED_TOKENS: self.real_tokens, **consumed}
+        dispatched = {} if self.microbatches is None else {DISPATCHED_MICROBATCHES: self.microbatches}
+        return {COMMITTED_TOKENS: self.real_tokens, **consumed, **dispatched}
 
     @property
     def real_tokens(self) -> int:

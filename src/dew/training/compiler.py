@@ -8,7 +8,7 @@ import dataclasses
 import functools
 import json
 import logging
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
@@ -44,7 +44,7 @@ from dew.training.memory import (
 )
 from dew.training.model_flops import batch_consumed, batch_tokens, model_batch
 from dew.training.narrow import holds_copies, narrowing
-from dew.training.phase_passes import PhasePasses
+from dew.training.phase_passes import Holding, PhasePasses, SampledPasses
 from dew.training.planning import (
     Candidate,
     FitSearch,
@@ -63,6 +63,7 @@ from dew.training.transaction import Transaction, outcome
 
 if TYPE_CHECKING:
     from dew.training.ahead import AheadOfTime
+    from dew.training.interval import Interval
     from dew.training.transaction import Committed
 
 _log = logging.getLogger(__name__)
@@ -181,6 +182,9 @@ class Compiled:
     links: Mapping[str, Link] = dataclasses.field(default_factory=dict)
     validation: Validation | None = None
     step: CompiledStep | None = None
+    planned: Planned | None = None
+    """The plan the step runs, as the run keeps it (`Planned.released`), which a sampled pass count's other
+    counts are admitted at (`StepCompiler.admitted_at`); none where a compile ahead reads its plan alone."""
 
 
 def resumed_stepping[L, E](stepping: Stepping[L, E], window_size: int, *, held: bool, pools: bool,
@@ -200,6 +204,66 @@ def resumed_stepping[L, E](stepping: Stepping[L, E], window_size: int, *, held: 
     if pools or replicas or (not afresh and (held or split > 1) and stepping.shape.split is None):
         return dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape, split=split))
     return stepping
+
+
+def _unlike(cap: Planned, other: Planned) -> list[str]:
+    """What `other`'s step holds or returns otherwise than `cap`'s (`StepCompiler.admitted_at`), each leaf
+    named by its path: the state it prepares, its window among them, with their shapes, dtypes and
+    shardings, and its outputs (`out_info`), the stepped state and the metrics a step's whole pools."""
+    def leaves(tree) -> dict[str, tuple]:
+        return {jax.tree_util.keystr(path): (getattr(leaf, "shape", None), str(getattr(leaf, "dtype", leaf)),
+                                             getattr(leaf, "sharding", None))
+                for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
+
+    unlike: list[str] = []
+    for name, (held, given) in {"state": (cap.candidate.prepared, other.candidate.prepared),
+                                "placement": (cap.candidate.shardings, other.candidate.shardings),
+                                "outputs": (cap.executable.out_info, other.executable.out_info)}.items():
+        ours, theirs = leaves(held), leaves(given)
+        unlike += [f"{name}{path}" for path in sorted(ours.keys() | theirs.keys())
+                   if ours.get(path) != theirs.get(path)]
+    return unlike
+
+
+@dataclasses.dataclass
+class SampledStep:
+    """The step of a run that draws its looped model's pass count per microbatch (`SampledPasses`): each
+    count's plan at its cap's (`StepCompiler.admitted_at`) and its FLOPs a step, by count (`plans`,
+    `flops`), the call running each of its `split` microbatches by its drawn count's program (`counts`,
+    `drawn`) over the one state."""
+
+    plans: Mapping[int, Planned]
+    flops: Mapping[int, StepFlops | None]
+    split: int
+    run: CompiledStep | None = None
+    counts: list[int] = dataclasses.field(default_factory=list)
+    key: tuple[int, ...] | None = None
+
+    def drawn(self, sampled: SampledPasses, key: jax.Array, interval: Interval,
+              step: int) -> StepFlops | None:
+        """The counts of the next call's microbatches, each drawn at its global position under the run's
+        `key` (`SampledPasses.count`), the run's dispatched microbatches past them (`Interval.microbatches`;
+        a checkpoint that counted none resumes at its `step`'s, said); and the call's FLOPs, each
+        microbatch's at its count's program's."""
+        if self.key is None:
+            self.key = tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
+        if interval.microbatches is None:
+            interval.microbatches = step * self.split
+            _log.info("the run's checkpoint counted none of its dispatched microbatches: its pass counts "
+                      "draw on from step %d's, microbatch %d", step, interval.microbatches)
+        start, interval.microbatches = interval.microbatches, interval.microbatches + self.split
+        self.counts = [sampled.count(self.key, start + part) for part in range(self.split)]
+        total: StepFlops | None = None
+        for count in self.counts:
+            each = self.flops[count]
+            if each is None:
+                return None
+            total = (1 / self.split) * each if total is None else total + (1 / self.split) * each
+        return total
+
+    def __call__(self, state: TrainState, batch: Batch, /, sampled: bool = False):
+        assert self.run is not None and len(self.counts) == self.split, "a call's counts are drawn first"
+        return self.run(state, batch, sampled)
 
 
 class StepCompiler[L, E]:
@@ -453,8 +517,9 @@ class StepCompiler[L, E]:
             # Where the devices, the state placed, hold no block for it, the plan's search runs here, on them.
             planned, compiled, keep = self._plan(stepping, state, batch, trials)
             keep()
-        return dataclasses.replace(compiled, step=self.runner(stepping, planned.released(),
-                                                              settings.device_mesh))
+        kept = planned.released()
+        return dataclasses.replace(compiled, step=self.runner(stepping, kept, settings.device_mesh),
+                                   planned=kept)
 
     def planned_unplaced(self, stepping: Stepping, state: TrainState, batch: Batch,
                          unplaced: int) -> None:
@@ -484,6 +549,86 @@ class StepCompiler[L, E]:
         planned, compiled, keep = self._plan(stepping, state, batch, trials, frontier)
         keep()
         return planned, compiled
+
+    def sampled_step(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Compiled,
+                     state: TrainState, batch: Batch) -> SampledStep:
+        """The step of a run that draws its pass count per microbatch (`PhasePasses.sampled`) over `batch`:
+        `cap`, its cap's step (`compile`), and every other count's admitted at its plan (`admitted_at`), each
+        traced under its count's objective, `holder`'s and the compiler's (`PhasePasses.scoped`), by
+        `stepping`. Its window pools each microbatch's statistics by their mean: one that replays them
+        (`pooled_by_mean`) would replay each at the count closing its window, and is refused where it holds
+        several (row 7884)."""
+        sampled, planned = self.phase_passes.sampled, cap.planned
+        assert sampled is not None and planned is not None, "a sampled count's cap compiled on the devices"
+        # A window that pools its microbatches by their mean holds their gradient's sum and its mass
+        # (`Trainer._initialize_accumulation`); one that replays them holds their batches instead.
+        window = planned.candidate.prepared.accumulation
+        if window is not None and window.mass is None:
+            raise ValueError(f"{type(self.objective).__name__}'s statistics are no mean its window pools, so "
+                             "its update replays each microbatch at the count that closes it: a pass count "
+                             "drawn per microbatch takes them one microbatch an update (split and "
+                             "accumulation 1), until replays run each at its own (row 7884)")
+        plans, flops = {sampled.cap: planned}, {sampled.cap: cap.step_flops}
+        for count in range(1, sampled.cap):
+            self.phase_passes.current = count
+            with self.phase_passes.scoped(holder, self):
+                plans[count], flops[count] = self.admitted_at(stepping(), state, batch, planned, count)
+        self.phase_passes.current = sampled.cap
+        with self.phase_passes.scoped(holder, self):
+            capped = stepping()
+        step = SampledStep(plans, flops, planned.split)
+        step.run = self.runner(capped, planned, capped.settings.device_mesh,
+                               parted=lambda: [plans[count] for count in step.counts])
+        return step
+
+    def admitted_at(self, stepping: Stepping, state: TrainState, batch: Batch, cap: Planned,
+                    passes: int) -> tuple[Planned, StepFlops | None]:
+        """The step of a sampled pass count's `passes` (`dew.training.phase_passes.SampledPasses`) at exactly
+        the plan `cap` its cap's step runs: its split, its rung and the narrow copies the cap's step reads
+        (`prepared_for`), so the window's microbatches pass one state between the counts' programs, part by
+        part (`runner`'s `parted`), none remaking copies. Lowered and judged once on the devices
+        (`FitSearch.fits_here`), with no search of its own: one that misses is refused, naming its count,
+        its rung and the bytes it fell short by, and one whose state, window or loss's shapes are other than
+        the cap's step's is refused, naming the leaves. Derived from the cap's plan at each admission, never
+        recorded (`_plans`), so a resume admits each count as the run did."""
+        settings = stepping.settings
+        mesh = settings.device_mesh
+        links = self.links(mesh)
+        # The cap's rung over this count's modules: its remat, head and options, its passes this count's.
+        cap.at.put(self.objective)
+        self.phase_passes.restored(self.objective)
+        stepping = dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape, split=cap.split))
+        try:
+            with stepping.traced_on(mesh, links) as schedule, held_objects():
+                replicated, placement = NamedSharding(mesh, P()), batch_shardings(mesh, batch)
+                shaped = self.loss_shaped(stepping, schedule)
+
+                def lower(split: int, narrow: bool, ns_group: int | None) -> Candidate:
+                    grouped = dataclasses.replace(shaped, settings=dataclasses.replace(shaped.settings,
+                                                                                       ns_group=ns_group))
+                    return candidate_for(grouped, state, batch, schedule, placement, replicated, split,
+                                         narrow, copies=cap.candidate.copies)
+
+                gathered = layer_gathers(self.objective, state.variables, mesh.devices.size)
+                search = FitSearch(
+                    lower, lambda candidate: step_options(
+                        self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
+                    self.objective, mesh, cap.at.xla_defaults, cap.at.narrow, cap.at.ns_group,
+                    None if self._base_rung is None else self._base_rung[1], None)
+                if not search.fits_here(cap.split):
+                    short = search.probes[-1].headroom
+                    raise ValueError(f"the step of {passes} passes misses the devices at its cap's plan "
+                                     f"({search.rung()}, {cap.split} microbatches a step)"
+                                     + ("" if short is None else f" by {-short} bytes"))
+                planned = search.found(cap.split)
+        finally:
+            self._loss_shapes.clear()
+        unlike = _unlike(cap, planned)
+        if unlike:
+            raise ValueError(f"the step of {passes} passes holds {unlike} other than its cap's step does: a "
+                             "sampled count's steps pass one state between them, its window pooling them all")
+        flops, _ = plan_flops(None, planned.executable)
+        return planned.released(), flops and cap.split * flops
 
     def _plan(self, stepping: Stepping, state: TrainState, batch: Batch, trials: Trials | None,
               frontier: bool = False, *, unplaced: int | None = None, provisional: bool = False
@@ -522,9 +667,11 @@ class StepCompiler[L, E]:
         layout, passes = self._plan_key(batch)
         return self._plans.get((layout, passes), self._plans.get((layout, None)))
 
-    def runner(self, stepping: Stepping, planned: Planned,
-               mesh: Mesh) -> CompiledStep:
-        """The step `planned` compiled, which reads a batch in its microbatches."""
+    def runner(self, stepping: Stepping, planned: Planned, mesh: Mesh,
+               parted: Callable[[], Sequence[Planned]] | None = None) -> CompiledStep:
+        """The step `planned` compiled, which reads a batch in its microbatches: each by `planned`'s program,
+        or by its own of the plans `parted` names for the step's microbatches at each call, programs at
+        `planned`'s plan over the one state (a sampled pass count's, `admitted_at`)."""
         settings = stepping.settings
         # The program compiled above, not the jit: a call through the jit traces and compiles its own,
         # without the step's compiler options, which was 25 s of an A100's cold start.
@@ -537,12 +684,13 @@ class StepCompiler[L, E]:
         # this step's window first (`laid_out`).
         returned: list[jax.Array | None] = [None]
         # A split step's whole from its microbatches' outputs, its loss as an unsplit step logs it.
-        whole = whole_step_program(self.objective)
+        whole = whole_step_program(self.objective, parted_work=settings.sampled_passes is not None)
 
         def run(current, batch, sampled: bool = False):
             # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
-            executable = planned.sampled.executable if sampled and planned.sampled is not None else (
-                planned.executable)
+            plans = [planned] * split if parted is None else parted()
+            executables = [held.sampled.executable if sampled and held.sampled is not None
+                           else held.executable for held in plans]
             donor = None
             if current.inner is None and current.window_size is not returned[0]:
                 current, donor = laid_out(current, window)
@@ -576,7 +724,7 @@ class StepCompiler[L, E]:
                     released([donor])
                 outputs = []
                 moving, frozen = apart(current)
-                for part in parts:
+                for part, executable in zip(parts, executables, strict=True):
                     moving, *output = executable(moving, frozen, batch, part)
                     outputs.append(tuple(output))
                 stepped = together(moving, frozen)

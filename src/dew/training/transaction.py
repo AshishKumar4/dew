@@ -186,7 +186,8 @@ def _only_when(due, taken, kept, operand):
 
 
 def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux, committed: Committed | None,
-            batch: Batch, stepped: jax.typing.ArrayLike, consumed: jax.Array, *, split: int) -> tuple:
+            batch: Batch, stepped: jax.typing.ArrayLike, consumed: jax.Array, *, split: int,
+            part: Batch | None = None, passes: int | None = None) -> tuple:
     """What a compiled step returns (`Trainer.compile`) of the transaction it ran from `current` on
     `batch`, wherever it ran: the advanced state, its step counting `stepped` and its clock the source
     examples its microbatch `consumed` (`TrainState.consumed`, where the run keeps one), the loss, the
@@ -194,9 +195,10 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
     where it states none), the microbatch accepted and the window committed. A metric stated as a statistic
     (`Aux.pooled`) is its value where the step is read whole (`split` 1), and its statistic where it is one
     of `split` microbatches, which the step's whole
-    pools (`dew.training.planning.whole_step`)."""
+    pools (`dew.training.planning.whole_step`). A step of a sampled pass count's `passes` counts the work of
+    its microbatch `part` at its count (`step_counts`)."""
     pooled = aux.pooled if split > 1 else {name: value.mean()[0] for name, value in aux.pooled.items()}
-    metrics = {**aux.metrics, **pooled, **step_counts(batch)}
+    metrics = {**aux.metrics, **pooled, **step_counts(batch, part, passes)}
     if aux.record is not None:
         assert "evaluated" in aux.record, "a recording transaction stacks its evaluations (`recorded`)"
         metrics |= recorded_metrics(aux.record)
@@ -617,12 +619,15 @@ def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
 
 def compact_qk(tree):
     """Reduce every sowed `max_logits` leaf over its rows, keeping the heads, and a layer's geometry
-    (`kv_heads`, `head_dim`, `qk_nope`) to the one count it is.
+    (`kv_heads`, `head_dim`, `qk_nope`) to the one count it is; and a layer's calls to one, their largest
+    (`dew.batch.sown_calls`: a looped layer's passes, each over the same weights).
 
     The clip reads each head's strongest logit alone, so a retained window
-    holds one row per layer instead of the batch's. A pipelined layer sows
-    its geometry once a microbatch (`StackView`), the same count each time,
-    and the clip reads it as one.
+    holds one row per layer instead of the batch's, and one call: a run that
+    draws its pass count per microbatch holds one window whatever each
+    microbatch's count. A pipelined layer sows its geometry once a
+    microbatch (`StackView`), the same count each time, and the clip reads it
+    as one.
     """
     def compact(path, leaf):
         is_maximum = any(isinstance(entry, jax.tree_util.DictKey) and entry.key == "max_logits"
@@ -630,7 +635,13 @@ def compact_qk(tree):
         if is_maximum:
             return jnp.max(leaf, axis=-2, keepdims=True) if leaf.ndim > 1 else leaf
         return jnp.max(leaf) if leaf.ndim else leaf
-    return jax.tree_util.tree_map_with_path(compact, tree)
+
+    def called(tree: Mapping) -> dict:
+        return {name: called(value) if isinstance(value, Mapping) else
+                (functools.reduce(jnp.maximum, value),) if isinstance(value, tuple) and value else value
+                for name, value in tree.items()}
+    compacted = jax.tree_util.tree_map_with_path(compact, tree)
+    return called(compacted) if isinstance(compacted, Mapping) else compacted
 
 
 def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_scale_lib.DynamicScale | None:

@@ -11,10 +11,12 @@ hands on.
 from __future__ import annotations
 
 import contextlib
+import math
 from collections.abc import Collection, Hashable, Iterator, Sequence
-from dataclasses import dataclass, field
-from typing import Protocol
+from dataclasses import dataclass, field, replace
+from typing import ClassVar, Protocol
 
+import numpy as np
 from flax import linen as nn
 
 from dew.batch import PHASE, Batch
@@ -59,11 +61,21 @@ class PhasePasses[L, E]:
     counts: tuple[int, ...] = ()
     current: int | None = None
     built: dict[int, Objective[L, E]] = field(default_factory=dict)
+    sampled: SampledPasses | None = None
+    """The law a run draws its pass count from per microbatch, in place of a count a phase (`SampledPasses`):
+    its step one program a count from 1 to its cap, its cap the count the objective holds."""
 
     @classmethod
-    def of(cls, objective: Objective[L, E], stated: Sequence[int] | None) -> PhasePasses[L, E]:
+    def of(cls, objective: Objective[L, E], stated: Sequence[int] | None,
+           sampled: SampledPasses | None = None) -> PhasePasses[L, E]:
         """`stated` checked: each count at least one, the objective's modules looping, the last phase's count
-        the one they hold, the model the run hands on. No counts where it states none."""
+        the one they hold, the model the run hands on. No counts where it states none; a run that draws its
+        count per microbatch (`sampled`) holds its cap's, and states no count a phase beside it."""
+        if sampled is not None:
+            if stated is not None:
+                raise ValueError("a run states its loop's pass counts once: one a phase of its data "
+                                 "(phase_passes) or one drawn per microbatch (sampled_passes)")
+            return replace(cls.of(objective, (sampled.cap,)), current=sampled.cap, sampled=sampled)
         if stated is None:
             return cls(objective)
         counts = tuple(int(count) for count in stated)
@@ -90,6 +102,17 @@ class PhasePasses[L, E]:
             raise ValueError(f"a batch of the run's phase {phase} meets phase_passes of {len(self.counts)} "
                              "phase(s): one count a phase")
         return self.counts[phase]
+
+    def drawn_count(self) -> int | None:
+        """The count the step being compiled runs where the run draws one per microbatch
+        (`StepSettings.sampled_passes`); None for any other run."""
+        return None if self.sampled is None else self.current
+
+    def counted_at(self) -> list[Objective[L, E]] | None:
+        """The run's objective at each count from 1 to its cap where it draws one per microbatch, whose work
+        a batch counts at each (`prepare_counts`'s `at_counts`); None for any other run."""
+        return None if self.sampled is None else [self.objective_for(count)
+                                                  for count in range(1, self.sampled.cap + 1)]
 
     def begins(self, compiled: Collection[Hashable]) -> bool:
         """Whether the step being compiled (`current`) begins a phase whose count no step of `compiled`
@@ -169,3 +192,44 @@ class PhasePasses[L, E]:
         if passes not in self.built:
             self.built.setdefault(passes, self.base.substituted(_counted(self.base, passes)))
         return self.built[passes]
+
+
+@dataclass(frozen=True)
+class SampledPasses:
+    """A looped model's pass count drawn afresh for each microbatch a run steps (`count`), from a named law
+    bounded to `cap` (row 7660): `law` 'lognormal-poisson', the count `1 + N`, `N ~ Poisson(Λ)`,
+    `log Λ ~ Normal(log(mean - 1) - dispersion² / 2, dispersion²)`, so `mean` is the count's mean before its
+    bound, conditioned on 1 to `cap` by rejection, as recurrent-depth training draws it (Geiping et al. 2025,
+    arXiv 2502.05171). A draw is a function of the run's key and the microbatch's global position alone,
+    its place among every microbatch the run dispatched: every process draws alike, and a resume, a replan
+    or a step of another split draws on as the run would have."""
+
+    mean: float
+    dispersion: float
+    cap: int
+    law: str = "lognormal-poisson"
+
+    LAWS: ClassVar[tuple[str, ...]] = ("lognormal-poisson",)
+
+    def __post_init__(self) -> None:
+        if self.law not in self.LAWS:
+            raise ValueError(f"a sampled pass count follows one of the laws {list(self.LAWS)}, "
+                             f"not {self.law!r}")
+        if not (math.isfinite(self.mean) and self.mean > 1):
+            raise ValueError("a log-normal Poisson pass count's mean is above 1, its least count, "
+                             f"not {self.mean}")
+        if not (math.isfinite(self.dispersion) and self.dispersion >= 0):
+            raise ValueError("a log-normal Poisson pass count's dispersion is at least 0, "
+                             f"not {self.dispersion}")
+        if self.cap < 1:
+            raise ValueError(f"a sampled pass count's cap is at least one pass, not {self.cap}")
+
+    def count(self, key: Sequence[int], position: int) -> int:
+        """The pass count of the run's microbatch at global `position` under the run's `key` (its words,
+        `jax.random.key_data`): a draw of the bounded law, a count past `cap` drawn again."""
+        draws = np.random.Generator(np.random.Philox(np.random.SeedSequence([*map(int, key), int(position)])))
+        location = math.log(self.mean - 1) - self.dispersion ** 2 / 2
+        while True:
+            drawn = 1 + int(draws.poisson(math.exp(draws.normal(location, self.dispersion))))
+            if drawn <= self.cap:
+                return drawn

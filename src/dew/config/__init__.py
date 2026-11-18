@@ -106,6 +106,7 @@ if TYPE_CHECKING:
 
     from dew.interop import Pretrained
     from dew.nn.attention import AttentionImpl
+    from dew.training.phase_passes import SampledPasses
     from dew.training.trainer import Trainer
 
 
@@ -1754,9 +1755,33 @@ class DecoderRunConfig(RunConfig):
     loop_exit_threshold: float | None = None
     """Exit each token at the first pass whose cumulative exit probability reaches this
     (`Loop.exit_threshold`); None keeps a checkpoint's own choice."""
+    loop_steps_sample: str | None = None
+    """Draw the loop's pass count afresh for each microbatch from this named law, bounded to
+    `loop_steps_max` (`dew.training.phase_passes.SampledPasses`: 'lognormal-poisson', of mean
+    `loop_steps_mean` and dispersion `loop_steps_dispersion`), the model holding and handing on the cap;
+    None runs one count a step."""
+    loop_steps_mean: float | None = None
+    """The sampled pass count's mean before its bound (`loop_steps_sample`)."""
+    loop_steps_dispersion: float | None = None
+    """The standard deviation of the sampled pass count's log rate (`loop_steps_sample`)."""
+    loop_steps_max: int | None = None
+    """The sampled pass count's cap (`loop_steps_sample`), the count the model holds."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        sampling = (self.loop_steps_mean, self.loop_steps_dispersion, self.loop_steps_max)
+        if self.loop_steps_sample is None and any(field is not None for field in sampling):
+            raise ValueError("--loop-steps-mean, --loop-steps-dispersion and --loop-steps-max state a "
+                             "sampled pass count's law, which --loop-steps-sample names")
+        if self.loop_steps_sample is not None:
+            # Stated whole before anything loads; the law checks its own fields (`sampled_passes`).
+            if any(field is None for field in sampling):
+                raise ValueError("--loop-steps-sample draws from a law of a mean, a dispersion and a cap: "
+                                 "state --loop-steps-mean, --loop-steps-dispersion and --loop-steps-max")
+            if self.loop_steps is not None:
+                raise ValueError("a run states its loop's pass counts once: --loop-steps, or a count drawn "
+                                 "per microbatch (--loop-steps-sample), whose cap the model holds")
+            self.sampled_passes()
         if isinstance(self.loop_steps, tuple) and self.data is not None:
             # Refused before anything loads: a count a phase the data reads in.
             phases = self.data.phase_count
@@ -1767,14 +1792,30 @@ class DecoderRunConfig(RunConfig):
     @property
     def handed_passes(self) -> int | None:
         """The pass count the run's model holds and hands on: the last phase's, where the run names one a
-        phase (`loop_steps`), else `loop_steps`."""
+        phase (`loop_steps`), a sampled count's cap (`loop_steps_max`), else `loop_steps`."""
+        if self.loop_steps_sample is not None:
+            return self.loop_steps_max
         return self.loop_steps[-1] if isinstance(self.loop_steps, tuple) else self.loop_steps
+
+    def sampled_passes(self) -> "SampledPasses | None":
+        """The law the run draws its pass count from per microbatch (`loop_steps_sample`), None where it
+        draws none."""
+        from dew.training.phase_passes import SampledPasses
+
+        if self.loop_steps_sample is None:
+            return None
+        assert self.loop_steps_mean is not None and self.loop_steps_dispersion is not None
+        assert self.loop_steps_max is not None
+        return SampledPasses(self.loop_steps_mean, self.loop_steps_dispersion, self.loop_steps_max,
+                             law=self.loop_steps_sample)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
                                **resources) -> "Trainer[LossT, EffectsT]":
-        """`RunConfig.built`, its steps run each phase's pass count where the run names one a phase."""
-        phased = {"phase_passes": self.loop_steps} if isinstance(self.loop_steps, tuple) else {}
+        """`RunConfig.built`, its steps run each phase's pass count where the run names one a phase, or one
+        drawn per microbatch (`sampled_passes`)."""
+        phased = ({"phase_passes": self.loop_steps} if isinstance(self.loop_steps, tuple) else
+                  {"sampled_passes": sampled} if (sampled := self.sampled_passes()) is not None else {})
         return super().built(objective, mesh, rollout, **phased, **resources)
 
     @property
@@ -1782,7 +1823,8 @@ class DecoderRunConfig(RunConfig):
         """Whether the run asks anything of a loop (`looped`)."""
         return (self.loop_steps is not None or self.loop_layers is not None
                 or self.loop_backprop_steps is not None or self.loop_remat or self.loop_implicit
-                or self.loop_theta_per_pass or self.loop_exit_gate or self.loop_exit_threshold is not None)
+                or self.loop_theta_per_pass or self.loop_exit_gate or self.loop_exit_threshold is not None
+                or self.loop_steps_sample is not None)
 
     def exit_settings(self) -> dict[str, float]:
         """The exit objective's weight an objective that trains a gate the run draws (`loop_exit_gate`)

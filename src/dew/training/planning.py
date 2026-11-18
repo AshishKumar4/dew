@@ -199,16 +199,18 @@ class SampledStep(NamedTuple):
     executable: jax.stages.Compiled
 
 
-def whole_step_program[L, E](objective: Objective[L, E]) -> OuterProgram:
+def whole_step_program[L, E](objective: Objective[L, E], parted_work: bool = False) -> OuterProgram:
     """`whole_step` over `objective`'s statistics (`Objective.reduce_loss`), the one program a split step
     runs on its microbatches' outputs, compiled under its towers' options, which a run compiled ahead
-    compiles with its step (`dew.training.ahead`)."""
+    compiles with its step (`dew.training.ahead`); `parted_work` where each microbatch counts its own
+    work (a sampled pass count's, `step_counts`)."""
     return owned_program(functools.partial(whole_step, reduce=objective.reduce_loss,
-                                           shown=frozenset(objective.shown)), *objective.towers())
+                                           shown=frozenset(objective.shown), parted_work=parted_work),
+                         *objective.towers())
 
 
 def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
-                  shown: frozenset[str] = frozenset()):
+                  shown: frozenset[str] = frozenset(), parted_work: bool = False):
     """A step's outputs from those of the microbatches it was read in: its loss as an unsplit step logs it,
     whatever the split (docs/design/training.md, the logged loss): where a microbatch of it commits, the
     latest such commit's update's, pooled over its window; elsewhere its own batch's, its microbatches'
@@ -220,9 +222,11 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
     run's interval keeps the latest sampled commit: a step of two commits (a window a rejection left part
     filled, then the closing part of a run's last batch) reports its second's summaries, never the two
     added. A pure function, which a step compiles as a program of its own (`dew.training.compiler`) or
-    traces within its own (`dew.training.ahead`)."""
+    traces within its own (`dew.training.ahead`). Where each microbatch counted its own work
+    (`parted_work`, a sampled pass count's), the step's is their sum."""
     losses, metrics, finite, accepted, committed = zip(*outputs, strict=True)
-    report = {name: _pooled(name, [part[name] for part in metrics]) for name in metrics[-1]}
+    report = {name: (sum(part[name] for part in metrics) if parted_work and name == TRAINING_FLOPS
+                     else _pooled(name, [part[name] for part in metrics])) for name in metrics[-1]}
     if len(metrics) > 1:
         # A metric that states no pooling is one microbatch's, named so (`Aux.metrics`); a shown one, which
         # a run selects its best and its plateau by under its name, is refused.
