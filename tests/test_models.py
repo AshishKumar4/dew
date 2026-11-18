@@ -85,10 +85,11 @@ ENCODER_SEEDS = 8
 paired with the device's run on the CPU."""
 
 
-@pytest.mark.parametrize("batch", [1, 4])
-@pytest.mark.parametrize("backward", [False, True], ids=["encode", "vjp"])
-def test_a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
-    """The full jitted encoder, not an isolated downsampler, and its VJP.
+def a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
+    """The full jitted encoder, not an isolated downsampler, and its VJP, on an accelerator against its
+    host: a check of a device whose compiler is not the host's, run in the models' GPU flow
+    (tests/test_gpu_models.py), where on a CPU lane host and device are one and the check compared a run
+    with itself (the test audit's F3).
 
     XLA:TPU's stride-two rewrite moved the batch-one output by 40%. The
     device's run is on par with the host's fp32 run from the host's float64
@@ -216,9 +217,9 @@ LINEARIZATION_SEEDS = 8
 (check 1), sized by `seeds_for` paired with the device's run on the CPU."""
 
 
-@pytest.mark.parametrize("transform", ["jvp", "transpose", "forward_over_reverse", "reverse_over_forward"])
-def test_strided_convolution_linearizations_keep_host_precision(transform):
-    """Random filters expose a tangent chain just as they expose the primal.
+def strided_convolution_linearizations_keep_host_precision(transform):
+    """Random filters expose a tangent chain just as they expose the primal, on an accelerator against its
+    host, in the models' GPU flow as `a_vae_encoder_keeps_the_host_reference_precision` is.
 
     A boundary whose JVP drops the barrier leaves the same miscompiled
     convolution chain in the tangent-only program.

@@ -9,7 +9,6 @@ import json
 import os
 import subprocess
 import sys
-import tarfile
 from pathlib import Path
 
 import numpy as np
@@ -118,8 +117,7 @@ def test_caption_dropout_keeps_mask_conditioned_gradients(saved_pipelines):
 
 @pytest.mark.parametrize("case", ["sd1", "sd2", "sdxl-inpaint", "refiner"])
 def test_multilevel_unet_geometry_and_input_gradient(tmp_path, case):
-    with tarfile.open(ROOT / "tests/fixtures/native_unet_geometry.tar.xz") as archive:
-        archive.extractall(tmp_path, filter="data")
+    extract_fixture(ROOT / "tests/fixtures/native_unet_geometry.tar.xz", tmp_path)
     run_check(tmp_path / case, "--model")
 
 

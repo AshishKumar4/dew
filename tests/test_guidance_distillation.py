@@ -3,7 +3,6 @@ Flux pipeline's text towers: the loss written out from the paper's equation,
 and a saved student run restored."""
 
 import dataclasses
-import tarfile
 from pathlib import Path
 
 import jax
@@ -12,6 +11,7 @@ import numpy as np
 import pytest
 from diffusion_stubs import batch_for
 from diffusion_support import images_of, saved_after_one_step
+from interop_support import extract_fixture
 
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
@@ -48,8 +48,7 @@ def runs(tmp_path_factory, request):
     training and sampling schedules are one, and under EDM, whose training
     times are standard-normal draws its Karras sampling grid reads otherwise."""
     root = tmp_path_factory.mktemp("guidance")
-    with tarfile.open(FIXTURES / "flux_source.tar.xz") as archive:
-        archive.extractall(root / "flux", filter="data")
+    extract_fixture(FIXTURES / "flux_source.tar.xz", root / "flux")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
         data=images_of("tfds://oxford_flowers102", 8), preset=request.param, val_metrics=(),

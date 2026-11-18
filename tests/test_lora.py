@@ -116,16 +116,6 @@ def _source_tensor(source, tree, name: str) -> np.ndarray:
     return next(layout for layout in source.weight_layouts if layout.name == name).export(tree)
 
 
-def test_the_unmerged_forward_matches_peft(loaded, reference):
-    """The adapted model reads the split tree, factors under `params` and the
-    base under `frozen`, as it comes from the loader."""
-    adapter = loaded
-    assert sorted(adapter.variables) == [FROZEN, "params"]
-    logits = adapter.model.apply(adapter.variables, jnp.asarray(reference["input_ids"]))
-    np.testing.assert_allclose(np.asarray(logits), reference["adapted_logits"], atol=1e-4, rtol=0)
-    assert np.max(np.abs(reference["adapted_logits"] - reference["base_logits"])) > 1
-
-
 def _token_loss(objective, params, tokens):
     """The objective's token loss over the moving factors, the rest of `params` held."""
     def loss(moving):
@@ -199,21 +189,6 @@ def test_eval_prediction_disables_adapter_dropout(loaded, reference):
     np.testing.assert_allclose(predictions[False][0], reference["adapted_logits"][:, :-1],
                                atol=1e-4, rtol=0)
     assert not np.array_equal(*predictions[True])
-
-
-def test_the_merge_matches_peft_weights_and_logits(decoder, loaded, reference):
-    """W + scale * B A into every kernel, the factors gone, the plain model
-    over the merged tree agreeing with merge_and_unload."""
-    adapter = loaded
-    merged = adapter.merge(adapter.variables)
-    assert sorted(merged) == ["params"]
-    assert not any(_is_factor(path) for path, _ in jax.tree_util.tree_leaves_with_path(merged))
-    for key in reference:
-        if key.startswith("merged/"):
-            np.testing.assert_allclose(_source_tensor(decoder, merged, key.removeprefix("merged/")),
-                                       reference[key], atol=1e-6, rtol=0)
-    logits = decoder.model.apply(merged, jnp.asarray(reference["input_ids"]))
-    np.testing.assert_allclose(np.asarray(logits), reference["merged_logits"], atol=1e-4, rtol=0)
 
 
 def test_adapter_gradients_of_the_token_loss_match_peft(decoder, loaded, reference, tmp_path):
@@ -1472,9 +1447,10 @@ def test_peft_reads_the_adapter_dew_writes_at_dews_logits(name, decoder, tmp_pat
     """PEFT reads the adapter a case writes (tools/lora_export_reference.py's: a fresh one at a rank
     and alpha, one with rsLoRA, and the committed one whose rank and alpha patterns Dew writes back,
     each with its factors moved) onto transformers' llama-tiny, every tensor of the file landing, and
-    Dew reads it back as written. Dew's adapted and merged logits are on par with PEFT's adapted and
-    `merge_and_unload` logits, from its float64 twin's merged in float64, over drawn ids (check 1);
-    the adapter moves PEFT's logits by more than a unit."""
+    Dew reads it back as written, the split tree its loader gives (factors under `params`, the base under
+    `frozen`). Dew's adapted and merged logits, and every weight its merge writes (`W + scale B A`, the
+    factors gone), are on par with PEFT's adapted and `merge_and_unload` ones, from its float64 twin's
+    merged in float64, over drawn ids (check 1); the adapter moves PEFT's logits by more than a unit."""
     import copy
 
     import torch
@@ -1486,9 +1462,16 @@ def test_peft_reads_the_adapter_dew_writes_at_dews_logits(name, decoder, tmp_pat
 
     _, written = export_case(CASES[name], decoder, tmp_path)
     adapter = LoRA.load(decoder.model, decoder.variables, tmp_path, layouts=decoder.layouts)
+    assert sorted(adapter.variables) == [FROZEN, "params"]
     for read, wrote in zip(jax.tree.leaves(adapter.variables["params"]), jax.tree.leaves(written["params"]),
                            strict=True):
         np.testing.assert_array_equal(np.asarray(read), np.asarray(wrote))
+    merged_tree = adapter.merge(adapter.variables)
+    assert sorted(merged_tree) == ["params"]
+    assert not any(_is_factor(path) for path, _ in jax.tree_util.tree_leaves_with_path(merged_tree))
+    # The source weights each adapted module's merge writes, by the names PEFT's file adapts.
+    adapted = sorted({key.removeprefix("base_model.model.").split(".lora_")[0] + ".weight"
+                      for key in load_file(str(tmp_path / "adapter_model.safetensors"))})
     base = AutoModelForCausalLM.from_pretrained(LLAMA, dtype=torch.float32, attn_implementation="eager")
     peft = PeftModel.from_pretrained(base, tmp_path).eval()
     assert_landed(peft, load_file(str(tmp_path / "adapter_model.safetensors")))
@@ -1499,13 +1482,17 @@ def test_peft_reads_the_adapter_dew_writes_at_dews_logits(name, decoder, tmp_pat
 
     def both(model, ids):
         adapted_model, merged_model = model
-        return {"adapted": adapted_model(ids).logits, "merged": merged_model(ids).logits}
+        weights = merged_model.state_dict()
+        return {"adapted": adapted_model(ids).logits, "merged": merged_model(ids).logits,
+                "weights": {weight: weights[weight] for weight in adapted}}
 
     theirs, truth = transformers_arms((peft, merged), both, twin=(wide, merged_wide))
     draw = fixture_ids(LLAMA)
     variables = adapter.variables
+    weights = {weight: jnp.asarray(_source_tensor(decoder, merged_tree, weight)) for weight in adapted}
     assert_as_exact(lambda ids: {"adapted": adapter.model.apply(variables, ids),
-                                 "merged": decoder.model.apply(adapter.merge(variables), ids)},
+                                 "merged": decoder.model.apply(adapter.merge(variables), ids),
+                                 "weights": weights},
                     theirs, draw, f"{name} logits", seeds=EXPORT_SEEDS[name], truth_fn=truth)
     (ids,) = draw(0)
     with peft.disable_adapter(), torch.no_grad():
