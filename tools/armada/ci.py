@@ -1635,7 +1635,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
         command, environment, deadline, grace, pid, python, evidence_name(python, tests, group), began)
     # This attempt's peak, and an earlier attempt's where it ran tests this row carries (`progress.resumed`).
-    peak = max((found for found in (progress.task_peak(), peak_before) if found is not None), default=None)
+    peaks = [found for found in (progress.task_peak(host), peak_before) if found is not None]
+    peak = max(peaks, default=None)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
@@ -2252,7 +2253,7 @@ def folded_entries(record: dict[str, session.Entry], verdict: dict, target: floa
             if (measured := row_.get("peak")) is not None:
                 for node in row_.get("tests", {}):
                     if node in kept:
-                        peaks[node] = int(measured)
+                        peaks[node] = session.moved_peak(peaks.get(node), int(measured))
                 # A task killed before it reported a case (its pytest OOM-killed) still bounds its file's
                 # tests: their peaks raised to it, never lowered by a run that timed none of them (review).
                 if not row_.get("tests"):
