@@ -155,7 +155,7 @@ def counted_passes(args) -> dict:
     from dew.data import Memory
     from dew.data.compile import fitted
     from dew.data.pipeline import ObjectiveData, Pipeline
-    from dew.objectives.base import Objective
+    from dew.objectives.base import Aux, Objective
     from dew.optim import OptimConfig
     from dew.training import Checkpoints, Trainer
     from dew.training.budget import Counted
@@ -168,7 +168,7 @@ def counted_passes(args) -> dict:
 
         def loss(self, variables, batch, step):
             x = jnp.repeat(batch["id"].astype(jnp.float32)[:, None], FEATURES, axis=1)
-            return self.row_mean(jnp.square(variables["params"]["w"] - x), batch), {}
+            return self.row_mean(jnp.square(variables["params"]["w"] - x), batch), Aux({})
 
         def data(self):
             return ObjectiveData(train=(Questioned(),))

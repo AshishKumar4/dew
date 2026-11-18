@@ -650,7 +650,7 @@ _EAGER = (Map, MapWithIndex, Filter, FlatMap, Pack, Windows, TokenSplit)
 
 def _held_bound(stages: Sequence[Stage], at: int) -> int:
     """The stages of a bound in examples standing at `at` before a pack a memory read runs over its whole
-    source, or a layout a shuffle draws after (`_drawn_cut`) (`dew.data.compile._bounded`: a repeat without
+    source, or a layout a shuffle draws after (`_drawn_cut`) (`dew.data.bounds._bounded`: a repeat without
     a count where it reads on, its limit and its marks): the memory read runs them as it holds the rest,
     the source examples cycled to the limit and marked before the layout lays them out, so its windows
     carry the examples they consume. None (0) where no such bound stands there."""

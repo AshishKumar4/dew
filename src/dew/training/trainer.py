@@ -283,6 +283,9 @@ class Trainer(Generic[Loss, Effects]):
 
     _examples: int | None = None  # the bound of a run on the examples clock (`TrainState.consumed`)
 
+    _counting = False
+    """Whether its read counts its passes on the host for a cadence of them (`reading`), set as it reads."""
+
     def __init__(
         self,
         objective: Objective[Loss, Effects],
@@ -399,8 +402,6 @@ class Trainer(Generic[Loss, Effects]):
         # How the run's batches are cut and counted (`RunShape`): the microbatches a step's batch is read in
         # start 1 where `whole`, else as stated, until a pooling state's window or the first plan decides.
         self._shape = RunShape(split=1 if whole is not None else split)
-        # Whether its read counts its passes on the host for a cadence of them (`reading`).
-        self._counting = False
         # The split the run was given, which a phase planned afresh at an update's end plans under
         # (`_compiled_for`); None where the planner chooses.
         self._given_split = self._shape.split
