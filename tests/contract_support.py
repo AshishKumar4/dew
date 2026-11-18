@@ -152,8 +152,9 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
         wide_primals, wide_direction, wide_cotangent = widened((primals, direction, cotangent))
         wide = orders_of(truth_fn or fn, wide_primals, wide_direction, wide_cotangent)
         truths = {name: ran(order, f"{label} in float64", name) for name, order in wide.items()}
-    for name, order in narrow.items():
-        values = jax.tree.leaves(ran(order, label, name))
+    def held(values, name: str, site: str) -> None:
+        """An order's `values` held to the contract: each finite where the same order of the float64 run is a
+        normal float32, the plain formula's is finite and no order of its sums overflows."""
         plains = jax.tree.leaves(plain[name]) if plain else [None] * len(values)
         lost = {}
         for index, (value, truth, plainly) in enumerate(zip(values, jax.tree.leaves(truths[name]), plains,
@@ -172,23 +173,28 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
                 _, positive, negative = map(jax.tree.leaves, float64_signed_sums(wide[name]))
             lost = {index: where & (positive[index] <= MOST) & (negative[index] <= MOST)
                     for index, where in lost.items()}
-        broken = [f"{label}, {name}, leaf {index}: {int(where.sum())} values not finite where float64's are "
+        broken = [f"{site}, {name}, leaf {index}: {int(where.sum())} values not finite where float64's are "
                   f"normal float32s and no order of their sums overflows, e.g. {values[index][where][:3]}"
                   for index, where in lost.items() if where.any()]
         if broken:
             raise LessFinite(broken[0])
-    _on_a_mesh(fn, primals, direction, cotangent, label, truth_fn=truth_fn, without=without, draw=draw)
+
+    for name, order in narrow.items():
+        held(jax.tree.leaves(ran(order, label, name)), name, label)
+    _on_a_mesh(fn, primals, direction, cotangent, label, truth_fn=truth_fn, without=without, draw=draw,
+               held=held)
 
 
-def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, without, draw) -> None:
+def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, without, draw, held) -> None:
     """Each order of `fn` on training's mesh of two of this process's devices (`MeshSpec`'s, its data axis
-    two), its inputs placed on it whole: run at the cell's own inputs, so a split its specs do not fit
-    raises (row 7973's class); and where the cell gives its seeded `draw` (a seed's primals, direction and
-    cotangent, in its inputs' domain), a check-1 site (`reference_error.assert_as_exact`) against the float64
-    truth (`truth_fn`'s orders where given), its reference the same order off a mesh, over the seeds
-    `seeds_for` sizes: the mesh's program is another, partitioned, whose floats no common bits hold
-    (docs/design/testing.md), and a sum it counts twice fails by its own size. Where the cell set its own
-    mesh, its orders already run under it."""
+    two), its inputs placed on it whole: at the cell's own inputs held to the contract itself (`held`, as off
+    the mesh; a split its specs do not fit raises, row 7973's class); and where the cell gives its seeded
+    `draw` (a seed's primals, direction and cotangent in its domain, at a scale whose values float32 holds:
+    an edge's, which the contract excuses where float64 is no normal float32, check 1 cannot measure), a
+    check-1 site (`reference_error.assert_as_exact`) against the float64 truth (`truth_fn`'s orders where
+    given), its reference the same order off a mesh, over the seeds `seeds_for` sizes: the mesh's program is
+    another, partitioned, whose floats no common bits hold (docs/design/testing.md), and a sum it counts
+    twice fails by its own size. Where the cell set its own mesh, its orders already run under it."""
     from arm_forms import as_given
     from jax.sharding import NamedSharding, PartitionSpec
     from reference_error import assert_as_exact, seeds_for
@@ -215,8 +221,9 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, witho
                 placed = jax.device_put((primals, direction, cotangent), whole)
                 return ran(lambda: program(*placed), site, name)
 
+        # At the cell's own inputs, the contract itself (`held`), on the mesh as off it.
+        held(jax.tree.leaves(on(primals, direction, cotangent)), name, site)
         if draw is None:
-            on(primals, direction, cotangent)
             continue
 
         def off(primals, direction, cotangent, name=name):
