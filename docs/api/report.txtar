@@ -192,7 +192,6 @@ class Objective()  [dew.objectives.base]
   .task_settings(self) -> DataclassInstance | None
   .tile_head(self, tile: tuple[int, int] | None = None) -> str | None
   .tower_axes(self) -> dict[tuple[str, ...], LogicalAxes]
-  .towers(self) -> tuple[Held, ...]
   .trace_key(self) -> Hashable | None
   .traced_by(self, settings: TracedSetting) -> Hashable | None
   .training_flops(self, model, batch: Batch) -> float
@@ -295,7 +294,6 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .task_settings(self) -> DataclassInstance | None
   .tile_head(self, tile: tuple[int, int] | None = None) -> str | None
   .tower_axes(self) -> dict[tuple[str, ...], LogicalAxes]
-  .towers(self) -> tuple[Held, ...]
   .trace_key(self) -> Hashable | None
   .traced_by(self, settings: TracedSetting) -> Hashable | None
   .training_flops(self, model, batch: Batch) -> float
