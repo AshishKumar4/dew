@@ -126,8 +126,9 @@ def truth(arrays: dict, leaves: tuple[str, ...] = LEAVES) -> dict[str, jax.Array
 
 def the_chunked_form_is_as_exact_as_mamba_ssm(kernel: str | None, site: str,
                                               leaves: tuple[str, ...] = LEAVES):
-    """Mamba-3's chunked form on `kernel` (`chunked_on`) on par from float64 with recorded mamba_ssm at `site`'s declared
-    seeds (check 1), its leaves `leaves`, the truth the recurrence a token at a time in float64."""
+    """Mamba-3's chunked form on `kernel` (`chunked_on`) on par from float64 with recorded mamba_ssm at
+    `site`'s declared seeds (check 1), its leaves `leaves`, the truth the recurrence a token at a time in
+    float64."""
     from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 
     seeds = declared_seeds(RECORDED)[site]
