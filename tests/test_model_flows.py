@@ -385,3 +385,16 @@ def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
     # rows of float64 zero.
     assert [finding.rule for finding in stored.value.findings] == [
         finding.rule for finding in computing.value.findings]
+
+
+def test_a_gpu_tier_parts_prepare_runs_under_its_runs_flags():
+    """A GPU tier part's prepare (`DEW_TIER_PREPARE`, on the node's CPU) is configured under the XLA flags
+    its run is (`lane_environment.configure_lane`'s cuda lane), so the programs it compiles load where the
+    run holds them to its own (`dew.training.ahead.BuildTarget.held`: the prepare's CPU lane's devices and
+    scheduler beside the run's deterministic GPU ops refused test_gpu_numerics' vocabulary cell)."""
+    import lane_environment
+
+    node = {"CUDA_VISIBLE_DEVICES": "0"}
+    prepare = lane_environment.configured({**node, "JAX_PLATFORMS": "cpu", "DEW_TIER_PREPARE": "1"})
+    run = lane_environment.configured({**node, "JAX_PLATFORMS": "cuda"})
+    assert prepare["XLA_FLAGS"] == run["XLA_FLAGS"]
