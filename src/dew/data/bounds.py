@@ -1,7 +1,8 @@
 """Where a training read's examples are bounded and counted: the place before which a source example is
 still one example (`_one_example_until`), the bound a run in examples or epochs stands there
-(`_bounded`), and the mark a run counting its passes reads its consumption by (`_bounded`'s `counting`,
-`_countable`); `dew.data.compile` places them as it stages a read."""
+(`_bounded`), and the mark a run counting its passes reads its consumption by (`_counted`,
+`_countable`), both placed by one rule (`_placement`); `dew.data.compile` places them as it stages a
+read."""
 
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from dew.data.pipeline import (
     Phases,
     Pipeline,
     Repeat,
+    Shuffle,
     Stage,
     TokenBudget,
     Windows,
@@ -36,7 +38,7 @@ def _native_after_bound(pipeline: Pipeline) -> bool:
     return at is not None and any(isinstance(stage, Native) for stage in stages[at:])
 
 
-def _bounded(pipeline: Pipeline, examples: int, *, passes: bool = False, counting: bool = False) -> Pipeline:
+def _bounded(pipeline: Pipeline, examples: int, *, passes: bool = False) -> Pipeline:
     """`pipeline`'s training read bounded to its first `examples` source examples: the records as they
     reach the first of the objective's steps that makes several rows of one (`FlatMap.examples`, which
     run after the chain's own record order, `_objective_branch`), or where none does, the first stage that
@@ -46,48 +48,73 @@ def _bounded(pipeline: Pipeline, examples: int, *, passes: bool = False, countin
     bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`); in a
     pool, a read in one order takes the bound before it cuts its shares, and a read whose shares, or a
     share's loading workers, each read records of their own takes on each its part of the pool's first
-    `examples` (`dew.data.lowering._Build.bound_at`). Refuses a bound it cannot place: a repeat with a
-    count before it, or any repeat after it, the batch's included, a mixed corpus that packs on its own,
-    and phases, which end by steps. A chain without a batch is left for `compile` to refuse. A bound of
-    `passes` (a run's epochs) stands where a pass is counted (`_one_example_until`), before a step that
-    rejects a record it cannot make. A `counting` bound marks the examples a run bounded in steps consumes
-    and bounds nothing (`_UNCOUNTED`, `compile`'s `count_passes`): its batch stays as written, the read
-    endless, no short batch made."""
+    `examples` (`dew.data.lowering._Build.bound_at`). Refuses a bound it cannot place (`_placement`). A
+    chain without a batch is left for `compile` to refuse. A bound of `passes` (a run's epochs) stands where
+    a pass is counted (`_one_example_until`), before a step that rejects a record it cannot make."""
     if examples < 1:
         raise ValueError(f"examples must be at least 1, got {examples}")
-    if isinstance(pipeline.source, Phases):
-        raise ValueError("phases end each phase at a step, so their run is bounded in steps, not examples")
-    if any(isinstance(stage, (Pack, Windows)) for child in children(pipeline) for stage in _steps(child)):
-        raise ValueError(f"{_name(pipeline)} packs inside a corpus it mixes, so its records reach the mix as "
-                         "windows; pack after the mix to bound the run in examples")
     batched = _until(pipeline.stages, (BatchStage, TokenBudget))
-    if batched == len(pipeline.stages):
+    if batched == len(pipeline.stages) and not isinstance(pipeline.source, Phases):
         return pipeline
-    at = _one_example_until(pipeline, passes=passes)
-    repeats = [stage for stage in pipeline.stages[:at] if isinstance(stage, Repeat)]
-    if any(stage.epochs is not None for stage in repeats) or any(
-            isinstance(stage, Repeat) for stage in pipeline.stages[at:]):
-        raise ValueError(f"{_name(pipeline)} repeats with a count, or after the records it packs or batches, "
-                         f"which a bound of {examples} examples would cut or repeat; leave the repeat out")
+    at = _placement(pipeline, passes=passes, counting=False)
+    if isinstance(at, str):
+        raise ValueError(at)
+    repeats = any(isinstance(stage, Repeat) for stage in pipeline.stages[:at])
     # Each example the bound reads is consumed by the last row a step makes of it (`MarkConsumed`).
     bound = (*(() if repeats else (Repeat(None),)), Limit(examples), Map(MarkConsumed()))
-    batch = (pipeline.stages[batched] if counting
-             else dataclasses.replace(pipeline.stages[batched], drop_remainder=False))
+    batch = dataclasses.replace(pipeline.stages[batched], drop_remainder=False)
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *bound, *pipeline.stages[at:batched],
                                                  batch, *pipeline.stages[batched + 1:]))
 
 
+def _counted(pipeline: Pipeline) -> Pipeline:
+    """`pipeline`'s read marking each source example it consumes where a pass is counted
+    (`_one_example_until`, `MarkConsumed` alone): a run bounded in steps whose cadence reads its passes
+    (`dew.data.compile`'s `count_passes`), which bounds nothing, so its order, its repeats, its batch and
+    every row it makes are those of the read counting none, the mark adding the count each row carries.
+    Placed only where `_countable` says so."""
+    at = _placement(pipeline, passes=True, counting=True)
+    assert isinstance(at, int), at
+    return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], Map(MarkConsumed()),
+                                                 *pipeline.stages[at:]))
+
+
 def _countable(pipeline: Pipeline) -> bool:
-    """Whether a run bounded in steps can count the examples `pipeline`'s read consumes where a pass is
-    counted (`_bounded`'s `counting`): a bound it can place there, so a read whose bound would be refused
-    (phases, a corpus that packs inside a mix, a repeat after the place or one with a count before it)
-    reads as it would counting none, its passes uncounted."""
-    if isinstance(pipeline.source, Phases) or any(
-            isinstance(stage, (Pack, Windows)) for child in children(pipeline) for stage in _steps(child)):
-        return False
-    at = _one_example_until(pipeline, passes=True)
-    return not any(isinstance(stage, Repeat) and (index >= at or stage.epochs is not None)
-                   for index, stage in enumerate(pipeline.stages))
+    """Whether a run bounded in steps can count the examples `pipeline`'s read consumes (`_counted`,
+    `_placement`): a read it could not count where a pass is counted reads as it would counting none, its
+    passes uncounted."""
+    return isinstance(_placement(pipeline, passes=True, counting=True), int)
+
+
+def _placement(pipeline: Pipeline, *, passes: bool, counting: bool) -> int | str:
+    """Where the examples `pipeline`'s training read consumes are marked (`_one_example_until`), or why
+    they cannot be: the one rule a bound in examples (`_bounded`) and a count of passes (`_counted`) place
+    by. Neither stands in phases, which end by steps, nor in a mixed corpus that packs on its own, whose
+    records reach the mix as windows. A bound refuses a repeat with a count before it, or any repeat after
+    it, the batch's included, which would cut or repeat what it bounds; a count, which bounds nothing,
+    reads every repeat as written, and stands nowhere a native Grain step after it would drop its count, or
+    a shuffle after a layout after it would hold back each example's windows until all were read
+    (`dew.data.lowering._completes`), which a read counting none would not."""
+    name = _name(pipeline)
+    if isinstance(pipeline.source, Phases):
+        return "phases end each phase at a step, so their run is bounded in steps, not examples"
+    if any(isinstance(stage, (Pack, Windows)) for child in children(pipeline) for stage in _steps(child)):
+        return (f"{name} packs inside a corpus it mixes, so its records reach the mix as windows; pack after "
+                "the mix to bound the run in examples")
+    at = _one_example_until(pipeline, passes=passes)
+    stages = pipeline.stages
+    if counting:
+        after = stages[at:]
+        laid = next((index for index, stage in enumerate(after) if isinstance(stage, (Pack, Windows))), None)
+        if any(isinstance(stage, Native) for stage in after) or (
+                laid is not None and any(isinstance(stage, Shuffle) for stage in after[laid:])):
+            return f"{name} drops or holds back the count of what it consumes after its pass is counted"
+        return at
+    if any(isinstance(stage, Repeat) and (index >= at or stage.epochs is not None)
+           for index, stage in enumerate(stages)):
+        return (f"{name} repeats with a count, or after the records it packs or batches, which a bound in "
+                "examples would cut or repeat; leave the repeat out")
+    return at
 
 
 def _expands(stage: Stage) -> bool:

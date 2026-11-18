@@ -64,7 +64,15 @@ from dew.data.analysis import (
     same_stage,
     written,
 )
-from dew.data.bounds import _bounded, _countable, _expands, _lays_out, _native_after_bound, _one_example_until
+from dew.data.bounds import (
+    _bounded,
+    _countable,
+    _counted,
+    _expands,
+    _lays_out,
+    _native_after_bound,
+    _one_example_until,
+)
 from dew.data.compilation import compiling, within
 from dew.data.dataset import (
     Closeable,
@@ -578,6 +586,9 @@ class _Measured:
     """Where its training read is bounded ahead of what its memory would hold (`_held_ahead`): its
     expansion, to a count set once it holds the examples (`_UNCOUNTED`, `_staged`), or its pack, the bound
     held with it, its passes counted as it holds them (`Limit.passes`); None for neither."""
+    counted: int | None = None
+    """The source examples one pass holds of a memory read a run counting its passes marks ahead of the
+    expansion it holds (`_counted`), counted before it held them; None for any other read."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -628,16 +639,23 @@ def _measure(
         )
     # A memory read whose expansion it would hold is bounded before that expansion as it holds the rest, to
     # a count set once it holds them (`_staged`).
-    # A run that counts its passes (`counting`) holds no pass of a pack ahead, as it reads on without end,
-    # nor bounds a read it cannot count (`_countable`).
     counting = counting and training and _countable(branches[0])
     ahead = None if (epochs is None and not counting) or not training else _held_ahead(branches[0], read)
-    ahead = None if counting and ahead == "layout" else ahead
-    examples = _UNCOUNTED if ahead is not None else examples
-    if examples is not None and training:
-        branches = (_bounded(branches[0], examples, counting=counting), *branches[1:])
-        if ahead == "layout":
-            branches = (_rebound(branches[0], _UNCOUNTED, epochs), *branches[1:])
+    counted = None
+    if counting:
+        # A run that counts its passes marks a memory read's examples ahead of the expansion it holds
+        # (`_counted`), its pass the source examples reaching the mark, counted before it holds them; it
+        # holds no pack's passes ahead, reading on without end, and bounds nothing.
+        counted = _pass_examples(branches[0], read, None, passes=True) if ahead == "expansion" else None
+        ahead = "expansion" if counted is not None else None
+        if counted is not None:
+            branches = (_counted(branches[0]), *branches[1:])
+    else:
+        examples = _UNCOUNTED if ahead is not None else examples
+        if examples is not None and training:
+            branches = (_bounded(branches[0], examples), *branches[1:])
+            if ahead == "layout":
+                branches = (_rebound(branches[0], _UNCOUNTED, epochs), *branches[1:])
     if any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch)):
         def stored(branch: Pipeline) -> bool:
             return any(len(source.records(read)) for _, source in _leaves(branch))
@@ -653,8 +671,8 @@ def _measure(
             if training and not stored(branches[0]):
                 raise ValueError(f"no accepted rows of {_name(branches[0])}; raise the row budgets")
             metadata = _metadata(branches, read)
-        return _Measured(tuple(branches), metadata, tuple(counts or ()), ahead)
-    return _Measured(tuple(branches), None, tuple(counts or ()), ahead)
+        return _Measured(tuple(branches), metadata, tuple(counts or ()), ahead, counted)
+    return _Measured(tuple(branches), None, tuple(counts or ()), ahead, counted)
 
 
 def _made(prepared: Sequence[Pipeline], read: Read, counts: Sequence[dict[str, CorpusCounts]], *,
@@ -897,30 +915,27 @@ def _staged(
                             _bounded(train, epochs * passes, passes=True)))
         build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
     elif counting and measured.ahead == "expansion":
-        # Its bound held ahead of the expansion its read holds, to no count (`_UNCOUNTED`): it marks what
-        # the run consumes, the examples a pass reaches it with its pass.
-        passes = _pass_examples(train, read, build, passes=False)
+        # Marked ahead of the expansion its read holds (`_measure`): a pass the source examples it held.
+        passes = measured.counted
     elif counting:
         # A run bounded in steps whose cadence counts its passes (`compile`'s `count_passes`): where its read
-        # has no record count but states a pass's source examples, the examples it consumes are marked
-        # where a pass is counted, with no bound (`_bounded`'s `counting`); read endlessly otherwise.
+        # has no record count but states a pass's source examples, each one it consumes is marked where a
+        # pass is counted, with no bound (`_counted`), its read as it would be counting none.
         passes = (None if epoch_records(train, build) is not None or not _countable(train)
                   else _pass_examples(train, read, build, passes=True))
-        original, train = ((_endless(original), _endless(train)) if passes is None else
-                           (_bounded(original, _UNCOUNTED, passes=True, counting=True),
-                            _bounded(train, _UNCOUNTED, passes=True, counting=True)))
-        build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
+        if passes is not None:
+            original, train = _counted(original), _counted(train)
+            build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
     return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens, passes,
                    mirrored=measured.mirrored)
 
 
 _UNCOUNTED = UNCOUNTED
 """The bound in examples a memory read whose expansion it would hold takes before it holds them, past any
-count, set to its epochs' passes once it holds them (`_rebound`, `_staged`), or left so where the run counts
-its passes (`counting_only`)."""
+count, set to its epochs' passes once it holds them (`_rebound`, `_staged`)."""
 
 
-def _pass_examples(train: Pipeline, read: Read, build: _Build, *, passes: bool) -> int | None:
+def _pass_examples(train: Pipeline, read: Read, build: _Build | None, *, passes: bool) -> int | None:
     """The source examples one pass of a training read with no record count holds (`Loader.pass_examples`,
     `dew.data.epochs.epoch_records`): those reaching where a bound in examples stands (`_bounded`:
     the first step that packs or windows them or makes several rows of each, else the batch), before any
@@ -970,6 +985,8 @@ def _pass_examples(train: Pipeline, read: Read, build: _Build, *, passes: bool) 
             return None
         count = sum(known)
     elif read == "streamed" and not _in_memory(source):
+        if build is None:
+            return None
         stated = [shard.rows for shard in
                   source.manifest().sized(build.stream_loading.threads).shards]
         held = [rows for rows in stated if rows is not None]
@@ -2232,7 +2249,7 @@ def fitted[Entry](
         # Phases count no pass: each ends at its step (`_compile_phases`).
         counting = (count_passes and examples is None and epochs is None
                     and not isinstance(chain.source, Phases))
-        trained = chain if examples is not None or epochs is not None or counting else _endless(chain)
+        trained = chain if examples is not None or epochs is not None else _endless(chain)
         read = trained.mode or _preferred_read((trained,), provision=True)
         # A run of phases compiles each phase on its own (`_compile_phases`), each binding the widths
         # measured over every phase and held chain (data.md §10, `run_widths`).

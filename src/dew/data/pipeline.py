@@ -773,22 +773,24 @@ def _main_importable() -> bool:
 
 UNCOUNTED = 1 << 62
 """A bound in examples past any count: a run's bound before a memory read holds the examples it counts
-(`dew.data.compile._rebound`), or the bound of a run that counts its passes and bounds nothing
-(`dew.data.compile`'s `count_passes`), whose read marks them alone (`counting_only`)."""
+(`dew.data.compile._rebound`), set to its epochs' passes once it holds them."""
+
+
+def examples_limit(stages: Sequence[object]) -> int | None:
+    """Where a run bounded in examples stops reading (the limit before its mark, `examples_bound`): its index
+    in `stages`, None for a read marked with no bound, as a run counting its passes marks it
+    (`dew.data.bounds._counted`), or a read with no mark."""
+    at = examples_bound(stages)
+    return at - 1 if at is not None and at > 0 and isinstance(stages[at - 1], Limit) else None
 
 
 def counting_only(stages: Sequence[object]) -> frozenset[int]:
-    """The places among `stages` of a bound that bounds nothing (`UNCOUNTED`, a run counting its passes):
-    its limit and its mark (`MarkConsumed`), which change no row and no record the read makes, so no plan
-    or order states them, a run counting its passes resuming one saved without them, and its own resumed
-    by one that counts none."""
+    """The place among `stages` of a mark with no bound (a run counting its passes,
+    `dew.data.bounds._counted`), which changes no record the read makes and none of its order, so no plan
+    or order states it: a run counting its passes resumes one saved without it, and its own is resumed by
+    one that counts none."""
     at = examples_bound(stages)
-    if at is None or at == 0:
-        return frozenset()
-    limit = stages[at - 1]
-    if not isinstance(limit, Limit) or limit.count != UNCOUNTED or limit.passes is not None:
-        return frozenset()
-    return frozenset({at - 1, at})
+    return frozenset() if at is None or examples_limit(stages) is not None else frozenset({at})
 
 
 def examples_bound(stages: Sequence[object]) -> int | None:

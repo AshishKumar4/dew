@@ -91,3 +91,104 @@ def test_a_checkpoint_saved_before_its_run_counted_reads_its_count_off_a_global_
     shared: dict = {}
     Interval.counted_before(shared, json.dumps({_position.PLAN: {}, "iterator": {}}).encode())
     assert shared == {}
+
+
+def _identity_map(rows):
+    return rows
+
+
+def _chain(read: str, *, shard_rows: int = 3):
+    """Ten records, shuffled, read `read`, an objective making `id % 3 + 1` rows of each (`Questioned`),
+    in batches of four."""
+    import numpy as np
+
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+
+    ids = np.arange(1, 11, dtype=np.int32)
+    shuffled = {"seed": 3, "window": 10} if read == "streamed" else {"seed": 3}
+    return Pipeline(Memory({"id": ids}, shard_rows=shard_rows)).shuffle(**shuffled).read(read).batch(4)
+
+
+def _loader(chain, *, counting: bool, workers: int = 0, expands: bool = True):
+    """`chain` compiled for a run of eight steps, counting its passes or not, its objective making rows of
+    each record where it `expands` (`Questioned`)."""
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+    from dew.data.dataset import Loading
+    from dew.data.pipeline import ObjectiveData
+
+    objective = ObjectiveData(train=(Questioned(),)) if expands else ObjectiveData()
+    loader, _ = fitted(chain.loading(Loading(workers=workers)), None, objective=objective, steps=8,
+                       count_passes=counting)
+    return loader
+
+
+def _ids(stream, batches: int) -> list[list[int]]:
+    import itertools
+
+    import numpy as np
+
+    return [np.asarray(batch["id"]).tolist() for batch in itertools.islice(stream, batches)]
+
+
+def test_a_streamed_read_its_workers_deal_counts_its_passes_and_reads_as_one_counting_none():
+    """A streamed read of shards two loading workers each read their own of, which counts its passes,
+    reads the batches the same read counting none reads, its examples counted beside them: its count
+    bounds nothing, so no worker is dealt a part of a bound (`examples_limit`), which a counting bound
+    past any count made each worker read ahead for without end (the theme's review, F1)."""
+    plain = _loader(_chain("streamed"), counting=False, workers=2)
+    counting = _loader(_chain("streamed"), counting=True, workers=2)
+    assert counting.pass_examples == 10
+    streams = [loader.train(DataPartition()) for loader in (plain, counting)]
+    try:
+        assert _ids(streams[1], 6) == _ids(streams[0], 6)
+    finally:
+        for stream in streams:
+            stream.close()
+
+
+def test_a_position_saved_counting_or_not_resumes_in_a_read_doing_the_other():
+    """A streamed read's position saved by a run counting its passes resumes in one counting none, and the
+    other way round, onto the batches the run that saved it reads next: the count adds no stage to its
+    read's state, nor to its plan or order (`counting_only`), where a counting bound's limit held state of
+    its own the other run's read could not restore (the theme's review, F2)."""
+    for saving, resuming in ((False, True), (True, False)):
+        saved, after = _loader(_chain("streamed"), counting=saving), _loader(_chain("streamed"),
+                                                                              counting=resuming)
+        first, second = saved.train(DataPartition()), after.train(DataPartition())
+        try:
+            _ids(first, 3)
+            second.set_state(first.get_state())
+            assert _ids(second, 4) == _ids(first, 4)
+        finally:
+            first.close()
+            second.close()
+
+
+def test_a_read_whose_count_would_change_its_rows_counts_no_pass_and_reads_as_before():
+    """A memory read that packs its records and shuffles the windows after, and an indexed one a native Grain
+    step reads after its pack, count no pass where their cadence would read one (`_countable`): marking the
+    first would hold each example's windows back until all were read, and the second's native step keeps
+    no count. Each reads the batches it reads counting none, its passes uncounted, where it reordered its
+    rows or was refused (the theme's review, F3 and F4)."""
+    import numpy as np
+
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+
+    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(12)]
+    packed = Pipeline(Memory(documents)).shuffle(seed=1).pack(8, fields=("id",)).shuffle(seed=2).read(
+        "memory").batch(2)
+    native = Pipeline(Memory(documents)).pack(8, fields=("id",)).grain(
+        _identity_map, identity="identity@1").read("indexed").batch(2)
+    for chain in (packed, native):
+        plain, counting = (_loader(chain, counting=asked, expands=False) for asked in (False, True))
+        assert counting.pass_examples is None
+        streams = [loader.train(DataPartition()) for loader in (plain, counting)]
+        try:
+            assert _ids(streams[1], 4) == _ids(streams[0], 4)
+        finally:
+            for stream in streams:
+                stream.close()
