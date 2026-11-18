@@ -1427,8 +1427,11 @@ def write_device_tiny(name: str, model: PreTrainedModel, device: str, command: s
     ids = np.load(directory / "input_ids.npy")
     if not isinstance(model, GenerationMixin):
         raise TypeError(f"{type(model).__name__} generates no continuation")
+    # transformers declares `device` apart on PreTrainedModel and GenerationMixin, which hides
+    # `generate` from the checker.
+    generating: Any = model
     with torch.no_grad():
-        generated = model.generate(torch.tensor(ids[:1, :4], device=device), do_sample=False,
+        generated = generating.generate(torch.tensor(ids[:1, :4], device=device), do_sample=False,
                                    max_new_tokens=6, eos_token_id=None, pad_token_id=0)
     np.save(directory / "generated.npy", generated.cpu().numpy())
     (directory / "meta.json").write_text(json.dumps({

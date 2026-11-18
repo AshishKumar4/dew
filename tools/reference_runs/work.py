@@ -35,7 +35,7 @@ def measure(objective: Objective[Any, Any], batch: Batch) -> WorkloadWork:
 
     A model with no token geometry, a U-Net's convolutions, counts no tokens.
     """
-    if (sample := objective.inputs.sample) is None:
+    if objective.inputs is None or (sample := objective.inputs.sample) is None:
         raise ValueError(f"{type(objective).__name__} names no sample input to shape its batch by")
     model = objective.program_key()[0].module
     try:

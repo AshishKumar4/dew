@@ -222,13 +222,15 @@ def build_pipeline(root: Path):
         vocab_size=tokenizer_2.vocab_size, d_model=PIPELINE["joint_attention_dim"], d_ff=32,
         num_layers=2, num_heads=2, d_kv=8, relative_attention_num_buckets=8,
         feed_forward_proj="gated-gelu")).eval()
-    vae = AutoencoderKL(in_channels=3, out_channels=3, block_out_channels=(4, 8),
-                        down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D"),
-                        up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D"),
-                        layers_per_block=1, latent_channels=PIPELINE["in_channels"] // 4,
-                        norm_num_groups=2, sample_size=PIPELINE_SIZE, shift_factor=0.1159,
-                        scaling_factor=0.3611, use_quant_conv=False,
-                        use_post_quant_conv=False).eval()
+    # Diffusers types each per-block tuple as a 1-tuple (`tuple[int]`); these are its config's values.
+    autoencoder: dict[str, Any] = dict(
+        in_channels=3, out_channels=3, block_out_channels=(4, 8),
+        down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D"),
+        up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D"),
+        layers_per_block=1, latent_channels=PIPELINE["in_channels"] // 4,
+        norm_num_groups=2, sample_size=PIPELINE_SIZE, shift_factor=0.1159,
+        scaling_factor=0.3611, use_quant_conv=False, use_post_quant_conv=False)
+    vae = AutoencoderKL(**autoencoder).eval()
     pipe = FluxPipeline(
         scheduler=FlowMatchEulerDiscreteScheduler(
             num_train_timesteps=1000, use_dynamic_shifting=True, base_shift=0.5, max_shift=1.15,

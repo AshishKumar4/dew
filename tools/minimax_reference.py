@@ -95,7 +95,7 @@ def remote():
     import transformers.utils.import_utils as import_utils
 
     if not hasattr(import_utils, 'is_torch_fx_available'):
-        import_utils.is_torch_fx_available = lambda: False
+        vars(import_utils)["is_torch_fx_available"] = lambda: False
     configuration, modeling = hub_modules(f"minimax_remote_{REVISION[:8]}", REPO, REVISION,
                                           ('configuration_minimax_text_01.py', 'modeling_minimax_text_01.py'))
     modeling._flash_supports_window_size = False

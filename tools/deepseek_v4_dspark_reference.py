@@ -139,7 +139,7 @@ def import_reference():
     module = loaded("deepseek_v4_0731_model",
                     hf_hub_download(REPO, "inference/model.py", revision=DEEPSEEK_V4_0731_REVISION))
     v41.set_quantizers(module, enabled=False)
-    module.rotate_activation = lambda x: x
+    vars(module)["rotate_activation"] = lambda x: x  # the published module's own, replaced
     v41.install_selection_probe()
     return module
 

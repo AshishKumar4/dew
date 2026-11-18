@@ -37,7 +37,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import BinaryIO
+from typing import IO, BinaryIO
 
 import numpy as np
 
@@ -106,7 +106,7 @@ FRAME = struct.Struct("<Q")
 """A frame's size, its header: what `send` writes before the frame's bytes and `received` reads first."""
 
 
-def send(stream: BinaryIO, arrays: Mapping[str, np.ndarray]) -> None:
+def send(stream: IO[bytes], arrays: Mapping[str, np.ndarray]) -> None:
     """`arrays` as one frame to the other end of a pipe (`received`)."""
     buffer = io.BytesIO()
     np.savez(buffer, allow_pickle=False, **arrays)
@@ -115,7 +115,7 @@ def send(stream: BinaryIO, arrays: Mapping[str, np.ndarray]) -> None:
     stream.flush()
 
 
-def received(stream: BinaryIO) -> dict[str, np.ndarray] | None:
+def received(stream: IO[bytes]) -> dict[str, np.ndarray] | None:
     """The arrays of the next frame the other end sent (`send`), or None where it closed the pipe between
     frames. A frame cut short, in its size or its bytes, is an EOFError."""
     header = stream.read(FRAME.size)

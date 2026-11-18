@@ -274,6 +274,8 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
     devices = jax.device_count()
     timed = throughput(curves.window_seconds, curves.timed_steps, args.batch * run.seq)
     hf_config = json.loads(Path(args.model, "config.json").read_text())
+    if not run.work.tokens_per_step:
+        raise ValueError("the measured work counts no tokens to price a token's flops by")
     flops_token = run.work.training_flops_per_step / run.work.tokens_per_step
     peak_rate = peak_flops(device_kind)
     stats = [device.memory_stats() or {} for device in jax.local_devices()]

@@ -46,7 +46,7 @@ def generate(root):
     initial = torch.randn((256, 3), generator=torch.Generator().manual_seed(61), dtype=torch.float64) * 8
     arrays = {"initial": initial.to(torch.float32).numpy()}
 
-    def walk(cls: Any, options: dict[str, Any], dtype):
+    def walked(cls: Any, options: dict[str, Any], dtype):
         """Four steps of a scheduler `cls` (Diffusers' schedulers share this surface but type none of it)."""
         scheduler = cls(**common, **options)
         scheduler.set_timesteps(4)
@@ -67,7 +67,7 @@ def generate(root):
         ("dpm-karras", DPMSolverMultistepScheduler, dict(use_karras_sigmas=True)),
     ]
     for name, cls, options in walks:
-        scheduler, trajectory = walk(cls, options, torch.float32)
+        scheduler, trajectory = walked(cls, options, torch.float32)
         scheduler.save_pretrained(root / name)
         config = json.loads((root / name / "scheduler_config.json").read_text())
         arrays[name + ".config"] = np.asarray(json.dumps(config))
@@ -78,7 +78,7 @@ def generate(root):
         arrays[name + ".trajectory"] = trajectory
         arrays[name + ".final"] = trajectory[-1]
         with float64_scheduler(sys.modules[cls.__module__]):
-            scheduler, trajectory = walk(cls, options, torch.float64)
+            scheduler, trajectory = walked(cls, options, torch.float64)
         arrays[name + ".betas.fp64"] = scheduler.betas.numpy()
         arrays[name + ".final.fp64"] = trajectory[-1]
     np.savez_compressed(root / "schedulers.npz", allow_pickle=False, **arrays)

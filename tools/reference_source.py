@@ -49,11 +49,11 @@ def stub_torch_utils() -> None:
     import torch
 
     persistence = types.ModuleType("torch_utils.persistence")
-    persistence.persistent_class = lambda cls: cls
+    vars(persistence)["persistent_class"] = lambda cls: cls
     misc = types.ModuleType("torch_utils.misc")
-    misc.const_like = lambda ref, value: torch.as_tensor(value, dtype=ref.dtype, device=ref.device)
+    vars(misc)["const_like"] = lambda ref, value: torch.as_tensor(value, dtype=ref.dtype, device=ref.device)
     package = types.ModuleType("torch_utils")
-    package.persistence, package.misc = persistence, misc
+    vars(package).update(persistence=persistence, misc=misc)
     sys.modules.update({"torch_utils": package, "torch_utils.persistence": persistence,
                         "torch_utils.misc": misc})
 

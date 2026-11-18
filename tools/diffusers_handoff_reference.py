@@ -16,6 +16,7 @@ import contextlib
 import functools
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -45,7 +46,9 @@ def pipelines(root: Path, dtype: torch.dtype):
     base = root / "xl"
     config = returned(DDIMScheduler.load_config(base, subfolder="scheduler"), dict)
     scheduler = returned(DDIMScheduler.from_config(config), DDIMScheduler)
-    first = StableDiffusionXLPipeline(
+    # The pipeline types its scheduler as Diffusers' enum of scheduler names, not a scheduler: its
+    # components as the pipeline takes them.
+    components: dict[str, Any] = dict(
         vae=AutoencoderKL.from_pretrained(base, subfolder="vae", torch_dtype=dtype),
         text_encoder=CLIPTextModel.from_pretrained(base, subfolder="text_encoder", dtype=dtype),
         text_encoder_2=CLIPTextModelWithProjection.from_pretrained(base, subfolder="text_encoder_2",
@@ -54,6 +57,7 @@ def pipelines(root: Path, dtype: torch.dtype):
         tokenizer_2=CLIPTokenizer.from_pretrained(base, subfolder="tokenizer_2"),
         unet=UNet2DConditionModel.from_pretrained(base, subfolder="unet", torch_dtype=dtype),
         scheduler=scheduler)
+    first = StableDiffusionXLPipeline(**components)
     second = StableDiffusionXLImg2ImgPipeline.from_pretrained(root / "refiner", torch_dtype=dtype)
     return first, second
 

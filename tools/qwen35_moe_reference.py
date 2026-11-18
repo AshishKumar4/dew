@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -58,11 +59,12 @@ def main():
     valid = encoded['attention_mask'].bool()
     logits = torch.zeros((*encoded['input_ids'].shape, 256))
     continuation = []
+    generating: Any = model  # transformers declares `device` apart on PreTrainedModel and GenerationMixin
     for row, single in enumerate(_row_slices(encoded, model)):
         single = {name: value.to('cuda') for name, value in single.items()}
         with torch.no_grad():
             logits[row, valid[row]] = model(**single, use_cache=False).logits[0].cpu()
-            generated = model.generate(**single, max_new_tokens=3, do_sample=False, eos_token_id=None)
+            generated = generating.generate(**single, max_new_tokens=3, do_sample=False, eos_token_id=None)
             continuation.append(generated[0, single['input_ids'].shape[1]:].cpu())
     plain = dict(tokenizer(['token7 token9', 'token5 token8'], return_tensors='pt', padding=True))
     with torch.no_grad():

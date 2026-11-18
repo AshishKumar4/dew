@@ -430,7 +430,11 @@ def glm5_prediction_logits(case: Case, directory: Path, ids: np.ndarray) -> np.n
         else:
             prepared[name] = value
     for target, converter in pending.items():
-        prepared.update(converter.convert(target, config=model.config))
+        # Each target's one tensor, which transformers' conversion base types as a list of them.
+        for key, value in converter.convert(target, config=model.config).items():
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"{target}'s conversion gave {type(value).__name__} for {key}, not a tensor")
+            prepared[key] = value
     depth.load_state_dict(prepared, strict=True)
     tokens = torch.from_numpy(np.asarray(ids, np.int64))
     with torch.no_grad(), lower_index_ties(model), lower_index_ties(model, depth):

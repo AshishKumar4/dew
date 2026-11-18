@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -187,9 +187,12 @@ def write_generation(name: str) -> None:
               "eos_token_id": None, "use_cache": True, "return_dict_in_generate": True,
               "output_logits": True}
     with torch.no_grad():
-        greedy = model.generate(**common, do_sample=False, num_beams=1)
+        # transformers declares `device` apart on PreTrainedModel and GenerationMixin, which hides
+        # `generate` from the checker.
+        generating: Any = model
+        greedy = generating.generate(**common, do_sample=False, num_beams=1)
         torch.manual_seed(SAMPLE_SEED)
-        sampled = model.generate(**common, do_sample=True, temperature=TEMPERATURE, top_k=TOP_K,
+        sampled = generating.generate(**common, do_sample=True, temperature=TEMPERATURE, top_k=TOP_K,
                                  top_p=TOP_P)
     arrays: dict[str, np.ndarray] = {"prompt": ids, "mask": mask}
     with float64():

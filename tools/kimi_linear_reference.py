@@ -59,6 +59,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -159,12 +160,11 @@ def remote_modules():
     `auto_docstring` the identity while they import (the first of the changes above)."""
     import transformers.utils
 
-    documented = transformers.utils.auto_docstring
-    transformers.utils.auto_docstring = lambda obj=None, **kwargs: obj if obj is not None else (lambda inner: inner)
-    try:
+    def identity(obj=None, **kwargs):
+        return obj if obj is not None else (lambda inner: inner)
+
+    with patch.object(transformers.utils, "auto_docstring", identity):
         return hub_modules("kimi_linear_remote", REPO, REVISION, REMOTE)
-    finally:
-        transformers.utils.auto_docstring = documented
 
 
 def record_released_padding() -> None:

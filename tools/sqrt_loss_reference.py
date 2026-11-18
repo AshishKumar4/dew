@@ -74,7 +74,7 @@ def main() -> None:
 
     for dtype, suffix in ((torch.float32, ""), (torch.float64, "_f64")):
         # The published table read at the run's precision: its `.float()` the run's dtype.
-        gd._extract_into_tensor = float_scoped(published_read, dtype)
+        vars(gd)["_extract_into_tensor"] = float_scoped(published_read, dtype)
         a, c = (torch.tensor(arrays[name], dtype=dtype) for name in ("a", "c"))
         offset = torch.zeros(SHAPE, dtype=dtype, requires_grad=True)
 
@@ -88,7 +88,7 @@ def main() -> None:
         if (gradient := offset.grad) is None:
             raise RuntimeError("the backward pass left the offset without its gradient")
         landed[f"grad{suffix}"] = gradient.numpy()
-    gd._extract_into_tensor = published_read
+    vars(gd)["_extract_into_tensor"] = published_read
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out, allow_pickle=False, **landed)
     print(f"{out}: loss {landed['loss_f64']}")

@@ -231,7 +231,7 @@ def imported() -> None:
     # never uses it; that module imports FlaxCLIPTextModel, which
     # transformers 5 dropped, so an empty module stands in for it.
     pipeline = types.ModuleType("diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion")
-    pipeline.FlaxStableDiffusionPipeline = None
+    vars(pipeline)["FlaxStableDiffusionPipeline"] = None
     sys.modules.setdefault(pipeline.__name__, pipeline)
 
 

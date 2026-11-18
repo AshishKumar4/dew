@@ -10,12 +10,14 @@ torch's.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 import torch
 
 
 def recorded_vjp(side: str, outputs: dict[str, torch.Tensor], inputs: dict[str, torch.Tensor],
-                 named: list[tuple[str, torch.Tensor]], generator: torch.Generator, *,
+                 named: Sequence[tuple[str, torch.Tensor]], generator: torch.Generator, *,
                  reached: bool = False) -> dict[str, np.ndarray]:
     """`side`'s (encode or decode) VJP: a standard normal probe drawn from
     `generator` for each of `outputs`, in order, and the gradient of the sum
