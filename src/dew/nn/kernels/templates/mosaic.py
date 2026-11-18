@@ -1647,7 +1647,9 @@ class Transport[Allocated, Opened](abc.ABC):
         own; a warpgroup MMA's awaited before its accumulator finishes), then it arrives at `walked`'s
         barrier, of as many arrivals as a ring's slot has readers; a tile is written only after every
         consumer's arrival, so after every read of every slot, and no load lands past a consumer-fed walk's
-        last step. Each consumer passes `walked` once, before its first write `after`."""
+        last step. Each consumer passes `walked` once, before its first write `after`. This order is the
+        union's proof obligation, which no interpreted cell witnesses yet: the GPU interpreter's race
+        detection flags the plain consumer-fed ring itself (row 7853)."""
         names = tuple(streams)
         slots = tuple(streams[name]["smem"] for name in names)
         rest = {name: {key: value for key, value in streams[name].items() if key != "smem"} for name in names}
