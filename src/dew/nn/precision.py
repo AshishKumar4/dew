@@ -1310,15 +1310,32 @@ def two_sum(left, right):
     return total, (left - (total - part)) + (right - part)
 
 
+def float_bits(x: jax.Array) -> tuple[jax.Array, ...]:
+    """A float `x` (fp32 or float64) from its bits, each a signed integer of its width: its sign bit, its
+    biased exponent, its fraction, its fraction normalized as a normal one's (a subnormal's leading bit moved
+    up to the implicit bit's place and dropped) and its binary exponent `floor(log2 |x|)`, a subnormal's
+    below the least normal: `(sign, biased, fraction, normalized, exponent)`. Read from its bits, a
+    subnormal is kept where a process's float multiply flushes a subnormal operand (XLA's CPU, row 4023):
+    the one reading `binade_of`, `raised_exactly` and `aligned_sum` take."""
+    limits = jnp.finfo(x.dtype)
+    signed = jnp.dtype(f"int{limits.bits}")
+    bias, width = limits.maxexp - 1, limits.nmant
+    bits = jax.lax.bitcast_convert_type(x, signed)
+    biased = (bits >> width) & (2 * limits.maxexp - 1)
+    fraction = bits & ((1 << width) - 1)
+    sign = bits & np.array(-(1 << (limits.bits - 1)), signed)
+    up = jnp.clip(width - (limits.bits - 1 - jax.lax.clz(fraction)), 0, width)
+    normalized = jnp.where(biased > 0, fraction, (fraction << up) & ((1 << width) - 1))
+    exponent = jnp.where(biased > 0, biased - bias, limits.minexp - up)
+    return sign, biased, fraction, normalized, exponent
+
+
 def binade_of(x: jax.Array) -> jax.Array:
-    """`floor(log2(|x|))` of an fp32 `x` from its bits, int32, a subnormal's by its significand's leading
-    bit (its arithmetic on a process that flushes subnormal operands reads none of it), -1024 for zero."""
-    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
-    fraction = bits & np.uint32(0x7FFFFF)
-    leading = 31 - jax.lax.clz(fraction).astype(jnp.int32)
-    subnormal = jnp.where(fraction > 0, leading - 149, -1024)
-    return jnp.where(biased > 0, biased - 127, subnormal)
+    """`floor(log2(|x|))` of an fp32 `x` from its bits (`float_bits`), int32, a subnormal's by its
+    significand's leading bit (its arithmetic on a process that flushes subnormal operands reads none of
+    it), -1024 for zero."""
+    _, biased, fraction, _, exponent = float_bits(x.astype(jnp.float32))
+    return jnp.where((biased == 0) & (fraction == 0), -1024, exponent).astype(jnp.int32)
 
 
 def raised_exactly(x: jax.Array, k: jax.Array) -> jax.Array:
@@ -1326,18 +1343,11 @@ def raised_exactly(x: jax.Array, k: jax.Array) -> jax.Array:
     subnormal `x` normalized by its significand's leading bit, so a process whose float32 multiply flushes a
     subnormal operand (XLA's CPU, row 4023) still raises it. The result at most fp32's largest; an infinity
     or NaN as it is."""
-    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-    sign = bits & np.uint32(0x80000000)
-    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
-    fraction = bits & np.uint32(0x7FFFFF)
-    target = binade_of(x) + k
-    # A subnormal's significand, its leading bit at bit 23 of a normal one, the rest its fraction.
-    leading = 31 - jax.lax.clz(fraction).astype(jnp.int32)
-    up = jnp.clip(23 - leading, 0, 23).astype(jnp.uint32)
-    normalized = jnp.where(biased > 0, fraction, (fraction << up) & np.uint32(0x7FFFFF))
-    normal = sign | (jnp.clip(target + 127, 1, 254).astype(jnp.uint32) << 23) | normalized
+    sign, biased, fraction, normalized, exponent = float_bits(x.astype(jnp.float32))
+    target = exponent + k
+    normal = sign | (jnp.clip(target + 127, 1, 254) << 23) | normalized
     # Still below the least normal: the subnormal's significand shifted up by `k`.
-    below = sign | (fraction << jnp.clip(k, 0, 31).astype(jnp.uint32))
+    below = sign | (fraction << jnp.clip(k, 0, 31))
     raised = jnp.where(target >= -126, normal, below)
     kept = (biased == 0xFF) | ((biased == 0) & (fraction == 0))
     return jnp.where(kept, x.astype(jnp.float32), jax.lax.bitcast_convert_type(raised, jnp.float32))
@@ -1617,23 +1627,14 @@ def vanishing(dtype, base2: bool = False) -> float:
 def _binades(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """A float `x` (fp32 or float64) as its significand in [1, 2) (its sign kept; zero's zero) and its
     binary exponent as a whole number of its dtype, a subnormal's below the least normal: exactly `x =
-    significand 2^exponent`, from its bits alone, a subnormal normalized by its fraction's leading bit
-    (`raised_exactly`'s way), so a process whose multiply flushes a subnormal operand (XLA's CPU) keeps it:
-    lifted by a multiply, `2^-140 2^100` summed to zero (base review 675f2c056 F2)."""
-    limits = jnp.finfo(x.dtype)
-    signed = jnp.dtype(f"int{limits.bits}")
-    bias, width = limits.maxexp - 1, limits.nmant
-    bits = jax.lax.bitcast_convert_type(x, signed)
-    biased = (bits >> width) & (2 * limits.maxexp - 1)
-    fraction = bits & ((1 << width) - 1)
-    sign = bits & np.array(-(1 << (limits.bits - 1)), signed)
-    # A subnormal's leading bit moved up to a normal significand's, its exponent below the least normal.
-    up = jnp.clip(width - (limits.bits - 1 - jax.lax.clz(fraction)), 0, width)
-    normalized = jnp.where(biased > 0, fraction, (fraction << up) & ((1 << width) - 1))
+    significand 2^exponent`, from its bits (`float_bits`), so a process whose multiply flushes a subnormal
+    operand (XLA's CPU) keeps it: lifted by a multiply, `2^-140 2^100` summed to zero (base review
+    675f2c056 F2)."""
+    sign, biased, fraction, normalized, exponent = float_bits(x)
+    bias, width = jnp.finfo(x.dtype).maxexp - 1, jnp.finfo(x.dtype).nmant
     significand = jax.lax.bitcast_convert_type(sign | (bias << width) | normalized, x.dtype)
-    exponent = jnp.where(biased > 0, biased - bias, limits.minexp - up).astype(x.dtype)
     zero = (biased == 0) & (fraction == 0)
-    return jnp.where(zero, jnp.zeros_like(x), significand), exponent
+    return jnp.where(zero, jnp.zeros_like(x), significand), exponent.astype(x.dtype)
 
 
 def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...] | None = None) -> jax.Array:
