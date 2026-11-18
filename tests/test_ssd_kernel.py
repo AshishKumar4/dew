@@ -507,7 +507,9 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
         np.testing.assert_array_equal(np.asarray(ours, np.float64)[normal], theirs[normal])
     # Every order the kernel's rule takes finite wherever float64's is a normal float32 (the contract's
     # seams): its primal and its reverse mode (`contract_support.REVERSE_ONLY`: rows 7874, 7875).
-    assert_contract(without_ynn(documents_on_the_kernel), operands, operands, seeded,
+    # The kernel as a program differentiates and places it (no compiler options, which refuse to nest in the
+    # mesh run's program, `without_ynn`).
+    assert_contract(documents_on_the_kernel, operands, operands, seeded,
                     "the TPU kernel's forked call at fp32's edge", truth_fn=documents_one_by_one,
                     without=REVERSE_ONLY)
 
