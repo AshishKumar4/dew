@@ -1363,12 +1363,9 @@ class MosaicTgmm(_Mosaic):
         return pricing.split_count(tile, **self._contraction(ba, tile, target))
 
     def _walk(self, ba, tile: mosaic_gpu.Tiles, target) -> pricing.SplitWalk | None:
-        """The walk `tile` runs the call in (`pricing.split_walk`): a split tile's over the partials' call
-        its slices run (`_partials`), its output stored at the call's own dtype (the partials' fp32 passes
-        `SplitWalk.passes`' apart)."""
-        call = ba if tile.splits == 1 else self._partials(ba)
-        return pricing.split_walk(tile, **{**self._contraction(call, tile, target),
-                                           'stored': jnp.dtype(ba.arguments['out_dtype']).itemsize})
+        """The walk `tile` runs the call in (`pricing.split_walk`), split or not: its output stored at the
+        call's own dtype, a split's fp32 partials priced by their passes (`SplitWalk.passes`)."""
+        return pricing.split_walk(tile, **self._contraction(ba, tile, target))
 
     def _contraction(self, ba, tile: mosaic_gpu.Tiles, target) -> dict:
         """The call's contraction as the split prices it at `tile` (`pricing.split_walk`'s facts): the call
