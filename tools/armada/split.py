@@ -47,7 +47,8 @@ def pytest_collection_modifyitems(config, items):
     for name in sorted({grading.owning(node) for node in nodes}):
         path = Path(name)
         sites = session.declared_marks(name, path.read_text()) if path.is_file() else {}
-        of_file = {node: seconds for node, seconds in sorted(recorded.items()) if grading.owning(node) == name}
+        of_file = {node: seconds for node, seconds in sorted(recorded.items())
+                   if grading.owning(node) == name}
         record = session.own(session.standing(name, of_file), sites)
         planned = session.planned(name, list(record), list(record.values()), count)
         collected = [node for node in nodes if grading.owning(node) == name]
