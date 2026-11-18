@@ -9,6 +9,8 @@ library alone."""
 import collections
 from collections.abc import Container, Iterable, Mapping
 
+import grading
+
 
 def collected(lines: Iterable[str]) -> dict[str, set[str]]:
     """Each test file's node ids among `lines`, as `pytest --collect-only -q` prints them, a line a test."""
@@ -16,7 +18,7 @@ def collected(lines: Iterable[str]) -> dict[str, set[str]]:
     for line in lines:
         node = line.strip()
         if node.startswith("tests/") and "::" in node:
-            found.setdefault(node.split("::")[0], set()).add(node)
+            found.setdefault(grading.owning(node), set()).add(node)
     return found
 
 
