@@ -952,11 +952,12 @@ def test_a_lazy_walks_kept_anchor_never_passes_the_bound_its_unscaled_walk_takes
 
 @INTERPRETS
 def test_a_lazy_walks_dropped_weights_stay_within_fp16_interpreted():
-    """An fp16 forward under probability dropout at 0.75 (each kept weight times 4) whose second key tile's
-    logits pass the first's by 10, interpreted on wgmma: its lazy margin is the binades fp16's weights hold
-    after the multiplier (`algebra.lazy_binades`: 13), so the anchor moves and a kept weight is at most 4,
-    on par with the reference (check 1). A margin before the multiplier kept the anchor, and a kept weight
-    of 4 e^10, 88106, narrowed to fp16's infinity (the base review of a59590b06, F2)."""
+    """An fp16 folded forward under probability dropout at 0.75 (each kept weight times 4) whose second key
+    tile's logits pass the first's by 10 nats (14.4 binades), interpreted on wgmma: its lazy margin is the
+    binades fp16's weights hold after the multiplier (`algebra.lazy_binades`: 13), so the anchor moves and a
+    kept weight is at most 4, on par with the reference (check 1). A margin before the multiplier kept the
+    anchor, and a kept weight of 4 e^10, 88106, narrowed to fp16's infinity (the base review of a59590b06,
+    F2)."""
     spans = template.spans(256, 128, 1)
     seed, rows = jax.random.bits(jax.random.PRNGKey(7), (2,), jnp.uint32), jnp.arange(1, dtype=jnp.int32)
     hooks = template.Hooks(drop=template.Dropout(seed, rows, rows, 0.75))
@@ -965,7 +966,7 @@ def test_a_lazy_walks_dropped_weights_stay_within_fp16_interpreted():
     def ours(query, key, value, dout):
         del dout
         with _device(True, generation.gpu_target("sm90")), _pinned(tiles):
-            return attention_mosaic.forward(query, key, value, spans, hooks, natural=True, interpret=True)
+            return attention_mosaic.forward(query, key, value, spans, hooks, natural=False, interpret=True)
 
     def reference(query, key, value, dout):
         del dout
