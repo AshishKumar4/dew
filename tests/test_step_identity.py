@@ -1038,27 +1038,14 @@ BUMPED = jax.jit(_bumped)
 """A jitted function of this module's own, which a step's code reads."""
 
 
-def shifted_by(key):
-    """A step made inside a function: each id bumped (`BUMPED`) and shifted by a draw of its typed `key`."""
+def shifted_by(seed: int):
+    """A step made inside a function: each id bumped (`BUMPED`) and shifted by a draw of the typed key of
+    `seed`, which its closure holds."""
+    key = jax.random.key(seed)
+
     def shift(row):
         return {**row, "id": np.int32(BUMPED(row["id"]) + int(jax.random.randint(key, (), 0, 3)))}
     return shift
-
-
-def test_a_step_made_inside_a_function_resumes_exactly_by_its_code_closure_and_reads():
-    """A step made inside a function, which reads a jitted function of the user's and closes over a typed
-    PRNG key, is stated by its code and what it reads (`dew._stated.stated`): its run resumes exactly where
-    its key is the same, and is refused where its key changed. Such a step was inexact (its name's
-    `<locals>`), a jitted function of the user's had no statement, and a typed key crashed the statement
-    that fetched its bits (row 7814; train 1019's review, F1 and F3)."""
-    def reader(key):
-        pipeline = Pipeline(ROWS).map(shifted_by(key)).shuffle(0).repeat().batch(2)
-        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
-
-    state = saved_after_one(lambda: reader(jax.random.key(0)))
-    assert resumed_changes(reader(jax.random.key(0)), state) == ()
-    with pytest.raises(ValueError):
-        resumed_changes(reader(jax.random.key(1)), state)
 
 
 def library_scaled_by(factor: int):
@@ -1070,16 +1057,22 @@ def library_scaled_by(factor: int):
     return scale
 
 
-def test_a_step_a_library_made_inside_a_function_resumes_exactly_only_with_its_closure():
-    """A step made inside a function of a module no file of the user's holds (an installed library's, the
-    standard library's, Dew's) is stated by its code and its closure: its run resumes exactly where the
-    closure holds the same factor, and is refused where it holds another. Held by its module's version
-    alone, scale_by(3) and scale_by(4) shared an identity (train 1022's review)."""
-    def reader(factor: int):
-        pipeline = Pipeline(ROWS).map(library_scaled_by(factor)).shuffle(0).repeat().batch(2)
+@pytest.mark.parametrize(("made", "same", "other"), [
+    (shifted_by, 0, 1), (library_scaled_by, 3, 4)], ids=["own", "library"])
+def test_a_step_made_inside_a_function_resumes_exactly_only_with_its_closure(made, same, other):
+    """A step made inside a function is stated by its code and what it reads, its closure among it
+    (`dew._stated.stated`), whosever module made it: one of the user's own, which reads a jitted function
+    of the user's and closes over a typed PRNG key, and one a library's module made (`library_scaled_by`).
+    Its run resumes exactly where its closure holds the same value, and is refused where it holds another.
+    Such a step was inexact (its name's `<locals>`); then a jitted function of the user's had no
+    statement, a typed key crashed the statement that fetched its bits (row 7814; train 1019's review, F1
+    and F3), and a library's held by its module's version alone shared one identity over any closure
+    (train 1022's review)."""
+    def reader(value):
+        pipeline = Pipeline(ROWS).map(made(value)).shuffle(0).repeat().batch(2)
         return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
 
-    state = saved_after_one(lambda: reader(3))
-    assert resumed_changes(reader(3), state) == ()
+    state = saved_after_one(lambda: reader(same))
+    assert resumed_changes(reader(same), state) == ()
     with pytest.raises(ValueError):
-        resumed_changes(reader(4), state)
+        resumed_changes(reader(other), state)
