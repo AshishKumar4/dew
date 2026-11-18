@@ -498,4 +498,3 @@ def pair_law(model):
         pairs = jnp.concatenate([jnp.broadcast_to(prompt, (vocab, 3)), jnp.arange(vocab)[:, None]], axis=1)
         second = jax.nn.softmax(wide.apply(wide_params, pairs)[:, -1] / LAW_TEMPERATURE, axis=-1)
         return prompt, params, np.asarray(first[:, None] * second).reshape(-1)
-
