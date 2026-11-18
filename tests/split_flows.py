@@ -36,7 +36,7 @@ def split_routes(name: str) -> list[list[str]]:
     params = jax.tree.map(
         lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=jax.NamedSharding(
             mesh, jax.sharding.PartitionSpec())),
-        jax.eval_shape(lambda: model.init(jax.random.key(0), *flow.initialized()))["params"])
+        jax.eval_shape(lambda: flow.taken(model.init(jax.random.key(0), *flow.initialized()))))
     inputs = [jax.ShapeDtypeStruct(shape.shape, shape.dtype,
                                    sharding=jax.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
               for shape in flow.inputs]

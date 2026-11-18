@@ -139,11 +139,16 @@ class Flow:
             return pickle.loads((store_of(self) / PARAMS).read_bytes())
         with jax.default_device(jax.devices("cpu")[0]):
             initialized = jax.jit(self.model.init)(jax.random.key(5461), *self.initialized())
-            return jax.device_get(initialized["params"])
+            return jax.device_get(self.taken(initialized))
 
     def initialized(self) -> tuple[jax.Array, ...]:
         """What the model's `init` reads beside its key: token ids of a draw's shape, zeros."""
         return (jnp.zeros((self.rows, self.length), jnp.int32),)
+
+    @staticmethod
+    def taken(variables):
+        """What a flow's programs take of its model's variables (`params`): its parameters."""
+        return variables["params"]
 
     @property
     def vocab(self) -> int:
@@ -257,12 +262,19 @@ class ImageFlow:
 
     @cached_property
     def params(self):
-        """The flow's parameters, float32, drawn once on the host's CPU, or its prepare's (`Flow.params`)."""
+        """The flow's variables, float32, drawn once on the host's CPU, or its prepare's (`Flow.params`): its
+        parameters and its time embedding's frequencies (the `constants` collection), which its programs
+        read and differentiate none of."""
         if TRUTHS in os.environ and not preparing():
             return pickle.loads((store_of(self) / PARAMS).read_bytes())
         with jax.default_device(jax.devices("cpu")[0]):
             initialized = jax.jit(self.model.init)(jax.random.key(5461), *self.initialized())
-            return jax.device_get(initialized["params"])
+            return jax.device_get(self.taken(initialized))
+
+    @staticmethod
+    def taken(variables):
+        """What a flow's programs take of its model's variables (`params`): all of them."""
+        return variables
 
     def initialized(self) -> tuple[jax.Array, ...]:
         """What the model's `init` reads beside its key: latents and timesteps of a draw's shapes, zeros."""
@@ -281,19 +293,20 @@ class ImageFlow:
     def train(self, model) -> Callable:
         """`model`'s training step: each element's squared error against its target, `[rows, size, size,
         channels]`, and every parameter's gradient of their mean (`Flow.train`'s per-element losses)."""
-        def step(params, latents, times, targets):
+        def step(variables, latents, times, targets):
             def loss(params):
-                losses = jnp.square(model.apply({"params": params}, latents, times) - targets)
+                denoised = model.apply({**variables, "params": params}, latents, times)
+                losses = jnp.square(denoised - targets)
                 return jnp.mean(losses), losses
-            (_, losses), gradients = jax.value_and_grad(loss, has_aux=True)(params)
+            (_, losses), gradients = jax.value_and_grad(loss, has_aux=True)(variables["params"])
             return losses, gradients
         return step
 
     def forward(self, model) -> Callable:
         """`model`'s forward: its output over the latents at their timesteps."""
-        def forward(params, latents, times, targets):
+        def forward(variables, latents, times, targets):
             del targets
-            return model.apply({"params": params}, latents, times)
+            return model.apply(variables, latents, times)
         return forward
 
     def program(self, kind: str, model) -> Callable:
