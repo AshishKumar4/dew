@@ -126,6 +126,10 @@ class Committed:
     unfinite_layer: jax.Array | None = None
     """The first layer the attempt's backward walk met whose gradient was not finite (`Applied`), -1 for
     none; None in a step that updates no layer in its backward, and past the step."""
+    unfinite_state: jax.Array | None = None
+    """A scaled step's committed state as `unfinite_state` reads it: its first leaf not finite (-1 for none)
+    and how many are not (`dew.training.interval.checked_finite` stops the run on one); None where the step
+    is not scaled."""
     finite: jax.Array | None = None
     """Whether an attempt with no loss scale was finite, its gradient and forward as well as its loss, which
     the step reports (`outcome`) and a run's streak of steps that are not reads (`dew.training.interval`): a
@@ -489,6 +493,17 @@ def _collections_kept(finite: jax.Array, numerical: TrainState, state: TrainStat
     kept = {name: _chosen(finite, numerical.variables[name], state.variables[name])
             for name in dicts(written)}
     return dataclasses.replace(numerical, variables={**numerical.variables, **kept})
+
+
+def unfinite_state(kept: dict[str, Variables | optax.OptState | None]) -> jax.Array:
+    """The first leaf of a committed state's kept trees (`checked`: parameters, optimizer state, averages), in
+    their order, that holds a value not finite (-1 for none) and how many such leaves they hold,
+    `int32[2]`. A scaled step accepted on its finite gradient can leave them so: an update that overflows a
+    parameter, or a gradient near 1e20 that overflows Adam's second moment to infinity, whose parameter then
+    stops moving with every loss and gradient after it finite (row 6748). Read off the state once it is
+    committed, choosing nothing, so it holds no second state; it reads the kept trees once a step."""
+    finite = jnp.stack([all_finite(leaf) for leaf in jax.tree.leaves(kept)])
+    return jnp.stack([jnp.where(jnp.all(finite), -1, jnp.argmin(finite)), jnp.sum(~finite)]).astype(jnp.int32)
 
 
 def _unfinite_layer(runs: Sequence[tuple[jax.Array, int]]) -> jax.Array:
@@ -1337,9 +1352,8 @@ class Transaction:
         if gated:
             numerical = _collections_kept(finite, numerical, state, aux.variables)
         if holding or scale is not None:
-            # A step taken whole or not at all: one whose optimizer holds updates back (`optax.MultiSteps`) on
-            # its whole new state finite, which a sum of finite gradients can overflow; a scaled one on its
-            # loss and gradient alone, as GradScaler's `found_inf`, so its choice runs in place (row 6748).
+            # Taken whole or not: holding updates back (`optax.MultiSteps`), on its whole new state finite; a
+            # scaled step on its loss and gradient alone, as GradScaler's `found_inf`, in place (row 6748).
             accepted = finite & all_finite(checked(numerical)) if holding else finite
         if previous is not None:
             numerical = dataclasses.replace(
@@ -1381,7 +1395,8 @@ class Transaction:
             jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted),
             own=pending.own if self.split > 1 else None,
             finite=(accepted if holding else finite) if scale is None else None,
-            unfinite_layer=None if pending.applied is None else pending.applied.unfinite_layer)
+            unfinite_layer=None if pending.applied is None else pending.applied.unfinite_layer,
+            unfinite_state=None if scale is None or holding else unfinite_state(checked(advanced)))
 
     def planned(self, state: TrainState) -> _Planned | None:
         """The plan by which the runs a one-stage scanned state holds stacked update in their backward

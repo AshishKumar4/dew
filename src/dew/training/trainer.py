@@ -1468,7 +1468,9 @@ class Trainer(Generic[Loss, Effects]):
         held = abstract.opt_state if abstract.inner is None else abstract.inner.opt_state
         return Interval.resumed(run.stop_control, last_saved=(
             current if checkpoints is not None and checkpoints.latest is not None else None),
-            skips_nonfinite=self.skip_nonfinite or self.dynamic_scale or holds_back(held))
+            skips_nonfinite=self.skip_nonfinite or self.dynamic_scale or holds_back(held),
+            kept_paths=tuple(jax.tree_util.keystr(path) for path, _ in
+                             jax.tree_util.tree_leaves_with_path(checked(abstract))))
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
