@@ -1499,7 +1499,7 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     shapes (`collecting`), by digest: `started`'s last part."""
     from dew.distributed.placement import placed_shapes
     from dew.state import apart, together
-    from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest
+    from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest, streak_of
     from dew.training.planning import whole_step_program
 
     candidate, split = planned.candidate, planned.split
@@ -1519,6 +1519,7 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
                     [(loss, aux, finite, accepted, committed)] * split)
             book = book_shapes(loss)
             counted = bookkeep(*booked(book, book, loss, finite, committed, aux or {}))
+            streak_of(counted)
             if committed is not None and committed.inspected is not None:
                 latest((committed.count, committed.inspected), (committed.count, committed.inspected))
             added_tokens(counted.tokens, counted.tokens)

@@ -149,6 +149,14 @@ def booked(book: Book, fresh: Book, loss: jax.Array, finite: jax.Array, committe
 
 
 @program
+def streak_of(book: Book) -> Streak:
+    """What `book`'s steps that were not finite left (`Streak`), on the devices, one program: a run's start
+    compiled ahead holds it (`dew.training.ahead`), so its first check compiles nothing."""
+    return Streak(jnp.stack([book.worst_bad_run, book.unfinite_layer, book.first_bad, book.stepped]),
+                  jnp.stack([book.bad_loss, book.bad_norm]))
+
+
+@program
 def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committed | None, training=0.0,
              tokens=(0, 0), scored=(0, 0)) -> Book:
     """Advance the loop's counters for one step in a single dispatch.
@@ -295,10 +303,9 @@ class Interval:
         if self.book is None or self.fresh is None:
             return None
         book, fresh = self.book, self.fresh
-        counts = jnp.stack([book.worst_bad_run, book.unfinite_layer, book.first_bad, book.stepped])
         self.book = book._replace(worst_bad_run=fresh.worst_bad_run, unfinite_layer=fresh.unfinite_layer,
                                   first_bad=fresh.first_bad, stepped=fresh.stepped)
-        return Streak(counts, jnp.stack([book.bad_loss, book.bad_norm]))
+        return streak_of(book)
 
     def check_finite(self, step: int, display: TrainingDisplay) -> None:
         """Check the steps since the last check now (`checked_finite`): the loop checks at its logging
