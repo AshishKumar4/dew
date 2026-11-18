@@ -120,28 +120,31 @@ def test_a_flows_truth_computes_in_float64(name, store, monkeypatch):
 
 def test_a_packed_flows_exact_banks_are_its_banks_values():
     """A packed flow's truths read each bank's exact matrix from its bits (`model_flows.exact_banks`, by
-    integer arithmetic and casts, its products in the truth's dtype): the values a packed load's export
-    decodes (`dew.quantization.decoded_expert_banks`), bit for bit, at float32 and at float64."""
+    integer arithmetic and casts, its products in the truth's float64): each value its bfloat16 decode (code
+    times block scale over 2^8, exact) times its factor (2^8 times its expert's scale), multiplied on the
+    host in float64, where their product is exact, bit for bit."""
     from flax.traverse_util import flatten_dict
 
-    from dew.quantization import QUANTIZATION, decoded_expert_banks
+    from dew.nn.kernels.formats import NvFp4
+    from dew.quantization import QUANTIZATION
 
     flow = next(flow for flow in model_flows.FLOWS if isinstance(flow, model_flows.Flow) and flow.packed)
     drawn = flow.taken(flow.model.init(jax.random.key(0), *flow.initialized()))
-    decoded = flatten_dict(decoded_expert_banks(drawn)["params"])
+    banks = flatten_dict(dict(drawn[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4))
+
     def widened(leaf):
         # As check 1 widens a draw's floats for its truth.
         return jnp.asarray(leaf, jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
 
-    for wide in (False, True):
-        with jax.enable_x64(new_val=wide):
-            exact = flatten_dict(model_flows.exact_banks(jax.tree.map(widened, drawn) if wide else drawn)[
-                QUANTIZATION])
-            assert exact
-            for path, matrix in exact.items():
-                assert matrix.dtype == (jnp.float64 if wide else jnp.float32)
-                np.testing.assert_array_equal(np.asarray(matrix, np.float64),
-                                              np.asarray(decoded[path], np.float64))
+    with jax.enable_x64(new_val=True):
+        exact = flatten_dict(model_flows.exact_banks(jax.tree.map(widened, drawn))[QUANTIZATION])
+        assert exact.keys() == banks.keys()
+        for path, matrix in exact.items():
+            bank = banks[path]
+            want = (np.asarray(bank.decoded(), np.float64)
+                    * np.asarray(bank.factor, np.float64)[..., None, None])
+            assert matrix.dtype == jnp.float64
+            np.testing.assert_array_equal(np.asarray(matrix), want)
 
 
 def test_a_packed_flows_training_moves_its_parameters_and_never_its_banks():
