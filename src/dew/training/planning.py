@@ -201,7 +201,7 @@ class SampledStep(NamedTuple):
 
 def whole_step_program[L, E](objective: Objective[L, E]) -> OuterProgram:
     """`whole_step` over `objective`'s statistics (`Objective.reduce_loss`), the one program a split step
-    runs on its microbatches' outputs, compiled under its towers' options, which a run compiled ahead
+    runs on its microbatches' outputs, compiled through Dew's compile point, which a run compiled ahead
     compiles with its step (`dew.training.ahead`)."""
     return owned_program(functools.partial(whole_step, reduce=objective.reduce_loss,
                                            shown=frozenset(objective.shown)))
