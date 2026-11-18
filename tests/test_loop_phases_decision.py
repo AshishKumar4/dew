@@ -82,9 +82,14 @@ def phased(root: Path):
                   (asked(tickets(root, "second", "sales")), None))
 
 
-def parameters(state) -> dict:
+def named_leaves(variables) -> dict:
+    """Each leaf of `variables`' parameters by its path."""
     return {jax.tree_util.keystr(path): np.asarray(leaf)
-            for path, leaf in jax.tree_util.tree_leaves_with_path(state.variables["params"])}
+            for path, leaf in jax.tree_util.tree_leaves_with_path(variables["params"])}
+
+
+def parameters(state) -> dict:
+    return named_leaves(state.variables)
 
 
 def theta(state) -> np.ndarray:
@@ -178,15 +183,16 @@ def test_a_theta_per_pass_over_a_checkpoints_implicit_loop_starts_each_row_at_it
 
     loaded = Pretrained.load(str(QWEN35), dtype="float32", attention_impl="reference")
     implicit = looping(loaded, 3, (1, 3), implicit=True)
-    theta = np.random.default_rng(7661).uniform(0.1, 0.9, loaded.model.emb_features).astype(np.float32)
-    implicit = dataclasses.replace(implicit, variables={**implicit.variables, "params": {
-        **implicit.variables["params"], "loop_theta": theta}})
+    (held,) = [leaf for name, leaf in named_leaves(implicit.variables).items() if "loop_theta" in name]
+    theta = np.random.default_rng(7661).uniform(0.1, 0.9, held.shape).astype(np.float32)
+    implicit = dataclasses.replace(implicit, variables=jax.tree_util.tree_map_with_path(
+        lambda path, leaf: theta if "loop_theta" in jax.tree_util.keystr(path) else leaf, implicit.variables))
     asked = dataclasses.replace(run(Path(), None, None), loop_layers=None, loop_implicit=False,
                                 loop_theta_per_pass=True)
     per_pass = asked.looped(implicit)
     assert per_pass.model.loop.theta_passes == 3 and per_pass.model.loop.steps == 3
-    np.testing.assert_array_equal(np.asarray(per_pass.variables["params"]["loop_theta"]),
-                                  np.stack([theta] * 2))
+    (rows,) = [leaf for name, leaf in named_leaves(per_pass.variables).items() if "loop_theta" in name]
+    np.testing.assert_array_equal(np.asarray(rows), np.stack([theta] * 2))
     ids = jnp.arange(12, dtype=jnp.int32).reshape(2, 6)
     np.testing.assert_array_equal(np.asarray(per_pass.model.apply(per_pass.variables, ids)),
                                   np.asarray(implicit.model.apply(implicit.variables, ids)))
