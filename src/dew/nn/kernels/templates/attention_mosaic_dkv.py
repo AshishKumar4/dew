@@ -296,15 +296,15 @@ class _PlacedDq:
         family, rows = self.walk.program.family, self.walk.program.tiles.block_q
         view = self.dq_ref.at[turn if self.walk.interpret else 0, row, pl.ds(q_first, rows), head]
         smem = self.stages[1].at[turn]
-        # The reduces a step issues, a stage's columns each (`mosaic.chunked`): the step before's, through
-        # the other turn's stage, left reading while this step's first rewrites its own (`Family.added`'s
-        # `pending`), where waiting on them stalled the compute warpgroup on its own reduces.
-        issued = sum(-(-half.shape[1] // smem.shape[-1]) for half in halves)
+        # The reduces a step issues, a stage's columns each (`mosaic.chunked`), each write of the stage after
+        # every earlier reduce has read it (`Family.added`'s `pending` 0): a compute warpgroup's turn is its
+        # own (`Tcgen05Walked.walk`), so its every step writes the one stage its step before's reduces read,
+        # where letting them run on (`pending` its step's count) raced them (the base review of 8a5d0ce41,
+        # row 8283). A whole step lies between, so they have read it.
         first = 0
-        for index, half in enumerate(halves):
+        for half in halves:
             columns = half.shape[1]
-            family.added(half, view.at[:, pl.ds(first, columns)], self.walk.interpret, smem=smem,
-                         pending=issued if index == 0 else 0)
+            family.added(half, view.at[:, pl.ds(first, columns)], self.walk.interpret, smem=smem)
             first += columns
 
 
