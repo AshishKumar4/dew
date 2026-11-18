@@ -1336,12 +1336,18 @@ class Transaction:
         finite = finite & native_finite
         if gated:
             numerical = _collections_kept(finite, numerical, state, aux.variables)
-        if scale is not None or holding:
-            # A step taken whole or not at all reads what it formed: its whole new state finite. For an
-            # optimizer that holds updates back (`optax.MultiSteps`), that is its inner optimizer's state over
-            # the window's gathered gradient, which a sum of finite gradients can carry past what its
-            # moments hold.
+        if holding:
+            # An optimizer that holds updates back (`optax.MultiSteps`) is taken whole or not at all on its
+            # whole new state finite: its inner optimizer's state over the window's gathered gradient, which a
+            # sum of finite gradients can carry past what its moments hold.
             accepted = finite & all_finite(checked(numerical))
+        elif scale is not None:
+            # A scaled step is accepted on its loss and gradient finite, decided before the update reads
+            # them, as GradScaler's `found_inf` is: the update and the choice then run in place, holding no
+            # second state, where reading the new state's finiteness held the old and the new state of every
+            # leaf at once (row 6748). A finite gradient that overflows the update commits it, and the run
+            # stops on it at its next log as on any step not finite.
+            accepted = finite
         if previous is not None:
             numerical = dataclasses.replace(
                 numerical, accumulation=self._retained_window(state, batch, pending, attempt, read))

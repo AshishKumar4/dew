@@ -1913,6 +1913,37 @@ def unscaled(accum: int, microsteps: int):
     return host(state)
 
 
+def test_a_rejected_dynamic_scale_step_leaves_adams_state_as_it_was():
+    """A scaled step whose loss is not finite, under Adam, leaves the parameters, their average and the
+    optimizer's count and moments bit for bit as they were: the optimizer takes no step for it, not even one
+    of zero gradient (row 6748, the choice read on the loss and gradient alone)."""
+    trainer = Trainer(ScaledObjective(), optax.adam(.1), key=jax.random.key(0), dynamic_scale=True)
+    state = trainer.initial_state()
+    good = {"scale": jnp.ones((jax.device_count(),), jnp.float32)}
+    bad = {"scale": jnp.full((jax.device_count(),), 1e35, jnp.float32)}
+    step = trainer.compile(state, good)
+    state, *_ = step(state, good)
+    before = jax.device_get((state.variables, state.ema, state.opt_state))
+    state, _, _, _, accepted, _ = step(state, bad)
+    assert not bool(accepted)
+    for got, kept in zip(jax.tree.leaves(jax.device_get((state.variables, state.ema, state.opt_state))),
+                         jax.tree.leaves(before), strict=True):
+        np.testing.assert_array_equal(got, kept)
+
+
+def test_a_dynamic_scale_step_is_accepted_on_its_gradient_finite():
+    """A scaled step whose loss and gradient are finite is accepted though its update overflows the
+    parameters, as GradScaler's `found_inf` reads the gradients alone: the choice is made before the update
+    reads them, so it runs in place, holding no second state (row 6748); the run stops on the non-finite
+    state at its next log. Reading the new state's finiteness rejected it."""
+    trainer = Trainer(ScaledObjective(), optax.sgd(1e10), key=jax.random.key(0), dynamic_scale=True)
+    state = trainer.initial_state()
+    huge = {"scale": jnp.full((jax.device_count(),), 1e30, jnp.float32)}
+    state, _, _, finite, accepted, _ = trainer.compile(state, huge)(state, huge)
+    assert bool(finite) and bool(accepted)
+    assert not np.all(np.isfinite(np.asarray(state.variables["params"]["w"])))
+
+
 @pytest.mark.parametrize("accum", [1, 2])
 def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     """A dynamic scale's accepted steps are the unscaled run's, bit for bit, and a rejected one leaves
