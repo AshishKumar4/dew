@@ -130,29 +130,32 @@ class Tcgen05Placed(Tcgen05Rings):
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
                         ahead: tuple[int, ...] = (), sums: tuple[int, ...] = (),
                         together: tuple[int, ...] = ()) -> dict:
-        # A role's two accumulators of the one product it issues ahead (the logits' turns, `LOGITS`), two
-        # tiles of the one left operand it is given (the weights' turns, `WEIGHTS`, 16-bit two to a column),
-        # its one walk's sums kept across it (`SUMS`), and its hand-offs: the logits' (`scored`, two turns,
-        # the issuer's commit), the weights' (`weighed`, two, the consumer's threads, their tensor-memory
-        # stores ordered before the products that read them) and the sums' (`summed`, one, the commit). The
-        # products it places are those alone (`placed_products`).
+        # A role's two turns of the one product it issues ahead, each its logits' accumulator (`LOGITS`) and
+        # over it the one left operand it is given (`WEIGHTS`, 16-bit two to a column): a turn's weights are
+        # written once its consumer has read the turn's logits whole into its registers, which they are
+        # formed from, and the turn's next logits issued after the product reading those weights, the tensor
+        # core taking its products in their issue order (FlashAttention 4's P over S, two consumers' turns
+        # and sums within 512 columns at 64 keys and width 128). Its one walk's sums kept across it (`SUMS`),
+        # and its hand-offs: the logits' (`scored`, two turns, the issuer's commit), the weights' (`weighed`,
+        # two, the consumer's threads, their tensor-memory stores ordered before the products that read them)
+        # and the sums' (`summed`, one, the commit). The products it places are those alone
+        # (`placed_products`).
         del widths, together
         ((logits,), (left,), (kept,)) = ahead, tuple(dict.fromkeys(lefts)), sums
         rows, (depth, dtype) = self.rows, left
         return {"scored": tuple(self.signals(2).scratch() for _ in range(consumers)),
                 "weighed": tuple(self.signals(2).scratch() for _ in range(consumers)),
                 "summed": tuple(self.signals(1).scratch() for _ in range(consumers)),
-                LOGITS: tuple(tuple(self.tensor_memory((rows, logits)) for _ in range(2))
-                              for _ in range(consumers)),
-                WEIGHTS: tuple(tuple(self.tensor_memory((rows, depth), dtype) for _ in range(2))
-                               for _ in range(consumers)),
+                LOGITS: tuple(tuple(plgpu.RefUnion(self.tensor_memory((rows, logits)),
+                                                   self.tensor_memory((rows, depth), dtype))
+                                    for _ in range(2)) for _ in range(consumers)),
                 SUMS: tuple(self.tensor_memory((rows, kept)) for _ in range(consumers))}
 
     def product_columns(self, products: tuple | None) -> int:
         if products is None:
             return 0
         scratch = self.product_scratch(*products)
-        held = tuple(scratch[name] for name in (LOGITS, WEIGHTS, SUMS))
+        held = tuple(scratch[name] for name in (LOGITS, SUMS))
         return resources.tensor_memory_columns(jax.tree.leaves(held))
 
     def product_shared(self, scratch) -> tuple:
@@ -170,10 +173,10 @@ class Tcgen05Placed(Tcgen05Rings):
                 self.signals(1).opened(found["summed"][role]))
 
     def _turns(self, name: str, consumer: int | None = None) -> tuple[Accumulator, ...]:
-        """A consumer's two turns of the `name` tiles (`product_scratch`'s `LOGITS` or `WEIGHTS`), the
-        building role's where None, each its scope's shape and dtype."""
+        """A consumer's two turns of the `name` tiles (`product_scratch`'s `LOGITS`, or the `WEIGHTS` over
+        them), the building role's where None, each its scope's shape and dtype."""
         role = mosaic.ROLE.get() if consumer is None else consumer
-        refs = self._scoped()[name][role]
+        refs = tuple(turn[name == WEIGHTS] for turn in self._scoped()[LOGITS][role])
         return tuple(Accumulator(ref, tuple(ref.shape), dtype=ref.dtype) for ref in refs)
 
     def scored(self, declared: mosaic.Product, lhs, index, slots, shape: tuple[int, int]) -> jax.Array:
