@@ -5,6 +5,7 @@ computed by programs compiled ahead (`truths_ahead.compiled_truths`) judge as th
 itself, a missing or stale program refused."""
 
 import dataclasses
+import functools
 import json
 import os
 import sys
@@ -398,3 +399,27 @@ def test_a_gpu_tier_parts_prepare_runs_under_its_runs_flags():
     prepare = lane_environment.configured({**node, "JAX_PLATFORMS": "cpu", "DEW_TIER_PREPARE": "1"})
     run = lane_environment.configured({**node, "JAX_PLATFORMS": "cuda"})
     assert prepare["XLA_FLAGS"] == run["XLA_FLAGS"]
+
+
+def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):
+    """A GPU part's prepare on its node's CPU (`DEW_TIER_PREPARE=1`, the node an A100 by its serialized
+    topology) runs every cell of a flow pinned to the node's generation, Mosaic's among them, as its run
+    does (`gpu_flow.run_cells`, `generation_support.runnable` reading the node's generation): none skipped
+    for a GPU the prepare's process holds none of (row 7868: the recurrence matrix's five cells skipped
+    there, then compiled on the held GPU)."""
+    import gpu_flow
+    from jax.experimental import topologies
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    topology = store / "topology.bin"
+    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    ran: list[int] = []
+    cells = [gpu_flow.Cell(f"cell {index}", functools.partial(ran.append, index), generation="sm80",
+                           mosaic=index % 2 == 1) for index in range(5)]
+    # The node's compile-only GPU the default device, as a part's prepare holds it (`compiled_ahead`).
+    with jax.default_device(compile_only_gpus("sm80", 1)[0]):
+        assert gpu_flow.run_cells(cells) == []
+    assert ran == list(range(5))
