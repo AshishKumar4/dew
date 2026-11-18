@@ -103,7 +103,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - A ratio's transpose sums landed quotients along an axis its denominator varies over. [8292]
 - Tests/reference_error.py:1455 refuses to prepare a check-1 site with a library arm. [8468]
 - Tests/reference_error.py _arm_program (arm_arithmetic.py:193) traces a site's arm nested in make_jaxpr, so an arm that is a jit of its own compiler_options…. [8469]
-- The same program extracted twice in a decision run. [8472]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
