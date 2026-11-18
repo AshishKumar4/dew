@@ -579,7 +579,7 @@ def test_epochs_of_a_memory_read_that_rejects_documents_before_it_packs_them_cou
     from dew.data.pipeline import ObjectiveData
 
     documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(12)]
-    chain = (Pipeline(Memory(documents)).map(FirstKept(5)).pack(8, fields=("id",)).shuffle(seed=1)
+    chain = (Pipeline(Memory(documents)).filter_map(FirstKept(5)).pack(8, fields=("id",)).shuffle(seed=1)
              .read("memory").batch(8))
     loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
     assert (loader.pass_examples, loader.examples) == (9, 18)
@@ -593,7 +593,7 @@ def test_epochs_of_a_streamed_mix_whose_member_rejects_records_count_no_pass_ahe
 
     from dew.data.compile import fitted
 
-    first = Pipeline(Memory({"id": np.arange(1, 13, dtype=np.int32)})).map(Keeps(3)).named("first")
+    first = Pipeline(Memory({"id": np.arange(1, 13, dtype=np.int32)})).filter_map(Keeps(3)).named("first")
     second = Pipeline(Memory({"id": np.arange(21, 25, dtype=np.int32)})).named("second")
     chain = mix([first, second], weights=(1, 1)).read("streamed").batch(4)
     with pytest.raises(ValueError):
