@@ -1117,25 +1117,25 @@ def _first_timed(timed: dict, rows_at: Callable, seed):
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
            library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = (), terms_fn=None,
            label: str = "", examples: bool = False, conditioning=None, timed: dict | None = None,
-           followed=None):
-    """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
-    `truth_fn` on them (by default `reference_fn` on them widened, unrewritten). With `reference_seeds`,
-    the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
-    row of float64 zero is paired only where the two truths are the same values (an orbit's draws).
-    With `orders`, each arm also runs at every other order of its own draw (`orders(inputs)` past its
-    first, the draw itself), held to that draw's one truth: each arm's worst row is its worst over the
-    orders, measured rows of float64 zero included, and its values finite at every one; its errors and
-    its rows of float64 zero are the draw's own order's. With `library_fn`, the library arm runs beside
-    the reference on Dew's own inputs, held to Dew's truth, and the draws are judged against the larger
-    of the two on `library_leaves` (`_Draws.against_larger`), Dew and the truth evaluated once. With
-    `also`, further references run beside it on Dew's own inputs, each held to Dew's truth, Dew and the
-    truth evaluated once for them all: the reference's draws, then each further reference's, a list. With
-    `terms_fn`, the truth is that program's with each output's terms (`float64_terms`), every row sized by
-    the larger of its own RMS and its terms' (`_LaidTruths.of`); with a site's own terms program
-    (`_SiteTerms`), the truth is as without and its terms that program's, on the same widened inputs. With
-    `conditioning` (dew.parity's `Conditioning`), every arm's leaves are read as residuals in units of the
-    reference's rounding at its truth's inputs (`Weighed.weighed`). With `followed`, each arm is held to
-    the truth of its own decisions (`_draw_truth`, `_followed_truth`)."""
+           followed=None) -> list[_Draws]:
+    """Every leaf's errors (`_Draws`) over `seeds`, a list (the reference's, each further one's after):
+    both functions run on `draw(seed)`'s inputs, truth `truth_fn` on them (by default `reference_fn` on
+    them widened, unrewritten). With `reference_seeds`, the reference runs on those draws instead, each
+    held to its own draw's truth (`null_runs`), and a row of float64 zero is paired only where the two
+    truths are the same values (an orbit's draws). With `orders`, each arm also runs at every other order
+    of its own draw (`orders(inputs)` past its first, the draw itself), held to that draw's one truth: each
+    arm's worst row is its worst over the orders, measured rows of float64 zero included, and its values
+    finite at every one; its errors and its rows of float64 zero are the draw's own order's. With
+    `library_fn`, the library arm runs beside the reference on Dew's own inputs, held to Dew's truth, and
+    the draws are judged against the larger of the two on `library_leaves` (`_Draws.against_larger`), Dew
+    and the truth evaluated once. With `also`, further references run beside it on Dew's own inputs, each
+    held to Dew's truth, Dew and the truth evaluated once for them all, each further reference's draws
+    after the reference's. With `terms_fn`, the truth is that program's with each output's terms
+    (`float64_terms`), every row sized by the larger of its own RMS and its terms' (`_LaidTruths.of`); with
+    a site's own terms program (`_SiteTerms`), the truth is as without and its terms that program's, on the
+    same widened inputs. With `conditioning` (dew.parity's `Conditioning`), every arm's leaves are read as
+    residuals in units of the reference's rounding at its truth's inputs (`Weighed.weighed`). With
+    `followed`, each arm is held to the truth of its own decisions (`_draw_truth`, `_followed_truth`)."""
     if orders is not None and any(getattr(fn, "recorded", False) for fn in (reference_fn, *also)):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
     arms = [reference_fn] + ([] if library_fn is None else [library_fn]) + list(also)
@@ -1233,7 +1233,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     drawn = [_drawn_from(names, widths, evidence[at_arm], per_example[at_arm] if examples else None,
                         per_example_rows[at_arm] if examples else None) for at_arm in range(len(arms))]
     first = drawn[0] if library_fn is None else drawn[0].against_larger(drawn[1], library_leaves)
-    return [first, *drawn[len(arms) - len(also):]] if also else first
+    return [first, *drawn[len(arms) - len(also):]]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1632,11 +1632,11 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
         def drawn(start, stop):
             assert not judging(), f"{label}: a judge draws nothing of its own, its draws are its pool's"
             if (start, stop) not in ranges:
-                draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
-                               library_fn=library_fn, library_leaves=library_leaves, also=further,
-                               terms_fn=terms_fn, label=label, examples=examples,
-                               conditioning=conditioning_now(), timed=first, followed=followed)
-                ranges[start, stop] = draws if further else [draws]
+                ranges[start, stop] = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn,
+                                             orders=orders, library_fn=library_fn,
+                                             library_leaves=library_leaves, also=further, terms_fn=terms_fn,
+                                             label=label, examples=examples,
+                                             conditioning=conditioning_now(), timed=first, followed=followed)
                 narrow_leaves[:] = _narrow(ranges[start, stop][0])
             return ranges[start, stop][index]
         return drawn
@@ -1702,11 +1702,11 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
     _refuse_numpy_arms(draw, changed_fn, original_fn)
     changed_fn, original_fn = _arms(changed_fn, original_fn)
     truth_fn = _truth_program(truth_fn)
-    draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn, label=label)
+    [draws] = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn, label=label)
     moved, kept, unresolved = _moved(draws, 1)
     if not moved:
         further = range(seeds, staged_units(seeds))
-        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn, label=label))
+        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn, label=label)[0])
         moved, kept, unresolved = _moved(draws, 2)
     if not moved:
         found = (f"{label}: the change moves no leaf beyond rounding over {len(draws.mine)} seeds:\n"
@@ -1796,7 +1796,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     def drawn(start_at: int, stop: int):
         return _drawn(dew_fn or reference_fn, reference_fn, draw, range(first + start_at, first + stop),
                       truth_fn, orders=orders, label=label, examples=examples and dew_fn is not None,
-                      conditioning=weighing, followed=followed)
+                      conditioning=weighing, followed=followed)[0]
 
     return _sized_count(drawn, label, start=start, most=most, paired=dew_fn is not None)
 
@@ -1860,7 +1860,7 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
                               truth_fn, orders=orders,
                               reference_seeds=None if paired else range(base + span + start,
                                                                         base + span + stop),
-                              library_fn=library_fn, library_leaves=library_leaves, conditioning=weighing)
+                              library_fn=library_fn, library_leaves=library_leaves, conditioning=weighing)[0]
             return _staged(drawn, count, label, two_stage=two_stage)
 
         over, unresolved, stage = judged(None, seeds)
