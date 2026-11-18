@@ -1502,17 +1502,21 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         return next((config for config in (*fused, *two) if self.takes(ba, config, target)), None)
 
     def ladder(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
-        # The query blocks its derivation walks below `config`'s for its consumer's rows (`_query_walk`),
-        # `config`'s other fields kept, within its register cap and residency, largest first.
+        # The query blocks its derivation walks below `config`'s for its consumer's rows (`_query_walk`) on
+        # the layout its derivation walks (`_named`'s, its warps not yet arranged for the consumer's rows as
+        # `bundle_of`'s are, mma.sync's at 32 rows two warps of 16, of which no fewer rows are), `config`'s
+        # other fields kept, within its register cap and residency, largest first.
         if not self._typed(config):
             return ()
         target = generation.gpu_target()
         query = ba.arguments["query"]
-        family = bundle_of(config, query.dtype)
-        walk = _query_walk(config.block_k if config.block_k in fewer_rows(family) else None)
+        layout = self._named(target.generation, query.dtype, query.shape[1]).get(config.family)
+        if layout is None:
+            return ()
+        walk = _query_walk(config.block_k if config.block_k in fewer_rows(layout) else None)
         regime = self._regime(ba, config, target)
         smaller = (dataclasses.replace(config, block_q=block)
-                   for block in walk(family, query.dtype, query.shape[1]) if block < config.block_q)
+                   for block in walk(layout, query.dtype, query.shape[1]) if block < config.block_q)
         return tuple(rung for rung in smaller
                      if self.takes(ba, rung, target) and self._regime(ba, rung, target) == regime)
 
