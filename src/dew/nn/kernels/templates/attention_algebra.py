@@ -187,12 +187,15 @@ class Forward:
             return power2(half, k, reach=2 * 127) * half
         return natural_exp(x, self.scale if self.raw else 1.0, offset=k)
 
+    @property
+    def unit(self) -> float:
+        """A logit's unit in nats: the scale for raw products, ln 2 folded to base 2, else 1."""
+        return self.scale if self.raw else LN2 if self.base2 else 1.0
+
     def naturalized(self, m: jax.Array) -> jax.Array:
-        """A maximum in the logits' units taken to natural ones: from base 2 folded, from raw products
-        raw."""
-        if self.raw:
-            return m * self.scale
-        return m * LN2 if self.base2 else m
+        """A maximum in the logits' units taken to natural ones (`unit`): from base 2 folded, from raw
+        products raw; natural ones as they are."""
+        return m * self.unit if self.raw or self.base2 else m
 
 
 class Recompute(NamedTuple):
@@ -2305,7 +2308,7 @@ def lazy_amplified(weights, bound: float = 1.0, *, natural: bool) -> float:
 
 
 def lazy_margin(spec: Forward, weights, bound: float = 1.0) -> float | None:
-    """`lazy_binades` in the walk's logits' units (`Forward.naturalized`'s: binades where it folds to base 2,
+    """`lazy_binades` in the walk's logits' units (`Forward.unit`: binades where it folds to base 2,
     raw products where it keeps them raw, `Forward.raw`, whose exponent scales their difference after it is
     taken, else nats): a raw fold's margin of 32 binades kept an anchor 31 below a tile's raw maximum at a
     scale of 1.92, weights of e^59.5 (the base review of 51158f2a9, F1). A kept anchor's factor is exactly
@@ -2314,7 +2317,7 @@ def lazy_margin(spec: Forward, weights, bound: float = 1.0) -> float | None:
     binades = lazy_binades(spec.natural, compensated=spec.compensated, weights=weights, bound=bound)
     if binades is None:
         return None
-    return float(binades * LN2 / spec.naturalized(jnp.float32(1.0)))
+    return float(binades * LN2 / spec.unit)
 
 
 def lazy_anchor(margin: float | None) -> Callable | None:
