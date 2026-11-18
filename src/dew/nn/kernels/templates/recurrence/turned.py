@@ -141,7 +141,7 @@ def _in_last_frame(local, starts, documents):
     batch, length = local[0].shape[:2]
     place = jnp.arange(length)
     ends = (jnp.ones((batch, length), bool).at[:, :-1].set(jnp.asarray(starts, bool)[:, 1:])
-            if starts is not None else place[None] == length - 1)
+            if starts is not None else jnp.broadcast_to(place == length - 1, (batch, length)))
     lasts = jax.lax.cummin(jnp.where(ends, place[None], length), axis=1, reverse=True)
     last = tuple(_taken(part, lasts) for part in local)
     relative = compensated_add(local, tuple(-part for part in last))
