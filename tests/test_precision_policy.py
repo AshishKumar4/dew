@@ -1101,15 +1101,19 @@ def _ones(digits: int, exponent: int) -> float:
     (jnp.float64, _ones(53, 1023), _ones(53, -1) - 2.0 ** (-1 - 51)),
     (jnp.float16, _ones(11, 15), _ones(11, -1) - 2.0 ** (-1 - 9)),
     (jnp.bfloat16, _ones(8, 60), _ones(8, 59) - 2.0 ** (59 - 6)),
-], ids=["fp32 edge", "float64 edge", "float64 top", "float16 top", "bfloat16 edge"])
+    (jnp.float64, _ones(53, 511), _ones(53, 511)),
+    (jnp.float16, _ones(11, 7), _ones(11, 7)),
+], ids=["fp32 edge", "float64 edge", "float64 top", "float16 top", "bfloat16 edge", "float64 top product",
+        "float16 top product"])
 def test_an_exact_product_at_a_dtypes_edge_keeps_its_residual(dtype, left, right):
     """`precision.two_product`'s range-safe split (`bit_split`) at the top of each dtype's range, its
     operands' significands all ones (and two less): their product and its residual sum to the exact
-    rational product.
+    rational product, a product in the top binade's too.
     A Veltkamp split multiplies by `2^(p/2) + 1` first and overflows to NaN (past 2^115 in fp32, 2^996 in
     float64; base reviews 9bc4326dd F1, 1fe546a10 F1); an odd significand's truncated cut left its low parts'
     product past `p` bits, rounded (float64's 27 and 26 bits; the precision owner's review); the top binade's
-    rounded cut carried past the largest float."""
+    rounded cut carried past the largest float, and two cuts rounded up a product in it ((2 - 2^-52)
+    2^511 squared, 255.875 squared in float16: train 1018's review F1)."""
     from dew.nn.precision import two_product
 
     with jax.enable_x64(new_val=dtype == jnp.float64):

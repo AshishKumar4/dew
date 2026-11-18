@@ -66,13 +66,11 @@ This page is generated from the maintainers' findings ledger as each change land
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
 - Stacks, scans and looped models. [1568]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
 
 ## Training and parallelism
 
 - Time to first step: the compile path's re-derivations. [5556]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
-- Compile ahead within train CI time. [5361]
 - XLA:CPU edges. [1591]
 - Training and serving efficiency. [1880, 5292]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]

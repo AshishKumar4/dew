@@ -22,8 +22,10 @@ from pathlib import Path
 
 import jax
 import numpy as np
+from jax._src.named_sharding import UNSPECIFIED
 from jax.experimental.layout import Format, Layout
 from jaxlib import xla_client
+from jaxlib._jax import PjitFunction
 
 from dew import _hashing, _sources
 from dew._records import JSON
@@ -96,9 +98,9 @@ def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
     a call's key (an abstract value, a tree's structure node by node, a format, a device) by their parts. A
     value among `known` (by its `id`) is what its caller says of it.
 
-    Refused, naming `at` and the value's type, for anything else, an array of JAX's among them (a constant
-    of the program, which its executable cannot serialize): an object with no such form could differ
-    between two processes with nothing in the identity to show it."""
+    An array of JAX's is its values and sharding (`_jax_array`); a function `jax.jit` wraps, what it wraps
+    and its options (`_jitted`). Refused, naming `at` and the value's type, for anything else: an object
+    with no such form could differ between two processes with nothing in the identity to show it."""
     return _stated(value, at, known, ())
 
 
@@ -115,8 +117,8 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
     # A value of exactly Python's own type; a subclass (an enumeration's member) is stated as what it is.
     if value is None or type(value) in (bool, int, str):
         return value
-    if isinstance(value, jax.Array):
-        raise Unestablished(f"{at}: an array of JAX's, a constant of the program")
+    if (computed := _computed(value, at, again)) is not None:
+        return computed
     if isinstance(value, types.ModuleType):
         # A module of the user's is everything it holds: code that names it may read any of it.
         held = _module_state(value, at, known, walking) if _sources.own_source(value.__name__) else None
@@ -188,6 +190,59 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         return converted
     raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} has no form an "
                         "identity can state")
+
+
+
+
+def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
+    """One of JAX's values a program computes from or with: an array (`_jax_array`), a function `jax.jit`
+    wraps (`_jitted`); None for any other."""
+    if isinstance(value, jax.Array):
+        return _jax_array(value, at, again)
+    if isinstance(value, PjitFunction):
+        return _jitted(value, at, again)
+    return None
+
+
+def _jitted(value, at: str, again: Callable[..., JSON]) -> JSON:
+    """A function `jax.jit` wraps by what it wraps (`__wrapped__`, stated as any function is: a user's own by
+    its code and reads) and every option its wrapping records (`PjitInfo`: static and donated arguments,
+    shardings and layouts, their trees, `keep_unused`, `inline`, a backend or device, compiler options),
+    each stated as its value is: two wrappings of one function under other options trace other
+    programs."""
+    recorded = value._jit_info
+    options = {name: _jit_option(getattr(recorded, name), f"{at} (jit option {name})", again)
+               for name in sorted(_JIT_OPTIONS)}
+    return ["jit", again(value.__wrapped__, at=at), options]
+
+
+def _jit_option(value, at: str, again: Callable[..., JSON]) -> JSON:
+    """One option a jit records, a tuple of shardings or layouts entry by entry, JAX's mark of a sharding
+    the call left to JAX (`UNSPECIFIED`) as that."""
+    if value is UNSPECIFIED:
+        return "unspecified"
+    if isinstance(value, tuple):
+        return [_jit_option(each, f"{at}[{index}]", again) for index, each in enumerate(value)]
+    return again(value, at=at)
+
+
+_JIT_OPTIONS = frozenset({"static_argnums", "static_argnames", "donate_argnums", "donate_argnames",
+                          "in_shardings_treedef", "in_shardings_leaves", "out_shardings_treedef",
+                          "out_shardings_leaves", "in_layouts_treedef", "in_layouts_leaves",
+                          "out_layouts_treedef", "out_layouts_leaves", "keep_unused", "inline", "backend",
+                          "device", "compiler_options_kvs", "user_specified_in_shardings"})
+"""The parts of a jit's recorded options (`PjitInfo`) that decide what it traces and compiles; its source
+line, signature and counters, which a function's own statement holds or which decide nothing, apart."""
+
+
+def _jax_array(value: jax.Array, at: str, again: Callable[..., JSON]) -> JSON:
+    """An array of JAX's by its values, fetched to the host, as a NumPy array's (`_data`: its dtype, shape
+    and bytes), and its sharding: a trace that closes over it bakes both into its program. Refused where
+    this process holds only part of it, whose bytes no one process reads."""
+    if not value.is_fully_addressable:
+        raise Unestablished(f"{at}: an array of JAX's this process holds only part of")
+    host = _data(np.asarray(value), at)
+    return ["jax array", host, again(value.sharding, at=f"{at}.sharding")]
 
 
 def _data(value, at: str) -> JSON | None:
@@ -328,10 +383,13 @@ def _own(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) ->
     stated_name = ["own", module, value.__qualname__]
     if id(value) in walking:
         return [*stated_name, "itself"]
-    if "<locals>" in value.__qualname__:
-        raise Unestablished(f"{at}: {value.__module__}.{value.__qualname__}, made inside a function")
     if isinstance(value, types.FunctionType):
+        # A function made inside another (`<locals>`) among them: its code and what it reads, its closure's
+        # cells too, are all it is, however many its maker made.
         return [*stated_name, _code(value.__code__), reads(value, at, known, walking)]
+    if "<locals>" in value.__qualname__:
+        raise Unestablished(f"{at}: the class {value.__module__}.{value.__qualname__}, made inside a "
+                            "function")
     within = (*walking, id(value))
     return [*stated_name, [_class(held, at, known, within) for held in _sources.own_classes(value)]]
 
