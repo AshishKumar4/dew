@@ -6,6 +6,7 @@ float64 over drawn models and tokens (check 1)."""
 
 import dataclasses
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import jax
@@ -16,9 +17,16 @@ from flax import linen as nn
 from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, with_gradients
 
+from dew.batch import leaves_by_path
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.embeddings import prepared_embeddings
+from dew.nn.inspection import QK
+from dew.objectives.base import Step
+from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
+from dew.optim import QKClipState, scale_by_qk_clip
 
 VOCAB = 37
 
@@ -213,6 +221,108 @@ def test_a_loop_over_a_block_is_the_stack_with_the_block_repeated_cache_and_all(
     scanned = tiny(num_layers=4, loop=Loop(2, step_norm=False, layers=(1, 3)), scan_layers=True)
     assert_as_exact(jax.jit(scanned.apply), jax.jit(looped.apply), drawn(looped), 'scanned block loop',
                     seeds=SEEDS['scanned'], truth_fn=wide(looped))
+
+
+UNROLLED = (0, 1, 2, 1, 2, 3)
+"""The layers a four-layer stack whose layers 1 and 2 run twice computes, in order."""
+
+
+def repeated(variables, order=UNROLLED):
+    """`variables` of a stack whose layer i is layer `order[i]`'s, in every collection: a loop unrolled."""
+    def unrolled(tree):
+        layers = {f'layers_{index}': tree[f'layers_{source}'] for index, source in enumerate(order)}
+        return {**{name: value for name, value in tree.items() if not name.startswith('layers_')}, **layers}
+    return {collection: unrolled(tree) for collection, tree in variables.items()}
+
+
+def copies(layer: int, order=UNROLLED) -> list[int]:
+    """The layers of the unrolled stack (`repeated`) that are calls of the looped stack's `layer`."""
+    return [index for index, source in enumerate(order) if source == layer]
+
+
+def by_layer(tree) -> dict[int, dict[tuple[str, ...], np.ndarray]]:
+    """A collection's leaves by each layer's index, then by their path below it."""
+    found: dict[int, dict[tuple[str, ...], np.ndarray]] = {}
+    for path, leaf in leaves_by_path(tree).items():
+        found.setdefault(int(path[0].removeprefix('layers_')), {})[path[1:]] = np.asarray(leaf)
+    return found
+
+
+@pytest.mark.parametrize("shared_cache", [False, True])
+def test_a_looped_router_moves_its_bias_by_the_load_of_every_pass(rng, shared_cache):
+    """A mixture a loop runs twice routes tokens at both passes, and its one balancing bias balances them
+    all: the counts a run's objective takes (`ExpertBalance.effects`, which the commit applies) are, to the
+    count, the sums of the unrolled stack's over its two calls of each looped layer, whose second pass
+    routes otherwise than its first; and the bias moves by them (row 7885). A shared cache's passes,
+    which sow at the block's names alike, step and count alike."""
+    mixture = Mixture(experts=4, top_k=2, bias=True)
+    looped = tiny(num_layers=4, mixture=mixture,
+                  loop=Loop(2, step_norm=False, layers=(1, 3), shared_cache=shared_cache))
+    deep = tiny(num_layers=6, mixture=mixture, loop=None)
+    ids = tokens(rng)
+    variables = nn.unbox(looped.init(rng, ids))
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
+
+    def counted(model, variables):
+        objective = LMObjective(model, ids.shape[1] - 1, balance=ExpertBalance(balance_rate=0.01))
+        effects = objective.scalar_loss(variables, {"text": ids}, step)[1].effects
+        assert effects is not None
+        return objective, effects
+
+    objective, ours = counted(looped, variables)
+    theirs = by_layer(counted(deep, repeated(variables))[1])
+    summed = {layer: jax.tree.map(lambda *counts: sum(counts), *(theirs[index] for index in copies(layer)))
+              for layer in range(4)}
+    first, second = copies(1)
+    assert any(not np.array_equal(theirs[first][path], theirs[second][path]) for path in theirs[first])
+    assert by_layer(ours).keys() == summed.keys()
+    for layer, counts in by_layer(ours).items():
+        assert counts.keys() == summed[layer].keys(), layer
+        for path, count in counts.items():
+            np.testing.assert_array_equal(count, summed[layer][path], err_msg=f"layers_{layer} {path}")
+    moved = by_layer(objective.apply_effects(variables, ours)['moe'])
+    assert any(not np.array_equal(moved[1][path], by_layer(variables['moe'])[1][path]) for path in moved[1])
+
+
+def test_qk_clip_bounds_a_looped_layer_by_the_largest_logit_of_every_pass(rng):
+    """QK-Clip rescales a looped layer's queries and keys by the largest attention logit any of its passes
+    reads: from a looped stack's sows its factors are, bit for bit, those of the unrolled stack's logit
+    maxima maxed over each layer's calls, and at a threshold between a head's first pass's maximum and
+    its second's, larger, the head is clipped otherwise than the first pass's alone clips it (row 7885)."""
+    looped = tiny(num_layers=4, qk_norm=False, loop=Loop(2, step_norm=False, layers=(1, 3)))
+    deep = tiny(num_layers=6, qk_norm=False, loop=None)
+    ids = tokens(rng)
+    variables = nn.unbox(looped.init(rng, ids))
+    ours = looped.apply(variables, ids, mutable=[QK])[1][QK]
+    theirs = deep.apply(repeated(variables), ids, mutable=[QK])[1][QK]
+
+    def called(layers: list[int]) -> dict:
+        """The unrolled stack's sows at `layers`, calls of one looped layer, as one call: their maxima's
+        elementwise largest, the geometry they share."""
+        sown = [theirs[f'layers_{index}']['self_attn'] for index in layers]
+        return {'self_attn': {**sown[0], 'max_logits': (jax.tree.map(
+            lambda *maxima: jnp.max(jnp.stack(maxima), axis=0), *(held['max_logits'] for held in sown)))}}
+
+    every = {f'layers_{layer}': called(copies(layer)) for layer in range(4)}
+    first_only = {**every, 'layers_1': called(copies(1)[:1])}
+    passes = [jnp.max(jnp.asarray(theirs[f'layers_{index}']['self_attn']['max_logits'][0]), axis=-2)
+              for index in copies(1)]
+    head = int(jnp.argmax(passes[1] - passes[0]))
+    assert passes[1][head] > passes[0][head], "a head whose second pass reads a larger logit than its first"
+    tau = float((passes[0][head] + passes[1][head]) / 2)
+    clip, params = scale_by_qk_clip(tau), variables['params']
+
+    def rescales(qk) -> Mapping[str, jax.Array]:
+        state = clip.update(jax.tree.map(jnp.zeros_like, params), clip.init(params), params, qk_stats=qk)[1]
+        assert isinstance(state, QKClipState)
+        return state.rescales
+
+    expected = rescales(every)
+    jax.tree.map(np.testing.assert_array_equal, rescales(ours), expected)
+    clipped = [key for key, factor in expected.items() if "layers_1" in key and bool(jnp.any(factor < 1))]
+    assert clipped, "the second pass's logit clips layer 1"
+    alone = rescales(first_only)
+    assert any(not np.array_equal(alone[key], expected[key]) for key in clipped)
 
 
 def test_a_decoder_gains_a_loop_over_its_own_block_that_one_pass_leaves_as_it_was(rng):

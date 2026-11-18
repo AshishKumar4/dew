@@ -102,7 +102,15 @@ def _layer_slice(tree, index):
 WRITTEN = ('cache', ROUTER_COLLECTION, QK, INDEXER_COLLECTION)
 """The collections a decoder block writes: its decode cache, and what its
 router, its attention and its sparse indexer sow, which a looped pass keeps
-apart per pass (`PassView`)."""
+apart per pass (`PassView`), but for what they observe of the block's weights
+(`OBSERVED`)."""
+
+OBSERVED = (ROUTER_COLLECTION, QK)
+"""What a block's routers and attention sow of its weights' use: the experts each token chose and the
+attention logits' maxima, which a router's balancing bias and QK-Clip read at the weights' own path. A
+loop's every pass and exit coda calls the same weights, so each sows at its layers' own names, after the
+calls before it (`dew.batch.sown_calls`): the bias balances the load of every pass, and the clip bounds
+the logits of every pass."""
 
 
 LAYER_ROWS = 'layer_rows'
@@ -344,9 +352,10 @@ class PassView:
     `inside` shows the pass those entries (a run's name moves with its first
     layer) and hides every other layer's, and keeps the tree it was given;
     `outside` puts the pass's entries back beside the others'. A name that
-    is not a layer's is every pass's. Flax calls `inside` before `outside`
-    within one trace (`nn.map_variables`), which is what holding the tree
-    relies on.
+    is not a layer's is every pass's, and what the pass observes of its
+    weights (`OBSERVED`) it sows at their own names, after every earlier
+    call's. Flax calls `inside` before `outside` within one trace
+    (`nn.map_variables`), which is what holding the tree relies on.
     """
     offset: int
     first: int
@@ -368,14 +377,18 @@ class PassView:
     def inside(self, variables: Mapping[str, Mapping]) -> dict:
         self.held = {collection: dict(tree) for collection, tree in variables.items()}
         back = self.first - self.offset
-        return {collection: {self._moved(name, back): value for name, value in tree.items()
-                             if self._ours(name)}
+        return {collection: tree if collection in OBSERVED else
+                {self._moved(name, back): value for name, value in tree.items() if self._ours(name)}
                 for collection, tree in self.held.items()}
 
     def outside(self, variables: Mapping[str, Mapping]) -> dict:
-        out = {collection: {name: value for name, value in tree.items() if not self._ours(name)}
+        out = {collection: tree if collection in OBSERVED else
+               {name: value for name, value in tree.items() if not self._ours(name)}
                for collection, tree in self.held.items()}
         for collection, tree in variables.items():
+            if collection in OBSERVED:
+                out[collection] = dict(tree)
+                continue
             out.setdefault(collection, {}).update(
                 {self._moved(name, self.offset - self.first): value for name, value in tree.items()})
         return out
