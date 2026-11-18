@@ -36,7 +36,8 @@ def _alone_mixed(phases: Phases) -> Phases:
     mix of its own: its steps before its batch the member's, the batch and the steps after it the mix's.
     A phase on its own stream continues a corpus it shares by its member's draws (`_shared`), so a corpus
     read alone continues as `mix([(corpus, 1.0)])` written in each phase does, where it was refused. A
-    phase that reads it otherwise (in a mix of its own, a concatenation) stays as written."""
+    phase that reads it otherwise (in a mix of its own, a concatenation) stays as written. Every phase of a
+    read on its own streams is staged from the phases so read (`dew.data.compile._compile_phases`)."""
     keys = [{_corpus_key(chain) for chain in _corpora(pipeline)} for pipeline in phases.pipelines]
     shared = {key for index, held in enumerate(keys) for key in held
               if any(key in others for at, others in enumerate(keys) if at != index)}

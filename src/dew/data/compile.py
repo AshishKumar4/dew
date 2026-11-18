@@ -1545,9 +1545,9 @@ def _compile_phases(
     """`train`'s phases, each compiled on its own, every phase and the validation binding the run's
     `widths` (`run_widths`), measured over every phase and held chain, one program for them all, a phase
     binding its measure among `measured` where it may (`_measured_phase`)."""
-    source = train.source
-    if not isinstance(source, Phases):
+    if not isinstance(train.source, Phases):
         raise TypeError("phased compilation needs a Phases source")
+    source: Phases = train.source
 
     _tokenizer_contract((train,) if validation is None else (train, validation))
 
@@ -1567,10 +1567,7 @@ def _compile_phases(
     # Phases on the step clock whose first reads per share (its order cut where each share reads it: a
     # stream batched by its tokens after steps that drop rows) read each its own stream (`StepPhases`).
     per_share = not tokens and not first.build.global_order
-    if per_share:
-        # A corpus a phase reads alone continues as one it reads in a mix of its own does (`_alone_mixed`),
-        # every phase staged from the phases so read (`staged_at` reads `source`).
-        source = _alone_mixed(source)
+    source = _alone_mixed(source) if per_share else source
     shared = _shared(source) if per_share else tuple({} for _ in source.pipelines)
     staged = (_own_streams(source, first, shared, staged_at) if per_share
               else _in_one_order(source, first, staged_at))
