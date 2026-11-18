@@ -1689,8 +1689,8 @@ def _regrouped_pages(store: Mapping[str, jax.Array], rows: jax.Array, banked: bo
     columns = store[TABLE].shape[-1]
 
     def placed(table: jax.Array, cursor: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """A layer's new table, and the pages its copies read (`parents`) and write (`own`, the pool's size
-        where a row copies nothing)."""
+        """A layer's new table, and the pages its copies read (`parents`) and write (`own`), the pool's size
+        where a row copies nothing."""
         table, cursor = table[rows], cursor[rows]
         tail = cursor // size
         written = jnp.arange(columns)[None, :] < tail[:, None]
@@ -1708,7 +1708,9 @@ def _regrouped_pages(store: Mapping[str, jax.Array], rows: jax.Array, banked: bo
         tail_page = jnp.where(keep, parent, own)
         table = jnp.where(written, table, jnp.where(jnp.arange(columns)[None, :] == tail[:, None],
                                                     tail_page[:, None], pages))
-        return table, jnp.where(fresh, parent, pages), own
+        # A parent whose cursor's page holds no token yet (none in its table) leaves its child's empty.
+        copies = fresh & (parent < pages)
+        return table, jnp.where(copies, parent, pages), jnp.where(copies, own, pages)
 
     allot = jax.vmap(placed) if banked else placed
     table, parents, own = allot(store[TABLE], store[cursor_name])

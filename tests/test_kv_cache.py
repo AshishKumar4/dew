@@ -738,14 +738,15 @@ def test_a_paged_stores_regrouped_rows_share_their_parents_written_pages_and_wri
     own, its parent's for the first child (no copy) and a free page holding the parent's tokens for the
     rest, so a token each row then writes at its cursor reaches that row alone (row 8034)."""
     size, columns, pages = 2, 4, 10
-    cursor = jnp.asarray([5, 3], jnp.int32)
+    # A parent's cursor inside its page and one at a page's end, whose next page holds nothing yet.
+    cursor = jnp.asarray([5, 4], jnp.int32)
     held = jnp.arange(pages * size, dtype=jnp.float32).reshape(1, pages, size, 1) + 100
     store = {TABLE: default_page_table(2, columns, pages, 1), CURSOR: cursor, "cached_key": held,
              "cached_value": -held, BOUND: jnp.ones((1, pages, size)), DOCUMENTS: jnp.ones((1, pages, size),
                                                                                          jnp.int32)}
     rows = jnp.asarray([0, 0, 1, 0], jnp.int32)
     regrouped = gather_cache_rows({"layer": store}, rows)["layer"]
-    table, keys = np.asarray(regrouped[TABLE]), np.asarray(regrouped["cached_key"])
+    table, keys = np.asarray(regrouped[TABLE]), np.array(regrouped["cached_key"])
 
     def slots(table, pool, row, count):
         return [float(pool[0, table[row, slot // size], slot % size, 0]) for slot in range(count)]
@@ -757,7 +758,7 @@ def test_a_paged_stores_regrouped_rows_share_their_parents_written_pages_and_wri
         np.testing.assert_array_equal(table[row, :count // size], old[parent, :count // size])
     np.testing.assert_array_equal(np.asarray(regrouped[CURSOR]), np.asarray(cursor)[np.asarray(rows)])
     tails = [table[row, int(cursor[parent]) // size] for row, parent in enumerate(np.asarray(rows))]
-    assert tails[0] == old[0, 2] and tails[2] == old[1, 1], "a first child keeps its parent's page"
+    assert tails[0] == old[0, 2] and tails[2] == old[1, 2], "a first child keeps its parent's page"
     written = {int(page) for row, parent in enumerate(np.asarray(rows))
                for page in table[row, :int(cursor[parent]) // size]}
     assert len(set(tails)) == len(tails) and not written & set(tails)
@@ -769,3 +770,13 @@ def test_a_paged_stores_regrouped_rows_share_their_parents_written_pages_and_wri
     for row, parent in enumerate(np.asarray(rows)):
         count = int(cursor[parent])
         assert slots(table, keys, row, count + 1) == [*slots(old, np.asarray(held), parent, count), -row - 1]
+
+    # Regrouped again past those tokens: a cursor at a page's end, whose next page no table holds yet,
+    # leaves its children's new pages empty and every child reading its parent's tokens.
+    later = {**regrouped, "cached_key": jnp.asarray(keys), CURSOR: regrouped[CURSOR] + 1}
+    again = gather_cache_rows({"layer": later}, jnp.asarray([1, 1, 0, 3], jnp.int32))["layer"]
+    for row, parent in enumerate([1, 1, 0, 3]):
+        count = int(later[CURSOR][parent])
+        assert slots(np.asarray(again[TABLE]), np.asarray(again["cached_key"]), row, count) == slots(
+            table, keys, parent, count), row
+    assert not np.isnan(np.asarray(again["cached_key"])).any()
