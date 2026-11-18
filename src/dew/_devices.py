@@ -299,15 +299,23 @@ device's standing in for a GPU (`dew.training.ahead.stand_in_gpus`): the one sta
 and layout check on the device reads (`device_memory`, `allocator_limit`)."""
 
 
-def allocator_limit(memory: int) -> int:
+COMPILE_ONLY_SHARE: dict = {}
+"""Each compile-only GPU's pool share as the run that loads its programs holds it
+(`dew.training.ahead.AheadTarget.share`): what every admission and layout check on the device reads
+(`device_memory`, `allocator_limit`), where the compiling process's own share (`pool_share`) is its own
+GPU's, a prepare packed beside another job holding a share of that GPU alone."""
+
+
+def allocator_limit(memory: int, share: float | None = None) -> int:
     """The bytes XLA's allocator is limited to on a GPU of `memory` bytes, as the run that loads a program
-    states it (`bytes_limit`): its memory times the pool's share (`pool_share`), as a double truncated
+    states it (`bytes_limit`): its memory times the pool's share, the loading run's stated one (`share`,
+    `COMPILE_ONLY_SHARE`) else this process's (`pool_share`), as a double truncated
     (`CreateBFCAllocator`, xla/pjrt/gpu/gpu_helpers.cc), the one rule a compile for absent GPUs and the
     GPU's own allocator read alike. The GPU's own rounds it up to 2 MiB besides (`RoundUpGpuMemoryLimit`,
     there), so a plan held to this limit is held to at most 2 MiB less than the GPU's, and loads there:
     a GH200 of 101,468,602,368 bytes at Dew's share derives 96,395,172,249 against the 96,395,591,680 it
     states (M-IG-6, measured)."""
-    return int(memory * pool_share())
+    return int(memory * (pool_share() if share is None else share))
 
 
 def device_memory(device, arguments: int = 0) -> Mapping[str, int]:
@@ -321,14 +329,14 @@ def device_memory(device, arguments: int = 0) -> Mapping[str, int]:
     memory = COMPILE_ONLY_MEMORY.get(device)
     if memory is None:
         return (device.memory_stats() or {}) if device in jax.local_devices() else {}
-    return fresh_pool(memory, arguments)
+    return fresh_pool(memory, arguments, COMPILE_ONLY_SHARE.get(device))
 
 
-def fresh_pool(memory: int, arguments: int = 0) -> dict[str, int]:
+def fresh_pool(memory: int, arguments: int = 0, share: float | None = None) -> dict[str, int]:
     """What XLA's BFC pool states on a GPU of `memory` bytes, fresh at its allocator's limit
-    (`allocator_limit`) with `arguments` resident: the one stated memory of a GPU not attached
-    (`device_memory`, `dew.training.memory.needed`)."""
-    limit = allocator_limit(memory)
+    (`allocator_limit`, at `share` where the loading run's is stated) with `arguments` resident: the one
+    stated memory of a GPU not attached (`device_memory`, `dew.training.memory.needed`)."""
+    limit = allocator_limit(memory, share)
     return {"bytes_limit": limit, "bytes_in_use": arguments, "pool_bytes": limit,
             "largest_free_block_bytes": limit - arguments}
 

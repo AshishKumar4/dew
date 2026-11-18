@@ -482,6 +482,29 @@ def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...],
     return Collectives.of(positions.to_json(), gpus)
 
 
+@dataclasses.dataclass(frozen=True)
+class LoadedProgram:
+    """A compiled program as this process loaded it (`loaded_program`): the devices it runs on and its
+    runtime's fingerprint, None where the runtime states none."""
+
+    devices: tuple
+    """The devices it runs on (JAX's `Device`s)."""
+    fingerprint: bytes | None
+
+
+def loaded_program(executable: jax.stages.Compiled) -> LoadedProgram | None:
+    """`executable`'s program as this process loaded it (its runtime a `LoadedExecutable`), None for one
+    compiled for devices it has not (`dew.nn.kernels.generation.compile_only_gpus`), which is never loaded
+    here: no devices, fingerprint or room of this process's. The one reading of it `admit`, a kept program
+    (`dew.training.ahead`) and a step's flops (`dew.training.rungs`) take."""
+    runtime = executable.runtime_executable()
+    if runtime is None or not isinstance(runtime, LoadedExecutable):
+        return None
+    fingerprint = runtime.fingerprint
+    return LoadedProgram(tuple(runtime.local_devices()),
+                         fingerprint if isinstance(fingerprint, bytes) else None)
+
+
 def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = gpu_free_bytes) -> None:
     """Admit a compiled or loaded program's communicators and code against the room the process's sizing left
     them and its GPUs have free outside XLA's pool now (`Resident`), refusing one that would not fit before it
@@ -490,16 +513,16 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
     host's room, as does a program on the host's CPU. Every program Dew compiles passes here
     (`dew.nn.kernels.templates.report`), the RL rollouts' among them (`dew.nn.kernels.options.OuterProgram`),
     and every executable it loads compiled ahead (`dew.training.ahead`)."""
-    runtime = executable.runtime_executable()
-    if _HELD is None or runtime is None or not isinstance(runtime, LoadedExecutable):
+    program = loaded_program(executable)
+    if _HELD is None or program is None:
         return
-    devices = runtime.local_devices()
+    devices = program.devices
     if not devices or any(device.platform != "gpu" for device in devices):
         # A program on the host's CPU makes no NCCL communicator and holds no GPU code.
         return
     gpus = assigned(devices)
-    fingerprint = runtime.fingerprint
-    if not isinstance(fingerprint, bytes):
+    fingerprint = program.fingerprint
+    if fingerprint is None:
         made = collectives_of(executable, gpus)
         loaded = None
     else:
