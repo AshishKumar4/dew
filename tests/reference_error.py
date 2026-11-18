@@ -1898,6 +1898,41 @@ def declared_seeds(path) -> dict[str, int]:
             if name.endswith(".seeds")}
 
 
+def ahead_arm(fn: Callable, label: str) -> Callable:
+    """`fn` (a function of arrays: a test's computation with no check-1 site, a bitwise check's kernel run on
+    the GPU) as an arm with no site, through the arms' own path: within a GPU tier part's prepare (`COMPILED`,
+    a store that prepares) its call is traced and compiled at its inputs' shapes as a site's arms are
+    (`_arm_program` in the store's `tracing`, `_arm_compile`, held under `armed(label)` by Dew's statement of
+    it, `_arm_role`) and gives zeros of its outputs' shapes, nothing computing there (a test's later failure
+    in its prepare, past its stored program, judges nothing); in its run its call is that executable
+    (`CompiledTruths.called`), tracing, lowering and compiling none; outside a part, `fn` itself. One no
+    statement holds, or one its prepare did not reach, runs unprepared, recorded and named (`unprepared`,
+    as `running` records a site). One call a label: a second in one prepare is refused, as a second site
+    of one label is (`compile_site`). Its inputs are host arrays, NumPy's: a prepare's default device
+    computes nothing, not even their placement (bible §8)."""
+    def called(*inputs):
+        store = COMPILED.get()
+        if store is None:
+            return fn(*inputs)
+        role = _arm_role("dew", fn, label)
+        if role is None:
+            store.unprepared(f"{label}: its arm has no statement of what it computes")
+            return fn(*inputs)
+        if store.prepare:
+            programs: dict = {}
+            held: dict = {}
+            with store.tracing():
+                _arm_program(programs, held, role, fn, inputs, reference=False)
+            store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain=True), arms=True)
+            return jax.tree.map(lambda shape: np.zeros(shape.shape, shape.dtype), jax.eval_shape(fn, *inputs))
+        if not store.holds(armed(label)):
+            store.unprepared(f"{label}: its prepare did not reach this arm")
+            return fn(*inputs)
+        return store.called(armed(label), role, inputs)
+
+    return called
+
+
 def drawn_on_the_host(inputs_of: Callable, seed: int):
     """`inputs_of(seed)` drawn on the host's CPU, as a recording's inputs were, whatever device the test runs
     on: jax.random's draws are the same bits on every device but its normal's float transform is not (a

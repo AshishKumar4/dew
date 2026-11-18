@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 import tier_wire
 from process_support import relayed
-from reference_error import assert_as_exact, over_windows, run_to_run, windows
+from reference_error import ahead_arm, assert_as_exact, over_windows, run_to_run, windows
 from truths_ahead import UNPREPARED, MissingTruth, compiled_truths
 
 from dew.nn.kernels import generation
@@ -379,6 +379,32 @@ def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     assert not dew_traced and not reference_traced
     assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
     assert dew_traced and reference_traced
+
+
+def test_a_site_free_arm_runs_its_prepared_program(tmp_path):
+    """A computation with no check-1 site (a bitwise check's kernel, `reference_error.ahead_arm`) is
+    prepared as an arm is: its prepare traces it and gives zeros of its outputs' shapes, its run computes it
+    with the program its prepare compiled, tracing none, the same values bit for bit as computing it; one its
+    prepare did not reach runs unprepared, recorded and named (bible section 8: compiling in the prepare,
+    none on a held GPU; the GPU tier's site-free tests computed before any site there and compiled on it)."""
+    traced: list[None] = []
+
+    def scaled(a, b):
+        traced.append(None)
+        return a * b + 1.0
+
+    a, b = (np.arange(6, dtype=np.float32).reshape(2, 3) + offset for offset in (1.0, 0.5))
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        prepared = ahead_arm(jax.jit(scaled), "a scaled product")(a, b)
+    assert traced and np.asarray(prepared).tolist() == np.zeros((2, 3), np.float32).tolist()
+    traced.clear()
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        stored = ahead_arm(jax.jit(scaled), "a scaled product")(a, b)
+    assert not traced and np.asarray(stored).tolist() == (a * b + 1.0).tolist()
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        unreached = ahead_arm(jax.jit(scaled), "a product no prepare reached")(a, b)
+    assert traced and np.asarray(unreached).tolist() == (a * b + 1.0).tolist()
+    assert (tmp_path / UNPREPARED).is_file()
 
 
 @pytest.mark.parametrize("jitted", [False, True], ids=["a plain reference", "a jitted reference"])
