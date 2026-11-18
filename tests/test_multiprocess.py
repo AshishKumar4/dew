@@ -275,16 +275,18 @@ def test_a_pool_counting_its_passes_evaluates_at_their_ends_whichever_rank_prefe
     """A pool bounded in steps that counts its passes for its evaluation and checkpoints (`count_passes`),
     each share reading records of its own: its first rank prefetching eight batches deep, ahead of the
     pool's evaluation and checkpoint rounds, and its second one, behind them, then the other way round. Its
-    clock is the pool's: every rank evaluates at the steps one process of two devices does, each pass's
-    end, and saves the examples the whole pool consumed, as the pool's read round counts them on the
-    loop's thread (`pooled_read`) whatever its prefetch runs ahead to."""
-    alone = run_pool("counted_passes", tmp_path / "alone", 1, script=EXAMPLES_CLOCK, devices=2)[0]
-    assert alone["pass"] == 10 and len(alone["evaluated"]) >= 2
+    clock is the pool's whichever rank runs ahead: it evaluates at the steps the pool prefetching one batch
+    deep on both ranks does, each pass's end, and every rank saves the examples the whole pool consumed,
+    as the pool's read round counts them on the loop's thread (`pooled_read`) whatever its prefetch runs
+    ahead to."""
+    level = run_pool("counted_passes", tmp_path / "level", 2, script=EXAMPLES_CLOCK)
+    assert level[0]["pass"] == 10 and len(level[0]["evaluated"]) >= 2
+    assert level[0]["consumed"] == level[1]["consumed"] is not None
     for lagging in (0, 1):
         reports = run_pool("counted_passes", tmp_path / f"lag{lagging}", 2, script=EXAMPLES_CLOCK, lag=8,
                            lag_rank=lagging)
-        assert [report["evaluated"] for report in reports[:1]] == [alone["evaluated"]]
-        assert [report["consumed"] for report in reports] == [alone["consumed"]] * 2
+        assert reports[0]["evaluated"] == level[0]["evaluated"]
+        assert [report["consumed"] for report in reports] == [level[0]["consumed"]] * 2
 
 
 @pytest.mark.distributed
