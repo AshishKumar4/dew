@@ -4,6 +4,7 @@ training stream (`waited_read`)."""
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import dataclasses
 import datetime
@@ -1214,6 +1215,25 @@ class Start:
     held: Mapping[int, int]
     """Each device's bytes of the state, by its id, as the layout validates its placement
     (`Validation.device_bytes`): its own memory's alone, none of a field kept in the host's."""
+
+    def unplaced(self, mesh: Mesh) -> int:
+        """The most bytes any of this process's devices of `mesh` takes as the start places the state: the
+        state's as the layout validates it (`held`), none of a field kept in the host's, but for the frozen
+        held arrays it keeps as they are, placed where it keeps them already (`through`), each device's own
+        shards of them; every other held array it copies."""
+        from dew.state import apart
+        from dew.training.memory import local_devices
+
+        inputs = jax.tree.leaves(self.initializer)
+        where = jax.tree.leaves(apart(self.shardings)[1])
+        kept: dict = collections.Counter()
+        for index, given in self.through.items():
+            leaf = inputs[given]
+            if (isinstance(leaf, jax.Array) and leaf.sharding == where[index]
+                    and (leaf.sharding.memory_kind or "device") == "device"):
+                for shard in leaf.addressable_shards:
+                    kept[shard.device.id] += shard.data.nbytes
+        return max(self.held[device.id] - kept[device.id] for device in local_devices(mesh))
 
     @functools.cached_property
     def placing(self) -> StartBuild:
