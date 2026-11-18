@@ -122,13 +122,15 @@ def decision_objective(model, weights):
                              shuffle_options=False, pass_weights=weights)
 
 
+@pytest.mark.check1_shards(seeds=64, per_task=16)
 def test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_weight():
     """`pass_weights` over a decision model's looped backbone, a consistency term beside the label loss
     over a group of two questions, one negated, whose divergence is nonzero: the loss and every parameter's
     gradient on par from float64 with each `with_passes(k)` backbone's own decision loss at its weight
     (check 1). The two questions' options are named, not described, so the joint row fits in 512 tokens,
     where `test_decision_consistency.NEGATED`'s described nouls and a third question took 959 and the
-    test set its CI train's wall (row 7291)."""
+    test set its CI train's wall (row 7291). Its 64 seeds are drawn by CI's map tasks, 16 a task: drawn
+    whole they took 251 s (row 8406)."""
     from dew.decision import Group, JointSchemaHead
     from dew.decision.layout import SegmentLayout
 
