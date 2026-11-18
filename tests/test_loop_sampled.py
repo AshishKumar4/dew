@@ -574,3 +574,27 @@ def test_a_rollout_beside_a_pass_count_drawn_per_microbatch_is_refused():
     with pytest.raises(ValueError):
         phased_trainer(model, 0, None, sampled_passes=TRAINED, rollout=_Drawing())
     phased_trainer(model, 0, (CAP,), rollout=_Drawing())
+
+
+def test_a_sampled_runs_step_compiled_ahead_holds_every_count(tmp_path):
+    """A run that draws its pass count per microbatch, its step compiled ahead for compile-only GPUs
+    (`compile_ahead`), holds beside its cap's step every other count's at the cap's plan, each its own program
+    (`AheadOfTime.counts`, row 7924), saved and loaded with it; a run handed it takes each count's
+    (`AheadOfTime.at_count`), a count it holds none of refused."""
+    from test_compile_ahead import gpus
+
+    from dew.training import MeshSpec
+    from dew.training.ahead import AheadOfTime, compile_ahead
+
+    trainer = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED,
+                             mesh=MeshSpec().build(gpus("sm90")))
+    ahead = compile_ahead(trainer, {"text": np.asarray(token_batch()["text"])})
+    assert sorted(ahead.counts) == list(range(1, CAP))
+    programs = {count: step.program for count, (step, _) in ahead.counts.items()}
+    assert len({ahead.program, *programs.values()}) == CAP
+    ahead.save(tmp_path / "step.dew-aot")
+    loaded = AheadOfTime.load(tmp_path / "step.dew-aot")
+    assert {count: step.program for count, (step, _) in loaded.counts.items()} == programs
+    assert all(loaded.at_count(count).program == program for count, program in programs.items())
+    with pytest.raises(ValueError):
+        loaded.at_count(CAP)

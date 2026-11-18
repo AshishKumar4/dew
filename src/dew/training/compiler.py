@@ -10,7 +10,7 @@ import functools
 import json
 import logging
 import time
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
@@ -484,6 +484,9 @@ class StepCompiler[L, E]:
         self.objective = objective
         self.phase_passes = phase_passes
         self.ahead = ahead
+        # The step compiled ahead a run was handed, whose counts' family a run that draws its pass count per
+        # microbatch takes after its first compile took the cap's (`admitted_counts`).
+        self.counts_ahead: AheadOfTime | None = None
         self._stated_links = dict(links or {})
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         # The ladder's rungs past the objective's head and remat that a step fit at (no narrow copies, XLA's
@@ -818,13 +821,8 @@ class StepCompiler[L, E]:
                              "drawn per microbatch takes them one microbatch an update (split and "
                              "accumulation 1), until replays run each at its own (row 7884)")
         plans, flops = {sampled.cap: planned}, {sampled.cap: cap.step_flops}
-        # Compiled here, a step compiled ahead holding its cap's alone (`dew.training.ahead`).
-        _log.info("the run draws its pass count per microbatch: it compiles the steps of counts %s at its "
-                  "cap's plan", list(range(1, sampled.cap)))
-        for count in range(1, sampled.cap):
-            self.phase_passes.current = count
-            with self.phase_passes.scoped(holder, self):
-                plans[count], flops[count] = self.admitted_at(stepping(), state, batch, planned, count)
+        for count, each in self.admitted_counts(holder, stepping, planned, state, batch):
+            plans[count], flops[count] = each.released(), self._flops(each)
         self.phase_passes.current = sampled.cap
         with self.phase_passes.scoped(holder, self):
             capped = stepping()
@@ -834,8 +832,39 @@ class StepCompiler[L, E]:
                                parted=lambda: [plans[count] for count in step.counts])
         return step
 
-    def admitted_at(self, stepping: Stepping, state: TrainState, batch: Batch, cap: Planned,
-                    passes: int) -> tuple[Planned, StepFlops | None]:
+    def admitted_counts(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Planned,
+                        state: TrainState, batch: Batch) -> Iterator[tuple[int, Planned]]:
+        """Every count but the cap of a run that draws its pass count per microbatch (`PhasePasses.sampled`)
+        admitted at the cap's plan `cap` (`admitted_at`), each traced under its count's objective, `holder`'s
+        and the compiler's (`PhasePasses.scoped`), by `stepping`, and handed on as it is admitted, so its
+        caller releases or keeps each before the next compiles; each taken from the counts' family of the
+        step compiled ahead where the run was handed one (`counts_ahead`, `AheadOfTime.at_count`), which
+        its first admission consumes as a step compiled ahead is (a later batch's shapes compile their
+        own), else compiled here, as the run says."""
+        sampled = self.phase_passes.sampled
+        assert sampled is not None, "a run that draws its pass count per microbatch"
+        counts, family, self.counts_ahead = range(1, sampled.cap), self.counts_ahead, None
+        if family is None:
+            _log.info("the run draws its pass count per microbatch: it compiles the steps of counts %s at "
+                      "its cap's plan", list(counts))
+        try:
+            for count in counts:
+                self.phase_passes.current = count
+                with self.phase_passes.scoped(holder, self):
+                    planned = self.admitted_at(stepping(), state, batch, cap, count,
+                                               ahead=None if family is None else family.at_count(count))
+                yield count, planned
+        finally:
+            self.phase_passes.current = sampled.cap
+
+    @staticmethod
+    def _flops(planned: Planned) -> StepFlops | None:
+        """A step's FLOPs at `planned`, a microbatch's (`plan_flops`) times its split."""
+        flops, _ = plan_flops(None, planned.executable)
+        return flops and planned.split * flops
+
+    def admitted_at(self, stepping: Stepping, state: TrainState, batch: Batch, cap: Planned, passes: int,
+                    ahead: AheadOfTime | None = None) -> Planned:
         """The step of a sampled pass count's `passes` (`dew.training.phase_passes.SampledPasses`) at exactly
         the plan `cap` its cap's step runs: its split, its rung and the narrow copies the cap's step reads
         (`prepared_for`), so the window's microbatches pass one state between the counts' programs, part by
@@ -843,7 +872,10 @@ class StepCompiler[L, E]:
         (`FitSearch.fits_here`), with no search of its own: one that misses is refused, naming its count,
         its rung and the bytes it fell short by, and one whose state, window or loss's shapes are other than
         the cap's step's is refused, naming the leaves. Derived from the cap's plan at each admission, never
-        recorded (`_plans`), so a resume admits each count as the run did."""
+        recorded (`_plans`), so a resume admits each count as the run did. `ahead`, its step compiled ahead
+        (`AheadOfTime.at_count`), runs in place of its compile where it is that program. Unreleased: its
+        caller releases it (`Planned.released`) once it has read its lowering, a step compiled ahead its
+        program's digest."""
         settings = stepping.settings
         mesh = settings.device_mesh
         links = self.links(mesh)
@@ -867,7 +899,7 @@ class StepCompiler[L, E]:
                     lower, lambda candidate: step_options(
                         self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
                     self.objective, mesh, cap.at.xla_defaults, cap.at.narrow, cap.at.ns_group,
-                    None if self._base_rung is None else self._base_rung[1], None)
+                    None if self._base_rung is None else self._base_rung[1], None, ahead=ahead)
                 if not search.fits_here(cap.split):
                     short = search.probes[-1].headroom
                     raise ValueError(f"the step of {passes} passes misses the devices at its cap's plan "
@@ -880,8 +912,7 @@ class StepCompiler[L, E]:
         if unlike:
             raise ValueError(f"the step of {passes} passes holds {unlike} other than its cap's step does: a "
                              "sampled count's steps pass one state between them, its window pooling them all")
-        flops, _ = plan_flops(None, planned.executable)
-        return planned.released(), flops and cap.split * flops
+        return planned
 
     def _plan(self, stepping: Stepping, state: TrainState, batch: Batch, trials: Trials | None,
               frontier: bool = False, *, unplaced: int | None = None, provisional: bool = False
@@ -1067,7 +1098,11 @@ class StepCompiler[L, E]:
             above = search.above(candidates, planned.split) if frontier else None
         for probe in above or ():
             _log.info("above the plan, fitting at fewer microbatches: %s", probe.named())
-        # Consume the artifact only after its program was accepted; a refusal leaves it pending.
+        # Consume the artifact only after its program was accepted; a refusal leaves it pending. A run
+        # that draws its pass count per microbatch keeps its counts' family for their admission
+        # (`admitted_counts`).
+        if self.ahead is not None and search.ahead is None and self.phase_passes.sampled is not None:
+            self.counts_ahead = self.ahead
         self.ahead = search.ahead
         planned.at.put(self.objective)
         self._xla_defaults, self._narrow = planned.at.xla_defaults, planned.at.narrow
