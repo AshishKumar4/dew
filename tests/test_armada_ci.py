@@ -333,6 +333,22 @@ def test_a_task_fetches_only_the_pins_its_environment_lacks_within_its_deadline(
         ci.session.fetched_absent("3.12", 1.0, ci.digests.fetched.absent(tmp_path))
 
 
+def test_a_targeted_run_fetches_the_pins_its_store_lacks_before_pytest(ci, tmp_path, monkeypatch):
+    """The pytest operation (a lane's targeted run, the gangs) fetches the pins its store lacks before pytest,
+    as a task does: the environment's key reads no pin (train 1049's review, F6)."""
+    order = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ci.digests.fetched, "absent", lambda root: {"x": {}})
+    monkeypatch.setattr(ci.session, "fetched_absent",
+                        lambda python, _, lacking: order.append(("fetch", python, sorted(lacking))) or 0.0)
+    monkeypatch.setattr(ci, "targeted",
+                        lambda python, arguments, *rest: order.append(("pytest", arguments)) or 0)
+    report = f"--report={tmp_path / 'r.xml'}"
+    monkeypatch.setattr(sys, "argv", ["ci.py", "pytest", "--python=3.12", report, "--", "tests/test_x.py"])
+    assert ci.main() == 0
+    assert order == [("fetch", "3.12", ["x"]), ("pytest", ["tests/test_x.py"])]
+
+
 def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     """A failed test, a skip on a missing import and a file that does not
     collect each turn their own file's row red; a passing file and an

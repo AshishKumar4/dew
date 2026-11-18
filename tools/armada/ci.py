@@ -2458,8 +2458,8 @@ def main() -> int:
         # And each file's pinned generations, one line of JSON: what a tier's composer cuts each kind's by.
         print(json.dumps(pinned))
         return 0
-    if args.operation == "pytest":
-        # argparse keeps the `--` that sets pytest's arguments apart from these.
+    if args.operation == "pytest":  # its absent pins fetched first, as a task's; argparse keeps the `--`
+        session.fetched_absent(args.python, session.DEADLINE, digests.fetched.absent(Path.cwd()))
         arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
         return targeted(args.python, arguments, args.report, args.tests.split(), args.split)
     if args.operation == "gpu-lane":
