@@ -1884,6 +1884,47 @@ def test_a_launch_runs_a_flags_branch_and_its_negations_branch_each_alone(semant
     np.testing.assert_array_equal(np.asarray(out), np.repeat(np.asarray([2, 1], np.int32), 128))
 
 
+@pytest.mark.gpu(reason="a warp's lanes hold values of their own only on the device")
+@pytest.mark.parametrize("read", ["uniform", "own"])
+def test_a_uniform_read_gives_each_lane_its_warps_lane_zero_value(read):
+    """`across.uniform` of a scalar each lane of a warpgroup holds its own of (its thread's index plus 7, as
+    a word each lane reads may differ) gives every lane its warp's lane 0's: one shuffle from a constant
+    lane. Read as each lane holds it, each lane's own (the control)."""
+    from jax.experimental.mosaic.gpu import fragmented_array, utils
+    from jax.extend.mlir import ir
+    from jax.extend.mlir.dialects import arith, vector
+
+    scalar, lanes = plgpu.Layout.WG_SPLAT(()), plgpu.Layout.WG_STRIDED((128,), vec_size=1)
+
+    def own(ctx):
+        del ctx
+        i32 = ir.IntegerType.get_signless(32)
+        thread = arith.remui(utils.thread_idx(), utils.c(128, i32))
+        value = arith.addi(thread, utils.c(7, i32))
+        return fragmented_array.FragmentedArray.splat(value, (), is_signed=True)
+
+    def spread(ctx, value):
+        # Each thread's register at its own index.
+        del ctx
+        i32 = ir.IntegerType.get_signless(32)
+        held = vector.broadcast(ir.VectorType.get((1,), i32), value.registers.item())
+        return fragmented_array.FragmentedArray(
+            _registers=np.asarray([held], dtype=object),
+            _layout=fragmented_array.WGStridedFragLayout((128,), 1), _is_signed=True)
+
+    def body(out_gmem):
+        held = plgpu.inline_mgpu(
+            return_type=plgpu.ShapeDtypeStruct((), jnp.dtype(jnp.int32), layout=scalar))(own)()
+        read_value = across.uniform(held) if read == "uniform" else held
+        each = plgpu.ShapeDtypeStruct((128,), jnp.dtype(jnp.int32), layout=lanes)
+        out_gmem[...] = plgpu.inline_mgpu(arg_types=(scalar,), return_type=each)(spread)(read_value)
+
+    out = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((128,), jnp.int32), grid=(1,))()
+    threads = np.arange(128, dtype=np.int32)
+    expected = (threads // 32 * 32 if read == "uniform" else threads) + 7
+    np.testing.assert_array_equal(np.asarray(out), expected)
+
+
 ONCE_BUNDLES = [pytest.param("wgmma", marks=INTERPRETS), pytest.param("fed", marks=INTERPRETS), "mxu"]
 """The ways a family walks a once stream: held beside a ring, held by a consumer-fed bundle's loader, and a
 TPU core's fold, its kernels interpreted on any host."""

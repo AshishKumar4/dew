@@ -57,6 +57,29 @@ def arrived(counter, contributors) -> jax.Array:
     return inline(ticket)(counter, jnp.asarray(contributors, jnp.int32))
 
 
+def uniform(value) -> jax.Array:
+    """`value`, an int32 scalar each thread of a warpgroup holds (a verdict its consumers' published words
+    make, each thread reading them from shared memory), as its warp's lane 0 holds it: one `shfl.sync.idx`
+    from a constant lane, whose result ptxas holds in a uniform register where a load's it holds lane by lane.
+    So a branch on it is not divergent, and the addresses formed under it (a paged decode's TMA coordinates
+    from its page table) are formed once, not by an elect loop over the lanes (row 7898). Where every lane
+    holds the same value it is that value."""
+    scalar = plgpu.Layout.WG_SPLAT(())
+
+    # One shuffle a thread: an operation of the CUDA cores, no memory read or written.
+    @emission.stating(lambda value: Work(operations=1))
+    def lane_zero(ctx, value):
+        del ctx
+        i32 = ir.IntegerType.get_signless(32)
+        broadcast = mgpu_utils.inline_ptx("shfl.sync.idx.b32 $0, $1, 0, 0x1f, 0xffffffff;",
+                                          value.registers.item(), result_types=i32, convergent=True)
+        return mgpu_fragments.FragmentedArray.splat(broadcast, (), is_signed=True)
+
+    inline = plgpu.inline_mgpu(arg_types=(scalar,),
+                               return_type=plgpu.ShapeDtypeStruct((), jnp.dtype(jnp.int32), layout=scalar))
+    return inline(lane_zero)(jnp.asarray(value, jnp.int32))
+
+
 def summing(shape: tuple[int, ...], consumers: int) -> dict:
     """`summed_across`' allocations for `pl.run_scoped` (collective across the consumers, in a scope after
     the walk's, whose shared memory it reuses): every consumer's fp32 part but the first's, the barrier they
