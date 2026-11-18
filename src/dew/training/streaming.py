@@ -98,12 +98,11 @@ def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
     """Why `trainer`'s run cannot stream its parameters from the host, None where it can. What the streamed
     step cannot be: a layout the run states (`stated`), a custom step, which owns its execution, or a process
     holding no CPU companion of the devices, which JAX makes only before it initializes. And what it is not
-    built for yet (`NOT_BUILT`): a rollout, an inspected step, DiLoCo, a step compiled `ahead`,
+    built for yet (`NOT_BUILT`): a rollout, DiLoCo, a step compiled `ahead`,
     a lowering for another target, AutoPGLE, and a part whose table
     states no host link to price it by (`GpuTarget.host_links`: a TPU's). Read before any plan is built."""
     unbuilt = (
         (trainer.rollout is not None, "a rollout"),
-        (trainer.inspection is not None, "an inspected step"),
         (trainer.diloco is not None, "DiLoCo's groups"),
         (ahead, "a step compiled ahead"),
         (trainer.lower_for is not None, "a lowering for another target"),
