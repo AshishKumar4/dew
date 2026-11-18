@@ -685,7 +685,9 @@ def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, column
 
     def update(h, q, k, v, g, beta, own=None):
         del q, own
-        decayed = accurate_exp(g).reshape(-1, 1) * h
+        # The language's exp, which the algebra reads as the decay `exp(z)` and evaluates by `scan._exp`
+        # (accurate on every backend): Dew's own on a TPU is a protected span it reads no operation of.
+        decayed = jnp.exp(g).reshape(-1, 1) * h
         written = v - k @ decayed if delta else v
         return decayed + beta * k[:, None] * written[None, :]
 
@@ -787,7 +789,8 @@ def _oja_forms(*, scale: float, width: int, columns: int, work: jnp.dtype, reset
 
     def update(h, q, k, v, g, beta):
         del q
-        decayed = accurate_exp(g).reshape(-1, 1) * h
+        # The language's exp, the algebra's decay (`_delta_forms`' update).
+        decayed = jnp.exp(g).reshape(-1, 1) * h
         return decayed + v[:, None] * (beta * k - beta * (v @ decayed))[None, :]
 
     def readout(h, q, k, v, g, beta):
