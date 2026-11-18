@@ -973,7 +973,7 @@
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[decision-user+causal]",
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-flux2_transformer]",
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-hybrid_dit]",
-"tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-simple_mmdit]",
+"tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-simple_udit]",
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-unet_2d_condition]",
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-unet_3d]",
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-video_dit]",
@@ -1433,8 +1433,8 @@
 "tests/test_decoder_export.py::test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export[glm_moe_dsa]",
 "tests/test_decoder_export.py::test_the_export_carries_the_trained_weights_not_the_loaded_ones[deepseek_v3]",
 "tests/test_decoder_export.py::test_the_export_carries_the_trained_weights_not_the_loaded_ones[glm5_next]",
-"tests/test_decoder_export.py::test_the_export_carries_the_trained_weights_not_the_loaded_ones[glm_moe_dsa]",
-"tests/test_decoder_export.py::test_the_export_carries_the_trained_weights_not_the_loaded_ones[mixtral]",
+"tests/test_decoder_export.py::test_the_export_carries_the_trained_weights_not_the_loaded_ones[gpt_neox]",
+"tests/test_decoder_export.py::test_the_export_carries_the_trained_weights_not_the_loaded_ones[opt]",
 "tests/test_decoder_export.py::test_the_gradients_match_the_reference_implementation[deepseek_v4]",
 "tests/test_decoder_export.py::test_the_gradients_match_the_reference_implementation[glm5_next]",
 "tests/test_decoder_export.py::test_the_gradients_match_the_reference_implementation[glm_moe_dsa]",
@@ -1443,7 +1443,7 @@
 "tests/test_decoder_export.py::test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits[deepseek_v4]",
 "tests/test_decoder_export.py::test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits[glm4_moe]",
 "tests/test_decoder_export.py::test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits[glm_moe_dsa]",
-"tests/test_decoder_export.py::test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits[mixtral]",
+"tests/test_decoder_export.py::test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits[mamba2]",
 "tests/test_decoder_export.py::test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits[qwen3_next]",
 "tests/test_decoder_export.py::test_transformers_reads_the_trained_export[deepseek_v2]",
 "tests/test_decoder_export.py::test_transformers_reads_the_trained_export[deepseek_v4]",
@@ -1550,10 +1550,10 @@
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a small weight on a large value, float32-as drawn-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a subnormal share of an overflowing row, bfloat16-as drawn-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a tiny value beside an overflowing column at equal weights-float16-accurate]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[documents of one key-as drawn-fast]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[logits near 1e4-as drawn-accurate]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[ties at scale 1-float16-accurate]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[values near fp32's largest over 256 equal keys-as drawn-fast]"
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[documents of one key-float16-fast]",
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[logits near 1e30-float16-fast]",
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[ties at scale 1/2, cotangents near 2**125-as drawn-fast]",
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[values near fp32's largest over 2 equal keys, bfloat16-as drawn-accurate]"
 ],
 "tests/test_diffusion_gemma_workflow.py": [
 "tests/test_diffusion_gemma_workflow.py::test_public_pipeline_source_storage_and_saved_block_compute_are_independent",
@@ -2281,8 +2281,8 @@
 ],
 "tests/test_lora.py": [
 "tests/test_lora.py::test_a_pipeline_adapts_its_denoiser_alone_and_starts_as_the_source[flux]",
-"tests/test_lora.py::test_a_pipeline_files_components_keep_the_bases_each_names",
-"tests/test_lora.py::test_a_pretrained_pipeline_run_from_the_command_line_trains_its_lora",
+"tests/test_lora.py::test_a_pipeline_adapts_its_denoiser_alone_and_starts_as_the_source[sd]",
+"tests/test_lora.py::test_a_pipeline_lora_run_moves_its_factors_and_nothing_else[sd3]",
 "tests/test_lora.py::test_a_recorded_run_imports_its_adapter_from_the_hub_and_replays_it_offline",
 "tests/test_lora.py::test_a_registry_model_adapts_through_the_names_its_own_kernels_carry",
 "tests/test_lora.py::test_a_tuned_pipeline_saves_its_adapter_and_its_merged_weights[flux]",
@@ -2426,7 +2426,7 @@
 ],
 "tests/test_model_flops_families.py": [
 "tests/test_model_flops_families.py::test_conditional_unet_counts_odd_resizing_pooled_time_ids_and_cross_only_attention[True]",
-"tests/test_model_flops_families.py::test_each_family_matches_every_traced_forward_product[sd_unet]",
+"tests/test_model_flops_families.py::test_each_family_matches_every_traced_forward_product[uvit]",
 "tests/test_model_flops_families.py::test_published_single_stream_families_match_forward_products[z_image]"
 ],
 "tests/test_model_flows.py": [
@@ -2455,7 +2455,7 @@
 "tests/test_model_protocols.py": [
 "tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[flux2_transformer]",
 "tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[hybrid_dit]",
-"tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[simple_mmdit]",
+"tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[unet]",
 "tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[unet_2d_condition]",
 "tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[unet_3d]",
 "tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[uvit]",
@@ -3259,6 +3259,10 @@
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[mimo-v2-sliding-tiny-native]",
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[mimo-v2-tiny-saved]"
 ],
+"tests/test_rl_contracts.py": [
+"tests/test_rl_contracts.py::test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima[DPOObjective]",
+"tests/test_rl_contracts.py::test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima[GRPOObjective]"
+],
 "tests/test_router_statistics.py": [
 "tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains",
 "tests/test_router_statistics.py::test_all_padding_has_no_router_support_or_bias_effect[mtp-attention_mask-False]",
@@ -3542,7 +3546,7 @@
 "tests/test_serving.py::test_a_hybrid_stack_keeps_or_loses_a_prefixs_state_to_the_bit_of_a_sized_sites_server[evicted]",
 "tests/test_serving.py::test_a_hybrid_stack_keeps_or_loses_a_prefixs_state_to_the_bit_of_a_sized_sites_server[from-one-host-slot]",
 "tests/test_serving.py::test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages[dense-layered]",
-"tests/test_serving.py::test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages[paged-chunked-parallel]",
+"tests/test_serving.py::test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages[paged-chunked-layered]",
 "tests/test_serving.py::test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages[paged-parallel]",
 "tests/test_serving.py::test_a_multimodal_model_serves_over_its_language_models_cache[dense]",
 "tests/test_serving.py::test_a_paged_server_serves_layers_that_read_their_keys_places[alibi-unshared]",
@@ -3821,8 +3825,8 @@
 ],
 "tests/test_trainer.py": [
 "tests/test_trainer.py::test_a_fit_places_its_device_prefetch_and_plans_its_step_beside_them",
-"tests/test_trainer.py::test_a_schedule_stage_past_the_models_context_is_refused",
-"tests/test_trainer.py::test_a_tree_of_any_kind_of_mapping_is_held_as_dicts_where_it_enters[write-back-dict-list]"
+"tests/test_trainer.py::test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed",
+"tests/test_trainer.py::test_checkpoints_whose_write_failed_close_and_keep_the_error_their_run_raised[False]"
 ],
 "tests/test_training_transactions.py": [
 "tests/test_training_transactions.py::test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima[whole]",
