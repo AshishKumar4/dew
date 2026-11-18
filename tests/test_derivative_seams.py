@@ -56,6 +56,7 @@ def _summed_over_the_mesh(psums: int):
     return total
 
 
+@pytest.mark.mesh(devices=2)
 def test_the_contract_runs_every_order_on_trainings_mesh():
     """Every order is a check-1 site on training's mesh of two devices (`contract_support._on_a_mesh`), as a
     training step runs it, its reference the order off a mesh: a launch given its operands' specs holds,
