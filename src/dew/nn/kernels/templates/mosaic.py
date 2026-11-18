@@ -732,10 +732,6 @@ class Issuer[Accumulator](abc.ABC):
         row (a forward's maxima and sums) stays within a warp, needing no reduction scratch."""
         return True
 
-    reads_query_tile: bool = True
-    """Whether a consumer reads its query's stage in its tile's layout and writes it back (`tile_of`: a query
-    prologue's, the query's power taken in the kernel)."""
-
     def row_shifted(self, tile, shift, *, period: int, interpret: bool) -> jax.Array:
         """`tile` (a register tile in the accumulator's layout, `tile_of`'s) with each row `i` holding row
         `i - shift`'s values within its `period`-row group, any value where that row leaves the group (a

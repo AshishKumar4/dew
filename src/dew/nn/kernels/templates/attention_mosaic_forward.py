@@ -676,8 +676,9 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         # norm): XLA's program before the launch takes it.
         query = prologued(query, hooks.query_mod, hooks.query_params)
         hooks = dataclasses.replace(hooks, query_mod=None, query_params=())
-    # A query its consumers take by its power in their stage enters as the caller's (`_powered_in_kernel`).
-    fused = _powered_in_kernel(query.dtype, hooks, family)
+    # A query its consumers take under its prologue enters as the caller's, its power of two taken in the
+    # kernel after the prologue (`_prologued`): a norm of the query by the power is no norm's of the query.
+    fused = hooks.query_mod is not None
     call = padded_call(query if fused else by_power(query, power / taken), key, value, spans, hooks,
                        _block(tiles), table, by_position=True,
                        query_block=tiles.consumers * tiles.block_q if inference else None,
@@ -714,16 +715,7 @@ def _rewalked(spec: algebra.Forward, form: algebra.Forward, query: jax.Array, ta
     if taken == 1.0 or form.natural == spec.natural:
         return query, form
     rewalked = dataclasses.replace(form, scale=form.scale / taken, prescale=taken)
-    return (query if _powered_in_kernel(query.dtype, hooks, family) else by_power(query, taken)), rewalked
-
-
-def _powered_in_kernel(dtype, hooks: Hooks, family: mosaic.Family) -> bool:
-    """Whether a launch's consumers take its query's power of two in their stage (`_prologued`, its form's
-    `prescale`): under a query prologue (a norm of the query by the power is no norm's of the query), and for
-    a 16-bit query on a family that reads its query's stage in its tile's layout (`Issuer.reads_query_tile`),
-    exact, no pass of XLA's over it before the launch (a decode step's 1.5 of its 27.6 us at batch 1 on a
-    GH200, M-ET-87); an fp32 query's parts (`MosaicForward.parts`) are formed of the query taken by it."""
-    return hooks.query_mod is not None or (jnp.dtype(dtype).itemsize == 2 and family.reads_query_tile)
+    return (query if hooks.query_mod is not None else by_power(query, taken)), rewalked
 
 
 class _Read(NamedTuple):
@@ -1075,9 +1067,7 @@ def _query_of(program: _Program, spec: algebra.Forward, q_view, q_smem, q_loaded
     family, block_q = program.family, program.tiles.block_q
     if program.parts == 1:
         family.loaded(((q_view, q_smem, q_loaded),))
-        # The power where the launch's consumers take it (`_powered_in_kernel`; XLA's otherwise).
-        if hooks.query_mod is not None or (spec.prescale != 1.0
-                                           and _powered_in_kernel(q_smem.dtype, hooks, family)):
+        if hooks.query_mod is not None:
             _prologued(family, hooks.query_mod, hooks, hooked.query, place, first, q_smem, spec.prescale)
         return family.held(q_smem)
     family.loaded(tuple((view, q_smem.at[pl.ds(part * block_q, block_q)], barrier)
@@ -1085,14 +1075,14 @@ def _query_of(program: _Program, spec: algebra.Forward, q_view, q_smem, q_loaded
     return program.parted(q_smem, block_q)
 
 
-def _prologued(family: mosaic.Family, mod: Callable | None, hooks: Hooks, refs: tuple, place: tuple, first,
-               q_smem, power: float) -> None:
-    """The query block in its stage under the query prologue (`Hooks.query_mod`, none where None), once a
-    tile where the consumer loads it: read in its family's tile layout (`Family.tile_of`), taken at its rows'
-    indices `[rows, 1]` with its parameters, a head's scalar and a width's and a query's as the tile's
-    entries, which the hook reads as it reads the reference's `[1, D]` and `[rows, 1]`
-    (`attention.prologued`) where it broadcasts them, rounded to its dtype as the reference rounds it, taken
-    by the launch's power of two (`attention.by_power`, its caller's `prescale`, exact), written back and
+def _prologued(family: mosaic.Family, mod: Callable, hooks: Hooks, refs: tuple, place: tuple, first, q_smem,
+               power: float) -> None:
+    """The query block in its stage under the query prologue (`Hooks.query_mod`), once a tile where the
+    consumer loads it: read in its family's tile layout (`Family.tile_of`), taken at its rows' indices
+    `[rows, 1]` with its parameters, a head's scalar and a width's and a query's as the tile's entries,
+    which the hook reads as it reads the reference's `[1, D]` and `[rows, 1]` (`attention.prologued`) where
+    it broadcasts them, rounded to its dtype as the reference rounds it, taken by
+    the launch's power of two (`attention.by_power`, its caller's `prescale`, exact), written back and
     made visible to the products that read it (`Family.published`). Mosaic GPU lowers a norm's reduction
     over the width and a rotation's halves so (sm90 and sm100, a 64 x 256 bf16 tile, et-prologue-lowers)."""
     row, head = place[:2]
@@ -1112,7 +1102,7 @@ def _prologued(family: mosaic.Family, mod: Callable | None, hooks: Hooks, refs: 
 
     positions = (first + jnp.arange(rows, dtype=jnp.int32))[:, None]
     params = (param(ref, value.kind) for ref, value in zip(refs, hooks.query_params, strict=True))
-    taken = tile if mod is None else mod(tile, positions, *params).astype(q_smem.dtype)
+    taken = mod(tile, positions, *params).astype(q_smem.dtype)
     q_smem[...] = taken if power == 1.0 else taken * jnp.asarray(power, q_smem.dtype)
     family.published()
 

@@ -381,10 +381,6 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         mosaic.synced(interpret=False)
         return loaded
 
-    # Its query's stage staged for its fragments' loads (ldmatrix), which Mosaic GPU reads in no tile's layout
-    # (layout inference refused sm120's forward reading it).
-    reads_query_tile = False
-
     @property
     def rows_whole(self) -> bool:
         # Its warps along a tile's rows alone (four of them) hold whole rows of the accumulator and the
