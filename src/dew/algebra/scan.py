@@ -1081,11 +1081,11 @@ def compensated(values, *, low=None, axis: int = 0, reverse: bool = False,
                 restarts=None) -> tuple[jax.Array, jax.Array]:
     """`values`' inclusive prefix sums along `axis` (suffix sums where `reverse`), each a float and its
     rounding error (a compensated scan), each restarting where `restarts` holds (a segmented scan: an
-    element of it the first of its segment's). `low`, where given, is each value's own low part, the values
-    then double floats themselves (an exact product's pair, `two_product`: Mamba-3's turns). Each pair
-    joined renormalized (`compensated_add`), the hand math's sum: a pair left unrenormalized held a
-    residual that a product XLA:CPU fused into its sum (a rated decay's `rate * beta`, an FMA) had left
-    wrong, 1.5e-5 off a 16-token prefix (row 1966).
+    element of it the first of its segment's, in either direction: a suffix sums to its segment's last).
+    `low`, where given, is each value's own low part, the values then double floats themselves (an exact
+    product's pair, `two_product`: Mamba-3's turns). Each pair joined renormalized (`compensated_add`), the
+    hand math's sum: a pair left unrenormalized held a residual that a product XLA:CPU fused into its sum (a
+    rated decay's `rate * beta`, an FMA) had left wrong, 1.5e-5 off a 16-token prefix (row 1966).
     A nested program (`dew.nn.nested`), traced once for its arguments' types within a trace: the associative
     scan otherwise traces its protected additions afresh at every level on every call, each chunk's walked
     sum among them."""
@@ -1102,6 +1102,12 @@ def compensated(values, *, low=None, axis: int = 0, reverse: bool = False,
 
     if restarts is None:
         return lax.associative_scan(combine, (values, low), reverse=reverse, axis=axis)
+    if reverse:
+        # A reverse scan combines its elements from the last, so a segment restarts there at its last
+        # element: the one before each segment's first, and the last of all (none of an empty axis).
+        before = (slice(None),) * (axis % jnp.ndim(restarts))
+        restarts = jnp.concatenate([restarts[(*before, slice(1, None))],
+                                    jnp.ones_like(restarts[(*before, slice(0, 1))])], axis=axis)
     high, low, _ = lax.associative_scan(combine, (values, low, restarts), reverse=reverse, axis=axis)
     return high, low
 

@@ -1126,11 +1126,15 @@ def test_a_derived_chunk_computes_what_its_token_update_states(update, dtype):
         np.testing.assert_array_equal(np.asarray(outputs), np.asarray(declared_outputs))
 
 
-def test_a_segmented_compensated_scan_of_double_floats_along_an_axis_holds_each_segments_exact_sum():
+@pytest.mark.parametrize("reverse", [False, True], ids=["prefixes", "suffixes"])
+def test_a_segmented_compensated_scan_of_double_floats_along_an_axis_holds_each_segments_exact_sum(reverse):
     """`scan.compensated` over double floats (`low` each value's low part) along a later axis, restarting
-    at each segment's first: each prefix's pair is its segment's exact sum, the high half that sum rounded
-    once. Whole numbers with low parts in multiples of 2^-30 keep every pair's arithmetic exact, so the
-    pairs equal float64's sums, where a plain fp32 sum drops every low part. Each value a double float as an
+    at each segment's first: each prefix's pair, and each suffix's where `reverse`, is its segment's exact
+    sum, the high half that sum rounded once (a suffix's within its segment to its last element, where a
+    reverse scan that restarted at segment firsts summed [1, 2, 3, 4] from [T, F, T, F] to [1, 5, 3, 4],
+    not [3, 2, 7, 4]: the base review of row 7432's head). Whole numbers with low parts in multiples of
+    2^-30 keep every pair's arithmetic exact, so the pairs equal float64's sums, where a plain fp32 sum drops
+    every low part. Each value a double float as an
     exact product leaves it, its low part within half its high part's ulp (none beside a zero)."""
     rng = np.random.default_rng(7432)
     shape = (2, 64, 3)
@@ -1139,14 +1143,23 @@ def test_a_segmented_compensated_scan_of_double_floats_along_an_axis_holds_each_
     restarts = rng.random(shape[:2]) < 0.1
     restarts[:, 0] = True
     restarts = np.broadcast_to(restarts[:, :, None], shape)
-    summed_high, summed_low = jax.jit(functools.partial(scan.compensated, axis=1))(
+    summed_high, summed_low = jax.jit(functools.partial(scan.compensated, axis=1, reverse=reverse))(
         high, low=low, restarts=restarts)
-    exact = np.zeros(shape)
-    for t in range(shape[1]):
-        before = 0.0 if t == 0 else exact[:, t - 1]
-        exact[:, t] = np.where(restarts[:, t], 0.0, before) + high[:, t].astype(np.float64) + low[:, t]
+    exact, steps = np.zeros(shape), shape[1]
+    for t in reversed(range(steps)) if reverse else range(steps):
+        # The sum beside `t` so far, its segment's where `t` opens none: a prefix's where `t` starts no
+        # segment, a suffix's where the next token starts none.
+        if reverse:
+            beside = 0.0 if t == steps - 1 else np.where(restarts[:, t + 1], 0.0, exact[:, t + 1])
+        else:
+            beside = 0.0 if t == 0 else np.where(restarts[:, t], 0.0, exact[:, t - 1])
+        exact[:, t] = beside + high[:, t].astype(np.float64) + low[:, t]
     np.testing.assert_array_equal(np.float64(summed_high) + np.float64(summed_low), exact)
     np.testing.assert_array_equal(np.asarray(summed_high), exact.astype(np.float32))
+    # An empty axis scans to empty sums either way (the review: a reverse scan's restarts shifted along it).
+    empty = np.zeros((2, 0, 3), np.float32)
+    assert [x.shape for x in scan.compensated(empty, axis=1, reverse=reverse,
+                                              restarts=np.zeros(empty.shape, bool))] == [empty.shape] * 2
 
 
 PAIRS = 3
