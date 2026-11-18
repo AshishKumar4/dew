@@ -1317,7 +1317,9 @@ def uncontracted(*values):
     transform reads each operand more than once and holds only where every read sees the same rounded value,
     which a compiler's contraction of a multiply into an add (an FMA, XLA's CPU and GPU, Triton's) breaks by
     reading the exact product at one place and the rounded one at another (a two_product's product added in a
-    compensated sum, its residual then counted twice). An optimization barrier, which no fusion crosses.
+    compensated sum, its residual then counted twice). An optimization barrier, which no fusion crosses, on
+    the value where it is made, so every reader sees the one rounded value (`two_sum`'s operands,
+    `two_product`'s product).
 
     On a TPU (`generation.backend`) the values as they are: Pallas TPU's Mosaic lowering takes no barrier
     (post108, whose attention forms reach `two_product` and `two_sum` in a kernel body, `natural_exp` and
@@ -1454,7 +1456,11 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         scale = jnp.where(halves[0], 2.0, 1.0) * jnp.where(halves[1], 2.0, 1.0)
     lh, ll = split(left)
     rh, rl = split(right)
-    product = rounded(left * right)
+    # The product read as one value (`uncontracted`) by the residual's steps and by its caller alike: a
+    # compiler that took its multiply into the step reading it (`product - head`, a caller's `n - product`)
+    # would read the exact product there and the rounded one elsewhere, the residual then the product's
+    # rounding where a caller adds it to the rounded product.
+    (product,) = uncontracted(rounded(left * right))
     head = rounded(lh * rh)
     lost = rounded(product - head if subtract else head - product)
     cross = ((ll, rh), (lh, rl)) if subtract else ((lh, rl), (ll, rh))
@@ -1463,11 +1469,7 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         lost = rounded(lost - term if subtract else lost + term)
     tail = rounded(ll * rl)
     residual = rounded(tail - lost if subtract else lost + tail)
-    # The pair each read as one value (`uncontracted`): a sum reading the product would otherwise take its
-    # multiply into an FMA and add the exact product beside a residual that holds its rounding.
-    if scale is not None:
-        product, residual = product * scale, residual * scale
-    return uncontracted(product, residual)
+    return (product, residual) if scale is None else (product * scale, residual * scale)
 
 
 def _correctly_rounded_divide(numerator: jax.typing.ArrayLike,
