@@ -29,6 +29,28 @@ def file_of(case: ET.Element) -> str:
     return "/".join(parts[:module + 1]) + ".py"
 
 
+def owning(name: str) -> str:
+    """The test file a row's name is of: the file itself, or a test node's (`file::test`) file."""
+    return name.partition("::")[0]
+
+
+def holds(name: str, node: str) -> bool:
+    """Whether test node id `node` is of what a run named `name`: its file, or a test node in it
+    (`file::test`, a class's `file::Class`), each of its parametrized cases among them."""
+    if "::" not in name:
+        return owning(node) == name
+    return node == name or node.startswith((f"{name}[", f"{name}::"))
+
+
+def of(case: ET.Element, name: str) -> bool:
+    """Whether JUnit `case` is of what a run named `name` (`holds`): a case with no class path, a file that
+    did not collect, is of every name its file holds (2026-11-17: a tier given node ids read every one of
+    them as never run, its cases matched against their file's name)."""
+    if "::" not in name or not case.get("classname"):
+        return file_of(case) == owning(name)
+    return holds(name, node_of(case))
+
+
 def red_as(kind: str, nodes: list[str]) -> dict:
     """What turned a red row red, for grading it again (`land.sh`, `suspect.sh`): `kind` "nodes", its
     `failed` tests alone, by node id; "collect", its file's collection; "deadline", its task's; or
@@ -76,7 +98,8 @@ def graded(name: str, own: list[ET.Element], cases: list[ET.Element], counted: M
                f"{node.get('message')}" for case in own for node in case.iter("skipped")
                if "could not import" in f"{node.get('message')} {node.text}"]
     deselected = bool(counted) and counted["collected"] == counted["deselected"]
-    spent = expired is not None and (name == running or running is None)
+    # The executed log's visits name files: a test node's row is spent where its file's test was running.
+    spent = expired is not None and (owning(name) == running or running is None)
     unreached = expired is not None and not spent and not own and not deselected
     unstarted = expired is None and not started and not reported and returncode != 0
     exited = [] if (expired is not None and not spent) or unstarted else \

@@ -399,7 +399,13 @@ def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
 FP32_PRODUCTS = frozenset({"HIGHEST", "F32_F32_F32"})
 """The precision names that declare fp32 operands' products in IEEE fp32 (`precision_names`): `highest` and
 the F32_F32_F32 preset, which `jax_default_matmul_precision` spells 'highest', 'float32' or the preset's
-name."""
+name. On a GPU a program holding such a dot compiles its GEMMs on cuBLAS
+(`dew.nn.kernels.templates.report.targeted`, reading the program's own dots, an operation's precision as
+a run's), whose sum is the one a float32 reference is computed with: XLA's Triton GEMM sums farther from
+float64 (1.29 to 1.45 times cuBLAS's distance on an A100 and a GH200, rows 5026/5028/5029). That is the
+price of 'highest' meeting its reference, a wrong result weighed against a slower one: a float32
+decode-sized forward (32 rows of one token) 16 to 18 percent slower on both GPUs, a Qwen3-0.6B's float32
+forward and its loss and gradient at 8 x 512 within 2 percent either way (M-IG-13)."""
 
 
 def declares_fp32_products(precision: jax.lax.PrecisionLike) -> bool:
@@ -1392,17 +1398,21 @@ def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
     return jnp.where(biased == 0xFF, x.astype(jnp.float32), rounded)
 
 
-_SPLIT_BITS = {jnp.dtype(jnp.float64): (np.uint64, 27), jnp.dtype(jnp.float32): (np.uint32, 12),
-               jnp.dtype(jnp.bfloat16): (np.uint16, 4), jnp.dtype(jnp.float16): (np.uint16, 6)}
-"""Each float's significand split for `two_product`'s `bit_split`: its unsigned bits and the low bits masked,
-`p - floor(p / 2)` of its `p`, so its high part holds `floor(p / 2)` bits. An even `p`'s truncated remainder
-holds the other half (fp32's 12, bfloat16's 4); an odd `p`'s would hold one bit more (float64's 27, float16's
-6), its low parts' product past `p` bits, so the cut rounds to nearest there, its remainder signed and at most
-half the high part's last bit: every product of two parts exact (Dekker's)."""
+def _split_bits(dtype) -> tuple[type, int, int]:
+    """A float's significand split for `two_product`'s `bit_split`: its unsigned bits' type, the mask keeping
+    its high part and the low bits masked, `p - floor(p / 2)` of its `p`, so its high part holds
+    `floor(p / 2)` bits. An even `p`'s truncated remainder holds the other half (fp32's 12, bfloat16's 4); an
+    odd `p`'s would hold one bit more (float64's 27, float16's 6), its low parts' product past `p` bits, so
+    the cut rounds to nearest there (`_odd`), its remainder signed and at most half the high part's last
+    bit: every product of two parts exact (Dekker's)."""
+    limits = jnp.finfo(dtype)
+    unsigned = np.dtype(f'uint{limits.bits}').type
+    low = (limits.nmant + 2) // 2
+    return unsigned, ~((1 << low) - 1) & np.iinfo(unsigned).max, low
 
 
 def _odd(dtype) -> bool:
-    """Whether a float's significand holds an odd count of bits (`_SPLIT_BITS`' rounded cut)."""
+    """Whether a float's significand holds an odd count of bits (`_split_bits`' rounded cut)."""
     return (jnp.finfo(dtype).nmant + 1) % 2 == 1
 
 
@@ -1412,7 +1422,7 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
     """Dekker's rounded product and its residual, with a Veltkamp significand split.
 
     Guidance keeps the multiply split. `bit_split` truncates the significands
-    instead (`_SPLIT_BITS`: a float's low half of its bits masked, fp32's 12,
+    instead (`_split_bits`: a float's low half of its bits masked, fp32's 12,
     float64's 27, a 16-bit float's), with no splitter to overflow: the multiply
     split's `2^(p/2) + 1` overflowed past 2^115 in fp32 and 2^996 in float64
     (base reviews 9bc4326dd F1, 1fe546a10 F1); near underflow the splits differ.
@@ -1429,11 +1439,12 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         if bit_split and isinstance(value, np.generic | np.ndarray):
             # A constant (a kernel's static factor) splits where it is known, on the host.
             constant = np.asarray(value, np.float32)
-            high = (constant.view(np.uint32) & np.uint32(0xfffff000)).view(np.float32)
+            unsigned, mask, _ = _split_bits(np.float32)
+            high = (constant.view(unsigned) & unsigned(mask)).view(np.float32)
             return jnp.asarray(high), jnp.asarray(constant - high)
         if bit_split:
-            unsigned, low = _SPLIT_BITS[jnp.dtype(value.dtype)]
-            mask = np.array(~((1 << low) - 1) & np.iinfo(unsigned).max, unsigned)
+            unsigned, mask, low = _split_bits(value.dtype)
+            mask = np.array(mask, unsigned)
             bits = jax.lax.bitcast_convert_type(value, unsigned)
             if _odd(value.dtype):
                 # Half the cut's last bit added to the magnitude's bits: the cut rounds to nearest.
@@ -1447,10 +1458,14 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
 
     scale = None
     if bit_split and _odd(jnp.result_type(left, right)):
-        # A rounded cut of the top binade's last values carries past the largest float: such an operand
-        # is halved first, its product and residual doubled back after (each exact, a power of two).
+        # A rounded cut of the top binade's last values carries past the largest float, and two cuts
+        # rounded up carry a product in the top binade past it ((2 - 2^-52) 2^511 squared, the head inf):
+        # such an operand, and the larger of such a product's, is halved first, its product and residual
+        # doubled back after (each exact, a power of two; train 1018's review F1).
         top = 2.0 ** (jnp.finfo(jnp.result_type(left, right)).maxexp - 1)
-        halves = [jnp.abs(operand) >= top for operand in (left, right)]
+        large = jnp.abs(left * right) >= top
+        larger = jnp.abs(left) >= jnp.abs(right)
+        halves = [(jnp.abs(left) >= top) | (large & larger), (jnp.abs(right) >= top) | (large & ~larger)]
         left, right = (jnp.where(half, operand * 0.5, operand)
                        for operand, half in zip((left, right), halves, strict=True))
         scale = jnp.where(halves[0], 2.0, 1.0) * jnp.where(halves[1], 2.0, 1.0)

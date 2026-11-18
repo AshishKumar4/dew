@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 import tier_wire
 from process_support import relayed
-from reference_error import assert_as_exact, over_windows, windows
+from reference_error import assert_as_exact, over_windows, run_to_run, windows
 from truths_ahead import UNPREPARED, MissingTruth, compiled_truths
 
 from dew.nn.kernels import generation
@@ -292,6 +292,32 @@ def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     assert not dew_traced and not reference_traced
     assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
     assert dew_traced and reference_traced
+
+
+def test_a_compiled_sites_window_loop_and_run_to_run_arms_are_traced_by_its_prepare_alone(tmp_path):
+    """Arms over a site's windows (`over_windows`) and declared to vary from run to run (`run_to_run`), each
+    a record of its arm: judged from programs compiled ahead, the run traces neither (their prepare did), as
+    a plain arm's (train 1016's F2: such adapters went unstated, so unprepared)."""
+    dew, reference, draw = _site()
+    traced = []
+
+    def dew_arm(a, b):
+        traced.append(None)
+        return dew(a, b)
+
+    def windowed(seed):
+        return tuple(np.stack([x, x]) for x in draw(seed))
+
+    # A jitted arm under both adapters: each a record of its arm, never stated as the wrapper it holds.
+    arm = run_to_run(over_windows(jax.jit(dew_arm)), "a product summed in arrival order")
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(arm, over_windows(reference), windowed, "a product's adapted arms", seeds=8)
+    assert traced
+    traced.clear()
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(arm, over_windows(reference), windowed, "a product's adapted arms", seeds=8)
+    assert not traced
+    assert not (tmp_path / UNPREPARED).exists()
 
 
 def test_a_window_loops_truth_is_computed_window_by_window_from_its_windows_program(tmp_path):

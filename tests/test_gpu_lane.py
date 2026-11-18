@@ -1,6 +1,7 @@
 """CI's GPU lane (tools/armada/ci.py `gpu-lane`): each test file in a process of its own, admitted on the
 GPU memory its runs measured, and tools/armada/gpu_holds.py, what a lane needs to run a file."""
 
+import functools
 import itertools
 import json
 import os
@@ -44,6 +45,26 @@ def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_
     assert fetched.is_file() and not (tmp_path / "read").exists()
 
 
+def lane_machine(root: Path, monkeypatch, url: str, name: str, source: str) -> None:
+    """A GPU lane's machine at `root` with the test cache at `url` (`gpu_lane_at`), its Python and
+    fetcher, and test file `name` holding `source`."""
+    gpu_lane_at(root, monkeypatch, url, 0)
+    interpreter(root, "3.12")
+    fetcher(root)
+    (root / name).write_text(source)
+
+
+def lane_rows(ci, root: Path, tests: list[str], marks: list[Path],
+              **network: bool) -> list[tuple[str, int]]:
+    """A lane's rows over `tests` at `root`, each name and exit, with the cache on, the files its tests
+    mark that they ran (`marks`) cleared first."""
+    for mark in marks:
+        mark.unlink(missing_ok=True)
+    out = root / "verdict.json"
+    assert ci.gpu_lane("3.12", tests, out, cache="on", processes=1, deadline=600.0, **network) == 0
+    return [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]]
+
+
 def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_records_them_apart(
         ci, tmp_path, monkeypatch, cache_worker):
     """The network lane runs each file's network-marked tests alone, which every other task sets aside,
@@ -51,11 +72,7 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
     runs its other tests and is no reuse of the network lane's run, and a second network lane on the same
     inputs reuses its own (the maintainer, 2026-10-25: no CI run reached the published checkpoints' parity
     tests)."""
-    url, _, _ = cache_worker
-    gpu_lane_at(tmp_path, monkeypatch, url, 0)
-    interpreter(tmp_path, "3.12")
-    fetcher(tmp_path)
-    (tmp_path / "tests/test_hub.py").write_text(
+    lane_machine(tmp_path, monkeypatch, cache_worker[0], "tests/test_hub.py",
         "import os, pytest\nfrom pathlib import Path\n"
         "@pytest.mark.network\ndef test_reads_the_hub():\n"
         "    assert not {'HF_HUB_OFFLINE', 'HF_ENDPOINT'} & set(os.environ), 'the Hub is closed'\n"
@@ -63,16 +80,8 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
         "def test_offline():\n"
         "    assert os.environ['HF_HUB_OFFLINE'] == '1'\n"
         "    Path('offline').write_text('ran')\n")
-    out = tmp_path / "verdict.json"
     hub, offline = tmp_path / "hub", tmp_path / "offline"
-
-    def lane(**network: bool) -> list[tuple[str, int]]:
-        hub.unlink(missing_ok=True)
-        offline.unlink(missing_ok=True)
-        assert ci.gpu_lane("3.12", ["tests/test_hub.py"], out, cache="on", processes=1, deadline=600.0,
-                           **network) == 0
-        return [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]]
-
+    lane = functools.partial(lane_rows, ci, tmp_path, ["tests/test_hub.py"], [hub, offline])
     assert lane(network=True) == [("3.12:tests/test_hub.py", 0)]
     assert hub.is_file() and not offline.exists()
     assert lane() == [("3.12:tests/test_hub.py", 0)]
@@ -501,6 +510,72 @@ def test_a_gpu_lanes_groups_run_each_test_of_the_tips_file_once_their_rows_their
     weights.write_text(json.dumps({"tests/test_long.py::test_a": 300.0}))
     assert ci.gpu_lane("3.12", groups, out, cache="on", processes=2, deadline=600.0) == 0
     assert {name: (tmp_path / f"ran-{name}").read_text() for name in names} == dict.fromkeys(names, "11")
+
+
+def test_a_gpu_lane_given_test_nodes_grades_each_by_its_own_cases(ci, tmp_path, monkeypatch, cache_worker):
+    """A lane given single tests by node id (`file::test`, a parametrized one among them, as a lane's own GPU
+    run names them) grades each by its own cases: one that passed is green, one whose case failed red with
+    it, none "never ran" (2026-11-17: every node id a tier was given read "no evidence ran", its cases matched
+    against their file's name)."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    (tmp_path / "tests/test_nodes.py").write_text(
+        "import pytest\n"
+        "def test_walk():\n    pass\n"
+        "@pytest.mark.parametrize('form', ['pipeline', 'streamed'])\n"
+        "def test_pipeline(form):\n    assert form == 'pipeline'\n"
+        "def test_other():\n    raise SystemExit('not named')\n")
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    out = tmp_path / "verdict.json"
+    nodes = ["tests/test_nodes.py::test_walk", "tests/test_nodes.py::test_pipeline"]
+    ci.gpu_lane("3.12", nodes, out, cache="off", processes=1, deadline=600.0)
+    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+    assert {name: row["exitCode"] for name, row in rows.items()} == {
+        "3.12:tests/test_nodes.py::test_walk": 0, "3.12:tests/test_nodes.py::test_pipeline": 1}
+    assert "test_pipeline[streamed]" in rows["3.12:tests/test_nodes.py::test_pipeline"]["output"]
+    assert all("no evidence" not in row["output"] for row in rows.values())
+
+
+def test_a_test_nodes_green_run_keeps_a_record_its_next_lane_reuses(ci, tmp_path, monkeypatch, cache_worker):
+    """A test node's green run (`file::test`, its parametrized case's id outside the Worker's key alphabet)
+    keeps its file's record under a place the Worker takes (`rows.row_place`), so a second lane on the same
+    inputs reuses it rather than run it again, and another node of the same file is no reuse of it (review of
+    the first node-id grading: a node row found no record of its process, and its place held a colon)."""
+    lane_machine(tmp_path, monkeypatch, cache_worker[0], "tests/test_nodes.py",
+        "import pytest\nfrom pathlib import Path\n"
+        "@pytest.mark.parametrize('form', ['a/b c'])\n"
+        "def test_walk(form):\n    Path('walked').write_text(form)\n"
+        "def test_other():\n    Path('othered').write_text('ran')\n")
+    walked, othered = tmp_path / "walked", tmp_path / "othered"
+
+    def lane(node: str) -> list[tuple[str, int]]:
+        return lane_rows(ci, tmp_path, [node], [walked, othered])
+    walk, other = "tests/test_nodes.py::test_walk", "tests/test_nodes.py::test_other"
+    assert lane(walk) == [(f"3.12:{walk}", 0)]
+    assert walked.read_text() == "a/b c"
+    assert lane(walk) == [(f"3.12:{walk}", 0)]
+    assert not walked.exists(), "the node's green run on the same inputs is reused"
+    assert lane(other) == [(f"3.12:{other}", 0)]
+    assert othered.is_file() and not walked.exists(), "another node of its file runs its own"
+
+
+def test_a_test_nodes_record_is_kept_where_the_worker_takes_it_and_read_back_as_its_node(ci):
+    """A test node's record place (`rows.row_place`) is a key the Worker takes, however its parametrized
+    case is spelled or long, distinct from its file's and its siblings', and its readers (`key_parts`) read
+    it back as the node, a long one as its file's node by digest, never a file of its own; a file whose
+    name holds an escape's characters reads back as itself."""
+    file = "tests/test_nodes.py"
+    nodes = [f"{file}::test_walk", f"{file}::test_walk[a/b c]", f"{file}::Walks::test_walk[\u00e9-..]",
+             f"{file}::test_walk[{'x' * 400}]"]
+    places = [ci.record_key("3.12", ci.row("3.12", node, ""), "sm90") for node in [file, *nodes]]
+    assert all(ci.r2.valid(place) for place in places) and len(set(places)) == len(places)
+    read = [ci.key_parts(place.removeprefix(f"{ci.CACHE_PREFIX}/3.12/"))[1] for place in places]
+    assert read[:4] == [file, *nodes[:3]]
+    assert read[4].startswith(f"{file}::") and read[4] != nodes[3]
+    odd = "tests/test_a=20b.py"
+    assert ci.key_parts(ci.record_key("3.12", ci.row("3.12", odd, ""), "sm90").removeprefix(
+        f"{ci.CACHE_PREFIX}/3.12/"))[1] == odd
 
 
 def test_a_tier_cut_groups_green_row_is_reused_while_its_cut_holds_the_same_tests(

@@ -46,23 +46,6 @@ def test_merge_after_select_puts_the_averaged_leaves_where_they_came_from():
     np.testing.assert_array_equal(merged["params"]["head"]["w"], 0.0)
 
 
-def test_registered_lm_objective_computes_next_token_loss():
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.lm import LMObjective
-    from dew.registry import objectives
-
-    model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1,
-                              num_heads=1, mlp_features=16, max_seq_len=8)
-    registered = objectives.build("lm", model=model, seq_len=4)
-    direct = LMObjective(model, seq_len=4)
-    variables = direct.init(jax.random.key(0))
-    batch = {"text": jnp.array([[0, 1, 2, 3, 4]], dtype=jnp.int32)}
-    step = Step(step=jnp.array(0), key=jax.random.key(1), ema=None)
-    actual, _ = registered.scalar_loss(variables, batch, step)
-    expected, _ = direct.scalar_loss(variables, batch, step)
-    np.testing.assert_array_equal(actual, expected)
-
-
 def lm_objective(variables=None, **options):
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective

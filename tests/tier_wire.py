@@ -4,6 +4,7 @@ unit's worker. Read by tests/model_flows.py, which writes it, and by tools/armad
 lane), which loads this file by its path as it loads check1_wire: it imports nothing of Dew's."""
 
 import hashlib
+import os
 from pathlib import Path
 
 PREPARE = "DEW_TIER_PREPARE"
@@ -13,6 +14,11 @@ TRUTHS = "DEW_TIER_TRUTHS"
 UNIT = "DEW_TIER_UNIT"
 """The name the lane runs a prepare's unit under (a file, `<file>#G/N` for a group, or a variant's process
 of either), set in the prepare's environment: the unit's flows' needs are filed under it (`needs_file`)."""
+
+
+def preparing() -> bool:
+    """Whether this process is a GPU tier part's prepare (`PREPARE`): on the node's CPU, before its run."""
+    return os.environ.get(PREPARE) == "1"
 
 
 def needs_file(store: Path, unit: str) -> Path:

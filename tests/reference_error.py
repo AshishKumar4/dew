@@ -109,7 +109,7 @@ from truths_ahead import COMPILED, CompiledTruths, judged, named, running
 
 from dew._accuracy import distance, reduction_bound, within
 from dew._sources import function_reads
-from dew._stated import Unestablished, _code, reads, stated
+from dew._stated import Unestablished, stated
 from dew.algebra import passes
 from dew.nn import programs
 from dew.parity import (
@@ -572,7 +572,8 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     # Each arm named as each process first finds it, before any call of it here (`_arm_role`); one no
     # statement holds runs unprepared in its run.
     named_arms = {role: (named_role, fn, reference) for role, (fn, reference) in arms.items()
-                  if fn is not None and (named_role := _arm_role(role, fn, label)) is not None}
+                  if fn is not None and _holds_program(fn)
+                  and (named_role := _arm_role(role, fn, label)) is not None}
     if store.target is None:
         # An arm computing in NumPy refused as a run refuses it, by a call on a draw; for a GPU's store the
         # prepare computes nothing on its host (bible §8), and its trace refuses an arm that cannot trace.
@@ -642,7 +643,7 @@ def _arm_role(role: str, fn, label: str) -> str | None:
     at = f"{label}: its {role} arm"
     try:
         known: dict[int, Any] = {}
-        _local_functions_known(fn, at, known, ())
+        _mutable_known(fn, known, set())
         statement = stated(fn, at, known)
     except Unestablished as unstated:
         _log.info("an arm no statement holds runs unprepared: %s", unstated)
@@ -650,37 +651,42 @@ def _arm_role(role: str, fn, label: str) -> str | None:
     return f"{role} {hashlib.sha256(json.dumps(statement, sort_keys=True).encode()).hexdigest()[:16]}"
 
 
-def _local_functions_known(value, at: str, known: dict[int, Any], walking: tuple[int, ...]) -> None:
-    """Into `known` (`dew._stated.stated`'s values its caller states), each function of the user's own code
-    made inside a function that `value` reaches through partials, sequences, mappings and what each such
-    function reads, stated as Dew states a function no module holds: its module, name, code (`_code`) and
-    what it reads (`reads`), those it reaches first. Dew's statement refuses one (one of however many its
-    maker made), and a check's arms are such functions (a test's closures, `with_gradients`'s): within one
-    test of one commit, its prepare and its run make each the same. A list, a dict or a set one reads is
-    state it keeps as it runs (a test's record of its calls, a cache a trace fills), which a prepare's trace
-    of the arm fills and its run, calling the arm's executable, does not: stated by its type alone."""
-    if id(value) in known or id(value) in walking:
+def _mutable_known(value, known: dict[int, Any], walking: set[int]) -> None:
+    """Into `known` (`dew._stated.stated`'s values its caller states), each list, dict or set `value`
+    reaches through partials, records, tuples, jits and what each function reads, stated by its type alone
+    (row 7674): such a container is state an arm keeps as it runs (a test's record of its calls, a cache a
+    trace fills), which a prepare's trace of the arm fills and its run, calling the arm's executable, does
+    not."""
+    if id(value) in walking or id(value) in known:
         return
+    walking.add(id(value))
     if isinstance(value, (list, dict, set)):
         known[id(value)] = ["mutable", type(value).__qualname__]
         return
     if isinstance(value, functools.partial):
         parts = (value.func, *value.args, *value.keywords.values())
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        parts = tuple(getattr(value, field.name) for field in dataclasses.fields(value))
     elif isinstance(value, tuple):
         parts = value
-    elif isinstance(value, types.FunctionType) and "<locals>" in value.__qualname__:
+    elif isinstance(value, types.FunctionType):
         cells, read = function_reads(value)
-        within = (*walking, id(value))
-        for part in (*cells.values(), *read.values(), value.__defaults__ or (),
-                     *(value.__kwdefaults__ or {}).values()):
-            _local_functions_known(part, at, known, within)
-        known[id(value)] = ["local", value.__module__, value.__qualname__, _code(value.__code__),
-                            reads(value, at, known, within)]
-        return
+        parts = (*cells.values(), *read.values(), *(value.__defaults__ or ()),
+                 *(value.__kwdefaults__ or {}).values())
+    elif (wrapped := getattr(value, "__wrapped__", None)) is not None:
+        parts = (wrapped,)
     else:
         return
     for part in parts:
-        _local_functions_known(part, at, known, walking)
+        _mutable_known(part, known, walking)
+
+
+def _holds_program(fn) -> bool:
+    """Whether arm `fn`, within a run-to-run declaration and a window loop, is one the store holds programs
+    of (`_compile_arms`): none an arm the gate runs as given or one running Dew's own programs."""
+    while isinstance(fn, (_RunToRun, _Windowed)):
+        fn = fn.fn
+    return not (_given(fn) or getattr(fn, "dew_programs", False))
 
 
 def _ahead_arm(given, compiled, call: Callable, role: str):
@@ -1543,7 +1549,9 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
         # arm computing in NumPy.
         def from_store(given_fn, arm, role: str):
             # Named as its prepare named it, before any call of it (`_compile_arms`); one no statement holds
-            # runs unprepared, named.
+            # runs unprepared, named; one that holds no program (run as given, Dew's own) as it is.
+            if not _holds_program(given_fn):
+                return arm
             named_role = _arm_role(role, given_fn, label)
             if named_role is None:
                 ahead[0].unprepared(f"{label}: its {role} arm has no statement of what it computes")

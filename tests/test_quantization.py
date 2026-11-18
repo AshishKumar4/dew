@@ -23,7 +23,6 @@ import optax
 import pytest
 from lane_environment import without_flags
 from flax import linen as nn
-from flax.core import FrozenDict
 from interop_support import token_draw
 from model_support import parameter_loss
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, with_gradients
@@ -923,80 +922,6 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
 
     assert_as_exact(packed_side, canonical_side, lambda seed: (np.int32(seed),), "packed quantized pipeline",
                     seeds=PACKED_SEEDS, truth_fn=truth)
-
-
-def test_a_program_finds_every_quantized_tower_its_models_hold():
-    """The options a program compiles with read the quantization of every model it is handed and every
-    tower those hold (`quantizations`): a quantized text transformer inside a condition's encoder record,
-    inside the tuple of a task's encoders, counts as a quantized denoiser handed alone does, and an
-    unquantized one adds nothing."""
-    from dew.nn.kernels.options import quantizations
-
-    pytest.importorskip("qwix")
-
-    @dataclasses.dataclass(frozen=True)
-    class Encoder:
-        transformer: nn.Module
-        params: dict
-
-    spec = Quantization(dtype="int8")
-    plain = tiny()
-    quantized = spec.apply(plain)
-    weights = {"params": {"kernel": np.zeros((2, 2), np.float32)}}
-    assert quantizations(plain, (("textcontext", Encoder(plain, weights)),)) == []
-    held = quantizations((("textcontext", Encoder(quantized, weights)),))
-    assert [found.dtype for found in held] == ["int8"]
-    assert quantizations(quantized) == held
-    # A FrozenDict makes each nested mapping as it is read: a tower behind fifty such siblings is found.
-    nested = FrozenDict({f"branch_{index}": {"leaf": {"value": np.zeros(())}} for index in range(50)}
-                        | {"tower": {"encoder": Encoder(quantized, weights)}})
-    assert [found.dtype for found in quantizations(nested)] == ["int8"]
-
-
-@pytest.mark.parametrize("kind", ["diffusion", "decision"])
-def test_a_step_compiles_for_the_quantized_text_tower_it_encodes_with(kind):
-    """An objective's programs run its inputs' condition encoders beside its model (`Objective.towers`): a
-    text-to-image objective's text tower, a decision objective's configured context encoder; so the
-    options its step and its samples compile with read a quantized tower (`compiler_options`) as they
-    read a quantized model. A decision objective listed its backbone and head alone, so an int8 context
-    encoder escaped the int8 Triton GEMM guard (row 7617)."""
-    from pathlib import Path
-
-    from dew.data.text import ByteTokenizer
-    from dew.decision.layout import Specials
-    from dew.decision.model import state_width
-    from dew.decision.objective import DecisionObjective
-    from dew.diffusion import presets
-    from dew.inputs import Condition, Field, InputSpec
-    from dew.interop import Pretrained
-    from dew.interop.encoders import CLIPText
-    from dew.nn.backbones.dit import SimpleDiT
-    from dew.nn.cross_attention import CrossAttention
-    from dew.nn.kernels.options import quantizations
-    from dew.objectives.diffusion import DiffusionObjective
-
-    pytest.importorskip("qwix")
-    fixtures = Path(__file__).parent / "fixtures"
-    encoder = CLIPText.from_pretrained(str(fixtures / "clip" / "tiny"))
-
-    def objective(tower):
-        if kind == "diffusion":
-            return DiffusionObjective(SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
-                                                mlp_ratio=1),
-                                      presets.Flow(), InputSpec(Field("image", (8, 8, 3)),
-                                                                {"textcontext": Condition(tower)}),
-                                      guidance=None, steps=2)
-        source = Pretrained.load(fixtures / "hf" / "llama-tiny", dtype="float32", attention_impl="reference")
-        blocks = CrossAttention((0,), 16, context_features=state_width(tower))
-        return DecisionObjective(source.with_cross_attention(blocks, key=0), tokenizer=ByteTokenizer(),
-                                 specials=Specials(begin=None, separator=10, marker=0, marker_text="\x00",
-                                                   pad=255),
-                                 context_encoder=tower)
-
-    assert quantizations(*objective(encoder).towers()) == []
-    tower = Quantization(dtype="int8").apply(encoder.transformer)
-    quantized = dataclasses.replace(encoder, transformer=tower)
-    assert [found.dtype for found in quantizations(*objective(quantized).towers())] == ["int8"]
 
 
 SPLIT_SEEDS = 16

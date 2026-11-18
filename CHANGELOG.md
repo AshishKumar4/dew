@@ -98,7 +98,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
 
-- Dew requires its JAX build 0.12.0.1.post109 and, on Linux x86_64 and aarch64, its own jaxlib build
+- Dew requires its JAX build 0.12.0.1.post110 and, on Linux x86_64 and aarch64, its own jaxlib build
   0.12.0.1.post103, with its CUDA and PJRT plugins 0.12.0.1.post103 (post96's until now). A GPU compile takes a
   device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
   whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
@@ -120,7 +120,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   in a warp context could hang its block, now refused as its arrive is; and an interpreted Mosaic GPU kernel's
   shared memory admitted another execution's device beside the live one's, now one execution at a time. A Mosaic
   GPU kernel branches on whether any or every element of a boolean array holds (`jnp.any`, `jnp.all`) under either
-  semantics, the warpgroup's threads agreeing through one `bar.red` predicate reduction. Elsewhere jaxlib stays the
+  semantics, the warpgroup's threads agreeing through one `bar.red` predicate reduction. A Mosaic GPU row made a
+  `[1, n]` one in its own layout broadcasts, where a kernel holding it through an optimization barrier failed to
+  lower; Pallas TPU lowers an optimization barrier; a Mosaic GPU gather or scatter of four rows names the thread
+  that issues it; and the GPU interpreter's race detection orders a copy into shared memory after the reads its
+  thread's synchronization orders, as a ring refilled once its readers release a slot. Elsewhere jaxlib stays the
   stock 0.12.0.1.
 
 - A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
