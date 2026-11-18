@@ -24,7 +24,6 @@ from jax.experimental import pallas as pl
 from dew.batch import document_firsts
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.tables import Column, column, packed, unpacked
-from dew.nn.scatter import gather_positions
 
 
 @dataclasses.dataclass(frozen=True)
@@ -424,8 +423,6 @@ class AlignedDocuments:
     stores: jax.Array
     """The stored slot each aligned chunk leaves its memory in `[B, chunks]`
     (`recurrence_chunk.Chunk.stores`), zero for none."""
-    takes: jax.Array
-    """The document each aligned chunk takes up `[B, chunks]`, -1 for none."""
     length: int
     """The aligned grid's slots, the chunks' a row."""
 
@@ -452,11 +449,9 @@ class AlignedDocuments:
         lines = jnp.arange(rows)[:, None]
         first = jnp.where(held, opened // chunk, total)
         last = jnp.where(held, opened // chunk + chunks - 1, total)
-        numbers = jnp.broadcast_to(jnp.arange(documents, dtype=jnp.int32), firsts.shape)
-        takes = jnp.full((rows, total), -1, jnp.int32).at[lines, first].set(numbers, mode="drop")
         loads = jnp.full((rows, total), -1, jnp.int32).at[lines, first].set(forked.loads, mode="drop")
         stores = jnp.zeros((rows, total), jnp.int32).at[lines, last].set(forked.stores, mode="drop")
-        return cls(aligned.astype(jnp.int32), loads, stores, takes, total * chunk)
+        return cls(aligned.astype(jnp.int32), loads, stores, total * chunk)
 
     def laid(self, *operands):
         """The operands `[B, S, ...]` on the aligned grid `[B, length, ...]`, zero between documents."""
@@ -468,26 +463,6 @@ class AlignedDocuments:
     def unlaid(self, out):
         """`out` `[B, length, ...]` back at the call's slots `[B, S, ...]`."""
         return jax.vmap(lambda row, at: row[at])(out, self.slots)
-
-    def entries(self, forked: Forked, transposed: bool = False):
-        """Each aligned chunk's entry write (`recurrence_chunk.Chunk.entry_key`), the document it takes up's,
-        zero for none: `[B, chunks, Hv, Dk, Dv]` summed over its terms and weighed, `[Dv, Dk]` where
-        `transposed`; None where the call gives none. A chunk's own, formed once a chunk."""
-        if forked.entry is None:
-            return None
-        key, value, weight = forked.entry
-        taken = jnp.maximum(self.takes, 0)
-        key, value, weight = (gather_positions(x, taken) for x in (key, value, weight))
-        group = value.shape[-2] // key.shape[-2]
-        if group > 1:
-            key = jnp.repeat(key, group, axis=-2)
-        # The weight inside the contraction, so its gradient is one too (`dot_general`'s accumulation), not
-        # an elementwise product summed after: the SSD port's weight gradient took 1.6 to 1.9 times the
-        # error each document alone takes from float64 summed after (armada, 11-11).
-        live = self.takes >= 0
-        weighed = jnp.where(live[..., None], weight, 0)
-        spelled = 'bcrhv,bcrhk,bch->bchvk' if transposed else 'bcrhk,bcrhv,bch->bchkv'
-        return jnp.einsum(spelled, *((value, key) if transposed else (key, value)), weighed)
 
 
 @dataclasses.dataclass(frozen=True)
