@@ -10,7 +10,6 @@ the file.
 """
 import argparse
 import hashlib
-import importlib.util
 import json
 import subprocess
 from importlib.metadata import version
@@ -21,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import export
 
+import dew
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -61,10 +61,10 @@ def main():
         held = {"ids": np.asarray(ids)}
         for path, leaf in jax.tree_util.tree_flatten_with_path(params)[0]:
             held["params/" + "/".join(item.key for item in path)] = np.asarray(leaf)
-        np.savez(directory / f"{stem}.npz", **held)
+        np.savez(directory / f"{stem}.npz", allow_pickle=False, **held)
     serialized = exported.serialize()
     (directory / f"{stem}.jaxexport").write_bytes(serialized)
-    checkout = Path(importlib.util.find_spec("dew").origin).parents[2]
+    checkout = Path(dew.__file__).parents[2]
     (directory / f"{stem}.json").write_text(json.dumps({
         "dew_commit": subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"],
                                               text=True).strip(),

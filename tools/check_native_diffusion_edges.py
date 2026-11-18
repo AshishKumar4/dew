@@ -116,7 +116,7 @@ def check_schedule(ref, case):
 
 def check_unet(directory, case):
     import torch
-    from diffusers import UNet2DConditionModel
+    from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 
     from _dew_torch.precision import float64, float64_twin
 
