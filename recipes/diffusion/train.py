@@ -21,10 +21,26 @@ from dew.data.sources import source
 
 TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}",
              "This is a photo of a {} flower", "A photo of a {} flower")
-TRAIN, HELD = source("tfds://oxford_flowers102").holdout(records=128)
-FLOWERS = TRAIN.shuffle(seed=0).repeat().pipe(presets.images, 128, batch=32, augment=True,
-                                              caption=images.caption(templates=TEMPLATES))
-VALIDATION = HELD.pipe(presets.images, 128, batch=32, caption=images.caption(templates=TEMPLATES))
+VALIDATION_TEMPLATE = "a photo of a {label}"
+"""The held-out images' one caption template, the first of `TEMPLATES`."""
+
+
+def flowers():
+    """Oxford flowers, its last 128 records held out."""
+    return source("tfds://oxford_flowers102").holdout(records=128)
+
+
+def default(train, held) -> DiffusionRunConfig:
+    """The recipe's run over labelled images, `train`'s and `held`'s, each captioned by its class: a
+    training image by a template drawn for it, a held-out one by the first, so every validation reads the
+    same captions (a drawn caption in validation is refused, its draws having no record index to follow).
+    An image that does not decode is dropped and counted (`data/rejected/`), its record still read by the
+    pass its epochs count."""
+    return DiffusionRunConfig(
+        data=train.shuffle(seed=0).repeat().pipe(presets.images, 128, batch=32, augment=True,
+                                                 caption=images.caption(templates=TEMPLATES)),
+        validation=held.pipe(presets.images, 128, batch=32, caption=images.caption(VALIDATION_TEMPLATE)))
+
 
 if __name__ == "__main__":
-    DiffusionRunConfig.cli(default=DiffusionRunConfig(data=FLOWERS, validation=VALIDATION)).run()
+    DiffusionRunConfig.cli(default=default(*flowers())).run()

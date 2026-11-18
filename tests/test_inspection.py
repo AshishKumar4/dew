@@ -95,6 +95,28 @@ def test_a_sampled_steps_summaries_are_its_commits_arrays():
         name: float(value) for name, value in expected.items()}
 
 
+class Printing(Pulled):
+    """`Pulled`, its loss printed from the step (`jax.debug.print`, a host callback)."""
+
+    def loss(self, variables, batch, step):
+        loss, aux = super().loss(variables, batch, step)
+        jax.debug.print("loss {}", loss)
+        return loss, aux
+
+
+def test_a_run_whose_step_calls_the_host_inspects_it():
+    """A run whose step calls a host callback (`jax.debug.print`) plans its sampled step and logs its
+    summaries: no file of programs can hold such a program, so its digest is taken only where a run is
+    compiled ahead. Digested on every inspecting run's plan, it crashed the search (train 1013's
+    review, F1)."""
+    tracker = Kept()
+    Trainer(Printing(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker,
+            inspection=Inspection(paths=("w",), every=1)).fit(
+        Loader(lambda partition: stream(), None, batch=BATCH, records=None), steps=1, log_every=1,
+        eval_every=None, checkpoint_every=None)
+    assert np.isfinite(tracker.rows[1]["inspect/updates/w/rms"])
+
+
 def test_a_step_of_two_commits_reports_its_latest_sample_and_sums_its_telemetry():
     """A split step can commit twice (a window a rejection left part filled, then the closing part of a
     run's last batch): its parts' counts, tokens and norms add, and its inspection is the last part's

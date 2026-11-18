@@ -11,7 +11,9 @@ a session of its own, so a rank's cleanup signals its own (the maintainer, 2026-
 killed owner 43 hours at 195% CPU on the VM). The standard library alone: the CI harness loads this file by
 path (tools/armada/child_groups.py), as importing `dew` sets the process's XLA flags."""
 
+import _thread
 import contextlib
+import functools
 import os
 import select
 import signal
@@ -147,7 +149,8 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     are let go first, their pipes closed. A start interrupted, or whose command cannot execute, stops the
     group it started, lets its lifeline go and closes every descriptor it opened: no caller holds them.
 
-    The start runs on a thread of its own (`_Starting`), which no Python signal handler runs on: one that
+    The start runs on a thread of its own (`_Starting`, started by `_thread` and waited for on a lock alone,
+    `_Done`), which no Python signal handler runs on: one that
     raises (a Ctrl-C, a deadline's alarm) runs on the main thread, whichever thread the signal reached,
     and landing between a descriptor's creation and its holder's holding it, there or inside Popen's
     own, would leak it. An interruption reaches the caller wherever it is (launching the thread, waiting
@@ -156,20 +159,57 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     and the caller waits for either before it raises; a second interruption while it waits leaves the
     undoing to finish on its own. A start abandoned before it began starts nothing."""
     starting = _Starting(command, options)
-    worker = threading.Thread(target=starting.run, name="dew-group-start", daemon=True)
     try:
-        worker.start()
+        _thread.start_new_thread(_run, (starting.run,))
         starting.done.wait()
         return starting.result()
     except BaseException:
         process, begun = starting.abandon()
         if process is not None:
-            undoing = threading.Thread(target=_undone, args=(process,), name="dew-group-undo", daemon=True)
-            undoing.start()
-            undoing.join()
+            done = _Done()
+            _thread.start_new_thread(_run, (functools.partial(_undo_and_signal, process, done),))
+            done.wait()
         elif begun:
             starting.done.wait()
         raise
+
+
+def _run(work: Callable[[], None]) -> None:
+    """`work()` on a thread `_thread` started, under the trace and profile hooks a `threading` thread takes
+    (`threading.settrace`, `threading.setprofile`)."""
+    sys.settrace(threading.gettrace())
+    sys.setprofile(threading.getprofile())
+    work()
+
+
+class _Done:
+    """One worker's end, which one caller waits for (`wait`) on a lock alone: a caller's interruption
+    (an exception a signal handler raises) leaves it as it was wherever it lands, where `threading`'s
+    waits (`Thread.start`, `Event.wait`) reacquire a condition's lock as they unwind and an interruption
+    landing there made them raise "release unlocked lock" in its place (row 7619). `finished` is set
+    before the lock is released, so a wait whose acquire had succeeded as it was interrupted never
+    acquires again."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.lock.acquire()
+        self.finished = False
+
+    def set(self) -> None:
+        self.finished = True
+        self.lock.release()
+
+    def wait(self) -> None:
+        if not self.finished:
+            self.lock.acquire()
+
+
+def _undo_and_signal(process: subprocess.Popen, done: _Done) -> None:
+    """`process`'s group undone (`_undone`), then `done` set, however the undoing ends."""
+    try:
+        _undone(process)
+    finally:
+        done.set()
 
 
 class _Starting:
@@ -181,7 +221,7 @@ class _Starting:
     def __init__(self, command: Sequence[str], options: Mapping[str, object]) -> None:
         self.command, self.options = command, options
         self.lock = threading.Lock()
-        self.done = threading.Event()
+        self.done = _Done()
         self.begun = self.abandoned = False
         self.process: subprocess.Popen | None = None
         self.error: BaseException | None = None

@@ -46,7 +46,7 @@ from dew.decision.layout import (
     layout_writing,
     per_question,
 )
-from dew.decision.model import DecisionModel
+from dew.decision.model import DecisionModel, state_width
 from dew.decision.objective import DecisionObjective
 from dew.decision.renderer import Unit
 from dew.decision.rows import option_width
@@ -56,7 +56,7 @@ from dew.inputs.condition import ConditionEncoder
 from dew.inputs.spec import TextCondition
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, SharedCrossAttention
-from dew.nn.protocols import CountedCondition, RematChoosing
+from dew.nn.protocols import RematChoosing
 from dew.optim import OptimConfig
 from dew.registry import (
     ModelConfig,
@@ -346,16 +346,14 @@ class DecisionRunConfig(DecoderRunConfig):
 
     def _context_blocks(self, configured: ConditionEncoder | None) -> CrossAttention | SharedCrossAttention:
         """The context layers the run draws (`context_form`), reading a configured encoder's states at its own
-        width (`ConditionWork.features`), else the backbone's."""
+        width (`ConditionWork.features`), else the backbone's; a shared layer reads them at the backbone's."""
         assert self.context_layers is not None
-        if configured is None:
-            form = SharedCrossAttention if self.context_form == "shared" else CrossAttention
-            return form(self.context_layers, self.context_length)
         if self.context_form == "shared":
-            raise ValueError("--context-form shared reads a context in the layer's own attention, at the "
-                             "backbone's width, which a configured --context-text encoder's states are not")
-        return CrossAttention(self.context_layers, self.context_length,
-                              context_features=_encoded_width(configured))
+            # The layer's own attention reads the context at the backbone's width, a configured encoder's
+            # states among them where they are that wide; the layer refuses any other width.
+            return SharedCrossAttention(self.context_layers, self.context_length)
+        features = None if configured is None else state_width(configured)
+        return CrossAttention(self.context_layers, self.context_length, context_features=features)
 
     def build_run(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
@@ -591,12 +589,3 @@ def _budgeted(layout: Layout, budgets: Budgets) -> Layout:
 
 
 __all__ = ["DecisionRunConfig", "JointShape", "Letters"]
-
-
-def _encoded_width(encoder: ConditionEncoder) -> int:
-    """The width of the states a configured context encoder hands the cross-attention, as it declares its
-    work (`CountedCondition.conditioning_flops`, `ConditionWork.features`)."""
-    if not isinstance(encoder, CountedCondition):
-        raise ValueError(f"{type(encoder).__name__} declares no conditioning_flops, whose features are the "
-                         "width its states reach the context layers at")
-    return encoder.conditioning_flops(encoder.tokenize([""])).features

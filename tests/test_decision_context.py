@@ -402,6 +402,15 @@ class Conditioning(CharTable):
     keyword = "conditioning"
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class Wide(CharTable):
+    """A character table whose states are the tiny Laya backbone's width, 128 features."""
+
+    @classmethod
+    def from_pretrained(cls, checkpoint: str = "char_table", **settings) -> "Wide":
+        return super().from_pretrained(checkpoint, **{"features": 128, **settings})
+
+
 def configured(tokens: int = 12, *, trained: bool = False) -> DecisionObjective:
     """A decision over the tiny Llama whose context is encoded by a configured encoder (`CharTable`, a
     character table of 16 features) in place of the backbone's own, read by fresh cross-attention before
@@ -849,7 +858,8 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
     text condition is, a pretrained tower (`clip_text`) among them, and trains a step with it frozen; an
     encoder that reads no text into the states context layers read (an audio tower, a denoiser's
     conditioner) and a diffusion run's field or unconditional text are refused. The run built the tower in
-    float32 and took any registered encoder, which failed at its first trace (theme 22's review)."""
+    float32 and took any registered encoder, which failed at its first trace (theme 22's review). Its task
+    loaded computes its encoder as the run did, or in the dtype the load asks for."""
     from run_kinds import decision, trained
     from test_text_encoders import TINY
 
@@ -863,8 +873,14 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
                               model=ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     objective = run.prepare().objective
     assert jnp.dtype(objective.model.context.encoder.dtype) == jnp.dtype("bfloat16")
-    state, _ = trained(run, tmp_path, "clip")
+    state, _ = trained(run, tmp_path, "clip", trainer={"checkpoint_final": True})
     assert "context" in state.variables[FROZEN] and "context" not in state.variables["params"]
+    # Loaded, the task's encoder computes as the run's did, or in the dtype the load asks for, as its
+    # backbone does: a load's dtype bound the backbone and head alone (row 7611).
+    for asked, computed in ((None, "bfloat16"), ("float32", "float32")):
+        loaded = Decide.from_run(str(tmp_path / "runs" / "clip"), dtype=asked)
+        assert jnp.dtype(loaded.model.context.encoder.dtype) == jnp.dtype(computed)
+        assert jnp.dtype(loaded.model.backbone.dtype) == jnp.dtype(computed)
     # A character table is taken; one differing from it in its declarations alone (`reads_captions`,
     # `keyword`) is refused, as an audio tower and a denoiser's conditioner are.
     table = TextCondition(encoder="char_table", checkpoint="char_table")
@@ -913,3 +929,51 @@ def test_a_run_from_a_saved_run_holds_its_configured_encoders_weights_frozen_or_
         assert "context" not in second.variables.get(other, {})
     with pytest.raises(ValueError):
         dataclasses.replace(decision(tmp_path, drawn=False), context_text_trained=True).prepare()
+
+
+def test_a_shared_cross_attention_reads_a_configured_encoder_of_the_backbones_width(tmp_path):
+    """`--context-form shared` reads a configured encoder's states in the layer's own attention, at the
+    backbone's width: an encoder of that width (`Wide`, 128 features as the tiny Laya backbone) trains a
+    step, and one of another width (char_table's 16) is refused by the layer's own width check. Every
+    configured encoder was refused under the shared form (row 7613)."""
+    from run_kinds import decision, trained
+
+    from dew.inputs.spec import TextCondition
+
+    run = dataclasses.replace(decision(tmp_path, drawn=False), context_layers=(0,), context_length=32,
+                              context_form="shared", calibrate=False,
+                              context_text=TextCondition(encoder=f"{__name__}:Wide", checkpoint="char_table"))
+    state, _ = trained(run, tmp_path, "shared")
+    assert "context" in state.variables[FROZEN]
+    table = TextCondition(encoder="char_table", checkpoint="char_table")
+    narrow = dataclasses.replace(run, context_text=table)
+    with pytest.raises(ValueError):
+        trained(narrow, tmp_path, "narrow")
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_configured_encoder_is_placed_by_its_own_axes_frozen_or_trained(tmp_path):
+    """A run's configured context encoder (a CLIP tower) is placed on a mesh with a tensor axis by the axes
+    its towers declare (`DecisionObjective.tower_axes`), in the collection the run holds it in, frozen or
+    trained, some of its weights split over tensor as a diffusion run's frozen towers are: its weights are
+    no module's draw, and the layout replicated them (the base review of fcc9f98cc, F3)."""
+    from placement_cases import LAYOUT, MIN_SHARD
+    from run_kinds import decision
+    from test_text_encoders import TINY
+
+    from dew.distributed.placement import Layout as Placement
+    from dew.inputs.spec import TextCondition
+    from dew.mesh import TENSOR_AXIS, mesh_axes
+
+    text = TextCondition(encoder="clip_text", checkpoint=str(TINY))
+    for trains in (False, True):
+        run = dataclasses.replace(decision(tmp_path, drawn=False), context_layers=(0,), context_length=32,
+                                  context_text=text, context_text_trained=trains, calibrate=False)
+        objective = run.prepare().objective
+        trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), mesh=LAYOUT,
+                          layout=Placement(min_shard=MIN_SHARD), tracker=None)
+        trainer.device_mesh = LAYOUT.build(jax.devices()[:8])
+        placed = trainer.shardings(jax.eval_shape(trainer.initial_state)).variables
+        held = placed["params" if trains else FROZEN]["context"]
+        assert any(TENSOR_AXIS in mesh_axes(entry) for sharding in jax.tree.leaves(held)
+                   for entry in sharding.spec)

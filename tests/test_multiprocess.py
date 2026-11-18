@@ -47,7 +47,7 @@ from process_support import (
     spawn,
     start_process,
     stuck,
-    terminate,
+    terminate_all,
     worker_env as worker_env,
 )
 from test_whole_validation import POOLED
@@ -1231,8 +1231,8 @@ def told(pool: list[tuple[subprocess.Popen, Path]], timeout: float = 600) -> lis
     finally:
         for handle in [*exits, *readers]:
             os.close(handle)
-        for process, path in pool:
-            terminate(process)
+        terminate_all([process for process, _ in pool])
+        for _, path in pool:
             path.unlink()
     return [heard[index] for index in range(len(pool))]
 

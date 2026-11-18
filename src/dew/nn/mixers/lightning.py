@@ -32,14 +32,13 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.mesh import SEQUENCE_AXIS
 from dew.nn.dense import Dense
 from dew.nn.flops import projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
-from dew.nn.kernels import recurrence, recurrence_algebra
-from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, RESET_DECAY, Chunk, chunk
+from dew.nn.kernels import recurrence
+from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, Chunk, chunk
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
-from dew.nn.linear import fork_start, forked_scan, over_sequence, sequence_split
+from dew.nn.linear import fork_start, forked_scan, over_sequence, sequence_entered, sequence_split
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
@@ -181,23 +180,24 @@ class LightningAttention(nn.Module):
             return self.out_proj(nn.sigmoid(self.output_gate(x)) * out)
         if shards > 1:
             # Each shard runs its slice from the memory the earlier ones leave it (`_sequence_memory`); a
-            # call split so holds no cache (`sequence_split`).
-            out, final = over_sequence(functools.partial(_sequence_memory, chunk_size=self.chunk_size,
-                                                         max_segments=tokens.max_segments),
-                                       shards, (query, key, value, log_decay, tokens.starts), ()), None
-        elif held is not None and length == 1:
-            out, _, final = recurrence.step_reference(LIGHTNING, recurrence.Step(
-                state=held.value, query=query[:, 0], key=key[:, 0], value=value[:, 0],
-                log_decay=log_decay[:, 0], active=None if tokens.valid is None else tokens.valid[:, 0]))
-            out = out[:, None]
+            # call split so is no decode call and holds no cache (`sequence_split`).
+            out = over_sequence(functools.partial(_sequence_memory, chunk_size=self.chunk_size,
+                                                  max_segments=tokens.max_segments),
+                                shards, (query, key, value, log_decay, tokens.starts), ())
         else:
-            out, final = chunk(LIGHTNING, Chunk(query, key, value, log_decay=log_decay,
-                                                state=None if held is None else held.value,
-                                                starts=tokens.starts, firsts=tokens.firsts),
-                               chunk_size=self.chunk_size, max_segments=tokens.max_segments)
-        if held is not None and final is not None:
-            # The memory kept in the cache's dtype, as it always was.
-            kept(held, final.astype(held.value.dtype), STATE)
+            if held is not None and length == 1:
+                out, _, final = recurrence.step_reference(LIGHTNING, recurrence.Step(
+                    state=held.value, query=query[:, 0], key=key[:, 0], value=value[:, 0],
+                    log_decay=log_decay[:, 0], active=None if tokens.valid is None else tokens.valid[:, 0]))
+                out = out[:, None]
+            else:
+                out, final = chunk(LIGHTNING, Chunk(query, key, value, log_decay=log_decay,
+                                                    state=None if held is None else held.value,
+                                                    starts=tokens.starts, firsts=tokens.firsts),
+                                   chunk_size=self.chunk_size, max_segments=tokens.max_segments)
+            if held is not None:
+                # The memory kept in the cache's dtype, as it always was.
+                kept(held, final.astype(held.value.dtype), STATE)
         # The recurrence's output under both names a remat policy reads it by (`RESIDUALS`).
         out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
         out = self.norm(out.reshape(batch, length, self.features).astype(qkv.dtype))
@@ -206,20 +206,13 @@ class LightningAttention(nn.Module):
 
 def _sequence_memory(query, key, value, log_decay, starts, *, chunk_size: int, max_segments: int):
     """This shard's slice of the memory's recurrence, inside a `shard_map` that holds the sequence axis
-    manual (`over_sequence`): run from zero, the memory it leaves and its span's log decay (a document start
-    in it zeroing the decay, `RESET_DECAY`) give the memory the earlier shards leave it
-    (`recurrence_algebra.entering`), and the slice runs again from that memory, a start in it dropping it
-    as on one device, as Mamba-2's scan does."""
+    manual (`over_sequence`), from the memory the earlier shards leave it (`sequence_entered`), its span's
+    decay a head's summed log decay."""
     def run(state):
         return chunk(LIGHTNING, Chunk(query, key, value, log_decay=log_decay, state=state, starts=starts),
                      chunk_size=chunk_size, max_segments=max_segments)
 
-    _, leaving = run(None)
-    decay = jnp.sum(log_decay, axis=1)                              # [B, H]
-    if starts is not None:
-        decay = jnp.where(jnp.any(starts, axis=1)[:, None], RESET_DECAY, decay)
-    out, _ = run(recurrence_algebra.entering(recurrence_algebra.Span(decay, leaving), SEQUENCE_AXIS))
-    return out
+    return sequence_entered(run, jnp.sum(log_decay, axis=1), starts)
 
 
 @dataclasses.dataclass(frozen=True)

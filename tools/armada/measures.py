@@ -3,8 +3,6 @@ its recorded peak, and of the records its runs left, the one that held the most;
 Dew's admission of the programs its prepare filed."""
 
 import concurrent.futures
-import functools
-import importlib.util
 import json
 import math
 import os
@@ -58,18 +56,6 @@ def largest(keys: Iterable[str], read: Callable[[str], dict | None],
     return most
 
 
-@functools.cache
-def wire():
-    """The tier's prepare-to-lane contract (tests/tier_wire.py, its one owner), loaded by its path when a lane
-    first needs it: a harness checkout with no tests/ (a page generator's scratch copy) imports ci.py all the
-    same (review)."""
-    spec = importlib.util.spec_from_file_location("tier_wire", Path(__file__).resolve().parents[2] / "tests"
-                                                  / "tier_wire.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 NEEDED = """import json, sys
 import jax
 from dew._devices import allocator_limit
@@ -86,27 +72,27 @@ GPU, its allocator's stranding counted: one accounting, the one the planner trus
 (train 997's review: read as pool bytes, every need was its share's inverse larger)."""
 
 
-def prepared_programs(names: Iterable[str]) -> dict[str, list[dict]]:
-    """The programs' memory each of `names` filed at its prepare (`wire`'s `needs_file`), by unit; none
-    where the tier's store names none, or the unit filed nothing."""
-    store = os.environ.get(wire().TRUTHS)
+def prepared_programs(names: Iterable[str], wire) -> dict[str, list[dict]]:
+    """The programs' memory each of `names` filed at its prepare (the tier's contract `wire`, its
+    `needs_file`), by unit; none where the tier's store names none, or the unit filed nothing."""
+    store = os.environ.get(wire.TRUTHS)
     if not store:
         return {}
     found = {}
     for name in names:
-        path = wire().needs_file(Path(store), name)
+        path = wire.needs_file(Path(store), name)
         if path.is_file() and (filed := json.loads(path.read_text()))["unit"] == name and filed["programs"]:
             found[name] = filed["programs"]
     return found
 
 
-def prepared_needs(python: str, names: Iterable[str]) -> dict[str, float]:
+def prepared_needs(python: str, names: Iterable[str], wire) -> dict[str, float]:
     """Each of `names`' least pool in bytes by Dew's admission of the programs it filed at its prepare
     (`NEEDED`), read on this GPU in a process of the lane's environment that takes no pool (its allocator
     grows): a part's float64 truths, which no measured run of it held, are admitted before they run
     (2026-11-17: two flows' 1.71 GiB terms walk beside 1.1 GiB of arms ran out of a 2.84 GiB share). None
     where none filed, or Dew could not read them, which the lane says: their measured shares stand."""
-    programs = prepared_programs(names)
+    programs = prepared_programs(names, wire)
     if not programs:
         return {}
     path = os.pathsep.join(filter(None, ("src", os.environ.get("PYTHONPATH"))))

@@ -167,6 +167,12 @@ def run_config(args: RigelArgs) -> LMRunConfig:
         tokenizer=args.tokenizer, max_new_tokens=0)
 
 
-if __name__ == "__main__":
-    args, rest = tyro.cli(RigelArgs, return_unknown_args=True)
+def main(argv: list[str] | None = None) -> None:
+    """Run the recipe on `argv`, the process's own command line where None: Rigel's flags, then any
+    `LMRunConfig` flag after them."""
+    args, rest = tyro.cli(RigelArgs, args=argv, return_unknown_args=True)
     LMRunConfig.cli(rest, default=run_config(args)).run()
+
+
+if __name__ == "__main__":
+    main()

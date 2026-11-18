@@ -93,8 +93,10 @@ class Scan:
     group of one): Mamba-3's ranks (`group` the MIMO rank R, a token's R ranks the walked axis's R entries,
     mamba_ssm's tilelang mamba3_mimo_fwd excluding a token's whole R x R block), whose own block a model adds
     itself. A rank reading a lower rank of its own token at its gate and taking the gate's part back off
-    cancelled catastrophically (one row 13 times its reference in 48 seeds, row 7402). No correction reads
-    apart: its tokens write their own state.
+    cancelled catastrophically (one row 13 times its reference in 48 seeds, row 7402). A correction reads
+    apart from a group of one alone: each token reads the state after its decay, before its own corrected
+    write, its pairs with the chunk's earlier tokens' corrected writes (row 7608); a group past one beside a
+    correction is refused, its tokens' writes correcting the state its group's earlier writes left.
     `turn`, where given, names an operand neither reads, `[..., A]` along the walked axis: each token's turn
     of the state's first `2 A` key rows, `A` adjacent pairs `(2j, 2j + 1)`, each a complex number `h_2j + i
     h_2j+1` the token multiplies by `e^{-i turn}` before its decay (Mamba-3's rotating basis,
@@ -275,16 +277,17 @@ def _unturned(declaration: Scan, shapes: Mapping, dtype) -> tuple | None:
 
 def _apart(declaration: Scan, affine, tokens: int) -> int:
     """The tokens of the group a readout reads apart from (`Scan.group`, 0 where it reads after its write or
-    before its token): refused where its tokens correct the state (each writes its own), a chunk of `tokens`
-    cuts a group (its memory would hold its own group's earlier writes), or a group of more than one token
-    is declared beside another readout, which reads none of it (train 1004's review F3)."""
+    before its token): refused where its tokens correct the state in a group past one (`Scan.reads`), a chunk
+    of `tokens` cuts a group (its memory would hold its own group's earlier writes), or a group of more than
+    one token is declared beside another readout, which reads none of it (train 1004's review F3)."""
     if declaration.reads != "apart":
         if declaration.group != 1:
             raise Refused(f"a group of {declaration.group} tokens under a readout {declaration.reads!r} its "
                           "token: a group is what a readout apart from its writes reads none of")
         return 0
-    if affine.correction is not None:
-        raise Refused("a readout apart from its group's writes under a correction has no chunk form here")
+    if affine.correction is not None and declaration.group != 1:
+        raise Refused(f"a readout apart from a group of {declaration.group} tokens' writes under a "
+                      "correction has no chunk form here: a group of one alone")
     if declaration.group < 1 or tokens % declaration.group:
         raise Refused(f"a chunk of {tokens} tokens cuts a group of {declaration.group}")
     return declaration.group

@@ -8,6 +8,7 @@ import dataclasses
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
 from collections.abc import Mapping
@@ -104,19 +105,31 @@ def _keep_argument():
     )
 
 
+_log = logging.getLogger(__name__)
+
+PASSES = "passes"
+"""The default validation and checkpoint cadence: at each pass's end where the run counts its data's passes
+(as `epoch`), otherwise once, at the run's end (`100%`), as `TrainerConfig.interval` resolves it at the
+start, which records and logs what it became (docs/design/training.md, cadences). `epoch`, written, is
+strict: a run whose data counts no pass refuses it."""
+
+_AT_END = "100%"
+"""What `PASSES` resolves to where the data counts no pass: the run's end, a share of its planned length."""
+
+
 def _cadence_argument(*, timed: bool = True):
-    """A cadence's command-line form: steps, `epoch`, a share of the run such as `5%`, None, and with
-    `timed` a duration such as `30m`."""
+    """A cadence's command-line form: steps, `epoch`, `passes`, a share of the run such as `5%`, None, and
+    with `timed` a duration such as `30m`."""
     def read(given):
         value = given[0]
         if value == 'None':
             return None
-        if value == 'epoch' or is_share(value):
+        if value in ('epoch', PASSES) or is_share(value):
             return value
         return int(value) if value.isdecimal() or not timed else duration(value)
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
-        metavar="STEPS|DURATION|SHARE%|epoch" if timed else "STEPS|SHARE%|epoch",
+        metavar="STEPS|DURATION|SHARE%|epoch|passes" if timed else "STEPS|SHARE%|epoch|passes",
         instance_from_str=read,
         is_instance=lambda value: value is None or isinstance(value, (int, str, datetime.timedelta)),
         str_from_instance=lambda value: [
@@ -185,16 +198,17 @@ class TrainerConfig:
     `--trainer.cooldowns.at 20% 40% --trainer.cooldowns.length 20%`."""
     log_every: Annotated[int | str, _cadence_argument(timed=False)] = 100
     """The steps between logs, or a share of the run such as "1%" (`eval_every`)."""
-    eval_every: Annotated[int | str | None, _cadence_argument(timed=False)] = "epoch"
+    eval_every: Annotated[int | str | None, _cadence_argument(timed=False)] = PASSES
     """The steps between validation passes.
 
-    It is a number of steps, "epoch" for one pass over the data, a share of the
-    run such as "5%", resolved once against its planned length in steps, epochs,
-    examples or tokens (`dew.training.Trainer.fit`), or None to never validate.
-    "epoch" over a stream that reports no record count raises a ValueError, since
-    such a stream has no pass.
+    It is a number of steps, "epoch" for one pass over the data, "passes" (the default) for each pass's
+    end where the run counts its data's passes and its end otherwise (`PASSES`), a share of the run such
+    as "5%", resolved once against its planned length in steps, epochs, examples or tokens
+    (`dew.training.Trainer.fit`), or None to never validate. "epoch" over data whose passes the run counts
+    none of (a stream without a record count, a decision table a steps-bounded run reads) raises a
+    ValueError, since the run can find no pass's end.
     """
-    checkpoint_every: Annotated[int | str | datetime.timedelta | None, _cadence_argument()] = "epoch"
+    checkpoint_every: Annotated[int | str | datetime.timedelta | None, _cadence_argument()] = PASSES
     """The steps between checkpoints, with the same choices as `eval_every`, or a duration such as 30m.
 
     A stream whose iterator cannot report its read position must train with None;
@@ -408,11 +422,12 @@ class TrainerConfig:
         run_length(self.steps, self.epochs, self.tokens, self.examples, required=False)
         if isinstance(self.log_every, str) and not is_share(self.log_every):
             raise ValueError(f"--trainer.log-every is steps or a share such as 1%, not {self.log_every!r}")
-        if isinstance(self.eval_every, str) and self.eval_every != 'epoch' and not is_share(self.eval_every):
-            raise ValueError(f"--trainer.eval-every is steps, epoch or a share such as 5%, not "
+        if (isinstance(self.eval_every, str) and self.eval_every not in ('epoch', PASSES)
+                and not is_share(self.eval_every)):
+            raise ValueError(f"--trainer.eval-every is steps, epoch, passes or a share such as 5%, not "
                              f"{self.eval_every!r}")
-        if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch' and not is_share(
-                self.checkpoint_every):
+        if (isinstance(self.checkpoint_every, str) and self.checkpoint_every not in ('epoch', PASSES)
+                and not is_share(self.checkpoint_every)):
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
         if isinstance(self.keep, Mapping):
             object.__setattr__(self, 'keep', from_record(Keep, self.keep, dtypes=False))
@@ -514,7 +529,7 @@ class TrainerConfig:
 
     def eval_interval(self, dataset: Loader) -> int | str | Counted | None:
         """Return the steps between validation passes over `data`, or None for never."""
-        return self._interval(self.eval_every, dataset, "eval-every")
+        return self.interval(self.eval_every, dataset, "--trainer.eval-every")
 
     def checkpoint_interval(self, dataset: Loader) -> int | str | Counted | datetime.timedelta | None:
         """Return the steps, or a recorded duration such as 30m, between checkpoints."""
@@ -523,19 +538,28 @@ class TrainerConfig:
             if value.total_seconds() <= 0:
                 raise ValueError("checkpoint_every duration must be positive")
             return value
-        return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
+        return self.interval(self.checkpoint_every, dataset, "--trainer.checkpoint-every")
 
-    def _interval(self, value, dataset: Loader, field_name: str) -> int | str | Counted | None:
-        """Steps for `epoch`, or the source examples a pass holds where the run reads its epochs as
-        passes over them (`Loader.epochs`, `Loader.pass_examples`); steps, a share of the run (which `fit`
-        resolves) or None as given."""
+    def interval(self, value, dataset: Loader, option: str) -> int | str | Counted | None:
+        """A cadence (`eval_every`, `checkpoint_every`, a split's `RunConfig.val_every`) the command
+        line's `option` (`--trainer.eval-every`) sets, resolved against `dataset`: steps for `epoch`, or
+        the source examples a pass holds where the run reads its epochs as passes over them
+        (`Loader.epochs`, `Loader.pass_examples`); for `passes`, the same where the run counts its data's
+        passes, and the run's end (`_AT_END`) where it counts none, which it logs; steps, a share of the
+        run (which `fit` resolves) or None as given."""
         if value is None or isinstance(value, int) or is_share(value):
             return value
-        if dataset.steps_per_epoch is None and dataset.epochs is not None and dataset.pass_examples:
-            return Counted(dataset.pass_examples, "examples")
+        passed = dataset.pass_examples if dataset.epochs is not None else None
+        if value == PASSES and dataset.steps_per_epoch is None and not passed:
+            _log.info("%s passes: the run counts none of its data's passes (no record count, and no "
+                      "--trainer.epochs over source examples), so it runs at the run's end (%s)", option,
+                      _AT_END)
+            return _AT_END
+        if dataset.steps_per_epoch is None and passed:
+            return Counted(passed, "examples")
         if dataset.steps_per_epoch is None:
             raise ValueError(
-                f"--trainer.{field_name} epoch needs a dataset with a record count; this "
+                f"{option} epoch needs a dataset with a record count; this "
                 f"one streams without one, so give the interval in steps or None")
         return dataset.epoch_steps(window=self.accumulation)
 

@@ -85,6 +85,7 @@ FORMED = [
     recurrence.Hooks(decay='none', delta=False, reads='before'),
     recurrence.Hooks(decay='scalar', delta=False, write_gate=True, reads='apart'),
     recurrence.Hooks(decay='vector', delta=False, reads='apart'),
+    recurrence.Hooks(decay='scalar', delta=True, reads='apart'),
 ]
 """The launch's other prologue values: Mamba2's step gates clipped with the skip, the gated delta rule's
 gates with a clipped step, a scale without the l2 norm and one under it, a rated decay with the
@@ -94,9 +95,9 @@ the delta rule read before its update, a write gate's own write weighed in a rea
 readout of the state entering its token alone, undecayed and with no delta rule: its key walk sums one
 term (`step._summed_keys`), which a tuple of one wrapped again failed to trace (audit 2026-11-17); and a
 readout apart from its token's own write ('apart', row 7402), a decay a head's under a write gate
-(Mamba-3's) and a key dimension's."""
+(Mamba-3's), a key dimension's, and the delta rule's (row 7608)."""
 
-FORMED_SEEDS = dict(zip(FORMED, (8, 16, 8, 8, 16, 16, 16, 16, 8, 8, 8), strict=True))
+FORMED_SEEDS = dict(zip(FORMED, (8, 16, 8, 8, 16, 16, 16, 16, 8, 8, 8, 16), strict=True))
 """The formed sites' seeds, sized independently by `seeds_for` on armada (2026-10-21; the last three
 2026-11-17)."""
 

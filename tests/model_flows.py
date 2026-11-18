@@ -395,7 +395,7 @@ def _flat(flow: Flow, program: Callable):
     return flat, [*shapes, jax.ShapeDtypeStruct((flow.rows, flow.length), np.int32)]
 
 
-def _target():
+def node_target():
     """The node's GPU (`TOPOLOGY`): its generation, its kind's (`generation.gpu_target`), and the facts its
     serialized device states of itself, its multiprocessors and its block's shared memory among them
     (`generation.runtime_facts`), read with no GPU visible, as a prepare runs, so nothing of the CUDA
@@ -501,7 +501,7 @@ def prepare(flow: Flow) -> bool:
     (`judge`). Whether it prepared: none where no kernel off the reference path claims a choice the flow is
     for on the node's GPU (`claimed`), which its store records (`PORTABLE`) for its run to skip."""
     held_process(flow)
-    target = _target()
+    target = node_target()
     directory = store_of(flow)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / PORTABLE).unlink(missing_ok=True)
@@ -611,7 +611,7 @@ def loaded(flow: Flow) -> dict[str, Callable]:
 def judge(flow: Flow, programs: Mapping[str, Callable], kind: str, target=None) -> None:
     """Check 1 of the flow's program `kind` (`KINDS`) against its float64 truth, computed on this GPU by the
     programs the tier's prepare compiled for it (`truths_ahead.compiled_truths`); compiled there where this
-    process prepares (`programs` none), for `target` (the node's GPU, `_target`; this process's devices
+    process prepares (`programs` none), for `target` (the node's GPU, `node_target`; this process's devices
     where none)."""
     truth_model = float64_twin(flow.model)
     truth = flow.train(truth_model) if kind == "train" else flow.decode_truth(truth_model)

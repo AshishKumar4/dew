@@ -31,6 +31,7 @@ from dew.batch import Batch
 from dew.distributed.placement import Placement
 from dew.mesh import DILOCO_AXIS
 from dew.nn.kernels.options import owned_program
+from dew.nn.precision import at_least_fp32
 from dew.state import REPLICA_FIELDS, Replicas, ReplicaState, TrainState
 from dew.training.transaction import cleared, example_groups, window_dropped
 
@@ -125,7 +126,7 @@ class DiLoCo:
     def synced(self, state: TrainState) -> TrainState:
         """`state` with its groups met: the outer gradient the outer parameters less the groups' mean,
         stepped by the outer optimizer in float32, every group's parameters the outer ones again; the
-        other collections and the EMA the groups' mean where they are floating, the first group's
+        other collections and the EMA the groups' mean where they are inexact (`_met`), the first group's
         otherwise. Each group keeps its inner optimizer's state."""
         inner = state.inner
         assert inner is not None, "a DiLoCo step's state holds its groups' inner state"
@@ -295,17 +296,20 @@ def on_groups(sharding: NamedSharding) -> NamedSharding:
 
 
 def _wide(leaf: jax.Array) -> jax.Array:
-    """A floating leaf in at least float32, the outer model's precision; another as it is."""
-    if jnp.issubdtype(leaf.dtype, jnp.floating) and jnp.finfo(leaf.dtype).bits < 32:
-        return leaf.astype(jnp.float32)
+    """An inexact leaf (floating or complex) in at least float32 (`at_least_fp32`), the outer model's
+    precision: a float64 or complex leaf as it is, a narrower float in float32; another as it is."""
+    if jnp.issubdtype(leaf.dtype, jnp.inexact):
+        return leaf.astype(at_least_fp32(leaf.dtype))
     return leaf
 
 
 def _met(stacked: jax.Array) -> jax.Array:
-    """The groups' `stacked` leaf met: their mean, in its dtype, where it is floating; the first group's
-    otherwise."""
-    if jnp.issubdtype(stacked.dtype, jnp.floating):
-        return jnp.mean(stacked, axis=0, dtype=jnp.float32).astype(stacked.dtype)
+    """The groups' `stacked` leaf met: their mean, taken in at least float32 of its dtype
+    (`at_least_fp32`: a float64 leaf's in float64, a complex leaf's in its complex dtype) and stored in its
+    dtype, where it is inexact; the first group's otherwise (a count, a flag). A complex leaf took the
+    first group's, and a float64 one a float32 mean."""
+    if jnp.issubdtype(stacked.dtype, jnp.inexact):
+        return jnp.mean(stacked, axis=0, dtype=at_least_fp32(stacked.dtype)).astype(stacked.dtype)
     return stacked[0]
 
 
@@ -315,7 +319,7 @@ def _agreed(leaf):
     group's otherwise."""
     if not isinstance(leaf, jax.Array):
         return leaf
-    if jnp.issubdtype(leaf.dtype, jnp.floating):
+    if jnp.issubdtype(leaf.dtype, jnp.inexact):
         return jax.lax.pmean(leaf, DILOCO_AXIS)
     if leaf.dtype == jnp.bool_:
         return jax.lax.pmin(leaf.astype(jnp.int32), DILOCO_AXIS).astype(jnp.bool_)

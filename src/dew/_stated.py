@@ -106,7 +106,7 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
     """`stated`, within the functions and containers `walking` whose reads or parts are being stated, the
     path to `value` in order: a function among them met again (one that names itself) is that function,
     stated once; a container among them met again is a reference back to it, by how far up the path it
-    stands (`_again`)."""
+    stands (`met_again`)."""
     again = functools.partial(_stated, known=known, walking=walking)
     if id(value) in known:
         return known[id(value)]
@@ -149,7 +149,7 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         # resume (train 947's review). One met twice apart, in two branches, is stated twice: `walking` is
         # the path's alone.
         if id(value) in walking:
-            return _again(value, walking)
+            return met_again(value, walking)
         again = functools.partial(_stated, known=known, walking=(*walking, id(value)))
     if isinstance(value, (tuple, list)):
         # A named tuple's type names its fields, which its parts take in order.
@@ -385,7 +385,7 @@ def _field_part(value, at: str, known: Mapping[int, JSON], walking: tuple[int, .
     return "missing" if value is _sources.MISSING else _stated(value, at, known, walking)
 
 
-def _again(value, walking: tuple[int, ...]) -> JSON:
+def met_again(value, walking: tuple[int, ...]) -> JSON:
     """A container met again on its own path (`walking`), as a reference back to it: its type and how many
     steps up the path it stands, the same wherever the path began."""
     return ["again", f"{type(value).__module__}.{type(value).__qualname__}",
