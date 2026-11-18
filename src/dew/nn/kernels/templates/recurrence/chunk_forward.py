@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import zero_padded
 from dew.nn.kernels.templates import mosaic, product
@@ -59,9 +58,8 @@ def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=No
     if starts is None:
         spans = chunked_launch.sequences(batch, length, chunk=chunk)
     else:
-        most = length if max_segments is None else max_segments
-        spans = chunked_launch.sequences(batch, length, cu_seqlens(starts, batch * (most + 1), firsts),
-                                         chunk=chunk)
+        bound = length if max_segments is None else max_segments
+        spans = chunked_launch.packed_sequences(starts, firsts, bound, chunk=chunk)
     table = tables.unpacked(chunked_launch.ChunkSpan, lambda i: jnp.asarray(spans.chunks)[:, i])
     span = tables.unpacked(chunked_launch.Span, lambda i: jnp.asarray(spans.spans)[:, i])
     chunks, taken = table.taken.shape[0], table.taken

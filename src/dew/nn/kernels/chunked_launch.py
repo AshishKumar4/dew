@@ -184,6 +184,16 @@ def slots(spans: Sequences, batch: int, length: int, chunk: int = 64) -> int:
     return _passing(batch, length, chunk, packed) + batch + packed
 
 
+def packed_sequences(starts, firsts, bound: int, *, chunk: int) -> Sequences:
+    """The spans (`sequences`) of a packed call's documents, `starts` `[B, T]` each one's first token,
+    `firsts` `[B, D]` where given, at most `bound` a row: the one form a packed call's chunks
+    (`templates.recurrence.chunk_forward`) and a forked call's (`ForkedChunks.spans`) take."""
+    from dew.nn.inputs import cu_seqlens
+
+    batch, length = starts.shape
+    return sequences(batch, length, cu_seqlens(starts, batch * (bound + 1), firsts), chunk=chunk)
+
+
 def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> Sequences:
     """The spans of `cu_seqlens` (`[N + 1]` int32 over the `batch * length` tokens, each row's
     boundaries among them), or of the rows themselves where None. A traced `cu_seqlens` takes the most
@@ -482,13 +492,10 @@ class ForkedChunks:
 
     @staticmethod
     def spans(forked: Forked, batch: int, length: int, chunk: int) -> "Sequences":
-        """`forked`'s documents' spans (`sequences`), as a packed call of its documents' first tokens and
-        `firsts` lays them at a documents bound of its own (`Chunk.loads`' `D`)."""
-        from dew.nn.inputs import cu_seqlens
-
-        starts = forked.tokens(length)[0] >= 0
-        offsets = cu_seqlens(starts, batch * (forked.loads.shape[1] + 1), forked.firsts)
-        return sequences(batch, length, offsets, chunk=chunk)
+        """`forked`'s documents' spans, as a packed call of its documents' first tokens and `firsts` lays
+        them at a documents bound of its own (`Chunk.loads`' `D`; `packed_sequences`)."""
+        return packed_sequences(forked.tokens(length)[0] >= 0, forked.firsts, forked.loads.shape[1],
+                                chunk=chunk)
 
     @classmethod
     def of(cls, forked: Forked, batch: int, length: int, chunk: int) -> "ForkedChunks":
