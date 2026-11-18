@@ -328,6 +328,11 @@ def test_a_release_file_kept_at_its_origin_is_fetched_from_its_release_and_never
     assert store.check(root)
 
 
+RELEASE_ASSETS = 1000
+"""The most assets GitHub keeps in one release, past which the store's upload workflow (dew-fixtures'
+upload.yml), which `_github` stands in for, opens the next."""
+
+
 def _github(store, monkeypatch, releases: list[dict], private: bool = False, exists: bool = True,
             uploads: dict[str, bytes] | None = None) -> list:
     """GitHub's store stood in for `gh`, its releases `releases` (each its tag and assets), the repository
@@ -353,7 +358,7 @@ def _github(store, monkeypatch, releases: list[dict], private: bool = False, exi
             if data is None or hashlib.sha256(data).hexdigest() != given["sha256"]:
                 return ""
             open_ = next((release for release in releases
-                          if len(release["assets"]) < store.ASSETS_PER_RELEASE), None)
+                          if len(release["assets"]) < RELEASE_ASSETS), None)
             if open_ is None:
                 highest = max((int(release["tag_name"].removeprefix("store-")) for release in releases),
                               default=0)
@@ -474,7 +479,7 @@ def test_a_githubs_store_file_is_staged_on_its_host_and_dispatched_as_its_asset_
     assert [call[:3] for call in asked if call[0] == "workflow"] == [("workflow", "run", "upload.yml")]
     # A full release opens the one after the highest.
     full = [{"tag_name": "store-2", "assets": [{"name": f"{index}.npz", "digest": ""}
-                                               for index in range(store.ASSETS_PER_RELEASE)]}]
+                                               for index in range(RELEASE_ASSETS)]}]
     _github(store, monkeypatch, full, uploads={entry["url"]: held[key]})
     store.dispatch([entry], root)
     assert store.pins(root)[LARGE]["revision"] == "store-3"

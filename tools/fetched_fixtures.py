@@ -59,9 +59,8 @@ GITHUB = "AshishKumar4/dew-fixtures"
 lets it be re-hosted (`REHOSTED`), an asset named by its content (`_asset`), never overwritten, read
 anonymously over HTTPS (owner, 2026-11-16: GitHub rather than R2)."""
 GITHUB_RELEASE = re.compile(r"store-[1-9][0-9]*")
-"""A release of GitHub's store, `store-N`; a new one opens as the last holds `ASSETS_PER_RELEASE`."""
-ASSETS_PER_RELEASE = 1000
-"""The most assets GitHub keeps in one release."""
+"""A release of GitHub's store, `store-N`; the store's upload workflow (dew-fixtures'
+.github/workflows/upload.yml) opens the next as the last fills."""
 REHOSTED = frozenset({"apache-2.0", "mit", "mit and apache-2.0", "the owner's own code"})
 """The licenses, as a pin names them in any case, under which GitHub's store re-hosts a file; a file under any
 other stays in the Hub's store or at its release's own origin (`ORIGINS`)."""
