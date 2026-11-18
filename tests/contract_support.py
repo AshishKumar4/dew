@@ -242,6 +242,16 @@ EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.
 pairs) reach float32's largest or its least normal."""
 
 
+def assert_drawn_contract(fn, inputs, scale: float, label: str, **options) -> None:
+    """`assert_contract` over a cell's one builder of its inputs, `inputs(seed, scale)`: a seed's primals,
+    direction and cotangent at `scale` (an `EDGES` value), in the cell's domain. Its fixed inputs are the
+    builder's at seed 0, and at the normal scale alone the builder is the mesh's check-1 draw (`draw`),
+    check 1 measuring what float32 holds while an edge's values, which the contract excuses where float64
+    is no normal float32, stay judged by the contract alone (Main's ruling, 2026-11-18)."""
+    draw = (lambda seed: inputs(seed, scale)) if scale == EDGES["normal"] else None
+    assert_contract(fn, *inputs(0, scale), label, draw=draw, **options)
+
+
 def on_a_tpu(fn):
     """`fn` traced as for a TPU (an assumed v5e, `generation.assumed`): the forms Dew takes there, its own
     where a TPU's backend is not accurate enough (`precision.accurate_exp`), run on this host."""

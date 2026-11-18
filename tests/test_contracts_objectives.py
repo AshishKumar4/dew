@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, FORWARD_ORDERS, assert_contract, normal_draw
+from contract_support import EDGES, FORWARD_ORDERS, assert_contract, assert_drawn_contract, normal_draw
 
 from dew.nn import categorical, inspection
 from dew.nn.protocols import OutputTable
@@ -29,8 +29,7 @@ def test_the_categorical_losses_hold_every_order(edge):
     """`categorical`'s probabilities, cross entropy, soft cross entropy and KL divergence (each a custom
     derivative): every order in the logits finite wherever float64 is a normal float32 and the plain formula,
     jax.nn's softmax and log-softmax as written, is."""
-    logits, labels, targets, reference = categorical_draw(2645, edge)
-    (direction,) = normal_draw(2646, logits.shape, scale=EDGES[edge])
+    _, labels, targets, reference = categorical_draw(2645, edge)
     rows = jnp.arange(3)
     sites = {
         "probabilities": (categorical.probabilities, lambda x: jax.nn.softmax(x, axis=-1), (3, 6)),
@@ -46,15 +45,13 @@ def test_the_categorical_losses_hold_every_order(edge):
                                                - jax.nn.log_softmax(x, axis=-1)), axis=-1), (3,)),
     }
     for name, (fn, plain, shape) in sites.items():
-        (cotangent,) = normal_draw(2647, shape)
 
-        def draw(seed, shape=shape):
-            """A seed's logits, direction and cotangent at unit scale, the mesh order's check-1 draw."""
-            (drawn,), along = normal_draw([2645, seed], (3, 6)), normal_draw([2646, seed], (3, 6))
-            return (drawn,), along, normal_draw([2647, seed], shape)[0]
+        def inputs(seed, scale, shape=shape):
+            """A seed's logits and direction at `scale`, and its cotangent."""
+            return (normal_draw((2645, seed), (3, 6), scale=scale),
+                    normal_draw((2646, seed), (3, 6), scale=scale), normal_draw((2647, seed), shape)[0])
 
-        assert_contract(fn, (logits,), (direction,), cotangent, f"{name} {edge}", truth_fn=plain,
-                        plain_fn=plain, draw=draw if edge == "normal" else None)
+        assert_drawn_contract(fn, inputs, EDGES[edge], f"{name} {edge}", truth_fn=plain, plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -62,10 +59,7 @@ def test_a_ruled_loss_holds_every_order(edge):
     """`Objective.with_gradients`'s seam (`base._ruled`, a surrogate): a value whose derivative in the
     parameters is a stated rule, every order finite wherever float64 is a normal float32 and the plain
     formula, the value plus the rule's inner product with the parameters' move, is."""
-    value, first, second = normal_draw(2691, (3,), (4, 5), (6,), scale=EDGES[edge])
     rule = dict(zip(("first", "second"), normal_draw(2692, (4, 5), (6,)), strict=True))
-    direction = normal_draw(2693, (3,), (4, 5), (6,), scale=EDGES[edge])
-    (cotangent,) = normal_draw(2694, (3,))
 
     def ruled(value, first, second):
         return base._ruled(value, rule, {"first": first, "second": second})
@@ -75,13 +69,14 @@ def test_a_ruled_loss_holds_every_order(edge):
         return value + sum(jnp.vdot(rule[name], leaf - jax.lax.stop_gradient(leaf))
                            for name, leaf in moved.items())
 
-    def draw(seed):
-        """A seed's value and parameters, direction and cotangent at unit scale (the mesh order's check 1)."""
-        return (normal_draw([2691, seed], (3,), (4, 5), (6,)), normal_draw([2693, seed], (3,), (4, 5), (6,)),
-                normal_draw([2694, seed], (3,))[0])
+    def inputs(seed, scale):
+        """A seed's value and parameters and their direction at `scale`, and its cotangent."""
+        return (normal_draw((2691, seed), (3,), (4, 5), (6,), scale=scale),
+                normal_draw((2693, seed), (3,), (4, 5), (6,), scale=scale),
+                normal_draw((2694, seed), (3,))[0])
 
-    assert_contract(ruled, (value, first, second), direction, cotangent, f"a ruled loss {edge}",
-                    truth_fn=plain, plain_fn=plain, draw=draw if edge == "normal" else None)
+    assert_drawn_contract(ruled, inputs, EDGES[edge], f"a ruled loss {edge}", truth_fn=plain,
+                          plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -89,9 +84,6 @@ def test_the_label_terms_hold_every_order(edge):
     """`categorical.label_terms` (a custom JVP, the categorical's own derivative, which the whole-logits head
     reads): each row's cross entropy and log partition of whole logits, every order finite wherever float64
     is a normal float32 and the plain formula, jax.nn's log-softmax and logsumexp as written, is."""
-    (logits,) = normal_draw(2701, (4, 7), scale=EDGES[edge])
-    (direction,) = normal_draw(2702, logits.shape, scale=EDGES[edge])
-    (cotangent,) = normal_draw(2703, (2, 4))
     targets = jnp.asarray([0, 3, 6, 2], jnp.int32)
 
     def whole(logits):
@@ -102,13 +94,13 @@ def test_the_label_terms_hold_every_order(edge):
         return jnp.stack([-jax.nn.log_softmax(logits, axis=-1)[rows, targets],
                           jax.nn.logsumexp(logits, axis=-1)])
 
-    def draw(seed):
-        """A seed's logits, direction and cotangent at unit scale (the mesh order's check 1)."""
-        return normal_draw([2701, seed], (4, 7)), normal_draw([2702, seed], (4, 7)), normal_draw(
-            [2703, seed], (2, 4))[0]
+    def inputs(seed, scale):
+        """A seed's logits and direction at `scale`, and its cotangent."""
+        return (normal_draw((2701, seed), (4, 7), scale=scale),
+                normal_draw((2702, seed), (4, 7), scale=scale), normal_draw((2703, seed), (2, 4))[0])
 
-    assert_contract(whole, (logits,), (direction,), cotangent, f"whole logits' losses {edge}", truth_fn=plain,
-                    plain_fn=plain, draw=draw if edge == "normal" else None)
+    assert_drawn_contract(whole, inputs, EDGES[edge], f"whole logits' losses {edge}", truth_fn=plain,
+                          plain_fn=plain)
 
 
 @pytest.mark.parametrize("head", ["whole", "tiled", "fused"])
@@ -119,9 +111,6 @@ def test_the_lm_heads_hold_every_order_of_their_gradient(head, edge):
     its gradient taken in the forward. Every order, their own forward derivatives among them (a tangent that
     transposes to the hand-written backward, row 2690), finite wherever float64 is a normal float32 and
     the plain formula, the whole logits' log-softmax, is."""
-    scale = EDGES[edge]
-    hidden, table = normal_draw(2704, (2, 4, 8), (11, 8), scale=scale)
-    direction = normal_draw(2705, hidden.shape, table.shape, scale=scale)
     targets = jnp.asarray([[0, 3, 10, 2], [7, 1, 4, 9]], jnp.int32)
     weights = jnp.ones(targets.shape, jnp.float32)
 
@@ -144,16 +133,16 @@ def test_the_lm_heads_hold_every_order_of_their_gradient(head, edge):
             return jnp.concatenate([jnp.sum(losses * weights)[None], log_z.ravel()])
         return jnp.stack([losses, log_z])
 
-    shape = jax.eval_shape(plain, hidden, table).shape
-    (cotangent,) = normal_draw(2706, shape)
+    shape = jax.eval_shape(plain, jnp.zeros((2, 4, 8)), jnp.zeros((11, 8))).shape
 
-    def draw(seed):
-        """A seed's hidden states, table, direction and cotangent at unit scale (the mesh order's check 1)."""
-        return (normal_draw([2704, seed], (2, 4, 8), (11, 8)), normal_draw([2705, seed], (2, 4, 8), (11, 8)),
-                normal_draw([2706, seed], shape)[0])
+    def inputs(seed, scale):
+        """A seed's hidden states and table and their direction at `scale`, and its cotangent."""
+        return (normal_draw((2704, seed), (2, 4, 8), (11, 8), scale=scale),
+                normal_draw((2705, seed), (2, 4, 8), (11, 8), scale=scale),
+                normal_draw((2706, seed), shape)[0])
 
-    assert_contract(heads, (hidden, table), direction, cotangent, f"the {head} LM head {edge}",
-                    truth_fn=plain, plain_fn=plain, draw=draw if edge == "normal" else None)
+    assert_drawn_contract(heads, inputs, EDGES[edge], f"the {head} LM head {edge}", truth_fn=plain,
+                          plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", EDGES)
