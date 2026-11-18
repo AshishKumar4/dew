@@ -25,7 +25,15 @@ from native_certificates import (
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 from reference_error import assert_as_exact, equations, with_gradients
 
-from dew.nn.kernels import gemm, generation, grouped_launch, grouped_matmul, grouped_triton, selection, tuning
+from dew.nn.kernels import (
+    gemm,
+    generation,
+    grouped_cells,
+    grouped_launch,
+    grouped_matmul,
+    grouped_triton,
+    tuning,
+)
 from dew.nn.kernels.templates.gemm import mosaic_gpu, row_tiles
 from dew.nn.moe import expert_projection
 
@@ -1187,34 +1195,9 @@ def test_a_blackwells_projection_and_its_gradients_hold_check_1(sizes, out):
                         seeds=SEEDS, truth_fn=with_gradients(on_xla(jnp.float64)))
 
 
-TIMED = [
-    ("sm90", "forward", (2560, 9216), "mosaic"), ("sm90", "forward", (9216, 2560), "xla"),
-    ("sm90", "forward", (2560, 1024), "mosaic"), ("sm90", "forward", (2560, 64), "xla"),
-    ("sm90", "input_gradient", (2560, 9216), "mosaic"), ("sm90", "input_gradient", (9216, 2560), "mosaic"),
-    ("sm90", "input_gradient", (2560, 1024), "mosaic"), ("sm90", "input_gradient", (2560, 64), "mosaic"),
-    ("sm90", "kernel_gradient", (2560, 9216), "xla"), ("sm90", "kernel_gradient", (9216, 2560), "mosaic"),
-    ("sm90", "kernel_gradient", (2560, 1024), "mosaic"), ("sm90", "kernel_gradient", (2560, 64), "mosaic"),
-    ("sm90", "forward", (2560, 3072), "xla"), ("sm90", "kernel_gradient", (3072, 2560), "xla"),
-    ("sm100", "forward", (2560, 64), "xla"), ("sm100", "forward", (2560, 9216), "mosaic"),
-    ("sm100", "input_gradient", (2560, 9216), "xla"), ("sm100", "input_gradient", (2560, 64), "mosaic"),
-    ("sm100", "kernel_gradient", (2560, 9216), "xla"), ("sm100", "kernel_gradient", (9216, 2560), "mosaic"),
-    ("sm100", "kernel_gradient", (2560, 1024), "xla"), ("sm100", "kernel_gradient", (2560, 64), "mosaic"),
-    ("sm100", "kernel_gradient", (3072, 2560), "mosaic"),
-]
-"""Each dense product the receipts timed (M-EM-36-gh200 on Hopper, em35d and lab-b200-20261113-grid on a
-B200: Qwen3.5-4B's up, down, key and gates matrices `[in, out]` at 24,576 tokens) beside the route its receipt
-timed fastest, and an untimed matrix (`[2560, 3072]`, `[3072, 2560]`), which keeps its kind's default
-(Hopper's XLA cells, the B200's template)."""
-
-
-def _named(value) -> str:
-    """A parameter's id: a matrix's extents joined by x, any other value as it prints."""
-    return "x".join(map(str, value)) if isinstance(value, tuple) else str(value)
-
-
-def _dense_route(generation_name: str, made: str, matrix: tuple[int, int], rows: int) -> str:
-    """The route `GROUPED` selects on `generation_name` for a 16-bit dense product making `made` of `matrix`
-    `[in, out]` over `rows` tokens."""
+def _dense_cell(generation_name: str, made: str, matrix: tuple[int, int], rows: int) -> grouped_cells.Kind:
+    """The cell (`GroupedCase.cell`'s kind) of a 16-bit dense product on `generation_name` making `made` of
+    `matrix` `[in, out]` over `rows` tokens."""
     from dew.nn.kernels.templates.product import declared
 
     width_in, width_out = matrix
@@ -1231,27 +1214,22 @@ def _dense_route(generation_name: str, made: str, matrix: tuple[int, int], rows:
             call = grouped_matmul.gmm_call(tokens, bf16((1, width_in, width_out)), sizes,
                                            out_dtype=jnp.bfloat16, trans_rhs=transposed, interpret=False,
                                            dense=True)
-        case = grouped_matmul.grouped_case(*call, product=product, whole=True)
-        return selection.selected(grouped_matmul.GROUPED, case).name
-
-
-@pytest.mark.parametrize(("generation_name", "made", "matrix", "kernel"), TIMED, ids=_named)
-def test_a_timed_dense_product_takes_the_route_its_receipt_timed_fastest(generation_name, made, matrix,
-                                                                          kernel):
-    """A dense product of a matrix its family's receipts timed is a cell of its own (`grouped_cells.Kind`'s
-    `matrix`, `MEASURED`), which the route its receipt timed fastest holds (`DECLARED`): the template where it
-    won, XLA's dot where it lost; a matrix no receipt timed takes its kind's cell, as before (owner, ops
-    361caffc)."""
-    assert _dense_route(generation_name, made, matrix, 24576) == kernel
+        return grouped_matmul.grouped_case(*call, product=product, whole=True).cell[1]
 
 
 @pytest.mark.parametrize("made", ("forward", "input_gradient", "kernel_gradient"))
-def test_a_timed_matrix_over_rows_no_receipt_timed_takes_its_kinds_cell(made):
-    """A receipt is evidence for the rows it timed alone (`grouped_cells.Timed`, row 6794): the 4B key's
-    matrix, whose cells the template holds on Hopper at 24,576 tokens, takes its kind's cell, XLA's dot, over
-    a fine-tune row's 2,048, where the template's launches made the step's products 1.75 ms slower."""
-    assert _dense_route("sm90", made, (2560, 1024), 24576) == "mosaic"
-    assert _dense_route("sm90", made, (2560, 1024), 2048) == "xla"
+def test_a_receipts_matrix_is_a_cell_of_its_own_over_the_rows_it_timed_alone(made):
+    """A receipt is evidence for the products it timed alone (`grouped_cells.Timed`, row 6794): each matrix
+    Hopper's receipts timed is a cell of its own (`Kind.matrix`) over the receipt's fewest to most rows and
+    no further (a fine-tune's 2,048 took the 4B key's cell and its launches made the step's products 1.75
+    ms slower), and a matrix no receipt timed never is."""
+    (timed,) = grouped_cells.MEASURED[("wgmma", grouped_cells.Made(made), False)]
+    for matrix in timed.matrices:
+        for rows, held in ((timed.fewest, True), (timed.most, True), (timed.fewest - 1, False),
+                           (timed.most + 1, False)):
+            assert (_dense_cell("sm90", made, matrix, rows).matrix == matrix) is held, (matrix, rows)
+    untimed = (timed.fewest + 1, timed.fewest + 3)
+    assert _dense_cell("sm90", made, untimed, timed.fewest).matrix is None
 
 
 @pytest.mark.parametrize("gpu", [pytest.param(name, marks=runs(name)) for name in ("sm80", "sm90")])
