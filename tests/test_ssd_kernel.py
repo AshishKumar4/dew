@@ -431,9 +431,10 @@ def test_documents_entering_their_own_states_scan_as_each_alone():
     assert_as_exact(mine, theirs, documents_draw, "the TPU kernel's forked call", seeds=24)
 
 
-FORWARD_ORDERS = ("jvp", "jvp of grad", "second jvp", "jvp of grad, remat", "second jvp, remat",
-                  "jvp of grad, nested jit", "jvp of grad, scanned")
-"""`assert_contract`'s forward-mode orders, which the TPU forked scan's custom VJP refuses (row 7874)."""
+REFUSED_ORDERS = ("jvp", "jvp of grad", "second jvp", "jvp of grad, remat", "second jvp, remat",
+                  "jvp of grad, nested jit", "jvp of grad, scanned", "grad of grad")
+"""`assert_contract`'s orders the TPU forked scan's rule refuses: forward mode's, its custom VJP no jvp
+reaches (row 7874), and reverse over reverse, its backward a kernel no transform differentiates (row 7875)."""
 
 
 @pytest.mark.parametrize(("key", "value", "weight", "final", "cancelled"),
@@ -478,11 +479,11 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
         theirs = np.asarray(theirs)
         normal = normal_float32(theirs)
         np.testing.assert_array_equal(np.asarray(ours, np.float64)[normal], theirs[normal])
-    # Every order finite wherever float64's is a normal float32 (the contract's seams), but forward mode's:
-    # the kernel's rule is a custom VJP, which no jvp reaches (row 7874).
+    # Every order the kernel's rule takes finite wherever float64's is a normal float32 (the contract's
+    # seams): its primal and its reverse mode (`REFUSED_ORDERS`).
     assert_contract(without_ynn(documents_on_the_kernel), operands, operands, seeded,
                     "the TPU kernel's forked call at fp32's edge", truth_fn=documents_one_by_one,
-                    without=FORWARD_ORDERS)
+                    without=REFUSED_ORDERS)
 
 
 @pytest.mark.tpu(reason="the recurrence matrix's TPU cells run on the TPU tier's own TPU")
