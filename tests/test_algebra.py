@@ -534,3 +534,23 @@ def test_a_programs_sigmoid_and_dews_one_logistic_reach_one_normal_form():
     # A span of Dew's error-free arithmetic names no operation: kept as written.
     kept = canonical(jax.make_jaxpr(lambda a, b: two_sum(a, b))(x, x))
     assert marked_call_p in primitives_of(kept)
+
+
+def test_a_logistic_turned_back_into_code_is_dews_one_logistic():
+    """A logistic held as a term (a program's own, `jax.lax.logistic`, or Dew's read as it by the normal
+    form) is turned back into code as Dew's one logistic (`precision.logistic_value`, `terms.value_of`): the
+    evaluated form holds no `logistic_p`, whose backend's form a v5e and Mosaic's `approx_math` compute
+    approximately, and its values are Dew's, bit for bit."""
+    from dew.algebra import forms, terms
+    from dew.nn.precision import logistic_value
+    from dew.nn.programs import equations
+
+    x = jnp.linspace(-30.0, 30.0, 64, dtype=jnp.float32)
+    region = terms.region(jax.make_jaxpr(jax.lax.logistic)(x))
+
+    def evaluated(value):
+        return forms.evaluator(region, [value], {})(region.outputs[0])
+
+    program = jax.make_jaxpr(evaluated)(x)
+    assert all(equation.primitive is not jax.lax.logistic_p for equation in equations(program.jaxpr))
+    np.testing.assert_array_equal(np.asarray(jax.jit(evaluated)(x)), np.asarray(logistic_value(x)))
