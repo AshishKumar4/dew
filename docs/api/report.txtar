@@ -45,7 +45,7 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .wait(self) -> None
   .window_size(self, step: int) -> int
   .would_keep(self, ranking: Ranking | Sequence[Ranking]) -> bool
-class Condition(encoder: ConditionEncoder[Any, Any], field: str = 'text', unconditional: str | float | Mapping[str, object] = '') -> None  [dew.inputs.spec]
+class Condition(encoder: ConditionEncoder, field: str = 'text', unconditional: str | float | Mapping[str, object] = '') -> None  [dew.inputs.spec]
   .bound(record: Mapping[str, object], *, params: Variables | None = None) -> Condition  [staticmethod]
 class Dataset()  [dew.data.pipeline]
   .batch(self, size: int | None = None, *, tokens: int | None = None, drop_remainder: bool = True, batch_fn: Callable[[Sequence[Batch]], Batch] | None = None) -> Pipeline

@@ -4,6 +4,7 @@ shape, and the links of its mesh's axes, and the compile of its step from what t
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import functools
 import json
@@ -38,8 +39,8 @@ from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
 from dew.state import Accumulation, TrainState, apart, occupied, together
-from dew.telemetry.compiles import executable_only
-from dew.telemetry.instrumentation import StepFlops
+from dew.telemetry.compiles import Compiles
+from dew.telemetry.instrumentation import StepFlops, count_step_misses
 from dew.training._candidates import Stepping, _shaped, candidate_for, lowered_for
 from dew.training._lowering import Lowered, routed
 from dew.training.distributed import (
@@ -155,7 +156,8 @@ class HostStartup(NamedTuple):
     (`StepCompiler._compile_host`): its programs' names, how many, the seconds it took, and by backend
     (`options.spending`: its CPU companion's, its accelerator's) each one's seconds tracing and lowering,
     and compiling or reading JAX's persistent cache: the run's own compiles of a step whose steps then
-    compile nothing."""
+    compile nothing. A lowering begun in another thread (`options.compiling`) is that thread's time: this
+    process's `lowered` reads near none of it."""
 
     names: tuple[str, ...]
     programs: int
@@ -185,10 +187,12 @@ STEADY = 3
 class HostRun:
     """A step that keeps its variables on the host, as its run calls it (`StepCompiler._compile_host`): each
     step's microbatches through the transaction's phases (`body`) and the glue between them, every
-    program of which a startup pass compiled over its shapes (`startup`), each step run where none
-    compiles (`executable_only`), refused by name where one is missing; a batch of shapes no pass stepped
-    over (a ramp's stage's), or a step called in a trace context none stepped in (a float64 replay's
-    precision), has a pass of its own before its step."""
+    program of which a startup pass compiled over its shapes (`startup`), so its steps compile nothing; a
+    batch of shapes no pass stepped over (a ramp's stage's), or a step called in a trace context none
+    stepped in (a float64 replay's precision), has a pass of its own before its step. A step that still
+    traces or compiles (an input no pass foresaw) does, and says so: each program named in a warning and
+    counted (`misses`, and the run's record's `train/step_misses`), never silent; a run held to its
+    loaded programs alone refuses it by its own `executable_only` (training.md §6)."""
 
     def __init__(self, stepping: Stepping, body: Callable, placement, prepared: TrainState, shapes,
                  split: int, window: int, empty, whole: Callable):
@@ -201,6 +205,8 @@ class HostRun:
         self.opened = owned_program(functools.partial(_opened, split=split))
         self.ended = owned_program(functools.partial(outcome_of, split=split))
         self.started: set[Hashable] = set()
+        # The programs steps traced or compiled past their passes, by name (`__call__`).
+        self.misses: collections.Counter[str] = collections.Counter()
 
     def __call__(self, current, batch, sampled: bool = False):
         # A host-master run inspects nothing (`compile` refuses it), so no step of it is sampled.
@@ -212,8 +218,16 @@ class HostRun:
             current = self.windowed(current, batch)
             if (abstract_signature(batch), trace_context()) not in self.started:
                 self.startup(current, batch)
-            with executable_only():
-                return self.stepped(current, batch, transfer)
+            with Compiles(None) as compiles:
+                stepped = self.stepped(current, batch, transfer)
+        missed = [program.name for program in compiles.programs if program.kind == "compiled"]
+        if missed:
+            self.misses.update(missed)
+            count_step_misses(len(missed))
+            _log.warning("a host step compiled %d programs its startup pass did not (%s): an input no pass "
+                         "stepped over; %d so far", len(missed), ", ".join(sorted(missed)),
+                         sum(self.misses.values()))
+        return stepped
 
     def windowed(self, current: TrainState, batch: Batch) -> TrainState:
         """`current` with the window its step reads: the one built with the step at a run's first, a
@@ -397,32 +411,42 @@ def _unlike(cap: Planned, other: Planned) -> list[str]:
 
 @dataclasses.dataclass
 class DrawingStep:
-    """The step of a run that draws its looped model's pass count per microbatch (`SampledPasses`): each
-    count's plan at its cap's (`StepCompiler.admitted_at`) and its FLOPs a step, by count (`plans`,
-    `flops`), the call running each of its `split` microbatches by its drawn count's program (`counts`,
-    `drawn`) over the one state."""
+    """The step of a run that draws its looped model's pass count per microbatch (`sampled`): each count's
+    plan at its cap's (`StepCompiler.admitted_at`) and its FLOPs a step, by count (`plans`, `flops`), the
+    call running each of its `split` microbatches by its drawn count's program (`counts`) over the one
+    state. Each call's counts are drawn at the global positions of its microbatches under the run's `key`
+    (`SampledPasses.count`), from the position it holds (`position`): a fit draws them before the call from
+    the microbatches the run dispatched (`drawn`), and a call no fit drew for, as `Trainer.compile`'s caller
+    makes (`dew inspect`, a step called by hand), draws its own from where it stands, its first at its
+    state's step's microbatches."""
 
     plans: Mapping[int, Planned]
     flops: Mapping[int, StepFlops | None]
     split: int
+    sampled: SampledPasses
+    key: tuple[int, ...]
+    """The run's key's words (`jax.random.key_data`), which every draw reads."""
     run: CompiledStep | None = None
     counts: list[int] = dataclasses.field(default_factory=list)
-    key: tuple[int, ...] | None = None
+    """The counts of the call in hand: the next call's where `pending`, else the last call's."""
+    pending: bool = False
+    position: int | None = None
+    """The global position of the next draw's first microbatch; None until a fit or the first call sets it."""
 
-    def drawn(self, sampled: SampledPasses, key: jax.Array, interval: Interval,
-              step: int) -> StepFlops | None:
-        """The counts of the next call's microbatches, each drawn at its global position under the run's
-        `key` (`SampledPasses.count`), the run's dispatched microbatches past them (`Interval.microbatches`;
-        a checkpoint that counted none resumes at its `step`'s, said); and the call's FLOPs, each
-        microbatch's at its count's program's."""
-        if self.key is None:
-            self.key = tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
+    def drawn(self, interval: Interval, step: int) -> StepFlops | None:
+        """The counts of the next call's microbatches at the run's dispatched microbatches
+        (`Interval.microbatches`, the interval's count past them): a run's first step, its fresh start's
+        microbatch 0, a checkpoint's microbatches where it counted them, else (a checkpoint of a run that drew
+        none) its `step`'s, said; and the call's FLOPs, each microbatch's at its count's program's."""
         if interval.microbatches is None:
             interval.microbatches = step * self.split
-            _log.info("the run's checkpoint counted none of its dispatched microbatches: its pass counts "
-                      "draw on from step %d's, microbatch %d", step, interval.microbatches)
-        start, interval.microbatches = interval.microbatches, interval.microbatches + self.split
-        self.counts = [sampled.count(self.key, start + part) for part in range(self.split)]
+            if interval.last_saved is not None:
+                _log.info("the run's checkpoint counted none of its dispatched microbatches: its pass counts "
+                          "draw on from step %d's, microbatch %d", step, interval.microbatches)
+        self.position = interval.microbatches
+        interval.microbatches += self.split
+        self._draw()
+        self.pending = True
         total: StepFlops | None = None
         for count in self.counts:
             each = self.flops[count]
@@ -431,8 +455,20 @@ class DrawingStep:
             total = (1 / self.split) * each if total is None else total + (1 / self.split) * each
         return total
 
+    def _draw(self) -> None:
+        """The next call's counts, drawn at `position`, which moves past them."""
+        assert self.position is not None
+        self.counts = [self.sampled.count(self.key, self.position + part) for part in range(self.split)]
+        self.position += self.split
+
     def __call__(self, state: TrainState, batch: Batch, /, sampled: bool = False):
-        assert self.run is not None and len(self.counts) == self.split, "a call's counts are drawn first"
+        assert self.run is not None
+        if not self.pending:
+            # A call no fit drew for draws its own, its first at its state's step's microbatches.
+            if self.position is None:
+                self.position = int(state.step) * self.split
+            self._draw()
+        self.pending = False
         return self.run(state, batch, sampled)
 
 
@@ -648,6 +684,10 @@ class StepCompiler[L, E]:
             if self.ahead is not None or settings.inspection is not None:
                 raise ValueError("a step compiled ahead or inspected runs where the devices hold the state; "
                                  "this layout keeps the variables on the host")
+            if self.phase_passes.sampled is not None:
+                raise ValueError("a pass count drawn per microbatch (sampled_passes) runs each count's step "
+                                 "at its cap's plan where the devices hold the state; this layout keeps the "
+                                 "variables on the host (row 8271)")
             return Compiled(stepping.shape.split, step=self._compile_host(stepping, state, batch))
         held, self._unplaced = self._unplaced, None
         mesh = settings.device_mesh
@@ -740,25 +780,26 @@ class StepCompiler[L, E]:
         return planned, compiled
 
     def drawing(self, holder: Holding[L, E], stepping: Callable[[], Stepping], compiled: Compiled,
-                state: TrainState, batch: Batch) -> CompiledStep:
+                state: TrainState, batch: Batch, key: jax.Array) -> CompiledStep:
         """`compiled`'s step, or where the run draws its pass count per microbatch (`PhasePasses.sampled`)
-        its every count's step at its cap's plan (`sampled_step`)."""
+        its every count's step at its cap's plan, drawing under the run's `key` (`sampled_step`)."""
         assert compiled.step is not None
         if self.phase_passes.sampled is None:
             return compiled.step
-        return self.sampled_step(holder, stepping, compiled, state, batch)
+        return self.sampled_step(holder, stepping, compiled, state, batch, key)
 
-    def drawn(self, held: tuple[CompiledStep, StepFlops | None], key: jax.Array, interval: Interval,
+    @staticmethod
+    def drawn(held: tuple[CompiledStep, StepFlops | None], interval: Interval,
               step: int) -> tuple[CompiledStep, StepFlops | None]:
         """A compiled step and its FLOPs (`held`), a drawing step's (`DrawingStep`) its next call's counts
         drawn at the microbatches `interval` counted, its FLOPs theirs."""
         compiled, flops = held
-        if isinstance(compiled, DrawingStep) and (sampled := self.phase_passes.sampled) is not None:
-            flops = compiled.drawn(sampled, key, interval, step)
+        if isinstance(compiled, DrawingStep):
+            flops = compiled.drawn(interval, step)
         return compiled, flops
 
     def sampled_step(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Compiled,
-                     state: TrainState, batch: Batch) -> DrawingStep:
+                     state: TrainState, batch: Batch, key: jax.Array) -> DrawingStep:
         """The step of a run that draws its pass count per microbatch (`PhasePasses.sampled`) over `batch`:
         `cap`, its cap's step (`compile`), and every other count's admitted at its plan (`admitted_at`), each
         traced under its count's objective, `holder`'s and the compiler's (`PhasePasses.scoped`), by
@@ -787,7 +828,8 @@ class StepCompiler[L, E]:
         self.phase_passes.current = sampled.cap
         with self.phase_passes.scoped(holder, self):
             capped = stepping()
-        step = DrawingStep(plans, flops, planned.split)
+        words = tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
+        step = DrawingStep(plans, flops, planned.split, sampled, words)
         step.run = self.runner(capped, planned, capped.settings.device_mesh,
                                parted=lambda: [plans[count] for count in step.counts])
         return step

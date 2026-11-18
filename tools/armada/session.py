@@ -605,6 +605,21 @@ file's new task has none (row 6003: a group's four ranks peaked at 7.17 GiB, and
 rank killed). Through armada's own per-entry `size`; a large task armada still packs only by its measures."""
 
 
+PEAK_MOVES = 0.25
+"""How far a test's newest task peak must move from its recorded one, as a part of it, for the record to take
+it (`moved_peak`): a task's exact bytes differ every run, and a peak taken each run rewrites nearly every
+entry each fold (train 1039's review F5)."""
+
+
+def moved_peak(held: int | None, measured: int) -> int:
+    """The peak to record for a test whose recorded one is `held` (None: none) and whose newest task peaked at
+    `measured`: the newest where it moved by more than `PEAK_MOVES` or across `LARGE_FROM`, which sizes the
+    test's tasks (`heavy_files`); else the recorded one, unchanged."""
+    if held is None or (held > LARGE_FROM) != (measured > LARGE_FROM):
+        return measured
+    return held if held * (1 - PEAK_MOVES) <= measured <= held * (1 + PEAK_MOVES) else measured
+
+
 def heavy_files(path: Path = DURATIONS) -> set[str]:
     """The test files any of whose tests' recorded peaks (`peak`) passes `LARGE_FROM`: their tasks'
     size large, whatever group a cut gives each test."""

@@ -385,6 +385,26 @@ def test_a_program_compiled_over_a_zero_tangents_shape_runs_for_its_host_value()
     np.testing.assert_array_equal(np.asarray(answered), np.ones(4))
 
 
+def test_a_program_holds_at_most_its_bound_kept_and_compiled_over_shapes_together():
+    """A program called over more distinct shapes than it keeps (its `CACHED`, three here), some of them
+    compiled over shapes first (`collecting`), holds no more executables than its bound across its kept
+    and its shaped stores together: one eviction policy (`_bounded`)."""
+    from dew.nn.kernels.options import collecting, owned_program
+
+    program = owned_program(lambda values: values + 1)
+    program.CACHED = 3
+    with collecting():
+        for size in (1, 2):
+            program(jax.ShapeDtypeStruct((size,), jnp.float32))
+    for size in range(3, 8):
+        program(jnp.zeros((size,), jnp.float32))
+    assert len(program._executables) + len(program._shaped) <= 3
+    # The latest kept, which the bound never lets go: called again, it compiles nothing.
+    with Compiles(None) as compiles:
+        program(jnp.zeros((7,), jnp.float32))
+    assert compiles.count == 0
+
+
 def test_each_collection_in_a_process_holds_every_program_it_called():
     """Two collections in one process over the same shapes (two equivalent runs compiled ahead) each hold
     every program their calls reached, the second's taken from the first's compile, not left out: each

@@ -758,15 +758,16 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
                         f"whose instances are called, of Dew's or of a trusted package (trust=, --trust), "
                         f"and a function is the record {{'function': ...}}")
                 return _built(member, named[1], dtypes=dtypes)
-        if isinstance(annotation, type) and annotation is not object:
-            # A field typed with a class takes a record of the class itself or
+        nominal = nominal_class(annotation)
+        if nominal is not None and nominal is not object:
+            # A field typed with a class, or a generic of one, takes a record of the class itself or
             # of any class derived from it or function returning it; `object`
             # declares nothing, and its record stays the record it is.
             named = class_record(value)
             if named is not None:
-                return _built(_member(named[0], (annotation,)), named[1], dtypes=dtypes)
-            if dataclasses.is_dataclass(annotation):
-                return _construct(annotation, value, dtypes=dtypes)
+                return _built(_member(named[0], (nominal,)), named[1], dtypes=dtypes)
+            if dataclasses.is_dataclass(nominal):
+                return _construct(nominal, value, dtypes=dtypes)
         if typing.get_origin(annotation) in _MAPPINGS:
             keys, entries = typing.get_args(annotation)
             return {_key(keys, str(name)): _rebuilt(entries, entry, dtypes=dtypes, name=str(name))
@@ -786,6 +787,18 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
 _SCALARS: Mapping[type, Callable[[object, str], object]] = {
     bool: boolean, int: integer, float: real, str: text}
 """The reader of each scalar type a field declares (`_rebuilt`), each refusing a value of another."""
+
+
+def nominal_class(annotation: Annotation) -> type | None:
+    """The class `annotation` names: a class itself, or a subscripted generic's origin (`Base[int]`'s
+    `Base`), which every reader of a field's class takes alike (`_rebuilt`, `_read`); None for a union,
+    a container generic (`Mapping[...]`, `tuple[...]`, whose entries are walked) or no class."""
+    if isinstance(annotation, type):
+        return annotation
+    origin = typing.get_origin(annotation)
+    if not isinstance(origin, type) or issubclass(origin, (Mapping, Sequence, tuple)):
+        return None
+    return origin
 
 
 def class_record(value: Mapping[str, object] | Mapping[RecordKey, object]
@@ -1146,9 +1159,8 @@ def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes:
     held = record_class(member)
     if held is not None:
         declared = declared_type(held, name)
-        # A subscripted generic's nominal class is its origin (`ConditionEncoder[Any, Any]`'s, the class).
-        nominal = typing.get_origin(declared) or declared
-        if (not (dtypes and name == "dtype") and isinstance(nominal, type)
+        nominal = nominal_class(declared)
+        if (not (dtypes and name == "dtype") and nominal is not None
                 and nominal not in (Any, object, bool, int, float, str) and not is_protocol(nominal)
                 and not issubclass(nominal, (Mapping, Sequence)) and isinstance(value, nominal)):
             # A value the caller built, of the field's own nominal class (an encoder a binder made),

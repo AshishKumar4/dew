@@ -48,6 +48,13 @@ def memory(level: Path) -> int | None:
     return None if limit == "max" else int(limit)
 
 
+def memory_peak(level: Path) -> int | None:
+    """The most bytes `level` has held since it was made (`memory.peak`), None where it states none: a CI
+    task's bound of its tests' memory (tools/armada/progress.py, row 6003)."""
+    peak = level / "memory.peak"
+    return int(peak.read_text()) if peak.is_file() else None
+
+
 def memory_held(level: Path) -> int | None:
     """The bytes `level` holds that its kernel will not reclaim first: its charge (`memory.current`) less
     its inactive page cache (`memory.stat`'s `inactive_file`), as the kubelet counts a container's working

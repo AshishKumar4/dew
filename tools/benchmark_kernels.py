@@ -39,6 +39,7 @@ import optax
 from benchmark_cases import LM_DENSE, LM_MOE, Case, grouped_operands, routed
 from benchmark_models import build_trainer, compiled_step, timed_steps
 
+from dew._records import integer, record
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.options import program
 from dew.nn.moe import expert_projection
@@ -205,16 +206,12 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
     else:
         config = dict(LM_MOE)
         if args is not None:
-            mixture = LM_MOE["mixture"]
-            if not isinstance(mixture, dict):
-                raise TypeError(f"LM_MOE's mixture is a record, not {mixture!r}")
+            mixture = record(LM_MOE["mixture"], "mixture")
             config["mixture"] = {**mixture, "implementation": args.implementation}
     config["remat"] = None if remat in (None, "none") else remat
-    length = config["max_seq_len"]
-    if not isinstance(length, int):
-        raise TypeError(f"the case's max_seq_len is a count, not {length!r}")
     # The decoder's whole context, a window a row.
-    return Case("causal_transformer", config, dtype="bfloat16", batch_size=batch, seq_len=length)
+    return Case("causal_transformer", config, dtype="bfloat16", batch_size=batch,
+                seq_len=integer(config["max_seq_len"], "max_seq_len"))
 
 
 def step(args: argparse.Namespace) -> dict[str, object]:
