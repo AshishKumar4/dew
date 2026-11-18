@@ -609,7 +609,14 @@ def verdict(args, pool):
     shared part does not set leaves the verdict's interval unresolved, which is Inconclusive."""
     import numpy as np
     import torch
-    from reference_error import Inconclusive, as_given, assert_as_exact, recorded_pilots, seeds_for
+    from reference_error import (
+        Inconclusive,
+        as_given,
+        as_recorded,
+        assert_as_exact,
+        recorded_pilots,
+        seeds_for,
+    )
     from reference_source import dew_revision
 
     from dew.parity import leaf_summary
@@ -669,9 +676,10 @@ def verdict(args, pool):
         return {"log_probabilities": np.concatenate([
             log_softmax(np.asarray(loaded[phase][name], np.float64)) for name in names])}
 
-    original = functools.partial(log_probabilities, "author")
-    exact = as_given(functools.partial(log_probabilities, "truth"))
+    original = as_recorded(functools.partial(log_probabilities, "author"))
+    exact = as_recorded(as_given(functools.partial(log_probabilities, "truth")))
 
+    @as_recorded
     def recorded(index):
         return {"log_probabilities": leaf_summary(original(index)["log_probabilities"],
                                                   exact(index)["log_probabilities"])}
@@ -679,7 +687,6 @@ def verdict(args, pool):
     def draw(seed):
         return (np.asarray(seed, np.int64),)
 
-    original.recorded = recorded.recorded = exact.recorded = True
     # Every phase is read from the recordings and normalized on the host, as given.
     native = as_given(functools.partial(log_probabilities, "native"))
     count = seeds_for(recorded_pilots(original, draw, len(pool["pilot"])), draw, "released slot runtime",
