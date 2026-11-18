@@ -152,6 +152,15 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | No
     return [read(atom) for atom in jaxpr.outvars]
 
 
+def stated_primitive(equation: jcore.JaxprEqn) -> jcore.Primitive | None:
+    """The primitive a marked span stating the operation it computes (`derivatives.stated_operation`) is read
+    as (`_computed`): Dew's one logistic (`precision.logistic_value`) the logistic, `logistic_p`; None for
+    any other equation."""
+    from dew.nn.precision import logistic_value
+
+    return jax.lax.logistic_p if stated_operation(equation) is logistic_value else None
+
+
 def _computed(equation: jcore.JaxprEqn, operands: list) -> list | None:
     """A marked span's outputs as the operation it states it computes (`derivatives.stated_operation`): Dew's
     one logistic (`precision.logistic_value`) the logistic, `logistic_p`, of its operand widened to float32
@@ -159,9 +168,9 @@ def _computed(equation: jcore.JaxprEqn, operands: list) -> list | None:
     computes and rounds it; at float32 or wider the logistic alone), so a program's own sigmoid and Dew's
     reach one normal form; None for any other equation, a span stating nothing kept as written. The form
     holds the node; turned back into code it is Dew's arithmetic again (`terms.value_of`)."""
-    from dew.nn.precision import at_least_fp32, logistic_value
+    from dew.nn.precision import at_least_fp32
 
-    if stated_operation(equation) is not logistic_value or len(operands) != 1:
+    if stated_primitive(equation) is not jax.lax.logistic_p or len(operands) != 1:
         return None
     (operand,) = operands
     dtype = jnp.result_type(operand)

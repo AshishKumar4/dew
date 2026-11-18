@@ -259,8 +259,11 @@ def declared_tangent[Value](kind: TangentKind, primal: Callable[..., Value], tan
     computes (`Protected.computes`) states it of the primal alone: the rule's span is protected stating
     nothing, as partial evaluation splits it into pieces that compute no such one operation."""
     fixed = tuple(nondiff_argnums)
+    # A span stating its operation is bound with the rule it is declared with (`Protected.declared`).
+    stated = (dataclasses.replace(kind, declared=tangent) if isinstance(kind, Protected) and kind.computes
+              else kind)
     rule = contracted("test_a_declared_derivative_holds_every_order")(
-        jax.custom_jvp(bound_span(kind, primal, static=fixed), nondiff_argnums=fixed))
+        jax.custom_jvp(bound_span(stated, primal, static=fixed), nondiff_argnums=fixed))
     ruled = Protected() if isinstance(kind, Protected) else kind
     rule.defjvp(bound_span(ruled, tangent, static=range(len(fixed))), symbolic_zeros=symbolic_zeros)
     return rule
@@ -309,8 +312,12 @@ class Protected:
     residual a reassociation would cancel; or, where it names what it `computes`, one operation of Dew's
     in at least float32 and rounded once to its operand's dtype (`dew.nn.precision.logistic_value`, Dew's
     one logistic, `dew.nn.activations.logistic`), which the algebra's normal form reads as that operation
-    (`dew.algebra.normal_form`), its arithmetic Dew's wherever it is fused."""
+    (`dew.algebra.normal_form`), its arithmetic Dew's wherever it is fused. Such a span declared with a
+    derivative of its own (`declared_tangent`) is `declared` with that rule, set there alone, so a reader
+    that takes the span for its operation takes its derivative for the operation's only where the rule is
+    the one Dew's own declaration of it is declared with (`dew.algebra.recognize`)."""
     computes: Callable | None = None
+    declared: Callable | None = None
 
 
 def stated_operation(equation) -> Callable | None:
