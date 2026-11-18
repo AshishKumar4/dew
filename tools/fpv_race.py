@@ -447,6 +447,8 @@ def _staged(world: World, stage: str, updates: int, every: int | None, report: d
     (world.json's `level`), where a stopped stage goes on; one stopped between the two is restored at that
     checkpoint and scored before the next chunk trains. Returns the stage's last state, its agent and the
     level it ended at."""
+    from dew.rl.flight import FlightEnv
+
     from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective
 
     done = _latest(world.out / stage)
@@ -477,6 +479,8 @@ def _staged(world: World, stage: str, updates: int, every: int | None, report: d
         if (moved := advanced(level, point["crashed"])) != level:
             level = moved
             for raced in (rollout.env, *races):
+                if not isinstance(raced, FlightEnv):
+                    raise TypeError(f"the race's rollout steps a {type(raced).__name__}, not a FlightEnv")
                 raced.difficulty = raced.ramp = level
         # The level the next chunk trains at, beside the score that earned it: a resumed stage goes on there.
         report["level"] = level
