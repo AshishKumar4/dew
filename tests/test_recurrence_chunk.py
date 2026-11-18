@@ -678,6 +678,45 @@ def test_a_memory_read_through_a_decay_past_fp32s_normals_is_as_exact_as_the_rec
                     seeds=FEWEST_SEEDS)
 
 
+OWN_PAIR_EDGES = {
+    "unnormalised keys": (recurrence.Hooks(decay='vector', scale=1.0), -100, 60, -60, 0),
+    "unit keys at the floor": (recurrence.Hooks(decay='vector', l2norm=True), 0, 0, -7, -110),
+}
+"""The template's own pairs at fp32's edge (row 7299): a call's hooks, then its second token's query
+`2^q`, its first token's key `2^k`, the second's decay `2^g` along the first key dimension and its write
+gate `2^b` (a tiny row of the system's product, its key times its gate)."""
+
+
+@pytest.mark.parametrize('case', list(OWN_PAIR_EDGES))
+def test_an_own_pair_at_fp32s_edge_reads_as_float64_does(case):
+    """The template's own pairs (`recurrence_algebra.key_diagonal_bands`, interpreted) over two tokens: the
+    first writes its key `2^k` and a unit value, the second reads it through its decay `2^g` with its query
+    `2^q`; every output float64's exactly wherever float64's is a normal float32 (exact powers of two).
+    Unnormalised keys keep the row times the key first: the decay folded into the row lost `2^-100` under
+    a decay of `2^-60` against a key of `2^60` (base review 6ce025bc7 F1). Keys normalised to one fold it
+    (`mainloop.Call.unit_keys`), all the fold loses below normal in the exact term too."""
+    from contract_support import normal_float32
+
+    hooks, query, key, decay, gate = OWN_PAIR_EDGES[case]
+    width = 16
+    keys = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 0, 0, 0].set(2.0 ** key)
+    queries = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 1, 0, 0].set(2.0 ** query)
+    if hooks.l2norm:
+        # A normalised call's keys and queries along the first dimension, so each stays a unit vector.
+        keys, queries = keys.at[0, 1, 0, 0].set(1.0), queries.at[0, 0, 0, 0].set(1.0)
+    values = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 0, 0, 0].set(1.0)
+    log_decay = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 1, 0, 0].set(decay * np.log(2.0))
+    operands = Chunk(queries.astype(jnp.bfloat16), keys.astype(jnp.bfloat16), values.astype(jnp.bfloat16),
+                     log_decay=log_decay, beta=jnp.ones((1, 2, 1), jnp.float32).at[0, 1, 0].set(2.0 ** gate))
+    ours = np.asarray(chunk_on('mosaic_gpu', hooks, operands, chunk_size=CHUNK)[0], np.float64)
+    with jax.enable_x64(new_val=True):
+        truth = np.asarray(token_by_token(hooks, jax.tree.map(
+            lambda t: jnp.asarray(t, jnp.float64) if jnp.issubdtype(jnp.asarray(t).dtype, jnp.floating)
+            else t, operands))[0], np.float64)
+    normal = normal_float32(truth)
+    np.testing.assert_array_equal(ours[normal], truth[normal])
+
+
 ROUNDED_ONCE = [recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True),
                 recurrence.Hooks(decay='scalar', scale=0.1, skip=True),
                 recurrence.Hooks(decay='scalar', scale=0.1, skip=True, output=recurrence.OutputNorm(1e-6))]
