@@ -2090,10 +2090,15 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
 
         def read(refs, other, column=0, width=None):
             # The partials' structure read off the running value's: a ref may itself be a tree; the widest
-            # leaf's slice of `width` columns from `column` alone where the merge is sliced.
+            # leaf's slice of `width` columns from `column` alone where the merge is sliced. A tile's partial
+            # is read in its accumulator's layout (`layout`), as the running value holds it: a load of no
+            # layout left an A100's two-by-two warps' accumulator (mma.sync's m_warps 2, a 128 x 128 tile
+            # of a balanced tail) no layout its combine satisfies.
             tree = jax.tree.structure(summed)
             loaded = [plgpu.load(ref.at[other] if place != widest or width is None
-                                 else ref.at[other, :, pl.ds(column, width)], optimized=False)
+                                 else ref.at[other, :, pl.ds(column, width)], optimized=False,
+                                 **({"layout": self.layout} if place == widest and len(ref.shape) == 3
+                                    else {}))
                       for place, ref in enumerate(tree.flatten_up_to(refs))]
             return jax.tree.unflatten(tree, loaded)
 

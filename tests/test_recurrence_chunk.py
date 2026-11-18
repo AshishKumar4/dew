@@ -357,6 +357,11 @@ memory is entered, so no gradient's row is float64 zero, whose terms the gate wo
 HELD = 2
 """The stored slots a row's table holds (`Chunk.held`)."""
 
+ADDS = ((0, 0, 1), (0, 0, 2))
+"""Each row's documents' added slots (`Chunk.adds`): the first row's last document adding its row's given
+memory to its parent's final, the second row's the first document's final to its predecessor's, as a looped
+pass's document enters its fork parent's final and its own of the pass before (row 7662)."""
+
 
 def entered_draw(hooks, seed: int, entries: bool = False):
     """`draw`'s packed operands over a table of `GIVEN` memories a row, with `entries` an entry write a
@@ -388,13 +393,15 @@ def entry_write(operands, row: int, document: int):
     return operands.entry_weight[row, document][:, None, None] * written
 
 
-def entering_documents(operands):
-    """`operands` with `draw`'s packed documents a forked call's, each entering its `FORKED` table slot."""
+def entering_documents(operands, added: bool = False):
+    """`operands` with `draw`'s packed documents a forked call's, each entering its `FORKED` table slot, and
+    where `added`, adding its `ADDS` slot to it (`Chunk.adds`)."""
     starts = jnp.zeros(operands.value.shape[:2], bool)
     for row, begins in enumerate(DOCUMENTS):
         starts = starts.at[row, jnp.asarray(begins)].set(True)
     loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
-    return dataclasses.replace(operands, starts=starts, loads=loads, stores=stores, held=HELD)
+    adds = jnp.asarray(ADDS, jnp.int32) if added else None
+    return dataclasses.replace(operands, starts=starts, loads=loads, stores=stores, adds=adds, held=HELD)
 
 
 def _neutral(hooks: recurrence.Hooks, name: str) -> float:
@@ -404,10 +411,11 @@ def _neutral(hooks: recurrence.Hooks, name: str) -> float:
     return -1e30 if formed else 0.0
 
 
-def document_by_document(hooks, operands, run=None):
+def document_by_document(hooks, operands, run=None, added: bool = False):
     """Each document of `operands` a sequence of its own through `run(hooks, piece)` (`token_by_token`
     where None), in the row's order from its `FORKED` table slot's memory (a given one, or the final an
-    earlier document stored, with its entry write added where `operands` give one), its outputs back in
+    earlier document stored, with its `ADDS` slot's added where `added`, its entry write where `operands`
+    give one), its outputs back in
     place, and each row's last memory. The rows' k-th documents run as one call, a row each over the longest
     document's tokens, each padded after its own with tokens that leave its memory as it is
     (`stacked_documents`, `_neutral`):
@@ -428,6 +436,8 @@ def document_by_document(hooks, operands, run=None):
         for row, (loads, _) in enumerate(FORKED):
             load = loads[document]
             state = tables[row][load - 1] if load else jnp.zeros_like(operands.state[row, 0])
+            if added and ADDS[row][document]:
+                state = state + tables[row][ADDS[row][document] - 1]
             if operands.entry_key is not None:
                 state = state + entry_write(operands, row, document)
             states.append(state)
@@ -447,7 +457,7 @@ def document_by_document(hooks, operands, run=None):
 
 
 @pytest.mark.check1_shards(seeds=80, per_task=8)
-@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0]], ids=str)
+@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0], FORMED[9]], ids=str)
 def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
     """80 draws, 8 a task: at 40 a skip's and a gated decay's bias's gradients, two entries a head, were
     inconclusive (intervals 1.58 and 1.56 wide, pooled 1.09 and 0.95; jsf-1506b); the gate holds a draw's
@@ -456,9 +466,22 @@ def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hoo
     The portable math's walk over a forked call, each document laid from a chunk's edge and its table slot's
     memory taken up there, the stored finals kept in the walk's table (`xla_mainloop`, `_walk`), against
     each document a sequence of its own the recurrence a token at a time (`assert_forked_on_par`): a slot
-    entered twice sums both documents' gradients."""
+    entered twice sums both documents' gradients. RWKV6's readout of the memory entering its token
+    (`Hooks.reads`) among them: a window refused it, its document's memory entering mid-chunk (base review
+    80b5b68ad F1)."""
     assert_forked_on_par('xla', hooks, functools.partial(entered_draw, hooks),
                          f'xla {hooks} a forked call\'s documents', seeds=80)
+
+
+@pytest.mark.check1_shards(seeds=80, per_task=8)
+@pytest.mark.parametrize('hooks', [HOOKS[4], FORMED[0]], ids=str)
+def test_documents_adding_a_second_slot_are_as_exact_as_each_alone(hooks):
+    """The portable math's walk over a forked call whose documents each add a second table slot to the memory
+    they enter (`Chunk.adds`, `ADDS`: a given memory, and a final stored two documents before), against each
+    document a sequence of its own from the two memories summed (`assert_forked_on_par`): an added slot's
+    gradient its document's too. The template's and the TPU scan's tables take none yet (`ADDS_HANDOFF`)."""
+    assert_forked_on_par('xla', hooks, functools.partial(entered_draw, hooks),
+                         f'xla {hooks} a forked call\'s documents adding a slot', seeds=80, added=True)
 
 
 @pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[6], HOOKS[8]], ids=str)
@@ -516,25 +539,26 @@ def test_fla_refuses_a_forked_call_named_or_handed_to_it():
     assert handed.value.refusals == [recurrence_chunk.PORT_FORKED]
 
 
-def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alone: bool = False) -> None:
+def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alone: bool = False,
+                         added: bool = False) -> None:
     """A forked call on `kernel` (`entering_documents` of `draw`'s operands; `Chunk.loads`: a request's
     questions entering its shared part's final memory, a chain's each its predecessor's): its output, the
     row's last memory and every operand's gradient, the given memories' included, against each document a
     sequence of its own from its table slot's memory in the row's order (`document_by_document`), through
     `kernel`'s call where `alone`, else the recurrence a token at a time, which in float64 is their truth
-    (check 1)."""
+    (check 1); where `added`, each document adding its `ADDS` slot (`Chunk.adds`)."""
     def ours(operands):
-        out, final = chunk_on(kernel, hooks, entering_documents(operands), chunk_size=CHUNK)
+        out, final = chunk_on(kernel, hooks, entering_documents(operands, added), chunk_size=CHUNK)
         return out.astype(jnp.float32), final.astype(jnp.float32)
 
     def own(hooks, piece):
         return chunk_on(kernel, hooks, piece, chunk_size=CHUNK)
 
     def theirs(operands):
-        out, final = document_by_document(hooks, operands, own if alone else None)
+        out, final = document_by_document(hooks, operands, own if alone else None, added)
         return out.astype(jnp.float32), final.astype(jnp.float32)
 
-    wide = jax.jit(with_gradients(lambda operands: document_by_document(hooks, operands)))
+    wide = jax.jit(with_gradients(lambda operands: document_by_document(hooks, operands, added=added)))
 
     def widened(leaf):
         floating = jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating)
@@ -548,17 +572,17 @@ def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alo
                     truth_fn=truth)
 
 
-@pytest.mark.check1_shards(seeds=80, per_task=8)
-@pytest.mark.parametrize('hooks', [FORMED[4], FORMED[5]], ids=str)
-def test_the_ssd_ports_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
-    """The port of mamba_ssm's kernels over a forked call, each document laid from a chunk's edge and the
-    state passing taking up its table slot's memory there with its entry write added (`Chunk.entry_key`),
-    keeping the finals its documents store (`_ported_documents`), as the port's call over each document
-    alone from its slot's memory and entry write (`assert_forked_on_par`). The port's own numbers
-    (mamba_ssm's) are tests/test_mamba_ssd.py's."""
-    assert_forked_on_par('pallas', hooks, functools.partial(entered_draw, hooks, entries=True),
-                         f'pallas {hooks} a forked call\'s documents, against each alone', seeds=80,
-                         alone=True)
+def test_the_ssd_port_refuses_a_forked_call_named_to_it():
+    """mamba_ssm's state passing takes a memory at a sequence's first chunk alone, so no forked call
+    (`Chunk.loads`), whose documents take their memories up mid-chunk, is one its port takes (inherently): a
+    forked call naming it is refused, the selector's typed refusal and its reason, never a shape's error."""
+    from dew.nn.kernels.selection import KernelRefused
+
+    hooks = FORMED[4]
+    operands = entering_documents(entered_draw(hooks, 0, entries=True)[0])
+    with pytest.raises(KernelRefused) as named:
+        chunk_on('pallas', hooks, operands, chunk_size=CHUNK)
+    assert recurrence_chunk.SSD_PORT_FORKED in named.value.refusals
 
 
 def narrowed_draw(hooks, seed: int):
@@ -574,13 +598,14 @@ FORKED_TEMPLATE = [HOOKS[4], HOOKS[8], FORMED[4]]
 """The forked call's forms on the template: the gated delta rule, Kimi delta attention and Mamba2's SSD."""
 
 
-def the_templates_forked_documents_are_as_exact_as_each_alone(hooks):
+def the_templates_forked_documents_are_as_exact_as_each_alone(hooks, added: bool = False):
     """The recurrence template over a forked call in 16 bits: its walks take each document's memory up from
     the call's table and keep the finals its documents store (`table.Taking`, `table.Returning`; ledger
-    5376), as its call over each document alone (`assert_forked_on_par`), the same launches' arithmetic."""
+    5376), where `added` each document adding its `ADDS` slot (`Chunk.adds`), as its call over each document
+    alone (`assert_forked_on_par`), the same launches' arithmetic."""
     assert_forked_on_par('mosaic_gpu', hooks, functools.partial(narrowed_draw, hooks),
-                         f'mosaic_gpu {hooks} a forked call\'s documents, against each alone',
-                         seeds=8, alone=True)
+                         f'mosaic_gpu {hooks} a forked call\'s documents{" adding a slot" if added else ""}, '
+                         'against each alone', seeds=8, alone=True, added=added)
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=1)
@@ -589,6 +614,16 @@ def test_the_templates_forked_documents_are_as_exact_as_each_alone_interpreted(h
     """`the_templates_forked_documents_are_as_exact_as_each_alone` interpreted off a GPU. A draw a task: four
     took 287 to 381 s a task (jsf-table-phase at 693aa1c1c)."""
     the_templates_forked_documents_are_as_exact_as_each_alone(hooks)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=1)
+@pytest.mark.parametrize('hooks', FORKED_TEMPLATE, ids=str)
+def test_the_templates_documents_adding_a_slot_are_as_exact_as_each_alone_interpreted(hooks):
+    """The template's walks over a forked call whose documents each add a second table slot (`Chunk.adds`,
+    `ADDS`): the forward's taking sums both slots (`table.Taking`), the reverse walk returns the memory's
+    gradient to both (`table.Returning`, the given slots' sum; Kimi delta attention's taken memories),
+    interpreted off a GPU (`the_templates_forked_documents_are_as_exact_as_each_alone`)."""
+    the_templates_forked_documents_are_as_exact_as_each_alone(hooks, added=True)
 
 
 UNDELTA_HEADS = 8

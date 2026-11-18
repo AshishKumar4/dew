@@ -466,9 +466,12 @@ def _exp_value(base2: bool, x) -> jax.Array:
     return summed * _power_of_two(half) * _power_of_two(n - half)
 
 
-def _power_of_two(n) -> jax.Array:
-    """`2^n`, fp32, of an integral `n` within fp32's normal exponents, set in its exponent bits."""
-    return jax.lax.bitcast_convert_type((n.astype(jnp.int32) + 127) << 23, jnp.float32)
+def _power_of_two(n, dtype=jnp.float32) -> jax.Array:
+    """`2^n` in `dtype` (fp32 or float64), of an integral `n` within its normal exponents, set in its
+    exponent bits."""
+    limits = jnp.finfo(dtype)
+    signed = jnp.dtype(f"int{limits.bits}")
+    return jax.lax.bitcast_convert_type((n.astype(signed) + (limits.maxexp - 1)) << limits.nmant, dtype)
 
 
 def _exp_jvp(base2: bool, primals, tangents) -> tuple[jax.Array, jax.Array]:
@@ -1307,15 +1310,32 @@ def two_sum(left, right):
     return total, (left - (total - part)) + (right - part)
 
 
+def float_bits(x: jax.Array) -> tuple[jax.Array, ...]:
+    """A float `x` (fp32 or float64) from its bits, each a signed integer of its width: its sign bit, its
+    biased exponent, its fraction, its fraction normalized as a normal one's (a subnormal's leading bit moved
+    up to the implicit bit's place and dropped) and its binary exponent `floor(log2 |x|)`, a subnormal's
+    below the least normal: `(sign, biased, fraction, normalized, exponent)`. Read from its bits, a
+    subnormal is kept where a process's float multiply flushes a subnormal operand (XLA's CPU, row 4023):
+    the one reading `binade_of`, `raised_exactly` and `aligned_sum` take."""
+    limits = jnp.finfo(x.dtype)
+    signed = jnp.dtype(f"int{limits.bits}")
+    bias, width = limits.maxexp - 1, limits.nmant
+    bits = jax.lax.bitcast_convert_type(x, signed)
+    biased = (bits >> width) & (2 * limits.maxexp - 1)
+    fraction = bits & ((1 << width) - 1)
+    sign = bits & np.array(-(1 << (limits.bits - 1)), signed)
+    up = jnp.clip(width - (limits.bits - 1 - jax.lax.clz(fraction)), 0, width)
+    normalized = jnp.where(biased > 0, fraction, (fraction << up) & ((1 << width) - 1))
+    exponent = jnp.where(biased > 0, biased - bias, limits.minexp - up)
+    return sign, biased, fraction, normalized, exponent
+
+
 def binade_of(x: jax.Array) -> jax.Array:
-    """`floor(log2(|x|))` of an fp32 `x` from its bits, int32, a subnormal's by its significand's leading
-    bit (its arithmetic on a process that flushes subnormal operands reads none of it), -1024 for zero."""
-    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
-    fraction = bits & np.uint32(0x7FFFFF)
-    leading = 31 - jax.lax.clz(fraction).astype(jnp.int32)
-    subnormal = jnp.where(fraction > 0, leading - 149, -1024)
-    return jnp.where(biased > 0, biased - 127, subnormal)
+    """`floor(log2(|x|))` of an fp32 `x` from its bits (`float_bits`), int32, a subnormal's by its
+    significand's leading bit (its arithmetic on a process that flushes subnormal operands reads none of
+    it), -1024 for zero."""
+    _, biased, fraction, _, exponent = float_bits(x.astype(jnp.float32))
+    return jnp.where((biased == 0) & (fraction == 0), -1024, exponent).astype(jnp.int32)
 
 
 def raised_exactly(x: jax.Array, k: jax.Array) -> jax.Array:
@@ -1323,18 +1343,11 @@ def raised_exactly(x: jax.Array, k: jax.Array) -> jax.Array:
     subnormal `x` normalized by its significand's leading bit, so a process whose float32 multiply flushes a
     subnormal operand (XLA's CPU, row 4023) still raises it. The result at most fp32's largest; an infinity
     or NaN as it is."""
-    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-    sign = bits & np.uint32(0x80000000)
-    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
-    fraction = bits & np.uint32(0x7FFFFF)
-    target = binade_of(x) + k
-    # A subnormal's significand, its leading bit at bit 23 of a normal one, the rest its fraction.
-    leading = 31 - jax.lax.clz(fraction).astype(jnp.int32)
-    up = jnp.clip(23 - leading, 0, 23).astype(jnp.uint32)
-    normalized = jnp.where(biased > 0, fraction, (fraction << up) & np.uint32(0x7FFFFF))
-    normal = sign | (jnp.clip(target + 127, 1, 254).astype(jnp.uint32) << 23) | normalized
+    sign, biased, fraction, normalized, exponent = float_bits(x.astype(jnp.float32))
+    target = exponent + k
+    normal = sign | (jnp.clip(target + 127, 1, 254) << 23) | normalized
     # Still below the least normal: the subnormal's significand shifted up by `k`.
-    below = sign | (fraction << jnp.clip(k, 0, 31).astype(jnp.uint32))
+    below = sign | (fraction << jnp.clip(k, 0, 31))
     raised = jnp.where(target >= -126, normal, below)
     kept = (biased == 0xFF) | ((biased == 0) & (fraction == 0))
     return jnp.where(kept, x.astype(jnp.float32), jax.lax.bitcast_convert_type(raised, jnp.float32))
@@ -1609,6 +1622,97 @@ def vanishing(dtype, base2: bool = False) -> float:
     (`dew.algebra.scan`'s decays)."""
     least = math.log(float(jnp.finfo(dtype).smallest_subnormal))
     return math.floor(least / (math.log(2.0) if base2 else 1.0)) - 1
+
+
+def _binades(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """A float `x` (fp32 or float64) as its significand in [1, 2) (its sign kept; zero's zero) and its
+    binary exponent as a whole number of its dtype, a subnormal's below the least normal: exactly `x =
+    significand 2^exponent`, from its bits (`float_bits`), so a process whose multiply flushes a subnormal
+    operand (XLA's CPU) keeps it: lifted by a multiply, `2^-140 2^100` summed to zero (base review
+    675f2c056 F2)."""
+    sign, biased, fraction, normalized, exponent = float_bits(x)
+    bias, width = jnp.finfo(x.dtype).maxexp - 1, jnp.finfo(x.dtype).nmant
+    significand = jax.lax.bitcast_convert_type(sign | (bias << width) | normalized, x.dtype)
+    zero = (biased == 0) & (fraction == 0)
+    return jnp.where(zero, jnp.zeros_like(x), significand), exponent.astype(x.dtype)
+
+
+def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...] | None = None) -> jax.Array:
+    """The sum of `terms` in float32 or float64 (their widest, at least float32), each the broadcast product
+    of its factors, summed over `axis` of each
+    product too where given (kept): every product formed as its factors' significands' (each below two)
+    times a power of two, aligned to the largest's binade before the sum and scaled back after in steps each
+    within float32's normal exponents, so a sum in range is its value though its terms leave float32's
+    range: entry writes of keys of +-2^60 and values of 2^-20 under a weight of 2^100, each term 2^140 and
+    their sum zero, where summed as formed it was inf - inf, NaN (base review ead11c83a F1). A product a
+    term at a time (`twice_scaled`) holds each term's range, not a sum's. Its error bound: the result is the
+    plain float32 sum's rounding of the exactly scaled terms (each product's significands rounded twice),
+    `(n + 2) 2^-24` of the terms' absolute sum over `n` terms, and a dropped term lies more than 2^126 below
+    the largest, under that bound. Its tangent is its terms' own, each factor's direction times its term's
+    other factors, summed as a plain sum (`_aligned_tangent`): its bits carry none, so differentiated as
+    formed every factor's was zero. Its tangents and gradients carry a plain product's range, not its
+    value's: a forked call's gradient at fp32's edge can still overflow there, which a kernel's own adjoint
+    summing aligned (`ssd`'s TPU forked scan) does not. Elementwise and over a 2-D array's axes, so a Pallas
+    TPU kernel forms it in place."""
+    shape = tuple(len(term) for term in terms)
+    dtype = jnp.result_type(jnp.float32, *(factor for term in terms for factor in term))
+    return _aligned(shape, axis, *(jnp.asarray(factor, dtype) for term in terms for factor in term))
+
+
+def _regrouped(shape: tuple[int, ...], flat: Sequence[jax.Array]) -> list[tuple[jax.Array, ...]]:
+    """`aligned_sum`'s terms from their factors in a row, `shape` each term's count."""
+    ends = np.cumsum(shape)
+    return [tuple(flat[end - count:end]) for count, end in zip(shape, ends, strict=True)]
+
+
+def _aligned_value(shape: tuple[int, ...], axis, *flat: jax.Array) -> jax.Array:
+    """`aligned_sum` of its terms' factors in a row (`_regrouped`)."""
+    products = []
+    for term in _regrouped(shape, flat):
+        significand, exponent = _binades(term[0])
+        for factor in term[1:]:
+            more, power = _binades(factor)
+            significand, exponent = significand * more, exponent + power
+        products.append((significand, exponent))
+
+    def reduced(x, op):
+        return x if axis is None else op(x, axis=axis, keepdims=True)
+
+    dtype = flat[0].dtype
+    limits = jnp.finfo(dtype)
+    least, most = limits.minexp, limits.maxexp - 1
+    # The largest term's binade, a sum of no nonzero term's zero: no term then aligned past it.
+    top = functools.reduce(jnp.maximum, [reduced(jnp.where(significand != 0, exponent, -jnp.inf), jnp.max)
+                                         for significand, exponent in products])
+    top = jnp.where(jnp.isfinite(top), top, 0.0)
+    # Each term's shift to the largest's binade, at most none; one past the normal exponents dropped.
+    total = sum(reduced(jnp.where(
+        (significand != 0) & (exponent - top >= least),
+        significand * _power_of_two(jnp.clip(exponent - top, least, 0.0), dtype), 0.0), jnp.sum)
+        for significand, exponent in products)
+    first = jnp.clip(top, least, most)
+    second = jnp.clip(top - first, least, most)
+    third = jnp.clip(top - first - second, least, most)
+    return (total * _power_of_two(first, dtype) * _power_of_two(second, dtype)
+            * _power_of_two(third, dtype))
+
+
+def _aligned_tangent(shape: tuple[int, ...], axis, primals, tangents):
+    """`aligned_sum`'s value and tangent: each factor's direction times its term's other factors, every
+    term's summed (over `axis` too where given)."""
+    terms, moved = _regrouped(shape, primals), _regrouped(shape, tangents)
+    # Each term's direction reduced over the axis before the terms add, as the value's are: summed after,
+    # a term broadcast across the axis counted once a row (base review 675f2c056 F1).
+    directions = [functools.reduce(jnp.multiply, (*term[:at], direction, *term[at + 1:]))
+                  for term, directions in zip(terms, moved, strict=True)
+                  for at, direction in enumerate(directions)]
+    if axis is not None:
+        directions = [jnp.sum(direction, axis=axis, keepdims=True) for direction in directions]
+    return _aligned_value(shape, axis, *primals), sum(directions[1:], directions[0])
+
+
+_aligned = contracted("test_an_aligned_sum_holds_every_order")(
+    declared_tangent(Protected(), _aligned_value, _aligned_tangent, nondiff_argnums=(0, 1)))
 
 
 def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax.Array:

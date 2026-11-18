@@ -13,6 +13,8 @@ from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels.templates import swizzling
+
 
 @dataclasses.dataclass(frozen=True)
 class Scattered:
@@ -106,3 +108,28 @@ def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int, leas
                  o_gmem.at[pl.ds(row_start + start, rung), pl.ds(column, o_smem.shape[1])])
 
         start = start + (stored & rung)
+
+
+def swizzled_rows_out(smem, o_gmem, row_start, first, stored, column, *, swizzle: int) -> None:
+    """Rows `first` to `first + stored` of `smem` (`[rows, width]`, staged at `swizzle` bytes:
+    `swizzling.staged`) to `o_gmem` at row `row_start + r` and `column`, by the warpgroup's threads, each a
+    16-byte piece of a row at a time read where the staging's swizzle put it (`swizzling.staged_address`)
+    and its global store predicated on its row being stored: the copy reads whole swizzled tiles, where a
+    ladder of row copies (`store_rows`) would slice a tile at any row, which a swizzled staging refuses
+    below its 8-row tiles (CUTLASS's sm80 epilogue's predicated stores). Done when it returns: the threads
+    meet before and after it."""
+    scalar = plgpu.Layout.WG_SPLAT(())
+    dest = o_gmem.at[:, pl.ds(column, smem.shape[1])]
+
+    def pieces(ctx, smem_ref, dest_ref, start_value, first_value, stored_value):
+        del ctx
+        from dew.nn.kernels.templates import gathered  # its lane-level helpers build on `Ring`
+
+        gathered.swizzled_pieces(smem_ref, dest_ref, gathered.splat_value(start_value),
+                                 gathered.splat_value(first_value), gathered.splat_value(stored_value),
+                                 swizzle=swizzle)
+
+    transforms = swizzling.swizzle_transforms(smem.dtype, swizzle)
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(transforms), plgpu.RefType(), scalar, scalar, scalar))(pieces)(
+        smem, dest, jnp.asarray(row_start, jnp.int32), jnp.asarray(first, jnp.int32),
+        jnp.asarray(stored, jnp.int32))

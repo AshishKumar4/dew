@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import zero_padded
 from dew.nn.kernels.templates import mosaic, product
@@ -37,12 +36,15 @@ from dew.nn.kernels.templates.recurrence.output import output_launch
 from dew.nn.kernels.templates.recurrence.table import Table
 
 
-def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=None, *, chunk: int):
+def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=None, *, chunk: int,
+            forked: bool = False):
     """A call's tokens `chunk` at a time: `(chunks, taken [chunks], sequences [N, 5], laid, unlaid)`, each
     chunk's tokens, each sequence's walk (`Walked`; `_states`), and the maps from `[B, T, ...]` to the
     chunks' rows
     `[chunks * C, ...]` (a chunk's rows past its tokens zero) and back. An aligned call's chunks are its
-    rows' own, unmoved."""
+    rows' own, unmoved. A `forked` call's documents are laid as a packed call's are, each from a chunk's
+    edge, and each row walks its documents' chunks in turn, one sequence a row, its documents taking their
+    memories up from its table (`chunked_launch.ForkedChunks`)."""
     tokens = batch * length
     if starts is None and length % chunk == 0:
         chunks = tokens // chunk
@@ -56,9 +58,8 @@ def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=No
     if starts is None:
         spans = chunked_launch.sequences(batch, length, chunk=chunk)
     else:
-        most = length if max_segments is None else max_segments
-        spans = chunked_launch.sequences(batch, length, cu_seqlens(starts, batch * (most + 1), firsts),
-                                         chunk=chunk)
+        bound = length if max_segments is None else max_segments
+        spans = chunked_launch.packed_sequences(starts, firsts, bound, chunk=chunk)
     table = tables.unpacked(chunked_launch.ChunkSpan, lambda i: jnp.asarray(spans.chunks)[:, i])
     span = tables.unpacked(chunked_launch.Span, lambda i: jnp.asarray(spans.spans)[:, i])
     chunks, taken = table.taken.shape[0], table.taken
@@ -66,6 +67,14 @@ def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=No
     live = span.tokens > 0
     sequences = tables.packed(Walked(jnp.cumsum(sizes) - sizes, sizes, span.memory,
                                              live & (span.takes == 1), live & (span.gives == 1)))
+    if forked:
+        # A row's documents' chunks follow one another (`cu_seqlens`' order): its walk their first's on.
+        row = jnp.clip(span.memory, 0, batch - 1)
+        opening = jax.ops.segment_min(jnp.where(live, jnp.cumsum(sizes) - sizes, chunks), row,
+                                      num_segments=batch)
+        walked = jax.ops.segment_sum(jnp.where(live, sizes, 0), row, num_segments=batch)
+        sequences = tables.packed(Walked(opening, walked, jnp.arange(batch), jnp.ones(batch, jnp.int32),
+                                         jnp.ones(batch, jnp.int32)))
     place = jnp.arange(chunk)
     real = (place[None, :] < taken[:, None]).reshape(-1)
     index = jnp.where(real, (table.start[:, None] + place[None, :]).reshape(-1), tokens)
@@ -86,34 +95,40 @@ def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=No
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class ForkedTable:
-    """A forked call's table as the template takes it, its documents laid from chunks' edges
-    (`chunked_launch.AlignedDocuments`): each row's given memories `given` `[B, S', HV, Dk, Dv]` fp32, the
-    slot each aligned chunk takes up and stores its memory in, `loads` and `stores` `[B, NC]`
-    (`table.Table`), its entry write `entries` `[B, NC, HV, Dk, Dv]` fp32 where the call gives one, and the
-    stored slots a row holds, `held` (static: its walks' outputs are shaped by it)."""
+    """A forked call's table as the template takes it, its documents laid as a packed call's are, each from a
+    chunk's edge (`chunked_launch.ForkedChunks`): each row's given memories `given` `[B, S', HV, Dk, Dv]`
+    fp32, the slot each chunk takes up and stores its memory in, `loads` and `stores` `[NC]`
+    (`table.Table`), its entry write `entries` `[NC, HV, Dk, Dv]` fp32 where the call gives one, the row each
+    chunk walks (`rows` `[NC]`), and the stored slots a row holds, `held` (static: its walks' outputs are
+    shaped by it)."""
 
     given: jax.Array
     loads: jax.Array
     stores: jax.Array
     entries: jax.Array | None
+    rows: jax.Array
     held: int = dataclasses.field(metadata={'static': True})
+    adds: jax.Array | None = None
 
 
 def tabled(forked: ForkedTable, width: int, columns: int) -> Table:
     """`forked` as the walks take it (`table.Table`): its memories padded to the call's key and value
     widths and laid as the memories are, its slots a chunk's."""
     def laid(x):
-        return zero_padded(zero_padded(x.astype(jnp.float32), 3, width), 4, columns).reshape(-1, columns)
+        x = zero_padded(zero_padded(x.astype(jnp.float32), x.ndim - 2, width), x.ndim - 1, columns)
+        return x.reshape(-1, columns)
 
     entries = None if forked.entries is None else laid(forked.entries)
     return Table(laid(forked.given), forked.loads.reshape(-1).astype(jnp.int32),
-                 forked.stores.reshape(-1).astype(jnp.int32), entries, forked.given.shape[1], forked.held)
+                 forked.stores.reshape(-1).astype(jnp.int32), entries, forked.rows, forked.given.shape[1],
+                 forked.held, None if forked.adds is None else forked.adds.reshape(-1).astype(jnp.int32))
 
 def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None,
             max_segments: int | None = None,
             scale: float | None = None, delta: bool = True, wide: bool = False,
             family: mosaic.Family | None = None, interpret: bool = False,
-            rounded: bool = False, values_gated: bool = False, ranged: bool = False, skip=None,
+            rounded: bool = False, values_gated: bool = False,
+            unit_keys: bool = False, ranged: bool = False, skip=None,
             forked: ForkedTable | None = None):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
     `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g`, a head's `[B, T, HV]` (the gated delta
@@ -143,7 +158,8 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, keeps=False,
-                                 rounded=rounded, values_gated=values_gated, ranged=ranged, skip=skip,
+                                 rounded=rounded, values_gated=values_gated,
+                                 unit_keys=unit_keys, ranged=ranged, skip=skip,
                                  forked=forked)
     return out, final
 
@@ -166,7 +182,8 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  scale: float | None = None, delta: bool = True, wide: bool = False,
                  family: mosaic.Family | None = None, interpret: bool = False,
                  keeps: bool = True,
-                 rounded: bool = False, values_gated: bool = False, ranged: bool = False,
+                 rounded: bool = False, values_gated: bool = False,
+                 unit_keys: bool = False, ranged: bool = False,
                  skip=None, forked: ForkedTable | None = None) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
     (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
@@ -179,7 +196,8 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                        keeps=keeps)
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
-                   rounded=rounded, values_gated=values_gated, ranged=ranged, scans=scans, forked=forked,
+                   rounded=rounded, values_gated=values_gated,
+                   unit_keys=unit_keys, ranged=ranged, scans=scans, forked=forked,
                    out_dtype=jnp.float32 if wide else None, skipped=skip is not None)
     call, tiles, out_dtype = run.call, run.tiles, run.landed
     # The skip in the launch that holds the values as given (`Call.gated_keys`); where they hold them gated,
@@ -288,7 +306,8 @@ def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool,
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
              firsts=None,
              inverse=None, kept=None, keeps: bool = True,
-             rounded: bool = False, values_gated: bool = False, ranged: bool = False, scans: bool = False,
+             rounded: bool = False, values_gated: bool = False,
+             unit_keys: bool = False, ranged: bool = False, scans: bool = False,
              forked=None,
              out_dtype=None, skipped: bool = False) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
@@ -303,9 +322,9 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     launches (`skipped`, `kept_forward`), so it rounds once (`_Run.landed`); `_Run.scans` says which. A
     skip is a call's without the delta rule alone (`skipped` with `delta` refused). The solve stores its
     inverse
-    where the call `keeps` it (`_solved`). A forked call's documents laid from chunks' edges
-    (`chunked_launch.AlignedDocuments`) give `forked` (`tabled`): its walks take up each document's memory
-    from its table (`table.Table`)."""
+    where the call `keeps` it (`_solved`). A forked call's documents, laid as a packed call's are (its
+    `starts`, `firsts` and `max_segments`), give `forked` (`tabled`): each row's walk takes up each document's
+    memory from its table (`table.Table`)."""
     dtype, per_key = jnp.result_type(q, k, v), g.ndim == 4
     family = _taken(dtype, family, per_key=per_key, rounded=rounded, delta=delta, skipped=skipped)
     batch, length, _, key_width = k.shape
@@ -324,7 +343,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         starts = jnp.asarray(starts, bool)
         h0 = jnp.where(starts[:, 0, None, None, None], 0.0, h0)
     chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts,
-                                                     chunk=tiles.chunk)
+                                                     chunk=tiles.chunk, forked=forked is not None)
     rows = chunks * tiles.chunk
     given = Operand(rows, _parts(dtype, family, rounded), dtype)
     # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it (the
@@ -340,6 +359,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     held = given if delta or rounded else Operand(rows, product.EXACT_PARTS, jnp.dtype(jnp.float32))
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                 interpret, generation.gpu_target(), tiles.chunk, ranged=ranged, values_gated=values_gated,
+                unit_keys=unit_keys,
                 producers=tiles.producers, residents=tiles.residents)
     table = None if forked is None else tabled(forked, width, columns)
     # A skip reads the values a launch holds as given (`Call.gated_keys`); else it is added after them.

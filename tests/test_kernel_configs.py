@@ -25,7 +25,7 @@ from jax.sharding import PartitionSpec
 from kernel_compile import Uncounted, compile_kernels, failures, gate_generations
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
-from dew.nn.kernels.templates import bundles, report, resources
+from dew.nn.kernels.templates import bundles, report, resources, swizzling
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
 from dew.nn.kernels.templates.gemm.hooks import Hooks
 
@@ -1753,3 +1753,75 @@ def test_a_grouped_calls_walk_takes_every_column_tile_and_a_dense_ones_a_power_o
         tile = launch.derived(arguments, generation.gpu_target())
     columns = 768 // tile.block_n  # three or six: no power of two, so the two bands differ
     assert (tile.grid_block_n & (tile.grid_block_n - 1) == 0) if dense else tile.grid_block_n == columns, tile
+
+
+@lowers("sm80")
+def test_a_balanced_tail_of_two_by_two_warps_lowers_its_partials_for_an_a100():
+    """The 4B up projection's dense kernel gradient on an A100 at 128 x 128, one program a multiprocessor
+    (mma.sync's warps two by two, `MmaIssuer.specialized`; its tiles past the multiprocessors' walked by a
+    balanced tail, programs leaving fp32 partials in a workspace), compiled by Mosaic for a compile-only A100:
+    it lowers, each partial read in the accumulator's layout (`Family.fixed_up`), and spills no register (no
+    layout of the loaded partial satisfied the two-by-two accumulator's combine before)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    [(name, launch, args, options)] = [call for call in _gemm_forms(*GEMM_SHAPES["qwen3.5-4b up"])
+                                       if call[0] == "dense kernel gradient"]
+    with generation.assumed("sm80"):
+        ba = launch.bind(*args, **options)
+        tile = dataclasses.replace(launch.derived(ba, generation.gpu_target()), block_m=128, block_n=128,
+                                   stages=3, programs=1)
+        assert pricing.family_of(tile, jnp.bfloat16).specialized(128, 128).m_warps == 2
+        (record,) = compile_mosaic_kernels([KernelCase(name, lambda: launch.lowering(ba, tile))], "sm80")
+    assert not record.get("error"), record.get("error")
+    assert [kernel.get("spilled") for kernel in record["kernels"]] == [0]
+
+
+@pytest.mark.parametrize("shape", [(64, 128), (64, 64), (32, 64)], ids=lambda shape: f"{shape[0]}x{shape[1]}")
+def test_an_mma_sync_stage_takes_its_copies_and_ldmatrix_reads_in_one_pass_a_phase(shape):
+    """A 16-bit step stage an A100's cp.async copies in and mma.sync's ldmatrix reads, at the swizzle it
+    stages at (`swizzling.copied_swizzle`): each copy phase (8 lanes, 16 bytes each, a row's consecutive
+    chunks) and each ldmatrix phase (8 lanes, a 16-byte chunk of 8 consecutive rows at one column, its
+    transposed read's too) passes shared memory's banks once, by the staging's address arithmetic
+    (`swizzling.staged_address`)."""
+    swizzle = swizzling.copied_swizzle(shape, jnp.bfloat16)
+    row_bytes = shape[1] * 2
+    for row in range(0, shape[0], 8):
+        for chunk in range(0, row_bytes, 16 * 8 if row_bytes >= 128 else row_bytes):
+            copies = [swizzling.staged_address(row + (chunk + 16 * lane) // row_bytes,
+                                               (chunk + 16 * lane) % row_bytes, row_bytes, swizzle)
+                      for lane in range(8)]
+            assert swizzling.wavefronts(copies, 16) == 1, (row, chunk, swizzle)
+        for column in range(0, row_bytes, 16):
+            reads = [swizzling.staged_address(row + lane, column, row_bytes, swizzle) for lane in range(8)]
+            assert swizzling.wavefronts(reads, 16) == 1, (row, column, swizzle)
+
+
+@pytest.mark.parametrize(("shape", "dtype"), [((128, 64), jnp.bfloat16), ((128, 192), jnp.bfloat16),
+                                              ((64, 64), jnp.float32), ((16, 8), jnp.bfloat16)])
+def test_an_mma_sync_output_tile_stages_where_its_accumulators_stores_pass_the_banks_once(shape, dtype):
+    """An mma.sync output tile's staging (`Mma.stored_swizzle`): each warp store of its accumulator
+    fragment (an 8-row slab by 8 columns, two elements a lane) passes shared memory's banks the fewest times
+    at the staging chosen, once a phase where a swizzle's row fits its columns, by the staging's own address
+    arithmetic (`swizzling.staged_address`); plain, a 64-column slab's rows share their banks (row 5271's
+    dense kernel gradient's bank conflicts)."""
+    from dew.nn.kernels.templates import mosaic_sm80
+
+    family = mosaic_sm80.Mma(jnp.dtype(dtype))
+    itemsize = jnp.dtype(dtype).itemsize
+    row_bytes = shape[1] * itemsize
+
+    def passes(swizzle: int) -> int:
+        addresses = [swizzling.staged_address(lane // 4, (2 * (lane % 4)) * itemsize, row_bytes, swizzle)
+                     for lane in range(32)]
+        return swizzling.wavefronts(addresses, 2 * itemsize)
+
+    chosen = family.stored_swizzle(shape, dtype)
+    phases = 32 * 2 * itemsize // (swizzling.BANKS * 4)
+    if row_bytes % swizzling.NARROWEST_SWIZZLE_BYTES == 0:
+        assert chosen != swizzling.UNSWIZZLED and passes(chosen) == phases
+    else:
+        assert chosen == swizzling.UNSWIZZLED
+    if row_bytes == 128:
+        assert passes(swizzling.UNSWIZZLED) > phases
+
