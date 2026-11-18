@@ -96,13 +96,17 @@ def dew_form(chunked: Callable, arrays: dict, leaves: tuple[str, ...] = LEAVES) 
     return {leaf: found[leaf] for leaf in leaves}
 
 
-def chunked_on(kernel: str, x, dt, A, B, C, lam, theta, starts):
-    """`chunk_mamba3`'s output on `kernel` (`generation.chosen`'s name for the chunked op's) from a zero
-    state, at the kernel's chunk."""
+def chunked_on(kernel: str | None, x, dt, A, B, C, lam, theta, starts):
+    """`chunk_mamba3`'s output from a zero state at the kernel's chunk, on `kernel` (`generation.chosen`'s
+    name for the chunked op's) or, None, on each product's selected kernel, as a layer runs it (a bf16
+    call's forward on the template, its gradient on the portable math until the template's backward takes
+    it, row 2076)."""
+    import contextlib
+
     from dew.nn.kernels import generation
     from dew.nn.mixers.mamba3 import chunk_mamba3
 
-    with generation.chosen(gated_delta_rule=kernel):
+    with contextlib.nullcontext() if kernel is None else generation.chosen(gated_delta_rule=kernel):
         return chunk_mamba3(x, dt, A, B, C, lam, theta, starts=starts, chunk_size=CHUNK)[0]
 
 
@@ -120,8 +124,9 @@ def truth(arrays: dict, leaves: tuple[str, ...] = LEAVES) -> dict[str, jax.Array
     return dew_form(recurrent, widened, leaves)
 
 
-def the_chunked_form_is_as_exact_as_mamba_ssm(kernel: str, site: str, leaves: tuple[str, ...] = LEAVES):
-    """Mamba-3's chunked form on `kernel` on par from float64 with recorded mamba_ssm at `site`'s declared
+def the_chunked_form_is_as_exact_as_mamba_ssm(kernel: str | None, site: str,
+                                              leaves: tuple[str, ...] = LEAVES):
+    """Mamba-3's chunked form on `kernel` (`chunked_on`) on par from float64 with recorded mamba_ssm at `site`'s declared
     seeds (check 1), its leaves `leaves`, the truth the recurrence a token at a time in float64."""
     from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 
