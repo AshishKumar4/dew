@@ -215,6 +215,8 @@ def test_a_theta_per_pass_over_a_checkpoints_implicit_loop_starts_each_row_at_it
     fewer = dataclasses.replace(asked, loop_steps=2).looped(per_pass)
     assert fewer.model.loop.theta_passes == 3 and fewer.model.loop.steps == 2
     assert np.all(np.isfinite(np.asarray(fewer.model.apply(fewer.variables, ids))))
+    with pytest.raises(ValueError):
+        dataclasses.replace(asked, loop_steps=4).looped(per_pass)
 
 
 @pytest.mark.parametrize("phase", range(len(STEPS)), ids=[f"{passes}-passes" for passes in STEPS])

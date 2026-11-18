@@ -1812,8 +1812,9 @@ class DecoderRunConfig(RunConfig):
         rows = max((count for count in counts if count is not None), default=None)
         own = start.model.loop if isinstance(start.model, Looped) else None
         if own is not None and own.theta_passes is not None:
-            # A checkpoint holding rows already keeps them, a count of fewer passes reading the first.
-            rows = max(own.theta_passes, rows or 0)
+            # A checkpoint holding rows already keeps them: a count of fewer passes reads the first, and
+            # one of more is refused by its loop, no row held for its later passes.
+            rows = own.theta_passes
         elif rows is None and own is not None:
             # The checkpoint's own count, where the run keeps it.
             rows = own.steps
