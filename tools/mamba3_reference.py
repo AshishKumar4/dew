@@ -28,28 +28,30 @@ FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mamba3" 
 
 def run(arrays: dict[str, np.ndarray], device: str) -> dict[str, np.ndarray]:
     """`mamba3_siso_combined` on a site's arrays (`mamba3_sites.Site.arrays`' layout, `[B, L, H]` where the
-    kernel reads `[B, H, L]`), its biases zero and no skip, gate or state entering: its output and each
-    operand's gradient under `d_out`, as float32 in the site's layout. Packed documents as one row of
-    sequences (`cu_seqlens`)."""
+    kernel reads `[B, H, L]`; its chunk `chunk`, a 0-d array), its biases zero and no skip, gate or state
+    entering: its output and each operand's gradient under `d_out`, as float32 in the site's layout. Packed
+    documents as one row of sequences (`cu_seqlens`)."""
     import torch
-    from mamba3_sites import CHUNK, HEADS, OPERANDS, STATE
     from mamba_ssm.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
 
+    # Its chunk rides the request (`write_seeded`): this environment holds no Dew, the sites' module none.
+    chunk = int(arrays.pop("chunk"))
     narrow = {"x": torch.bfloat16, "B": torch.bfloat16, "C": torch.bfloat16}
+    operands = [name for name in arrays if name not in ("d_out", "starts")]
     leaves = {name: torch.tensor(arrays[name], device=device, dtype=narrow.get(name, torch.float32))
-              .requires_grad_() for name in OPERANDS}
+              .requires_grad_() for name in operands}
     cu_seqlens = None
     if "starts" in arrays:
         firsts = np.flatnonzero(arrays["starts"][0]).tolist()
         cu_seqlens = torch.tensor([*firsts, arrays["starts"].shape[1]], device=device, dtype=torch.int32)
-    zero = torch.zeros((HEADS, STATE), device=device, dtype=torch.float32)
+    zero = torch.zeros((arrays["x"].shape[2], arrays["B"].shape[-1]), device=device, dtype=torch.float32)
     out = mamba3_siso_combined(
         Q=leaves["C"], K=leaves["B"], V=leaves["x"], ADT=leaves["ADT"].transpose(1, 2),
         DT=leaves["DT"].transpose(1, 2), Trap=leaves["trap"].transpose(1, 2), Q_bias=zero, K_bias=zero,
-        Angles=leaves["angles"], chunk_size=CHUNK, cu_seqlens=cu_seqlens)
+        Angles=leaves["angles"], chunk_size=chunk, cu_seqlens=cu_seqlens)
     out.backward(torch.tensor(arrays["d_out"], device=device, dtype=out.dtype))
     return {"out": out.detach().float().cpu().numpy(),
-            **{name: leaves[name].grad.float().cpu().numpy() for name in OPERANDS}}
+            **{name: leaves[name].grad.float().cpu().numpy() for name in operands}}
 
 
 def serve() -> None:
@@ -76,7 +78,7 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
     token at a time, `mamba3_sites.truth`), recorded as a summary (`record_case`) into `out`: a unit of the
     recording, whose units `merged` joins into the fixture."""
     import jax
-    from mamba3_sites import sites, truth
+    from mamba3_sites import CHUNK, sites, truth
     from recorded_references import provenance, record_case
     from reference_worker import arms
 
@@ -86,7 +88,8 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
         exact = jax.jit(truth)
 
     def evaluate(arrays):
-        reference, _ = arms(worker.ask({name: np.asarray(value) for name, value in arrays.items()}))
+        request = {name: np.asarray(value) for name, value in arrays.items()} | {"chunk": np.asarray(CHUNK)}
+        reference, _ = arms(worker.ask(request))
         with jax.enable_x64(new_val=True):
             return reference, {leaf: np.asarray(value, np.float64) for leaf, value in exact(arrays).items()}
 
