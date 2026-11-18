@@ -1072,7 +1072,9 @@ def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array
         # zeroed), its strip zero there (`own_bands`) its terms'. The keys' terms are moved up from the rows
         # `e` below, each within its sub-chunk where selected.
         bands = [strip(e)[:, None] for strip in strips]
-        d_rows = tuple(total + strip * keys * pair for total, strip in zip(d_rows, bands, strict=True))
+        # The decay folded into the keys once for every strip, each term a fused multiply-add (row 7299).
+        decayed = keys * pair
+        d_rows = tuple(total + strip * decayed for total, strip in zip(d_rows, bands, strict=True))
         # The rows read where they are weighed, not held across the offsets: held, an sm100's own pairs'
         # backward needed all of its 248 registers, read here 232 (row 5298).
         weighted = functools.reduce(jnp.add, (strip * row() for strip, row in zip(bands, own, strict=True)))
