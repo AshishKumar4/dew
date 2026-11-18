@@ -976,12 +976,14 @@ class _RuledIterator(pygrain.DatasetIterator):
 
 @overload
 def _repeated(rows: pygrain.MapDataset, epochs: int | None, name: str, loading: Loading, *,
-              reseed: bool = True, certain: bool = True, barren: bool = False) -> pygrain.MapDataset: ...
+              reseed: bool = True, certain: bool = True, barren: bool = False,
+              varying: tuple[str, ...] = ()) -> pygrain.MapDataset: ...
 
 
 @overload
 def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *,
-              reseed: bool = True, certain: bool = True, barren: bool = False) -> Rows: ...
+              reseed: bool = True, certain: bool = True, barren: bool = False,
+              varying: tuple[str, ...] = ()) -> Rows: ...
 
 
 def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, reseed: bool = True,
