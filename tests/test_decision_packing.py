@@ -682,9 +682,12 @@ PACKED_SEEDS = 256
 variables, sized paired by `seeds_for` on armada."""
 
 
+@pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_packed_loss_counts_only_real_scored_questions():
     """Different joint-row lengths and label counts contribute question charges, not token,
-    window, unanswered or padding counts; a repeated held window contributes neither part."""
+    window, unanswered or padding counts; a repeated held window contributes neither part. Its 256
+    seeds, each two arms' runs of the objective, are drawn by CI's map tasks, 64 a task
+    (`check1_shards`, row 6449)."""
     examples = [
         Example("short", {"q0": Choice("x", ["a", "b"])}, {"q0": "a"}),
         Example("state " + "x" * 80,
