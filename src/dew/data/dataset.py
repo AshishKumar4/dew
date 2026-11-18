@@ -1722,8 +1722,9 @@ class PhasedStream:
                 )
 
         # Each phase's order as the version its saved plan records described its stages (`Plan.order_under`).
-        held = [] if saved.plan is None else saved.plan.get("phases", [saved.plan])
-        versions = [saved_version(plan) if isinstance(plan, Mapping) else None for plan in held]
+        phases = None if saved.plan is None else saved.plan.get("phases", [saved.plan])
+        versions = [saved_version(plan) if isinstance(plan, Mapping) else None
+                    for plan in (phases if isinstance(phases, list) else [])]
 
         def ordered(index: int) -> str:
             return self._stream(index).order_under(versions[index] if index < len(versions) else None)
