@@ -303,6 +303,21 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
         rows = launched[0][1] if rows is None else rows.at[at:at + len(KEYED_ROWS)].set(launched[0][1])
     return found["dq"], found.get("keyed"), rows
 
+def _rows_stored(family: mosaic.Family, carried: tuple, summed: tuple, views: tuple, smem, *,
+                 cotangents: bool) -> None:
+    """A dQ consumer's rows its walk `carried` stored to `views` through `smem`, each in a row's layout
+    whatever its own (a call without a hook's keyed mass is a constant): `DQ_ROWS` and its `summed`
+    parameters' gradients and pullbacks (`dq_rows`), a launch reading no `cotangents` its `KEYED_ROWS`."""
+    residual, mass, grads, weighed, keyed_mass, keyed_shift = carried
+    if cotangents:
+        named = {"residual": residual, "mass": mass, "keyed_mass": keyed_mass, "keyed_shift": keyed_shift}
+        parts = dq_rows(named, tuple(part for part, on in zip(grads, summed, strict=True) if on),
+                        tuple(part for part, on in zip(weighed, summed, strict=True) if on))
+    else:
+        parts = (keyed_mass, keyed_shift)
+    family.stored(tuple(family.as_row(part) for part in parts), views, smem=smem)
+
+
 @tuning.lowered_once(("walk", "share", "name", "walked"))
 def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, spans: _Spans | None,
                 score_params: tuple, drop: Dropout | None, *, walk: _Backward, share: tuple[int, int],
@@ -367,7 +382,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
             start = (nothing, nothing, (nothing,) * len(kinds), (nothing,) * len(kinds), nothing,
                      nothing + gradient.NO_SHIFT)
             # The tiles its partner reads around its own (`Family.walk_own`).
-            (residual, mass, grads, weighed, keyed_mass, keyed_shift), accumulated = family.walk_own(
+            carried, accumulated = family.walk_own(
                 streams, views, (lo, hi), streamed, index,
                 lambda streams, lo, hi, counted: family.walk(
                     streams, ((step, lo, hi),), start, ((block_q, share[1]),) * len(walked),
@@ -376,16 +391,9 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
             written = [(acc, ref.at[rows]) for acc, ref in zip(accumulated, sum_refs, strict=True)]
             staged_after(after, out_smem, index,
                          lambda stage: family.stored(*zip(*written, strict=True), smem=stage))
-            # Each row in a row's layout whatever its own (a call without a hook's keyed mass is a constant).
-            summed_grads = tuple(part for part, on in zip(grads, summed, strict=True) if on)
-            summed_weighed = tuple(part for part, on in zip(weighed, summed, strict=True) if on)
-            parts = (dq_rows({"residual": residual, "mass": mass, "keyed_mass": keyed_mass,
-                              "keyed_shift": keyed_shift}, summed_grads, summed_weighed) if cotangents
-                     else (keyed_mass, keyed_shift))
-            family.stored(tuple(family.as_row(part) for part in parts),
-                          tuple(rows_ref.at[place, row, head, pl.ds(first, block_q)]
-                                for place in range(rows_count)),
-                          smem=row_smem.at[index])
+            _rows_stored(family, carried, summed, tuple(rows_ref.at[place, row, head, pl.ds(first, block_q)]
+                                                        for place in range(rows_count)),
+                         row_smem.at[index], cotangents=cotangents)
 
         def producer():
             family.stream(streams, views, *streamed)
