@@ -112,6 +112,7 @@ from dew.data.pipeline import (
     BatchStage,
     Combined,
     Concatenated,
+    Configured,
     Documents,
     Expansion,
     Filter,
@@ -151,6 +152,7 @@ from dew.data.plan import Manifest
 from dew.data.readers import WorkerMirrors, _FillShare
 from dew.data.shards import _Sequential, bounded as shards_bounded, bounded_places, cut, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
+from dew.data.sources.urls import Fetch
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
@@ -989,11 +991,12 @@ def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, re
     each pass afresh (`reseed`) as Grain's does, unless it stands for a repeat of a stream, whose
     passes replay the first. An endless repeat of a pass that holds nothing is refused, as it
     would read nothing forever: an indexed pass by its length, a stream's when a pass ends without
-    a row and nothing before the repeat drops one (`certain`), so the pass is the source's own
-    rows. A pass a step emptied may yield rows next time (a fetch that failed for now), so the
-    repeat reads on, logging its empty passes. Every pass of a stream goes on counting its corpus
-    (`_Passes`). A worker's pass of its inputs and the markers of what they dropped that holds
-    nothing (`barren`) holds no input at all, which ends it (`_Barren`)."""
+    a row and nothing before the repeat drops one, or every step before it makes the same rows each
+    pass (`certain`, `_same_each_pass`): a share whose records a filter or a rejecting step keeps none
+    of, which read on forever. A pass a step emptied that may yield rows next time (a fetch that failed
+    for now, a draw, a reseeded shuffle) is read on, logging its empty passes. Every pass of a stream
+    goes on counting its corpus (`_Passes`). A worker's pass of its inputs and the markers of what they
+    dropped that holds nothing (`barren`) holds no input at all, which ends it (`_Barren`)."""
     if isinstance(rows, pygrain.MapDataset):
         if epochs is None and not len(rows):
             raise ValueError(f"a pass of {name} holds no rows, so repeating it reads nothing forever")
@@ -1064,6 +1067,18 @@ class _PassesIterator(pygrain.DatasetIterator):
         rewinding = self._ended and state is self._opening
         self._rows.set_state(rewound(state, self._rows.get_state()) if rewinding else state)
         self._yielded, self._ended = not rewinding, False
+
+
+def _same_each_pass(stage: Stage) -> bool:
+    """Whether `stage`, before a repeat, makes the same rows of a record on every pass, so a pass of a
+    share's records it keeps none of keeps none on any: none that draws, a shuffle reseeded each pass (the
+    records a share's cut takes after it differ), a native Grain step, which states nothing, or a fetch,
+    whose failure is transient (`Fetch`: dropped for a later pass to fetch again)."""
+    match stage:
+        case RandomMap() | Shuffle() | Native() | Configured(random=True) | Map(step=Fetch()):
+            return False
+        case _:
+            return True
 
 
 _UNCHANGING_BEFORE = (Shuffle, Slice, Limit, Map, MapWithIndex, Filter, Prefetch, Workers, Artifact)
@@ -1896,7 +1911,8 @@ class _Build:
         if isinstance(stage, Shuffle) and stage.block_shards is not None:
             return self.block_shuffle(rows, stage, pipeline, partition)
         if isinstance(stage, Repeat):
-            certain = not any(_drops(written) for written in pipeline.stages[:at])
+            before = pipeline.stages[:at]
+            certain = not any(_drops(written) for written in before) or all(map(_same_each_pass, before))
             return _repeated(rows, stage.epochs, _name(pipeline), self.loading, certain=certain)
         from dew.data.ordering import WindowShuffle
 

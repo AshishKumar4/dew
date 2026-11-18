@@ -268,3 +268,32 @@ def test_a_nested_mixture_reads_in_the_workers_it_writes():
     topology = record(plan["topology"], "topology")
     assert set(_ids(reader, 8)) <= set(range(0, 12, 2))
     assert "pools" not in topology and "workers" not in topology
+
+
+@dataclass(frozen=True)
+class _Odd:
+    """Rejects every even id, permanently: a record steps cannot make."""
+
+    identity = "odd@1"
+    rejects = True
+
+    def __call__(self, row):
+        return Rejected("even") if int(row["id"]) % 2 == 0 else row
+
+
+def test_a_share_whose_records_a_step_keeps_none_of_is_refused_not_read_forever():
+    """Two shares of a repeated indexed read whose rejecting step keeps only the odd ids: the share cut every
+    other record holds the even ones alone, a pass of which keeps no row on any pass, so its read is
+    refused at its first batch, where it read empty passes forever (a counted-passes cell's 40-minute
+    hang); the other share reads its records."""
+    ids = Pipeline(Memory({"id": np.arange(1, 11, dtype=np.int32)}, shard_rows=3)).filter_map(_Odd())
+    loader = compile(ids.read("indexed").repeat().batch(2), loading=Loading(workers=0))
+    kept = loader.train(DataPartition(0, 2))
+    empty = loader.train(DataPartition(1, 2))
+    try:
+        assert {int(row) % 2 for row in np.asarray(next(kept)["id"]).ravel()} == {1}
+        with pytest.raises(ValueError):
+            next(empty)
+    finally:
+        kept.close()
+        empty.close()
