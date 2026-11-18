@@ -700,16 +700,18 @@ class OuterProgram:
 
     def _reserved(self, key: Hashable) -> tuple[Future[jax.stages.Compiled], bool]:
         """The compile kept under `key` and whether this caller owns it: a future its owner settles
-        (`_keep`, `_released`), reserved where none is, the least recently used key's evicted past
-        `CACHED`; the map alone held, so calls of other keys compile at once."""
+        (`_keep`, `_released`), reserved where none is, the bound `CACHED` held over everything it keeps
+        (`_bounded`); the map alone held, so calls of other keys compile at once."""
         with self._compiling:
             pending = self._executables.get(key)
             owner = pending is None
             if owner:
                 pending = self._executables[key] = Future()
-                if len(self._executables) > self.CACHED:
-                    self._ready.pop(self._executables.popitem(last=False)[0], None)
             self._executables.move_to_end(key)
+            if owner:
+                # One bound over every executable it holds, kept and compiled over shapes (`_bounded`):
+                # this key, the most recently used, is never the one it lets go.
+                self._bounded()
         return pending, owner
 
     def _kept(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled:
