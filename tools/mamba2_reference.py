@@ -214,11 +214,13 @@ def scan_reference(site, inputs, dtype) -> dict[str, np.ndarray]:
         return {"output": output.numpy(), "final": state.numpy()}
     outputs, finals = [], []
     for row, spans in enumerate(documents_of(SCAN_STARTS)):
-        pieces = []
+        pieces, final = [], None
         for index, (start, end) in enumerate(spans):
             piece, final = scanned(slice(row, row + 1), slice(start, end),
                                    t["h0"][row:row + 1] if index == 0 else None)
             pieces.append(piece)
+        if final is None:
+            raise ValueError(f"row {row} holds no document to scan")
         outputs.append(torch.cat(pieces, dim=1))
         finals.append(final)
     return {"output": torch.cat(outputs).numpy(), "final": torch.cat(finals).numpy()}
@@ -244,8 +246,8 @@ def layer_reference(site, inputs, dtype, layer=None) -> dict[str, np.ndarray]:
     if site in ("layer", "layer_bf16"):
         return {"output": layer(hidden).double().numpy()}
     if site == "decoded":
-        return {"output": stepped_outputs(lambda length: on(hidden[:, :length]), hidden.shape[1],
-                                          support.PREFILL, xp=np)}
+        return {"output": np.asarray(stepped_outputs(lambda length: on(hidden[:, :length]), hidden.shape[1],
+                                                     support.PREFILL, xp=np))}
     if site == "padded":
         second = hidden[1, :12][torch.from_numpy(support.PAUSED[1])][None]
         return {"first": on(hidden[:1, :12])[0], "second": on(second)[0]}
@@ -274,7 +276,7 @@ def model_reference(site, inputs, dtype) -> dict[str, np.ndarray]:
         def logits(length):
             return model(ids[:, :length]).logits.double().numpy()
 
-        return {"logits": stepped_outputs(logits, 12, 4, xp=np)[:, 3:]}
+        return {"logits": np.asarray(stepped_outputs(logits, 12, 4, xp=np))[:, 3:]}
     length = {"model_padded": 16, "model_scored": 17}[site]
     valid, segments = support.padded_layout(length)
     real, closed = ids[:1, :length][:, torch.from_numpy(valid[0])], segments[:, valid[0]]
@@ -324,7 +326,7 @@ def _recorded(site, draw, twin, reference) -> dict[str, np.ndarray]:
 
     def scale(inputs, seed):
         # The mixer built first: its construction's initializers are no step of the computation weighed.
-        unit = np.finfo(np.float32).eps / 2
+        unit = float(np.finfo(np.float32).eps) / 2
         with torch.no_grad(), float64():
             built = _mixer(inputs, torch.float64)
             return rounding_scale(lambda: layer_reference(site, inputs, torch.float64, built), unit, seed)[1]
@@ -410,7 +412,9 @@ def write_interop() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     port = Mamba2ForCausalLM.from_pretrained("AntonV/mamba2-130m-hf", revision=support.MAMBA2_130M_HF,
                                              dtype=torch.float32).eval()
-    narrow, twin = copy.deepcopy(port).to(device, torch.bfloat16), float64_twin(port).to(device)
+    # transformers' `to` wrapper loses its binding to the type checker: called through the class.
+    narrow = Mamba2ForCausalLM.to(copy.deepcopy(port), device, torch.bfloat16)
+    twin = Mamba2ForCausalLM.to(float64_twin(port), device)
 
     @torch.no_grad()
     def logits(model, inputs):

@@ -88,7 +88,9 @@ def distances(vgg, linear, images, references, dtype, *, gradient: bool) -> dict
         result = {"distance": value.detach().reshape(-1).numpy()}
         if gradient:
             value.mean().backward()
-            result["gradient"] = first.grad.permute(0, 2, 3, 1).numpy()
+            if (gradient := first.grad) is None:
+                raise RuntimeError("the backward pass left the image without its gradient")
+            result["gradient"] = gradient.permute(0, 2, 3, 1).numpy()
     return result
 
 

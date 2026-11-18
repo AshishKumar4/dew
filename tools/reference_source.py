@@ -347,7 +347,7 @@ def write_probes(directory: Path, model, vocab: int, continued=None) -> None:
     (`torch_greedy`)."""
     import numpy as np
 
-    from dew.interop.verify import probe_ids
+    from dew.interop.probe import probe_ids
 
     ids = probe_ids(vocab)
     mask, padded, positions = padded_probe(ids)

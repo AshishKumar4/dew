@@ -31,10 +31,18 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import perturb, recording, saved_pipeline, seeded, tiny_qwen3_encoder
+from diffusers_reference_helpers import (
+    perturb,
+    recording,
+    returned,
+    saved_pipeline,
+    seeded,
+    tiny_qwen3_encoder,
+)
 from diffusers_wan_reference import float64_scheduler
 from reference_releases import RELEASES
 
@@ -146,8 +154,12 @@ def build_pipeline(root: Path):
     transformer = ZImageTransformer2DModel(**PIPELINE).eval()
     perturb(torch.Generator().manual_seed(SEED + 8), 0.05, vae, transformer)
     scheduler = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
-    pipe = ZImagePipeline(scheduler=FlowMatchEulerDiscreteScheduler.from_config(scheduler), vae=vae,
-                          text_encoder=encoder, tokenizer=tok, transformer=transformer)
+    # ZImagePipeline types its tokenizer by transformers' factory, not what a pipeline holds: its components
+    # as the pipeline takes them.
+    components: dict[str, Any] = dict(
+        scheduler=returned(FlowMatchEulerDiscreteScheduler.from_config(scheduler), FlowMatchEulerDiscreteScheduler),
+        vae=vae, text_encoder=encoder, tokenizer=tok, transformer=transformer)
+    pipe = ZImagePipeline(**components)
     return saved_pipeline(pipe, root / "pipeline", HEIGHT, WIDTH)
 
 

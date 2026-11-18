@@ -367,7 +367,7 @@ def float64_truth(model: torch.nn.Module, directory: Path,
     def grid(values: torch.Tensor) -> np.ndarray:
         return np.where(valid[..., None], values.detach().numpy(), np.nan)
 
-    return {"loss_f64": np.float64(loss.detach()), "updated_logits_f64": grid(updated),
+    return {"loss_f64": np.asarray(loss.item(), np.float64), "updated_logits_f64": grid(updated),
             "step_logits_f64": step_logits}
 
 

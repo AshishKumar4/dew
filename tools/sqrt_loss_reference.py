@@ -85,7 +85,9 @@ def main() -> None:
         loss = diffusion.training_losses(model, images, torch.tensor(indices), noise=noise)
         landed[f"loss{suffix}"] = loss["loss"].detach().numpy()
         loss["loss"].mean().backward()
-        landed[f"grad{suffix}"] = offset.grad.numpy()
+        if (gradient := offset.grad) is None:
+            raise RuntimeError("the backward pass left the offset without its gradient")
+        landed[f"grad{suffix}"] = gradient.numpy()
     gd._extract_into_tensor = published_read
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out, allow_pickle=False, **landed)

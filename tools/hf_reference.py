@@ -124,6 +124,7 @@ from transformers import (
     Starcoder2Config,
     Starcoder2ForCausalLM,
 )
+from transformers.generation.utils import GenerationMixin
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32ForCausalLM
 from transformers.models.gemma3.modeling_gemma3 import (
@@ -155,7 +156,8 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5VisionModel,
 )
 
-from dew.interop.verify import BATCH, probe_ids, reference_logits, scatter_weights
+from dew.interop.probe import BATCH, probe_ids
+from dew.interop.verify import reference_logits, scatter_weights
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 REAL_MODEL = "Qwen/Qwen3-0.6B"
@@ -456,7 +458,7 @@ def write_minimax_m2_recordings() -> None:
     from _dew_torch.precision import float64_twin
 
     release = require("minimax-m2")["transformers"]
-    dequantized = {'quantization_config': FineGrainedFP8Config(dequantize=True)}
+    dequantized: dict[str, Any] = {'quantization_config': FineGrainedFP8Config(dequantize=True)}
     for name, options in (('minimax-m2-tiny', {}), ('minimax-m2-fp8-tiny', dequantized)):
         directory = FIXTURES / name
         model = MiniMaxM2ForCausalLM.from_pretrained(str(directory), dtype=torch.float32, **options)
@@ -485,7 +487,8 @@ def write_qwen2_moe() -> None:
         shared_expert_intermediate_size=24, num_experts=4, num_experts_per_tok=2,
         norm_topk_prob=False, decoder_sparse_step=1, mlp_only_layers=[1],
         qkv_bias=True, use_sliding_window=True, sliding_window=4, max_window_layers=3,
-        max_position_embeddings=64, rope_theta=1000000.0, tie_word_embeddings=False))
+        max_position_embeddings=64, rope_parameters={"rope_type": "default", "rope_theta": 1000000.0},
+        tie_word_embeddings=False))
     model.set_experts_implementation('eager')
     write_tiny('qwen2-moe-tiny', model, padded=True)
     directory = FIXTURES / 'qwen2-moe-tiny'
@@ -503,7 +506,8 @@ def write_granitemoe() -> None:
     model = GraniteMoeForCausalLM(GraniteMoeConfig(
         vocab_size=64, hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
         num_key_value_heads=2, intermediate_size=24, num_local_experts=4,
-        num_experts_per_tok=2, max_position_embeddings=64, rope_theta=10000.0,
+        num_experts_per_tok=2, max_position_embeddings=64,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
         embedding_multiplier=12.0, residual_multiplier=0.22, logits_scaling=6.0,
         attention_multiplier=0.015625, tie_word_embeddings=True, bos_token_id=0, eos_token_id=0))
     model.set_experts_implementation('eager')
@@ -542,13 +546,16 @@ def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
     """
     from transformers import ModernBertConfig, ModernBertForMaskedLM
 
+    # transformers 5 reads ModernBERT's released keywords, its global layers' period and its two rope
+    # thetas, into its layer types and per-type rope parameters; its signature names none of them.
+    released: dict[str, Any] = dict(global_attn_every_n_layers=3, global_rope_theta=160000.0,
+                                    local_rope_theta=10000.0)
     torch.manual_seed(0)
     model = ModernBertForMaskedLM(ModernBertConfig(
         vocab_size=64, hidden_size=32, intermediate_size=24, num_hidden_layers=4,
-        num_attention_heads=2, global_attn_every_n_layers=3, local_attention=6,
-        global_rope_theta=160000.0, local_rope_theta=10000.0, norm_eps=3e-5,
+        num_attention_heads=2, local_attention=6, norm_eps=3e-5,
         max_position_embeddings=64, pad_token_id=0, bos_token_id=1, eos_token_id=2,
-        cls_token_id=1, sep_token_id=2))
+        cls_token_id=1, sep_token_id=2, **released))
     write_tiny(name, model, logits=False)
     directory = FIXTURES / name
     ids = np.load(directory / 'input_ids.npy')
@@ -1064,7 +1071,8 @@ def gemma4_vision_tiny_system(seed: int = 1234, *, head_dim: int = 8, device: st
     with torch.no_grad():
         tower.std_bias.copy_(torch.randn(32) * 0.5)
         tower.std_scale.copy_(1.0 + torch.randn(32) * 0.05)
-    tower = tower.float().eval().to(device)
+    # transformers' `to` wrapper loses its binding to the type checker: called through the class.
+    tower = Gemma4VisionModel.to(tower.float().eval(), device)
     pixels = np.random.RandomState(11).rand(BATCH, 16, 192).astype(np.float32)
     positions = gemma4_positions(4, BATCH)
     with torch.no_grad():
@@ -1362,7 +1370,7 @@ def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: b
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
     scatter_weights(model, seed)
-    model = model.float().to(device)
+    model = type(model).to(model.float(), device)  # transformers' `to` loses its binding to the checker
     model.save_pretrained(directory, safe_serialization=True)
 
     ids = probe_ids(model.config.vocab_size)
@@ -1417,6 +1425,8 @@ def write_device_tiny(name: str, model: PreTrainedModel, device: str, command: s
     write_tiny(name, model, device=device)
     directory = FIXTURES / name
     ids = np.load(directory / "input_ids.npy")
+    if not isinstance(model, GenerationMixin):
+        raise TypeError(f"{type(model).__name__} generates no continuation")
     with torch.no_grad():
         generated = model.generate(torch.tensor(ids[:1, :4], device=device), do_sample=False,
                                    max_new_tokens=6, eos_token_id=None, pad_token_id=0)

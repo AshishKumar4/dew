@@ -46,7 +46,7 @@ def main():
     config._attn_implementation = 'eager'
     model = Qwen3_5MoeForConditionalGeneration(config).float().eval()
     scatter_weights(model)
-    model = model.to('cuda')
+    model = Qwen3_5MoeForConditionalGeneration.to(model, 'cuda')  # `to` loses its binding to the checker
     model.save_pretrained(directory)
     processor, tokenizer = qwen3_vl_processor(directory)
     images = np.random.default_rng(1735).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)

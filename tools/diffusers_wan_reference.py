@@ -40,12 +40,20 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from diffusers_reference_helpers import perturb, recording, restore_transformers_names, saved_pipeline, seeded
+from diffusers_reference_helpers import (
+    perturb,
+    recording,
+    restore_transformers_names,
+    returned,
+    saved_pipeline,
+    seeded,
+)
 from reference_releases import RELEASES
 
 from _dew_torch.precision import default_dtype, float64, float64_twin, widened
@@ -226,8 +234,12 @@ def build_pipeline(root: Path):
                 if module is transformer or name.endswith(("gamma", "bias")):
                     parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
     scheduler = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
-    pipe = WanPipeline(tokenizer=tok, text_encoder=encoder, transformer=transformer, vae=vae,
-                       scheduler=UniPCMultistepScheduler.from_config(scheduler))
+    # WanPipeline types its tokenizer by transformers' factory and its scheduler by the flow-matching class
+    # it ships with, neither what a pipeline holds: its components as the pipeline takes them.
+    components: dict[str, Any] = dict(
+        tokenizer=tok, text_encoder=encoder, transformer=transformer, vae=vae,
+        scheduler=returned(UniPCMultistepScheduler.from_config(scheduler), UniPCMultistepScheduler))
+    pipe = WanPipeline(**components)
     return saved_pipeline(pipe, root / "pipeline", HEIGHT, WIDTH, frames=FRAMES)
 
 
@@ -254,7 +266,7 @@ def scheduler_replay() -> dict[str, np.ndarray]:
                     # The model's pins and the scheduler module's tables, widened through every step.
                     scope.enter_context(widened())
                     scope.enter_context(float64_scheduler(scheduling_unipc_multistep))
-                scheduler = UniPCMultistepScheduler.from_config(config)
+                scheduler = returned(UniPCMultistepScheduler.from_config(config), UniPCMultistepScheduler)
                 scheduler.set_timesteps(steps)
                 x, latents = x_T.to(dtype), []
                 for index, time in enumerate(scheduler.timesteps):

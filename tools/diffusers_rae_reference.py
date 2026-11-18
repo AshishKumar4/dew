@@ -64,7 +64,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import on_bfloat16_grid
+from diffusers_reference_helpers import on_bfloat16_grid, returned
 from reference_releases import RELEASES, require
 from reference_vjp import recorded_vjp
 
@@ -87,6 +87,7 @@ SEED = 41
 
 def build(name: str, root: Path) -> dict[str, np.ndarray]:
     from diffusers.models.autoencoders.autoencoder_rae import AutoencoderRAE
+    from diffusers.models.autoencoders.vae import DecoderOutput, EncoderOutput
 
     config = CONFIGS[name]
     torch.manual_seed(SEED)
@@ -107,16 +108,16 @@ def build(name: str, root: Path) -> dict[str, np.ndarray]:
     model.save_pretrained(root, safe_serialization=True)
     decoder = [(key, value) for key, value in model.named_parameters() if key.startswith("decoder.")]
     for _, value in decoder:
-        value.requires_grad_(requires_grad=True)
+        value.requires_grad_(True)
 
     size = grid * config["patch_size"]
     image = torch.rand((BATCH[name], 3, size, size), generator=generator).requires_grad_()
-    latent = model.encode(image).latent
+    latent = returned(model.encode(image), EncoderOutput).latent
     encoded = recorded_vjp("encode", {"probe_latent": latent}, {"image": image}, [], generator,
                            reached=True)
 
     code = torch.randn(latent.shape, generator=generator).requires_grad_()
-    pixels = model.decode(code).sample
+    pixels = returned(model.decode(code), DecoderOutput).sample
     decoded = recorded_vjp("decode", {"probe": pixels}, {"code": code}, decoder, generator, reached=True)
 
     arrays = {"image": image.detach().numpy(), "latent": latent.detach().numpy(), **encoded,

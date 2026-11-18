@@ -35,6 +35,7 @@ import numpy as np
 import torch
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
+from diffusers_reference_helpers import returned
 from recorded_draws import fixed_draws
 from reference_source import github, selected, simple_statements
 
@@ -80,13 +81,17 @@ def statements(text: str) -> tuple[str, str]:
     [main] = selected(text, {"main"})
     helper = next(node for node in ast.walk(main)
                   if isinstance(node, ast.FunctionDef) and node.name == "get_sigmas")
-    return ast.get_source_segment(text, helper), "\n".join(simple_statements(text, main, STATEMENTS))
+    if (segment := ast.get_source_segment(text, helper)) is None:
+        raise ValueError("the source's get_sigmas holds no position to read it by")
+    return segment, "\n".join(simple_statements(text, main, STATEMENTS))
 
 
 def scheduler(name: str) -> FlowMatchEulerDiscreteScheduler:
     with tarfile.open(ROOT / "tests" / "fixtures" / f"{name}_source.tar.xz") as archive:
-        config = json.loads(archive.extractfile("pipeline/scheduler/scheduler_config.json").read())
-    return FlowMatchEulerDiscreteScheduler.from_config(config)
+        if (member := archive.extractfile("pipeline/scheduler/scheduler_config.json")) is None:
+            raise ValueError(f"{name}'s source holds no scheduler config")
+        config = json.loads(member.read())
+    return returned(FlowMatchEulerDiscreteScheduler.from_config(config), FlowMatchEulerDiscreteScheduler)
 
 
 def main() -> None:

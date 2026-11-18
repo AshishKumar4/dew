@@ -23,7 +23,7 @@ import json
 import math
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -269,11 +269,13 @@ def lower_index_ties(model, block: torch.nn.Module | None = None,
             yield
             return
         from importlib import import_module
-        classes = getattr(import_module(named[0]), named[1])
+        kinds = getattr(import_module(named[0]), named[1])
+    else:
+        kinds = classes
     target = model if block is None else block
-    held = [(m, m.forward) for m in target.modules() if isinstance(m, classes)]
+    held = [(m, m.forward) for m in target.modules() if isinstance(m, kinds)]
     if not held:
-        raise ValueError(f'the reference has no {classes}')
+        raise ValueError(f'the reference has no {kinds}')
 
     def stable(original):
         def forward(*args, **kwargs):
@@ -513,9 +515,9 @@ def _bare(name: str) -> str:
         parts.pop(0)
     return '.'.join(parts)
 
-def _indexed(named):
+def _indexed[V](named: Iterable[tuple[str, V]]) -> dict[str, tuple[str, V]]:
     """`named` by bare name, refusing two that share one."""
-    held: dict[str, tuple[str, object]] = {}
+    held: dict[str, tuple[str, V]] = {}
     for name, value in named:
         key = _bare(name)
         if key in held:

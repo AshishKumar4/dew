@@ -78,6 +78,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -151,9 +152,14 @@ def import_reference():
     model = importlib.import_module("model")
     engram = importlib.import_module("engram")
     model.ParallelEngramEmbedding.forward = _engram_lookup
-    if not getattr(model.Indexer.forward, "publishes", False):
+    if model.Indexer.forward not in _INSTALLED:
         model.Indexer.forward = _publishing_indexer(model)
     return model, engram
+
+
+_INSTALLED: set[object] = set()
+"""The functions this tool installed in place of the release's or torch's own, which a second install
+leaves in place."""
 
 
 def _publishing_indexer(model):
@@ -175,7 +181,7 @@ def _publishing_indexer(model):
             model.shared_attn.index_k = self.k_cache
         return forward(self, x, qr, latent, start_pos, offset)
 
-    publishing.publishes = True
+    _INSTALLED.add(publishing)
     return publishing
 
 
@@ -492,7 +498,7 @@ def install_selection_probe():
     """Wrap torch.Tensor.topk and torch.topk to record every selection: its scored rows, its sorted picks
     and their margins. The releases select through the method, transformers' DeepSeek-V4 router through
     the function (modeling_deepseek_v4.py:1039)."""
-    if getattr(torch.topk, "probed", False):
+    if torch.topk in _INSTALLED:
         return
 
     def probed(topk):
@@ -506,7 +512,7 @@ def install_selection_probe():
                     record.add("selection", rows=rows, picks=picks, **selection_margins(rows, k))
             return result
 
-        probe_topk.probed = True
+        _INSTALLED.add(probe_topk)
         return probe_topk
 
     torch.Tensor.topk, torch.topk = probed(torch.Tensor.topk), probed(torch.topk)
@@ -700,7 +706,8 @@ def widened_outputs(seed: int) -> dict[str, np.ndarray]:
             RECORDS.clear()
             outputs.update({name: value for name, value in recorded.arrays(prefix).items()
                             if name.endswith(("_in", "_out", "_rows", "_picks"))})
-            outputs.update({f"{prefix}logits": logits.numpy(), f"{prefix}loss": np.float64(loss.item())})
+            outputs.update({f"{prefix}logits": logits.numpy(),
+                            f"{prefix}loss": np.asarray(loss.item(), np.float64)})
             with torch.no_grad():
                 outputs.update({f"{prefix}{name}": value for name, value in cached(net, ids).items()})
         for prefix, gradient in gradients.items():
@@ -898,7 +905,7 @@ TEXT_CONFIG = {
 
 def config_json(args) -> dict:
     """The release's config.json (text half) for the toy arguments."""
-    text = {"model_type": "deepseek_v41_text"}
+    text: dict[str, Any] = {"model_type": "deepseek_v41_text"}
     for field, key in TEXT_CONFIG.items():
         value = getattr(args, field)
         text[key] = list(value) if isinstance(value, tuple) else value

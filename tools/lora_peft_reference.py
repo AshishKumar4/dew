@@ -43,16 +43,19 @@ those masks:
 
 from __future__ import annotations
 
-from typing import Any
 import contextlib
 import json
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
 from _dew_torch.precision import float64, float64_twin
+
+if TYPE_CHECKING:
+    from dew.batch import Variables
 
 ROOT = Path(__file__).resolve().parents[1]
 LLAMA = ROOT / "tests" / "fixtures" / "hf" / "llama-tiny"
@@ -89,7 +92,7 @@ def adapter(case: str, settings: dict, out: Path):
         if "lora_B" in name:
             parameter.data = torch.randn(parameter.shape, generator=generator) * 0.2
     directory = out / case / "adapter"
-    model.save_pretrained(directory)
+    model.save_pretrained(str(directory))
     (directory / "README.md").unlink()
     saved = json.loads((directory / "adapter_config.json").read_text())
     saved["base_model_name_or_path"] = str(LLAMA.relative_to(ROOT))
@@ -218,7 +221,7 @@ def drawn_axes(adapter) -> dict:
     return boxed_axes(thaw(abstract(adapter.model.init, jax.random.key(0), jnp.zeros((1, 4), jnp.int32))))
 
 
-def adapter_orders(adapter) -> tuple[dict, set[str]]:
+def adapter_orders(adapter) -> tuple["Variables", set[str]]:
     """The adapter's frozen base and its factors as one `{"params": ...}` tree, which an order
     permutes whole (tests/residual_orders.py, the factors' residual sides read off their declared
     axes), and the PEFT module paths of the targets whose branch input is the residual stream:
@@ -239,8 +242,8 @@ def adapter_orders(adapter) -> tuple[dict, set[str]]:
     return whole, residual_inputs
 
 
-def in_order(adapter, whole: dict, residual_inputs: set[str], order: np.ndarray,
-             masks: dict[str, np.ndarray] | None) -> tuple[dict, dict[str, np.ndarray] | None]:
+def in_order(adapter, whole: "Variables", residual_inputs: set[str], order: np.ndarray,
+             masks: dict[str, np.ndarray] | None) -> tuple["Variables", dict[str, np.ndarray] | None]:
     """The adapter's variables with the residual stream's units in `order` (`adapter_orders`),
     and `masks`, a dropout mask's last axis moved with its target's branch input where that input
     is the residual stream."""

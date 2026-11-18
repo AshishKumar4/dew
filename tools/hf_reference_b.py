@@ -187,7 +187,8 @@ from moe_reference import expert_tensors
 from qwen_mtp_reference import QwenMTP
 
 from dew.interop.safetensors_io import write_file
-from dew.interop.verify import probe_ids, reference_logits, scatter_weights
+from dew.interop.probe import probe_ids
+from dew.interop.verify import reference_logits, scatter_weights
 
 
 def tiny_deepseek_v2() -> DeepseekV2ForCausalLM:
