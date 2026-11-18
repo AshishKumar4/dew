@@ -971,8 +971,8 @@
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[decision-multimodal_transformer+qwen35]",
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[decision-multimodal_transformer+qwen38]",
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[decision-user+causal]",
-"tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-flux2_transformer]",
-"tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-hybrid_dit]",
+"tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-flux_transformer]",
+"tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-nnx+denoiser]",
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-simple_udit]",
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-unet_2d_condition]",
 "tests/test_capability_matrix.py::test_a_supported_cell_trains_evaluates_and_reloads[diffusion-unet_3d]",
@@ -1132,14 +1132,14 @@
 "tests/test_contracts_recurrence.py::test_the_chunked_delta_rule_holds_every_order[packed-the largest its chunk holds-grad of grad]",
 "tests/test_contracts_recurrence.py::test_the_decode_step_holds_every_order[near the largest]",
 "tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[near the least normal-fla_kda-first orders]",
-"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_kda-jvp of grad]",
-"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[near the least normal-kimi_delta]",
-"tests/test_contracts_recurrence.py::test_the_derived_delta_rules_chunk_adjoint_holds_its_orders[near the largest]",
-"tests/test_contracts_recurrence.py::test_the_derived_delta_rules_chunk_adjoint_holds_its_orders[normal]",
-"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the largest-jvp of grad]",
-"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the least normal-second orders, staged]",
-"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[normal-grad of grad]",
-"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[normal-second jvp]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[near the least normal-gated_delta]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-kimi_delta]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rules_chunk_adjoint_holds_its_orders[near the least normal]",
+"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the largest-grad of grad]",
+"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the least normal-jvp of grad]",
+"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[normal-first orders]",
+"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[normal-jvp of grad]",
+"tests/test_contracts_recurrence.py::test_the_short_conv_holds_every_order[near the least normal]",
 "tests/test_contracts_recurrence.py::test_the_ssd_port_holds_its_orders[near the least normal-first orders]",
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[near the least normal-second orders, staged]"
 ],
@@ -1629,6 +1629,9 @@
 "tests/test_dory.py::test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop_count[2]",
 "tests/test_dory.py::test_the_release_tests_symmetries_keep_dorys_function_and_redraw_its_sums"
 ],
+"tests/test_dpo.py": [
+"tests/test_dpo.py::test_packed_pairs_train_as_each_pair_a_row[attention-whole]"
+],
 "tests/test_dreamer.py": [
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[prefilled-replay]",
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[prefilled-steps]",
@@ -1780,6 +1783,9 @@
 "tests/test_fresh_rate.py::test_a_shared_form_run_draws_its_layers_gates_alone_in_its_fresh_group",
 "tests/test_fresh_rate.py::test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one",
 "tests/test_fresh_rate.py::test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_groups_rate[a fresh group]"
+],
+"tests/test_gated_mlp.py": [
+"tests/test_gated_mlp.py::test_the_fused_mlp_holds_check_1_with_its_gradients[swiglu-1.5-sm90]"
 ],
 "tests/test_gemm_gather.py": [
 "tests/test_gemm_gather.py::test_a_gathered_kernel_gradient_lowers_for_cuda"
@@ -3824,8 +3830,8 @@
 "tests/test_trace_keys.py::test_every_keyed_objectives_key_is_the_same_after_its_loss_is_traced_and_built_anew"
 ],
 "tests/test_trainer.py": [
-"tests/test_trainer.py::test_a_fit_places_its_device_prefetch_and_plans_its_step_beside_them",
-"tests/test_trainer.py::test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed",
+"tests/test_trainer.py::test_a_mesh_without_stages_takes_its_one_microbatch_asked_for",
+"tests/test_trainer.py::test_a_step_only_prefix_keeps_lifetime_real_tokens",
 "tests/test_trainer.py::test_checkpoints_whose_write_failed_close_and_keep_the_error_their_run_raised[False]"
 ],
 "tests/test_training_transactions.py": [
