@@ -122,7 +122,8 @@ def test_vllms_engine_streams_token_ids_as_the_other_engines_do(tmp_path):
     """vllm-engine asks for token ids, not text (`detokenize=False`), as Dew's and SGLang's engines give,
     so no engine's clock holds text decoding the others skip; and it times on the same closed loop. Its
     record states none of Dew's server settings, a paged cache's page size among them, which its engine
-    never reads, and the mesh, which sets its engine's parallelism (row 7901)."""
+    never reads, which it refuses where they are set, and the mesh, which sets its engine's parallelism
+    (row 7901)."""
     for name, text in VLLM.items():
         (tmp_path / "engine" / "vllm" / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / "engine" / "vllm" / name).write_text(text)
@@ -131,8 +132,8 @@ def test_vllms_engine_streams_token_ids_as_the_other_engines_do(tmp_path):
     subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_lm_serving.py"),
                     "--backend", "vllm-engine", "--model", "a/model", "--slots", "2", "--prompt", "8",
                     "--output", "5", "--vocab-limit", "200", "--repeats", "1", "--requests", "4",
-                    "--kv", "paged", "--page-size", "8", "--mesh", '{"tensor": 2}',
-                    "--out", str(tmp_path / "record.json")], check=True, env=env, cwd=ROOT)
+                    "--mesh", '{"tensor": 2}', "--out", str(tmp_path / "record.json")],
+                   check=True, env=env, cwd=ROOT)
     assert json.loads(policy.read_text()) == {
         "temperature": 0, "top_p": 1, "top_k": -1, "min_p": 0, "repetition_penalty": 1, "max_tokens": 5,
         "ignore_eos": True, "detokenize": False}
@@ -141,6 +142,15 @@ def test_vllms_engine_streams_token_ids_as_the_other_engines_do(tmp_path):
     assert not {"decode_steps", "kv", "page_size"} & record.keys()
     settings = json.loads(engine.read_text())
     assert (settings["tensor_parallel_size"], record["mesh"]) == (2, {"tensor": 2})
+    # Dew's server's settings, which the engine never reads, are refused, not taken silently: the run starts
+    # no engine and writes no record.
+    engine.unlink()
+    refused = subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_lm_serving.py"),
+                              "--backend", "vllm-engine", "--model", "a/model", "--kv", "paged",
+                              "--page-size", "8", "--out", str(tmp_path / "refused.json")],
+                             env=env, cwd=ROOT, capture_output=True, text=True)
+    assert refused.returncode == 2
+    assert not engine.exists() and not (tmp_path / "refused.json").exists()
 
 
 @pytest.mark.parametrize("kv", ["dense", "paged"])
