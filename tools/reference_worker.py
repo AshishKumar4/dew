@@ -173,13 +173,50 @@ def bootstrap(script: str, arguments: Sequence[str]) -> None:
     runpy.run_path(script, run_name="__main__")
 
 
-def recording_command(script: str, sites: str, *, serve: Callable[[], None],
-                      merged: Callable[[list[Path]], Path], write_seeded: Callable, fixture: Path) -> None:
+def merged_units(units: Sequence[Path], fixture: Path, license: str) -> Path:
+    """A site recording's units (each recorder's `write_seeded`, their sites disjoint) joined and saved as its
+    `fixture` under `license` (fetched_fixtures' `save`), its provenance the units' own, which must agree but
+    for the device: where units ran on more than one, the provenance names each device's sites (`devices`),
+    as a reference's library may tune each device apart (fla autotunes its configs per device). A unit
+    recorded under another provenance, or a key recorded twice, is refused."""
+    import json
+
+    from fetched_fixtures import save
+
+    stored: dict[str, np.ndarray] = {}
+    devices: dict[str, list[str]] = {}
+    common = None
+    for unit in units:
+        with np.load(unit, allow_pickle=False) as part:
+            recorded = json.loads(str(part["provenance"]))
+            device = recorded.pop("device")
+            if common is not None and recorded != common:
+                raise ValueError(f"{unit} was recorded under another provenance: {recorded}")
+            common = recorded
+            for key, value in part.items():
+                if key == "provenance":
+                    continue
+                if key in stored:
+                    raise ValueError(f"{unit} records {key} again")
+                stored[key] = value
+                site = key.split(".", 1)[0]
+                if site not in devices.setdefault(device, []):
+                    devices[device].append(site)
+    if common is None:
+        raise ValueError("a fixture merges at least one unit")
+    named = {"device": next(iter(devices))} if len(devices) == 1 else {"device": " and ".join(devices),
+                                                                       "devices": devices}
+    stored["provenance"] = np.asarray(json.dumps({**common, **named}))
+    return save(fixture, stored, reference=common["reference"], license=license)
+
+
+def recording_command(script: str, sites: str, *, serve: Callable[[], None], write_seeded: Callable,
+                      fixture: Path, license: str) -> None:
     """A site recorder's command line (tools/fla_gdn_reference.py, tools/mamba3_reference.py): `--serve`, the
     reference's side (`serve`); `--list`, its site names a line each (the module `sites`' `sites()`);
-    `--merge <units>`, the fixture from the recording's units (`merged`); else `<python> <out> <site>...`,
-    those sites' unit written to `out` (`write_seeded`) against `script`'s worker run in `<python>`
-    (`session`)."""
+    `--merge <units>`, the `fixture` from the recording's units under its reference's `license`
+    (`merged_units`); else `<python> <out> <site>...`, those sites' unit written to `out` (`write_seeded`)
+    against `script`'s worker run in `<python>` (`session`)."""
     if sys.argv[1] == "--serve":
         serve()
     elif sys.argv[1] == "--list":
@@ -187,7 +224,7 @@ def recording_command(script: str, sites: str, *, serve: Callable[[], None],
 
         print("\n".join(importlib.import_module(sites).sites()), flush=True)
     elif sys.argv[1] == "--merge":
-        written = merged([Path(unit) for unit in sys.argv[2:]])
+        written = merged_units([Path(unit) for unit in sys.argv[2:]], fixture, license)
         print(f"wrote {fixture.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
     else:
         with session([sys.argv[1], script, "--serve"]) as worker:

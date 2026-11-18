@@ -321,3 +321,39 @@ def test_a_recording_through_a_worker_is_the_recording_made_in_process(monkeypat
     assert through.keys() == here.keys()
     for name in here:
         np.testing.assert_array_equal(through[name], here[name], err_msg=name)
+
+
+def test_a_recordings_units_merge_into_one_fixture_naming_each_devices_sites(tmp_path, monkeypatch):
+    """`merged_units` joins units recorded on two devices into one fixture whose provenance names each
+    device's sites; a unit under another provenance, or recording a key again, is refused."""
+    import json
+
+    import fetched_fixtures
+
+    worker = protocol
+    saved = {}
+
+    def save(path, arrays, *, reference, license):
+        saved.update(path=path, arrays=arrays, reference=reference, license=license)
+        return tmp_path / "written.npz"
+
+    monkeypatch.setattr(fetched_fixtures, "save", save)
+
+    def unit(name: str, device: str, keys: list[str], revision: str = "1") -> Path:
+        recorded = {"reference": "fla", "revision": revision, "device": device, "command": "c"}
+        np.savez(tmp_path / name, provenance=np.asarray(json.dumps(recorded)),
+                 **{key: np.zeros(1) for key in keys})
+        return tmp_path / name
+
+    first = unit("a.npz", "H100", ["gdn.out", "gdn.final"])
+    second = unit("b.npz", "A100", ["kda.out"])
+    assert worker.merged_units([first, second], Path("fla/gdn.npz"), "MIT") == tmp_path / "written.npz"
+    assert (saved["path"], saved["reference"], saved["license"]) == (Path("fla/gdn.npz"), "fla", "MIT")
+    assert sorted(saved["arrays"]) == ["gdn.final", "gdn.out", "kda.out", "provenance"]
+    assert json.loads(str(saved["arrays"]["provenance"])) == {
+        "reference": "fla", "revision": "1", "command": "c", "device": "H100 and A100",
+        "devices": {"H100": ["gdn"], "A100": ["kda"]}}
+    with pytest.raises(ValueError, match="another provenance"):
+        worker.merged_units([first, unit("c.npz", "H100", ["x.out"], revision="2")], Path("f.npz"), "MIT")
+    with pytest.raises(ValueError, match="records gdn.out again"):
+        worker.merged_units([first, unit("d.npz", "H100", ["gdn.out"])], Path("f.npz"), "MIT")
