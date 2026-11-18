@@ -204,7 +204,7 @@ shares = _loaded(HERE / "shares.py")
 collection = _loaded(HERE / "collection.py")
 gpu_measures = _loaded(HERE / "measures.py")
 GPU_HEADROOM, gpu_needs = gpu_measures.GPU_HEADROOM, gpu_measures.gpu_needs
-apportioned, deadline_shares = shares.apportioned, shares.deadline_shares
+apportioned, deadline_shares, task_shares = shares.apportioned, shares.deadline_shares, shares.task_shares
 # The names the land queue's tools read from this module at every commit they run (land.sh's `ci.STALE`,
 # run_tests.py's `node_of`), older commits' and newer alike.
 STALE, node_of = grading.STALE, grading.node_of
@@ -1659,7 +1659,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
     counts = json.loads(collection.read_text()) if collection.is_file() else {}
     ran = []
-    shares = task_seconds(tests, cases, log, time.monotonic() - began, expired)
+    stood = followed.visited(followed.log_events(log)) if expired or not report.is_file() else []
+    shares = task_shares(tests, cases, time.monotonic() - began, stood[-1] if expired and stood else None,
+                         expired, grading)
     # Where the task ran out of time, the file whose test started last is the one it was spent in (executed.py
     # logs each visit): its row is the deadline's red; a file pytest reported is graded by its own cases, the
     # exit the interrupt's, not its; and one with none is not graded but run again (`grading.STALE`), never
@@ -1669,7 +1671,6 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # deadline's.
     # A row named by a test node (`file::test`) is graded by its own cases (`grading.of`), its file's
     # collection and visits its own: a GPU lane runs each such row in a task of its own (`lane_units`).
-    stood = followed.visited(followed.log_events(log)) if expired or not report.is_file() else []
     running = stood[-1] if stood else None
     for name in tests:
         own = [case for case in cases if grading.of(case, name)]
@@ -1712,25 +1713,6 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         record(python, ran, log, common, network, opened,
                set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set(), wrote)
     return 0
-
-
-def task_seconds(tests: list[str], cases: list[ET.Element], log: Path, wall: float,
-                 expired: bool) -> dict[str, float]:
-    """Each of `tests`' seconds of its task's `wall` time, by its JUnit `cases`: in proportion to its tests'
-    own times (`apportioned`); where the task ran out of time (`expired`), the file running at its deadline
-    (its executed `log`'s last visit) at least what it needs, and one that never started none
-    (`deadline_shares`)."""
-    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if grading.of(case, name))
-                   for name in tests}
-    if not expired:
-        return apportioned(own_seconds, wall, len(tests))
-    # The file whose test started last is the one running at the deadline (executed.py logs each visit), its
-    # row the one stopped (a test node's, which runs in a task of its own: `lane_units`).
-    stood = followed.visited(followed.log_events(log))
-    running = next((name for name in tests if grading.owning(name) == stood[-1]), stood[-1]) if stood \
-        else None
-    reported = {name for name in tests if any(grading.of(case, name) for case in cases)}
-    return deadline_shares(own_seconds, reported, wall, running)
 
 
 def resumed(tests: list[str]) -> dict[str, float]:

@@ -44,6 +44,17 @@ def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_
     assert fetched.is_file() and not (tmp_path / "read").exists()
 
 
+def lane_rows(ci, root: Path, tests: list[str], marks: list[Path],
+              **network: bool) -> list[tuple[str, int]]:
+    """A lane's rows over `tests` at `root`, each name and exit, with the cache on, the files its tests mark that
+    they ran (`marks`) cleared first."""
+    for mark in marks:
+        mark.unlink(missing_ok=True)
+    out = root / "verdict.json"
+    assert ci.gpu_lane("3.12", tests, out, cache="on", processes=1, deadline=600.0, **network) == 0
+    return [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]]
+
+
 def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_records_them_apart(
         ci, tmp_path, monkeypatch, cache_worker):
     """The network lane runs each file's network-marked tests alone, which every other task sets aside,
@@ -63,15 +74,10 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
         "def test_offline():\n"
         "    assert os.environ['HF_HUB_OFFLINE'] == '1'\n"
         "    Path('offline').write_text('ran')\n")
-    out = tmp_path / "verdict.json"
     hub, offline = tmp_path / "hub", tmp_path / "offline"
 
     def lane(**network: bool) -> list[tuple[str, int]]:
-        hub.unlink(missing_ok=True)
-        offline.unlink(missing_ok=True)
-        assert ci.gpu_lane("3.12", ["tests/test_hub.py"], out, cache="on", processes=1, deadline=600.0,
-                           **network) == 0
-        return [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]]
+        return lane_rows(ci, tmp_path, ["tests/test_hub.py"], [hub, offline], **network)
 
     assert lane(network=True) == [("3.12:tests/test_hub.py", 0)]
     assert hub.is_file() and not offline.exists()
@@ -542,14 +548,10 @@ def test_a_test_nodes_green_run_keeps_a_record_its_next_lane_reuses(ci, tmp_path
         "@pytest.mark.parametrize('form', ['a/b c'])\n"
         "def test_walk(form):\n    Path('walked').write_text(form)\n"
         "def test_other():\n    Path('othered').write_text('ran')\n")
-    out = tmp_path / "verdict.json"
     walked, othered = tmp_path / "walked", tmp_path / "othered"
 
     def lane(node: str) -> list[tuple[str, int]]:
-        walked.unlink(missing_ok=True)
-        othered.unlink(missing_ok=True)
-        assert ci.gpu_lane("3.12", [node], out, cache="on", processes=1, deadline=600.0) == 0
-        return [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]]
+        return lane_rows(ci, tmp_path, [node], [walked, othered])
 
     walk, other = "tests/test_nodes.py::test_walk", "tests/test_nodes.py::test_other"
     assert lane(walk) == [(f"3.12:{walk}", 0)]

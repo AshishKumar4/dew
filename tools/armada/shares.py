@@ -24,3 +24,18 @@ def deadline_shares(own_seconds: Mapping[str, float], reported: Container[str], 
     unaccounted = max(wall - sum(own_seconds.values()), 0.0)
     return {name: own + (unaccounted if name == running else 0.0) for name, own in own_seconds.items()
             if name == running or name in reported}
+
+
+def task_shares(tests: list[str], cases: list, wall: float, running: str | None, expired: bool,
+                grading) -> dict[str, float]:
+    """Each of a task's `tests`' seconds of its `wall` time, by its JUnit `cases` (`grading.of`): in proportion to
+    its tests' own times (`apportioned`); where the task ran out of time (`expired`), the row of the file `running`
+    at its deadline (its executed log's last visit; a test node's row, which runs in a task of its own) at least
+    what it needs, and one that never started none (`deadline_shares`)."""
+    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if grading.of(case, name))
+                   for name in tests}
+    if not expired:
+        return apportioned(own_seconds, wall, len(tests))
+    reported = {name for name in tests if any(grading.of(case, name) for case in cases)}
+    row = next((name for name in tests if grading.owning(name) == running), running)
+    return deadline_shares(own_seconds, reported, wall, row)
