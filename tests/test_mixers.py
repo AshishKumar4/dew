@@ -283,7 +283,7 @@ the packed row as its Dew arm, on armada, ledger 2828): compared with themselves
 and C biases' and norms' gradients within 512."""
 
 
-SHARDED = {"gated_delta_net", "kimi_delta_attention", "mamba2", "memory"}
+SHARDED = {"gated_delta_net", "kimi_delta_attention", "mamba", "mamba2", "memory"}
 """The kinds whose packed rows' draws run as armada's map tasks (`check1_shards`), each a test of its own."""
 
 
@@ -305,6 +305,13 @@ def test_a_packed_row_of_kimi_delta_attention_computes_what_its_documents_comput
     """`assert_packs_as_alone` over Kimi delta attention, whose 64 seeds took 60 s of 120 cold on
     armada's CI CPU: CI draws them in map tasks of 8 (ledger 3901)."""
     assert_packs_as_alone("kimi_delta_attention")
+
+
+@pytest.mark.check1_shards(seeds=32, per_task=8)
+def test_a_packed_row_of_mamba_computes_what_its_documents_compute_alone():
+    """`assert_packs_as_alone` over Mamba, whose 32 seeds took 133 s in train 1005's CI (main f4ee27d20):
+    CI draws them in map tasks of 8 (row 7475)."""
+    assert_packs_as_alone("mamba")
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=32)

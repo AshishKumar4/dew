@@ -855,15 +855,12 @@ def test_a_reader_that_names_a_tokenizer_class_loads_it_through_the_one_loader(t
     own reads (`load_tokenizer(cls=)`, ledger 3013): a load of its own, apart from the loader's default
     fast class over the same files and shared by every reader that names the class, encoding a caption
     as transformers' `CLIPTokenizer` itself does."""
-    import tarfile
-
+    from interop_support import extract_fixture
     from transformers import CLIPTokenizer
 
     from dew.data.text import pin_tokenizer
 
-    with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
-        archive.extractall(tmp_path, members=[member for member in archive.getmembers()
-                                              if member.name.startswith("sd/tokenizer")], filter="data")
+    extract_fixture(FIXTURES / "tiny_diffusers.tar.xz", tmp_path, "sd/tokenizer")
     pinned = pin_tokenizer(str(tmp_path / "sd" / "tokenizer"))
     slow = pinned.transformers(cls="CLIPTokenizer")
     assert type(slow) is CLIPTokenizer and pinned.transformers(cls="CLIPTokenizer") is slow

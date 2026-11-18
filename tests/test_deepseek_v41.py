@@ -129,10 +129,12 @@ def test_the_quantizers_round_fp32_input_as_the_stand_ins(source):
 
 QAT_SEEDS = 2
 """The quantization-aware step's draws of ids that check 2 certifies, each certified whole: its every
-primitive, executed alone, is within its own operation's contract, so a draw's every element holds."""
+primitive, executed alone, is within its own operation's contract, so a draw's every element holds. Each
+draw a test of its own, where the two took 298 s in one (train 1003, row 7449)."""
 
 
-def test_a_quantization_aware_step_is_never_wrong(source, monkeypatch):
+@pytest.mark.parametrize("seed", range(QAT_SEEDS))
+def test_a_quantization_aware_step_is_never_wrong(source, monkeypatch, seed):
     """The tiny's quantization-aware training step, its activations rounding through the release's
     quantizers with the straight-through estimator (`fake_quant.straight_through`, docs/design/training.md
     Quantization-aware training): its loss, its gradient in every parameter and its parameters after one
@@ -162,7 +164,7 @@ def test_a_quantization_aware_step_is_never_wrong(source, monkeypatch):
     # The program its users run: the suite's wide CPU arithmetic (float64 sums and reductions) is the
     # suite's alone, and check 2 holds float formats of the lane's own.
     monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
-    assert_certified(step, draw, "a quantization-aware step", seeds=QAT_SEEDS)
+    assert_certified(step, draw, "a quantization-aware step", seeds=range(seed, seed + 1))
 
 
 def test_the_engram_hash_is_the_releases_int64_arithmetic():

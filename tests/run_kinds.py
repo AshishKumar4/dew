@@ -6,7 +6,6 @@ import csv
 import dataclasses
 import json
 import os
-import tarfile
 import typing
 from collections.abc import Mapping
 from pathlib import Path
@@ -144,14 +143,14 @@ def diffusion(root: Path, drawn: bool) -> RunConfig:
 def published(root: Path, drawn: bool) -> RunConfig:
     """A diffusion run over the tiny SD pipeline (tiny_diffusers.tar.xz's `sd`, unpacked under `root`) naming
     no preset, so it trains the pipeline's own process over its grid (`ImageSettings.grid_process`)."""
-    directory = root / "tiny_diffusers"
-    if not (directory / "sd").exists():
-        with tarfile.open(REPO_ROOT / "tests" / "fixtures" / "tiny_diffusers.tar.xz") as archive:
-            archive.extractall(directory, members=[member for member in archive.getmembers()
-                                                   if member.name.split("/")[0] == "sd"], filter="data")
+    from interop_support import tiny_pipeline
+
+    pipeline = root / "tiny_diffusers" / "sd"
+    if not pipeline.exists():
+        tiny_pipeline(root / "tiny_diffusers", "sd")
     train, held = pictures()
     return DiffusionRunConfig(
-        pretrained=str(directory / "sd"), preset=None,
+        pretrained=str(pipeline), preset=None,
         model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32", "attention_impl": "xla"}),
         data=captioned(train, 32, drawn=drawn), validation=captioned(held, 32, drawn=False), val_metrics=(),
         objective=ObjectiveConfig("diffusion", {"steps": 2}))

@@ -205,8 +205,10 @@ def assert_recomputed_blocks_train_the_same_model(shape, *, scan):
     rerun, _ = training_step(remat)
     draw = drawn_steps(plain, stepped, routed=shape == "sparse")
     wide = plain.clone(dtype=jnp.float64)
-    assert_as_exact(lambda variables, *_: remat.apply(variables, ids),
-                    lambda variables, *_: plain.apply(variables, ids), draw,
+    # Each forward one compiled program for every draw, where op by op they took most of the sparse
+    # unscanned cell's 208 s (row 7474).
+    assert_as_exact(jax.jit(lambda variables, *_: remat.apply(variables, ids)),
+                    jax.jit(lambda variables, *_: plain.apply(variables, ids)), draw,
                     f"a recomputed {shape} block's forward, scan {scan}", seeds=STEP_SEEDS,
                     truth_fn=jax.jit(lambda variables, *_: wide.apply(variables, ids)))
     assert_as_exact(committed(rerun), committed(run), draw,

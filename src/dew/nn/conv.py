@@ -326,7 +326,14 @@ class Conv(nn.Conv):
 
     @nn.nowrap
     def _convolved(self, inputs: jax.Array, kernel_size: tuple[int, ...]) -> jax.Array:
-        """Flax's shared-weight convolution of `inputs`, its bias added by `biased`."""
+        """Flax's shared-weight convolution of `inputs`, its bias added by `biased`: `flax.linen.linear._Conv
+        .__call__` at flax v0.12.10 (google/flax d1f0d69b49a4f208e0a854039d7914c1c7c431e3, Apache License
+        2.0, Copyright 2024 The Flax Authors), its unshared-weight path dropped and its bias added at fp32
+        (`biased`: a bf16 cotangent's bias gradient summed in fp32, where JAX's broadcast-add transpose sums
+        it in its dtype). Flax's own extension point (`conv_general_dilated`, `conv_general_dilated_cls`)
+        replaces the convolution alone, its `__call__` adding the bias after it, so the call is copied here
+        (ledger 5625); delete it for `nn.Conv`'s own call once a Flax release Dew pins adds the bias through
+        a hook of its own."""
         # Every batch dimension in one, as flax convolves them.
         batch_dims = inputs.ndim - len(kernel_size) - 1
         batch_shape = inputs.shape[:batch_dims]

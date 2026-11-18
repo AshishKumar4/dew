@@ -19,7 +19,6 @@ write to dewml.
 import json
 import os
 import shutil
-import tarfile
 import uuid
 from pathlib import Path
 
@@ -139,9 +138,9 @@ def test_a_pipeline_downloads_only_the_component_weights_it_reads(api, throwaway
     from dew.interop.pretrained import Pretrained
 
     repo = throwaway("pipeline")
-    with tarfile.open(ROOT / "tests" / "fixtures" / "tiny_diffusers.tar.xz") as archive:
-        archive.extractall(tmp_path, filter="data")
-    folder = tmp_path / "sd"
+    from interop_support import tiny_pipeline
+
+    folder = tiny_pipeline(tmp_path, "sd")
     published = folder.parent / "published"
     shutil.copytree(folder, published)
     unet = published / "unet" / "diffusion_pytorch_model.safetensors"

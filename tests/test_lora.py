@@ -21,7 +21,6 @@ Observed against the references, all under the 1e-4 bound:
 import dataclasses
 import functools
 import json
-import tarfile
 from pathlib import Path
 
 import jax
@@ -31,7 +30,14 @@ import optax
 import pytest
 from affine_run import Replaying
 from flax import linen as nn
-from interop_support import extract_fixture, fixture_ids, hub_cache, peft_twin, transformers_arms
+from interop_support import (
+    extract_fixture,
+    fixture_ids,
+    hub_cache,
+    peft_twin,
+    tiny_pipeline,
+    transformers_arms,
+)
 from model_support import flat_tree
 from reference_error import as_given, assert_as_exact, dew_programs, indexed_recording, recording, widened
 from safetensors.numpy import load_file
@@ -951,11 +957,8 @@ TEXT_ROOT = ("encoders", "conditioning", "text_encoder", "text_model")
 
 @pytest.fixture(scope="module")
 def pipeline(tmp_path_factory):
-    destination = tmp_path_factory.mktemp("sd")
-    with tarfile.open(ROOT / "tests/fixtures/tiny_diffusers.tar.xz") as archive:
-        archive.extractall(destination, members=[m for m in archive.getmembers() if m.name.startswith("sd/")],
-                           filter="data")
-    source = Pretrained.load(destination / "sd", dtype="float32", attention_impl="reference")
+    folder = tiny_pipeline(tmp_path_factory.mktemp("sd"), "sd")
+    source = Pretrained.load(folder, dtype="float32", attention_impl="reference")
     return dataclasses.replace(source, model=torch_unet(source.model))
 
 
@@ -1275,12 +1278,9 @@ def pipelines(tmp_path_factory):
     """The tiny FLUX and SD3 pipelines and the tiny SD one, loaded at float32."""
     root = tmp_path_factory.mktemp("pipelines")
     for family in ("flux", "sd3"):
-        with tarfile.open(ROOT / f"tests/fixtures/{family}_source.tar.xz") as archive:
-            archive.extractall(root / family, filter="data")
-    with tarfile.open(ROOT / "tests/fixtures/tiny_diffusers.tar.xz") as archive:
-        archive.extractall(root, members=[m for m in archive.getmembers() if m.name.startswith("sd/")],
-                           filter="data")
-    directories = {"flux": root / "flux" / "pipeline", "sd3": root / "sd3" / "pipeline", "sd": root / "sd"}
+        extract_fixture(ROOT / f"tests/fixtures/{family}_source.tar.xz", root / family)
+    directories = {"flux": root / "flux" / "pipeline", "sd3": root / "sd3" / "pipeline",
+                   "sd": tiny_pipeline(root, "sd")}
     return {family: Pretrained.load(directory, dtype="float32", attention_impl="xla")
             for family, directory in directories.items()}
 
