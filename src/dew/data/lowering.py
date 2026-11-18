@@ -1779,8 +1779,7 @@ class _Build:
                 carried = index
             if index == carried and pool is not None:
                 rows = self.handed_on(rows, pipeline, partition, pool, carried, spread,
-                                      streak=_barren_bound(pipeline.stages, passes, carried,
-                                                                partition.count))
+                                      streak=_barren_bound(pipeline.stages, passes, carried, partition.count))
             if isinstance(stage, (BatchStage, MapBatch)):
                 break
             if index == self.lowering.absorbed:
@@ -1812,8 +1811,7 @@ class _Build:
                 ran = index + len(run)
                 rows = self.record_stage(rows, run, pipeline, partition, index, marked=index < carried,
                                          unplaced=index <= last < ran,
-                                         streak=_barren_bound(pipeline.stages, passes, ran,
-                                                                partition.count))
+                                         streak=_barren_bound(pipeline.stages, passes, ran, partition.count))
             elif index < carried and isinstance(stage, Repeat) and not isinstance(rows, pygrain.MapDataset):
                 # A worker's inputs hold a marker for each record dropped, so a pass with nothing
                 # in it holds no input: that worker reads no more, and the others read on.
@@ -1838,8 +1836,7 @@ class _Build:
                 rows = self.stage(rows, stage, pipeline, partition, index)
         if carried == len(pipeline.stages) and pool is not None:
             rows = self.handed_on(rows, pipeline, partition, pool, carried, spread,
-                                  streak=_barren_bound(pipeline.stages, passes, carried,
-                                                                partition.count))
+                                  streak=_barren_bound(pipeline.stages, passes, carried, partition.count))
         return self.delivered(rows, pipeline, counting=counting, examples=examples)
 
     def skipping(self, rows: pygrain.MapDataset, pipeline: Pipeline, at: int) -> pygrain.MapDataset:
