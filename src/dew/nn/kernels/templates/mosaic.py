@@ -1625,7 +1625,10 @@ class Transport[Allocated, Opened](abc.ABC):
         products are issued on one (`Issuer.places_on_role`), each a branch of one switch where `exclusive`
         (`handoffs.Schedule.run`); the consumers' value where they are its every warpgroup."""
         schedule = self.roles(consumers, floor)
-        bodies = {"consumer": consumer, "producer": producer, "issuer": issuer}
+        # The producer and the issuer one unit each, of no index (`handoffs.Schedule.run`'s).
+        bodies = {"consumer": consumer, "producer": lambda index: producer()}
+        if issuer is not None:
+            bodies["issuer"] = lambda index: issuer()
         return schedule.run(exclusive=exclusive, **{role.name: bodies[role.name] for role in schedule.roles})
 
     def lifetimes(self, streams: Allocated, steps: int | None = None) -> tuple[tuple, tuple]:

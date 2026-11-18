@@ -283,7 +283,7 @@ def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu:
 
 def test_a_blackwells_gathered_product_lowers_for_cuda():
     """A gathered grouped product on a compile-only B200 lowers through Mosaic GPU on tcgen05's bundle: its
-    load warp's TMA four-row gathers into the swizzled ring (`gathered.tma_rows`), each slot released by its
+    load warp's TMA four-row gathers into the swizzled ring (`gathered.Gathers`), each slot released by its
     products' commit; and its kernel gradient's tables at the tile its launch derives for a wide and a
     32-column cotangent, one its launch takes (`legal`), on whichever family derives it."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
