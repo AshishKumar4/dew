@@ -1857,8 +1857,8 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
     owner = load("child_groups", "tools/armada").SOURCE.relative_to(ROOT)
     (tmp_path / owner).parent.mkdir(parents=True)
     shutil.copy(ROOT / owner, tmp_path / owner)
-    # The cgroup reader every task reads its peak through (host.py's `CGROUPS`).
-    reader = load("host", "tools/armada").CGROUPS.relative_to(ROOT)
+    # The cgroup reader every task reads its peak through (host.py's `cgroups`).
+    reader = Path(load("host", "tools/armada").cgroups().__file__).relative_to(ROOT)
     (tmp_path / reader).parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(ROOT / reader, tmp_path / reader)
     shutil.copy(ROOT / "pyproject.toml", tmp_path / "pyproject.toml")

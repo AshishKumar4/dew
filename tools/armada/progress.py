@@ -4,10 +4,9 @@ ends, so the task's next attempt, recalled while it ran, sets them aside and goe
 (tools/armada/ci.py `resumed`, armada's ARMADA_RESUME). Loaded by a CI task's pytest beside executed.py;
 writes nothing outside a task."""
 
-import functools
-import importlib.util
 import json
 import os
+import types
 from collections.abc import Callable
 from pathlib import Path
 
@@ -65,31 +64,24 @@ def pytest_runtest_logreport(report) -> None:
             Path(artifacts).mkdir(parents=True, exist_ok=True)
             with (Path(artifacts) / PROGRESS).open("a") as progress:
                 # The attempt's peak by then, which bounds this test (`task_peak`).
-                peak = task_peak()
+                import host
+
+                peak = task_peak(host)
                 progress.write(json.dumps({"node": report.nodeid, "seconds": seconds,
                                            **({"cold": True} if cold else {}),
                                            **({"peak": peak} if peak is not None else {})}) + "\n")
 
 
-def task_peak() -> int | None:
+def task_peak(host: types.ModuleType) -> int | None:
     """This task's resident peak in bytes so far: its cgroup's (cgroup v2's memory.peak, which every process
     the task started counts in, a test's ranks with it), each of its tests' bound above (row 6003: a test's
     four ranks peaked at 7.17 GiB, packed beside another on a medium), read by Dew's one cgroup reader
-    (src/dew/data/cgroups.py through host.py, its root DEW_CGROUP_ROOT's where set). None where the task's
-    cgroup states no peak."""
-    reader = _host().cgroups()
-    return reader.memory_peak(reader.own(_host().cgroup_root()))
+    through `host` (tools/armada/host.py: src/dew/data/cgroups.py, its root DEW_CGROUP_ROOT's where set),
+    which a task's pytest imports (tools/armada on its path) and ci.py loads. None where the task's cgroup
+    states no peak."""
+    reader = host.cgroups()
+    return reader.memory_peak(reader.own(host.cgroup_root()))
 
-
-@functools.cache
-def _host():
-    """host.py beside this plugin, loaded once by its path, as ci.py loads its neighbours: this module runs in
-    a task's pytest and inside ci.py alike, and neither puts tools/armada on sys.path."""
-    spec = importlib.util.spec_from_file_location("armada_host", Path(__file__).with_name("host.py"))
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def resumed(tests: list[str], owning: Callable[[str], str]) -> tuple[dict[str, float], set[str], int | None]:

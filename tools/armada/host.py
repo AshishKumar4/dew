@@ -15,15 +15,12 @@ CPUINFO = Path("/proc/cpuinfo")
 """Linux's description of the host's processors."""
 
 
-CGROUPS = Path(__file__).resolve().parents[2] / "src" / "dew" / "data" / "cgroups.py"
-"""Dew's raw cgroup (v2) reader, which every CI task reads its peak through (progress.py's `task_peak`)."""
-
-
 @functools.cache
 def cgroups():
-    """Dew's raw cgroup (v2) reader (`CGROUPS`), the standard library alone, loaded once by its path where a
-    limit is read: CI keys a host before Dew is importable (row 4161)."""
-    spec = importlib.util.spec_from_file_location("dew_cgroups", CGROUPS)
+    """Dew's raw cgroup (v2) reader, src/dew/data/cgroups.py, the standard library alone, loaded once by its
+    path where a limit is read: CI keys a host before Dew is importable (row 4161)."""
+    spec = importlib.util.spec_from_file_location(
+        "dew_cgroups", Path(__file__).resolve().parents[2] / "src" / "dew" / "data" / "cgroups.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
