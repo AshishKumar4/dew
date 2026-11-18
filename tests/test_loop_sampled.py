@@ -358,7 +358,7 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
     step = sampled.compile(state, batch)
     assert isinstance(step, DrawingStep)
     interval = Interval(time.time(), None, microbatches=0)
-    flops = step.drawn(TRAINED, sampled.key, interval, 0)
+    flops = step.drawn(interval, 0)
     _, _, metrics, *_ = step(state, batch)
     work = counted[TRAINING_FLOPS]
     expected = sum(jnp.sum(jnp.asarray(work[part::2, count - 1]), dtype=jnp.float32)
