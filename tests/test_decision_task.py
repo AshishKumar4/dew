@@ -982,6 +982,26 @@ def test_runs_whose_data_hold_other_widths_average_padded_to_the_widest(decide, 
     assert average.options == budgets[0].options
 
 
+def test_a_run_continued_from_its_runs_release_averages_with_its_start(decide, tmp_path):
+    """A run exported as a release (`Decide.save_pretrained`), a run continued from that release and the
+    run it started from average as one task's (`Decide.averaged`). transformers writes the release's
+    tokenizer files as it holds them, tokenizer.json among them, so their hashes differ from its run's:
+    the two are one tokenizer by both written again by this host's transformers (`canonical_files`). The
+    hashes alone compared them, and averaging refused a continued run its own start (row 7387)."""
+    import hashlib
+
+    start = trained_runs(decide, tmp_path, 1, name="start")[0]
+    release = tmp_path / "release"
+    Decide.from_run(start).save_pretrained(release)
+    folder = next(release.rglob("tokenizer.json")).parent
+    held = Decide.from_run(start).tokenizer.pinned
+    assert {path: hashlib.sha256((folder / path).read_bytes()).hexdigest() for path in held.files} != dict(
+        held.files)
+    continued = trained_runs(Decide.from_pretrained(str(release), attention_impl="xla"), tmp_path, 1,
+                             name="continued")[0]
+    assert Decide.averaged([start, continued]).weights.averaged
+
+
 def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_path):
     """Runs average where their recorded task settings are one task's: a run whose head trained under
     dropout averages with one that trained none, as dropout says how a head trains and not what it

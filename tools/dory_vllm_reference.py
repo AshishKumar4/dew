@@ -557,22 +557,53 @@ LOOPS = sorted({loops for loops, _, _ in RUNS})
 """The release's loop counts, each a model `invariance` builds."""
 
 
+def chain_roundings(text: dict, loops: int, length: int) -> int:
+    """An upper bound on the roundings a prompt row's log-probabilities go through in the release's model
+    code over `length` tokens at `loops` recurrent loops (`assert_computes_the_oracle`'s `roundings`): the
+    layers each loop runs, the input layers, the recurrent ones `loops` times and the output layers
+    (`layer_types`, `n_input_layers`, `n_recurrent_layers`, `n_output_layers`), each summing the reductions
+    an output's chain passes in it. An attention layer: its query, key, value and gate projections over the
+    width, each head's query and key normalized over its width, the scores over a head's width, the softmax's
+    sum and the values' over the tokens, the output projection over every head's, and the step's two
+    normalizations over the width (nGPT's `slerp_norm`). A feed-forward layer: its projections over the
+    width, its normalization and its down projection over the intermediate width, and the step's two over
+    the width. Then the embedding's and the final normalization over the width, the head over it, and the
+    log-softmax over the vocabulary."""
+    width, inner, head = text['hidden_size'], text['intermediate_size'], text['head_dim']
+    first, recurrent = text['n_input_layers'], text['n_recurrent_layers']
+    kinds = text['layer_types']
+    run = kinds[:first] + kinds[first:first + recurrent] * loops + kinds[first + recurrent:]
+    attention = 4 * width + 2 * head + head + 2 * length + text['num_attention_heads'] * head + 2 * width
+    feed_forward = width + 2 * inner + 2 * width
+    return (sum(feed_forward if kind == 'mlp' else attention for kind in run)
+            + 3 * width + 2 * text['vocab_size'])
+
+
 def invariance(directory: Path) -> None:
     """The evidence each order is an exact symmetry: vLLM's own model code in float64 (`model_code`,
     under src/_dew_torch/precision.py's `float64`) on the sentence's prompt under every order of every
     batch (`symmetry`, `permute`), each order's largest distance from the identity's rows over their
     largest magnitude, which float64 rounding alone moves, `invariance-{loops}.npy` `[batches, ORDERS]`
-    float64 for each loop count, as many batches as any run is recorded under."""
+    float64 for each loop count, as many batches as any run is recorded under. Each order's rows are held
+    to the identity's within float64 rounding over the computation's longest chain of reductions
+    (`chain_roundings`, `assert_computes_the_oracle`), as tools/rounding_orders.py's `symmetric` holds Dew's
+    orders: a permutation that breaks the symmetry moves the rows by orders of magnitude more, where the
+    distance alone, kept in the provenance, was judged nowhere."""
     import torch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tests'))
+    from reference_error import assert_computes_the_oracle
 
     from _dew_torch.precision import float64
 
     config, tensors = release()
     probe = np.load(directory / 'probe.npz')
+    text = config.get('text_config', config)
     with float64():
         for loops in LOOPS:
             model, rows = model_code(config, tensors, loops, 'per_loop', torch.float64)
             identity = rows(probe['sentence'], probe['sentence'][:0], prompt_rows=True)
+            roundings = chain_roundings(text, loops, len(probe['sentence']))
             batches = max(BATCHES.values())
             scale, apart = float(np.max(np.abs(identity))), np.zeros((batches, ORDERS))
             for batch in range(batches):
@@ -580,6 +611,8 @@ def invariance(directory: Path) -> None:
                     permute(model, config, symmetry(config, batch, index))
                     found = rows(probe['sentence'], probe['sentence'][:0], prompt_rows=True)
                     apart[batch, index] = float(np.max(np.abs(found - identity))) / scale
+                    assert_computes_the_oracle(found, identity, f'{loops} loops, order {batch}.{index}',
+                                               roundings=roundings)
                 print(f'{loops} loops, batch {batch}: worst {apart[batch].max():.2e}', flush=True)
             np.save(directory / f'invariance-{loops}.npy', apart)
             del model, rows

@@ -1148,7 +1148,7 @@ def _compiled(
         volatile=any(_volatile(stage) for stage in (*_steps(original), *(
             stage for source in sources for stage in _written(source, ())))),
         # The steps it describes read a saved plan's earlier descriptions of them (`ReadsEarlier`).
-        earlier=earlier_readers((*described, *host)),
+        earlier=earlier_readers(described, host),
     )
     tuned = build.tuned(train, batches=batches)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.

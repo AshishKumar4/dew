@@ -53,7 +53,7 @@ from dew.nn.host_memory import fetched, fetched_at, on_host, placed_like, stored
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, Choice, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
-from dew.nn.precision import at_least_fp32, divided, float32_einsum
+from dew.nn.precision import at_least_fp32, declares_fp32_products, divided, float32_einsum
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import manual_map, sequence_shards
 
@@ -1350,6 +1350,17 @@ TPU_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
                 row='roadmap: TPU paged decode over windows'),
     Requirement('sinks', lambda case: not case.sinks,
                 "jax's TPU paged attention has no sinks; the gathered rows' attention applies them",
+                row=INHERENT),
+    Requirement('lanes', lambda case: case.head_dim % 128 == 0,
+                lambda case: f"jax's TPU paged attention blocks its outputs in 128-lane tiles, which a "
+                             f"{case.head_dim}-wide head does not fill (Pallas TPU's block rule, row 7228)",
+                row=INHERENT),
+    Requirement('fp32_by_bf16_precise',
+                lambda case: (not declares_fp32_products(jax.config.jax_default_matmul_precision)
+                              or generation.gpu_target().fp32_by_bf16_precise),
+                "the TPU's MXU takes no fp32-precision product of the kernel's fp32 weights with its bf16 "
+                "values, which a run declaring fp32 products asks of it (`precision.declares_fp32_products`: "
+                "'highest' or F32_F32_F32; a v5e, row 6994)",
                 row=INHERENT),
 )
 """jax's Pallas TPU paged attention, which applies a logit softcap itself."""

@@ -24,13 +24,12 @@ against 8.4).
 
 import abc
 import dataclasses
-import enum
 import functools
 import importlib
 import importlib.util
 import math
 from collections.abc import Callable
-from typing import ClassVar, NamedTuple, Protocol
+from typing import ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -39,6 +38,19 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from ...algebra import bits
 from . import generation, selection
 from .generation import INHERENT
+from .grouped_cells import (
+    B200_GRID,
+    EM35D,
+    M_EM_36,
+    M_EM_52,
+    M_EM_65,
+    M_EM_67,
+    MEASURED,
+    NORMED_08B,
+    NORMED_4B_8B,
+    Kind,
+    Made,
+)
 from .grouped_launch import INTERPRETED, _GroupedLaunch
 from .grouped_triton import Gmm, Tgmm, _gradient_sides, _product_sides
 from .templates import across, base, bundles, mosaic, report, resources, stores, swizzling
@@ -1706,44 +1718,6 @@ def _multiprocessors(target: generation.GpuTarget) -> int:
     return target.multiprocessors
 
 
-class Made(enum.Enum):
-    """What a grouped call makes (`Kind`): a forward product, its input gradient (the matrix read transposed),
-    or the matrices' kernel gradient, summed by the tensor cores or exactly (`exact_sums`)."""
-
-    FORWARD = 'forward'
-    INPUT_GRADIENT = 'input_gradient'
-    KERNEL_GRADIENT = 'kernel_gradient'
-    EXACT_KERNEL_GRADIENT = 'kernel_gradient exact'
-
-
-class Kind(NamedTuple):
-    """The kind of call a grouped product is (`GroupedCase.kind`), which with the device's instruction family
-    is its cell (`DECLARED`): dense (one matrix, every row) or grouped, what it makes, the operands no
-    receipt of a 16-bit call times: FP8 ones (XLA's dot of them sums narrower than the FP8 contract holds,
-    row 1625), rows gathered through a table or stored through one (no old route reads them); and, for a
-    dense product a receipt timed on its family (`MEASURED`: its matrix, over the rows it timed), that
-    matrix's `[in, out]` extents, a cell of its own, which the receipt's winner for it holds (None for every
-    other product, the kind's cell)."""
-
-    dense: bool
-    made: Made
-    fp8: bool = False
-    gathered: bool = False
-    scattered: bool = False
-    matrix: tuple[int, int] | None = None
-    formed: bool = False
-    """Whether its left operand is formed by a prologue the kernel runs tile by tile (a norm's normalization
-    the algebra's recognition fused into the product, `fused_gemm`), its call one that reads the rows the
-    prologue forms them from: a forward's or a kernel gradient's, a cell of its own where a receipt timed one
-    (`MEASURED`)."""
-
-    def __str__(self) -> str:
-        parts = (('fp8',) * self.fp8 + ('gathered',) * self.gathered + ('scattered',) * self.scattered
-                 + ('formed',) * self.formed)
-        timed = () if self.matrix is None else ('x'.join(map(str, self.matrix)),)
-        return ' '.join(('dense' if self.dense else 'grouped', self.made.value, *parts, *timed))
-
-
 @dataclasses.dataclass(frozen=True)
 class GroupedCase:
     """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run on its
@@ -1869,60 +1843,12 @@ CUTLASS = _launch_kernel(CutlassGmm.name, DECLARED_ONLY)
 """CUTLASS's launches, on their declared cells alone (`DECLARED_ONLY`)."""
 XLA = selection.Kernel[GroupedCase]('xla', (), generic=True)
 
-FOUR_B = ((2560, 9216), (9216, 2560), (2560, 1024), (2560, 64))
-"""Qwen3.5-4B's dense projections' matrices `[in, out]`: its MLP's up and down, its attention's key, its
-gated delta net's gates, which M-EM-36-gh200 and em35d timed at 24,576 tokens, each product of each."""
-
-class Timed(NamedTuple):
-    """The dense products a kind's receipts timed (`MEASURED`): of these `matrices` `[in, out]`, over `rows`
-    from `fewest` to `most` tokens. A receipt is evidence for the products it measured alone: a product of
-    another matrix, or of one of these over rows outside them, takes its kind's cell (row 6794: the 4B
-    key's cells, timed at 24,576 tokens, took a fine-tune's key and value products at 2,048, whose 216
-    template launches a step ran 6.57 ms, the step's dense products 1.75 ms slower than cuBLAS's alone)."""
-
-    matrices: frozenset[tuple[int, int]]
-    fewest: int
-    most: int
-
-    def holds(self, matrix: tuple[int, int], rows: int) -> bool:
-        """Whether a product of `matrix` over `rows` tokens is one these receipts timed."""
-        return matrix in self.matrices and self.fewest <= rows <= self.most
-
-
-NORMED_08B = ((1024, 4096 + 512 + 512), (1024, 2 * 3584))
-"""Qwen3.5-0.8B's normed projections M-EM-65 timed (`M_EM_65`): the attention input norm before the joined
-query (doubled by its output gate), key and value, and the MLP's norm before gate and up, `[in, out]`."""
-
-M_EM_65 = ("M-EM-65-a100 and M-EM-65-gh200 (an A100 and a GH200, main 99c7334e2, rounds.py's two arms "
-           "interleaved 5 rounds, CUPTI medians, 4 x 3072 rows of bf16, a training step's forward and "
-           "backward): the norm in the template's prologue against the fused norm kernel then XLA's dot, "
-           "0.955x and 0.619x at the attention norm + q/k/v, 0.971x and 0.533x at the MLP norm + gate/up, "
-           "ranges apart")
-MEASURED: dict[tuple[str | None, Made, bool], Timed] = {
-    **{(family, made, False): Timed(frozenset(FOUR_B), 24576, 49152) for family in ('wgmma', 'tcgen05')
-       for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT)},
-    **{(family, made, True): Timed(frozenset(NORMED_08B), 12288, 12288) for family in ('mma.sync', 'wgmma')
-       for made in (Made.FORWARD, Made.KERNEL_GRADIENT)}}
-"""The dense products each instruction family's receipts timed, by what the product makes: one of them is a
-cell of its own (`Kind.matrix`), which its receipt's winner holds; every other product its kind's. The
-receipts timed 24,576 tokens (M-EM-36, M-EM-52, em35d); the 4B step's 49,152 (four rows) held the same
-cells at parity with cuBLASLt (M-EM-54, interleaved in one session: 3,418.7 against 3,416.9 ms)."""
-
-M_EM_36 = ("M-EM-36-gh200 (a GH200, base/kernels df82480cb5c, CUPTI medians of 5 rounds, cuBLASLt autotuned "
-           "at run, 24,576 tokens)")
-M_EM_52 = ("M-EM-52-gh200 (a GH200 under its power cap, base/kernels 3bea6245b56's derivation: the kernel "
-           "gradient on a multicast pair, CUPTI medians of 5 rounds interleaved with cuBLASLt's, autotuned "
-           "in the same process, 24,576 tokens)")
-EM35D = ("em35d (a B200, base/kernels ce6eff7f0be, CUPTI medians of 5 rounds, cuBLASLt autotuned at run, "
-         "24,576 tokens)")
-B200_GRID = ("lab-b200-20261113-grid (a B200, base/kernels 5ac163abbec, medians of 5 rounds' same-round "
-             "ratios, cuBLASLt autotuned at run, 24,576 tokens; its down kernel gradient the template's, "
-             "0.833x)")
-
 DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {
     **{(family, Kind(dense=True, made=made, matrix=matrix, formed=True)): (MOSAIC, M_EM_65)
        for family in ('mma.sync', 'wgmma') for made in (Made.FORWARD, Made.KERNEL_GRADIENT)
        for matrix in NORMED_08B},
+    **{('wgmma', Kind(dense=True, made=made, matrix=matrix, formed=True)): (MOSAIC, M_EM_67)
+       for made in (Made.FORWARD, Made.KERNEL_GRADIENT) for matrix in NORMED_4B_8B},
     ('mma.sync', Kind(dense=True, made=Made.FORWARD)):
         (XLA, "DENSE1 (A100, a55c8ffb2, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
              "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens; M-FS-9 (RTX PRO 6000, "
@@ -2031,8 +1957,8 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     family = generation.family(call.target.generation)
 
     def timed(*, formed: bool) -> bool:
-        measured = MEASURED.get((family, made, formed))
-        return matrix is not None and measured is not None and measured.holds(matrix, rows)
+        return matrix is not None and any(timed.holds(matrix, rows)
+                                          for timed in MEASURED.get((family, made, formed), ()))
 
     formed = options['hooks'].prologue is not None and timed(formed=True)
     kind = Kind(bool(options['dense']), made, fp8=fp8, gathered=gathered, scattered=scattered,

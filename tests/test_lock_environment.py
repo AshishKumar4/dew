@@ -35,15 +35,15 @@ done
 
 def locked(tmp_path: Path, monkeypatch, **environment: str) -> tuple[subprocess.CompletedProcess, list[str]]:
     """tools/lock_environment.sh run in a copy of the checkout with uv's stand-in (`UV`, under `environment`),
-    Dew's package index served locally listing jax, qwix, a new fork and jax-cuda12-plugin: its run and its
-    calls to uv."""
-    site = tmp_path / "site" / "simple"
-    site.mkdir(parents=True)
-    (site / "index.html").write_text('<!DOCTYPE html>\n<html><body><h1>Simple index</h1>\n'
-                                     '<a href="jax/">jax</a><br>\n<a href="qwix/">qwix</a><br>\n'
-                                     '<a href="newfork/">newfork</a><br>\n'
-                                     '<a href="jax-cuda12-plugin/">jax-cuda12-plugin</a><br>\n'
-                                     '</body></html>\n')
+    Dew's package index served locally listing jax, qwix, a new fork and jax-cuda12-plugin, and the index's
+    staging of a release under test listing jaxlib, each an extra index of constraints.txt in place of those
+    it names: its run and its calls to uv."""
+    for index, projects in (("simple", ("jax", "qwix", "newfork", "jax-cuda12-plugin")),
+                            ("staging/simple", ("jaxlib",))):
+        site = tmp_path / "site" / index
+        site.mkdir(parents=True)
+        (site / "index.html").write_text('<!DOCTYPE html>\n<html><body><h1>Simple index</h1>\n' + "".join(
+            f'<a href="{name}/">{name}</a><br>\n' for name in projects) + '</body></html>\n')
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(tmp_path / "site"))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -54,9 +54,11 @@ def locked(tmp_path: Path, monkeypatch, **environment: str) -> tuple[subprocess.
         shutil.copy(ROOT / "tools/lock_environment.sh", checkout / "tools/lock_environment.sh")
         for name in ("pyproject.toml", ".python-version"):
             shutil.copy(ROOT / name, checkout / name)
-        index = f"http://127.0.0.1:{server.server_address[1]}/simple"
-        (checkout / "constraints.txt").write_text(
-            (ROOT / "constraints.txt").read_text().replace("https://pypi.dewml.dev/simple", index))
+        served = f"http://127.0.0.1:{server.server_address[1]}"
+        named = [line for line in (ROOT / "constraints.txt").read_text().splitlines()
+                 if not line.startswith("--extra-index-url ")]
+        indexes = [f"--extra-index-url {served}/staging/simple/", f"--extra-index-url {served}/simple"]
+        (checkout / "constraints.txt").write_text("\n".join([*indexes, *named]) + "\n")
         (tmp_path / "bin").mkdir()
         (tmp_path / "bin" / "uv").write_text(UV)
         (tmp_path / "bin" / "uv").chmod(0o755)
@@ -72,16 +74,17 @@ def locked(tmp_path: Path, monkeypatch, **environment: str) -> tuple[subprocess.
 
 
 def test_every_package_dews_index_serves_resolves_undated(tmp_path, monkeypatch):
-    """Dew's package index (constraints.txt's extra index) serves its own builds of packages (JAX's,
-    Qwix's), whose static pages give no upload times, so every package its root page lists resolves with no
-    date, however many the index serves, a dated list naming it or not: a lock dated past one of them finds
-    none of its versions (2026-10-28: qwix joined the index, and every lock check failed on "qwix==0.1.8 has
-    no publish time"; 2026-10-31: the CUDA plugins did, both undated and dated, and every version was
-    filtered)."""
+    """Dew's package index and a release under test's staging of it (constraints.txt's extra indexes) serve
+    their own builds of packages (JAX's, Qwix's), whose static pages give no upload times, so every package
+    either root page lists resolves with no date, however many each serves, a dated list naming it or not: a
+    lock dated past one of them finds none of its versions (2026-10-28: qwix joined the index, and every lock
+    check failed on "qwix==0.1.8 has no publish time"; 2026-10-31: the CUDA plugins did, both undated and
+    dated, and every version was filtered; 2026-11-16: post102's staging index, a second extra index, broke
+    the lock's one-index read)."""
     done, calls = locked(tmp_path, monkeypatch)
     assert done.returncode == 0, done.stderr
-    assert calls and all(f"--exclude-newer-package {name}=false" in call
-                         for call in calls for name in ("jax", "qwix", "newfork", "jax-cuda12-plugin")), calls
+    assert calls and all(f"--exclude-newer-package {name}=false" in call for call in calls
+                         for name in ("jax", "qwix", "newfork", "jax-cuda12-plugin", "jaxlib")), calls
     # A package the index serves takes no date of a dated list either: both flags at once filtered every
     # version of the CUDA plugin the index took (2026-10-31, ledger 3116: every lane's lock check failed).
     assert not any("--exclude-newer-package jax-cuda12-plugin=20" in call for call in calls), calls
