@@ -384,10 +384,12 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, 
             # Formed only where the segment opens its document: a continuation's memory gradient is the
             # chunk's, against which a term's products left fp32's range where the document's are in it,
             # and masked after, inf times zero gave every key gradient NaN (base review 13abb0d6b F1).
+            entries, gradients = entry, dentry
+
             @pl.when(load >= 0)
             def _():
-                key, value, weight = (ref[document] for ref in entry)
-                dkey, dvalue, dweight = dentry
+                key, value, weight = (ref[document] for ref in entries)
+                dkey, dvalue, dweight = gradients
                 # Each term's gradients, its key row's, its value column's and the weight's, each a sum of
                 # three-factor products formed range-preserving (`_product`), no two-factor partial of them.
                 rows = range(key.shape[0])
