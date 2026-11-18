@@ -48,7 +48,7 @@ def fused_seam(epsilon: float, dtype, offset: bool, after_cast: bool, *, axes=No
                                                                after_cast, portable, axes=axes)
 
 
-def fused_activated(epsilon: float, activation):
+def fused_activated(epsilon: float, activation, *, axes=None):
     """The fused RMS norm with `activation` after it (`norm_swiglu.rms_norm`'s epilogue), as `fused_seam`
     is."""
     def portable(x, scale):
@@ -57,26 +57,26 @@ def fused_activated(epsilon: float, activation):
                                      activation=activation)[1]
 
     return lambda x, scale: norm_swiglu.rms_norm(x, scale, epsilon, x.dtype, offset=False, after_cast=False,
-                                                 portable=portable, epilogue=activation)
+                                                 portable=portable, epilogue=activation, axes=axes)
 
 
-def fused_gated(epsilon: float, dtype, activation: str):
+def fused_gated(epsilon: float, dtype, activation: str, *, axes=None):
     """The fused gated norm called itself (`norm_swiglu.gated_rms_norm`), as `fused_seam` is."""
     def portable(x, gate, scale):
         return gated_rms_normalized(x, gate, scale, epsilon, dtype, activation, implementation="xla")
 
     return lambda x, gate, scale: norm_swiglu.gated_rms_norm(x, gate, scale, epsilon, dtype, activation,
-                                                            portable)
+                                                            portable, axes=axes)
 
 
-def fused_unweighted(epsilon: float):
+def fused_unweighted(epsilon: float, *, axes=None):
     """`norms.unweighted_rmsnorm` fused (`norm_swiglu.rms_norm`'s `inverse_rounded`), as `fused_seam`
     is."""
     def portable(x, scale):
         return norms.unweighted_rmsnorm(x, epsilon, implementation="xla")
 
     return lambda x: norm_swiglu.rms_norm(x, None, epsilon, x.dtype, offset=False, after_cast=False,
-                                          portable=portable, inverse_rounded=True)
+                                          portable=portable, inverse_rounded=True, axes=axes)
 
 
 def fused_swiglu(*, axes=None):
