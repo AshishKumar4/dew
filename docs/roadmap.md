@@ -76,7 +76,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Time to first step: the compile path's re-derivations. [5556]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - XLA:CPU edges. [1591]
-- Training and serving efficiency. [1880, 5292]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
@@ -84,6 +83,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Data
 
+- Training and serving efficiency. [5292]
 - The diffusion kinds' starts keep no record and their refits trace again. [6297]
 
 ## RL and serving
