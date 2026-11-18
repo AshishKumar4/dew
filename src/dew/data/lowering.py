@@ -1779,7 +1779,7 @@ class _Build:
                 carried = index
             if index == carried and pool is not None:
                 rows = self.handed_on(rows, pipeline, partition, pool, carried, spread,
-                                      streak=_barren_bound(pipeline.stages, passes, carried, partition.count))
+                                      streak=self.barren_bound(pipeline, passes, carried, partition))
             if isinstance(stage, (BatchStage, MapBatch)):
                 break
             if index == self.lowering.absorbed:
@@ -1811,7 +1811,7 @@ class _Build:
                 ran = index + len(run)
                 rows = self.record_stage(rows, run, pipeline, partition, index, marked=index < carried,
                                          unplaced=index <= last < ran,
-                                         streak=_barren_bound(pipeline.stages, passes, ran, partition.count))
+                                         streak=self.barren_bound(pipeline, passes, ran, partition))
             elif index < carried and isinstance(stage, Repeat) and not isinstance(rows, pygrain.MapDataset):
                 # A worker's inputs hold a marker for each record dropped, so a pass with nothing
                 # in it holds no input: that worker reads no more, and the others read on.
@@ -1836,7 +1836,7 @@ class _Build:
                 rows = self.stage(rows, stage, pipeline, partition, index)
         if carried == len(pipeline.stages) and pool is not None:
             rows = self.handed_on(rows, pipeline, partition, pool, carried, spread,
-                                  streak=_barren_bound(pipeline.stages, passes, carried, partition.count))
+                                  streak=self.barren_bound(pipeline, passes, carried, partition))
         return self.delivered(rows, pipeline, counting=counting, examples=examples)
 
     def skipping(self, rows: pygrain.MapDataset, pipeline: Pipeline, at: int) -> pygrain.MapDataset:
@@ -1933,6 +1933,17 @@ class _Build:
         keyed = hashlib.blake2b(repr((stage.seed, key)).encode(), digest_size=4).digest()
         return dataclasses.replace(stage, seed=int.from_bytes(keyed, "big"))
 
+    def cut_after(self, partition: DataPartition) -> int:
+        """The shares `partition`'s cut takes of the rows a read's stages make (`_same_each_pass`): its count
+        where the read cuts one global order after them, 1 where it reads per share, cutting its inputs
+        before any stage, so its passes hold its own records whatever a shuffle draws."""
+        return partition.count if self.global_order else 1
+
+    def barren_bound(self, pipeline: Pipeline, passes: tuple[int, int] | None, ran: int,
+                     partition: DataPartition) -> Streak | None:
+        """`_barren_bound` of `pipeline`'s stages for `partition`'s share (`cut_after`)."""
+        return _barren_bound(pipeline.stages, passes, ran, self.cut_after(partition))
+
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:
         """`rows` through `stage`, written at `at` in `pipeline`, a shuffle as this build orders it
         (`ordered`)."""
@@ -1946,7 +1957,7 @@ class _Build:
         if isinstance(stage, Repeat):
             before = pipeline.stages[:at]
             certain = (not any(_drops(written) for written in before)
-                       or _same_each_pass(before, partition.count))
+                       or _same_each_pass(before, self.cut_after(partition)))
             varying = () if certain else _varying(before)
             share = f"{_name(pipeline)} (share {partition.index} of {partition.count})"
             return _repeated(rows, stage.epochs, share, self.loading, certain=certain, varying=varying)
