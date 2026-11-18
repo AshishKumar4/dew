@@ -583,6 +583,22 @@ def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(ta
         jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4))).trace(*operands).lower(lowering_platforms=("cuda",))
 
 
+@lowers("sm90")
+def test_a_turned_forked_call_lowers_for_a_gpu_under_a_mesh():
+    """A turned forked call (`Hooks.turns`, Mamba-3's: its documents' load rotation, `Forked.turning`) with
+    entry writes, through the public chunked op on the template, lowered for an H100 under a mesh, as
+    training runs every call (`jax.set_mesh`): each operand its shard spec (`_template_launch`), where the
+    load rotation took none and the specs' zip with the operands refused the call under any mesh (row
+    7973)."""
+    from test_recurrence_chunk import TURNED, entered_draw, entering_documents
+
+    operands = entering_documents(entered_draw(TURNED, 0, entries=True)[0])
+    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(lambda given: chunk_on('mosaic_gpu', TURNED, given)).trace(operands).lower(
+            lowering_platforms=("cuda",))
+
+
 def test_a_ranged_calls_inverse_states_the_fp32_parts_its_merges_issue():
     """A bf16 Kimi delta attention forward with no bound on its inverse, lowered for an H100: its chunk
     inverse's doubling merges in fp32 (`Call.ranged`), two bf16 parts on warpgroup products, which take no
