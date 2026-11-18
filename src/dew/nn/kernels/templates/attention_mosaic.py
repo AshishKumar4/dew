@@ -241,6 +241,12 @@ def _sides(rows: int, family: mosaic.Family, dtype, extent: int) -> tuple[int, .
     return tuple(side for side in walked_extents(family, dtype, extent) if side % rows == 0)
 
 
+def _query_walk(rows: int | None) -> Callable[..., tuple[int, ...]]:
+    """The query blocks a backward walks for a consumer of `rows` rows, largest first: a role's (None)
+    `extents`, fewer rows' (`fewer_rows`) `_sides`; its derivation's walk and its ladder's (`ladder`)."""
+    return extents if rows is None else functools.partial(_sides, rows)
+
+
 @dataclasses.dataclass(frozen=True)
 class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config]):
     """What this mainloop's launches share as Template implementations (`MosaicForward`, `MosaicBackward`):
@@ -1496,17 +1502,17 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         return next((config for config in (*fused, *two) if self.takes(ba, config, target)), None)
 
     def ladder(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
-        # The query blocks its derivation walks below `config`'s (`_derived`'s walk, `extents`: whole units of
-        # its family's role and swizzled rows), `config`'s other fields kept, within its register cap and
-        # residency, largest first.
+        # The query blocks its derivation walks below `config`'s for its consumer's rows (`_query_walk`),
+        # `config`'s other fields kept, within its register cap and residency, largest first.
         if not self._typed(config):
             return ()
         target = generation.gpu_target()
         query = ba.arguments["query"]
+        family = bundle_of(config, query.dtype)
+        walk = _query_walk(config.block_k if config.block_k in fewer_rows(family) else None)
         regime = (self.register_budget(config), self.resident(ba, config, target))
         smaller = (dataclasses.replace(config, block_q=block)
-                   for block in extents(bundle_of(config, query.dtype), query.dtype, query.shape[1])
-                   if block < config.block_q)
+                   for block in walk(family, query.dtype, query.shape[1]) if block < config.block_q)
         return tuple(rung for rung in smaller if self.takes(ba, rung, target)
                      and (self.register_budget(rung), self.resident(ba, rung, target)) == regime)
 
@@ -1616,7 +1622,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             for columns in (1, 2, 4):
                 fewer = fewer_rows(dq) if _fewer_hooked(self.score_mod, self.score_reads[0], dq) else ()
                 for rows in (None, *fewer):
-                    walks = extents if rows is None else functools.partial(_sides, rows)
+                    walks = _query_walk(rows)
                     for staged in (False, True):
                         def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
                                   ) -> BackwardTiles:
