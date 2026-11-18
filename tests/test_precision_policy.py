@@ -967,13 +967,14 @@ def test_dews_own_transcendentals_are_as_exact_as_jaxs_across_their_range(name, 
     to large positive and near zero, their input in fp32 and bf16 (check 1)."""
     from contract_support import on_a_tpu
 
-    from dew.nn import precision
+    from dew.nn import activations, precision
 
     def draw(seed):
         x = np.random.default_rng(seed).uniform(*span, 4096).astype(np.float32)
         return (jnp.asarray(x, dtype),)
 
-    ours, theirs = {"softplus": (precision.softplus, jax.nn.softplus), "silu": (precision.silu, jax.nn.silu),
+    ours, theirs = {"softplus": (precision.softplus, jax.nn.softplus),
+                    "silu": (activations.silu, jax.nn.silu),
                     "exp": (on_a_tpu(precision.accurate_exp), jnp.exp),
                     "exp2": (on_a_tpu(functools.partial(precision.accurate_exp, base2=True)), jnp.exp2)}[name]
     for part, mine, jaxs in (("value", ours, theirs),
@@ -1129,6 +1130,47 @@ def test_a_float64_value_asked_for_without_x64_fails_rather_than_computing_in_fl
         jnp.ones(3, jnp.float64)
     with jax.enable_x64(new_val=True):
         assert jnp.ones(3, jnp.float64).dtype == jnp.float64
+
+
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+def test_a_gated_norms_gate_gradient_is_a_number_where_its_exp_overflows(activation):
+    """A gated norm's gate on JAX's derivative (the portable path, `norms.gated_rms_normalized`) at gates of
+    -100 and -1000, where `e^-gate` overflows fp32: every gradient a number, as the one logistic's declared
+    tangent gives it (`activations.GATE_ACTIVATIONS`), where JAX's derivative of the logistic's arithmetic
+    made the gate's zero times infinity. Its values are the gated norm's own check 1's
+    (tests/test_norm_swiglu.py)."""
+    from dew.nn.norms import gated_rms_normalized
+
+    x = jnp.asarray(np.random.default_rng(7609).standard_normal((2, 8)), jnp.float32)
+    gate = jnp.asarray([[-100.0, -1000.0, -3.0, 0.5, 17.0, -100.0, 2.0, -50.0]] * 2, jnp.float32)
+    scale = jnp.ones((8,), jnp.float32)
+
+    def loss(x, gate):
+        return jnp.sum(gated_rms_normalized(x, gate, scale, 1e-6, x.dtype, activation, implementation="xla"))
+
+    grads = jax.grad(loss, argnums=(0, 1))(x, gate)
+    assert all(np.all(np.isfinite(np.asarray(grad))) for grad in grads)
+
+
+@pytest.mark.parametrize("gate", [17.0, 20.0, -17.0])
+def test_a_kernels_logistic_slope_is_the_declared_tangents_past_its_value_rounding_to_one(gate):
+    """A kernel's slope of the one logistic (`precision.activation_and_slope`, the recurrence conv's
+    backward) is the declared tangent's, `s(x) s(-x)` (`activations.logistic`'s, as JAX differentiates it),
+    bit for bit, and a number past zero at an fp32 gate of 17, where `s(x)` rounds to one and `s (1 - s)`
+    made the slope zero; silu's is `s + g s(x) s(-x)`, the product rule over it. Their values against
+    float64 are the logistic's contract's (`test_silu_holds_every_order`)."""
+    from dew.nn.activations import logistic
+    from dew.nn.precision import activation_and_slope, logistic_value
+
+    value = jnp.asarray([gate], jnp.float32)
+    declared = jax.grad(lambda g: logistic(g)[0])(value)
+    _, slope = activation_and_slope(value, "sigmoid")
+    np.testing.assert_array_equal(np.asarray(slope), np.asarray(declared))
+    product = logistic_value(value) * logistic_value(-value)
+    np.testing.assert_array_equal(np.asarray(slope), np.asarray(product))
+    assert float(slope[0]) > 0
+    _, silu_slope = activation_and_slope(value, "silu")
+    np.testing.assert_array_equal(np.asarray(silu_slope), np.asarray(logistic_value(value) + value * slope))
 
 
 def _ones(digits: int, exponent: int) -> float:

@@ -723,7 +723,7 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
     group by group, the way the slots are placed (a prefilled admission's state
     rows first, `_rows_first`); None leaves them where they are. `options` are
     the program's own XLA options beside the run's
-    (`decode_programs`: the model's `dew.nn.kernels.options.compiler_options`,
+    (`decode_programs`: the opened `dew.nn.kernels.options.compiler_options`,
     and the admitting step's); pass XLA_FLAGS to change the backend's
     defaults. See docs/performance.md for the measurements.
     """
@@ -984,7 +984,7 @@ def dispatched(program: OuterProgram) -> Step:
 
 def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, Option]
                     ) -> tuple[OuterProgram, OuterProgram]:
-    """`_compiled` over `formats` and model `options`
+    """`_compiled` over `formats` and the run's `options`
     (`dew.nn.kernels.options.compiler_options`), for the decoding step and
     the admitting one, compiled without CUDA command buffers on a GPU
     (`dew.nn.kernels.options.UNGRAPHED_OPTIONS`): its inputs are fresh

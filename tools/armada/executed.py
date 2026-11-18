@@ -17,6 +17,7 @@ import json
 import os
 import sys
 
+import grading
 import lifetime
 import pytest
 from session import MARKS
@@ -57,7 +58,7 @@ lifetime.leading()
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
-    name = item.nodeid.split("::")[0]
+    name = grading.owning(item.nodeid)
     if lifetime.owners[0] != name:
         lifetime.switch(name)
     for mark in MARKS:
@@ -93,7 +94,7 @@ def pytest_collectreport(report):
 def tally(counts: dict[str, int], items) -> None:
     """Each item's test file counted once more in `counts`."""
     for item in items:
-        name = item.nodeid.split("::")[0]
+        name = grading.owning(item.nodeid)
         counts[name] = counts.get(name, 0) + 1
 
 

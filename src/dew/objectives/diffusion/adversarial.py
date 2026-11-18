@@ -32,6 +32,7 @@ from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
+from dew.nn.activations import logistic
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.conv import convolution
 from dew.nn.dit import TextContext, masked_mean
@@ -304,7 +305,7 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         clean, _ = student.convert(noisy, t, output)
 
         mean, std = self.renoise_times
-        level = jax.nn.sigmoid(mean + std * step.sample("renoise times", jax.random.normal, (),
+        level = logistic(mean + std * step.sample("renoise times", jax.random.normal, (),
                                                         dtype=jnp.float32, rows=count))
         rates = broadcast_rates(schedule, level, samples)
         renoise = step.sample("renoise", jax.random.normal, samples.shape[1:], dtype=jnp.float32, rows=count)

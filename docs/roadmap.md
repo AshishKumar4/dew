@@ -10,8 +10,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - finished_merged's mean is 0 where its slices' masses total past fp32's largest. [6904]
 - finished_merged's derivative along its denominators is NaN where (o - out) / W passes fp32 though its product with the tangent does not. [6905]
-- The flash fallback's packed documents on a TPU give wrong results. [6981]
-- Splash's training step on a v5e is not finite in its value gradient. [7226]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -28,11 +26,11 @@ This page is generated from the maintainers' findings ledger as each change land
 - finished_merged's derivative as to a slice of zero total is 0 where the merge formula's is (o - out) e^(m - M) / W. [7124]
 - The kernel gate reads no resource report of a fp32 decode's plain-forward kernels. [7263]
 - The row-indexed hooked attention backward compile nodes (test_attention_mosaic_compile spill-free, sm80/sm86/sm89 accurate, row-indexed hook) take 209-295 s…. [7360]
-- No test exercises the TPU paged decode (jax's pallas tpu paged_attention via kv_cache) on a v5e. [7385]
 - Tests/test_mamba3.py::test_the_chunked_form_is_as_exact_as_the_recurrence passes vacuously on main. [7401]
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-data] took 683 s (a check-1 site: its longest draws task 621 s (1 draws),…. [7603]
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-fsdp] took 613 s (a check-1 site: its longest draws task 550 s (1 draws),…. [7604]
 - A warp-uniform read of a shared-memory scalar for the Mosaic GPU toolkit. [7898]
+- A decode step's query and output pass through grouped_rows' transpose ([B,T,KV,G,D] to [B,T,G,KV,D] and back, attention.py:1113-1128) and a pad to the launch's…. [7926]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -73,9 +71,8 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Training and parallelism
 
 - Time to first step: the compile path's re-derivations. [5556]
-- Distributed and memory training modes. [156, 873, 1306, 1307, 617]
+- Distributed and memory training modes. [156, 873, 1306, 617]
 - XLA:CPU edges. [1591]
-- Training and serving efficiency. [1880, 5292]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
@@ -83,6 +80,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Data
 
+- Training and serving efficiency. [5292]
 - The diffusion kinds' starts keep no record and their refits trace again. [6297]
 
 ## RL and serving
@@ -96,8 +94,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Bit-level synthesis in dew.algebra. [3733]
-- Check1 qualification on prepared arms. [7606]
-- An arm's mutable containers stated by type. [7674]
+- The merge law's placed sum keeps two bands of a term's span, not three. [8061]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
@@ -109,6 +106,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Every model comparison on check 1. [2300, 3722, 5212]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 - Py `_holds_regions`: 'any other holder of a program (a manual mesh's, a native kernel's) is an opaque leaf'), so a projection mapped per shard…. [6578]
+- Check 2's ratio contract reads the law's bound looser than its spec states. [7980]
 
 ## Tutorials and docs
 

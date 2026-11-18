@@ -65,7 +65,7 @@ from jaxlib import xla_client
 
 from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
-from dew._devices import COMPILE_ONLY_MEMORY, device_memory
+from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, device_memory, pool_share
 from dew._records import JSON, boolean, record
 from dew._stated import Unestablished, traceback_frames
 from dew.batch import Batch
@@ -129,20 +129,22 @@ def compile_only_tpus(topology: str) -> tuple:
 
 
 @contextlib.contextmanager
-def stand_in_gpus(devices: Sequence, memory: int) -> Iterator[tuple]:
+def stand_in_gpus(devices: Sequence, memory: int, share: float | None = None) -> Iterator[tuple]:
     """`devices`, a host's own CPU devices (`jax.devices("cpu")`), each stated to hold a GPU's `memory`, its
-    total bytes as the GPU states them, while the block runs: every layout check and admission on them reads
-    the allocator's limit derived from it (`dew._devices.allocator_limit`, `COMPILE_ONLY_MEMORY`), as
-    `compile_only_gpus`' do, where JAX's CUDA plugin, which those need, does not install. `Trainer.validate`
-    checks a run's layout on them against the GPUs' limits; a program compiles for the CPU."""
+    total bytes as the GPU states them, at `share`, the pool's share in the run they stand in for (this
+    process's own, `pool_share`, read as the block opens, where none is given), while the block runs: every
+    layout check and admission on them reads the allocator's limit derived from them
+    (`dew._devices.allocator_limit`, `StatedGpu`), as `compile_only_gpus`' do, where JAX's CUDA plugin,
+    which those need, does not install. `Trainer.validate` checks a run's layout on them against the GPUs'
+    limits; a program compiles for the CPU."""
     positive_memory(memory)
     devices = tuple(devices)
-    COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
+    STATED_GPUS.update(dict.fromkeys(devices, StatedGpu(memory, pool_share() if share is None else share)))
     try:
         yield devices
     finally:
         for device in devices:
-            del COMPILE_ONLY_MEMORY[device]
+            del STATED_GPUS[device]
 
 
 _HOSTS_GPUS: set = set()
@@ -150,14 +152,14 @@ _HOSTS_GPUS: set = set()
 GPUs' program (`compile_ahead`'s `portable` where its mesh holds others)."""
 
 
-def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
+def host_gpus(generation: str, topology: str | Path, count: int, share: float = DEW_SHARE) -> tuple:
     """`count` compile-only devices of the CUDA `generation`'s GPUs a host serialized its own topology of
     (`jax.experimental.topologies.get_attached_topology("cuda").serialize()`, written to `topology`), none
     attached: XLA compiles over them as over that host's GPUs, the SKU's memory, clocks and multiprocessors
     its own, so a program compiled here keys the persistent cache as that host's compile of it does (its
     backend's platform version and topology fingerprint are the host's) and the host's run reads it. A
     canonical target (`compile_only_gpus`) keys another entry: the 80 GB A100 it names against a 40 GB
-    host's."""
+    host's. Each is admitted at `share`, the pool's share in the host's run (`StatedGpu`)."""
     # The CUDA plugin, which a serialized topology deserializes through, initialized as the generation's
     # compile-only GPUs initialize it: with no client and no GPU.
     compile_only_gpus(generation, 1)
@@ -166,7 +168,7 @@ def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
     _HOSTS_GPUS.update(devices)
     memory = topology_memory(serialized)
     if memory is not None:
-        COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
+        STATED_GPUS.update(dict.fromkeys(devices, StatedGpu(memory, share)))
     if len(devices) < count:
         raise ValueError(f"the topology at {topology} holds {len(devices)} GPUs, not {count}")
     held = gpu_target(devices[0].device_kind).generation
@@ -504,14 +506,19 @@ PHASE_FLAGS = (*DUMP_FLAGS, "--xla_gpu_load_autotune_results",
                "--xla_gpu_require_complete_aot_autotune_results", "--xla_gpu_per_fusion_autotune_cache_dir")
 """XLA_FLAGS of one phase's own (where a run dumps, what a build loads), which compute nothing a program
 does."""
+HOST_FLAGS = ("--xla_force_host_platform_device_count",)
+"""XLA_FLAGS of a process's own host, which size its CPU client and compute nothing a program compiled in it
+does, its own devices compared apart (`BuildTarget`): JAX's compilation cache leaves them out of its key
+too (jax/_src/cache_key.py, `xla_flags_to_exclude_from_cache_key`). A GPU tier part's prepare sees no GPU
+and its run the GPUs it holds, each its host devices (tests/lane_environment.py)."""
 
 
 def computation_flags(flags: str | None = None) -> tuple[str, ...]:
     """The XLA flags, `XLA_FLAGS` by default, that decide what a program computes (Dew's rounding and
-    division, dew/__init__.py, among them): every one but a phase's own (`PHASE_FLAGS`), in their order, as
-    XLA reads a flag given twice by its last value."""
+    division, dew/__init__.py, among them): every one but a phase's own (`PHASE_FLAGS`) and its host's
+    (`HOST_FLAGS`), in their order, as XLA reads a flag given twice by its last value."""
     given = os.environ.get("XLA_FLAGS", "") if flags is None else flags
-    return tuple(setting for setting in given.split() if not setting.startswith(PHASE_FLAGS))
+    return tuple(setting for setting in given.split() if not setting.startswith((*PHASE_FLAGS, *HOST_FLAGS)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -745,6 +752,13 @@ class Keeping:
         except Unestablished as refusal:
             self.refused[named] = str(refusal)
             return
+        loaded = communicators.loaded_program(executable)
+        if loaded is None:
+            # Compiled for devices this process has not loaded (a compile-only GPU's), refused before it is
+            # serialized: no program of its default backend.
+            self.refused[named] = "it was compiled for devices this process has not loaded (a compile-only " \
+                                  "target's), outside the process's default backend"
+            return
         try:
             serialized = Executable.of(executable)
         except (NotImplementedError, ValueError) as refusal:
@@ -752,14 +766,7 @@ class Keeping:
             # program, which no executable serializes.
             self.refused[named] = f"its executable does not serialize: {refusal}"
             return
-        runtime = executable.runtime_executable()
-        if runtime is None or not isinstance(runtime, xla_client.LoadedExecutable):
-            # Compiled for devices this process has not loaded (a compile-only GPU's,
-            # `dew.nn.kernels.generation.compile_only_gpus`): no program of its default backend.
-            self.refused[named] = "it was compiled for devices this process has not loaded (a compile-only " \
-                                  "target's), outside the process's default backend"
-            return
-        ran = runtime.local_devices()
+        ran = loaded.devices
         if not set(ran) <= set(jax.devices()):
             # The file's target is the process's default backend's (`save`), which this program is none of.
             self.refused[named] = f"it runs on {sorted({device.platform for device in ran})} devices, " \
@@ -990,6 +997,15 @@ class AheadTarget:
     """The run's data phases whose steps are compiled in place of the first's, each over a batch of its own
     (`phase_batch`), into the run's persistent compilation cache, where that phase's first compile in the
     run finds them: none, the first step's alone."""
+    share: float = DEW_SHARE
+    """The share of each GPU XLA's pool takes in the run that loads the step (`dew._devices.pool_share`):
+    Dew's own as Dew prepares a training process, or the run's named one. Its plan is admitted against the
+    limit it derives (`StatedGpu.share`), not this process's own share, which a prepare packed beside
+    another job holds of its own GPU alone (row 7644: 6.78 GiB of an 80 GiB target)."""
+
+    def __post_init__(self) -> None:
+        if not 0 < self.share <= 1:
+            raise ValueError(f"a pool's share of a GPU is in (0, 1], not {self.share!r}")
 
     @property
     def memory(self) -> int | None:
@@ -1004,9 +1020,10 @@ class AheadTarget:
             if self.multiprocessors is not None or self.capacity_gib is not None:
                 raise ValueError("a host's topology states its GPUs' memory and multiprocessors; set neither "
                                  "capacity_gib nor multiprocessors with it")
-            return host_gpus(self.generation, self.topology, self.devices)
+            return host_gpus(self.generation, self.topology, self.devices, self.share)
         if ":" not in self.generation:
-            return compile_only_gpus(self.generation, self.devices, self.memory, self.multiprocessors)
+            return compile_only_gpus(self.generation, self.devices, self.memory, self.multiprocessors,
+                                     self.share)
         if self.multiprocessors is not None:
             raise ValueError(f"a TPU topology ({self.generation}) states its own cores; set no "
                              "multiprocessors")
@@ -1474,7 +1491,7 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
             variables = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
                                                                                  sharding=sharding),
                                      start.abstract.variables, start.shardings.variables)
-            narrowing(candidate.copies, trainer.objective.towers(), candidate.shardings.compute).compiled(
+            narrowing(candidate.copies, candidate.shardings.compute).compiled(
                 variables)
     collected.update(_results_programs(trainer, start, planned, plan))
     return {digest: Executable.of(executable) for digest, executable in collected.items()}
@@ -1487,7 +1504,7 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     shapes (`collecting`), by digest: `started`'s last part."""
     from dew.distributed.placement import placed_shapes
     from dew.state import apart, together
-    from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest
+    from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest, streak_of
     from dew.training.planning import whole_step_program
 
     candidate, split = planned.candidate, planned.split
@@ -1507,6 +1524,7 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
                     [(loss, aux, finite, accepted, committed)] * split)
             book = book_shapes(loss)
             counted = bookkeep(*booked(book, book, loss, finite, committed, aux or {}))
+            streak_of(counted)
             if committed is not None and committed.inspected is not None:
                 latest((committed.count, committed.inspected), (committed.count, committed.inspected))
             added_tokens(counted.tokens, counted.tokens)

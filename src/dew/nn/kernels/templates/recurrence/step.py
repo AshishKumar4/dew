@@ -23,7 +23,14 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence, short_conv, tuning
 from dew.nn.kernels.templates import mosaic, resources, scan
-from dew.nn.precision import L2NORM_EPS, rms_weighted, softplus_series
+from dew.nn.precision import (
+    L2NORM_EPS,
+    accurate_exp,
+    activation_and_slope,
+    logistic_value,
+    rms_weighted,
+    softplus_series,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -375,7 +382,7 @@ class _Conv:
                     else None)
             pre = short_conv.preactivation(window, weights, bias)
             # SiLU as the reference's, the input times its sigmoid.
-            streams.append(pre if self.conv.activation is None else pre * jax.nn.sigmoid(pre))
+            streams.append(pre if self.conv.activation is None else pre * logistic_value(pre))
         return tuple(streams)
 
     def held(self):
@@ -438,8 +445,8 @@ def _gates(hooks, inputs, row, head, layout):
         rate = softplus_series(scalar('gate') + headed('bias'))
         if hooks.gates.limit is not None:
             rate = jnp.clip(rate, *hooks.gates.limit)
-        decay = jnp.exp(-jnp.exp(headed('log_a')) * rate)
-        return decay, rate if hooks.gates.write == 'step' else jax.nn.sigmoid(scalar('beta'))
+        decay = accurate_exp(-accurate_exp(headed('log_a')) * rate)
+        return decay, rate if hooks.gates.write == 'step' else logistic_value(scalar('beta'))
     if hooks.rated:
         write = scalar('beta')
         return jnp.exp(headed('rate') * write), write
@@ -603,5 +610,5 @@ def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, interpret:
     # As `precision.rms_statistics` takes it: the sum times the count's reciprocal, over a head's columns.
     total = scan.summed((out * out).reshape(-1), exchanged, interpret=interpret)
     mean = total * (1.0 / token.block.columns)
-    return rms_weighted(out, lax.rsqrt(mean + hooks.output.epsilon), weight=weight, gate=gate,
-                        activation=hooks.output.activation)
+    return rms_weighted(out, lax.rsqrt(mean + hooks.output.epsilon), weight=weight,
+                        gate=activation_and_slope(gate, hooks.output.activation)[0])

@@ -37,7 +37,7 @@ from dew.objectives.base import OMITTED, Omitted
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.solvers import DDIM, Solver
-from dew.sampling.walks import sampling_modules, walk_and_decode
+from dew.sampling.walks import walk_and_decode
 from dew.telemetry.profile import region
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
@@ -362,11 +362,10 @@ class TextToImage(SavedRunTask, InItsForm):
         by the task's towers as the training step encodes its blank (`DiffusionObjective.encode`)."""
         leaves = jax.tree.leaves(tokens)
         if leaves and leaves[0].shape[0] != 1:
-            encode = _encoder(plan.sharding, self.inputs.encoders)
+            encode = _encoder(plan.sharding)
             return encode(self.inputs.encoders, self.variables, plan.place(plan.pad(tokens)))
         # Host tokens, which reach the encoders' devices as the call places them.
-        return _encoder(None, self.inputs.encoders)(self.inputs.encoders, self.variables,
-                                                    jax.tree.map(np.asarray, tokens))
+        return _encoder(None)(self.inputs.encoders, self.variables, jax.tree.map(np.asarray, tokens))
 
 
     def prepare(
@@ -509,7 +508,6 @@ class TextToImage(SavedRunTask, InItsForm):
         mapped over the requests (`_initials`, `_walks`), the weights and the grid shared."""
         walks = [jax.random.fold_in(request, 1) for request in requests]
         grid = _default_grid(walking.process, walking.count) if walking.times is None else walking.times
-        models = sampling_modules(self.model, walking.guidance, self.autoencoder)
         statics = (self.model, walking.process, self.autoencoder, self.finish, self.final_denoise,
                    walking.decode)
         times = np.asarray(grid, np.float32)
@@ -520,7 +518,7 @@ class TextToImage(SavedRunTask, InItsForm):
                 plan = RowPlan.over(mesh_of(self.variables), inputs.rows)
                 initial = program(_initial, static_argnums=(0, 1, 2), in_shardings=(plan.sharding, None))(
                     walking.solver, walking.process, grid, inputs.noise, walk)
-                walked = program(_walk, *models, static_argnums=(0, 1, 2, 3, 4, 5),
+                walked = program(_walk, static_argnums=(0, 1, 2, 3, 4, 5),
                                  in_shardings=(None, None, None, None, None, plan.sharding, None,
                                                plan.sharding, None, None),
                                  out_shardings=plan.sharding)
@@ -535,7 +533,7 @@ class TextToImage(SavedRunTask, InItsForm):
             keys = jnp.stack(walks)
             initial = program(_initials, static_argnums=(0, 1, 2))(walking.solver, walking.process, grid,
                                                                    noise, keys)
-            generated = program(_walks, *models, static_argnums=(0, 1, 2, 3, 4, 5))(
+            generated = program(_walks, static_argnums=(0, 1, 2, 3, 4, 5))(
                 *statics, walking.solver, walking.guidance, times, initial, self.variables, conditions,
                 unconditional, noise, keys, streams)
         return [replace(jax.tree.map(lambda leaf, index=index: leaf[index], generated), rows=inputs.rows)
@@ -742,7 +740,7 @@ class TextToImage(SavedRunTask, InItsForm):
         plan, process = settled.plan, settled.process
         given = plan.place(plan.pad(settled.tokens))
         if "given" not in settled.encoded:
-            given = _encoder(plan.sharding, self.inputs.encoders)(self.inputs.encoders, self.variables, given)
+            given = _encoder(plan.sharding)(self.inputs.encoders, self.variables, given)
         if settled.null_tokens is None:
             null = {}
         elif "null" in settled.encoded:
@@ -756,7 +754,7 @@ class TextToImage(SavedRunTask, InItsForm):
                             out_shardings=plan.sharding)
             return given, null, noise(process, plan.keys(settled.request), settled.shape)
         start = process.times(settled.count)[0] if settled.times is None else settled.times[0]
-        starting = program(_image_start, *(() if self.autoencoder is None else self.autoencoder.towers()),
+        starting = program(_image_start,
                            static_argnums=(0, 1, 2),
                            in_shardings=(None, plan.sharding, plan.sharding, None, None),
                            out_shardings=plan.sharding)
@@ -1102,10 +1100,10 @@ def _encoded(encoders, params, tokens):
     return encode_conditions(encoders, params["encoders"] if encoders else {}, tokens, path="TextToImage")
 
 
-def _encoder(rows: jax.sharding.NamedSharding | None, encoders):
-    """The program that encodes rows placed by `rows` (`_encoded`) with `encoders`, placed as they are,
-    under the options its towers compile with (`compiler_options`)."""
-    return program(_encoded, encoders, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
+def _encoder(rows: jax.sharding.NamedSharding | None):
+    """The program that encodes rows placed by `rows` (`_encoded`), its encoders placed as they are,
+    compiled through Dew's compile point (`program`)."""
+    return program(_encoded, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
 
 
 def _encoded_rows(conditions: Mapping[str, Conditioning]) -> int:

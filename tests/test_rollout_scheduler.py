@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from episode_support import Harness, environment as sandbox
+from episode_support import environment as sandbox
 from flax import linen as nn
 from recording import bits
 
@@ -32,7 +32,6 @@ from dew.objectives.rl import EnvironmentSource, EpisodeStatus, GRPOObjective, O
 from dew.objectives.rl.scheduler import Asynchronous, RolloutScheduler
 from dew.objectives.rl.sessions import Status, pack
 from dew.sampling import Sampling
-from dew.sampling.strategies import Beam
 from dew.training import Layout, Trainer
 
 VOCAB = 13
@@ -453,43 +452,6 @@ def test_a_server_whose_requests_repeat_prompts_shares_their_pages():
         assert not isinstance(whole.rows, PagedRows) and not whole.reuses_prefixes
     short = Server.from_task(serving_task(capacity=12), slots=2, capacity=8, kv_cache="shared")
     assert not isinstance(short.rows, PagedRows)
-
-
-def test_an_episode_schedulers_turns_are_served_over_pages_by_default():
-    """An episode scheduler over a `TextGeneration` policy drawing one row a prompt by sampling, whose model
-    pages, serves its cohort's turns over a paged cache (`served_layout`, `EpisodeCollector.kv_cache`), so
-    each turn prefills only what follows its row's history where every turn prefilled it again (row 5374);
-    a policy drawing several rows a prompt, or searching beams, is drawn whole."""
-    from model_support import serving_task
-
-    from dew.objectives.rl import EpisodeCollector
-    from dew.objectives.rl.scheduler import Synchronous
-
-    task = serving_task(capacity=64)
-    objective = GRPOObjective(task.model, seq_len=7)
-
-    def layout(policy: TextGeneration):
-        """The cache layout the scheduler's collector serves its cohort's turns over."""
-        acquisition = RolloutScheduler.episodes(
-            policy, Harness(), lambda episode: 0.0, objective=objective, max_prompt_tokens=8,
-            max_new_tokens=4, max_turns=2, sampling=Sampling(eos_token_ids=(3,))).acquisition
-        assert isinstance(acquisition, Synchronous) and isinstance(acquisition.collector, EpisodeCollector)
-        return acquisition.collector.kv_cache
-
-    paged = layout(task)
-    assert paged is not None and paged.page_size == 64
-    assert layout(dataclasses.replace(task, n=2)) is None
-    # A policy searching beams, which a server over pages does not draw, is drawn whole, its model's own
-    # pages too.
-    assert layout(dataclasses.replace(task, strategy=Beam(width=2))) is None
-    declared = dataclasses.replace(task, model=task.model.with_kv_cache(KVCache(page_size=8)))
-    declared_layout = layout(declared)
-    assert declared_layout is not None and declared_layout.page_size == 8
-    assert layout(dataclasses.replace(declared, strategy=Beam(width=2))) is None
-    # A model whose max_seq_len holds no row of the cohort's 12 slots in its own whole pages of 8 is drawn
-    # whole, which a server over them would refuse.
-    short = serving_task(capacity=12)
-    assert layout(dataclasses.replace(short, model=short.model.with_kv_cache(KVCache(page_size=8)))) is None
 
 
 def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):

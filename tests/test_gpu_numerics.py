@@ -88,6 +88,8 @@ def norm_cells(_) -> list[Cell]:
                functools.partial(norm_swiglu_tests.every_config_of_the_swiglu_kernels_holds_the_float64_gate,
                                  kernel, dtype), native={"kernel": kernel.__name__, "dtype": dtype.__name__})
           for kernel in (norm_swiglu.SwigluForward, norm_swiglu.SwigluBackward) for dtype in DTYPES),
+        Cell("a norm with Dew's silu after it holds the float64 gate",
+             norm_swiglu_tests.a_norm_with_dews_silu_after_it_holds_the_float64_gate),
     ]
 
 

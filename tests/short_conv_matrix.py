@@ -10,6 +10,7 @@ held to the same call on XLA's conv ('xla', check 1), the float64 conv a row at 
 
 import functools
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import pytest
@@ -98,8 +99,7 @@ CASES = (
 
 
 @cell("short_conv", covers=lambda case: dict(zip(AXES["short_conv"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_short_convs_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """`case`'s conv on its GPU on the kernels, on par with XLA's conv (check 1, the float64 conv a row at

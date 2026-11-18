@@ -1163,6 +1163,36 @@ def sown_nodes(tree, *markers: str) -> list[tuple[tuple[str, ...], Mapping]]:
     return found
 
 
+def sown_calls(tree, *markers: str) -> list[tuple[tuple[str, ...], tuple]]:
+    """Every call of a module that sowed all of `markers` (`sown_nodes`), with its module path: what the call
+    sowed under each marker, in `markers`' order, a path's calls in the order they ran. A module called
+    more than once in a forward sows once a call, each an application of the same weights: a layer a loop
+    runs again, once a pass (`dew.nn.backbones.decoder_stack.BY_CALL`), each call's after the last's
+    (`sows_appended`)."""
+    return [(path, call) for path, node in sown_nodes(tree, *markers)
+            for call in zip(*(node[marker] for marker in markers), strict=True)]
+
+
+def sows_appended(held: Mapping, sown: Mapping) -> dict:
+    """A collection's `held` entries with a call's `sown` ones appended (`_appended`): what a module called
+    again sows after its calls before (`sown_calls`), a looped layer's pass
+    (`dew.nn.backbones.decoder_stack.PassView`), a head read at each exit, a pass of a denoiser."""
+    return {**held, **{name: _appended(held.get(name), value) for name, value in sown.items()}}
+
+
+def _appended(held, sown):
+    """`held` with `sown` appended at each leaf: a sown tuple extends the held one, a mapping merges
+    key by key, and any other value replaces the held one, as a sow's reduction does."""
+    if isinstance(sown, Mapping):
+        merged: dict[str, object] = dict(held or {})
+        for name, value in sown.items():
+            merged[name] = _appended(merged.get(name), value)
+        return merged
+    if isinstance(sown, tuple):
+        return (*(held or ()), *sown)
+    return sown
+
+
 __all__ = [
     "BLOCKS_FIELD",
     "COORDINATES_FIELD",
@@ -1203,7 +1233,9 @@ __all__ = [
     "scored_targets",
     "select",
     "shifted_span",
+    "sown_calls",
     "sown_nodes",
+    "sows_appended",
     "thaw",
     "token_id",
     "token_ids",

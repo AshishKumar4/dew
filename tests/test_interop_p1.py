@@ -8,13 +8,13 @@ from __future__ import annotations
 import io
 import json
 import shutil
-import tarfile
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import extract_fixture
 from PIL import Image
 
 from dew.interop import Pretrained, PretrainedDecoder, PretrainedPipeline, codecs
@@ -119,14 +119,12 @@ def test_pipeline_dduf_single_file_and_composite_loads_without_weights_download_
     root = tmp_path / "hub"
 
     sd3_root = tmp_path / "sd3"
-    with tarfile.open(FIXTURES / "sd3_source.tar.xz") as archive:
-        archive.extractall(sd3_root, filter="data")
+    extract_fixture(FIXTURES / "sd3_source.tar.xz", sd3_root)
     sd3_dir = sd3_root / "pipeline"
     expected_pipe = Pretrained.load(sd3_dir, dtype="float32", attention_impl="xla", on_host=True)
 
     flux_root = tmp_path / "flux"
-    with tarfile.open(FIXTURES / "flux_source.tar.xz") as archive:
-        archive.extractall(flux_root, filter="data")
+    extract_fixture(FIXTURES / "flux_source.tar.xz", flux_root)
     dduf_repo = tmp_path / "dduf_repo"
     dduf_repo.mkdir()
     dduf_path = dduf_repo / "pipeline.dduf"
@@ -167,8 +165,7 @@ def test_single_file_loads_without_weights_across_storage_dtypes_and_borrowed_sh
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     flux_root = tmp_path / "flux"
-    with tarfile.open(FIXTURES / "flux_source.tar.xz") as archive:
-        archive.extractall(flux_root, filter="data")
+    extract_fixture(FIXTURES / "flux_source.tar.xz", flux_root)
     expected_flux = Pretrained.load(
         flux_root / "pipeline", dtype="float32", attention_impl="xla", on_host=True
     )
@@ -280,8 +277,7 @@ def test_flux2_metadata_only_load_preserves_latent_statistics_on_restore(
     tmp_path: Path
 ) -> None:
     flux2_root = tmp_path / "flux2"
-    with tarfile.open(FIXTURES / "flux2_source.tar.xz") as archive:
-        archive.extractall(flux2_root, filter="data")
+    extract_fixture(FIXTURES / "flux2_source.tar.xz", flux2_root)
     flux2_dir = flux2_root / "pipeline"
     expected = PretrainedPipeline.load(flux2_dir, dtype="float32", attention_impl="xla", on_host=True)
     assert expected.autoencoder is not None
@@ -436,8 +432,7 @@ def test_a_hub_autoencoder_resolves_its_release_once(tmp_path: Path) -> None:
 
     from dew.interop.autoencoders.pretrained import load_autoencoder
 
-    with tarfile.open(FIXTURES / "dc_ae.tar.xz") as archive:
-        archive.extractall(tmp_path / "dc-ae", filter="data")
+    extract_fixture(FIXTURES / "dc_ae.tar.xz", tmp_path / "dc-ae")
     directory = tmp_path / "dc-ae" / "plain"
     expected = _shapes_and_dtypes(load_autoencoder(str(directory), revision="main", dtype="float32").params)
     repo, options = "acme/dc-ae", {"revision": "main", "dtype": "float32"}

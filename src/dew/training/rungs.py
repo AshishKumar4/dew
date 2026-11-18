@@ -24,13 +24,13 @@ from typing import TYPE_CHECKING
 
 import jax
 from jax.sharding import Mesh
-from jaxlib.xla_client import LoadedExecutable
 
 from dew import _cache
 from dew._devices import device_memory
 from dew._files import write_atomically
 from dew._records import JSON, json_value, record
 from dew._stated import Unestablished, stated
+from dew.communicators import loaded_program
 from dew.nn.kernels.generation import assumption, gpu_target
 from dew.nn.sharding import trace_context
 from dew.telemetry.instrumentation import StepFlops, step_flops
@@ -126,17 +126,16 @@ def plan_flops(recorded: JSON, executable: jax.stages.Compiled) -> tuple[StepFlo
     reads the module's text. A key read before the step traces cannot tell
     apart two steps that differ in an objective's arguments alone; the
     executable can."""
-    runtime = executable.runtime_executable()
     # An executable compiled for absent devices is not loaded and has no runtime fingerprint.
-    fingerprint = (runtime.fingerprint
-                   if runtime is not None and isinstance(runtime, LoadedExecutable) else None)
-    named = fingerprint.hex() if isinstance(fingerprint, bytes) else None
+    program = loaded_program(executable)
+    named = program.fingerprint.hex() if program is not None and program.fingerprint is not None else None
     counted = record(recorded, 'recorded plan').get('flops') if recorded is not None else None
-    if named is not None and isinstance(counted, list) and len(counted) == 4 and counted[:1] == [named]:
+    if named is not None and isinstance(counted, list) and len(counted) == 5 and counted[:1] == [named]:
         flops = StepFlops(*counted[1:])
     else:
         flops = step_flops(executable)
-    return flops, None if flops is None else [named, flops.model, flops.hardware, flops.unsized]
+    return flops, None if flops is None else [named, flops.model, flops.hardware, flops.unsized,
+                                              flops.bounded]
 
 
 def keep_rung(path: Path, key: Mapping[str, JSON], rung: JSON) -> None:

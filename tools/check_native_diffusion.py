@@ -92,11 +92,10 @@ def prompts(inputs) -> dict[str, str]:
 
 
 def encoded(encoder, params, tokens):
-    """`encoder`'s conditions of `tokens`, encoded by one program under the options its towers compile
-    with, as a pipeline encodes them (`dew.nn.kernels.options.program`, which compiles a program once for
-    its process): each draw's prompts where its CLIP towers ran op by op, 147 s of the SDXL image walk's
-    263 (row 4625)."""
-    return program(encoder.encode, encoder)(params, tokens)
+    """`encoder`'s conditions of `tokens`, encoded by one program through Dew's compile point, as a pipeline
+    encodes them (`dew.nn.kernels.options.program`, which compiles a program once for its process): each
+    draw's prompts where its CLIP towers ran op by op, 147 s of the SDXL image walk's 263 (row 4625)."""
+    return program(encoder.encode)(params, tokens)
 
 
 def conditions(source, texts=SAVED, extended=False):

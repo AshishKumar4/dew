@@ -27,6 +27,7 @@ from reference_runs import assert_arms_as_recorded
 
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
+from dew.nn.kv_cache import KVCache
 from dew.sampling import Beam, Sampling, decoding, generate
 
 VOCAB = 13
@@ -283,3 +284,17 @@ def test_a_renormalized_biased_search_is_transformers(name):
     ended = want == int(reference["eos"])
     np.testing.assert_array_equal(np.asarray(found.lengths), np.where(ended.any(-1), ended.argmax(-1) + 1, 6))
     np.testing.assert_array_equal(np.asarray(found.terminated), ended.any(-1))
+
+
+def test_a_search_over_a_paged_model_draws_what_it_draws_over_the_dense_one(model):
+    """A beam search over a model that declares a paged cache (`with_kv_cache(KVCache(page_size=2))`),
+    whose pool's shared pages hold no regrouped row, decodes over its cache unpaged (`Regrouping`): its
+    tokens and scores are the search's over the dense model's, bit for bit (row 7934)."""
+    decoder, params = model
+    paged = decoder.with_kv_cache(KVCache(page_size=2))
+    found = {name: generate(held, params, jnp.asarray([PROMPT], jnp.int32), 4, key=jax.random.key(0),
+                            sampling=Sampling(pad_token_id=0), n=2, strategy=Beam(width=3))
+             for name, held in (("dense", decoder), ("paged", paged))}
+    for field in ("tokens", "lengths", "raw_log_probs"):
+        np.testing.assert_array_equal(np.asarray(getattr(found["paged"], field)),
+                                      np.asarray(getattr(found["dense"], field)), err_msg=field)

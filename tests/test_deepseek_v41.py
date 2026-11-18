@@ -164,7 +164,7 @@ def test_a_quantization_aware_step_is_never_wrong(source, monkeypatch, seed):
     # The program its users run: the suite's wide CPU arithmetic (float64 sums and reductions) is the
     # suite's alone, and check 2 holds float formats of the lane's own.
     monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
-    assert_certified(step, draw, "a quantization-aware step", seeds=range(seed, seed + 1))
+    assert_certified(step, lambda _: draw(seed), f"a quantization-aware step, draw {seed}", seeds=1)
 
 
 def test_the_engram_hash_is_the_releases_int64_arithmetic():

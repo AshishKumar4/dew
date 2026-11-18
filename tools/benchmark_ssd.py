@@ -106,8 +106,8 @@ def portable_scan(x, B, C, a, carried, chunk_size: int):
 
 def scan_fn(implementation: str, platform: str, chunk_size: int):
     if implementation == 'kernel':
-        return lambda *args: _chunk_scan(*args, None, chunk_size, platform)
-    return lambda *args: portable_scan(*args, chunk_size)
+        return lambda x, B, C, a, carried: _chunk_scan(x, B, C, a, carried, None, chunk_size, platform)
+    return lambda x, B, C, a, carried: portable_scan(x, B, C, a, carried, chunk_size)
 
 
 def failure(error: BaseException) -> str:

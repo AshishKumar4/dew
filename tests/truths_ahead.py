@@ -42,6 +42,7 @@ from pathlib import Path
 
 import jax
 import numpy as np
+from tool_support import load
 
 
 class MissingTruth(AssertionError):
@@ -122,12 +123,14 @@ class CompiledTruths:
             yield
 
     def compile_site(self, label: str, programs: Mapping[str, tuple[Callable, Sequence]],
-                     held: Mapping[str, dict], *, compiled: Callable | None = None) -> None:
+                     held: Mapping[str, dict], *, compiled: Callable | None = None, arms: bool = False
+                     ) -> None:
         """The site's `programs` (each a function of its constants and inputs, flat, and their shapes, by
         its name, `named`) compiled for the store's target and written with what each `held`; refused for a
         label this store compiled already, whose programs a second site of it would replace. `compiled` makes
         each program as its run's compile does (`dew.training.ahead.compile_programs`' `compiled`; Dew's
-        compile point where None, a truth's, whose program is its run's)."""
+        compile point where None, a truth's, whose program is its run's); `arms` whether they are a site's
+        arms (`compiled_memory`), whose state its run holds while its truths compute."""
         from dew._cache import uncached
 
         if label in self.begun:
@@ -146,7 +149,8 @@ class CompiledTruths:
         (site / HELD).write_bytes(pickle.dumps(dict(held)))
         memory = {name: executable.memory._asdict() for name, executable in built.programs.items()
                   if executable.memory is not None}
-        (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory}))
+        (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory,
+                                             "arms": arms}))
 
     def _compiled(self, programs: Mapping[str, tuple[Callable, Sequence]], compiled: Callable | None):
         """`programs` compiled for the store's target (`compile_programs`), or for this process's first device
@@ -209,12 +213,34 @@ class CompiledTruths:
         return self.read[label]
 
 
-def compiled_memory(directory: Path) -> list[dict[str, int]]:
-    """Every program of a store's sites (`compiled_truths`, prepared) as its compile analysed its memory
+def compiled_memory(directory: Path, *, arms: bool = False) -> list[dict[str, int]]:
+    """Every program of a store's sites (`compiled_truths`, prepared), its truths' or, with `arms`, its
+    arms' (`CompiledTruths.compile_site`), as its compile analysed its memory
     (`dew.telemetry.instrumentation.CompiledMemory`, as its fields name it), its sites' record's; none for
     a program whose backend stated none."""
-    return [memory for site in Path(directory).glob(f"*/{SITE}")
-            for memory in json.loads(site.read_text()).get("memory", {}).values()]
+    records = (json.loads(site.read_text()) for site in Path(directory).glob(f"*/{SITE}"))
+    return [memory for record in records if record.get("arms", False) == arms
+            for memory in record.get("memory", {}).values()]
+
+
+def admitted_needs(arms: Sequence[dict[str, int]], truths: Sequence[dict[str, int]]) -> list[dict[str, int]]:
+    """A run's programs as the allocator admits them (`dew.training.memory.admitted`), each its compile's
+    memory (`compiled_memory`'s, `CompiledMemory`'s fields) in the admission's own terms
+    (`dew.training.memory.admission`): an arm's alone, a float64 truth's or terms program's with the arms'
+    state held beside it (the most any arm takes as arguments, which the run keeps while its truths compute;
+    every program's outputs are fetched to the host, `CompiledTruths.called`). A part's worker fits a slot
+    where every program of its units is admitted there (`tier_wire.unit_needs`)."""
+    from dew.telemetry.instrumentation import CompiledMemory
+    from dew.training.memory import admission
+
+    arms_memory = [CompiledMemory(**memory) for memory in arms]
+    state = max((memory.argument for memory in arms_memory), default=0)
+
+    def admitted_as(memory: CompiledMemory, held: int) -> dict[str, int]:
+        return dict(zip(("resident", "beside", "temporaries"), admission(memory, held), strict=True))
+
+    return [*(admitted_as(memory, 0) for memory in arms_memory),
+            *(admitted_as(CompiledMemory(**memory), state) for memory in truths)]
 
 
 COMPILED: contextvars.ContextVar[CompiledTruths | None] = contextvars.ContextVar("truths_ahead_store",
@@ -237,6 +263,26 @@ def compiled_truths(directory: str | Path, *, prepare: bool, stamp: str,
         yield store
     finally:
         COMPILED.reset(token)
+
+
+@contextlib.contextmanager
+def prepared(directory: Path, *, stamp: str, target) -> Iterator[CompiledTruths]:
+    """A GPU tier part's test's prepare (`tests/conftest.py`'s `compiled_ahead`): its check-1 sites compiled
+    into `directory` for the node's GPU (`target`, a `BuildTarget`) with that GPU's compile-only device
+    this process's default, on which nothing computes, and their programs' needs (`admitted_needs`) filed
+    under the part's unit as it closes, whatever its test ended in (`tier_wire.unit_needs`, as a flow's are,
+    row 7900), by which the lane sizes the unit's worker."""
+    import tier_wire
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    try:
+        with (compiled_truths(directory, prepare=True, stamp=stamp, target=target) as store,
+              jax.default_device(compile_only_gpus(target.generation, 1)[0])):
+            yield store
+    finally:
+        arms, truths = compiled_memory(directory, arms=True), compiled_memory(directory)
+        tier_wire.unit_needs(admitted_needs(arms, truths))
 
 
 @contextlib.contextmanager
@@ -272,7 +318,8 @@ def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], wh
     record = directory / UNPREPARED
     if record.exists():
         return
-    path = Path(test.split("::", 1)[0])
+    # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
+    path = Path(load("grading", "tools/armada").owning(test))
     lines = [line for file, line in frames if Path(file).name == path.name]
     directory.mkdir(parents=True, exist_ok=True)
     record.write_text(json.dumps({"test": test, "where": f"{path}:{lines[0]}" if lines else str(path),

@@ -32,8 +32,8 @@ import numpy as np
 from gpu_flow import Cell, run_cells
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact
-from tier_wire import TRUTHS, UNIT, needs_file, preparing
-from truths_ahead import compiled_memory, compiled_truths
+from tier_wire import TRUTHS, preparing, unit_needs
+from truths_ahead import admitted_needs, compiled_memory, compiled_truths
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.categorical import token_log_probs
@@ -526,40 +526,13 @@ NEED = "need.json"
 by which the GPU tier admits a part's worker to a slot (`dew.training.memory.admitted` of each)."""
 
 
-def unit_needs(programs: list[dict[str, int]]) -> None:
-    """`programs` (`need`'s) added to the needs of the tier's unit this prepare runs (`UNIT`), one file a
-    unit under the tier's store (`TRUTHS`'s `needs/`), from which its lane sizes the unit's worker by Dew's
-    admission of each (`dew.training.memory.admitted`); none outside the tier's prepare, which names no
-    unit."""
-    unit = os.environ.get(UNIT)
-    if unit is None:
-        return
-    path = needs_file(Path(os.environ[TRUTHS]), unit)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    held = json.loads(path.read_text())["programs"] if path.exists() else []
-    path.write_text(json.dumps({"unit": unit, "programs": [*held, *programs]}))
-
-
 def need(dew, reference, truths: Path) -> dict[str, list[dict[str, int]]]:
-    """A flow's run's programs as the allocator admits them (`dew.training.memory.admitted`), each its
-    compile's memory (`Executable.memory`, `truths_ahead.compiled_memory`) in the admission's own terms
-    (`dew.training.memory.admission`): a float64 truth's or terms program's with the arms' state held beside
-    it (the most any arm takes as arguments, which the run keeps while its truths compute; every program's
-    outputs are fetched to the host, `loaded`, `CompiledTruths.called`). A part's worker fits a slot where
-    every program of its flows is admitted there."""
-    from dew.telemetry.instrumentation import CompiledMemory
-    from dew.training.memory import admission
-
-    arms = [executable.memory for programs in (dew, reference) for executable in programs.programs.values()
-            if executable.memory is not None]
-    state = max((memory.argument for memory in arms), default=0)
-
-    def admitted_as(memory: CompiledMemory, held: int) -> dict[str, int]:
-        return dict(zip(("resident", "beside", "temporaries"), admission(memory, held), strict=True))
-
-    truths_memory = [CompiledMemory(**memory) for memory in compiled_memory(truths)]
-    return {"programs": [*(admitted_as(memory, 0) for memory in arms),
-                         *(admitted_as(memory, state) for memory in truths_memory)]}
+    """A flow's run's programs as the allocator admits them (`truths_ahead.admitted_needs`): its own programs'
+    (Dew's and its reference's, each `Executable.memory`), the state its run holds while its truths compute,
+    and its truths' (`truths_ahead.compiled_memory`)."""
+    arms = [executable.memory._asdict() for programs in (dew, reference)
+            for executable in programs.programs.values() if executable.memory is not None]
+    return {"programs": admitted_needs(arms, compiled_memory(truths))}
 
 
 PREPARED_APART = """import sys

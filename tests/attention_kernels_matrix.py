@@ -21,6 +21,7 @@ cell of this matrix).
 import contextlib
 from typing import get_args
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -160,8 +161,7 @@ CASES = (
 
 
 @cell("attention_kernels", covers=lambda case: dict(zip(AXES["attention_kernels"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"a {case[0]} cell runs on its own device alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_kernels_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The op's training step of `case` on its kernel, on its device, on par with the reference path's (check

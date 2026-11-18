@@ -21,6 +21,7 @@ fuses reporting the `fused` kernel, no named kernel refusing the region, and the
 
 import functools
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -175,8 +176,7 @@ CASES = (
 
 
 @cell("fused_gemm", covers=lambda case: dict(zip(AXES["fused_gemm"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_fused_gemm_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The fused region's training step of `case` on its GPU on par with the same region's stages in XLA

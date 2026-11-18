@@ -7,8 +7,6 @@ The last batch is filled out to the batch's rows with repeats that
 
 from __future__ import annotations
 
-import tarfile
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,6 +14,7 @@ import pytest
 from data_support import record_batches
 from diffusion_stubs import batch_for
 from diffusion_support import images_of
+from interop_support import extract_fixture
 from objective_cases import cases
 from objective_data import corpus_windows
 from reference_error import assert_computes_the_oracle, chain_roundings
@@ -54,8 +53,7 @@ def runnable(name: str, windows, tmp_path):
     pipeline's towers distilling its own initialization."""
     if name != "guidance_distillation":
         return cases(windows)[name]()
-    with tarfile.open(FIXTURES / "flux_source.tar.xz") as archive:
-        archive.extractall(tmp_path / "flux", filter="data")
+    extract_fixture(FIXTURES / "flux_source.tar.xz", tmp_path / "flux")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
         data=images_of("tfds://oxford_flowers102", 8), preset=Flow(), val_metrics=(),

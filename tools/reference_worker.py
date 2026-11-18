@@ -173,6 +173,27 @@ def bootstrap(script: str, arguments: Sequence[str]) -> None:
     runpy.run_path(script, run_name="__main__")
 
 
+def recording_command(script: str, sites: str, *, serve: Callable[[], None],
+                      merged: Callable[[list[Path]], Path], write_seeded: Callable, fixture: Path) -> None:
+    """A site recorder's command line (tools/fla_gdn_reference.py, tools/mamba3_reference.py): `--serve`, the
+    reference's side (`serve`); `--list`, its site names a line each (the module `sites`' `sites()`);
+    `--merge <units>`, the fixture from the recording's units (`merged`); else `<python> <out> <site>...`,
+    those sites' unit written to `out` (`write_seeded`) against `script`'s worker run in `<python>`
+    (`session`)."""
+    if sys.argv[1] == "--serve":
+        serve()
+    elif sys.argv[1] == "--list":
+        import importlib
+
+        print("\n".join(importlib.import_module(sites).sites()), flush=True)
+    elif sys.argv[1] == "--merge":
+        written = merged([Path(unit) for unit in sys.argv[2:]])
+        print(f"wrote {fixture.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
+    else:
+        with session([sys.argv[1], script, "--serve"]) as worker:
+            write_seeded(worker, sys.argv[3:], Path(sys.argv[2]))
+
+
 class Session:
     """A recorder's end of a worker's protocol (`session`): `ask` sends a request and returns its answer."""
 

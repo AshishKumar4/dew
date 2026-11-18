@@ -760,7 +760,7 @@ def parted_record(path: Path = session.DURATIONS) -> dict[str, dict[str, float]]
     parted: dict[str, dict[str, float]] = {}
     record = durations_record(path)
     for node in sorted(record):
-        parted.setdefault(node.split("::")[0], {})[node] = record[node]
+        parted.setdefault(grading.owning(node), {})[node] = record[node]
     return parted
 
 
@@ -771,7 +771,14 @@ def own_tests(name: str, tests: dict[str, float]) -> dict[str, float]:
 
 
 def durations_record(path: Path = session.DURATIONS) -> dict[str, float]:
-    """The durations record (`session.DURATIONS`, or the one at `path`): each test's node id and seconds."""
+    """The durations record (`session.DURATIONS`, or the one at `path`): each test's node id and its cost
+    (`session.cost`)."""
+    return session.costs(path)
+
+
+def durations_entries(path: Path = session.DURATIONS) -> dict[str, float | list[float]]:
+    """The durations record's entries as kept, each test's least warm and least cold seconds
+    (`session.entry`)."""
     return json.loads(path.read_text()) if path.is_file() else {}
 
 
@@ -793,8 +800,9 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
     takes. base/kernels' route census, 1,576 tests recorded at 2,654 s in a
     file main ran in 6 s, was packed by that median with six other files into
     one task, which ran past its deadline (train 18). Else the recorded sum, scaled by
-    how much slower armada ran the files measured both ways; else None, for a
-    file nothing has timed."""
+    how much slower armada ran the files measured both ways, and never below it, a floor as
+    a measured file's is (a test's cold time outweighs a warm run's measure); else None,
+    for a file nothing has timed."""
     recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
     # A file armada holds no timing of weighs its rows' sum at the cut they name (`measured_cut`), which is
     # what its timing would say: armada keeps a plan's rows from run to run, and drops the file timings a run
@@ -809,7 +817,7 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
                     if name in measured and recorded.get(name, 0) > 1)
     slower = ratios[len(ratios) // 2] if ratios else 1.0
     return {name: max(measured[name], recorded.get(name, 0.0)) if name in measured
-            else recorded[name] * slower if name in recorded else None for name in files}
+            else recorded[name] * max(slower, 1.0) if name in recorded else None for name in files}
 
 
 def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | None:
@@ -1093,7 +1101,7 @@ def site_costs(python: str, name: str, test: str) -> dict[str, float]:
         record = json.loads(path.read_text())
         python_, _, rest = record["site"].partition("::")
         node = rest.rpartition("::")[0]
-        if (python_, node.split("::")[0]) == (python, name) and session.site_name(node, held) == test:
+        if (python_, grading.owning(node)) == (python, name) and session.site_name(node, held) == test:
             # The record's own words, those of what its draws paid once among them where it keeps them.
             records.append(costs.Drawn(**{word: record[word] for word in costs.Drawn.__annotations__
                                           if word in record}))
@@ -1356,25 +1364,6 @@ def targeted(python: str, arguments: list[str], report: Path, tests: Sequence[st
     run = session.selected(session.pytest_run(python, report), network=False, site=site is not None)
     return subprocess.run([*run, *arguments, *session.selection(list(tests), split)],
                           env=session.pytest_environment(site_environment(site)), check=False).returncode
-
-
-def flow_cells(cases) -> dict[str, dict]:
-    """A GPU flow's counts by its cases (each case's JUnit property `cells`, tests/conftest.py from
-    tests/gpu_flow.py: passed, failed, skipped and the device), as every row a task runs carries them, an
-    empty object where its file runs no flow: the train's native gate reads a flow none of whose cells ran as
-    unqualified, and a reused row keeps its counts (ledger 2643)."""
-    return {grading.node_of(case): json.loads(item.get("value") or "null") for case in cases
-            for item in case.iter("property") if item.get("name") == "cells"}
-
-
-def ynn_switched(cases) -> list[dict]:
-    """The accuracy gate's sites a file's cases moved onto YNNPACK's fusions (each case's JUnit property
-    `ynn_switched`, tests/conftest.py), green cases included: each its test node, label and XLA:CPU's
-    refusal, as every row a task runs carries them for the train report to count, an empty list where
-    nothing moved, so a row without the field is one recorded before it, uncounted."""
-    return [{"node": grading.node_of(case), **site} for case in cases
-            for item in case.iter("property") if item.get("name") == "ynn_switched"
-            for site in json.loads(item.get("value") or "[]")]
 
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
@@ -1642,7 +1631,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # does a run that records none (a prepare's: a test it prepared has not passed, and a test an earlier
     # attempt passed still prepares into this one's store).
     resumes = recorded and site is None and coverage is None
-    done_before = resumed(tests) if resumes else {}
+    done_before, cold_before = progress.resumed(tests, grading.owning) if resumes else ({}, set())
     aside = out.with_name(f"{out.name}.set-aside.json")
     aside.write_text(json.dumps(sorted(done_before)))
     command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if resumes else [])]
@@ -1699,7 +1688,12 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      "tests": {**{node: seconds for node, seconds in done_before.items()
                                   if grading.holds(name, node)},
                                **{grading.node_of(case): float(case.get("time") or 0) for case in own}},
-                     "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
+                     # The tests that compiled a program the shared cache lacked (`grading.compiled_cold`),
+                     # an earlier attempt's among them (`progress.resumed`): their seconds are a cold run's,
+                     # which the durations record keeps apart (`folded_entries`).
+                     **({"cold": cold} if (cold := sorted(set(grading.compiled_cold(own)) | {
+                         node for node in cold_before if grading.holds(name, node)})) else {}),
+                     "ynn_switched": grading.ynn_switched(own), "cells": grading.flow_cells(own),
                      # A judge's, beside its pooling, what its map tasks' records say they paid
                      # (`site_costs`).
                      "timings": {row(python, name, group if site else ""): seconds,
@@ -1714,30 +1708,6 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         record(python, ran, log, common, network, opened,
                set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set(), wrote)
     return 0
-
-
-def resumed(tests: list[str]) -> dict[str, float]:
-    """The tests of `tests` an earlier attempt of this task passed before the fleet recalled it (armada keeps
-    a recalled attempt's artifacts and hands them to the next as ARMADA_RESUME, #4544), each with its seconds,
-    as tools/armada/progress.py kept them; copied into this attempt's progress, so a second recall keeps them
-    too. None outside a resumed task."""
-    kept = Path(os.environ.get("ARMADA_RESUME", "/nonexistent")) / progress.PROGRESS
-    if not kept.is_file():
-        return {}
-    passed = {}
-    for line in kept.read_text().splitlines():
-        found = json.loads(line)
-        if found["node"].split("::", 1)[0] in tests:
-            passed[found["node"]] = float(found["seconds"])
-    artifacts = os.environ.get("ARMADA_ARTIFACTS")
-    if artifacts and passed:
-        Path(artifacts).mkdir(parents=True, exist_ok=True)
-        with (Path(artifacts) / progress.PROGRESS).open("a") as carried:
-            carried.writelines(json.dumps({"node": node, "seconds": seconds}) + "\n"
-                               for node, seconds in passed.items())
-    if passed:
-        print(f"resumed: {len(passed)} tests an earlier attempt passed set aside", flush=True)
-    return passed
 
 
 def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
@@ -2257,6 +2227,34 @@ def raised(record: dict[str, float], held: list[dict], marked: dict) -> dict[str
     return taken
 
 
+def folded_entries(record: dict[str, float | list[float]], verdict: dict, target: float) -> dict:
+    """The durations `record`'s entries with main's CI `verdict` folded in (`session.entry`): each test's
+    warm time as `folded` keeps the record, a run in which it compiled a program the shared cache lacked
+    (a row's `cold`) timing it no warm time; its cold time the least of the green runs so, raised by a
+    red or cut-off row's past it, as `raised` raises an entry. A test the warm record drops loses its
+    cold time with it: one record, so no test is timed cold that the record no longer holds (Main,
+    2026-11-18, row 7939)."""
+    warm = {node: session.warm_cold(held)[0] for node, held in record.items()}
+    cold = {node: found for node, held in record.items()
+            if (found := session.warm_cold(held)[1]) is not None}
+    # The warm fold sees each cold-timed test at its warm record, where it has one: a cold run moves no warm
+    # time. A test no warm run has timed takes its cold time as its warm one, which a warm run lowers.
+    calm = {**verdict, "rows": [
+        {**row_, "tests": {node: warm[node] if node in row_.get("cold", ()) and node in warm else seconds
+                           for node, seconds in row_.get("tests", {}).items()}}
+        for row_ in verdict["rows"]]}
+    kept = folded(warm, calm, target)
+    for held in verdict_rows(verdict).values():
+        for row_ in held:
+            green = row_["exitCode"] == 0
+            for node in row_.get("cold", ()):
+                if node in kept and (seconds := row_.get("tests", {}).get(node)) is not None:
+                    before = cold.get(node)
+                    cold[node] = (seconds if before is None else min(before, seconds) if green
+                                  else max(before, seconds))
+    return {node: session.entry(seconds, cold.get(node)) for node, seconds in kept.items()}
+
+
 def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, float]:
     """The durations `record` with main's CI `verdict` (`armada verdict <sha> --json`) folded in, one test
     file at a time, each whole, as its floor Python's rows ran it. A file whose rows are all green and
@@ -2277,7 +2275,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     its draws, so its map tasks are weighed by armada's measures of them, never by the record
     (`site_entries`), and a judge armada did not run is a row of its task's name."""
     rows = verdict_rows(verdict)
-    kept = {node: seconds for node, seconds in record.items() if Path(node.split("::")[0]).is_file()}
+    kept = {node: seconds for node, seconds in record.items() if Path(grading.owning(node)).is_file()}
     for name, held in rows.items():
         splits = {parsed_row(row_["name"])[2] for row_ in held}
         counts = {int(split_.split("/")[1]) for split_ in splits if split_}
@@ -2288,7 +2286,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
             kept.update(raised(kept, held, marked))
             continue
         observed = {node: seconds for row_ in held for node, seconds in row_["tests"].items()}
-        own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name
+        own = {node: seconds for node, seconds in kept.items() if grading.owning(node) == name
                and session.site_name(node, marked) not in marked}
         took = sum(row_["seconds"] for row_ in held)
         if cuts.stale(session, own, observed, took, max(counts, default=1), target):
@@ -2364,7 +2362,7 @@ def slow(verdict: dict, target: float, base: dict[str, float] | None = None) -> 
         for test, seconds in (row_.get("tests") or {}).items():
             if seconds <= most or (base is not None and test in base and not mapped):
                 continue
-            found.append({"test": test, "file": test.partition("::")[0], "seconds": round(seconds, 1),
+            found.append({"test": test, "file": grading.owning(test), "seconds": round(seconds, 1),
                           "target": most,
                           **({"map_task": row_["name"], "fix": "fewer units a task (per_task, "
                               "conditioning_per_task)"} if mapped else {})})
@@ -2419,10 +2417,10 @@ def main() -> int:
         return 1 if wrong or not nodes else 0
     if args.operation == "durations":
         target = json.loads(Path(".armada.json").read_text())["target"]
-        before, verdict = durations_record(), json.loads(args.verdict.read_text())
+        before, verdict = durations_entries(), json.loads(args.verdict.read_text())
         # The record main's CI cut its files by, read before its times change it (`cuts.refolded`).
         cut_by = {name: own_tests(name, tests) for name, tests in parted_record().items()}
-        recorded = folded(before, verdict, target)
+        recorded = folded_entries(before, verdict, target)
         if recorded != before:
             session.DURATIONS.write_text(json.dumps(recorded, indent=0) + "\n")
         after = {name: own_tests(name, tests) for name, tests in parted_record().items()}
@@ -2430,8 +2428,8 @@ def main() -> int:
         stored = cuts.refolded(session, session.stored_cuts(), runs, target, cut_by, after)
         if stored != session.stored_cuts():
             session.CUTS.write_text(json.dumps(stored, indent=0, sort_keys=True) + "\n")
-        changed = sorted({node.split("::")[0] for node in before.keys() ^ recorded.keys()}
-                         | {node.split("::")[0] for node in before.keys() & recorded.keys()
+        changed = sorted({grading.owning(node) for node in before.keys() ^ recorded.keys()}
+                         | {grading.owning(node) for node in before.keys() & recorded.keys()
                             if before[node] != recorded[node]})
         print(f"{len(changed)} files refolded in {session.DURATIONS}: {' '.join(changed) or 'none'}")
         return 0

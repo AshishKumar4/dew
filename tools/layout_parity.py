@@ -101,7 +101,7 @@ even split (the DiT's fsdp2_sequence2 1.016), and a repeated matmul path 8%
 and more (the DiT's text projection under fsdp2_tensor2 9%, the dense
 decoder's head under fsdp2_tensor2 18%)."""
 
-LAYOUTS: dict[str, dict[str, int]] = {
+LAYOUTS: dict[str, dict[str, int | tuple[str, ...]]] = {
     "data4": {},
     "fsdp4": {"fsdp": 4},
     "tensor4": {"tensor": 4},
@@ -457,6 +457,8 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     if one_device:
         trainer.device_mesh = MeshSpec().build([jax.local_devices()[0]])
     elif devices is not None:
+        if not isinstance(trainer.mesh, MeshSpec):
+            raise ValueError("a layout's mesh is a MeshSpec its devices build")
         trainer.device_mesh = trainer.mesh.build(jax.devices()[:devices])
     return trainer
 

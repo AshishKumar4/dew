@@ -64,7 +64,7 @@ from dew.batch import (
 from dew.distributed.placement import Layout, RefinesLayout
 from dew.nn.derivatives import contracted, surrogate
 from dew.nn.inspection import INSPECTED, QK, Watched, watching
-from dew.nn.kernels.options import Held, Option, compiler_options, owned_program
+from dew.nn.kernels.options import Option, compiler_options, owned_program
 from dew.nn.precision import (
     ROUNDING_STREAM,
     Numerics,
@@ -621,8 +621,11 @@ class Aux(Generic[Effects]):
     """The `qk` collection the attention layers sowed, which the optimizer's QK-Clip reads.
 
     It is nested by module path. Each attention layer holds `max_logits`, a
-    one-tuple of an fp32 `[rows, heads]` array of per-head logit maxima, and
-    an MLA layer also holds `qk_nope`, an int scalar giving its nope width.
+    tuple of an fp32 `[rows, heads]` array of per-head logit maxima for each
+    call of the layer, one but where a model runs it again (a looped layer's
+    passes, a head read at each exit: `dew.batch.sown_calls`), which the clip
+    reads at their largest; an MLA layer also holds `qk_nope`, an int scalar
+    giving its nope width, a call each alike.
     Rows are the batch's rows, with microbatches concatenated under a
     pipeline. It is None where the step asked for none (`Step.qk_stats`),
     and empty where it asked and no layer sowed any; a run whose optimizer
@@ -1210,15 +1213,6 @@ class Objective(ABC, Generic[Loss, Effects]):
                 layout = entry.module.placement(layout)
         return layout
 
-    def towers(self) -> tuple[Held, ...]:
-        """Every network this objective's programs run, whose quantization the options they compile
-        with read (`dew.nn.kernels.options.compiler_options`): the modules `program_key` names and its
-        inputs' condition encoders (`InputSpec.encoders`: a diffusion run's text towers, a decision
-        run's configured context encoder), and an objective whose steps call further towers (an
-        autoencoder) adds them."""
-        encoders = () if self.inputs is None else tuple(encoder for _, encoder in self.inputs.encoders)
-        return (*(entry.module for entry in self.program_key()), *encoders)
-
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         """Replace the modules `program_key` names, one per entry in its order."""
         if len(modules) != len(self.program_key()):
@@ -1423,18 +1417,16 @@ class Objective(ABC, Generic[Loss, Effects]):
         change a tiled head, and `substitute` may quantize it at the same shapes. Argument shapes
         alone cannot identify those programs, nor can they the pipeline's microbatch count, the
         layout's rules or the links a model decides from. `name` names everything else the program
-        fixes. `donate_argnames` are the arguments the program donates, as `jax.jit`'s are: a rollout's
-        live state, written in place. `holds` are the objects `function` runs beyond the modules, as the
-        device steps a host step runs, a sample's guidance and autoencoder or a rollout's environment,
-        whose numbers it bakes in: the program is reused only while they are the same objects, and one
-        over others replaces it. `modules` are the networks it runs beside the objective's own, an
-        autoguide's or an autoencoder's: they key it as `holds` do, and its options cover them. `step` are
-        the XLA options of the training step the program is part of
-        (`dew.training.memory.step_compiler_options`), beside its modules' own, so a host step's programs
-        compile as the resident step does. Keep only the current specialization, not a history of old
-        models or steps. The cache is the objective's, so its programs live as long as it does: the
-        process-wide seam every other outer program shares (`dew.nn.kernels.options.program`) would keep
-        each objective alive with them.
+        fixes. `donate_argnames` are the arguments the program donates, as `jax.jit`'s are: a rollout's live
+        state, written in place. `holds` are the objects `function` runs beyond the modules, as the device
+        steps a host step runs, a sample's guidance and autoencoder or a rollout's environment, whose numbers
+        it bakes in: the program is reused only while they are the same objects, and one over others replaces
+        it. `modules` are the networks it runs beside the objective's own, an autoguide's or an autoencoder's:
+        they key it as `holds` do. `step` are the XLA options of the training step the program is part of
+        (`dew.training.memory.step_compiler_options`), so a host step's programs compile as the resident step
+        does. Keep only the current specialization, not a history of old models or steps. The cache is the
+        objective's, so its programs live as long as it does: the process-wide seam every other outer program
+        shares (`dew.nn.kernels.options.program`) would keep each objective alive with them.
         """
         programs = tuple((program.module, (program.head_tile, program.head_fused))
                          for program in self.program_key())
@@ -1453,7 +1445,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         if held is None or len(held[0]) != len(kept) or any(
                 now is not was for now, was in zip(kept, held[0], strict=True)):
             # A program jits a fresh callable, so JAX traces it afresh even for the same bound method.
-            held = (kept, owned_program(function, *self.towers(), *modules, step=step,
+            held = (kept, owned_program(function, step=step,
                                         static_argnames=static_argnames, donate_argnames=donate_argnames))
             cached[1][key] = held
         return held[1]

@@ -47,6 +47,7 @@ table); forward plus backward is counted as three times the forward.
 import argparse
 import dataclasses
 import datetime
+import importlib
 import json
 import statistics
 import subprocess
@@ -175,10 +176,7 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
     import jax.numpy as jnp
 
     from dew.nn import linear
-    from dew.nn.kernels import generation, log_linear, mamba_ssd, recurrence
-    from dew.nn.kernels.recurrence_chunk import SCAN, Chunk, chunk, fla_rule, scan_case
-    from dew.nn.mixers.lightning import LIGHTNING
-    from dew.nn.mixers.mamba2 import SSD
+    from dew.nn.kernels import generation
 
     given = {key: (np.asarray if host else jnp.asarray)(value) for key, value in operands(shape).items()}
     bf16 = jnp.bfloat16
@@ -189,63 +187,9 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
                 'xla': lambda x, taps: linear.xla_conv1d(x, taps, activation=True)}
         inputs, cotangents = (x, taps), given['dy'].astype(bf16)
     else:
-        if shape.kind == 'ssd':
-            x, B, C = (given[key].astype(bf16) for key in ('x', 'B', 'C'))
-            inputs = (x, given['dt'], given['A'], B, C, given['D'])
-            state = jnp.zeros((shape.batch, shape.value_heads, shape.value_width, shape.key_width))
-
-            def template(x, dt, A, B, C, D):
-                out, final = chunk(SSD, Chunk(C, B, x, beta=dt, rate=A, skip=D), chunk_size=shape.chunk,
-                                   dtype=jnp.float32)
-                return out, jnp.swapaxes(final, -1, -2)
-
-            def hand(x, dt, A, B, C, D):
-                return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, None, shape.chunk,
-                                          not generation.triton_runs())
-
-            hands = {'hand': hand}
-
-            # What the kernels take, whatever this GPU's row prefers.
-            case = scan_case(x, B, shape.chunk)
-            refusals['hand'] = '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').refusals(case))
-            cotangents = (given['dy'], given['dfinal'])
-        elif shape.kind == 'loglinear':
-            # The level weights in bf16 as fla's arm takes them, the two arms' inputs one draw's.
-            inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'],
-                      given['scales'].astype(bf16))
-
-            def template(q, k, v, g, scales):
-                # Scaled by one, as fla's kernel is unscaled.
-                return (log_linear.log_linear_attention(q, k, v, g, scales, scale=1.0),)
-
-            # No kernel of its own beside the template's.
-            hands = {}
-            cotangents = (given['do'],)
-        elif shape.kind == 'lightning':
-            inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'])
-
-            def template(q, k, v, g):
-                return chunk(LIGHTNING, Chunk(q, k, v, log_decay=g), chunk_size=shape.chunk)
-
-            # No kernel of its own beside the template's: fla's port takes no form without the delta rule.
-            hands = {}
-            cotangents = (given['do'], given['dfinal'])
-        else:
-            # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
-            hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
-                                     scale=shape.key_width ** -0.5, write_bound=1.0)
-            inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'],
-                      given['beta'].astype(bf16))
-
-            def template(q, k, v, g, beta):
-                return chunk(hooks, Chunk(q, k, v, log_decay=g, beta=beta), chunk_size=shape.chunk)
-
-            def hand(q, k, v, g, beta):
-                return fla_rule(q, k, v, g, beta, scale=shape.key_width ** -0.5)
-
-            hands = {'hand': hand}
-
-            cotangents = (given['do'], given['dfinal'])
+        builder = {'ssd': _ssd_parts, 'loglinear': _loglinear_parts, 'lightning': _lightning_parts}.get(
+            shape.kind, _gated_parts)
+        inputs, template, hands, refusals, cotangents = builder(shape, given)
 
         def xla(*args):
             with generation.chosen(gated_delta_rule='xla', ssd='xla'):
@@ -258,6 +202,88 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
 
         arms = {'template': template, 'mosaic': mosaic, **hands, 'xla': xla}
     return arms, refusals, inputs, cotangents
+
+
+def _ssd_parts(shape: Shape, given: dict) -> tuple:
+    """An SSD shape's inputs, template, hand kernels, refusals and cotangents (`jax_parts`)."""
+    import jax.numpy as jnp
+
+    from dew.nn.kernels import generation, mamba_ssd
+    from dew.nn.kernels.recurrence_chunk import SCAN, Chunk, chunk, scan_case
+    from dew.nn.mixers.mamba2 import SSD
+
+    x, B, C = (given[key].astype(jnp.bfloat16) for key in ('x', 'B', 'C'))
+    inputs = (x, given['dt'], given['A'], B, C, given['D'])
+    state = jnp.zeros((shape.batch, shape.value_heads, shape.value_width, shape.key_width))
+
+    def template(x, dt, A, B, C, D):
+        out, final = chunk(SSD, Chunk(C, B, x, beta=dt, rate=A, skip=D), chunk_size=shape.chunk,
+                           dtype=jnp.float32)
+        return out, jnp.swapaxes(final, -1, -2)
+
+    def hand(x, dt, A, B, C, D):
+        return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, None, shape.chunk,
+                                  not generation.triton_runs())
+
+    # What the kernels take, whatever this GPU's row prefers.
+    case = scan_case(x, B, shape.chunk)
+    refusals = {'hand': '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').refusals(case))}
+    return inputs, template, {'hand': hand}, refusals, (given['dy'], given['dfinal'])
+
+
+def _loglinear_parts(shape: Shape, given: dict) -> tuple:
+    """A log-linear shape's (`_ssd_parts`'s): no kernel of its own beside the template's."""
+    import jax.numpy as jnp
+
+    from dew.nn.kernels import log_linear
+
+    # The level weights in bf16 as fla's arm takes them, the two arms' inputs one draw's.
+    inputs = (*(given[key].astype(jnp.bfloat16) for key in ('q', 'k', 'v')), given['g'],
+              given['scales'].astype(jnp.bfloat16))
+
+    def template(q, k, v, g, scales):
+        # Scaled by one, as fla's kernel is unscaled.
+        return (log_linear.log_linear_attention(q, k, v, g, scales, scale=1.0),)
+
+    return inputs, template, {}, {}, (given['do'],)
+
+
+def _lightning_parts(shape: Shape, given: dict) -> tuple:
+    """A lightning shape's (`_ssd_parts`'s): no kernel of its own beside the template's, fla's port taking no
+    form without the delta rule."""
+    import jax.numpy as jnp
+
+    from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+    from dew.nn.mixers.lightning import LIGHTNING
+
+    inputs = (*(given[key].astype(jnp.bfloat16) for key in ('q', 'k', 'v')), given['g'])
+
+    def template(q, k, v, g):
+        return chunk(LIGHTNING, Chunk(q, k, v, log_decay=g), chunk_size=shape.chunk)
+
+    return inputs, template, {}, {}, (given['do'], given['dfinal'])
+
+
+def _gated_parts(shape: Shape, given: dict) -> tuple:
+    """A gated delta rule's or KDA's shape's (`_ssd_parts`'s): the draws' sigmoid write gates of unit keys
+    (`recurrence.Hooks.write_bound`), as layers declare."""
+    import jax.numpy as jnp
+
+    from dew.nn.kernels import recurrence
+    from dew.nn.kernels.recurrence_chunk import Chunk, chunk, fla_rule
+
+    hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
+                             scale=shape.key_width ** -0.5, write_bound=1.0)
+    inputs = (*(given[key].astype(jnp.bfloat16) for key in ('q', 'k', 'v')), given['g'],
+              given['beta'].astype(jnp.bfloat16))
+
+    def template(q, k, v, g, beta):
+        return chunk(hooks, Chunk(q, k, v, log_decay=g, beta=beta), chunk_size=shape.chunk)
+
+    def hand(q, k, v, g, beta):
+        return fla_rule(q, k, v, g, beta, scale=shape.key_width ** -0.5)
+
+    return inputs, template, {'hand': hand}, {}, (given['do'], given['dfinal'])
 
 
 def forward_backward(fn):
@@ -327,83 +353,11 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
 
     given = {key: torch.tensor(value, device='cuda') for key, value in operands(shape).items()}
     bf16 = torch.bfloat16
-    if arm == 'mamba_ssm':
-        from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-
-        leaves = [given['x'].to(bf16), given['dt'], given['A'], given['B'].to(bf16), given['C'].to(bf16),
-                  given['D']]
-
-        def run(x, dt, A, B, C, D):
-            return mamba_chunk_scan_combined(x, dt, A, B, C, shape.chunk, D=D, return_final_states=True)
-
-        cotangents = (given['dy'].to(bf16), given['dfinal'])
-    elif arm == 'flashqla':
-        major, minor = torch.cuda.get_device_capability()
-        try:
-            from flash_qla import chunk_gated_delta_rule as rule
-        except ValueError as error:  # FlashQLA refuses an architecture it has no kernels for at import
-            return {'shape': name, 'arm': arm, 'length': shape.length, 'device': torch.cuda.get_device_name(),
-                    'fwd_ms': None, 'fwd_bwd_ms': None, 'refused': f"sm{major}{minor}: {error}"}
-
-        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'],
-                  given['beta'].to(bf16)]
-
-        def run(q, k, v, g, beta):
-            return rule(q=q, k=k, v=v, g=g, beta=beta, scale=shape.key_width ** -0.5, output_final_state=True)
-
-        cotangents = (given['do'].to(bf16), given['dfinal'])
-    elif shape.kind == 'loglinear':
-        from fla.ops.log_linear_attn import chunk_log_linear_attn
-
-        # The level weights in the operands' dtype, as a bf16 model's layer hands them (its `L` parameter's,
-        # log_linear_mamba2.py:105): fla-core 0.5.2's forward scales its scores by them after rounding to the
-        # queries' dtype and dots them with the values (chunk.py:194-199), which an fp32 weight makes an fp32
-        # operand beside bf16 values, refused by Triton.
-        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'],
-                  given['scales'].to(bf16)]
-
-        def run(q, k, v, g, scales):
-            # fla-core 0.5.2's kernel takes one key group (its forward refuses any other, chunk.py:1117) and
-            # no scale (unscaled), the queries and keys as its layer hands them (log_linear_mamba2.py:107).
-            return (chunk_log_linear_attn(q, k, v, g, scales)[0],)
-
-        cotangents = (given['do'].to(bf16),)
-    elif shape.kind == 'lightning':
-        from fla.ops.lightning_attn import chunk_lightning_attn
-
-        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16)]
-
-        def run(q, k, v):
-            # fla's MiniMax layer's call: its decay a head's own, from the layer's place (one layer of one,
-            # which times as any other), its scores unscaled as Dew's lightning layer's.
-            return chunk_lightning_attn(q, k, v, layer_idx=0, num_layers=1, scale=1.0,
-                                        output_final_state=True)
-
-        cotangents = (given['do'].to(bf16), given['dfinal'])
-    elif shape.kind == 'conv':
-        from fla.modules.convolution import causal_conv1d
-
-        leaves = [given['x'].to(bf16), given['taps'].to(bf16)]
-
-        def run(x, taps):
-            return (causal_conv1d(x, taps, activation='silu')[0],)
-
-        cotangents = (given['dy'].to(bf16),)
-    else:
-        if shape.kind == 'kda':
-            from fla.ops.kda import chunk_kda as rule
-        else:
-            from fla.ops.gated_delta_rule import chunk_gated_delta_rule as rule
-        group = shape.value_heads // shape.key_heads
-        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'],
-                  given['beta'].to(bf16)]
-
-        def run(q, k, v, g, beta):
-            # The layers' repeat, inside the timed call so its transpose sums each key head's gradients.
-            q, k = (x.repeat_interleave(group, dim=2) for x in (q, k))
-            return rule(q, k, v, g, beta, scale=shape.key_width ** -0.5, output_final_state=True)
-
-        cotangents = (given['do'].to(bf16), given['dfinal'])
+    case = _torch_case(shape, arm, given, bf16, torch)
+    if isinstance(case, str):
+        return {'shape': name, 'arm': arm, 'length': shape.length, 'device': torch.cuda.get_device_name(),
+                'fwd_ms': None, 'fwd_bwd_ms': None, 'refused': case}
+    leaves, run, cotangents = case
     leaves = [leaf.requires_grad_() for leaf in leaves]
 
     def forward():
@@ -417,7 +371,7 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
         for leaf in leaves:
             leaf.grad = None
 
-    row = {'shape': name, 'arm': arm, 'device': torch.cuda.get_device_name()}
+    row: dict[str, object] = {'shape': name, 'arm': arm, 'device': torch.cuda.get_device_name()}
     for part, fn in (('fwd_ms', forward), ('fwd_bwd_ms', backward)):
         torch.cuda.reset_peak_memory_stats()
         try:
@@ -432,6 +386,101 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
     return row
 
 
+def _torch_case(shape: Shape, arm: str, given: dict, bf16, torch) -> tuple | str:
+    """`torch_arm`'s leaves, call and cotangents for `arm` on `shape`, or its kernels' refusal of this GPU;
+    each arm's package imported by name, an optional one no environment but its own holds."""
+    if arm == 'mamba_ssm':
+        return _mamba_ssm_case(shape, given, bf16)
+    if arm == 'flashqla':
+        return _flashqla_case(shape, given, bf16, torch)
+    cases = {'loglinear': _fla_loglinear_case, 'lightning': _fla_lightning_case, 'conv': _fla_conv_case}
+    return cases.get(shape.kind, _fla_gated_case)(shape, given, bf16)
+
+
+def _mamba_ssm_case(shape: Shape, given: dict, bf16) -> tuple:
+    combined = importlib.import_module('mamba_ssm.ops.triton.ssd_combined').mamba_chunk_scan_combined
+    leaves = [given['x'].to(bf16), given['dt'], given['A'], given['B'].to(bf16), given['C'].to(bf16),
+              given['D']]
+
+    def run(x, dt, A, B, C, D):
+        return combined(x, dt, A, B, C, shape.chunk, D=D, return_final_states=True)
+
+    return leaves, run, (given['dy'].to(bf16), given['dfinal'])
+
+
+def _flashqla_case(shape: Shape, given: dict, bf16, torch) -> tuple | str:
+    major, minor = torch.cuda.get_device_capability()
+    try:
+        rule = importlib.import_module('flash_qla').chunk_gated_delta_rule
+    except ValueError as error:  # FlashQLA refuses an architecture it has no kernels for at import
+        return f"sm{major}{minor}: {error}"
+    leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'],
+              given['beta'].to(bf16)]
+
+    def run(q, k, v, g, beta):
+        return rule(q=q, k=k, v=v, g=g, beta=beta, scale=shape.key_width ** -0.5, output_final_state=True)
+
+    return leaves, run, (given['do'].to(bf16), given['dfinal'])
+
+
+def _fla_loglinear_case(shape: Shape, given: dict, bf16) -> tuple:
+    del shape
+    attention = importlib.import_module('fla.ops.log_linear_attn').chunk_log_linear_attn
+    # The level weights in the operands' dtype, as a bf16 model's layer hands them (its `L` parameter's,
+    # log_linear_mamba2.py:105): fla-core 0.5.2's forward scales its scores by them after rounding to the
+    # queries' dtype and dots them with the values (chunk.py:194-199), which an fp32 weight makes an fp32
+    # operand beside bf16 values, refused by Triton.
+    leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'],
+              given['scales'].to(bf16)]
+
+    def run(q, k, v, g, scales):
+        # fla-core 0.5.2's kernel takes one key group (its forward refuses any other, chunk.py:1117) and
+        # no scale (unscaled), the queries and keys as its layer hands them (log_linear_mamba2.py:107).
+        return (attention(q, k, v, g, scales)[0],)
+
+    return leaves, run, (given['do'].to(bf16),)
+
+
+def _fla_lightning_case(shape: Shape, given: dict, bf16) -> tuple:
+    del shape
+    attention = importlib.import_module('fla.ops.lightning_attn').chunk_lightning_attn
+    leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16)]
+
+    def run(q, k, v):
+        # fla's MiniMax layer's call: its decay a head's own, from the layer's place (one layer of one,
+        # which times as any other), its scores unscaled as Dew's lightning layer's.
+        return attention(q, k, v, layer_idx=0, num_layers=1, scale=1.0, output_final_state=True)
+
+    return leaves, run, (given['do'].to(bf16), given['dfinal'])
+
+
+def _fla_conv_case(shape: Shape, given: dict, bf16) -> tuple:
+    del shape
+    convolution = importlib.import_module('fla.modules.convolution').causal_conv1d
+    leaves = [given['x'].to(bf16), given['taps'].to(bf16)]
+
+    def run(x, taps):
+        return (convolution(x, taps, activation='silu')[0],)
+
+    return leaves, run, (given['dy'].to(bf16),)
+
+
+def _fla_gated_case(shape: Shape, given: dict, bf16) -> tuple:
+    module, name = (('fla.ops.kda', 'chunk_kda') if shape.kind == 'kda'
+                    else ('fla.ops.gated_delta_rule', 'chunk_gated_delta_rule'))
+    rule = getattr(importlib.import_module(module), name)
+    group = shape.value_heads // shape.key_heads
+    leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'],
+              given['beta'].to(bf16)]
+
+    def run(q, k, v, g, beta):
+        # The layers' repeat, inside the timed call so its transpose sums each key head's gradients.
+        q, k = (x.repeat_interleave(group, dim=2) for x in (q, k))
+        return rule(q, k, v, g, beta, scale=shape.key_width ** -0.5, output_final_state=True)
+
+    return leaves, run, (given['do'].to(bf16), given['dfinal'])
+
+
 def _kernel_milliseconds(torch, fn, repeats: int) -> float:
     """A call of `fn`'s mean device milliseconds over `repeats` synchronized calls under one capture, their
     CUDA kernels summed as torch's profiler reads them (CUPTI's, as the JAX arms' are), no host dispatch
@@ -442,7 +491,10 @@ def _kernel_milliseconds(torch, fn, repeats: int) -> float:
         for _ in range(repeats):
             fn()
             torch.cuda.synchronize()
-    return sum(event.device_time for event in profiled.events()
+    events = profiled.events()
+    if events is None:
+        raise RuntimeError("the profiler's capture held no events")
+    return sum(event.device_time for event in events
                if event.device_type == torch.autograd.DeviceType.CUDA) / 1e3 / repeats
 
 
@@ -486,7 +538,7 @@ def markdown(rows: list[dict], sha: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('jax', 'torch', 'row'))
     parser.add_argument('runs', nargs='?', help="row mode: the JSON lines the other modes wrote")
     parser.add_argument('--shape', default='all', help=f"one of {sorted(SHAPES)} or 'all'")

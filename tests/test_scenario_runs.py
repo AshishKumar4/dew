@@ -19,6 +19,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from interop_support import extract_fixture
 from placement_parity import layouts_agree
 from recording import RecordingTracker
 from run_kinds import cli_settings, lm, saved_record, scalars
@@ -563,15 +564,13 @@ def quantized_interchange(cell: Mapping, root: Path) -> None:
 
 def published_task(cell: Mapping, root: Path):
     """The cell's released pipeline, extracted under `root` and loaded at the cell's dtype."""
-    import tarfile
 
     from test_pipeline_streaming import PIPELINES
 
     from dew.interop.pretrained import Pretrained
 
     archive, inside = PIPELINES[cell["family"]]
-    with tarfile.open(Path(__file__).resolve().parents[1] / f"tests/fixtures/{archive}.tar.xz") as opened:
-        opened.extractall(root / archive, filter="data")
+    extract_fixture(Path(__file__).resolve().parents[1] / f"tests/fixtures/{archive}.tar.xz", root / archive)
     loaded = Pretrained.load(str(root / archive / inside), dtype=cell["dtype"], attention_impl="xla")
     return loaded.text_to_image()
 

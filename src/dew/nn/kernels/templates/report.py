@@ -1075,10 +1075,14 @@ def triton_wrong(lowered: jax.stages.Lowered, target: generation.GpuTarget) -> b
     on every GPU measured (`GpuTarget.int8_triton_gemm`); with CUDA 13 cuBLAS refuses some int8 shapes
     (on an A100 a contraction of 16 or 48), and then the program does not compile rather than compute
     wrong;
-    or fp32 operands at IEEE fp32 products (a precision of `HIGHEST` on both, or an algorithm of fp32
-    operands one product a term, the F32_F32_F32 preset), which it sums farther from float64 than cuBLAS,
-    whose sum a float32 reference is (`dew.nn.precision.FP32_PRODUCTS`), as JAX lowers each dot at the
-    precision it resolved: the run's default, a model's, an operation's own."""
+    or fp32 operands at IEEE fp32 products (a precision of `HIGHEST` on either operand, XLA's GPU taking the
+    higher of a pair, or an algorithm of fp32 operands one product a term, the F32_F32_F32 preset), which it
+    sums farther from float64 than cuBLAS, whose sum a float32 reference is
+    (`dew.nn.precision.FP32_PRODUCTS`), as JAX lowers each dot at the precision it resolved: the run's
+    default, a model's, an operation's own."""
+    from dew.nn.precision import FP32_PRODUCTS, declares_fp32_products
+    from dew.nn.programs import algorithm_arithmetic, dot_arithmetic
+
     wrong = False
 
     def visit(op: ir.Operation) -> ir.WalkResult:
@@ -1091,13 +1095,14 @@ def triton_wrong(lowered: jax.stages.Lowered, target: generation.GpuTarget) -> b
         elif all(isinstance(each, ir.F32Type) for each in types):
             attributes = op.attributes
             if "precision_config" in attributes:
-                config = [str(each) for each in ir.ArrayAttr(attributes["precision_config"])]
-                wrong = config == ["#stablehlo<precision HIGHEST>"] * 2
+                # Each operand's precision as JAX's enum names it, the pair read as a run's precision is.
+                lhs, rhs = (jax.lax.Precision[stablehlo.PrecisionAttr(each).value]
+                            for each in ir.ArrayAttr(attributes["precision_config"]))
+                wrong = declares_fp32_products((lhs, rhs))
             if not wrong and "algorithm" in attributes:
-                algorithm = stablehlo.DotAlgorithm(attributes["algorithm"])
-                wrong = (all(isinstance(side, ir.F32Type)
-                             for side in (algorithm.lhs_precision_type, algorithm.rhs_precision_type))
-                         and algorithm.num_primitive_operations == 1)
+                stated = algorithm_arithmetic(stablehlo.DotAlgorithm(attributes["algorithm"]))
+                wrong = any(stated == dot_arithmetic(name, jnp.float32, jnp.float32)
+                            for name in FP32_PRODUCTS)
         return ir.WalkResult.INTERRUPT if wrong else ir.WalkResult.ADVANCE
 
     module = lowered.compiler_ir("stablehlo")

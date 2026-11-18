@@ -544,7 +544,7 @@ class GpuTarget:
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
-    `dew.nn.kernels.options.compiler_options`)."""
+    `dew.nn.kernels.templates.report.triton_wrong`)."""
     triton_gemm_fusions: bool = True
     """Whether a training step keeps XLA's Triton GEMM fusions on this GPU (`dew.training.memory`): off
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
@@ -558,6 +558,12 @@ class GpuTarget:
     step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
     measured per GPU as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None where
     none was."""
+    host_links: Mapping[str, float] = dataclasses.field(kw_only=True, hash=False)
+    """Each part's link to its host's memory (by the device-kind prefixes `dense_peaks` keys), in bytes a
+    second one way, its datasheet's peak: PCIe's x16 lanes or NVLink-C2C, whose sheets state both ways
+    together (an H100's "PCIe Gen5: 128 GB/s" is 64e9 here, a GH200's 900 GB/s C2C 450e9). What a step that
+    streams its parameters from the host moves them over (`dew.training.memory.streamed_seconds`); a part
+    this states none of streams nothing priced (`host_link_rate`)."""
 
     @property
     def architecture(self) -> Architecture:
@@ -629,6 +635,11 @@ class GpuTarget:
     @property
     def peaks(self) -> Mapping[str, float]:
         return self._part(self.dense_peaks) or {}
+
+    @property
+    def host_link_rate(self) -> float | None:
+        """This part's host link in bytes a second one way (`host_links`), None where none is stated."""
+        return self._part(self.host_links)
 
     @property
     def part(self) -> Measured | None:
@@ -745,7 +756,9 @@ TARGETS = {target.generation: target for target in (
     # T4: 40 SMs at a 1590 MHz boost, 320 GB/s (the T4 datasheet).
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
               aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9,
-              memory=16 * 10 ** 9),
+              memory=16 * 10 ** 9,
+              # PCIe Gen3 x16, the T4 datasheet's 32 GB/s both ways.
+              host_links={'Tesla T4': 16e9, 'NVIDIA Tesla T4': 16e9}),
     # A dependent step on XLA's path: an A100-SXM4-40GB's loop iteration, 5.96 us (FS-STEP-SECONDS1-a100,
     # its one-element loop's slope over 64 to 1024 iterations, 0.4% from the line).
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
@@ -760,18 +773,24 @@ TARGETS = {target.generation: target for target in (
               kernel_step_seconds=225.3e-9,
               # tools/device_facts.py on an A100-SXM4-40GB: its stream FS-DEVICEFACTS2-a100's (1.555 TB/s by
               # its clocks), its launch FS-DEVICEFACTS4-a100's.
-              measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6)}),
+              measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6)},
+              # PCIe Gen4 x16, the A100 datasheet's 64 GB/s both ways (SXM4 and PCIe parts alike).
+              host_links={'NVIDIA A100': 32e9}),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024,
               # The RTX A6000's 154.8 TF dense (its datasheet's 309.7 with sparsity; the RTX PRO Blackwell
               # architecture whitepaper's Table 4), a real one's other facts its driver's (`runtime_facts`).
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12},
                'NVIDIA RTX A6000': {'bf16': 154.8e12}}, multiprocessors=72,
-              clock_hz=1695e6, memory_bandwidth=600e9, memory=24 * 10 ** 9),
+              clock_hz=1695e6, memory_bandwidth=600e9, memory=24 * 10 ** 9,
+              # PCIe Gen4 x16 each (the A10, RTX 3090 and RTX A6000 datasheets' 64 GB/s both ways).
+              host_links={'NVIDIA A10': 32e9, 'NVIDIA GeForce RTX 3090': 32e9, 'NVIDIA RTX A6000': 32e9}),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), multiprocessors=58,
               # The RTX 4080's 16 GB, the least of the parts it covers (the L4's 24).
-              clock_hz=2040e6, memory_bandwidth=300e9, memory=16 * 10 ** 9, triton_gemm_fusions=False),
+              clock_hz=2040e6, memory_bandwidth=300e9, memory=16 * 10 ** 9, triton_gemm_fusions=False,
+              # PCIe Gen4 x16 each (the L4 datasheet's 64 GB/s both ways; the RTX 4080's Gen4 x16).
+              host_links={'NVIDIA L4': 32e9, 'NVIDIA GeForce RTX 4080': 32e9}),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024, {
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
@@ -809,7 +828,10 @@ TARGETS = {target.generation: target for target in (
                         # against its 1.98 GHz clock locked.
                         'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6,
                                                        loaded_clock=1.496e9),
-                        'NVIDIA H200': Measured(2.81e-6, 4.617e12)}),
+                        'NVIDIA H200': Measured(2.81e-6, 4.617e12)},
+              # PCIe Gen5 x16 (the H100 and H200 datasheets' 128 GB/s both ways, SXM, PCIe and NVL alike);
+              # the GH200's NVLink-C2C to its Grace (the GH200 datasheet's 900 GB/s both ways).
+              host_links={'NVIDIA H100': 64e9, 'NVIDIA H200': 64e9, 'NVIDIA GH200': 450e9}),
     # Datasheet facts and a B200's measured steps, L2, stream, launch and hand-off, no routes: what a
     # compile-only sm100 device needs (`tests/kernel_compile.py`), its peaks the scoreboard's MFU; a B200
     # run states its own clock and bandwidth (`runtime_facts`). Its clock is the busy SM's under NVML, 1965
@@ -835,7 +857,10 @@ TARGETS = {target.generation: target for target in (
               # 1.600; the driver's software power capping counter running at the default 1,000 W limit;
               # lab-b200-20261112-bundle2/ncu-muon-raw.csv), where its idle-sampled 1965 MHz above stands.
               measured={'NVIDIA B200': Measured(4.29e-6, 6.593e12, launch=1.20e-6, handoff=0.651e-6,
-                                                loaded_clock=1.549e9)}),
+                                                loaded_clock=1.549e9)},
+              # HGX B200's PCIe Gen5 x16 a GPU (its datasheet's 128 GB/s both ways); GB200's NVLink-C2C to
+              # its Grace (the GB200 NVL72 datasheet's 900 GB/s both ways).
+              host_links={'NVIDIA B200': 64e9, 'NVIDIA GB200': 450e9}),
     # Blackwell Ultra, datasheet alone and unmeasured, a compile-only sm103 device's facts: 160 SMs and
     # 8 TB/s (NVIDIA, "Inside NVIDIA Blackwell Ultra"), HGX B300's 2.25/4.5 PF dense bf16/fp8 a GPU (the
     # HGX table's sparse figures halved over 8 GPUs). No source states its clock: B200's, which steers
@@ -843,7 +868,10 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm103', 'NVIDIA B300', 227 * 1024,
               dense_peaks={'NVIDIA B300': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=160,
               # HGX B300's 2.3 TB of HBM3e over its 8 GPUs, 288 GB each (NVIDIA's HGX table).
-              clock_hz=1965e6, memory_bandwidth=8e12, memory=288 * 10 ** 9),
+              clock_hz=1965e6, memory_bandwidth=8e12, memory=288 * 10 ** 9,
+              # PCIe Gen5 x16 a GPU: "Eight Gen5 x16 links ... per NVIDIA HGX B300 baseboard" (NVIDIA's
+              # Enterprise Reference Architecture, HGX AI Factory, Components).
+              host_links={'NVIDIA B300': 64e9}),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
               # The Server Edition's 1.597 TB/s (NVIDIA's RTX PRO 6000 Blackwell Server Edition page and
@@ -854,20 +882,24 @@ TARGETS = {target.generation: target for target in (
               memory=96 * 10 ** 9,
               # In-kernel: a dependent lane reduction's 137.7 ns (FS-STEP-SECONDS1-g4, its two rounds 137.68
               # and 137.66).
-              step_seconds=3.68e-6, kernel_step_seconds=137.7e-9),
-    GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
-    GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
-    GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
+              step_seconds=3.68e-6, kernel_step_seconds=137.7e-9,
+              # PCIe Gen5 x16 (the Server Edition's datasheet, 128 GB/s both ways).
+              host_links={'NVIDIA RTX PRO 6000 Blackwell': 64e9}),
+    # No TPU's host link is stated from a primary source: a TPU streams no parameter priced (`host_links`).
+    GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}, host_links={}),
+    GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}, host_links={}),
+    GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}, host_links={}),
     # One TensorCore a chip, of four 128 x 128 MXUs, each 16K multiply-adds a cycle, and 800 GiB/s of HBM
     # (cloud.google.com/tpu/docs/v5e, /tpu/docs/system-architecture-tpu-vm); the clock is 197e12 / 131072,
     # derived from the peak, no stated clock. Its scoped VMEM and MXU rate are its family's (`_TPUS`).
     GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, multiprocessors=1,
-              clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30),
-    GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
+              clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30, host_links={}),
+    GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}},
+              host_links={}),
     # One TensorCore a chip, of two 256 x 256 MXUs, 918 TF of bf16 and 1638 GB/s of HBM
     # (cloud.google.com/tpu/docs/v6e); the clock is 918e12 / 524288, derived from the peak as v5e's.
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}, multiprocessors=1,
-              clock_hz=918e12 / 524288, memory_bandwidth=1638e9),
+              clock_hz=918e12 / 524288, memory_bandwidth=1638e9, host_links={}),
 )}
 
 
@@ -923,7 +955,7 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
                for prefix in target.device_kind_prefixes if identifier.startswith(prefix)]
     if matches:
         return dataclasses.replace(max(matches, key=lambda entry: entry[0])[1], device_kind=identifier)
-    return GpuTarget(identifier, identifier)
+    return GpuTarget(identifier, identifier, host_links={})
 
 
 def built_target(generation: str, multiprocessors: int | None = None, memory: int | None = None) -> GpuTarget:
@@ -1022,23 +1054,27 @@ device_description_str: "{target.device_kind}"
 
 
 def compile_only_gpus(generation: str, count: int = 1, memory: int | None = None,
-                      multiprocessors: int | None = None) -> tuple:
+                      multiprocessors: int | None = None, share: float | None = None) -> tuple:
     """`count` compile-only devices of the CUDA `generation`, none attached: XLA's CUDA backend compiles a
     program over them, a mesh's collectives included, as for that many of the generation's GPUs, of the
     `multiprocessors` a build states where it states them (`built_target`). `memory` states each GPU's
     memory, its total bytes as the GPU states them (`nvidia-smi`'s total): XLA's scheduler and
     rematerialization read it as the target's (`device_memory_size`), and every admission of a program
     compiled for these devices reads the allocator's limit derived from it (`dew._devices.allocator_limit`,
-    `COMPILE_ONLY_MEMORY`), as the GPU's own allocator states it. Absent it, the devices state no memory: a
-    step is compiled ahead for them only where it is stated (`compile_ahead`)."""
-    from dew._devices import COMPILE_ONLY_MEMORY
+    `dew._devices.STATED_GPUS`), as the GPU's own allocator states it, at `share`, the pool's share in the
+    run that loads their programs: Dew's own (`DEW_SHARE`, a constant) where none is given, never this
+    process's (`pool_share`). Devices of two shares are two (each its record), however alike otherwise.
+    Absent `memory`, the devices state no memory: a step is compiled ahead for them only where it is
+    stated (`compile_ahead`)."""
+    from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu
 
     if memory is not None:
         positive_memory(memory)
+    held = DEW_SHARE if share is None else share
     stated = built_target(generation, multiprocessors).multiprocessors
-    devices = _compile_only_gpus(generation, count, memory, stated)
+    devices = _compile_only_gpus(generation, count, memory, stated, held)
     if memory is not None:
-        COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
+        STATED_GPUS.update(dict.fromkeys(devices, StatedGpu(memory, held)))
     return devices
 
 
@@ -1050,9 +1086,10 @@ def positive_memory(memory: int) -> None:
 
 @functools.cache
 def _compile_only_gpus(generation: str, count: int, memory: int | None,
-                       multiprocessors: int | None) -> tuple:
+                       multiprocessors: int | None, share: float) -> tuple:
     """`compile_only_gpus`, one topology for each GPU however a caller states it (the generation's own
-    multiprocessors as None or as their count)."""
+    multiprocessors as None or as their count), and for each `share` its loading run takes, which the
+    topology does not read: devices of their own, so each holds its own record (`StatedGpu`)."""
     import jax.experimental.topologies as topologies
 
     config = target_config(built_target(generation, multiprocessors), memory)
@@ -1260,7 +1297,7 @@ def _resolved(device, generation: str, real: bool) -> GpuTarget:
     kind = device.device_kind
     target = gpu_target(kind)
     if target.generation != generation:
-        canonical = TARGETS.get(generation, GpuTarget(generation, kind))
+        canonical = TARGETS.get(generation, GpuTarget(generation, kind, host_links={}))
         target = dataclasses.replace(canonical, device_kind=kind) if real else canonical
     return runtime_facts(target, device) if real else target
 

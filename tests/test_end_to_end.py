@@ -5,7 +5,6 @@ trains the model and not the autoencoder, and the autoencoder's own loss
 trains it and not the model."""
 
 import functools
-import tarfile
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -683,8 +682,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     from dew.registry import ModelConfig
 
     for name in ("tiny_diffusers", "rae"):
-        with tarfile.open(FIXTURES / f"{name}.tar.xz") as archive:
-            archive.extractall(tmp_path / name, filter="data")
+        extract_fixture(FIXTURES / f"{name}.tar.xz", tmp_path / name)
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 2, "num_heads": 2,
                                          "mlp_ratio": 1, "dtype": "float32", "attention_impl": "xla"}),

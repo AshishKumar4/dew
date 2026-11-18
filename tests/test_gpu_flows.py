@@ -11,6 +11,7 @@ user's (`lane_environment.USERS_ARITHMETIC`), each flow in the process of its va
 
 import model_flows
 import pytest
+import tier_wire
 
 pytestmark = [pytest.mark.gpu(reason="each family's own GPU kernels, from programs compiled for this GPU"),
               pytest.mark.prepares]
@@ -28,7 +29,7 @@ def test_a_model_trains_and_decodes_on_its_gpu_routes(name, monkeypatch, record_
     stage leaves undecided draws its second in its run, from the programs its prepare compiled
     (`truths_ahead`)."""
     flow = model_flows.flow_named(name)
-    if model_flows.preparing():
+    if tier_wire.preparing():
         if (took := model_flows.prepared_apart(flow)) is None:
             pytest.skip(f"{flow.name}: no native kernel claims a route it is for on the node's GPU")
         for name, value in took.items():

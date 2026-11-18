@@ -1535,6 +1535,16 @@ def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, le
     for constructor in (Term.unary, Term.convert, Term.shaped, Term.reduce):
         if (args := get_callable_args(term, constructor)) is not None:
             primitive, given = region_.params[integer(args[-1])]
+            if primitive is jax.lax.logistic_p:
+                # A logistic, a program's own or Dew's read as it (`normal_form._computed`), computed as Dew's
+                # one logistic (`activations.logistic`: its arithmetic `precision.logistic_value`, never a
+                # backend's, a v5e's approximate one or Mosaic's under `approx_math`; its tangent declared, so
+                # a rewritten program JAX differentiates keeps a number where `e^-x` overflows), rounded once
+                # to its operand's dtype.
+                from dew.nn.activations import logistic
+
+                operand = value(args[0])
+                return logistic(operand).astype(jnp.result_type(operand))
             made = primitive.bind(value(args[0]), **given)
             # A barrier of one value binds as a primitive of many results, its one result its value.
             return made[0] if primitive.multiple_results else made
