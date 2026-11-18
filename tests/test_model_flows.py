@@ -406,6 +406,28 @@ def test_an_arm_of_its_own_compiler_options_is_prepared_whole(tmp_path):
     assert not traced and not (tmp_path / UNPREPARED).exists()
 
 
+def test_a_library_sites_arms_are_prepared_and_run_from_their_programs(tmp_path):
+    """A site with a library arm (`library_fn`, the owner's exception under BIBLE section 7, run on Dew's own
+    inputs beside the reference) prepares it as one of its arms, and its run computes it from that program,
+    tracing none, with no test of it recorded unprepared (row 8468: a store refused every library site,
+    which then compiled on its GPU, test_gemm_gather's cuBLAS product among them)."""
+    dew, reference, draw = _site()
+    traced: list[None] = []
+
+    def library(a, b):
+        traced.append(None)
+        return jnp.dot(a, b)
+
+    options = {"library_fn": library, "library_row": 8468, "library_leaves": [""]}
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(dew, reference, draw, "a product beside its library", seeds=8, **options)
+    assert traced
+    traced.clear()
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(dew, reference, draw, "a product beside its library", seeds=8, **options)
+    assert not traced and not (tmp_path / UNPREPARED).exists()
+
+
 def test_a_site_free_arm_runs_its_prepared_program(tmp_path):
     """A computation with no check-1 site (a bitwise check's kernel, `reference_error.ahead_arm`) is
     prepared as an arm is: its prepare traces it and gives zeros of its outputs' shapes, its run computes it

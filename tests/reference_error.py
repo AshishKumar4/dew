@@ -522,7 +522,7 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
 
 
 def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn,
-                  terms, also, orders, plain: bool) -> None:
+                  terms, also, orders, plain: bool, library_fn=None) -> None:
     """`assert_as_exact`'s site prepared into `store` (`truths_ahead.compiled_truths`): every program its
     truths and terms take (`_ahead`), at each shape the draws of its stages take, compiled for the devices its
     run computes on, and its truth held to float64 on its first draw's shapes (`_of_float64`); and each of its
@@ -547,7 +547,9 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
         store.compile_site(label, programs, held)
     # A qualification run sizes a plain site first (`_qualified`), on its sizing draws through its arms.
     sizing = _sizing_seeds(reference_fn) if os.environ.get(QUALIFY) and plain else range(0)
+    # A library arm (`library_fn`) one of them, run on Dew's own inputs as a further reference is (row 8468).
     _compile_arms(store, {"dew": (dew_fn, False), "reference": (reference_fn, True),
+                          **({} if library_fn is None else {"library": (library_fn, True)}),
                           **{f"further {name}": (fn, True) for name, fn in also.items()}},
                   draw, label, seeds=seeds, orders=orders, sizing=sizing)
 
@@ -752,18 +754,23 @@ def _stored_arms(store: CompiledTruths, label: str, dew_fn, reference_fn, also: 
     prepare compiled into `store` (`_ahead_arm`), each named as its prepare named it, before any call of it
     (`_compile_arms`); one no statement holds runs unprepared, named, and one that holds no program as it
     is: the run's verdict's and a qualification run's sizing's (`_qualified`) alike."""
-    def from_store(given_fn, arm, role: str):
-        if not _holds_program(given_fn):
-            return arm
-        named_role = _arm_role(role, given_fn, label)
-        if named_role is None:
-            store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
-            return arm
-        return _ahead_arm(given_fn, arm, functools.partial(store.called, armed(label)), named_role)
-
-    return (from_store(dew_fn, compiled[0], "dew"), from_store(reference_fn, compiled[1], "reference"),
-            [from_store(fn, arm, f"further {name}")
+    return (_stored_arm(store, label, dew_fn, compiled[0], "dew"),
+            _stored_arm(store, label, reference_fn, compiled[1], "reference"),
+            [_stored_arm(store, label, fn, arm, f"further {name}")
              for (name, fn), arm in zip(also.items(), compiled[2], strict=True)])
+
+
+def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str):
+    """A site's arm `role` (`given_fn` as the site passed it, `arm` as compiled) whose every call is its
+    draw's program its prepare compiled into `store` (`_ahead_arm`), named as its prepare named it; one no
+    statement holds runs unprepared, named, and one that holds no program as it is (`_stored_arms`)."""
+    if not _holds_program(given_fn):
+        return arm
+    named_role = _arm_role(role, given_fn, label)
+    if named_role is None:
+        store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
+        return arm
+    return _ahead_arm(given_fn, arm, functools.partial(store.called, armed(label)), named_role)
 
 
 def _holds_program(fn) -> bool:
@@ -1479,12 +1486,12 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     # weighed check beside Dew and its reference.
     plain = not (library_fn or also or terms or conditioning)
     store = COMPILED.get()
-    if store is not None and (conditioning is not None or library_fn is not None):
-        raise ValueError(f"{label}: a weighed or library site reads its reference's own rounding and arms "
-                         "at its truth's inputs, which no program compiled ahead holds")
+    if store is not None and conditioning is not None:
+        raise ValueError(f"{label}: a weighed site reads its reference's own rounding at its truth's inputs, "
+                         "which no program compiled ahead holds")
     if store is not None and store.prepare:
         _compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, terms=terms,
-                      also=also, orders=orders, plain=plain)
+                      also=also, orders=orders, plain=plain, library_fn=library_fn)
         return
     if os.environ.get(QUALIFY) and not (drawing() or judging()):
         _qualified(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
@@ -1649,7 +1656,10 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
         # arm computing in NumPy.
         compiled = _stored_arms(ahead[0], label, dew_fn, reference_fn, also, compiled)
     dew_fn, reference_fn, further = compiled
-    library_fn = None if library_fn is None else _arms(library_fn, library_fn)[1]
+    library = None if library_fn is None else _arms(library_fn, library_fn)[1]
+    # A library arm's draws run by the program its prepare compiled, as the other arms' are (row 8468).
+    library_fn = library if library is None or ahead is None else _stored_arm(ahead[0], label, library_fn,
+                                                                              library, "library")
     truth_fn = truth_program
     # Each range's draws, every reference's, computed once for the stages of them all.
     ranges: dict[tuple[int, int], list[_Draws]] = {}
