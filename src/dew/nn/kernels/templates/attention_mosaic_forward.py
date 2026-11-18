@@ -393,9 +393,9 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
              else paged_reads(call.table, call.page, tiles.block_k))
     def launch(form: algebra.Forward, live: "jax.Array | _Flags | None", into: tuple | None = None
                ) -> "tuple[tuple, jax.Array, None] | tuple[tuple, None, _Flags]":
-        q, form = _rewalked(spec, form, raw, taken, hooks)
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
+        q, form = _rewalked(spec, form, raw, taken, hooks, bundle_of(at, raw.dtype))
         # A rewalk's flags: those the plain launch stated of its rows (`flagged`), else its live rows'.
         flags = (None if live is None else live if isinstance(live, _Flags)
                  else _Flags.of(live.reshape(*live.shape[:2], -1), at.block_q))
@@ -586,10 +586,10 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
     def launch(form: algebra.Forward, live: jax.Array | None, into=None):
         del live, into
-        q, form = _rewalked(spec, form, raw, taken, hooks)
         counted = counts and form.natural == spec.natural
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
+        q, form = _rewalked(spec, form, raw, taken, hooks, bundle_of(at, raw.dtype))
         # The launches on the family arranged for their own tiles (`bundle_of`), as their derivation priced
         # them: a natural rewalk's key tile its own (`Tiles.relaunch`).
         launching = bundle_of(at, query.dtype)
@@ -677,7 +677,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         query = prologued(query, hooks.query_mod, hooks.query_params)
         hooks = dataclasses.replace(hooks, query_mod=None, query_params=())
     # A query its consumers take by its power in their stage enters as the caller's (`_powered_in_kernel`).
-    fused = _powered_in_kernel(query.dtype, hooks)
+    fused = _powered_in_kernel(query.dtype, hooks, family)
     call = padded_call(query if fused else by_power(query, power / taken), key, value, spans, hooks,
                        _block(tiles), table, by_position=True,
                        query_block=tiles.consumers * tiles.block_q if inference else None,
@@ -705,8 +705,8 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     return call, spec, operands, read, taken, hooks
 
 
-def _rewalked(spec: algebra.Forward, form: algebra.Forward, query: jax.Array, taken: float, hooks: Hooks
-              ) -> tuple[jax.Array, algebra.Forward]:
+def _rewalked(spec: algebra.Forward, form: algebra.Forward, query: jax.Array, taken: float, hooks: Hooks,
+              family: mosaic.Family) -> tuple[jax.Array, algebra.Forward]:
     """A launch's query operand and form: the fold's natural rewalk (`algebra.unfolded`) of a call whose
     plain launch took its power of two into its scale (`taken`, `_prepared`) the query taken by the power
     (in the kernel, after the prologue, where its consumers take the query's, `_prologued`) and the scale
@@ -714,16 +714,16 @@ def _rewalked(spec: algebra.Forward, form: algebra.Forward, query: jax.Array, ta
     if taken == 1.0 or form.natural == spec.natural:
         return query, form
     rewalked = dataclasses.replace(form, scale=form.scale / taken, prescale=taken)
-    return (query if _powered_in_kernel(query.dtype, hooks) else by_power(query, taken)), rewalked
+    return (query if _powered_in_kernel(query.dtype, hooks, family) else by_power(query, taken)), rewalked
 
 
-def _powered_in_kernel(dtype, hooks: Hooks) -> bool:
+def _powered_in_kernel(dtype, hooks: Hooks, family: mosaic.Family) -> bool:
     """Whether a launch's consumers take its query's power of two in their stage (`_prologued`, its form's
     `prescale`): under a query prologue (a norm of the query by the power is no norm's of the query), and for
-    a 16-bit query, exact, no pass of XLA's over it before the launch (a decode step's 1.5 of its 27.6 us at
-    batch 1 on a GH200, M-ET-87); an fp32 query's parts (`MosaicForward.parts`) are formed of the query
-    taken by it."""
-    return hooks.query_mod is not None or jnp.dtype(dtype).itemsize == 2
+    a 16-bit query on a family that reads its query's stage in its tile's layout (`Issuer.reads_query_tile`),
+    exact, no pass of XLA's over it before the launch (a decode step's 1.5 of its 27.6 us at batch 1 on a
+    GH200, M-ET-87); an fp32 query's parts (`MosaicForward.parts`) are formed of the query taken by it."""
+    return hooks.query_mod is not None or (jnp.dtype(dtype).itemsize == 2 and family.reads_query_tile)
 
 
 class _Read(NamedTuple):
@@ -1075,7 +1075,9 @@ def _query_of(program: _Program, spec: algebra.Forward, q_view, q_smem, q_loaded
     family, block_q = program.family, program.tiles.block_q
     if program.parts == 1:
         family.loaded(((q_view, q_smem, q_loaded),))
-        if hooks.query_mod is not None or spec.prescale != 1.0:
+        # The power where the launch's consumers take it (`_powered_in_kernel`; XLA's otherwise).
+        if hooks.query_mod is not None or (spec.prescale != 1.0
+                                           and _powered_in_kernel(q_smem.dtype, hooks, family)):
             _prologued(family, hooks.query_mod, hooks, hooked.query, place, first, q_smem, spec.prescale)
         return family.held(q_smem)
     family.loaded(tuple((view, q_smem.at[pl.ds(part * block_q, block_q)], barrier)
