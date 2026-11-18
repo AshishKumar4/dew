@@ -53,8 +53,8 @@ def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monk
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
     with generation.assumed(target), jax.default_matmul_precision(flow.precision):
-        dew = {kind: _routes(programs[f"{kind} dew"]) for kind in model_flows.KINDS}
-        reference = [route for kind in model_flows.KINDS
+        dew = {kind: _routes(programs[f"{kind} dew"]) for kind in flow.kinds}
+        reference = [route for kind in flow.kinds
                      for route in _routes(programs[f"{kind} reference"], reference=True)]
         model_flows.held_routes(flow, dew, target)
         model_flows.held_reference(flow, reference)
@@ -70,7 +70,7 @@ def test_a_training_step_on_the_templates_plain_jax_mainloop_does_not_reach_its_
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
     with generation.assumed("sm90"), jax.default_matmul_precision(flow.precision):
-        native = {kind: _routes(programs[f"{kind} dew"]) for kind in model_flows.KINDS}
+        native = {kind: _routes(programs[f"{kind} dew"]) for kind in flow.kinds}
         with generation.chosen(attention_mainloop="portable"):
             forced = _routes(programs["train dew"])
     model_flows.held_routes(flow, native, "sm90")
@@ -109,11 +109,11 @@ def test_a_flows_truth_computes_in_float64(name, store, monkeypatch):
     this CPU, a node's for its GPU): each program's first draw's truth held to float64 (check 1's
     `_of_float64`, a narrow one refused) and every program its sites' truths and terms take compiled into the
     store, at the fewest seeds check 1 takes (`parity.FEWEST_SEEDS`)."""
-    fewest = dict.fromkeys(model_flows.KINDS, FEWEST_SEEDS)
-    flow = dataclasses.replace(model_flows.flow_named(name), seeds=fewest)
+    named = model_flows.flow_named(name)
+    flow = dataclasses.replace(named, seeds=dict.fromkeys(named.kinds, FEWEST_SEEDS))
     monkeypatch.setenv(tier_wire.TRUTHS, str(store))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
-    for kind in model_flows.KINDS:
+    for kind in flow.kinds:
         model_flows.judge(flow, {}, kind)
 
 
