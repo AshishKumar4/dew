@@ -405,19 +405,6 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """Why the launch takes no call of `ba` on `family`, or None (`refused`)."""
         raise NotImplementedError
 
-    def ladder(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
-        # `config`'s fields at each smaller query block its derivation takes (halvings and three quarters,
-        # the blocks its walk steps through), within `config`'s register cap and residency, largest first.
-        if not self._typed(config):
-            return ()
-        target = generation.gpu_target()
-        regime = (self.register_budget(config), self.resident(ba, config, target))
-        blocks = {config.block_q * 3 // 4, *(config.block_q >> shift for shift in range(1, 8))}
-        smaller = (dataclasses.replace(config, block_q=block) for block in sorted(blocks, reverse=True)
-                   if 0 < block < config.block_q)
-        return tuple(rung for rung in smaller if self.takes(ba, rung, target)
-                     and (self.register_budget(rung), self.resident(ba, rung, target)) == regime)
-
     def resident(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> int:
         """The programs of its launch at `config` a multiprocessor holds at once: its family's residency at
         its registers (`Family.programs`) and its shared memory's, each program's reservation its own
@@ -1507,6 +1494,21 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                for columns in (1, 2, 4) for walked in walked_extents(queries, query.dtype, key.shape[1])
                for step in steps] if queries is not None else []
         return next((config for config in (*fused, *two) if self.takes(ba, config, target)), None)
+
+    def ladder(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
+        # The query blocks its derivation walks below `config`'s (`_derived`'s walk, `extents`: whole units of
+        # its family's role and swizzled rows), `config`'s other fields kept, within its register cap and
+        # residency, largest first.
+        if not self._typed(config):
+            return ()
+        target = generation.gpu_target()
+        query = ba.arguments["query"]
+        regime = (self.register_budget(config), self.resident(ba, config, target))
+        smaller = (dataclasses.replace(config, block_q=block)
+                   for block in extents(bundle_of(config, query.dtype), query.dtype, query.shape[1])
+                   if block < config.block_q)
+        return tuple(rung for rung in smaller if self.takes(ba, rung, target)
+                     and (self.register_budget(rung), self.resident(ba, rung, target)) == regime)
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
         """Its tiles from the facts (`_derived`): each dK/dV consumer a unit of keys, the query tile both

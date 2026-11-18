@@ -637,9 +637,10 @@ class KernelOp(tokamax.Op):
 
     def ladder(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
         """The configs below a refused `config` whose kernels spill too where both `config`'s and the last's
-        do: `config`'s fields at each smaller block its derivation takes, within `config`'s register cap and
-        residency (ptxas is not monotone across caps, kernel-templates.md), largest first; none unless the
-        launch states them (`_spanned`)."""
+        do: `config`'s fields at each smaller block its derivation's own walk takes, within `config`'s
+        register cap and residency (ptxas is not monotone across caps, kernel-templates.md), largest first;
+        none unless the launch states them (`_spanned`), as no launch whose ladders were not measured
+        monotone does."""
         del ba, config
         return ()
 
