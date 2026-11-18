@@ -628,8 +628,6 @@ def _uniform(verdict: jax.Array) -> jax.Array:
     """A verdict every lane holds alike read warp-uniform (`across.uniform`), so a branch on it is not
     divergent and the copies issued under it address their tiles once, not lane by lane (row 7898); the
     interpreter's its own."""
-    from dew.nn.kernels.templates import across  # across builds on the toolkit
-
     return verdict if bodies.interpreting() else across.uniform(verdict)
 
 
