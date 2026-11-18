@@ -187,6 +187,16 @@ class CompiledTruths:
                                f"drew others)")
         return jax.device_get(programs[name](*held[name]["constants"], *jax.tree.leaves(inputs)))
 
+    def ran(self, label: str, role: str, inputs):
+        """The site's arm `role` run on `inputs` (`called`), reporting the routes its prepare's trace of it
+        reported (`generation.reported`), as a trace of it in the run would report them: the run calls its
+        executable and traces none (row 8374: a matrix cell's routes were empty on its GPU)."""
+        from dew.nn.kernels import generation
+
+        found = self.called(label, role, inputs)
+        generation.reported(self._site(label)[1][named(role, inputs)]["routes"])
+        return found
+
     def walked(self, label: str, role: str, inputs) -> bool:
         """Whether the site's program `role` at `inputs` is one its run walks as it runs (`float64_terms`),
         its prepare having found it steered by its values, which no program compiled ahead holds."""

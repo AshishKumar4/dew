@@ -113,6 +113,7 @@ from dew._sources import function_reads
 from dew._stated import Unestablished, stated
 from dew.algebra import passes
 from dew.nn import programs
+from dew.nn.kernels import generation
 from dew.parity import (
     CONFIDENCE,
     FACTOR,
@@ -610,8 +611,8 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
     (`_compiled`): within a run-to-run declaration and a window loop (at one window's inputs), a reference
     unrewritten but one of Dew's own paths (an arm that holds a program, `_holds_program`). Traced as its run
     traces it, and again where its compile lowers it (a launch a spill refused
-    derived at its next config), its constants the first trace's, by place (`_hold`); held under `role`, its
-    name with its fingerprint (`_arm_role`)."""
+    derived at its next config), its constants the first trace's, by place (`_hold`), and the routes that
+    trace reported; held under `role`, its name with its fingerprint (`_arm_role`)."""
     if isinstance(fn, _RunToRun):
         _arm_program(programs, held, role, fn.fn, inputs, reference=reference)
         return
@@ -621,7 +622,8 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         return
     traced_fn = unrewritten(fn) if reference and not _declared(fn) else fn
     name = named(role, inputs)
-    closed, shapes = jax.make_jaxpr(traced_fn, return_shape=True)(*inputs)
+    with generation.routes() as reported:
+        closed, shapes = jax.make_jaxpr(traced_fn, return_shape=True)(*inputs)
     structure = jax.tree.structure(inputs)
     schema = [jax.typeof(constant) for constant in closed.consts]
 
@@ -637,6 +639,9 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         return retraced
 
     _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
+    # The routes its trace reported, which its run, calling the program and tracing none, reports at each call
+    # (`truths_ahead.CompiledTruths.ran`).
+    held[name]["routes"] = list(reported)
 
 
 def _arm_role(role: str, fn, label: str) -> str | None:
@@ -731,7 +736,7 @@ def _stored_arms(store: CompiledTruths, label: str, dew_fn, reference_fn, also: 
         if named_role is None:
             store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
             return arm
-        return _ahead_arm(given_fn, arm, functools.partial(store.called, armed(label)), named_role)
+        return _ahead_arm(given_fn, arm, functools.partial(store.ran, armed(label)), named_role)
 
     return (from_store(dew_fn, compiled[0], "dew"), from_store(reference_fn, compiled[1], "reference"),
             [from_store(fn, arm, f"further {name}")

@@ -1,12 +1,19 @@
 """Check 1's arms beside Dew's and its reference (`assert_as_exact`'s `library_fn` and `also`): each is held
 as the reference is."""
 
+import contextlib
 import itertools
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
+from contract_support import normal_drawn
 from reference_error import GateFailure, Inconclusive, UnpairedDraw, as_given, assert_as_exact, seeds_for
 from test_reference_error import exact_rows, noised_draw, stacked_arm, stacked_examples
+from truths_ahead import compiled_truths
+
+from dew.nn.kernels import gemm, generation
 
 
 def noised(scale: float, noise: str, own: float = 0.0):
@@ -78,3 +85,29 @@ def test_a_library_arm_leaves_the_leaves_it_does_not_cover_judged_by_their_examp
         assert_as_exact(beside(stacked_arm(0, 3.0, every=5), 0), reference, stacked_examples,
                         "a fifth three times off", seeds=seeds, truth_fn=truth, examples=True, **allowed)
     assert not isinstance(failed.value, Inconclusive)
+
+
+def test_a_prepared_sites_arms_report_the_routes_their_unprepared_run_reports(tmp_path):
+    """A site whose arms its prepare compiled ahead (`truths_ahead.compiled_truths`, a GPU tier part's)
+    reports, as its run calls each arm's program, the routes the arm's trace reported where its prepare traced
+    it: those the site run unprepared reports. A run calling its executables traced nothing and reported no
+    route, so a matrix cell asserting its routes failed on its GPU (row 8374)."""
+    draw = normal_drawn(0x8374, (8, 16), (16, 4))
+
+    def dew(rows, matrix):
+        return gemm.gemm(rows, matrix, out_dtype=jnp.float32)
+
+    truth = as_given(lambda rows, matrix: np.asarray(rows, np.float64) @ np.asarray(matrix, np.float64))
+
+    def reported(**store) -> set:
+        with contextlib.ExitStack() as stack:
+            if store:
+                stack.enter_context(compiled_truths(tmp_path, stamp="here", **store))
+            found = stack.enter_context(generation.routes())
+            assert_as_exact(jax.jit(dew), jax.jit(jnp.dot), draw, "a routed product", seeds=16,
+                            truth_fn=truth)
+        return {(route.choice, route.kernel) for route in found}
+
+    unprepared = reported()
+    reported(prepare=True)
+    assert unprepared and reported(prepare=False) == unprepared, unprepared
