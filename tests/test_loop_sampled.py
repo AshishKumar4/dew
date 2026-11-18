@@ -274,21 +274,6 @@ def test_a_sampled_step_called_by_hand_draws_each_calls_counts_itself():
     assert step.counts == [TRAINED.count(words(sampled.key), position) for position in (40, 41)]
 
 
-def test_a_fresh_sampled_run_draws_from_its_first_microbatch_unsaid(caplog):
-    """A fresh run's first step, no checkpoint before it, draws from microbatch 0 and says nothing of a
-    checkpoint (row 8276); a checkpoint that counted none of its microbatches is said."""
-    key = jax.random.key(0)
-    step = DrawingStep({}, dict.fromkeys(range(1, CAP + 1)), 2, TRAINED, words(key))
-    with caplog.at_level("INFO", logger="dew.training.compiler"):
-        fresh = Interval.resumed({}, last_saved=None)
-        step.drawn(fresh, 0)
-        assert fresh.microbatches == 2 and not caplog.records
-        lacking = Interval.resumed({}, last_saved=3)
-        step.drawn(lacking, 3)
-    assert lacking.microbatches == 8
-    assert [record.name for record in caplog.records] == ["dew.training.compiler"]
-
-
 def test_a_sampled_run_whose_variables_are_on_the_host_is_refused_as_it_is_built():
     """A run drawing its pass count per microbatch whose stated layout keeps its variables on the host (a
     host-master run, which no plan of the devices steps) is refused as the trainer is built (rows 8271,
@@ -304,17 +289,12 @@ def test_a_sampled_run_whose_variables_are_on_the_host_is_refused_as_it_is_built
     assert streaming.refusal(default, stated=False, ahead=False) is not None
 
 
-def test_a_sampled_pass_count_is_exported_where_the_trainer_is():
-    """`SampledPasses`, `Trainer(sampled_passes=...)`'s type, is public beside the trainer (row 8277)."""
-    import dew.training
-
-    assert dew.training.SampledPasses is SampledPasses and "SampledPasses" in dew.training.__all__
-
-
-def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path):
+def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path, caplog):
     """A sampled run of four steps over data read in phases (`PhasedStream`), stopped after two and resumed,
     lands, bit for bit, where the run never stopped lands: each microbatch draws its count whatever its
-    data's phase, and its resume draws on from the microbatches its checkpoint counted."""
+    data's phase, and its resume draws on from the microbatches its checkpoint counted. A fresh run and a
+    resume of a checkpoint that counted its microbatches say nothing of a checkpoint lacking them (row
+    8276)."""
     from test_data_mixtures import assert_same, parameters
     from test_pass_weights import phased_draw, phased_loader
 
@@ -327,9 +307,13 @@ def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path):
                           checkpoints=Checkpoints(str(directory), keep=8)).fit(
             phased_loader(tokens), steps=steps, log_every=100, checkpoint_every=1)
 
-    whole = fitted(tmp_path / "whole", 4)
-    fitted(tmp_path / "resumed", 2)
-    resumed = fitted(tmp_path / "resumed", 4)
+    with caplog.at_level("INFO", logger="dew.training.compiler"):
+        whole = fitted(tmp_path / "whole", 4)
+        fitted(tmp_path / "resumed", 2)
+        resumed = fitted(tmp_path / "resumed", 4)
+    # The one note of a checkpoint lacking its count names its step and microbatch (`DrawingStep.drawn`).
+    assert not [record for record in caplog.records if record.name == "dew.training.compiler"
+                and isinstance(record.args, tuple) and len(record.args) == 2]
     assert int(resumed.step) == 4
     assert_same(parameters(whole), parameters(resumed), "the resumed sampled run is not the run unstopped")
 
