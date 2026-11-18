@@ -439,9 +439,9 @@ reaches (row 7874), and reverse over reverse, its backward a kernel no transform
 
 @pytest.mark.parametrize(("key", "value", "weight", "final", "cancelled"),
                          [(80, 80, -100, -100, False), (-80, 100, -100, 0, False), (-40, 100, -40, 56, False),
-                          (-100, 100, 30, 30, True)],
+                          (-100, 100, 30, 30, True), (60, -20, 100, -100, False)],
                          ids=["overflowing pair", "underflowing pair", "overflowing adjoint",
-                              "a continuation's adjoint"])
+                              "a continuation's adjoint", "cancelling terms"])
 def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, value, weight, final,
                                                                          cancelled):
     """A forked call's entry write (`Chunk.entry_key`) and its adjoint in the TPU kernel, at powers of two (a
@@ -457,9 +457,13 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
     step 127 that cancels the final memory's, so its opening memory's gradient is zero and its entry
     write's is too, while the memory continuing past 128 keeps the final's: its terms formed there and
     masked after, the weight and value's 2^130 against it, gave its key gradient NaN (base review 13abb0d6b
-    F1)."""
+    F1). `cancelling terms` gives a second term the first's value and its key negated: each term's write
+    2^140 and their sum zero, and its gradients' 2^-40 terms cancelling too, where a sum of terms formed
+    one at a time was inf - inf, NaN (base review ead11c83a F1)."""
     (x, b, c, a, given, keys, values, weights), (out, last) = documents_draw(0)
     keys, values = (jnp.zeros_like(t).at[:, :, 0].set(2.0 ** e) for t, e in ((keys, key), (values, value)))
+    if key == 60:
+        keys, values = keys.at[:, :, 1].set(-(2.0 ** key)), values.at[:, :, 1].set(2.0 ** value)
     operands = (jnp.zeros_like(x), jnp.ones_like(b), jnp.ones_like(c), jnp.zeros_like(a),
                 jnp.zeros_like(given), keys, values, jnp.full_like(weights, 2.0 ** weight))
     read = jnp.zeros_like(out)
