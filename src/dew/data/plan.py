@@ -266,7 +266,9 @@ class StepIdentity:
         stating = identity is None and isinstance(step, _DeclaredIdentity)
         declared = identity or (step.identity if isinstance(step, _DeclaredIdentity) else None)
         config = repr(step) if frozen else declared or name
-        unstable = any(marker in name or marker in config for marker in ("<lambda>", "<locals>", " at 0x"))
+        # A function made inside another is its code and reads (`dew._stated.stated`); a class made inside one
+        # stays refused there.
+        unstable = any(marker in name or marker in config for marker in ("<lambda>", " at 0x"))
         # Every external step that declares no identity is held by its code: the files of the external
         # code it runs, its own class's or function's and every function its fields hold (`_held_code`); a
         # part that runs code no file holds (a partial, a callable that is no dataclass, a lambda) leaves it

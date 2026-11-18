@@ -64,8 +64,9 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     pins it), the mesh and its devices' kind and allocator limit, the kernels their
     generation runs (`gpu_target`), what a model reads from context as it traces
     (`trace_context`), the libraries that compile it and the allocator and
-    XLA_FLAGS settings it compiles under. None where an identity states none of the step (a module
-    holding an array of JAX's): such a run keeps no record and decides its rung as it compiles."""
+    XLA_FLAGS settings it compiles under. None where an identity states none of the step (a module holding
+    a class made inside a function, or an array this process holds only part of): such a run keeps no
+    record and decides its rung as it compiles."""
     leaves, structure = jax.tree.flatten(arguments)
     try:
         traced = stated([list(modules), step, structure,
