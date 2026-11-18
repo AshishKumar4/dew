@@ -7,6 +7,8 @@ import numpy as np
 import optax
 import pytest
 
+from dew.data import Memory
+from dew.data.pipeline import Pipeline
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.training import Trainer
 
@@ -107,3 +109,32 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     for got, want in zip((w, ema), unscaled(accum, 2 * accum), strict=True):
         np.testing.assert_array_equal(got, want)
     assert int(state.microstep) == 2 * accum
+
+
+def test_a_gradient_that_would_overflow_adams_second_moment_is_rejected_by_its_norm():
+    """A scaled step whose gradient's square passes float32 (1e20 here) is rejected: its global norm, a sum of
+    the squares, is not finite, so no accepted step's gradient can carry Adam's second moment, a running
+    average of those squares, past float32, and the moments stay finite; the step's state is kept bit for
+    bit. One just under (1e19) is accepted."""
+    for scale, taken in ((5e18, True), (5e19, False)):
+        trainer = Trainer(ScaledObjective(), optax.adam(1e-3), key=jax.random.key(0), dynamic_scale=True)
+        state = trainer.initial_state()
+        batch = {"scale": jnp.full((jax.device_count(),), scale, jnp.float32)}
+        before = jax.device_get(state.opt_state)
+        state, _, _, _, accepted, _ = trainer.compile(state, batch)(state, batch)
+        assert bool(accepted) == taken
+        assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(state.opt_state))
+        if not taken:
+            for got, kept in zip(jax.tree.leaves(jax.device_get(state.opt_state)), jax.tree.leaves(before),
+                                 strict=True):
+                np.testing.assert_array_equal(got, kept)
+
+
+def test_a_scaled_run_whose_update_overflows_its_state_stops_at_the_next_log():
+    """A scaled run whose first update, from a finite gradient, overflows its parameters stops at the log
+    after it, naming the leaf, rather than reading on as its scale backs off (row 6748): its committed
+    state's finiteness is read after each commit."""
+    rows = Pipeline(Memory({"scale": np.full(4 * jax.device_count(), 5e9, np.float32)})).repeat()
+    trainer = Trainer(ScaledObjective(), optax.sgd(1e30), key=jax.random.key(0), dynamic_scale=True)
+    with pytest.raises(RuntimeError):
+        trainer.fit(rows.batch(jax.device_count()), steps=4, log_every=1)
