@@ -74,11 +74,13 @@ def task_peak() -> int | None:
     the task started counts in, a test's ranks with it), each of its tests' bound above (row 6003: a test's
     four ranks peaked at 7.17 GiB, packed beside another on a medium). None where the task runs in no
     cgroup this process can read."""
-    try:
-        group = Path("/proc/self/cgroup").read_text().strip().split("\n")[0].split("::", 1)[1]
-        return int((Path("/sys/fs/cgroup") / group.lstrip("/") / "memory.peak").read_text())
-    except (OSError, ValueError, IndexError):
+    cgroup = Path("/proc/self/cgroup")
+    line = cgroup.read_text().split("\n")[0] if cgroup.is_file() else ""
+    # cgroup v2's one hierarchy, `0::<path>`; under v1 (no such line) no peak is kept.
+    if "::" not in line:
         return None
+    peak = Path("/sys/fs/cgroup") / line.split("::", 1)[1].lstrip("/") / "memory.peak"
+    return int(peak.read_text()) if peak.is_file() else None
 
 
 def resumed(tests: list[str], owning: Callable[[str], str]) -> tuple[dict[str, float], set[str], int | None]:

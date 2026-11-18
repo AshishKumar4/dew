@@ -416,7 +416,7 @@ def test_a_tasks_peak_bounds_its_tests_and_a_heavy_files_tasks_run_large(ci, tmp
                       "tests/test_ranks.py::test_b": [5.0, 30.0, ranks],
                       "tests/test_light.py::test_a": [1.0, None, light]}
     assert ci.durations_record()["tests/test_ranks.py::test_b"] == 30.0
-    assert ci.heavy_files() == {"tests/test_ranks.py"}
+    assert ci.session.heavy_files() == {"tests/test_ranks.py"}
     entries = [entry for entry in ci.plan(240.0, {"files": {}}) if entry["python"] == "3.12"]
     # The task that runs the heavy file, light files packed beside it or not, is large.
     assert [entry.get("size") for entry in entries if "tests/test_ranks.py" in entry["tests"]] == ["large"]
@@ -426,7 +426,7 @@ def test_a_tasks_peak_bounds_its_tests_and_a_heavy_files_tasks_run_large(ci, tmp
     assert ci.main() == 0
     lowered = json.loads((tmp_path / "tests/test_durations.json").read_text())
     assert lowered["tests/test_ranks.py::test_a"][2] == light
-    assert ci.heavy_files() == set()
+    assert ci.session.heavy_files() == set()
     assert all("size" not in entry for entry in ci.plan(240.0, {"files": {}}))
 
 
@@ -450,9 +450,9 @@ def test_a_killed_tasks_peak_raises_its_files_tests_and_heavy_tasks_run_large(ci
     assert folded["tests/test_ranks.py::test_a"][2] == 9_000_000_000
     assert folded["tests/test_ranks.py::test_b"][2] == killed
     heavy = {"tests/test_ranks.py"}
-    assert ci.sized({"tests": "tests/test_ranks.py", "split": "test_site"}, heavy)["size"] == "large"
-    assert ci.sized({"tests": "tests/test_light.py tests/test_ranks.py"}, heavy)["size"] == "large"
-    assert "size" not in ci.sized({"tests": f"tests/test_ranks.py{ci.KEPT_AT}abc"}, heavy)
+    assert ci.session.sized({"tests": "tests/test_ranks.py", "split": "test_site"}, heavy)["size"] == "large"
+    assert ci.session.sized({"tests": "tests/test_light.py tests/test_ranks.py"}, heavy)["size"] == "large"
+    assert "size" not in ci.session.sized({"tests": f"tests/test_ranks.py{ci.session.KEPT_AT}abc"}, heavy)
 
 
 def test_a_resumed_attempts_rows_carry_the_earlier_attempts_peak(tmp_path, monkeypatch):

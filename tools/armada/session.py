@@ -579,3 +579,42 @@ def groups(seconds: list[float], count: int) -> list[range]:
     bounds = [*starts(weights, low), len(weights)]
     bounds += [len(weights)] * (count + 1 - len(bounds))
     return [range(bounds[index], bounds[index + 1]) for index in range(count)]
+
+
+KEPT_AT = "@"
+"""What joins a kept row's file to where its green run is kept in a plan entry's tests (ci.py's
+`reusable`): `tests/test_a.py@<class>:<key>`, or a group's, `tests/test_a.py#2/3@<class>:<key>`, which
+the task reads (ci.py's `kept_of`)."""
+
+GROUP_AT = "#"
+"""What joins a kept row's file to its group in its token (`KEPT_AT`), as a row's name does (ci.py's
+`row`)."""
+
+
+def entries(path: Path = DURATIONS) -> dict[str, Entry]:
+    """The durations record's entries as kept, each test's least warm and least cold seconds and its peak
+    (`entry`)."""
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+LARGE_FROM = 5 * 2**30
+"""A file's peak (`heavy_files`) past which its tasks run on a large container: half the memory a medium's
+tasks run under (armada's `tasksMemoryOf`, its 12 GiB less the 2 GiB the container keeps), so no two such
+tasks share a medium, which armada packs light tasks into by each task's own measures alone, and a regrouped
+file's new task has none (row 6003: a group's four ranks peaked at 7.17 GiB, and two packed on a medium had a
+rank killed). Through armada's own per-entry `size`; a large task armada still packs only by its measures."""
+
+
+def heavy_files(path: Path = DURATIONS) -> set[str]:
+    """The test files any of whose tests' recorded peaks (`peak`) passes `LARGE_FROM`: their tasks'
+    size large, whatever group a cut gives each test."""
+    return {node.partition("::")[0] for node, held in entries(path).items()
+            if (measured := peak(held)) is not None and measured > LARGE_FROM}
+
+
+def sized(entry: dict, heavy: set[str]) -> dict:
+    """`entry`, on a large container where it runs a file of `heavy` (`heavy_files`): a file's group, its
+    whole row, or a check-1 site's map task or judge, any task that runs its tests rather than looking a
+    kept row up (`KEPT_AT`)."""
+    runs = {token for token in entry["tests"].split() if KEPT_AT not in token}
+    return {**entry, "size": "large"} if runs & heavy else entry
