@@ -173,6 +173,32 @@ def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
         np.testing.assert_array_equal(tokens, discrete["whole"][key][1])
 
 
+@pytest.mark.parametrize("kind", sorted(MODELS))
+def test_an_episode_schedulers_cohort_is_served_and_draws_what_its_policy_draws_whole(kind):
+    """An episode scheduler over a `TextGeneration` policy drawing one row a prompt by sampling
+    (`RolloutScheduler.episodes`) serves its cohort's turns over the pages a server over them shares
+    (`served_layout`), each turn prefilling only what follows its row's history, and collects what the
+    policy collects prefilling every turn whole: every turn's context and action token for token, over
+    drawn weights (row 7905); their likelihoods are a served cohort's, held to check 1 beside."""
+    from dew.objectives.rl import GRPOObjective
+    from dew.objectives.rl.scheduler import RolloutScheduler, Synchronous
+
+    model = MODELS[kind]()
+    initialized = jax.jit(model.init)
+    for seed in range(4):
+        variables = nn.unbox(initialized(jax.random.key(seed), jnp.ones((1, 2), jnp.int32)))
+        acquisition = RolloutScheduler.episodes(
+            TextGeneration(model, variables), conversations, lambda episode: 1.0,
+            objective=GRPOObjective(model, seq_len=PROMPT + RESPONSE), max_prompt_tokens=PROMPT,
+            max_new_tokens=RESPONSE, max_turns=TURNS, sampling=SAMPLED).acquisition
+        assert isinstance(acquisition, Synchronous) and isinstance(acquisition.collector, EpisodeCollector)
+        scheduled, whole = collected(acquisition.collector, variables), collected(
+            collector(model, variables, SAMPLED), variables)
+        assert acquisition.collector.kv_cache is not None, "the scheduler serves its cohort over pages"
+        for name in ("contexts", "tokens"):
+            np.testing.assert_array_equal(scheduled[name], whole[name], err_msg=f"seed {seed}: {name}")
+
+
 def test_a_served_row_whose_context_does_not_continue_its_last_turn_is_prefilled_whole(caplog):
     """A served cohort's row whose next context does not begin with the history its last turn left (a
     context the environment rewrote) is prefilled whole, its draws the policy's whole draws, and says so: a
