@@ -555,6 +555,51 @@ def test_epochs_of_a_memory_read_that_packs_after_a_draw_or_a_cache_are_passes_o
     assert int(state.consumed) == 20
 
 
+class FirstKept:
+    """Rejects a document whose first id is a multiple of `every`, as a decode rejects bytes it cannot
+    make."""
+
+    identity = "first-kept@1"
+    rejects = True
+
+    def __init__(self, every: int):
+        self.every = every
+
+    def __call__(self, row):
+        from dew.data.pipeline import Rejected
+
+        return Rejected("unkept") if int(row["id"][0]) % self.every == 0 else row
+
+
+def test_epochs_of_a_memory_read_that_rejects_documents_before_it_packs_them_count_those_it_holds():
+    """Twelve documents, three of them rejected before a memory read packs the rest as it holds them: the
+    epochs' bound is held with the pack, where the read counts the nine it holds, a pass of them (train
+    1014's review: a bound placed before the rejecting step held none, and the epochs were refused)."""
+    from dew.data.compile import fitted
+    from dew.data.pipeline import ObjectiveData
+
+    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(12)]
+    chain = (Pipeline(Memory(documents)).filter_map(FirstKept(5)).pack(8, fields=("id",)).shuffle(seed=1)
+             .read("memory").batch(8))
+    loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
+    assert (loader.pass_examples, loader.examples) == (9, 18)
+
+
+def test_epochs_of_a_streamed_mix_whose_member_rejects_records_count_no_pass_ahead():
+    """A streamed mix of two corpora, one rejecting every third record, bounded after the mix where only the
+    rows it keeps reach the bound: no pass of it is counted ahead (a run of its epochs is refused), where
+    counting its source's records, 23 a pass, read each pass of it past its end (train 1014's review)."""
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+
+    first = Pipeline(Memory({"id": np.arange(1, 13, dtype=np.int32)})).filter_map(Keeps(3)).named("first")
+    second = Pipeline(Memory({"id": np.arange(21, 25, dtype=np.int32)})).named("second")
+    chain = mix([first, second], weights=(1, 1)).read("streamed").batch(4)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    assert (loader.pass_examples, loader.examples) == (None, None)
+
+
 def test_a_splits_epoch_cadence_is_the_runs_own_under_a_batch_ramp(tmp_path):
     """A split validated each epoch (`--val-every '{"val": "epoch"}'`) and the run's own validation at
     `epoch` (`eval_every`) resolve to the same steps under a batch ramp, which reads fewer records a step

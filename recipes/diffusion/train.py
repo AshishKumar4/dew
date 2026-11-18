@@ -34,13 +34,12 @@ def default(train, held) -> DiffusionRunConfig:
     """The recipe's run over labelled images, `train`'s and `held`'s, each captioned by its class: a
     training image by a template drawn for it, a held-out one by the first, so every validation reads the
     same captions (a drawn caption in validation is refused, its draws having no record index to follow).
-    A curated corpus's every image decodes, so one that does not stops the run (`rejects=False`): a
-    decode that drops it would leave the run no count of a pass ahead, and its epochs were refused."""
+    An image that does not decode is dropped and counted (`data/rejected/`), its record still read by the
+    pass its epochs count."""
     return DiffusionRunConfig(
         data=train.shuffle(seed=0).repeat().pipe(presets.images, 128, batch=32, augment=True,
-                                                 caption=images.caption(templates=TEMPLATES), rejects=False),
-        validation=held.pipe(presets.images, 128, batch=32, caption=images.caption(VALIDATION_TEMPLATE),
-                             rejects=False))
+                                                 caption=images.caption(templates=TEMPLATES)),
+        validation=held.pipe(presets.images, 128, batch=32, caption=images.caption(VALIDATION_TEMPLATE)))
 
 
 if __name__ == "__main__":
