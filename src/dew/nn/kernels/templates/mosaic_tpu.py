@@ -331,6 +331,10 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             raise ValueError("a TPU ring's streams take their views where they open (its walk copies)")
         return Streams(allocated, views)
 
+    def uniform(self, value: jax.Array) -> jax.Array:
+        # A core's scalar is its own: no lanes to read alike.
+        return value
+
     def decided_scratch(self, consumers: int) -> dict:
         # One core a program, its walk its one role: it decides a second walk alone (`after_walk.Decided`).
         del consumers

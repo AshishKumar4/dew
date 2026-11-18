@@ -333,8 +333,8 @@ class WalkStep:
 
 class Rare:
     """A kernel's verdict a rare span of it runs by (a decided walk's second, where its rows' sums passed
-    fp32's largest: `templates.after_walk.Decided`), through a marked call, which a count of the kernel's work by
-    emission reads as its common value, False (`templates.emission`): its launch states its common walk's
+    fp32's largest: `templates.after_walk.Decided`), through a marked call, which a count of the kernel's work
+    by emission reads as its common value, False (`templates.emission`): its launch states its common walk's
     work, as a rare call's scaled launch states none; inlined, it lowers to its value."""
 
 

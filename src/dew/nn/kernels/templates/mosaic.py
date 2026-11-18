@@ -701,8 +701,7 @@ class Issuer[Accumulator](abc.ABC):
 
     @property
     def rows_whole(self) -> bool:
-        """Whether each warp of a consumer holds whole rows of its products' tiles, so a reduction along a
-        row (a forward's maxima and sums) stays within a warp, needing no reduction scratch."""
+        """Whether each warp of a consumer holds whole rows of its tiles, a row's reduction its own."""
         return True
 
     def row_shifted(self, tile, shift, *, period: int, interpret: bool) -> jax.Array:
@@ -1088,8 +1087,7 @@ class Issuer[Accumulator](abc.ABC):
                 ready: Sequence, reaches: Sequence[tuple] | None = None) -> None:
         """The issuing role's walk of steps `lo` to `hi` (the streams' steps counted from `first`): each of
         `products` issued as its consumer's walk reads it (`places_on_role`), its left operands the program's
-        tiles `lefts` names (a mapping a consumer), once `ready` (its query loads' barriers) are done; each
-        consumer's at its own steps `reaches` within `lo` to `hi` (None: the program's)."""
+        tiles `lefts` names (one a consumer) once `ready` are done, each consumer's at its `reaches`."""
         del streams, products, lo, hi, first, lefts, ready, reaches
         raise NotImplementedError(f"{self.name}'s consumers issue their own products")
 
@@ -1599,8 +1597,7 @@ class Transport[Allocated, Opened](abc.ABC):
         producer lowered to `producer` where the family has one, `roles`, and its residency bounded by the
         `shared` bytes it stages where stated; `report.Launch.kernels`), which the compile point checks its
         kernel against; whether its program moves registers between its roles where the launch states
-        it (`moves`; else its model decides, `resources.moves_registers`); and whether its arithmetic reduces
-        across warps (`reduces`), reserving the family's reduction scratch there."""
+        it (`moves`; else its model decides, `resources.moves_registers`); its scratch where it `reduces`."""
 
     def scoped(self, body, *allocations, streams, after_walks: tuple = (), over_rings: bool = False):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
@@ -1749,9 +1746,12 @@ class Transport[Allocated, Opened](abc.ABC):
         """The producer's loads of steps `lo` to `hi` from `views` (`opened`'s), where the family has one
         (`streamed`); with `again`, once more where its consumers take their walk again, turns running on."""
 
+    def uniform(self, value: jax.Array) -> jax.Array:
+        """`value`, a scalar every lane holds alike, read warp-uniform (`across.uniform`, row 7898)."""
+        return value if bodies.interpreting() else across.uniform(value)
+
     def decided_scratch(self, consumers: int) -> dict:
-        """A decided walk's verdicts' scoped allocations (`after_walk.Decided`): a word a consumer and their
-        barrier; none where one consumer alone walks the program's rings (`feeds_itself`)."""
+        """A decided walk's verdicts' allocations (`after_walk.Decided`), none where one consumer feeds."""
         if consumers == 1 and self.feeds_itself:
             return {}
         return {"words": plgpu.SMEM((consumers,), jnp.int32),

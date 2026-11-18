@@ -5,6 +5,7 @@ take over the same steps (`Decided`: a decode's scaled walk where a row's sums p
 import dataclasses
 import functools
 import operator
+from collections.abc import Callable
 from typing import Any
 
 import jax
@@ -12,7 +13,6 @@ import jax.numpy as jnp
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn import derivatives
-from dew.nn.kernels.templates import across, bodies
 
 
 def scoped(family, body, allocations: tuple, streams: dict, after_walks: tuple, *, over_rings: bool):
@@ -85,12 +85,14 @@ class Decided:
     words: Any
     barrier: Any
     consumers: int
+    uniform: Callable[[jax.Array], jax.Array]
+    """The family's warp-uniform read of a scalar every lane holds alike (`Transport.uniform`)."""
 
     def stated(self, wg, verdict: jax.Array) -> jax.Array:
         """Consumer `wg`'s `verdict` (a scalar, uniform over its warpgroup) published, and whether any
         consumer's takes the walk again (`taken`)."""
         if self.words is None:
-            return _rare(_uniform(verdict.astype(jnp.int32)) != 0)
+            return _rare(self.uniform(verdict.astype(jnp.int32)) != 0)
         self.words[wg] = verdict.astype(jnp.int32)
         plgpu.barrier_arrive(self.barrier)
         return self.taken()
@@ -100,15 +102,8 @@ class Decided:
         rare verdict (`derivatives.Rare`), which a count of the kernel's work reads as not taken."""
         plgpu.barrier_wait(self.barrier)
         published = (self.words[index] for index in range(self.consumers))
-        return _rare(_uniform(functools.reduce(operator.or_, published)) != 0)
+        return _rare(self.uniform(functools.reduce(operator.or_, published)) != 0)
 
 
 _rare = derivatives.marked(derivatives.Rare(), lambda verdict: verdict)
 """A decided walk's verdict marked rare (`derivatives.Rare`)."""
-
-
-def _uniform(verdict: jax.Array) -> jax.Array:
-    """A verdict every lane holds alike read warp-uniform (`across.uniform`), so a branch on it is not
-    divergent and the copies issued under it address their tiles once, not lane by lane (row 7898); the
-    interpreter's its own."""
-    return verdict if bodies.interpreting() else across.uniform(verdict)

@@ -776,7 +776,7 @@ class _Layout(NamedTuple):
     decides: bool = False
     """Whether its consumers decide a second walk (`after_walk.Decided`), its verdicts' scratch last."""
 
-    def unpacked(self, q_ref, k_ref, v_ref, *refs) -> _Refs:
+    def unpacked(self, family: mosaic.Family, q_ref, k_ref, v_ref, *refs) -> _Refs:
         """A program's refs, its kernel's then its scoped allocations': the weights' relay tile last where
         the launch `relays` them (`relays`), a quantized call's converted keys' and values' tiles before it
         where it `converts` them (`_forward_allocations`' `codes`)."""
@@ -785,7 +785,7 @@ class _Layout(NamedTuple):
         (q_smem, row_smem, *stages), (q_loaded, schedule, *verdicts) = refs[:self.arrays], refs[self.arrays:]
         words, barrier = verdicts if verdicts else (None, None)
         consumers = 1 if words is None else words.shape[0]
-        decided = after_walk.Decided(words, barrier, consumers) if self.decides else None
+        decided = after_walk.Decided(words, barrier, consumers, family.uniform) if self.decides else None
         relay = stages.pop() if self.relays else None
         converted = (stages[-2], stages[-1]) if self.converts else None
         stages = stages[:-2] if self.converts else stages
@@ -1852,7 +1852,7 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
     consumers, block_q = tiles.consumers, tiles.block_q
 
     def body(*refs, streams, after=None, walked=None):
-        refs = layout.unpacked(*refs)
+        refs = layout.unpacked(program.family, *refs)
         read = refs.read
         located = functools.partial(_program_views, program, refs, read, peaks=peaks, group=group, page=page,
                                     batch=batch, parts=parts, queries=queries, kinds=kinds)

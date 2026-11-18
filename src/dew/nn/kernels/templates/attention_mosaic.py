@@ -483,11 +483,11 @@ class MosaicForward(_Mainloop[Tiles]):
     def decided(self, query, value, score_params, residuals: Kept | None, config: Tiles, table=None,
                 sources=None, scales=None, initial=None) -> bool:
         """Whether its launch at `config` walks unscaled and decides a scaled second walk of a program whose
-        rows' sums passed fp32's largest (`after_walk.Decided`), no pass over its values before it and no branch
-        read on the host: an inference launch whose rows' sums can pass it (`algebra.headroom`), on a family
-        whose consumers walk its rings (tcgen05's rows' issuer would wait on the verdicts too), where the
-        scaled walk's registers at the config the unscaled walk derives hold within the family's budget, by
-        the model that prices the launch (`registered`, `register_budget`): the common walk never pays the
+        rows' sums passed fp32's largest (`after_walk.Decided`), no pass over its values before it and no
+        branch read on the host: an inference launch whose rows' sums can pass it (`algebra.headroom`), on a
+        family whose consumers walk its rings (tcgen05's rows' issuer would wait on the verdicts too), where
+        the scaled walk's registers at the config the unscaled walk derives hold within the family's budget,
+        by the model that prices the launch (`registered`, `register_budget`): the common walk never pays the
         scaled walk's (sm80's and sm120's at width 128 would split their columns). Every other such launch
         takes the one fallback, `_fwd`'s bound pass and guard (`algebra.may_scale`, the scaled op)."""
         family = bundle_of(config, query.dtype)
