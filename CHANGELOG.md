@@ -13,6 +13,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   Qwen3-8B over four H100s (fsdp 2 x tensor 2) at 48 GiB: 14 fewer re-gathered all-gathers, 11.7 GB gathered
   a step against 16.8, at the same rung and temporaries (row 1307).
 
+- A fresh run that states no layout chooses whether to stream its parameters from the host
+  (`Layout(host=("variables",))`, `dew.training.streaming`; row 1880): the plan its devices hold, priced as its
+  compiled step's hardware FLOPs over the GPU's dense peak, against the streamed step, its own FLOPs or its host
+  link's transfers whichever is longer, then its update over the host's memory. It streams where its devices
+  hold only the streamed step, or where that step is the cheaper; the choice is said and kept
+  (`Trainer.layout_choice`). A GPU's host link is a table fact of each part (`GpuTarget.host_links`,
+  `host_link_rate`: PCIe's or NVLink-C2C's datasheet rate one way); a TPU states none yet. A resume
+  lays out as its checkpoint trained. A process takes the streamed plan only where it was started with a CPU companion of its devices.
+
 - A launch whose derived config spills certifies its ladder's rungs one after another and takes the first
   that holds, where it certified them in threaded rounds as wide as the host's cores: a rung's certification
   is its launch's trace and Mosaic GPU lowering, Python under the GIL, so a round of 13 rungs cost 13 rungs'

@@ -268,7 +268,7 @@ class StepCompiler[L, E]:
         a step runs."""
         return rung_record(self.objective, self._xla_defaults, narrow=self._narrow, ns_group=self._ns_group)
 
-    def checkpoint_rung(self) -> JSON:
+    def checkpoint_rung(self) -> dict[str, JSON]:
         """The rung a checkpoint records: the run's own, which every newly met
         shape starts from (`rung`'s fields as the first compile found them),
         and under `shapes` the rung each shape compiled at, by its layout
@@ -455,6 +455,23 @@ class StepCompiler[L, E]:
             keep()
         return dataclasses.replace(compiled, step=self.runner(stepping, planned.released(),
                                                               settings.device_mesh))
+
+    def holds_unplaced(self, batch: Batch) -> bool:
+        """Whether a fresh run's first step was planned over `batch`'s shapes before its state was placed
+        (`planned_unplaced`), the plan its first compile takes."""
+        return self._unplaced is not None and self._unplaced.signature == batch_signature(batch)
+
+    def anew(self) -> StepCompiler[L, E]:
+        """A compiler of this one's objective, links, step compiled ahead and pass counts, nothing planned:
+        where a run lays its state out otherwise than the plans this one made were for
+        (`dew.training.streaming.laid_start`), whose ladder climbs and plans read no step of that layout."""
+        return StepCompiler(self.objective, self._stated_links, self.ahead, self.phase_passes)
+
+    @property
+    def unplaced(self) -> Planned | None:
+        """The plan a fresh run's first step took before its state was placed (`planned_unplaced`), None
+        where its devices held none or none was made."""
+        return None if self._unplaced is None else self._unplaced.planned
 
     def planned_unplaced(self, stepping: Stepping, state: TrainState, batch: Batch,
                          unplaced: int) -> None:

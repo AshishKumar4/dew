@@ -1015,3 +1015,153 @@ def test_a_node_two_places_share_goes_to_each_places_own_target():
     placed = stream({"params": collections.defaultdict(dict, {"kernel": pair})},
                     {"params": {"kernel": first}}, held)
     assert held["params"]["kernel"] is placed["params"]["kernel"]
+
+
+def streaming_decoder(layout: Layout | None = None, checkpoints: Checkpoints | None = None,
+                      dtype=None) -> Trainer:
+    """A decoder of four scanned layers computing in `dtype` (its parameters' where None) trained by Adam,
+    whose optimizer state the devices hold beside its parameters, laid out as `layout` states, else as its
+    run chooses, checkpointed by `checkpoints`."""
+    model = CausalTransformer(vocab_size=256, emb_features=64, num_layers=4, num_heads=2, mlp_features=256,
+                              max_seq_len=8, scan_layers=True, dtype=dtype)
+    given = {} if layout is None else {"layout": layout}
+    return Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None), optax.adam(.001),
+                   key=jax.random.key(6), checkpoints=checkpoints, **given)
+
+
+def assumed_on_cpu(generation_name: str):
+    """A block choosing as on `generation_name`'s devices (`generation.assumed`), its facts that part's, every
+    kernel XLA's: the CPU running the run runs none of that part's own."""
+    import contextlib
+
+    from dew.nn.kernels import generation
+
+    stack = contextlib.ExitStack()
+    stack.enter_context(generation.assumed(generation_name))
+    stack.enter_context(generation.chosen(attention="xla", rms_norm="xla", swiglu="xla", gemm_epilogue="xla",
+                                          gemm_prologue="xla"))
+    return stack
+
+
+def streaming_data():
+    rows = [{"text": np.arange(row, row + 9, dtype=np.int32) % 256} for row in range(16)]
+    return Memory(rows).repeat().batch(jax.device_count()).read("memory").loading(Loading(workers=0))
+
+
+def streamed_only() -> int:
+    """The memory a stand-in H100 states (`stand_in_gpus`) where it holds the decoder's step that streams
+    its parameters from the host and not the step keeping its state on it: midway between the two needs,
+    each its compiled program's arguments and temporaries."""
+    from dew.telemetry import instrumentation as memory
+    from dew.training.ahead import stand_in_gpus
+
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
+        roomy = streaming_decoder()
+        roomy.fit(streaming_data(), steps=1, log_every=100)
+        device = memory.compiled_memory(roomy.executable)
+        held = streaming_decoder(Layout(host=("variables",)))
+        start = held.place()[0]
+        whole = memory.compiled_memory(streamed_program(held, start, *memory_streamed_arguments(held, start)))
+    device_need, streamed_need = device.argument + device.temp, whole.argument + whole.temp
+    assert streamed_need < device_need, (streamed_need, device_need)
+    return (device_need + streamed_need) // 2
+
+
+def test_a_fit_its_devices_hold_only_streamed_trains_as_the_streamed_layout_states():
+    """A fresh fit on GPUs (the host's CPUs standing in for H100s, `stand_in_gpus`) that hold the step
+    streaming its parameters from the host and not the step keeping the state on them (its Adam state
+    beside its parameters) streams, the one plan they hold: it is laid out as `Layout(host=("variables",))`
+    is, through the one construction a given layout takes (`Trainer._laid_out`), and trains its steps bit
+    for bit as a run given that layout does."""
+    from model_support import memory_limited_to
+
+    from dew.training.ahead import stand_in_gpus
+
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory_limited_to(streamed_only())):
+        chosen = streaming_decoder()
+        trained = chosen.fit(streaming_data(), steps=2, log_every=100)
+        given = streaming_decoder(Layout(host=("variables",)))
+        expected = given.fit(streaming_data(), steps=2, log_every=100)
+    # The one plan its devices hold: laid out as the streamed layout states, through its construction.
+    assert chosen.host_master and chosen.layout == given.layout, chosen.layout_choice
+    equal(trained.variables, expected.variables)
+
+
+def test_a_run_that_chose_to_stream_resumes_streamed_where_it_would_have_stood(tmp_path):
+    """A run that chose to stream its parameters from the host (its devices holding that step alone),
+    stopped after its first step and resumed on devices that hold either step, resumes in its checkpoint's
+    layout, unpriced (`streaming.resumed_layout`, from the rung its checkpoint recorded), and lands bit for
+    bit where the same run nobody stopped lands."""
+    from model_support import memory_limited_to
+
+    from dew.training.ahead import stand_in_gpus
+
+    cpus, tight = jax.devices("cpu"), memory_limited_to(streamed_only())
+    with assumed_on_cpu("sm90"), stand_in_gpus(cpus, tight):
+        expected = streaming_decoder().fit(streaming_data(), steps=3, log_every=100)
+        streaming_decoder(checkpoints=Checkpoints(str(tmp_path / "run"))).fit(
+            streaming_data(), steps=1, checkpoint_every=1, log_every=100)
+    resumed = streaming_decoder(checkpoints=Checkpoints(str(tmp_path / "run")))
+    with assumed_on_cpu("sm90"), stand_in_gpus(cpus, 80 * 2 ** 30):
+        trained = resumed.fit(streaming_data(), steps=3, log_every=100)
+    assert resumed.host_master and resumed.layout_choice.resumed
+    equal(trained.variables, expected.variables)
+
+
+def test_a_fit_its_devices_hold_both_ways_takes_the_cheaper_step_as_priced():
+    """A fresh bf16 fit on stand-in H100s that hold both its steps prices each (`streaming.Choice`: the
+    device plan's FLOPs over the H100's dense peak; the streamed step's FLOPs or its host link's transfers,
+    then its update on the host) and takes the one priced cheaper, and its steps are bit for bit those of a
+    run given that layout."""
+    from dew.training.ahead import stand_in_gpus
+
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
+        chosen = streaming_decoder(dtype=jnp.bfloat16)
+        trained = chosen.fit(streaming_data(), steps=2, log_every=100)
+        given = streaming_decoder(chosen.layout, dtype=jnp.bfloat16)
+        expected = given.fit(streaming_data(), steps=2, log_every=100)
+    choice = chosen.layout_choice
+    assert choice.device is not None and choice.streamed is not None, choice
+    assert choice.streams == (choice.streamed.seconds < choice.device.seconds), choice
+    assert chosen.host_master == choice.streams
+    equal(trained.variables, expected.variables)
+
+
+def memory_streamed_arguments(trainer: Trainer, state):
+    from dew.training.transaction import loss_arguments
+
+    batch = {"text": jax.ShapeDtypeStruct((jax.device_count(), 9), jnp.int32)}
+    return loss_arguments(trainer.objective, state, batch, 1, 1)
+
+
+def streamed_program(trainer: Trainer, state, variables, step):
+    from dew.distributed.host import companion_mesh
+    from dew.training.execution import HostExecution, stack_sites
+
+    mesh = trainer.device_mesh
+    execution = HostExecution(trainer.objective, trainer.layout, mesh, companion_mesh(mesh),
+                              stack_sites(trainer.objective, state.variables))
+    return execution.compiled_whole(variables, {"text": jax.ShapeDtypeStruct((jax.device_count(), 9),
+                                                                             jnp.int32)}, step)[0]
+
+
+@pytest.mark.distributed
+def test_a_streamed_step_one_process_cannot_compile_leaves_every_process_on_the_devices_plan(tmp_path):
+    """Two processes choosing a fresh run's layout, the streamed step's compile refused for memory on one
+    (as XLA refuses a step it cannot hold), agree that the devices do not hold it, as a plan's candidates
+    agree: neither waits on the other, and both keep the devices' plan."""
+    from test_multiprocess import run_pool
+
+    reports = run_pool("streamed_refused", tmp_path / "pool", 2, timeout=900)
+    assert [report["streams"] for report in reports] == [False, False], reports
+    assert [report["choice"]["fits"] for report in reports] == [False, False], reports
+
+
+def test_a_part_stating_no_host_link_prices_no_streamed_step():
+    """A fresh fit on a part whose table states no host link (a TPU's, `GpuTarget.host_links`) keeps its
+    devices' layout, the streamed step refused by name in the choice it keeps."""
+
+    with assumed_on_cpu("v5e"):
+        trainer = streaming_decoder()
+        trainer.fit(streaming_data(), steps=1, log_every=100)
+    assert not trainer.host_master and trainer.layout_choice.refused is not None
