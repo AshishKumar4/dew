@@ -195,6 +195,19 @@ def packed_sequences(starts, firsts, bound: int, *, chunk: int) -> Sequences:
     return sequences(batch, length, cu_seqlens(starts, batch * (bound + 1), firsts), chunk=chunk)
 
 
+def entry_write(key, value, weight, *, values_first: bool = False) -> jax.Array:
+    """A forked document's entry write `weight sum_r key_r value_r^T` (`recurrence_chunk.Chunk.entry_key`):
+    `key` `[..., R, Dk]`, `value` `[..., R, Dv]`, the write `[..., Dk, Dv]`, or with `values_first` `value`
+    `[..., Dv, R]` and the write `[..., Dv, Dk]` (the TPU forked scan's layout); `weight` broadcast against
+    the write. Its terms summed aligned to the largest (`precision.aligned_sum`), so a sum in range is its
+    value though its terms leave fp32's range: the one form the portable walk's opening, the template's
+    chunks (`ForkedChunks.entries`) and the TPU forked scan take."""
+    rank = key.shape[-2]
+    if values_first:
+        return aligned_sum([(weight, value[..., :, r:r + 1], key[..., r:r + 1, :]) for r in range(rank)])
+    return aligned_sum([(weight, key[..., r, :, None], value[..., r, None, :]) for r in range(rank)])
+
+
 def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> Sequences:
     """The spans of `cu_seqlens` (`[N + 1]` int32 over the `batch * length` tokens, each row's
     boundaries among them), or of the rows themselves where None. A traced `cu_seqlens` takes the most
@@ -556,6 +569,4 @@ class ForkedChunks:
         # an elementwise product summed after: the SSD port's weight gradient took 1.6 to 1.9 times the
         # error each document alone takes from float64 summed after (armada, 11-11).
         weighed = jnp.where((self.taken >= 0)[:, None], weight, 0)
-        # Its terms summed aligned to the largest, which may leave fp32's range where the sum is in it.
-        return aligned_sum([(weighed[..., None, None], key[:, r, :, :, None], value[:, r, :, None, :])
-                            for r in range(key.shape[1])])
+        return entry_write(jnp.moveaxis(key, 1, 2), jnp.moveaxis(value, 1, 2), weighed[..., None, None])

@@ -36,7 +36,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.typing import DTypeLike
 
 from dew.nn import derivatives
-from dew.nn.kernels import launches
+from dew.nn.kernels import chunked_launch, launches
 from dew.nn.precision import aligned_sum
 
 from ..precision import exact_float32
@@ -262,7 +262,7 @@ def _opened(given_ref, table, entry, load, add, document, zero):
     key, value, weight = (ref[document] for ref in entry)
     # Its terms' outer products summed aligned to the largest, which may leave fp32's range where the
     # sum is in it (`precision.aligned_sum`).
-    return taken + aligned_sum([(weight, value[:, r:r + 1], key[r:r + 1, :]) for r in range(key.shape[0])])
+    return taken + chunked_launch.entry_write(key, value, weight, values_first=True)
 
 
 def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, adds_ref, x_ref, b_ref, c_ref, a_ref, state_ref,

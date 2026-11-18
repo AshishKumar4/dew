@@ -42,19 +42,12 @@ from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed_at
 from dew.nn.inputs import cu_seqlens
 from dew.nn.nested import nested
-from dew.nn.precision import (
-    aligned_sum,
-    asks_default_precision,
-    at_least_fp32,
-    exact_products,
-    l2norm,
-    rounds_products,
-)
+from dew.nn.precision import asks_default_precision, at_least_fp32, exact_products, l2norm, rounds_products
 from dew.nn.residuals import Residual
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, shard_shapes, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
-from .chunked_launch import Forked, zero_padded
+from .chunked_launch import Forked, entry_write, zero_padded
 from .generation import INHERENT, Choice, triton_runs
 from .selection import Kernel, KernelRefused, Op, Refusal, Requirement, select, selected
 from .ssd import _chunk_scan, ssd_kernel_platform
@@ -853,7 +846,7 @@ def _opened(given, table, slot, adds, entry, document):
     # The weight inside the contraction, so its gradient is one too (`dot_general`'s accumulation): summed
     # after, the SSD port's took 1.6 to 1.9 times the error each document alone takes from float64.
     # Its terms summed aligned to the largest, which may leave fp32's range where the sum is in it.
-    written = aligned_sum([(weight, key[r][:, None], value[r][None, :]) for r in range(key.shape[0])])
+    written = entry_write(key, value, weight)
     return taken + written.astype(taken.dtype)
 
 
