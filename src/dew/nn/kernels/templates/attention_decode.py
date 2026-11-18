@@ -297,11 +297,18 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
     key = (jax.ShapeDtypeStruct((rows, keys, kv_heads, width), dtype) if pages is None
            else jax.ShapeDtypeStruct((kv_heads, rows * pages, page_size, width), dtype))
     table = None if pages is None else jax.ShapeDtypeStruct((rows, pages), jnp.int32)
+    plans = []
+
+    def step(q, k, v, t):
+        # The step's plan as its trace forms it (`planned` packs its rows: operands, never their shapes).
+        plans.append(planned(q, k, v, spans, Hooks(), table=t)[0])
+        return attend(q, k, v, spans, table=t)
+
     with generation.assumed(target):
-        work, *_ = planned(query, key, key, spans, Hooks(), table=table)
-        if work is None:
-            raise NotImplementedError(f"the template's decode derives no config on {target}")
-        traced = jax.make_jaxpr(lambda q, k, v, t: attend(q, k, v, spans, table=t))(query, key, key, table)
+        traced = jax.make_jaxpr(step)(query, key, key, table)
+    work = plans[0]
+    if work is None:
+        raise NotImplementedError(f"the template's decode derives no config on {target}")
     launches = [found for kernel in _kernels(traced.jaxpr) if (found := emission.work_of(kernel)) is not None]
     priced = dataclasses.replace(sum(launches, Work()), span=sum(each.span for each in launches))
     if max(plan.slices for plan in work.values()) > 1:
