@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import assert_contract, normal_float32
+from contract_support import REVERSE_ONLY, assert_contract, normal_float32
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
 from ssd_support import ssd_orbit, stepwise_scan
 
@@ -431,12 +431,6 @@ def test_documents_entering_their_own_states_scan_as_each_alone():
     assert_as_exact(mine, theirs, documents_draw, "the TPU kernel's forked call", seeds=24)
 
 
-REFUSED_ORDERS = ("jvp", "jvp of grad", "second jvp", "jvp of grad, remat", "second jvp, remat",
-                  "jvp of grad, nested jit", "jvp of grad, scanned", "grad of grad")
-"""`assert_contract`'s orders the TPU forked scan's rule refuses: forward mode's, its custom VJP no jvp
-reaches (row 7874), and reverse over reverse, its backward a kernel no transform differentiates (row 7875)."""
-
-
 @pytest.mark.parametrize(("key", "value", "weight", "final", "cancelled"),
                          [(80, 80, -100, -100, False), (-80, 100, -100, 0, False), (-40, 100, -40, 56, False),
                           (-100, 100, 30, 30, True), (60, -20, 100, -100, False)],
@@ -484,10 +478,10 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
         normal = normal_float32(theirs)
         np.testing.assert_array_equal(np.asarray(ours, np.float64)[normal], theirs[normal])
     # Every order the kernel's rule takes finite wherever float64's is a normal float32 (the contract's
-    # seams): its primal and its reverse mode (`REFUSED_ORDERS`).
+    # seams): its primal and its reverse mode (`contract_support.REVERSE_ONLY`: rows 7874, 7875).
     assert_contract(without_ynn(documents_on_the_kernel), operands, operands, seeded,
                     "the TPU kernel's forked call at fp32's edge", truth_fn=documents_one_by_one,
-                    without=REFUSED_ORDERS)
+                    without=REVERSE_ONLY)
 
 
 @pytest.mark.tpu(reason="the recurrence matrix's TPU cells run on the TPU tier's own TPU")
