@@ -956,9 +956,6 @@
 "tests/test_block_sft.py::test_official_sft_loss_and_every_parameter_gradient",
 "tests/test_block_sft.py::test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target"
 ],
-"tests/test_block_visibility.py": [
-"tests/test_block_visibility.py::test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names"
-],
 "tests/test_cache_opening.py": [
 "tests/test_cache_opening.py::test_a_stage_local_stores_cache_opens_a_layer_at_a_time_as_its_decode_opens_and_writes_it[memory]",
 "tests/test_cache_opening.py::test_each_familys_cache_opens_as_its_decode_opens_and_writes_it[multimodal_transformer+gemma3n]",
@@ -1636,9 +1633,6 @@
 "tests/test_dory.py::test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop_count[2]",
 "tests/test_dory.py::test_the_release_tests_symmetries_keep_dorys_function_and_redraw_its_sums"
 ],
-"tests/test_dpo.py": [
-"tests/test_dpo.py::test_packed_pairs_train_as_each_pair_a_row[attention-whole]"
-],
 "tests/test_dreamer.py": [
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[prefilled-replay]",
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[prefilled-steps]",
@@ -1794,14 +1788,11 @@
 "tests/test_fresh_rate.py::test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one",
 "tests/test_fresh_rate.py::test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_groups_rate[a fresh group]"
 ],
-"tests/test_gemm_formed.py": [
-"tests/test_gemm_formed.py::test_a_composed_mlps_training_step_compiles_within_its_resources[sm90]"
+"tests/test_gated_mlp.py": [
+"tests/test_gated_mlp.py::test_the_fused_mlp_holds_check_1_with_its_gradients[swiglu-1.5-sm90]"
 ],
 "tests/test_gemm_gather.py": [
 "tests/test_gemm_gather.py::test_a_gathered_kernel_gradient_lowers_for_cuda"
-],
-"tests/test_gemm_nvfp4.py": [
-"tests/test_gemm_nvfp4.py::test_a_stack_of_nvfp4_banks_is_read_at_its_layer_as_that_layers_bank[xla-rows]"
 ],
 "tests/test_gemm_paired.py": [
 "tests/test_gemm_paired.py::test_the_templates_paired_product_holds_check_1[grouped-sm100]"
@@ -1977,6 +1968,9 @@
 "tests/test_inference.py::test_an_lm_run_over_a_sources_own_processor_reloads_that_processor[False]",
 "tests/test_inference.py::test_every_route_generates_through_the_same_packed_projections",
 "tests/test_inference.py::test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images"
+],
+"tests/test_inference_sampling.py": [
+"tests/test_inference_sampling.py::test_cached_generation_records_the_transformers_filtered_distribution[sampling1]"
 ],
 "tests/test_inference_tasks.py": [
 "tests/test_inference_tasks.py::test_a_task_moves_onto_a_mesh_with_the_variables_it_holds"
@@ -2184,6 +2178,9 @@
 "tests/test_kimi_k3.py::test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference",
 "tests/test_kimi_k3.py::test_situ_matches_the_released_activation"
 ],
+"tests/test_kv_cache.py": [
+"tests/test_kv_cache.py::test_a_quantized_caches_scales_and_codes_are_its_formats_quotients[float8_e4m3fn]"
+],
 "tests/test_layer_stack.py": [
 "tests/test_layer_stack.py::test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop",
 "tests/test_layer_stack.py::test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop",
@@ -2208,6 +2205,9 @@
 ],
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp2_stage2]"
+],
+"tests/test_level_stacking.py": [
+"tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[slower-first-layers]"
 ],
 "tests/test_lfm3.py": [
 "tests/test_lfm3.py::test_an_lfm3_vl_trunk_read_or_built_resolves_its_defaults_and_cadence_one_way"
