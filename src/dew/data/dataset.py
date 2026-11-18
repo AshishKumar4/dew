@@ -1413,9 +1413,6 @@ class GlobalStream:
         """The order's description, which a saved position is compared against."""
         return self._order
 
-    def order_under(self, version: int | None) -> str:
-        """The order as the plan `version` described its stages (`Plan.order_under`)."""
-        return self._plan.order_under(version)
 
     def identity(self) -> str:
         """The plan's identity (`Plan.identity`), which a pool agrees before it
@@ -1438,7 +1435,8 @@ class GlobalStream:
 
         # The saved order as its plan's version described its stages (`Plan.order_under`).
         if not same_order(saved.order, self._plan.order_under(saved_version(saved.plan))):
-            raise ValueError(
+            raise _position.PlanChanged(
+                ("order",),
                 f"the saved data position is {saved.records} records into "
                 f"{saved.order}, and this run reads {self._order}; a record count "
                 f"is a place in one order and another place in another, so resume "
@@ -1462,7 +1460,6 @@ class GlobalReader(Protocol):
     def records(self) -> int: ...
     @property
     def order(self) -> str: ...
-    def order_under(self, version: int | None) -> str: ...
     def __next__(self) -> Batch: ...
     def get_state(self) -> Position: ...
     def set_state(self, state: bytes) -> None: ...
@@ -1686,7 +1683,7 @@ class PhasedStream:
 
     def set_state(self, state: bytes) -> None:
         saved = _position.read(state)
-        from dew.data.plan import same_order, saved_version
+        from dew.data.plan import same_order
 
         if self._tokens is not None:
             if len(saved.completed) > len(self._ends):
@@ -1713,25 +1710,17 @@ class PhasedStream:
                     raise _position.PlanChanged(("phases",), "a saved phase is not part of this run")
                 end = saved.completed[index][1] if index < len(saved.completed) else saved.records
                 shift = saved.origin if index == len(saved.completed) else 0
-                stream = self._stream(index)
-                stream.set_state(
-                    _position.encode(
-                        _position.Global(records=end - self._start(index) - shift, order=stream.order,
-                                         plan=plan)
-                    )
-                )
+                # Each phase's saved order and plan to its own stream, which compares them as the version
+                # the plan records described its stages (`GlobalStream.set_state`, `Plan.order_under`).
+                order = saved.completed[index][0] if index < len(saved.completed) else saved.order
+                self._stream(index).set_state(_position.encode(_position.Global(
+                    records=end - self._start(index) - shift, order=order, plan=plan)))
 
-        # Each phase's order as the version its saved plan records described its stages (`Plan.order_under`).
-        phases = None if saved.plan is None else saved.plan.get("phases", [saved.plan])
-        versions = [saved_version(plan) if isinstance(plan, Mapping) else None
-                    for plan in (phases if isinstance(phases, list) else [])]
-
-        def ordered(index: int) -> str:
-            return self._stream(index).order_under(versions[index] if index < len(versions) else None)
-
+        # A position with no plan, its orders as this Dew describes them.
+        planless = saved.plan is None
         for index, (order, end) in enumerate(saved.completed):
-            if (index >= len(self._ends) or not same_order(order, ordered(index))
-                    or self._ends[index] != end):
+            if (index >= len(self._ends) or self._ends[index] != end
+                    or (planless and not same_order(order, self._stream(index).order))):
                 raise _position.PlanChanged(
                     (f"phases.{index}",),
                     f"the saved run finished phase {index} reading {order} to record "
@@ -1739,7 +1728,7 @@ class PhasedStream:
                     f"run has read cannot change under it"
                 )
         phase = len(saved.completed)
-        if phase >= len(self._open) or not same_order(saved.order, ordered(phase)):
+        if phase >= len(self._open) or (planless and not same_order(saved.order, self._stream(phase).order)):
             raise _position.PlanChanged(
                 (f"phases.{phase}",),
                 f"the saved position is {saved.records} records into phase {phase}, "
@@ -1978,12 +1967,8 @@ class StepPhases(Forwarding):
         trained = [[node, member, frontier.record()] for (node, member), frontier in self._trained.items()]
         shared = ({"phases": self.CONTINUES, "carried": carried, "trained": trained}
                   if any(self._shared) else {})
-        from dew.data.plan import PLAN_VERSIONS
-
         return json.dumps({_position.STEP_PHASES: {
             "steps": self._steps, "phase": phase, "ends": self._ends[:phase], **shared,
-            # The plan version its identities describe their steps by, which a resume reads them under.
-            "version": PLAN_VERSIONS[-1],
             "identities": [self._identity(index) for index in range(phase + 1)],
             "position": base64.b64encode(own if isinstance(own, bytes)
                                          else json.dumps(own).encode()).decode(),
@@ -2001,12 +1986,14 @@ class StepPhases(Forwarding):
                        "saved phases' position")
         phase = integer(saved["phase"], "the saved phase")
         ends = list(listed(saved["ends"], "saved phase ends", read=integer, what="a list of steps"))
-        from dew.data.plan import saved_identity
+        from dew.data.plan import saved_identity, saved_version
 
         identities = [saved_identity(held) for held in strings(saved["identities"], "saved phase identities")]
-        version = saved.get("version")
-        if phase >= len(self._make) or ends != self._ends[:phase] or not self._read_alike(
-                identities, phase, None if version is None else integer(version, "the saved plan version")):
+        own = base64.b64decode(text(saved["position"], "the saved phase's position"))
+        # The plan version its phase's own reader recorded, which its identities describe their steps by.
+        version = saved_version(_position.saved_plan(own))
+        if phase >= len(self._make) or ends != self._ends[:phase] or not self._read_alike(identities, phase,
+                                                                                            version):
             raise _position.PlanChanged(
                 ("phases",), f"the saved run finished phases ending at steps {ends}, and this run's phases "
                 f"end at {self._ends[:phase]}, or read them otherwise; a phase the run has read cannot "
@@ -2025,7 +2012,6 @@ class StepPhases(Forwarding):
                               f"{self.CONTINUES if any(self._shared) else None!r} "
                               "(docs/design/data.md, the rules): resume it by the data plan version it was "
                               "saved under, as a run config's resume does")
-        own = base64.b64decode(text(saved["position"], "the saved phase's position"))
         # What a position saved before phases shared corpora holds of them: none.
         from dew.data.mixing import Left
 
@@ -2056,11 +2042,11 @@ class StepPhases(Forwarding):
 
     def _read_alike(self, saved: Sequence[str], phase: int, version: int | None) -> bool:
         """Whether the phases before `phase` read what the `saved` identities say, their steps described as
-        the plan `version` the position records described them (`dew.data.plan.described_under`); a
-        position that records none was saved under plan 15 or 14, whose rule describes them."""
-        from dew.data.plan import REFERENCED, described_under
+        the plan `version` its phase's reader recorded described them (`dew.data.plan.described_under`),
+        this Dew's where it recorded none."""
+        from dew.data.plan import DECIDED, described_under
 
-        with described_under(REFERENCED if version is None else version):
+        with described_under(DECIDED if version is None else version):
             return list(saved[:phase]) == [self._identity(index) for index in range(phase)]
 
     def _identity(self, phase: int) -> str:

@@ -13,9 +13,11 @@ it (`jax.jit`) at each of its draws' own shapes, traced for the run's devices (`
 a GPU run traces, lowers and compiles none of a site's programs: each compiled at a run's first call,
 those ran 2,000 of a day's GPU-minutes idle (2026-11-17's census of 226 jobs). A prepare lists them from
 the site's own call (`reference_error.assert_as_exact`), the one definition its run reads.
-A program the store does not hold for a draw's shapes, or one compiled at another `stamp` (the commit and
-JAX), is a red (`MissingTruth`), never one compiled in its place; a terms walk its values steer (a branch
-or loop it reads as it runs, `float64_terms.static`) is held as one, which its run walks on its device.
+A program the store does not hold for a draw's shapes or an arm's statement, or one compiled at another
+`stamp` (the commit and JAX), is a red (`MissingTruth`), never one compiled in its place; a site its
+prepare did not reach, and an arm no statement holds, runs unprepared, every draw judged, recorded in the
+test's store (`unprepared`); a terms walk its values steer (a branch or loop it reads as it runs,
+`float64_terms.static`) is held as one, which its run walks on its device.
 
 A program takes its traced constants as arguments, held beside it (`held.pkl`): no executable serializes an
 array it closed over. The roles are a site's truth (`truth`: its float64 program, `arm_arithmetic.Truth`),
@@ -44,20 +46,21 @@ from tool_support import load
 
 
 class MissingTruth(AssertionError):
-    """A check-1 site under a store of programs compiled ahead (`compiled_truths`) that its prepare did not
-    compile, or compiled for another commit or other shapes: a red with its reason, never a program compiled
-    here in its place (the GPU tier's run compiles none of a verdict's truths, row 5461)."""
+    """A check-1 site under a store of programs compiled ahead (`compiled_truths`) whose prepare compiled its
+    programs for another commit, for other shapes, or of another arm than the run's: a red with its reason,
+    never a program compiled here in its place (the GPU tier's run compiles none of a verdict's truths, row
+    5461). A site its prepare did not reach runs unprepared, recorded (`running`)."""
 
 
 PROGRAMS, HELD, SITE = "programs", "held.pkl", "site.json"
-
-UNPREPARED = "unprepared.json"
-"""A test's record, in its store, that it ran unprepared (`CompiledTruths.unprepared`): `{"test", "where",
-"error"}`, its first reason, the GPU tier's list of unprepared tests read from these alone (a ledger row
-each, the tier's)."""
 """A site's files under its store (`CompiledTruths.path`): its executables (`AheadPrograms`), each one's
 constants and output tree (`held`), and its record, written last, so a prepare cut short leaves none a run
 reads."""
+
+UNPREPARED = "unprepared.json"
+"""A test's record, in its store, that it ran unprepared (`unprepared`): `{"test", "where", "error"}`, its
+first reason, the GPU tier's list of unprepared tests read from these alone (a ledger row each, the
+tier's)."""
 
 
 def named(role: str, inputs) -> str:
@@ -91,15 +94,10 @@ class CompiledTruths:
         return (self.path(label) / SITE).is_file()
 
     def unprepared(self, why: str) -> None:
-        """Records in the store that its test ran a site, or an arm, unprepared (`UNPREPARED`), compiling it
-        on its devices with every site judged: the first reason a test gives, where in its file it reached
-        it (`where`)."""
-        record = self.directory / UNPREPARED
-        if record.exists():
-            return
+        """Records in the store that its test ran a site, or an arm, unprepared (`unprepared`), where in its
+        file this process stands."""
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
-        self.directory.mkdir(parents=True, exist_ok=True)
-        record.write_text(json.dumps({"test": test, "where": where(test), "error": why}))
+        unprepared(self.directory, test, [(frame.filename, frame.lineno) for frame in inspect.stack()], why)
 
     def device(self):
         """A device of the ones the store's programs compute on, whose platform picks a branch its platform
@@ -125,12 +123,14 @@ class CompiledTruths:
             yield
 
     def compile_site(self, label: str, programs: Mapping[str, tuple[Callable, Sequence]],
-                     held: Mapping[str, dict], *, compiled: Callable | None = None) -> None:
+                     held: Mapping[str, dict], *, compiled: Callable | None = None, arms: bool = False
+                     ) -> None:
         """The site's `programs` (each a function of its constants and inputs, flat, and their shapes, by
         its name, `named`) compiled for the store's target and written with what each `held`; refused for a
         label this store compiled already, whose programs a second site of it would replace. `compiled` makes
         each program as its run's compile does (`dew.training.ahead.compile_programs`' `compiled`; Dew's
-        compile point where None, a truth's, whose program is its run's)."""
+        compile point where None, a truth's, whose program is its run's); `arms` whether they are a site's
+        arms (`compiled_memory`), whose state its run holds while its truths compute."""
         from dew._cache import uncached
 
         if label in self.begun:
@@ -149,7 +149,8 @@ class CompiledTruths:
         (site / HELD).write_bytes(pickle.dumps(dict(held)))
         memory = {name: executable.memory._asdict() for name, executable in built.programs.items()
                   if executable.memory is not None}
-        (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory}))
+        (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory,
+                                             "arms": arms}))
 
     def _compiled(self, programs: Mapping[str, tuple[Callable, Sequence]], compiled: Callable | None):
         """`programs` compiled for the store's target (`compile_programs`), or for this process's first device
@@ -212,12 +213,34 @@ class CompiledTruths:
         return self.read[label]
 
 
-def compiled_memory(directory: Path) -> list[dict[str, int]]:
-    """Every program of a store's sites (`compiled_truths`, prepared) as its compile analysed its memory
+def compiled_memory(directory: Path, *, arms: bool = False) -> list[dict[str, int]]:
+    """Every program of a store's sites (`compiled_truths`, prepared), its truths' or, with `arms`, its
+    arms' (`CompiledTruths.compile_site`), as its compile analysed its memory
     (`dew.telemetry.instrumentation.CompiledMemory`, as its fields name it), its sites' record's; none for
     a program whose backend stated none."""
-    return [memory for site in Path(directory).glob(f"*/{SITE}")
-            for memory in json.loads(site.read_text()).get("memory", {}).values()]
+    records = (json.loads(site.read_text()) for site in Path(directory).glob(f"*/{SITE}"))
+    return [memory for record in records if record.get("arms", False) == arms
+            for memory in record.get("memory", {}).values()]
+
+
+def admitted_needs(arms: Sequence[dict[str, int]], truths: Sequence[dict[str, int]]) -> list[dict[str, int]]:
+    """A run's programs as the allocator admits them (`dew.training.memory.admitted`), each its compile's
+    memory (`compiled_memory`'s, `CompiledMemory`'s fields) in the admission's own terms
+    (`dew.training.memory.admission`): an arm's alone, a float64 truth's or terms program's with the arms'
+    state held beside it (the most any arm takes as arguments, which the run keeps while its truths compute;
+    every program's outputs are fetched to the host, `CompiledTruths.called`). A part's worker fits a slot
+    where every program of its units is admitted there (`tier_wire.unit_needs`)."""
+    from dew.telemetry.instrumentation import CompiledMemory
+    from dew.training.memory import admission
+
+    arms_memory = [CompiledMemory(**memory) for memory in arms]
+    state = max((memory.argument for memory in arms_memory), default=0)
+
+    def admitted_as(memory: CompiledMemory, held: int) -> dict[str, int]:
+        return dict(zip(("resident", "beside", "temporaries"), admission(memory, held), strict=True))
+
+    return [*(admitted_as(memory, 0) for memory in arms_memory),
+            *(admitted_as(CompiledMemory(**memory), state) for memory in truths)]
 
 
 COMPILED: contextvars.ContextVar[CompiledTruths | None] = contextvars.ContextVar("truths_ahead_store",
@@ -240,6 +263,26 @@ def compiled_truths(directory: str | Path, *, prepare: bool, stamp: str,
         yield store
     finally:
         COMPILED.reset(token)
+
+
+@contextlib.contextmanager
+def prepared(directory: Path, *, stamp: str, target) -> Iterator[CompiledTruths]:
+    """A GPU tier part's test's prepare (`tests/conftest.py`'s `compiled_ahead`): its check-1 sites compiled
+    into `directory` for the node's GPU (`target`, a `BuildTarget`) with that GPU's compile-only device
+    this process's default, on which nothing computes, and their programs' needs (`admitted_needs`) filed
+    under the part's unit as it closes, whatever its test ended in (`tier_wire.unit_needs`, as a flow's are,
+    row 7900), by which the lane sizes the unit's worker."""
+    import tier_wire
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    try:
+        with (compiled_truths(directory, prepare=True, stamp=stamp, target=target) as store,
+              jax.default_device(compile_only_gpus(target.generation, 1)[0])):
+            yield store
+    finally:
+        arms, truths = compiled_memory(directory, arms=True), compiled_memory(directory)
+        tier_wire.unit_needs(admitted_needs(arms, truths))
 
 
 @contextlib.contextmanager
@@ -267,12 +310,17 @@ def running() -> tuple[CompiledTruths, str] | None:
     return store, label
 
 
-def where(test: str) -> str:
-    """Where test `test` (a node id) stands in this process's stack: the deepest frame of its own file, as
-    `path:line` from the working directory; the test's file where no frame of it is on the stack."""
+def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], why: str) -> None:
+    """The one writer of a test's record that it ran unprepared (`UNPREPARED`, in its store `directory`),
+    compiling a site or an arm on its devices with every site judged: its node id, where (`frames`, innermost
+    first, `(file, line)`: the first of the test's own file, else the test's file), and the first reason it
+    gives, a record already written kept (a prepare's, before its run's)."""
+    record = directory / UNPREPARED
+    if record.exists():
+        return
     # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
     path = Path(load("grading", "tools/armada").owning(test))
-    frames = [frame for frame in inspect.stack() if Path(frame.filename).name == path.name]
-    if not frames:
-        return str(path)
-    return f"{path}:{frames[0].lineno}"
+    lines = [line for file, line in frames if Path(file).name == path.name]
+    directory.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"test": test, "where": f"{path}:{lines[0]}" if lines else str(path),
+                                  "error": why}))

@@ -64,8 +64,9 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     pins it), the mesh and its devices' kind and allocator limit, the kernels their
     generation runs (`gpu_target`), what a model reads from context as it traces
     (`trace_context`), the libraries that compile it and the allocator and
-    XLA_FLAGS settings it compiles under. None where an identity states none of the step (a module
-    holding an array of JAX's): such a run keeps no record and decides its rung as it compiles."""
+    XLA_FLAGS settings it compiles under. None where an identity states none of the step (a module holding
+    a class made inside a function, or an array this process holds only part of): such a run keeps no
+    record and decides its rung as it compiles."""
     leaves, structure = jax.tree.flatten(arguments)
     try:
         traced = stated([list(modules), step, structure,
@@ -131,11 +132,12 @@ def plan_flops(recorded: JSON, executable: jax.stages.Compiled) -> tuple[StepFlo
                    if runtime is not None and isinstance(runtime, LoadedExecutable) else None)
     named = fingerprint.hex() if isinstance(fingerprint, bytes) else None
     counted = record(recorded, 'recorded plan').get('flops') if recorded is not None else None
-    if named is not None and isinstance(counted, list) and len(counted) == 4 and counted[:1] == [named]:
+    if named is not None and isinstance(counted, list) and len(counted) == 5 and counted[:1] == [named]:
         flops = StepFlops(*counted[1:])
     else:
         flops = step_flops(executable)
-    return flops, None if flops is None else [named, flops.model, flops.hardware, flops.unsized]
+    return flops, None if flops is None else [named, flops.model, flops.hardware, flops.unsized,
+                                              flops.bounded]
 
 
 def keep_rung(path: Path, key: Mapping[str, JSON], rung: JSON) -> None:

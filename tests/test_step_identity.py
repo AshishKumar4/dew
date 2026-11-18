@@ -13,6 +13,7 @@ import subprocess
 import sys
 from uuid import uuid4
 
+import jax
 import numpy as np
 import pytest
 from reader_support import resumed_changes, saved_after_one
@@ -1027,3 +1028,109 @@ def test_a_step_whose_fields_lead_back_to_it_compiles_and_resumes_exactly(hidden
 
     state = saved_after_one(reader)
     assert resumed_changes(reader(), state) == ()
+
+
+def _bumped(ids):
+    return ids + 1
+
+
+BUMPED = jax.jit(_bumped)
+"""A jitted function of this module's own, which a step's code reads."""
+
+
+def read_exactly(step):
+    """`ROWS` read through `step`, shuffled and batched by two, resumed exactly."""
+    pipeline = Pipeline(ROWS).map(step).shuffle(0).repeat().batch(2)
+    return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+
+def shifted_by(seed: int):
+    """A step made inside a function (`shifted_by_key`) closing over the typed key of `seed`."""
+    return shifted_by_key(jax.random.key(seed))
+
+
+def shifted_by_key(key):
+    """A step made inside a function: each id bumped (`BUMPED`) and shifted by a draw of its typed `key`,
+    which its closure holds."""
+    def shift(row):
+        return {**row, "id": np.int32(BUMPED(row["id"]) + int(jax.random.randint(key, (), 0, 3)))}
+    return shift
+
+
+def library_scaled_by(factor: int):
+    """A step made inside a function of a library's module (its `__module__` the standard library's
+    `json`), multiplying each id by `factor`, which its closure holds."""
+    def scale(row):
+        return {**row, "id": row["id"] * factor}
+    scale.__module__ = "json"
+    return scale
+
+
+@pytest.mark.parametrize(("made", "same", "other"), [
+    (shifted_by, 0, 1), (library_scaled_by, 3, 4)], ids=["own", "library"])
+def test_a_step_made_inside_a_function_resumes_exactly_only_with_its_closure(made, same, other):
+    """A step made inside a function is stated by its code and what it reads, its closure among it
+    (`dew._stated.stated`), whosever module made it: one of the user's own, which reads a jitted function
+    of the user's and closes over a typed PRNG key, and one a library's module made (`library_scaled_by`).
+    Its run resumes exactly where its closure holds the same value, and is refused where it holds another.
+    Such a step was inexact (its name's `<locals>`); then a jitted function of the user's had no
+    statement, a typed key crashed the statement that fetched its bits (row 7814; train 1019's review, F1
+    and F3), and a library's held by its module's version alone shared one identity over any closure
+    (train 1022's review)."""
+    def reader(value):
+        return read_exactly(made(value))
+
+    state = saved_after_one(lambda: reader(same))
+    assert resumed_changes(reader(same), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(other), state)
+
+
+def shifted_where_weak(value):
+    """A step made inside a function: each id shifted by one where the array it closes over is weakly
+    typed, as a trace that promotes by it computes otherwise."""
+    def shift(row):
+        return {**row, "id": np.int32(row["id"] + (1 if value.weak_type else 0))}
+    return shift
+
+
+def _flipped_bits(key, bit_width, shape):
+    """Threefry's random bits, each flipped: an implementation of its own under the default tag."""
+    from jax.extend import random as extended
+
+    return jax.numpy.bitwise_not(extended.threefry_prng_impl.random_bits(key, bit_width, shape))
+
+
+def _tagged_alike(*, flipped: bool):
+    """A typed key of key data 0 under an implementation printing the default tag (`?`): threefry's, or
+    threefry's with its random bits flipped."""
+    from jax.extend import random as extended
+
+    threefry = extended.threefry_prng_impl
+    impl = extended.define_prng_impl(key_shape=threefry.key_shape, seed=threefry.seed, split=threefry.split,
+                                     random_bits=_flipped_bits if flipped else threefry.random_bits,
+                                     fold_in=threefry.fold_in)
+    return jax.random.wrap_key_data(jax.numpy.zeros(threefry.key_shape, jax.numpy.uint32), impl=impl)
+
+
+@pytest.mark.parametrize("held", ["weak type", "key implementation"])
+def test_a_captured_array_differing_only_in_what_its_bytes_do_not_hold_refuses_exact_resume(held):
+    """A step closing over an array of JAX's whose bytes, dtype name and sharding are the same as the one
+    its run saved with, but whose weak type, or whose typed key's implementation under one printed tag,
+    differs: its exact resume is refused, where the statement held neither and the resumed run read other
+    rows, or drew other bits, as an unchanged one (rows 7903, 7904). The same array resumes exactly."""
+    import jax.numpy as jnp
+
+    if held == "weak type":
+        saved, other = jnp.asarray(1), jnp.asarray(1, dtype=jnp.int32)
+        assert saved.weak_type and not other.weak_type
+        step = shifted_where_weak
+    else:
+        saved, other = _tagged_alike(flipped=False), _tagged_alike(flipped=True)
+        assert str(saved.dtype) == str(other.dtype)
+        step = shifted_by_key
+
+    state = saved_after_one(lambda: read_exactly(step(saved)))
+    assert resumed_changes(read_exactly(step(saved)), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(read_exactly(step(other)), state)

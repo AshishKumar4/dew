@@ -53,8 +53,8 @@ def _coded(module: str | None, at: str) -> str:
 
 
 def _named(value, at: str) -> list | None:
-    """`value` as the name its module holds it under (a class, a module's function, a jitted one, a
-    singleton), where it has one: its definition is its module's code, the process record's. None for a
+    """`value` as the name its module holds it under (a class, a module's function, a library's jitted one,
+    a singleton), where it has one: its definition is its module's code, the process record's. None for a
     value its module does not hold under its own name (a local function, an instance), and for one of
     `__main__`, whose code no process record holds: it is stated by what it is instead, as the user's own
     code is (`_own`)."""
@@ -128,8 +128,8 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
     if isinstance(value, (types.FunctionType, type)) and _sources.own_source(value.__module__):
         return _own(value, at, known, walking)
     if _sources.hand_written(getattr(value, "__wrapped__", None)):
-        # A callable that is no function and wraps one of the user's (a cache, a jitted function): what
-        # it holds beside the function (its cache, its options) is its type's, which nothing here states.
+        # A callable that is no function and wraps one of the user's, a jitted one aside (`_computed`): what
+        # it holds beside the function (a cache's entries) is its type's, which nothing here states.
         raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} wrapping a "
                             "function of the user's own code")
     if (named := _named(value, at)) is not None:
@@ -196,10 +196,15 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
 
 def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     """One of JAX's values a program computes from or with: an array (`_jax_array`), a function `jax.jit`
-    wraps (`_jitted`); None for any other."""
+    wraps, by its module's name for it where a library's (`_named`), else by what it wraps (`_jitted`); None
+    for any other."""
     if isinstance(value, jax.Array):
         return _jax_array(value, at, again)
     if isinstance(value, PjitFunction):
+        # A library's jitted function its module names (`jax.nn.silu`) is that name, as the library's code
+        # is its version's; one wrapping the user's code is what it wraps, with its options.
+        if not _sources.hand_written(value.__wrapped__) and (named := _named(value, at)) is not None:
+            return named
         return _jitted(value, at, again)
     return None
 
@@ -237,12 +242,17 @@ line, signature and counters, which a function's own statement holds or which de
 
 def _jax_array(value: jax.Array, at: str, again: Callable[..., JSON]) -> JSON:
     """An array of JAX's by its values, fetched to the host, as a NumPy array's (`_data`: its dtype, shape
-    and bytes), and its sharding: a trace that closes over it bakes both into its program. Refused where
-    this process holds only part of it, whose bytes no one process reads."""
+    and bytes; a typed PRNG key's its key type and key data, `terms.held_bits`), its weak type and its
+    sharding: a trace that closes over it bakes all of them into its program, and may branch on its weak
+    type. A typed key's dtype is stated as any value is, by its implementation's parts, which its printed
+    tag alone does not tell apart (two implementations may print one). Refused where this process holds
+    only part of it, whose bytes no one process reads."""
     if not value.is_fully_addressable:
         raise Unestablished(f"{at}: an array of JAX's this process holds only part of")
-    host = _data(np.asarray(value), at)
-    return ["jax array", host, again(value.sharding, at=f"{at}.sharding")]
+    # A typed PRNG key's bits are its key data, its dtype the key type, which NumPy cannot read whole.
+    dtype, bits = terms.held_bits(value)
+    return ["jax array", again(dtype, at=f"{at}.dtype"), jax.typeof(value).weak_type, _data(bits, at),
+            again(value.sharding, at=f"{at}.sharding")]
 
 
 def _data(value, at: str) -> JSON | None:

@@ -60,6 +60,7 @@ from dew.batch import (
     real_slots,
     scored_targets,
     shifted_span,
+    sown_calls,
     sown_nodes,
     thaw,
     token_layout,
@@ -447,14 +448,12 @@ def text_preview[S](phase: str, setup: Callable[[], S | None],
 
 
 def _global_qk_max(qk) -> jax.Array | None:
-    """Return the largest per-head maximum anywhere in the sowed `qk` dict.
+    """Return the largest per-head maximum anywhere in the sowed `qk` dict, every call of a layer's
+    (`sown_calls`, a looped layer's passes).
 
     None when no layer sowed one.
     """
-    found: list[jax.Array] = []
-    for _, node in sown_nodes(qk, "max_logits"):
-        logged = node["max_logits"]
-        found.append(jnp.max(logged[0] if isinstance(logged, (tuple, list)) else logged))
+    found = [jnp.max(logged) for _, (logged,) in sown_calls(qk, "max_logits")]
     return jnp.max(jnp.stack(found)) if found else None
 
 

@@ -7,6 +7,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A step over several GPUs compiles without XLA's rematerialization pass (`dew.training.memory.COLLECTIVES`),
+  as MaxText runs it: its plan fits it by Dew's ladder, and XLA's pass, against a limit of its own below the
+  plan's, recomputed what it picked at a rung that already fit, a sharded weight's all-gather among them.
+  Qwen3-8B over four H100s (fsdp 2 x tensor 2) at 48 GiB: 14 fewer re-gathered all-gathers, 11.7 GB gathered
+  a step against 16.8, at the same rung and temporaries (row 1307).
+
 - A launch whose derived config spills certifies its ladder's rungs one after another and takes the first
   that holds, where it certified them in threaded rounds as wide as the host's cores: a rung's certification
   is its launch's trace and Mosaic GPU lowering, Python under the GIL, so a round of 13 rungs cost 13 rungs'

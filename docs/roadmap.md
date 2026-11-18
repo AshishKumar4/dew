@@ -32,6 +32,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Tests/test_mamba3.py::test_the_chunked_form_is_as_exact_as_the_recurrence passes vacuously on main. [7401]
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-data] took 683 s (a check-1 site: its longest draws task 621 s (1 draws),…. [7603]
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-fsdp] took 613 s (a check-1 site: its longest draws task 550 s (1 draws),…. [7604]
+- A warp-uniform read of a shared-memory scalar for the Mosaic GPU toolkit. [7898]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -46,6 +47,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The attention backward's derivation proposes a spilling attention_dkv_fused at width 64 on sm100 and sm80. [6944]
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
 - A certification verdict's key names the ptxas that assembled it by the installed nvcc wheels alone. [7309]
+- The GPU interpreter's race detection (plgpu.InterpretGPUParams(detect_races=True)) flags a correctly ordered consumer-fed ring at one consumer. [7853]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
@@ -66,11 +68,12 @@ This page is generated from the maintainers' findings ledger as each change land
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
 - Stacks, scans and looped models. [1568]
+- Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
 
 ## Training and parallelism
 
 - Time to first step: the compile path's re-derivations. [5556]
-- Distributed and memory training modes. [156, 873, 1306, 1307, 617]
+- Distributed and memory training modes. [156, 873, 1306, 617]
 - XLA:CPU edges. [1591]
 - Training and serving efficiency. [1880, 5292]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
@@ -93,7 +96,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Bit-level synthesis in dew.algebra. [3733]
-- Check1 qualification on prepared arms. [7606]
 - An arm's mutable containers stated by type. [7674]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]

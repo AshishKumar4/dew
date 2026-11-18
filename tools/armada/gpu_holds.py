@@ -27,9 +27,12 @@ def holds(tests: list[str]) -> dict[str, float]:
     files = sorted({name.partition("#")[0] for name in tests})
     token = os.environ.get("DEW_XLA_CACHE_TOKEN", "")
     # Read whole or not at all (`strict`): a read the Worker does not answer fails this tool, whose caller
-    # sizes a job by it, and never reads as a file no class measured.
-    return {name: ci.gpu_needs(found, math.inf)[1]
-            for name, found in ci.borrowed_records(files, ci.PYTHONS[0], "", token, strict=True).items()}
+    # sizes a job by it, and never reads as a file no class measured. A test node (`file::test`) holds what
+    # its file does.
+    found = ci.borrowed_records(sorted({ci.grading.owning(name) for name in files}), ci.PYTHONS[0], "", token,
+                                strict=True)
+    return {name: ci.gpu_needs(found[whole], math.inf)[1] for name in files
+            if (whole := ci.grading.owning(name)) in found}
 
 
 def main() -> int:

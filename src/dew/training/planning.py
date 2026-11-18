@@ -201,8 +201,8 @@ class SampledStep(NamedTuple):
 
 def whole_step_program[L, E](objective: Objective[L, E]) -> OuterProgram:
     """`whole_step` over `objective`'s statistics (`Objective.reduce_loss`), the one program a split step
-    runs on its microbatches' outputs, compiled under its towers' options, which a run compiled ahead
-    compiles with its step (`dew.training.ahead`)."""
+    runs on its microbatches' outputs, compiled through Dew's compile point (`owned_program`), which a run
+    compiled ahead compiles with its step (`dew.training.ahead`)."""
     return owned_program(functools.partial(whole_step, reduce=objective.reduce_loss,
                                            shown=frozenset(objective.shown)), *objective.towers())
 
@@ -799,7 +799,7 @@ class FitSearch[LossT, EffectsT]:
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right, as the
         # step's own (`options`) are made; the target's own policy is the compile point's
         # (`report.targeted`).
-        self.required = compiler_options(*self.objective.towers()) or None
+        self.required = compiler_options() or None
 
     def admitted(self, candidates: Sequence[int], first: int) -> tuple[Planned, tuple[Probe, ...]]:
         """The first fitting plan the split-and-rung search finds (`searched`), and every compile it made:

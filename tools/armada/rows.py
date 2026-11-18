@@ -56,6 +56,9 @@ SPELLED = 160
 """The most characters a record place's part spells out (`spelled`); a longer one is spelled by its digest."""
 DIGEST = "=ZZ"
 """What begins a part spelled by its digest (`spelled`), no character's escape."""
+NODE = "=N"
+"""What begins a record place's test node segment (`row_place`: `<file>/=N<node>/<group>`), which no test
+file's path segment begins with and no spelling does (`spelled` escapes `=`)."""
 
 
 def spelled(text: str) -> str:
@@ -79,10 +82,15 @@ def unspelled(text: str) -> str:
 def row_place(row_name: str, held: str) -> str:
     """Row `row_name`'s place on class `held` under a record prefix: `<class>/<test file>/<group>`, a group
     `whole` or a split's `<index>-of-<count>` (`key_parts`), a process variant's (`varied`) with
-    `-as-<variant>` after it, in the Worker's key alphabet: a check-1 site's group (`test[id]`) `spelled`."""
+    `-as-<variant>` after it, in the Worker's key alphabet: a check-1 site's group (`test[id]`) `spelled`,
+    and a test node's (`file::test`) a segment of its own after its file's, marked `NODE`."""
     _, name, split = parsed_row(row_name)
     variant = split.partition(VARIED)[2]
-    return (f"{held}/{name}/"
+    file, _, node = name.partition("::")
+    # A test node's own segment, marked (`NODE`), after its file's path, which holds no segment so marked.
+    if any(part.startswith(NODE) for part in file.split("/")):
+        raise ValueError(f"{file}: a test file's path segment begins {NODE!r}, a test node's mark")
+    return (f"{held}/{file}/" + (f"{NODE}{spelled(node)}/" if node else "")
             + (spelled("-of-".join(cut.split("/"))) if (cut := cut_of(split)) else "whole")
             + (f"-as-{variant}" if variant else ""))
 
@@ -92,7 +100,8 @@ def key_parts(key: str) -> tuple[str, str, str]:
     its test file and its group (`whole`, or a split's `<index>-of-<count>`)."""
     held, rest = key.split("/", 1)
     name, group = rest.rsplit("/", 1)
-    return held, name, unspelled(group)
+    file, mark, node = name.rpartition(f"/{NODE}")
+    return held, f"{file}::{unspelled(node)}" if mark else name, unspelled(group)
 
 
 def place_variant(group: str) -> str:
