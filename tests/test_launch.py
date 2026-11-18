@@ -430,12 +430,12 @@ def test_a_bare_launch_runs_one_process_per_gpu_of_this_machine():
 
 def test_the_oom_kills_a_cgroup_counted_are_read_and_a_sigkill_after_one_names_the_kernel(tmp_path):
     """A cgroup v2 host's OOM kills are read off the process's cgroup's `memory.events` by the one cgroup
-    reader (`dew.data.cgroups`), none where a level keeps no such count; a rank's SIGKILL while the
+    reader (`dew._cgroups`), none where a level keeps no such count; a rank's SIGKILL while the
     launcher's cgroup counted one more names the kernel's OOM killer and the memory that ran out, where a
     bare SIGKILL read as a scheduler's (row 6003: a pool packed past its host's memory read as a
     preemption)."""
+    from dew import _cgroups as cgroups
     from dew._cli.launch import _exit_text
-    from dew.data import cgroups
 
     membership, root = tmp_path / "cgroup", tmp_path / "fs"
     (root / "job" / "step").mkdir(parents=True)

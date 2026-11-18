@@ -217,10 +217,10 @@ begun, ended = threading.Event(), threading.Event()
 compiled = report.attempted
 
 
-def attempted(lowered, held):
+def attempted(lowered, held, **given):
     begun.set()
     try:
-        return compiled(lowered, held)
+        return compiled(lowered, held, **given)
     finally:
         ended.set()
 
