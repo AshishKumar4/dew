@@ -377,9 +377,11 @@ def documents_draw(seed: int):
 def documents_on_the_kernel(x, b, c, a, given, key, value, weight, added: bool = False):
     """The kernel over a forked call, its documents walked in place, each taking its table slot's memory up
     at its first token, where `added` its `ADDS` slot's too (`Chunk.adds`), with its entry write added
-    (`recurrence_chunk._tpu_documents`): the output and the row's last memory."""
+    (`recurrence_chunk._tpu_documents`), launched per shard of rows and heads as the rated scan launches it
+    (`recurrence_chunk.ssd_specs`), so it runs under any mesh: the output and the row's last memory."""
     from dew.nn.kernels.chunked_launch import Forked
-    from dew.nn.kernels.recurrence_chunk import _tpu_documents
+    from dew.nn.kernels.recurrence_chunk import _tpu_documents, ssd_specs
+    from dew.nn.sharding import manual_map
 
     loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
     forked = Forked(jnp.asarray(DOCUMENTS, jnp.int32), loads, stores, (key, value, weight), 2,
@@ -391,7 +393,11 @@ def documents_on_the_kernel(x, b, c, a, given, key, value, weight, added: bool =
     padding = -length % 64
     x, b, c, a = (jnp.pad(t, ((0, 0), (0, padding)) + ((0, 0),) * (t.ndim - 2)) for t in (x, b, c, a))
     start = jnp.zeros((x.shape[0], *given.shape[2:]), jnp.float32)
-    y, final = _chunk_scan(x, b, c, a, start, documents, 64, "tpu", 2)
+
+    def local(x, b, c, a, start, documents):
+        return _chunk_scan(x, b, c, a, start, documents, 64, "tpu", 2)
+
+    y, final = manual_map(local, *ssd_specs(x.shape, documents))(x, b, c, a, start, documents)
     return y[:, :length], final
 
 

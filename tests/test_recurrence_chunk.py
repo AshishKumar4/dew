@@ -843,12 +843,13 @@ def test_the_templates_forked_documents_are_as_exact_as_each_alone_interpreted(h
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=1)
-@pytest.mark.parametrize('hooks', FORKED_TEMPLATE, ids=str)
+@pytest.mark.parametrize('hooks', [hooks for hooks in FORKED_TEMPLATE if not hooks.turns], ids=str)
 def test_the_templates_documents_adding_a_slot_are_as_exact_as_each_alone_interpreted(hooks):
     """The template's walks over a forked call whose documents each add a second table slot (`Chunk.adds`,
     `ADDS`): the forward's taking sums both slots (`table.Taking`), the reverse walk returns the memory's
     gradient to both (`table.Returning`, the given slots' sum; Kimi delta attention's taken memories),
-    interpreted off a GPU (`the_templates_forked_documents_are_as_exact_as_each_alone`)."""
+    interpreted off a GPU (`the_templates_forked_documents_are_as_exact_as_each_alone`); a turned call's
+    documents add none (refused, row 8284)."""
     the_templates_forked_documents_are_as_exact_as_each_alone(hooks, added=True)
 
 
