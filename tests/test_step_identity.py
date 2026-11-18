@@ -1038,6 +1038,12 @@ BUMPED = jax.jit(_bumped)
 """A jitted function of this module's own, which a step's code reads."""
 
 
+def read_exactly(step):
+    """`ROWS` read through `step`, shuffled and batched by two, resumed exactly."""
+    pipeline = Pipeline(ROWS).map(step).shuffle(0).repeat().batch(2)
+    return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+
 def shifted_by(key):
     """A step made inside a function: each id bumped (`BUMPED`) and shifted by a draw of its typed `key`."""
     def shift(row):
@@ -1052,8 +1058,7 @@ def test_a_step_made_inside_a_function_resumes_exactly_by_its_code_closure_and_r
     `<locals>`), a jitted function of the user's had no statement, and a typed key crashed the statement
     that fetched its bits (row 7814; train 1019's review, F1 and F3)."""
     def reader(key):
-        pipeline = Pipeline(ROWS).map(shifted_by(key)).shuffle(0).repeat().batch(2)
-        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+        return read_exactly(shifted_by(key))
 
     state = saved_after_one(lambda: reader(jax.random.key(0)))
     assert resumed_changes(reader(jax.random.key(0)), state) == ()
@@ -1105,11 +1110,7 @@ def test_a_captured_array_differing_only_in_what_its_bytes_do_not_hold_refuses_e
         assert str(saved.dtype) == str(other.dtype)
         step = shifted_by
 
-    def reader(value):
-        pipeline = Pipeline(ROWS).map(step(value)).shuffle(0).repeat().batch(2)
-        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
-
-    state = saved_after_one(lambda: reader(saved))
-    assert resumed_changes(reader(saved), state) == ()
+    state = saved_after_one(lambda: read_exactly(step(saved)))
+    assert resumed_changes(read_exactly(step(saved)), state) == ()
     with pytest.raises(ValueError):
-        resumed_changes(reader(other), state)
+        resumed_changes(read_exactly(step(other)), state)

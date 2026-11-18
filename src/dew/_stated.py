@@ -251,7 +251,7 @@ def _jax_array(value: jax.Array, at: str, again: Callable[..., JSON]) -> JSON:
         raise Unestablished(f"{at}: an array of JAX's this process holds only part of")
     # A typed PRNG key's bits are its key data, its dtype the key type, which NumPy cannot read whole.
     dtype, bits = terms.held_bits(value)
-    return ["jax array", again(dtype, at=f"{at}.dtype"), value.weak_type, _data(bits, at),
+    return ["jax array", again(dtype, at=f"{at}.dtype"), jax.typeof(value).weak_type, _data(bits, at),
             again(value.sharding, at=f"{at}.sharding")]
 
 
