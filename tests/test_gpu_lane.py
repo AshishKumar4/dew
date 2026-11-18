@@ -539,7 +539,7 @@ def test_a_gpu_lane_given_test_nodes_grades_each_by_its_own_cases(ci, tmp_path, 
 
 def test_a_test_nodes_green_run_keeps_a_record_its_next_lane_reuses(ci, tmp_path, monkeypatch, cache_worker):
     """A test node's green run (`file::test`, its parametrized case's id outside the Worker's key alphabet)
-    keeps its file's record under a place the Worker takes (`rows.placed`), so a second lane on the same
+    keeps its file's record under a place the Worker takes (`rows.row_place`), so a second lane on the same
     inputs reuses it rather than run it again, and another node of the same file is no reuse of it (review of
     the first node-id grading: a node row found no record of its process, and its place held a colon)."""
     lane_machine(tmp_path, monkeypatch, cache_worker[0], "tests/test_nodes.py",
@@ -561,9 +561,10 @@ def test_a_test_nodes_green_run_keeps_a_record_its_next_lane_reuses(ci, tmp_path
 
 
 def test_a_test_nodes_record_is_kept_where_the_worker_takes_it_and_read_back_as_its_node(ci):
-    """A test node's record place (`rows.placed`) is a key the Worker takes, however its parametrized case is
-    spelled or long, distinct from its file's and its siblings', and its readers (`key_parts`) read it back as
-    the node, a long one as its file's node by digest, never a file of its own."""
+    """A test node's record place (`rows.row_place`) is a key the Worker takes, however its parametrized
+    case is spelled or long, distinct from its file's and its siblings', and its readers (`key_parts`) read
+    it back as the node, a long one as its file's node by digest, never a file of its own; a file whose
+    name holds an escape's characters reads back as itself."""
     file = "tests/test_nodes.py"
     nodes = [f"{file}::test_walk", f"{file}::test_walk[a/b c]", f"{file}::Walks::test_walk[\u00e9-..]",
              f"{file}::test_walk[{'x' * 400}]"]
@@ -572,6 +573,9 @@ def test_a_test_nodes_record_is_kept_where_the_worker_takes_it_and_read_back_as_
     read = [ci.key_parts(place.removeprefix(f"{ci.CACHE_PREFIX}/3.12/"))[1] for place in places]
     assert read[:4] == [file, *nodes[:3]]
     assert read[4].startswith(f"{file}::") and read[4] != nodes[3]
+    odd = "tests/test_a=20b.py"
+    assert ci.key_parts(ci.record_key("3.12", ci.row("3.12", odd, ""), "sm90").removeprefix(
+        f"{ci.CACHE_PREFIX}/3.12/"))[1] == odd
 
 
 def test_a_tier_cut_groups_green_row_is_reused_while_its_cut_holds_the_same_tests(

@@ -614,27 +614,36 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
 
     def by_hand(dtype=None):
         if dtype is None:
-            return as_given(lambda key, rolled: stepped(objective, params, rolled))
+            step = stepped(objective)
+            return as_given(lambda key, rolled: step(params, rolled))
         weights = widened(params)
         # Built under x64, as it computes, so nothing it holds narrows to float32.
         with jax.enable_x64(new_val=True):
-            wide = GRPOObjective(model.clone(dtype=dtype), seq_len=7, variables=weights)
+            wide = stepped(GRPOObjective(model.clone(dtype=dtype), seq_len=7, variables=weights))
 
         def run(key, rolled):
             with jax.enable_x64(new_val=True):
-                return stepped(wide, weights, widened(rolled))
+                return wide(weights, widened(rolled))
         return as_given(run)
 
-    def stepped(objective, params, rolled):
-        def raw_policy_loss(p):
-            policy = objective.packed_log_probs(p, rolled)
-            return clipped_surrogate(
-                policy - jnp.asarray(rolled["old_log_probs"]),
-                jnp.asarray(rolled["advantages"]), jnp.asarray(rolled["response_mask"]))[0]
+    def stepped(objective):
+        """The raw policy ratio's SGD step by hand, one compiled program over a rollout's device fields,
+        where op by op its 65 calls took 107 s of the test (row 7447)."""
+        @jax.jit
+        def step(params, placed):
+            def raw_policy_loss(p):
+                policy = objective.packed_log_probs(p, placed)
+                return clipped_surrogate(policy - placed["old_log_probs"], placed["advantages"],
+                                         placed["response_mask"])[0]
 
-        loss, grads = jax.value_and_grad(raw_policy_loss)(params)
-        assert np.isfinite(loss)
-        return jax.tree.map(lambda p, g: p - 0.01 * g, params, grads)
+            loss, grads = jax.value_and_grad(raw_policy_loss)(params)
+            return loss, jax.tree.map(lambda p, g: p - 0.01 * g, params, grads)
+
+        def run(params, rolled):
+            loss, moved = step(params, split_fields(rolled)[0])
+            assert np.isfinite(loss)
+            return moved
+        return run
 
     rolled = rolled_from(jax.random.key(5))
     assert np.any(rolled["advantages"] != 0)

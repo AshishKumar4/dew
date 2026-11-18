@@ -1231,8 +1231,8 @@ def told(pool: list[tuple[subprocess.Popen, Path]], timeout: float = 600) -> lis
     finally:
         for handle in [*exits, *readers]:
             os.close(handle)
-        for process, path in pool:
-            terminate(process)
+        terminate([process for process, _ in pool])
+        for _, path in pool:
             path.unlink()
     return [heard[index] for index in range(len(pool))]
 

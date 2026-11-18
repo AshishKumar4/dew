@@ -65,6 +65,7 @@ import dataclasses
 import functools
 import hashlib
 import json
+import logging
 import os
 import time
 import types
@@ -107,7 +108,8 @@ from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
 from truths_ahead import COMPILED, CompiledTruths, judged, named, running
 
 from dew._accuracy import distance, reduction_bound, within
-from dew._sources import names_read
+from dew._sources import function_reads
+from dew._stated import Unestablished, _code, reads, stated
 from dew.algebra import passes
 from dew.nn import programs
 from dew.parity import (
@@ -153,6 +155,8 @@ from dew.telemetry.compiles import Compiles
 
 PRECISION = "precision"
 """The entry of a reference's array file that records the precision its generator's matmuls took."""
+
+_log = logging.getLogger(__name__)
 
 
 def ieee_fixture(path) -> dict[str, np.ndarray]:
@@ -525,7 +529,7 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
     truth = truth_fn if truth_fn is not None else reference_fn
     shaped = {}
     for seed in range(staged_units(seeds)):
-        inputs = _drawn_on_the_host(draw, seed)
+        inputs = drawn_on_the_host(draw, seed)
         shaped.setdefault(named("truth", widened(inputs)), inputs)
     programs, held = {}, {}
     with (jax.enable_x64(new_val=True), passes(on=False), jax.default_device(store.device()),
@@ -539,14 +543,6 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
     _compile_arms(store, {"dew": (dew_fn, False), "reference": (reference_fn, True),
                           **{f"further {name}": (fn, True) for name, fn in also.items()}},
                   draw, label, seeds=seeds, orders=orders)
-
-
-def _drawn_on_the_host(draw, seed: int):
-    """`draw(seed)` on this process's CPU: a prepare's draws, which shape its programs (cheap setup, as a
-    draw is), where its default device is a compile-only GPU's on which nothing computes
-    (`tests/conftest.py`'s `compiled_ahead`)."""
-    with jax.default_device(jax.local_devices(backend="cpu")[0]):
-        return draw(seed)
 
 
 def armed(label: str) -> str:
@@ -573,16 +569,17 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     and compiled as the gate compiles it (`_arm_compile`): its run calls each draw's executable
     (`_ahead_arm`), tracing, lowering and compiling none. An arm the gate runs as given, or one running Dew's
     own programs (`dew_programs`, a host loop), holds no program."""
-    # Each arm named as each process first finds it, before any call of it here (`_arm_role`).
-    named_arms = {role: (_arm_role(role, fn), fn, reference) for role, (fn, reference) in arms.items()
-                  if fn is not None}
+    # Each arm named as each process first finds it, before any call of it here (`_arm_role`); one no
+    # statement holds runs unprepared in its run.
+    named_arms = {role: (named_role, fn, reference) for role, (fn, reference) in arms.items()
+                  if fn is not None and (named_role := _arm_role(role, fn, label)) is not None}
     if store.target is None:
         # An arm computing in NumPy refused as a run refuses it, by a call on a draw; for a GPU's store the
         # prepare computes nothing on its host (bible §8), and its trace refuses an arm that cannot trace.
         _refuse_numpy_arms(draw, *(fn for _, fn, _ in named_arms.values()))
     inputs: dict[str, tuple] = {}
     for seed in range(staged_units(seeds)):
-        drawn = _drawn_on_the_host(draw, seed)
+        drawn = drawn_on_the_host(draw, seed)
         for ordered in (drawn,) if orders is None else orders(drawn):
             inputs.setdefault(named("arms", ordered), ordered)
     programs: dict = {}
@@ -636,97 +633,54 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
     _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
 
 
-def _arm_role(role: str, fn) -> str:
-    """An arm's role in its site's store (`_compile_arms`) with its computation's fingerprint
-    (`_fingerprint`): a run that passes the site another computation under that role finds none
-    (`truths_ahead.MissingTruth`), never the prepare's run in its place."""
-    digest = hashlib.sha256()
-    _fingerprint(fn, digest, {})
-    return f"{role} {digest.hexdigest()[:16]}"
+def _arm_role(role: str, fn, label: str) -> str | None:
+    """An arm's role in its site's store (`_compile_arms`) with what it computes as Dew states an identity
+    (`dew._stated.stated`, one form in every process that holds an equal value): a run that passes the site
+    another computation under that role finds none (`truths_ahead.MissingTruth`), never the prepare's run in
+    its place. None for an arm no statement holds (`Unestablished`), which runs unprepared, named
+    (`truths_ahead.CompiledTruths.unprepared`)."""
+    at = f"{label}: its {role} arm"
+    try:
+        known: dict[int, Any] = {}
+        _local_functions_known(fn, at, known, ())
+        statement = stated(fn, at, known)
+    except Unestablished as unstated:
+        _log.info("an arm no statement holds runs unprepared: %s", unstated)
+        return None
+    return f"{role} {hashlib.sha256(json.dumps(statement, sort_keys=True).encode()).hexdigest()[:16]}"
 
 
-def _fingerprint(value, digest, seen: dict[int, object]) -> None:
-    """`value` into `digest` as what an arm computes reads it, without tracing it, alike in every process of
-    a commit (a prepare's and its run's): a function by its code, its defaults and what it closes over; a
-    jit by the function it wraps; a partial by its function and what it binds; a bound method by its
-    function and its object; an array by its dtype, shape and bytes; a tuple or a frozenset by its length
-    and items (a frozenset's by their fingerprints, sorted); a class or a module by its name; any other
-    object by its type and its attributes (by its type alone where it has none), each value once (`seen`,
-    which holds each, so no id is another's later). No address enters it. A list, a dict or a set an arm
-    reaches is state it keeps as it runs (a forms' cache of splits a trace fills, a test's record of its
-    calls), whose contents differ by what a process ran before (a prepare runs a part's every test, its
-    run a part of them), so each enters by its type alone: an arm parameterized through one is told from
-    another by its code, its other bindings and its site's own label. A function's keyword defaults enter
-    as its other bindings do, and so do the plain globals it reads and its own module's functions: a
-    prepare reading a module's flag otherwise than its run (a backend read at import) names another arm,
-    a red in the run (`truths_ahead.MissingTruth`), never the prepare's program in its place. Taken before
-    the arm is traced or called."""
-    digest.update(type(value).__qualname__.encode())
-    if isinstance(value, np.ndarray | jax.Array | np.generic):
-        array = np.asarray(value)
-        digest.update(f"{array.dtype}{array.shape}".encode() + np.ascontiguousarray(array).tobytes())
+def _local_functions_known(value, at: str, known: dict[int, Any], walking: tuple[int, ...]) -> None:
+    """Into `known` (`dew._stated.stated`'s values its caller states), each function of the user's own code
+    made inside a function that `value` reaches through partials, sequences, mappings and what each such
+    function reads, stated as Dew states a function no module holds: its module, name, code (`_code`) and
+    what it reads (`reads`), those it reaches first. Dew's statement refuses one (one of however many its
+    maker made), and a check's arms are such functions (a test's closures, `with_gradients`'s): within one
+    test of one commit, its prepare and its run make each the same. A list, a dict or a set one reads is
+    state it keeps as it runs (a test's record of its calls, a cache a trace fills), which a prepare's trace
+    of the arm fills and its run, calling the arm's executable, does not: stated by its type alone."""
+    if id(value) in known or id(value) in walking:
         return
-    if value is None or isinstance(value, bool | int | float | complex | str | bytes):
-        digest.update(repr(value).encode())
+    if isinstance(value, (list, dict, set)):
+        known[id(value)] = ["mutable", type(value).__qualname__]
         return
-    # A container or an object once, its later references marked: an object graph's cycles end.
-    if id(value) in seen:
-        digest.update(b"seen")
-        return
-    seen[id(value)] = value
-    if isinstance(value, types.FunctionType):
-        digest.update(f"{value.__module__}.{value.__qualname__}".encode())
-        for part in (value.__code__, value.__defaults__, tuple(sorted((value.__kwdefaults__ or {}).items())),
-                     tuple(cell.cell_contents for cell in value.__closure__ or ())):
-            _fingerprint(part, digest, seen)
-        # The globals it reads that state what it computes: a module's flag or constant (a test's
-        # `ON_GPU`, read where its module was imported: a prepare's CPU and its run's GPU read two), and a
-        # function of its own module, as it reads them; a library's by its name, its code the commit's.
-        for name in sorted(names_read(value.__code__)):
-            found = value.__globals__.get(name)
-            own = isinstance(found, types.FunctionType) and found.__module__ == value.__module__
-            if own or _plain(found):
-                _fingerprint((name, found), digest, seen)
-    elif isinstance(value, types.CodeType):
-        digest.update(value.co_code + repr(value.co_names).encode())
-        _fingerprint(value.co_consts, digest, seen)
-    elif isinstance(value, type | types.ModuleType):
-        digest.update(f"{getattr(value, '__module__', '')}.{getattr(value, '__qualname__', value.__name__)}"
-                      .encode())
-    elif isinstance(value, types.MethodType):
-        _fingerprint((value.__func__, value.__self__), digest, seen)
-    elif isinstance(value, functools.partial):
-        _fingerprint((value.func, value.args, tuple(sorted(value.keywords.items()))), digest, seen)
+    if isinstance(value, functools.partial):
+        parts = (value.func, *value.args, *value.keywords.values())
     elif isinstance(value, tuple):
-        digest.update(f"[{len(value)}".encode())
-        for item in value:
-            _fingerprint(item, digest, seen)
-        digest.update(b"]")
-    elif isinstance(value, frozenset):
-        digest.update(f"{{{len(value)}".encode() + b"".join(sorted(_part_of(item, seen) for item in value))
-                      + b"}")
-    elif isinstance(value, list | dict | set):
+        parts = value
+    elif isinstance(value, types.FunctionType) and "<locals>" in value.__qualname__:
+        cells, read = function_reads(value)
+        within = (*walking, id(value))
+        for part in (*cells.values(), *read.values(), value.__defaults__ or (),
+                     *(value.__kwdefaults__ or {}).values()):
+            _local_functions_known(part, at, known, within)
+        known[id(value)] = ["local", value.__module__, value.__qualname__, _code(value.__code__),
+                            reads(value, at, known, within)]
         return
-    elif (wrapped := getattr(value, "__wrapped__", None)) is not None:
-        _fingerprint(wrapped, digest, seen)
-    elif isinstance(attributes := getattr(value, "__dict__", None), dict):
-        _fingerprint(tuple(sorted(attributes.items())), digest, seen)
-
-
-def _plain(value) -> bool:
-    """Whether `value` is plain data: None, a number, a string, bytes, or a tuple of them."""
-    if isinstance(value, tuple):
-        return all(_plain(item) for item in value)
-    return value is None or isinstance(value, bool | int | float | complex | str | bytes | np.generic)
-
-
-def _part_of(item, seen: dict[int, object]) -> bytes:
-    """A frozenset's member as its own fingerprint, so the set's are sorted by them (`_fingerprint`), each
-    from its container's ancestors alone (a copy of `seen`), so none depends on the order the set iterates in
-    (a string's hash, a process's own)."""
-    digest = hashlib.sha256()
-    _fingerprint(item, digest, dict(seen))
-    return digest.digest()
+    else:
+        return
+    for part in parts:
+        _local_functions_known(part, at, known, walking)
 
 
 def _ahead_arm(given, compiled, call: Callable, role: str):
@@ -1588,9 +1542,13 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
         # Each arm's draws run by the programs its prepare compiled (`_compile_arms`), whose trace refused an
         # arm computing in NumPy.
         def from_store(given_fn, arm, role: str):
-            # Named as its prepare named it, before any call of it (`_compile_arms`).
-            return _ahead_arm(given_fn, arm, functools.partial(ahead[0].called, armed(label)),
-                              _arm_role(role, given_fn))
+            # Named as its prepare named it, before any call of it (`_compile_arms`); one no statement holds
+            # runs unprepared, named.
+            named_role = _arm_role(role, given_fn, label)
+            if named_role is None:
+                ahead[0].unprepared(f"{label}: its {role} arm has no statement of what it computes")
+                return arm
+            return _ahead_arm(given_fn, arm, functools.partial(ahead[0].called, armed(label)), named_role)
 
         compiled = (from_store(dew_fn, compiled[0], "dew"),
                     from_store(reference_fn, compiled[1], "reference"),

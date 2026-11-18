@@ -52,43 +52,46 @@ def cut_of(group: str) -> str:
     return group.partition(VARIED)[0]
 
 
+SPELLED = 160
+"""The most characters a record place's part spells out (`spelled`); a longer one is spelled by its digest."""
 DIGEST = "=ZZ"
-"""What begins a test node's place spelled by its digest (`placed`), no character's escape."""
-NODE_PLACE = 160
-"""The most characters a test node's part of its record's place (`placed`) spells out; a longer one is its
-digest."""
+"""What begins a part spelled by its digest (`spelled`), no character's escape."""
+NODE = "=N"
+"""What begins a record place's test node segment (`row_place`: `<file>/=N<node>/<group>`), which no test
+file's path segment begins with and no spelling does (`spelled` escapes `=`)."""
 
 
-def placed(name: str) -> str:
-    """A row's file or test node (`file::test`) in the Worker's key alphabet: a node's part after its file,
-    each character outside letters, digits, `.`, `_` and `-` as `=XX` of its UTF-8 bytes (a parametrized
-    case's brackets, a class's colons), or past `NODE_PLACE` characters its digest; a file's as it is."""
-    file, colons, node = name.partition("::")
-    if not colons:
-        return name
-    spelled = "".join(char if char.isascii() and (char.isalnum() or char in "._-")
-                      else "".join(f"={byte:02X}" for byte in char.encode()) for char in colons + node)
-    digest = f"=3A=3A{DIGEST}{hashlib.sha256(node.encode()).hexdigest()[:32]}"
-    return file + (spelled if len(spelled) <= NODE_PLACE else digest)
+def spelled(text: str) -> str:
+    """`text` in the Worker's key alphabet (tools/armada/r2.json): each character outside letters, digits,
+    `.`, `_` and `-` as `=XX` of its UTF-8 bytes (a parametrized test's brackets, a test node's colons), or
+    past `SPELLED` characters its digest (2026-11-18: every parametrized check-1 site's group, `test[id]`, was
+    refused as a key before any request since 11-09, 19,218 lookups from 11-13 on, and no such row was ever
+    kept or reused)."""
+    out = "".join(char if char.isascii() and (char.isalnum() or char in "._-")
+                  else "".join(f"={byte:02X}" for byte in char.encode()) for char in text)
+    return out if len(out) <= SPELLED else DIGEST + hashlib.sha256(text.encode()).hexdigest()[:32]
 
 
-def unplaced(spelled: str) -> str:
-    """`placed`'s row name back from its spelling: a test node's whole, or one spelled by its digest as
-    `file::` and the digest; a file's as it is."""
-    file, colons, node = spelled.partition("=3A=3A")
-    if not colons:
-        return spelled
-    return f"{file}::" + re.sub(rb"=([0-9A-F]{2})", lambda byte: bytes.fromhex(byte[1].decode()),
-                                node.encode()).decode()
+def unspelled(text: str) -> str:
+    """`spelled`'s text back from its spelling; one spelled by its digest as it is."""
+    if text.startswith(DIGEST):
+        return text
+    return re.sub(rb"=([0-9A-F]{2})", lambda byte: bytes.fromhex(byte[1].decode()), text.encode()).decode()
 
 
 def row_place(row_name: str, held: str) -> str:
     """Row `row_name`'s place on class `held` under a record prefix: `<class>/<test file>/<group>`, a group
     `whole` or a split's `<index>-of-<count>` (`key_parts`), a process variant's (`varied`) with
-    `-as-<variant>` after it, in the Worker's key alphabet."""
+    `-as-<variant>` after it, in the Worker's key alphabet: a check-1 site's group (`test[id]`) `spelled`,
+    and a test node's (`file::test`) a segment of its own after its file's, marked `NODE`."""
     _, name, split = parsed_row(row_name)
     variant = split.partition(VARIED)[2]
-    return (f"{held}/{placed(name)}/" + ("-of-".join(cut.split("/")) if (cut := cut_of(split)) else "whole")
+    file, _, node = name.partition("::")
+    # A test node's own segment, marked (`NODE`), after its file's path, which holds no segment so marked.
+    if any(part.startswith(NODE) for part in file.split("/")):
+        raise ValueError(f"{file}: a test file's path segment begins {NODE!r}, a test node's mark")
+    return (f"{held}/{file}/" + (f"{NODE}{spelled(node)}/" if node else "")
+            + (spelled("-of-".join(cut.split("/"))) if (cut := cut_of(split)) else "whole")
             + (f"-as-{variant}" if variant else ""))
 
 
@@ -97,7 +100,8 @@ def key_parts(key: str) -> tuple[str, str, str]:
     its test file and its group (`whole`, or a split's `<index>-of-<count>`)."""
     held, rest = key.split("/", 1)
     name, group = rest.rsplit("/", 1)
-    return held, unplaced(name), group
+    file, mark, node = name.rpartition(f"/{NODE}")
+    return held, f"{file}::{unspelled(node)}" if mark else name, unspelled(group)
 
 
 def place_variant(group: str) -> str:

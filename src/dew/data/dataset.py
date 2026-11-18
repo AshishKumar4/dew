@@ -1413,6 +1413,10 @@ class GlobalStream:
         """The order's description, which a saved position is compared against."""
         return self._order
 
+    def order_under(self, version: int | None) -> str:
+        """The order as the plan `version` described its stages (`Plan.order_under`)."""
+        return self._plan.order_under(version)
+
     def identity(self) -> str:
         """The plan's identity (`Plan.identity`), which a pool agrees before it
         reads: hosts whose copies of a corpus hold other records, or whose
@@ -1430,9 +1434,10 @@ class GlobalStream:
                 f"past {len(saved.completed)} phase(s), and this run reads one order "
                 f"({self._order}); resume it with the phases that wrote it"
             )
-        from dew.data.plan import same_order
+        from dew.data.plan import same_order, saved_version
 
-        if not same_order(saved.order, self._order):
+        # The saved order as its plan's version described its stages (`Plan.order_under`).
+        if not same_order(saved.order, self._plan.order_under(saved_version(saved.plan))):
             raise ValueError(
                 f"the saved data position is {saved.records} records into "
                 f"{saved.order}, and this run reads {self._order}; a record count "
@@ -1457,6 +1462,7 @@ class GlobalReader(Protocol):
     def records(self) -> int: ...
     @property
     def order(self) -> str: ...
+    def order_under(self, version: int | None) -> str: ...
     def __next__(self) -> Batch: ...
     def get_state(self) -> Position: ...
     def set_state(self, state: bytes) -> None: ...
@@ -1680,7 +1686,7 @@ class PhasedStream:
 
     def set_state(self, state: bytes) -> None:
         saved = _position.read(state)
-        from dew.data.plan import same_order
+        from dew.data.plan import same_order, saved_version
 
         if self._tokens is not None:
             if len(saved.completed) > len(self._ends):
@@ -1715,8 +1721,16 @@ class PhasedStream:
                     )
                 )
 
+        # Each phase's order as the version its saved plan records described its stages (`Plan.order_under`).
+        phases = None if saved.plan is None else saved.plan.get("phases", [saved.plan])
+        versions = [saved_version(plan) if isinstance(plan, Mapping) else None
+                    for plan in (phases if isinstance(phases, list) else [])]
+
+        def ordered(index: int) -> str:
+            return self._stream(index).order_under(versions[index] if index < len(versions) else None)
+
         for index, (order, end) in enumerate(saved.completed):
-            if (index >= len(self._ends) or not same_order(order, self._stream(index).order)
+            if (index >= len(self._ends) or not same_order(order, ordered(index))
                     or self._ends[index] != end):
                 raise _position.PlanChanged(
                     (f"phases.{index}",),
@@ -1725,7 +1739,7 @@ class PhasedStream:
                     f"run has read cannot change under it"
                 )
         phase = len(saved.completed)
-        if phase >= len(self._open) or not same_order(saved.order, self._stream(phase).order):
+        if phase >= len(self._open) or not same_order(saved.order, ordered(phase)):
             raise _position.PlanChanged(
                 (f"phases.{phase}",),
                 f"the saved position is {saved.records} records into phase {phase}, "
@@ -1964,8 +1978,12 @@ class StepPhases(Forwarding):
         trained = [[node, member, frontier.record()] for (node, member), frontier in self._trained.items()]
         shared = ({"phases": self.CONTINUES, "carried": carried, "trained": trained}
                   if any(self._shared) else {})
+        from dew.data.plan import PLAN_VERSIONS
+
         return json.dumps({_position.STEP_PHASES: {
             "steps": self._steps, "phase": phase, "ends": self._ends[:phase], **shared,
+            # The plan version its identities describe their steps by, which a resume reads them under.
+            "version": PLAN_VERSIONS[-1],
             "identities": [self._identity(index) for index in range(phase + 1)],
             "position": base64.b64encode(own if isinstance(own, bytes)
                                          else json.dumps(own).encode()).decode(),
@@ -1986,8 +2004,9 @@ class StepPhases(Forwarding):
         from dew.data.plan import saved_identity
 
         identities = [saved_identity(held) for held in strings(saved["identities"], "saved phase identities")]
-        if phase >= len(self._make) or ends != self._ends[:phase] or identities[:phase] != [
-                self._identity(index) for index in range(phase)]:
+        version = saved.get("version")
+        if phase >= len(self._make) or ends != self._ends[:phase] or not self._read_alike(
+                identities, phase, None if version is None else integer(version, "the saved plan version")):
             raise _position.PlanChanged(
                 ("phases",), f"the saved run finished phases ending at steps {ends}, and this run's phases "
                 f"end at {self._ends[:phase]}, or read them otherwise; a phase the run has read cannot "
@@ -2034,6 +2053,15 @@ class StepPhases(Forwarding):
         encoded = boolean(saved["encoded"], "the saved position's encoding")
         stream.set_state(own if encoded else json.loads(own))
         self._steps = steps
+
+    def _read_alike(self, saved: Sequence[str], phase: int, version: int | None) -> bool:
+        """Whether the phases before `phase` read what the `saved` identities say, their steps described as
+        the plan `version` the position records described them (`dew.data.plan.described_under`); a
+        position that records none was saved under plan 15 or 14, whose rule describes them."""
+        from dew.data.plan import REFERENCED, described_under
+
+        with described_under(REFERENCED if version is None else version):
+            return list(saved[:phase]) == [self._identity(index) for index in range(phase)]
 
     def _identity(self, phase: int) -> str:
         """What phase `phase`'s reader reads, as the pool agrees it (`stream_identity`): its plan as this

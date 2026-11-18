@@ -30,7 +30,9 @@ import contextlib
 import contextvars
 import dataclasses
 import hashlib
+import inspect
 import json
+import os
 import pickle
 import shutil
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -47,6 +49,11 @@ class MissingTruth(AssertionError):
 
 
 PROGRAMS, HELD, SITE = "programs", "held.pkl", "site.json"
+
+UNPREPARED = "unprepared.json"
+"""A test's record, in its store, that it ran unprepared (`CompiledTruths.unprepared`): `{"test", "where",
+"error"}`, its first reason, the GPU tier's list of unprepared tests read from these alone (a ledger row
+each, the tier's)."""
 """A site's files under its store (`CompiledTruths.path`): its executables (`AheadPrograms`), each one's
 constants and output tree (`held`), and its record, written last, so a prepare cut short leaves none a run
 reads."""
@@ -77,6 +84,21 @@ class CompiledTruths:
 
     def path(self, label: str) -> Path:
         return self.directory / hashlib.sha256(label.encode()).hexdigest()[:32]
+
+    def holds(self, label: str) -> bool:
+        """Whether the store's prepare reached site `label` (its programs written, at any stamp)."""
+        return (self.path(label) / SITE).is_file()
+
+    def unprepared(self, why: str) -> None:
+        """Records in the store that its test ran a site, or an arm, unprepared (`UNPREPARED`), compiling it
+        on its devices with every site judged: the first reason a test gives, where in its file it reached
+        it (`where`)."""
+        record = self.directory / UNPREPARED
+        if record.exists():
+            return
+        test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+        self.directory.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"test": test, "where": where(test), "error": why}))
 
     def device(self):
         """A device of the ones the store's programs compute on, whose platform picks a branch its platform
@@ -231,6 +253,24 @@ def judged(label: str) -> Iterator[None]:
 
 def running() -> tuple[CompiledTruths, str] | None:
     """The store whose programs compute the truths of the site in progress, and its label: where a run reads
-    a store (`compiled_truths(prepare=False)`) within a site (`judged`), else None."""
+    a store (`compiled_truths(prepare=False)`) within a site (`judged`) its prepare reached, else None. A
+    site its prepare did not reach (a cell its prepare skipped, one computing past an earlier site) runs
+    unprepared, recorded (`CompiledTruths.unprepared`); one prepared at another stamp is a red
+    (`MissingTruth`)."""
     store, label = COMPILED.get(), SITE_IN_PROGRESS.get()
-    return None if store is None or store.prepare or label is None else (store, label)
+    if store is None or store.prepare or label is None:
+        return None
+    if not store.holds(label):
+        store.unprepared(f"{label}: its prepare did not reach this site")
+        return None
+    return store, label
+
+
+def where(test: str) -> str:
+    """Where test `test` (a node id) stands in this process's stack: the deepest frame of its own file, as
+    `path:line` from the working directory; the test's file where no frame of it is on the stack."""
+    path = Path(test.split("::", 1)[0])
+    frames = [frame for frame in inspect.stack() if Path(frame.filename).name == path.name]
+    if not frames:
+        return str(path)
+    return f"{path}:{frames[0].lineno}"

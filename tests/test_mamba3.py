@@ -202,18 +202,22 @@ def test_a_continuation_is_the_whole_call(rank):
                     seeds=CONTINUED_SEEDS[rank], terms=RESET_TERMS)
 
 
-def test_a_tokens_turn_at_fp32s_edge_stays_its_exact_product():
-    """One token's turn `dt theta` formed exactly (`two_product`) at fp32's edge: `dt` 2^120 under `theta`
-    zero turns nothing, and the token writes `lambda dt x B = 0.5 [1, 0]` and reads it back, 0.5 (base
-    review 9bc4326dd F1). A Veltkamp split multiplies `dt` by 4097 first, inf there, its residual NaN."""
-    x = jnp.full((1, 1, 1, 1, 1), 2.0 ** -120, jnp.float32)
-    dt = jnp.full((1, 1, 1), 2.0 ** 120, jnp.float32)
-    B = C = jnp.asarray([[[[[1.0, 0.0]]]]], jnp.float32)
-    lam = jnp.full((1, 1, 1), 0.5, jnp.float32)
-    theta = jnp.zeros((1, 1, 1, 1), jnp.float32)
-    out, carried = chunk_mamba3(x, dt, jnp.asarray([-1.0], jnp.float32), B, C, lam, theta)
-    np.testing.assert_array_equal(np.asarray(out).reshape(-1), [0.5])
-    np.testing.assert_array_equal(np.asarray(carried.state).reshape(-1), [0.5, 0.0])
+@pytest.mark.parametrize(("dtype", "edge"), [(jnp.float32, 120), (jnp.float64, 1000)],
+                         ids=["fp32", "float64"])
+def test_a_tokens_turn_at_a_dtypes_edge_stays_its_exact_product(dtype, edge):
+    """One token's turn `dt theta` formed exactly (`two_product`) at its dtype's edge: `dt` 2^edge under
+    `theta` zero turns nothing, and the token writes `lambda dt x B = 0.5 [1, 0]` and reads it back, 0.5
+    (base reviews 9bc4326dd F1, 1fe546a10 F1). A Veltkamp split multiplies `dt` by `2^(p/2) + 1` first, inf
+    there, its residual NaN."""
+    with jax.enable_x64(new_val=dtype == jnp.float64):
+        x = jnp.full((1, 1, 1, 1, 1), 2.0 ** -edge, dtype)
+        dt = jnp.full((1, 1, 1), 2.0 ** edge, dtype)
+        B = C = jnp.asarray([[[[[1.0, 0.0]]]]], dtype)
+        lam = jnp.full((1, 1, 1), 0.5, dtype)
+        theta = jnp.zeros((1, 1, 1, 1), dtype)
+        out, carried = chunk_mamba3(x, dt, jnp.asarray([-1.0], dtype), B, C, lam, theta)
+        np.testing.assert_array_equal(np.asarray(out).reshape(-1), [0.5])
+        np.testing.assert_array_equal(np.asarray(carried.state).reshape(-1), [0.5, 0.0])
 
 
 def test_a_mimo_layer_draws_as_its_full_forward_scores():

@@ -653,10 +653,13 @@ def test_a_banked_decode_keeps_its_cache_banked_and_reads_its_layers_as_the_per_
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
     scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixture=routed)
     plain = tiny(num_layers=4, max_seq_len=16, mixture=routed)
-    variables = plain.init(jax.random.key(0), jnp.zeros((2, 10), jnp.int32))
+    # Each init and the allocating call one compiled program, where op by op they took most of the test's
+    # 149 s (row 7456).
+    variables = jax.jit(plain.init)(jax.random.key(0), jnp.zeros((2, 10), jnp.int32))
     banked = HeldBanks(variables).place(scanned)
     first = jnp.zeros((2, 1), jnp.int32)
-    allocated = scanned.apply(banked, first, decode=True, mutable=["cache"])[1]["cache"]
+    allocate = jax.jit(lambda store, ids: scanned.apply(store, ids, decode=True, mutable=["cache"])[1])
+    allocated = allocate(banked, first)["cache"]
     assert "layers_0_3" in allocated and not any(f"layers_{index}" in allocated for index in range(4))
 
     def decoded(model, store, cache):
@@ -680,7 +683,7 @@ def test_a_banked_decode_keeps_its_cache_banked_and_reads_its_layers_as_the_per_
         return lambda ids: {name: value for name, value in run(ids).items()
                             if jnp.issubdtype(value.dtype, jnp.floating)}
 
-    per_layer = scanned.init(jax.random.key(0), first, decode=True)["cache"]
+    per_layer = jax.jit(functools.partial(scanned.init, decode=True))(jax.random.key(0), first)["cache"]
     bank, layers = decoded(scanned, banked, allocated), decoded(scanned, banked, per_layer)
     def integral(run):
         """`run`'s slots and cursors, which both arms hold exactly."""
@@ -696,8 +699,8 @@ def test_a_banked_decode_keeps_its_cache_banked_and_reads_its_layers_as_the_per_
     # compiles for every draw.
     with jax.enable_x64(new_val=True):
         wide = tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64)
-        truth = floating(decoded(wide, float64_held(variables),
-                                 float64_held(wide.init(jax.random.key(0), first, decode=True)["cache"])))
+        cache = jax.jit(functools.partial(wide.init, decode=True))(jax.random.key(0), first)["cache"]
+        truth = floating(decoded(wide, float64_held(variables), float64_held(cache)))
 
     assert_as_exact(floating(bank), floating(layers), drawn_ids(0x4550, 10), "banked decode",
                     seeds=BANKED_DECODE_SEEDS, truth_fn=truth)

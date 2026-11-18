@@ -66,13 +66,11 @@ This page is generated from the maintainers' findings ledger as each change land
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
 - Stacks, scans and looped models. [1568]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
 
 ## Training and parallelism
 
 - Time to first step: the compile path's re-derivations. [5556]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
-- Compile ahead within train CI time. [5361]
 - XLA:CPU edges. [1591]
 - Training and serving efficiency. [1880, 5292]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
@@ -96,6 +94,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Bit-level synthesis in dew.algebra. [3733]
 - Check1 qualification on prepared arms. [7606]
+- An arm's mutable containers stated by type. [7674]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]

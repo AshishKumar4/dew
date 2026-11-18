@@ -17,6 +17,7 @@ import optax
 import pytest
 from diffusion_stubs import label_table
 from flax import linen as nn
+from interop_support import extract_fixture
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -411,8 +412,7 @@ def _repae_task(tmp_path: Path, dtype) -> SimpleNamespace:
         return jax.tree.map(leaf_at, tree)
 
     tail = "_f64" if dtype == jnp.float64 else ""
-    with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
-        archive.extractall(tmp_path, filter="data")
+    extract_fixture(FIXTURES / "tiny_diffusers.tar.xz", tmp_path)
     representation = cast({"params": {"Conv_0": module("representation")}})
     alignment = Alignment("block_0", encoder=Representation(), width=PROJECTOR, resolution=None)
     table = label_table(range(CLASSES), null=CLASSES)

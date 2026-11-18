@@ -286,6 +286,9 @@ def test_compiled_embeddings_follow_the_substituted_encoder(mask):
 
 
 def test_video_objective_trains(mask, rng):
+    """The video objective's loss falls by a tenth over 15 Adam steps, each step's EMA the params themselves
+    (`step_with`): each step one compiled program, where op by op its 15 gradients took 197 s of the test's
+    232 (row 7468)."""
     objective = JepaObjective(
         JepaVideoEncoder(patch_size=PATCH, emb_features=32, num_layers=1,
                          num_heads=2, mlp_ratio=2),
@@ -293,19 +296,23 @@ def test_video_objective_trains(mask, rng):
         sample=Field("video", (FRAMES, RES, RES, 3)))
     params = objective.init(rng)
     batch = {"video": videos()}
-
-    def loss_of(p):
-        return objective.scalar_loss(p, batch, step_with(params))[0]
-
-    initial = float(loss_of(params))
     optimizer = optax.adam(3e-3)
+
+    @jax.jit
+    def loss_of(p, ema):
+        return objective.scalar_loss(p, batch, step_with(ema))[0]
+
+    @jax.jit
+    def stepped(params, opt_state):
+        updates, opt_state = optimizer.update(jax.grad(loss_of)(params, params), opt_state, params)
+        return optax.apply_updates(params, updates), opt_state
+
+    initial = float(loss_of(params, params))
     opt_state = optimizer.init(params)
     for _ in range(15):
-        grads = jax.grad(loss_of)(params)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
+        params, opt_state = stepped(params, opt_state)
 
-    assert float(loss_of(params)) < initial * 0.9
+    assert float(loss_of(params, params)) < initial * 0.9
 
 
 def solid_colour_images(rs, n):
