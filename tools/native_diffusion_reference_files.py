@@ -36,7 +36,9 @@ def convert(directory):
             write_flax_component(directory, component, declared, load_file(folder / filename))
             continue
         tensors = {}
-        for path, value in flatten_dict(serialization.msgpack_restore(flax_file.read_bytes())).items():
+        for path, restored in flatten_dict(serialization.msgpack_restore(flax_file.read_bytes())).items():
+            # A flattened tree's leaves are its arrays.
+            value = np.asarray(restored)
             parts = list(path)
             leaf = parts.pop()
             if leaf in ("kernel", "scale", "embedding"):

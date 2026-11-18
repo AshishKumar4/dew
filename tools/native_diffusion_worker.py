@@ -116,13 +116,19 @@ def flax_pipeline(task: str, wide: bool):
     """The saved Flax pipeline of `task` and its parameters, built at float64 where `wide`."""
     import jax
     import jax.numpy as jnp
-    from diffusers import (
-        FlaxDDIMScheduler,
-        FlaxStableDiffusionImg2ImgPipeline,
-        FlaxStableDiffusionInpaintPipeline,
+    from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion import (
         FlaxStableDiffusionPipeline,
+    )
+    from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_img2img import (
+        FlaxStableDiffusionImg2ImgPipeline,
+    )
+    from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_inpaint import (
+        FlaxStableDiffusionInpaintPipeline,
+    )
+    from diffusers.pipelines.stable_diffusion_xl.pipeline_flax_stable_diffusion_xl import (
         FlaxStableDiffusionXLPipeline,
     )
+    from diffusers.schedulers.scheduling_ddim_flax import FlaxDDIMScheduler
 
     directory = saved() / task
     cls = {"sd": FlaxStableDiffusionPipeline, "xl": FlaxStableDiffusionXLPipeline,
@@ -226,9 +232,11 @@ def torch_drawing(noise, wide: bool):
 def torch_pipeline(task: str, wide: bool):
     """The saved PyTorch pipeline of `task`, at float64 where `wide`."""
     import torch
-    from diffusers import (
-        StableDiffusionPipeline,
+    from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline
+    from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img import (
         StableDiffusionXLImg2ImgPipeline,
+    )
+    from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_inpaint import (
         StableDiffusionXLInpaintPipeline,
     )
 
@@ -284,8 +292,9 @@ def torch_call(task: str, case: dict[str, np.ndarray], wide: bool, wanted) -> di
             return {"hidden": hidden.numpy(), "pooled": pooled.numpy()}
         scale = pipe.vae.config.scaling_factor
         processed = pipe.image_processor.preprocess(Image.fromarray(case["pixels"]), height=32, width=32).to(dtype)
-        kwargs = dict(**prompts, num_inference_steps=meta["steps"], guidance_scale=3.0, height=32, width=32,
-                      generator=torch.Generator().manual_seed(KEY), output_type="latent")
+        kwargs: dict[str, object] = dict(**prompts, num_inference_steps=meta["steps"], guidance_scale=3.0,
+                                         height=32, width=32, generator=torch.Generator().manual_seed(KEY),
+                                         output_type="latent")
         if task == "xl-inpaint":
             mask = np.zeros((32, 32), np.uint8)
             mask[:, 16:] = 255

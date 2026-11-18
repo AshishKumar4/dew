@@ -45,6 +45,8 @@ from dew.nn.kernels.options import (
     hold,
     owned_program,
     program_key,
+    running,
+    shapes_of,
     unhold,
 )
 from dew.nn.kernels.templates import report
@@ -506,8 +508,7 @@ class Planned:
         if not profile:
             return dataclasses.replace(self, profiled=(runs, 0))
         relowered = Relowered(relower)
-        executable = report.compiled(self.candidate.lowered, {**(self.options or {}), "fdo_profile": profile},
-                                     relower=relowered)
+        executable = guided_compile(self.candidate.lowered, self.options, profile, relowered)
         candidate = relowered.candidate(self.candidate)
         fit, headroom = step_fits(executable, mesh, candidate.held)
         if not fit:
@@ -594,18 +595,81 @@ class Trials:
             stepped, *_ = step(state, self.batch)
             current, held = apart(stepped)
             parts = planned.parts(mesh)
-            with tempfile.TemporaryDirectory() as directory:
-                # XLA reads the trace alone, so the capture writes no XProf reports.
-                with Profiler(directory, reports=False) as profiler:
-                    for _ in range(runs):
-                        for part in parts:
-                            current, *_ = planned.executable(current, held, self.batch, part)
-                        jax.block_until_ready(current)
-                (capture,) = profiler.captures
-                (session,) = capture.glob("plugins/profile/*")
-                return get_profiled_instructions_proto(str(session))
+
+            def once() -> None:
+                nonlocal current
+                for part in parts:
+                    current, *_ = planned.executable(current, held, self.batch, part)
+                jax.block_until_ready(current)
+
+            return profile_of(once, runs)
 
         return self.run(profile)
+
+    def profiled_programs(self, step: Callable, runs: int, platform: Callable[[jax.stages.Compiled], bool]
+                          ) -> tuple[bytes, list[Ran]]:
+        """XLA's profile of `runs` steps of `step` (a host step, whose programs are each an executable of
+        its own run through Dew's compile point) on a trial (`profile_of`), after one untraced, as
+        `profiled`'s; with each executable those steps ran that `platform` takes (an accelerator's), its
+        program and its lowering, traced as the call traced it (`options.running`), which a guided compile
+        reads (`guided_compile`). One profile serves every program: XLA keys each instruction's cost by its
+        module's fingerprint. A trial borrowed on the host holds its copy in host memory, no device's."""
+        if active_profile() is not None:
+            raise RuntimeError(PGLE_CAPTURE)
+        ran: dict[int, Ran] = {}
+
+        @contextlib.contextmanager
+        def recorded(program: OuterProgram, executable: jax.stages.Compiled, args: tuple, kwargs: dict):
+            if id(executable) not in ran and platform(executable):
+                # Over its arguments' shapes, which a later lowering (a spill's) reads after the trial
+                # donated them; lowered here, under the contexts the call traced in.
+                shaped, named = jax.tree.map(
+                    lambda leaf: shapes_of(leaf) if isinstance(leaf, jax.Array) else leaf, (args, kwargs))
+                lower = functools.partial(program.lower, *shaped, **named)
+                ran[id(executable)] = (program, executable, lower(), lower)
+            yield
+
+        def profile(state: TrainState) -> bytes:
+            current, *_ = step(state, self.batch)
+
+            def once() -> None:
+                nonlocal current
+                current, *_ = step(current, self.batch)
+                jax.block_until_ready(current)
+
+            with running(recorded):
+                return profile_of(once, runs)
+
+        return self.run(profile), list(ran.values())
+
+
+type Ran = tuple[OuterProgram, jax.stages.Compiled, jax.stages.Lowered, Callable[[], jax.stages.Lowered]]
+"""An executable a profiled trial ran (`Trials.profiled_programs`): its program, it, its lowering and what
+lowers it again (a spill's relowering, `report.compiled`)."""
+
+
+def profile_of(run: Callable[[], None], runs: int) -> bytes:
+    """XLA's profile of `runs` calls of `run`, each waiting on what it ran, as JAX's AutoPGLE waits on the
+    runs it profiles, in one profiling session of its own (`jax.experimental.profiler
+    .get_profiled_instructions_proto`): empty on a backend XLA profiles none of. The one place Dew reads
+    JAX's profile of a trial (`Trials`)."""
+    with tempfile.TemporaryDirectory() as directory:
+        # XLA reads the trace alone, so the capture writes no XProf reports.
+        with Profiler(directory, reports=False) as profiler:
+            for _ in range(runs):
+                run()
+        (capture,) = profiler.captures
+        (session,) = capture.glob("plugins/profile/*")
+        return get_profiled_instructions_proto(str(session))
+
+
+def guided_compile(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None, profile: bytes,
+                   relower: Callable[[], jax.stages.Lowered]) -> jax.stages.Compiled:
+    """`lowered` compiled again under `options` guided by `profile` (`profile_of`), as JAX's jit guides
+    AutoPGLE's (XLA's feedback-directed `fdo_profile`), through the kernel templates' reports
+    (`report.compiled`, `relower` lowering afresh where a kernel spills): a device plan's step
+    (`Planned.guided`) and each program of a host step (`StepCompiler._guided_host`) alike."""
+    return report.compiled(lowered, {**(options or {}), "fdo_profile": profile}, relower=relower)
 
 
 def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,

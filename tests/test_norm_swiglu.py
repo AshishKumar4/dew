@@ -278,6 +278,19 @@ def test_a_norms_activation_choosing_a_branch_runs_on_the_tile(taken):
             SEEDS[(2, 3, 31)])
 
 
+@pytest.mark.parametrize("taken", [True, False])
+def test_a_norms_activation_choosing_a_branch_by_a_known_predicate_lowers_for_a_gpu(taken):
+    """The fused norm with an activation choosing between two branches by a predicate it closes over
+    (`lax.cond` on a constant), lowered through Pallas's Triton lowering for an H100 on this CPU: the branch
+    the predicate names runs on the tile, where Triton's conditional rule, which reads its index's MLIR type,
+    failed on the constant ("'TypedNdArray' object has no attribute 'type'", on an A100 and a GH200)."""
+    fused, _ = _fused_norm(lambda y: jax.lax.cond(jnp.asarray(taken), lambda v: v * 2, lambda v: v + 1, y))
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(fused).trace(jax.ShapeDtypeStruct((2, 3, 32), jnp.float32),
+                             jax.ShapeDtypeStruct((32,), jnp.float32)).lower(lowering_platforms=("cuda",))
+
+
 def a_norm_with_dews_silu_after_it_holds_the_float64_gate():
     """The fused fp32 norm with Dew's own silu after it (`activations.silu`, `x` times the one logistic, a
     declared tangent over a marked span the kernel's lowering runs as its body), its output and its input's

@@ -10,7 +10,8 @@ import numpy as np
 import pytest
 from forks_support import LAYOUTS, assert_forks_as_own_rows
 from model_support import as_stepped, decode_through, float64_twin
-from reference_error import assert_as_exact
+from reference_error import FEWEST_SEEDS, assert_as_exact
+from selective_support import near_the_largest, stepwise
 from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 
 from dew.interop import Pretrained
@@ -33,15 +34,6 @@ def operands(length=11, channels=16, state=4, seed=0):
             jax.random.normal(keys[5], (channels,)))
 
 
-def stepwise(x, dt, A, B, C, D, state):
-    """`mamba_selective_state_update` (modeling_mamba.py:129-172), one token at a time."""
-    outputs = []
-    for t in range(x.shape[1]):
-        state = jnp.exp(dt[:, t, :, None] * A) * state + (dt[:, t] * x[:, t])[..., None] * B[:, t, None, :]
-        outputs.append(jnp.einsum('bdn,bn->bd', state, C[:, t]) + x[:, t] * D)
-    return jnp.stack(outputs, 1), state
-
-
 @pytest.mark.parametrize('chunk', [1, 4, 64])
 def test_the_chunked_scan_is_the_recurrence_from_any_state(chunk):
     """Each chunk size, one that divides the sequence and one that pads it,
@@ -52,6 +44,24 @@ def test_the_chunked_scan_is_the_recurrence_from_any_state(chunk):
     expected, last = stepwise(x, dt, A, B, C, D, held)
     np.testing.assert_allclose(out, expected, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(final, last, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize('chunk', [16, 64])
+def test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence(chunk):
+    """The chunked scan's output and final state near float32's largest (`near_the_largest`'s entering state:
+    two writes past it together over a state entering near its negative, every state finite) on par from
+    float64 with the recurrence a token at a time (`stepwise`, check 1, which refuses a value not finite
+    where float64's is), where its spans summed the writes from a zero state past float32's largest, inf
+    (row 8465). Its gradients there, and a faint write after them, are row 8486's."""
+    def scan(x, dt, A, B, C, D, state):
+        return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=chunk)
+
+    def draw(seed):
+        return near_the_largest("an entering state", seed)[:-1]
+
+    exact = jax.jit(stepwise)
+    assert_as_exact(jax.jit(scan), exact, draw, f"the chunked scan near float32's largest, chunks of {chunk}",
+                    seeds=FEWEST_SEEDS, truth_fn=exact)
 
 
 def test_a_document_start_drops_the_state_entering_it():

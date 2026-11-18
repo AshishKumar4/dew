@@ -1220,7 +1220,7 @@ def _joins(reached: list, group_sizes, dtype, prologue, options: dict) -> bool:
     if (options['gather'] is not None or d.dtype != d_paired.dtype or matrix.shape != paired.shape
             or d.shape != d_paired.shape):
         return False
-    interpret = options['interpret_on_cpu'] and jax.default_backend() == 'cpu'
+    interpret = xla_products.interpreted(options['interpret_on_cpu'])
     sizes = jnp.full((1,), d.shape[0], jnp.int32) if group_sizes is None else group_sizes
     out = at_least_fp32(dtype) if prologue is not None else jnp.dtype(dtype)
     call, product = _gemm_call(d, matrix, sizes, None, (), (), None, (), (), (out,), several=False,
@@ -1245,7 +1245,7 @@ def _keeps_launch(lhs, rhs, group_sizes, hook, sides: tuple, outs: tuple, summed
     asked above the default precision runs as its bf16 parts' launches, the hook the last part's
     (`_gemm`'s `_in_parts`), so the launches asked about are those parts' (a wide cotangent's chained input
     gradient, `_input_cotangents`)."""
-    interpret = options['interpret_on_cpu'] and jax.default_backend() == 'cpu'
+    interpret = xla_products.interpreted(options['interpret_on_cpu'])
     group_sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if group_sizes is None else group_sizes
     if _part_counts(lhs.dtype, rhs.dtype, options['precision']) is not None:
         lhs, rhs = lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16)
@@ -1306,7 +1306,7 @@ def _prologue_keeps_launch(lhs, rhs, group_sizes, prologue, prologue_arrays, pro
     XLA's program of the whole product. Gathered rows keep the prologue (`_gemm_t` gathers them first)."""
     if options['gather'] is not None:
         return True
-    interpret = options['interpret_on_cpu'] and jax.default_backend() == 'cpu'
+    interpret = xla_products.interpreted(options['interpret_on_cpu'])
     dense = group_sizes is None
     sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if dense else group_sizes.astype(jnp.int32)
     product = declared(lhs.dtype, options['precision'], outputs=(out_dtype,), operands=(lhs.dtype, rhs.dtype))

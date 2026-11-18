@@ -39,7 +39,7 @@ AUTHOR_OVERRIDES = ROOT / "locks/reference/torch28-cu128-tf519-v1.override.txt"
 the CUDA 12.8 torch (`author_python`)."""
 AUTHOR_HEAD_DTYPE = "float32"
 """The dtype the author phase builds the authors' engine to hold its readout in, beside a narrow backbone."""
-JAX_PLATFORMS = {"gpu": "cuda"}
+JAX_PLATFORMS: dict[str, str] = {"gpu": "cuda"}
 """JAX's name for a CUDA device's platform, against torch's: the records name every device as torch does."""
 
 
@@ -85,7 +85,8 @@ class TorchBankWeights(Mapping):
                     layer = at_layer(one_layer(shapes, index, namespace=site.namespace), index,
                                      namespace=site.namespace)
                     owners.update(dict.fromkeys(flatten_dict(layer), (site.namespace, index)))
-        conversions = get_checkpoint_conversion_mapping(model.config.model_type)
+        # A model type transformers renames no checkpoint key of has none.
+        conversions = get_checkpoint_conversion_mapping(model.config.model_type) or []
         for layout in bundle.weight_layouts:
             name = layout.name
             for conversion in conversions:
@@ -184,7 +185,8 @@ def offloaded_model(directory, source, bundle, *, device):
     """The author's causal model with ordinary Accelerate offload, fed by the bank mapping."""
     import psutil
     import torch
-    from accelerate import cpu_offload, init_empty_weights
+    from accelerate import init_empty_weights
+    from accelerate.hooks import AlignDevicesHook, add_hook_to_module, attach_align_device_hook
     from block_override_reference import oracle_precision
     from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -202,8 +204,11 @@ def offloaded_model(directory, source, bundle, *, device):
                            f"{stored} bytes, and this host has {free} free")
     weights = TorchBankWeights(source, bundle, model)
     classes = sorted({type(layer).__name__ for layer in model.base_model.layers})
-    model = cpu_offload(model, execution_device=device, state_dict=weights,
-                        offload_buffers=True, preload_module_classes=classes)
+    # Accelerate's cpu_offload over the banks: its two hooks, whose weights map is any mapping by name (its
+    # own signature states a dict), the input moved back to its device and every weight read on its use.
+    add_hook_to_module(model, AlignDevicesHook(io_same_device=True), append=True)
+    attach_align_device_hook(model, execution_device=device, offload=True, offload_buffers=True,
+                             weights_map=weights, preload_module_classes=classes)
     return model, weights
 
 
@@ -262,13 +267,13 @@ class ObservedScoring:
         self.values = {}
         self.batch_rows = []
 
-    def admit(self, body):
+    def admit(self, request):
         from dew.inference.scoring import ScoringRequest
 
-        admitted = self.task.admit(body)
-        if len(admitted.rows) != len(body["questions"]):
+        admitted = self.task.admit(request)
+        if len(admitted.rows) != len(request["questions"]):
             raise ValueError("the qualification pool has one question per row")
-        asked = tuple((name, len(question["criteria"])) for name, question in body["questions"].items())
+        asked = tuple((name, len(question["criteria"])) for name, question in request["questions"].items())
         return ScoringRequest(admitted.rows, (asked, admitted.payload))
 
     def planned(self):
@@ -298,6 +303,7 @@ def native(args, pool):
 
     from dew.batch import part
     from dew.decision import Decide
+    from dew.decision.sources import PretrainedDecision
     from dew.decision.task import Budget
     from dew.inference import ScoringServer
     from dew.interop import Pretrained
@@ -305,6 +311,8 @@ def native(args, pool):
 
     # Each leaf at the dtype the release stores it in, as the verdict reads the release's headers.
     bundle = Pretrained.load(args.source, dtype=args.dtype, param_dtype="auto", attention_impl="xla")
+    if not isinstance(bundle, PretrainedDecision):
+        raise ValueError(f"{args.source} is no release a decision task loads from")
     decide = Decide.of(bundle)
     # Four rows a pass at the layout's shortest pass length (`Decide.pass_shapes`, its window's halvings),
     # so the server's passes batch: a slot release's 32768-token window pads every pass to 4096 or more.
@@ -334,7 +342,7 @@ def native(args, pool):
                     "compute_dtype": dtype_name(hidden.dtype),
                     "parameter_dtypes": sorted({str(value.dtype) for value in leaves
                                                 if jnp.issubdtype(value.dtype, jnp.floating)}),
-                    "device": ",".join(sorted({JAX_PLATFORMS.get(device.platform, device.platform)
+                    "device": ",".join(sorted({JAX_PLATFORMS.get(str(device.platform), str(device.platform))
                                                for device in devices})),
                     "devices": sorted(str(device) for device in devices),
                     "device_memory": jax.devices()[0].memory_stats()}
@@ -498,21 +506,27 @@ def author(args, pool, run):
     torch.set_float32_matmul_precision("highest")
     torch.backends.cudnn.allow_tf32 = False
     measured = None
+    # The float64 oracle's bank-fed model, its weights and its banks, which the truth's run alone holds.
+    oracle = None
     with contextlib.ExitStack() as stack:
         if truth:
             import jax
 
+            from dew.decision.sources import PretrainedDecision
             from dew.inference.banks import SafetensorsBanks
             from dew.interop import Pretrained
 
             stack.enter_context(jax.enable_x64(new_val=True))
             bundle = Pretrained.load(args.source, weights=False, dtype="float64", param_dtype="float64",
                                       attention_impl="reference")
+            if not isinstance(bundle, PretrainedDecision):
+                raise ValueError(f"{args.source} is no release a decision task loads from")
             if bundle.head.tied_labels() is None or jax.tree.leaves(bundle.head_variables):
                 raise ValueError("this released-model oracle requires a parameter-free slot_lm readout")
             banks = stack.enter_context(SafetensorsBanks(args.source, param_dtype="float64",
                                                           cache_bytes=0, read_ahead=False))
             model, weights = offloaded_model(args.source, banks, bundle, device=torch.device(args.device))
+            oracle = model, weights, banks
             if type(model) is not transformers.Qwen3_5ForCausalLM:
                 raise ValueError("the qualified releases use the author's Qwen3.5 causal decoder")
             stack.enter_context(patch.object(transformers.Qwen3_5ForCausalLM, "from_pretrained",
@@ -526,7 +540,7 @@ def author(args, pool, run):
         engine = engine_type(str(args.source), device=args.device,
                              dtype="float64" if truth else args.dtype,
                              head_dtype="float64" if truth else AUTHOR_HEAD_DTYPE, fork_mode="batched")
-        if truth and engine.model is not model:
+        if oracle is not None and engine.model is not oracle[0]:
             raise RuntimeError("the author runtime did not retain the bank-fed model")
         run = {**run, "compute_dtype": str(engine.torch_dtype).removeprefix("torch."),
                "device": torch.device(engine.device).type}
@@ -561,7 +575,8 @@ def author(args, pool, run):
                     "parameter_dtypes": sorted({str(value.dtype).removeprefix("torch.")
                                                 for value in engine.model.parameters()}),
                     "precision": precision()}
-        if truth:
+        if oracle is not None:
+            _, weights, banks = oracle
             # Every request's own operations, across the runs that recorded them.
             counts = {key: sum(spent[key] for spent in requests)
                       for key in ("floating_operations", "cuda_floating_operations")}
@@ -596,7 +611,14 @@ def verdict(args, pool):
     shared part does not set leaves the verdict's interval unresolved, which is Inconclusive."""
     import numpy as np
     import torch
-    from reference_error import Inconclusive, as_given, assert_as_exact, recorded_pilots, seeds_for
+    from reference_error import (
+        Inconclusive,
+        as_given,
+        as_recorded,
+        assert_as_exact,
+        recorded_pilots,
+        seeds_for,
+    )
     from reference_source import dew_revision
 
     from dew.parity import leaf_summary
@@ -656,9 +678,10 @@ def verdict(args, pool):
         return {"log_probabilities": np.concatenate([
             log_softmax(np.asarray(loaded[phase][name], np.float64)) for name in names])}
 
-    original = functools.partial(log_probabilities, "author")
-    exact = as_given(functools.partial(log_probabilities, "truth"))
+    original = as_recorded(functools.partial(log_probabilities, "author"))
+    exact = as_recorded(as_given(functools.partial(log_probabilities, "truth")))
 
+    @as_recorded
     def recorded(index):
         return {"log_probabilities": leaf_summary(original(index)["log_probabilities"],
                                                   exact(index)["log_probabilities"])}
@@ -666,7 +689,6 @@ def verdict(args, pool):
     def draw(seed):
         return (np.asarray(seed, np.int64),)
 
-    original.recorded = recorded.recorded = exact.recorded = True
     # Every phase is read from the recordings and normalized on the host, as given.
     native = as_given(functools.partial(log_probabilities, "native"))
     count = seeds_for(recorded_pilots(original, draw, len(pool["pilot"])), draw, "released slot runtime",

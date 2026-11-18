@@ -1242,6 +1242,24 @@ def test_a_gated_delta_steps_mosaic_kernels_compile_ahead_for_the_gpu_it_targets
     assert ("gated_delta_rule", "mosaic_gpu") in {tuple(kernel) for kernel in found["kernels"]}, found
 
 
+def test_a_gemm_asked_to_interpret_on_a_cpu_traced_ahead_for_a_gpu_holds_no_interpreter():
+    """A GEMM asked to interpret its kernel on a CPU (`interpret_on_cpu`), traced on this CPU host for a GPU
+    as a prepare traces a check-1 arm (`lowering_for`): its program holds no interpreted branch, whose host
+    callbacks' ordered effect gave its executable a token parameter its run on the GPU never passed (row
+    8099: a balanced dense kernel gradient's arm, "Execution supplied 2 arguments but compiled program
+    expected 3")."""
+    from dew.nn.kernels import gemm, generation
+    from dew.training.ahead import lowering_for
+
+    def gradient(rows, cotangent):
+        return gemm.gemm_t(rows, cotangent, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)[0]
+
+    with lowering_for("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        traced = jax.make_jaxpr(gradient)(jax.ShapeDtypeStruct((320, 128), jnp.bfloat16),
+                                          jax.ShapeDtypeStruct((320, 2816), jnp.bfloat16))
+    assert not traced.effects, traced.effects
+
+
 EVERY_TEMPLATE_AHEAD = """
 import json, sys
 import jax

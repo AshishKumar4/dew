@@ -29,6 +29,9 @@ import torch.nn.functional as F
 
 from _dew_torch.precision import replaced
 
+COHORT = "fla"
+"""The releases this file runs against, which its type check reads (tools/reference_releases.RELEASES)."""
+
 
 def sequences(cu_seqlens: torch.Tensor | None, tokens: int) -> list[tuple[int, int]]:
     """Each sequence's [start, end) of a call's tokens: `cu_seqlens`'s, else the whole."""

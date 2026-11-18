@@ -101,7 +101,16 @@ even split (the DiT's fsdp2_sequence2 1.016), and a repeated matmul path 8%
 and more (the DiT's text projection under fsdp2_tensor2 9%, the dense
 decoder's head under fsdp2_tensor2 18%)."""
 
-LAYOUTS: dict[str, dict[str, int | tuple[str, ...]]] = {
+type Layout = Mapping[str, int | tuple[str, ...]]
+"""A layout's mesh: `MeshSpec`'s fields, its axes' sizes and the axes it makes explicit."""
+
+
+def sizes(fields: Layout) -> dict[str, int]:
+    """A layout's axes' sizes (its `MeshSpec` fields but the axes it makes explicit)."""
+    return {axis: value for axis, value in fields.items() if isinstance(value, int)}
+
+
+LAYOUTS: dict[str, Layout] = {
     "data4": {},
     "fsdp4": {"fsdp": 4},
     "tensor4": {"tensor": 4},
@@ -403,7 +412,7 @@ def zeros_drawn(params, key):
                                      else leaf for index, leaf in enumerate(leaves)])
 
 
-def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumulation: int = 1,
+def _trainer(case, fields: Layout, *, one_device: bool = False, accumulation: int = 1,
              devices: int | None = None, record: bool = False):
     """The trainer of `case` on the layout `fields` names over the first
     `devices` devices (every device by default), or on this process's first
@@ -740,7 +749,7 @@ class Arm:
     each run on a fresh copy of it there (the step donates the state it is handed), recording what its
     loss drew and started from (`Trainer(record=True)`)."""
 
-    def __init__(self, case, fields: dict[str, int], *, one_device: bool = False, devices: int | None = None):
+    def __init__(self, case, fields: Layout, *, one_device: bool = False, devices: int | None = None):
         import jax
         import jax.numpy as jnp
 
@@ -753,7 +762,8 @@ class Arm:
         self.step = self.trainer.compile(self.initial, self.placed(0))
         self.compiled = {"flops_per_device": self.trainer.step_flops and self.trainer.step_flops.hardware,
                          "mesh": {axis: int(size) for axis, size in self.trainer.device_mesh.shape.items()},
-                         "replicated": replicated_share(case, self.trainer.objective, fields.get("stage", 1))}
+                         "replicated": replicated_share(case, self.trainer.objective,
+                                                        sizes(fields).get("stage", 1))}
 
     def placed(self, seed: int):
         """Draw `seed`'s batch placed on the arm's mesh as `fit` hands it to its step (`step_batch`), so the
@@ -1359,7 +1369,7 @@ def flops_bound(fields: Mapping[str, int], replicated: float = 0.0) -> float:
     return ((1 - replicated) * (microbatches + stages - 1) / microbatches + replicated * stages) * FLOPS_SLACK
 
 
-def count_flops(row: dict[str, Any], compiled: Mapping[str, Any], fields: Mapping[str, int],
+def count_flops(row: dict[str, Any], compiled: Mapping[str, Any], fields: Layout,
                 reference_flops: float | None) -> None:
     """`row` takes its layout's FLOPs against one device's: its devices' together over the
     reference's `reference_flops`, held to `flops_bound`, REDUNDANT past it where the row works."""
@@ -1367,7 +1377,7 @@ def count_flops(row: dict[str, Any], compiled: Mapping[str, Any], fields: Mappin
         return
     # Above one when devices compute what one device need not.
     ratio = compiled["flops_per_device"] * math.prod(compiled["mesh"].values()) / reference_flops
-    row.update(flops_ratio=ratio, flops_bound=flops_bound(fields, compiled["replicated"]))
+    row.update(flops_ratio=ratio, flops_bound=flops_bound(sizes(fields), compiled["replicated"]))
     if row["status"] == "works" and ratio > row["flops_bound"]:
         row["status"] = "REDUNDANT"
 

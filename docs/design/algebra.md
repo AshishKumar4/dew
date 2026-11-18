@@ -79,6 +79,8 @@ checked-in output yet. The text stays as the design to resume.
     rule relates it to anything outside it.
   - `KernelGlue`: the XLA glue of a kernel's custom derivative around its Pallas launches, which rules rewrite as
     any other math; the launches stay opaque leaves.
+  - `Activation`: an activation's gated or ungated product (the fusion seam its epilogue reads), which rules
+    rewrite within, as a `Surrogate` span's body.
   - `Algebra`: a derivative written only to restructure algebra (§1.3), which the pass rewrites freely: a span
     with no effects over arrays opens into the region around it, and any other is rewritten within its call, as
     a control-flow body is (its constants at hand, its inputs arrays).
@@ -509,7 +511,7 @@ class Term(Expr):
   every maximal set. It never crosses:
   - a checkpoint (remat) boundary;
   - an opaque equation;
-  - a marker (§6.10): a `Protected` span is a leaf, and a `Surrogate` or `KernelGlue` span a region of its own
+  - a marker (§6.10): a `Protected` span is a leaf, and a `Surrogate`, `KernelGlue` or `Activation` span a region of its own
     (an `Algebra` span with no effects over arrays is no boundary: it opens into the region around it, §6.10);
   - a `scan`, `while`, `cond` or `pjit` body (those are regions of their own).
 
