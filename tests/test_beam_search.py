@@ -308,17 +308,27 @@ def test_a_search_over_a_paged_model_draws_what_it_draws_over_the_dense_one(mode
                                       np.asarray(getattr(found["dense"], field)), err_msg=field)
     pool = regrouped_layout(layout, 2, 3, 5, 6, decoder.max_seq_len)
     assert pool.pages is not None and pool.pages * page_size < 2 * 3 * decoder.max_seq_len
+    # A loop scanning past its budget (`trips`) advances every row on, its pool sized for the scan.
+    tripped = {name: generate(held, params, prompts, 2, key=jax.random.key(0), trips=6,
+                              sampling=Sampling(pad_token_id=0), n=2, strategy=Beam(width=3))
+               for name, held in (("dense", decoder), ("paged", decoder.with_kv_cache(layout)))}
+    np.testing.assert_array_equal(np.asarray(tripped["paged"].tokens), np.asarray(tripped["dense"].tokens))
 
 
 def test_a_search_over_a_pool_one_page_short_is_refused_before_it_decodes(model):
     """A layout naming a pool smaller than its search needs (`regrouped_layout`'s least: the prompts' whole
-    pages and each beam's own) is refused by name before any decode, the least it can be named."""
+    pages and each beam's own) is refused before any decode; one naming the least decodes."""
     decoder, params = model
     least = regrouped_layout(KVCache(page_size=2), 1, 3, 5, 6, decoder.max_seq_len).pages
     assert least is not None
-    short = decoder.with_kv_cache(KVCache(page_size=2, pages=least - 1))
-    with pytest.raises(ValueError, match=f"at least {least} pages"):
-        generate(short, params, jnp.asarray([[1, 2, 3, 4, 5]], jnp.int32), 6, key=jax.random.key(0),
-                 sampling=Sampling(pad_token_id=0), n=2, strategy=Beam(width=3))
+
+    def searched(pages: int):
+        return generate(decoder.with_kv_cache(KVCache(page_size=2, pages=pages)), params,
+                        jnp.asarray([[1, 2, 3, 4, 5]], jnp.int32), 6, key=jax.random.key(0),
+                        sampling=Sampling(pad_token_id=0), n=2, strategy=Beam(width=3))
+
+    with pytest.raises(ValueError):
+        searched(least - 1)
+    assert np.asarray(searched(least).tokens).shape[-1] > 0
 
 

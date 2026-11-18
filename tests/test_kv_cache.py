@@ -780,3 +780,13 @@ def test_a_paged_stores_regrouped_rows_share_their_parents_written_pages_and_wri
         assert slots(np.asarray(again[TABLE]), np.asarray(again["cached_key"]), row, count) == slots(
             table, keys, parent, count), row
     assert not np.isnan(np.asarray(again["cached_key"])).any()
+    # Past its cursor's page a row's table holds that page again, which a kernel's whole tile reads.
+    for row, parent in enumerate([1, 1, 0, 3]):
+        tail = int(later[CURSOR][parent]) // size
+        assert set(np.asarray(again[TABLE])[row, tail:]) == {np.asarray(again[TABLE])[row, tail]}, row
+
+    # Negative rows are their rows from the end: two children of the last parent keep one page between them.
+    negative = np.asarray(
+        gather_cache_rows({"layer": store}, jnp.asarray([-1, 1], jnp.int32))["layer"][TABLE])
+    tail = int(cursor[1]) // size
+    assert negative[0, tail] != negative[1, tail]

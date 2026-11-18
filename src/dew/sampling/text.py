@@ -1125,7 +1125,8 @@ def generate(model: nn.Module, params: Variables,
         # A search reparenting its rows, its pool sized for them, or unpaged where groups split it.
         prompt = request.inputs.tokens.shape[1]
         model = model.with_kv_cache(regrouped_layout(model.kv_cache, plan.count, strategy.width, prompt,
-                                                     max_new_tokens, capacity))
+                                                     scanned, capacity,
+                                                     rebuilds=rebuild_position(model) is not None))
     if isinstance(model, Layered) and capacity is not None:
         refuse_unassigned(model.kv_cache, plan.count, capacity)
     from dew.nn.projections import pending

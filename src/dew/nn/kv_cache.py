@@ -1609,12 +1609,15 @@ def unpaged(layout: KVCache) -> KVCache:
 
 
 def regrouped_layout(layout: KVCache, prompts: int, width: int, prompt: int, new_tokens: int,
-                     capacity: int) -> KVCache:
+                     capacity: int, *, rebuilds: bool = False) -> KVCache:
     """The layout a search that regroups its rows (`dew.sampling.strategies.Regrouping`) decodes over:
-    `prompts` rows of `prompt` slots prefilled, then `width` rows each, `new_tokens` more tokens apiece.
+    `prompts` rows of `prompt` slots prefilled, then `width` rows each, `new_tokens` more tokens apiece (the
+    steps its loop advances them, past its budget too).
 
     A pool split among groups (`KVCache.groups`) decodes unpaged (`unpaged`): a regrouped row's parent may
-    lie in another group's part. An undivided pool keeps its pages, a regrouped row sharing its parent's
+    lie in another group's part; so does a model that rebuilds its cache past a position (`rebuilds`,
+    LongRoPE's), whose rebuild opens every row its own block and picks its leaves by row. An undivided pool
+    keeps its pages, a regrouped row sharing its parent's
     written ones (`gather_cache_rows`), sized for both phases: the prefill's tables give each prompt row
     its whole block (`default_page_table`, `refuse_unassigned`), `prompts * per_row` pages; past the branch,
     a prompt of `f` whole pages, which its rows share, holds at most `f + width * min(own, per_row - f)`,
@@ -1626,7 +1629,7 @@ def regrouped_layout(layout: KVCache, prompts: int, width: int, prompt: int, new
     smaller pool is refused, with the least it can be. A dense layout is the layout."""
     if layout.page_size is None:
         return layout
-    if layout.groups > 1:
+    if layout.groups > 1 or rebuilds:
         return unpaged(layout)
     size = layout.page_size
     per_row, own = capacity // size, -(-new_tokens // size) + 1
@@ -1680,39 +1683,43 @@ def _regrouped_pages(store: Mapping[str, jax.Array], rows: jax.Array, banked: bo
     cursor's page) shared, read only; the page its next token lands in its own: its parent's, for the
     first new row of each parent whose page no row reads as written, else a free page of the pool (one no
     new row's table holds below its cursor's page, nor a kept one) with the parent's tokens in it copied.
-    A table's columns past a row's cursor's page hold no page (the pool's size, which a write drops), so
-    a regrouped row writes into its cursor's page alone before it is regrouped again, as a beam's step
-    does. A pool too small for every new row's page drops the writes of those past it, as a write past
-    any paged pool does; `generate` sizes the pool for its search. Under a bank (`banked`) each layer's
-    store alike."""
+    A table's columns past a row's cursor's page hold that page again, which a decode's kernels read
+    whole tiles of past a row's length and every reader masks: a regrouped row writes into its cursor's
+    page alone before it is regrouped again, as a beam's step does. A pool too small for every new row's
+    page drops the writes of those past it, as a write past any paged pool does; `generate` sizes the pool
+    for its search. Under a bank (`banked`) each layer's store alike; an offloaded pool
+    (`KVCache.offloaded`) unbanked moves the pages copied alone, a banked one a layer at a time."""
     cursor_name = next(name for name in store if name in ROW_CURSORS)
     payload = store["cached_key"]
     axis = 2 if banked else 1
     pages, size = payload.shape[axis], payload.shape[axis + 1]
     columns = store[TABLE].shape[-1]
 
+    parents_of = jnp.where(rows < 0, rows + store[TABLE].shape[-2], rows)
+    # Each new row is its parent's first where it is the least new row of that parent.
+    least = jnp.full(store[TABLE].shape[-2], rows.shape[0]).at[parents_of].min(jnp.arange(rows.shape[0]))
+    first = least[parents_of] == jnp.arange(rows.shape[0])
+
     def placed(table: jax.Array, cursor: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         """A layer's new table, and the pages its copies read (`parents`) and write (`own`), the pool's size
         where a row copies nothing."""
-        table, cursor = table[rows], cursor[rows]
+        table, cursor = table[parents_of], cursor[parents_of]
         tail = cursor // size
         written = jnp.arange(columns)[None, :] < tail[:, None]
         read = jnp.zeros(pages, bool).at[jnp.where(written, table, pages)].set(True, mode="drop")
         writes = tail < columns
         parent = jnp.where(writes, jnp.take_along_axis(table, jnp.minimum(tail, columns - 1)[:, None],
                                                         axis=1)[:, 0], pages)
-        # A row is its parent's first where no earlier new row came of the same parent.
-        first = ~jnp.any(jnp.tril(rows[:, None] == rows[None, :], k=-1), axis=1)
         keep = first & (parent < pages) & ~read[jnp.minimum(parent, pages - 1)]
         held = read.at[jnp.where(keep, parent, pages)].set(True, mode="drop")
         fresh = writes & ~keep
         free = jnp.nonzero(~held, size=rows.shape[0], fill_value=pages)[0]
         own = jnp.where(fresh, free[jnp.cumsum(fresh) - 1], pages)
         tail_page = jnp.where(keep, parent, own)
-        table = jnp.where(written, table, jnp.where(jnp.arange(columns)[None, :] == tail[:, None],
-                                                    tail_page[:, None], pages))
-        # A parent whose cursor's page holds no token yet (none in its table) leaves its child's empty.
-        copies = fresh & (parent < pages)
+        table = jnp.where(written, table, tail_page[:, None])
+        # A parent whose cursor's page holds no token yet (at a page's start, its column the page before
+        # again or none) leaves its child's empty.
+        copies = fresh & (parent < pages) & (cursor % size > 0)
         return table, jnp.where(copies, parent, pages), jnp.where(copies, own, pages)
 
     allot = jax.vmap(placed) if banked else placed
@@ -1727,7 +1734,9 @@ def _regrouped_pages(store: Mapping[str, jax.Array], rows: jax.Array, banked: bo
         if name == TABLE:
             regrouped[name] = table
         elif name in POOLED:
-            regrouped[name] = on_device(copied, leaf, own, parents, banked=banked)
+            # An offloaded pool's pages move a page at a time (`pages_read`, `pages_written`), unbanked.
+            regrouped[name] = (on_device(copied, leaf, own, parents, banked=True) if banked
+                               else copied(leaf, own, parents))
         else:
             regrouped[name] = on_device(lambda held: jnp.take(held, rows, axis=0), leaf, banked=banked)
     return regrouped
