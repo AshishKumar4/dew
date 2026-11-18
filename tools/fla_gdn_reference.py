@@ -23,7 +23,6 @@ gate) take its `chunk_rwkv6(r, k, v, w, u)`, its naive reference laid `[B, H, T,
 """
 
 import itertools
-import json
 import os
 import sys
 import time
@@ -181,7 +180,7 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
     """Each named site's seeded draws with fla's outputs and gradients and their float64 truth (`worker`,
     `serve`'s `Session`), recorded as a summary (`record_case`) into `out`, Dew's float64 token
     recurrence held to fla's reference at every seed: a unit
-    of the recording, whose units `merged` joins into the fixture."""
+    of the recording, whose units `reference_worker.merged_units` joins into the fixture."""
     import functools
 
     import jax
@@ -248,44 +247,12 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
     print(f"wrote {out}: {out.stat().st_size:,} bytes", flush=True)
 
 
-def merged(units: list[Path]) -> Path:
-    """The recording's units (`write_seeded`'s, their sites disjoint) joined and saved as the fixture, its
-    provenance the units' own, which must agree but for the device: fla autotunes each device's configs, so
-    where units ran on more than one, the provenance names each device's sites (`devices`)."""
-    from fetched_fixtures import save
-
-    stored: dict[str, np.ndarray] = {}
-    devices: dict[str, list[str]] = {}
-    common = None
-    for unit in units:
-        with np.load(unit, allow_pickle=False) as part:
-            recorded = json.loads(str(part["provenance"]))
-            device = recorded.pop("device")
-            if common is not None and recorded != common:
-                raise ValueError(f"{unit} was recorded under another provenance: {recorded}")
-            common = recorded
-            for key, value in part.items():
-                if key == "provenance":
-                    continue
-                if key in stored:
-                    raise ValueError(f"{unit} records {key} again")
-                stored[key] = value
-                site = key.split(".", 1)[0]
-                if site not in devices.setdefault(device, []):
-                    devices[device].append(site)
-    assert common is not None, "a fixture merges at least one unit"
-    named = {"device": next(iter(devices))} if len(devices) == 1 else {"device": " and ".join(devices),
-                                                                       "devices": devices}
-    stored["provenance"] = np.asarray(json.dumps({**common, **named}))
-    return save(FIXTURE, stored, reference=common["reference"], license="MIT")
-
-
 def main() -> None:
     """The recorder's command line (`reference_worker.recording_command`), its sites `fla_sites`'s."""
     from reference_worker import recording_command
 
-    recording_command(__file__, "fla_sites", serve=serve, merged=merged, write_seeded=write_seeded,
-                      fixture=FIXTURE)
+    recording_command(__file__, "fla_sites", serve=serve, write_seeded=write_seeded,
+                      fixture=FIXTURE, license="MIT")
 
 
 if __name__ == "__main__":

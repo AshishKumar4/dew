@@ -55,6 +55,7 @@ import numpy as np
 from flax import serialization, traverse_util
 
 from dew._files import write_atomically
+from dew._records import JSON, integer, real
 from dew.checkpoints import Checkpoints, Keep
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig, TeacherConfig
@@ -143,7 +144,8 @@ def warmed(path: Path, objective):
     weight its own, each first layer's weights from the view's new entries zero, so it acts as it did."""
     new = jax.device_get(objective.init(jax.random.key(0)))
     previous = traverse_util.flatten_dict(serialization.msgpack_restore(path.read_bytes()))
-    fresh = traverse_util.flatten_dict(serialization.to_state_dict(new))
+    fresh = {name: np.asarray(value)
+             for name, value in traverse_util.flatten_dict(serialization.to_state_dict(new)).items()}
     for name, value in fresh.items():
         held = np.asarray(previous[name])
         if held.shape == value.shape:
@@ -248,10 +250,11 @@ def teacher_policy(objective):
 
 def check(out: Path, *, assets: Path, hz: float = 60.0) -> dict:
     """The race's first frames, and frames a second with images and without."""
-    report = {"device": str(jax.devices()[0])}
+    report: dict[str, JSON] = {"device": str(jax.devices()[0])}
     sample = race(16, ("image", "passed"), hz=hz, assets=assets)
     frames = [np.asarray(sample.reset(0)["image"])]
-    for _ in range(30):
+    stepped = sample.step(jnp.zeros((16, 4)))
+    for _ in range(29):
         stepped = sample.step(jnp.zeros((16, 4)))
     frames.append(np.asarray(stepped.observation["image"]))
     frames = np.concatenate(frames)
@@ -262,7 +265,8 @@ def check(out: Path, *, assets: Path, hz: float = 60.0) -> dict:
         timed = race(drones, views, hz=hz, assets=assets)
         timed.reset(0)
         actions = jnp.zeros((drones, 4))
-        for _ in range(5):
+        stepped = timed.step(actions)
+        for _ in range(4):
             stepped = timed.step(actions)
         jax.block_until_ready(stepped.reward)
         began = time.perf_counter()
@@ -300,13 +304,16 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
     while time.perf_counter() - began < seconds:
         done = _latest(out / TEACHER_RUN)
         run = teacher_run(out, hz=hz, level=level, drones=drones)
+        if run.trainer.steps is None:
+            raise ValueError("the teacher's run is bounded in steps")
         prepared = run.override({"trainer.steps": done + run.trainer.steps}).prepare()
         if warm is not None and not done:
             prepared.objective.variables = warmed(warm, prepared.objective)
         state = prepared.train(TEACHER_RUN)
         updates, objective = int(state.step), prepared.objective
-        epochs, minibatches, length = (prepared.run.rollout.arguments[name]
-                                       for name in ("epochs", "minibatches", "unroll_length"))
+        held = run.rollout.arguments
+        epochs, minibatches, length = (integer(held[name], name) for name in ("epochs", "minibatches",
+                                                                             "unroll_length"))
         point = {"updates": updates, "seconds": round(time.perf_counter() - began, 1),
                  "environment_steps": updates // (epochs * minibatches) * drones * length, "level": level,
                  **flown(judged_at(level, families_at(level)), objective, state.variables, jax.random.key(1),
@@ -432,6 +439,7 @@ def _staged(world: World, stage: str, updates: int, every: int | None, report: d
     checkpoint and scored before the next chunk trains. Returns the stage's last state, its agent and the
     level it ended at."""
     from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective
+    from dew.rl.flight import FlightEnv
 
     done = _latest(world.out / stage)
     points = [point for point in report.get(stage, []) if point["updates"] <= done]
@@ -461,6 +469,8 @@ def _staged(world: World, stage: str, updates: int, every: int | None, report: d
         if (moved := advanced(level, point["crashed"])) != level:
             level = moved
             for raced in (rollout.env, *races):
+                if not isinstance(raced, FlightEnv):
+                    raise TypeError(f"the race's rollout steps a {type(raced).__name__}, not a FlightEnv")
                 raced.difficulty = raced.ramp = level
         # The level the next chunk trains at, beside the score that earned it: a resumed stage goes on there.
         report["level"] = level
@@ -507,8 +517,9 @@ def world(world: World, *, pretrain_updates: int = 50_000, dagger_updates: int =
                                   jax.random.key(4))
         write_atomically(path, json.dumps(report, indent=1))
     collecting = world.run("online", level).rollout.arguments
-    online = int(round(environment_seconds * world.hz) * collecting["train_ratio"]
-                 / (collecting["batch"] * collecting["length"]))
+    ratio = real(collecting["train_ratio"], "train_ratio")
+    batch, length = integer(collecting["batch"], "batch"), integer(collecting["length"], "length")
+    online = int(round(environment_seconds * world.hz) * ratio / (batch * length))
     filmed = {"pretrain": "cloned.npz", "dagger": "dagger.npz", "online": "video.npz"}
     for stage, updates, every in zip(STAGES, (pretrain_updates, dagger_updates, online), (None, 2000, 10_000),
                                      strict=True):

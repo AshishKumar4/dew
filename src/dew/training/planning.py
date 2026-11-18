@@ -253,10 +253,13 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
             loss = jnp.where(part.count > 0, update, loss)
     summed = jax.tree.map(lambda *values: sum(values),
                           *(dataclasses.replace(part, inspected=None, own=None, finite=None,
-                                                unfinite_layer=None) for part in committed))
+                                                unfinite_layer=None, unfinite_state=None)
+                            for part in committed))
     walked = [part.unfinite_layer for part in committed if part.unfinite_layer is not None]
-    summed = dataclasses.replace(summed,
-                                 unfinite_layer=functools.reduce(jnp.maximum, walked) if walked else None)
+    # The state the step leaves is its last part's, whose committed state's report it keeps, a leaf's
+    # index no sum over parts (row 8269).
+    summed = dataclasses.replace(summed, unfinite_layer=functools.reduce(jnp.maximum, walked) if walked
+                                 else None, unfinite_state=committed[-1].unfinite_state)
     sample = None
     for part in committed:
         if part.inspected is not None:

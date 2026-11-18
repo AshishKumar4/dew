@@ -76,7 +76,7 @@ def serve() -> None:
 def write_seeded(worker, names: list[str], out: Path) -> None:
     """Each named site's seeded draws with mamba_ssm's leaves and their float64 truth (Dew's recurrence a
     token at a time, `mamba3_sites.truth`), recorded as a summary (`record_case`) into `out`: a unit of the
-    recording, whose units `merged` joins into the fixture."""
+    recording, whose units `reference_worker.merged_units` joins into the fixture."""
     import jax
     from mamba3_sites import CHUNK, sites, truth
     from recorded_references import provenance, record_case
@@ -107,35 +107,12 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
     print(f"wrote {out}: {out.stat().st_size:,} bytes", flush=True)
 
 
-def merged(units: list[Path]) -> Path:
-    """The recording's units (`write_seeded`'s, their sites disjoint) joined and saved as the fixture, their
-    provenance one."""
-    import json
-
-    from fetched_fixtures import save
-
-    stored: dict[str, np.ndarray] = {}
-    common = None
-    for unit in units:
-        with np.load(unit) as part:
-            recorded = json.loads(str(part["provenance"]))
-            if common is not None and recorded != common:
-                raise ValueError(f"{unit} was recorded under another provenance: {recorded}")
-            common = recorded
-            for key, value in part.items():
-                if key != "provenance" and key in stored:
-                    raise ValueError(f"{unit} records {key} again")
-                stored[key] = value
-    assert common is not None, "a fixture merges at least one unit"
-    return save(FIXTURE, stored, reference=common["reference"], license="Apache-2.0")
-
-
 def main() -> None:
     """The recorder's command line (`reference_worker.recording_command`), its sites `mamba3_sites`'s."""
     from reference_worker import recording_command
 
-    recording_command(__file__, "mamba3_sites", serve=serve, merged=merged, write_seeded=write_seeded,
-                      fixture=FIXTURE)
+    recording_command(__file__, "mamba3_sites", serve=serve, write_seeded=write_seeded,
+                      fixture=FIXTURE, license="Apache-2.0")
 
 
 if __name__ == "__main__":

@@ -154,6 +154,11 @@ _LIVE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("live_r
 _SCALE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("loss_scale", default=None)
 
 
+def unscaling() -> jax.Array | None:
+    """The loss scale a probe unscales its cotangent by in this context (`unscaled`), None where none."""
+    return _SCALE.get()
+
+
 @contextlib.contextmanager
 def unscaled(scale: jax.Array | None) -> Iterator[None]:
     """Within the block, a probe reads its cotangent divided by `scale`, the loss scale the step's backward

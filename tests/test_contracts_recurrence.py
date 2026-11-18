@@ -16,7 +16,9 @@ from ssd_support import stepwise_scan
 from dew.algebra import SATURATION, scan
 from dew.nn.kernels import generation, recurrence, recurrence_chunk, short_conv, ssd
 from dew.nn.kernels.templates.recurrence import turned
+from dew.nn.linear import causal_conv1d
 from dew.nn.mixers.mamba2 import chunk_ssd
+from dew.nn.sharding import manual_map
 
 DELTA_RULE_EDGES = {"normal": 1.0, "the largest its chunk holds": 2.0**62, "near the largest": 2.0**63,
                     "near the least normal": 2.0**-63}
@@ -411,11 +413,13 @@ def test_the_decode_step_holds_every_order(edge):
                     truth_fn=flattened(plain), plain_fn=flattened(plain), without=INTERPRETED_REMAT)
 
 
-def ssd_draw(seed: int, scale: float):
-    """Mamba2's operands `(x, dt, a, b, c, skip, state)`, their direction and the outputs' cotangents: inputs,
-    the groups' input gates and the state at `scale`, positive steps, decays under zero."""
+def ssd_draw(seed: int, scale: float, rows: int = 1):
+    """Mamba2's operands `(x, dt, a, b, c, skip, state)` over `rows` rows, their direction and the
+    outputs' cotangents: inputs, the groups' input gates and the state at `scale`, positive steps, decays
+    under zero."""
     x, steps, decay, b, c, skip, state = normal_draw(
-        seed, (1, 64, 2, 16), (1, 64, 2), (2,), (1, 64, 1, 16), (1, 64, 1, 16), (2,), (1, 2, 16, 16))
+        seed, (rows, 64, 2, 16), (rows, 64, 2), (2,), (rows, 64, 1, 16), (rows, 64, 1, 16), (2,),
+        (rows, 2, 16, 16))
     primals = (x * scale, jax.nn.softplus(steps), -jnp.exp(decay), b * scale, c, skip, state * scale)
     drawn = normal_draw(seed + 1, *(t.shape for t in primals))
     direction = tuple(along * (scale if at in (0, 3, 6) else 1.0) for at, along in enumerate(drawn))
@@ -454,11 +458,16 @@ def test_the_tpu_ssd_scan_holds_its_orders(edge):
     time is (`ssd_support.stepwise_scan`), at inputs, gates and states whose products near float32's least
     normal. Its other orders are its route's, the products' wrapper the other kernels' contracts hold
     (`_per_product`, row 2655), which a CPU cannot reach: its selector takes the kernel on a TPU alone, and
-    under an assumed one it lowers the kernel itself (`ssd._interpreting`)."""
-    (x, steps, decay, b, c, _, state), direction, cotangent = ssd_draw(2677, EDGES[edge])
+    under an assumed one it lowers the kernel itself (`ssd._interpreting`). Two rows, which a mesh's data axis
+    splits as the rated scan launches the kernel (`recurrence_chunk.ssd_specs`)."""
+    (x, steps, decay, b, c, _, state), direction, cotangent = ssd_draw(2677, EDGES[edge], rows=2)
 
     def tpu(x, b, c, a, state):
-        return ssd._chunk_scan(x, b, c, a, state, None, 64, "tpu")
+        # Launched per shard as the rated scan launches it: a kernel takes no axis the partitioner holds.
+        def local(x, b, c, a, state, documents):
+            return ssd._chunk_scan(x, b, c, a, state, documents, 64, "tpu")
+
+        return manual_map(local, *recurrence_chunk.ssd_specs(x.shape))(x, b, c, a, state, None)
 
     heads = tuple(jnp.repeat(t, 2, axis=2) for t in (b, c))
     primals = (x * steps[..., None], *heads, steps * decay, state)
@@ -470,20 +479,24 @@ def test_the_tpu_ssd_scan_holds_its_orders(edge):
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_short_conv_holds_every_order(edge):
     """The short conv on its kernels (`short_conv.conv`, differentiated through XLA's conv by
-    `generation.linear_tangent`; interpreted off a GPU), with its bias and silu: every order finite wherever
-    float64 is a normal float32 and the causal depthwise conv as its definition sums it is, at inputs and
-    taps whose products near float32's ends."""
+    `generation.linear_tangent`; interpreted off a GPU) as a layer reaches them (`linear.causal_conv1d`, the
+    kernels named, on an interpreted H100), with its bias and silu: every order finite wherever float64 is a
+    normal float32 and the causal depthwise conv as its definition sums it is, at inputs and taps whose
+    products near float32's ends. Two rows, which a mesh's data axis splits as the layer launches the kernels
+    per shard of its rows (`linear._per_row_shard`)."""
     scale = EDGES[edge]
     # A warpgroup's channels, the kernels' block (`templates.recurrence.conv.fits`).
-    x, taps, bias = normal_draw(2677, (1, 12, 128), (128, 4), (128,))
+    x, taps, bias = normal_draw(2677, (2, 12, 128), (128, 4), (128,))
     primals = (x * scale, taps, bias * scale)
     direction = tuple(along * (scale if at != 1 else 1.0)
                       for at, along in enumerate(normal_draw(2678, x.shape, taps.shape, bias.shape)))
     (cotangent,) = normal_draw(2679, x.shape)
 
     def kernel(x, taps, bias):
-        return short_conv.conv(x, taps, bias, None, None, ((128, None),), activation=True, eps=1e-6,
-                               dtype=x.dtype, interpret=INTERPRETED)[0]
+        # Off a GPU the kernels interpreted at an H100's facts (`generation.assumed`'s `interpreted`).
+        with (generation.assumed("sm90" if INTERPRETED else None, interpreted=INTERPRETED),
+              generation.chosen(short_conv="mosaic_gpu")):
+            return causal_conv1d(x, taps, activation=True, bias=bias)
 
     def plain(x, taps, bias):
         width = taps.shape[1]

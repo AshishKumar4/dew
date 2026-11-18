@@ -15,6 +15,7 @@ import jax
 import numpy as np
 import pytest
 from ahead_programs import arguments, programs
+from jax.experimental import topologies
 
 from dew._devices import pool_share
 from dew.nn.kernels.generation import assumed, built_target
@@ -29,7 +30,7 @@ import sys
 from dew.training.ahead import compile_programs
 from ahead_programs import programs
 
-compile_programs(programs(sys.argv[1]), sys.argv[1], int(sys.argv[3])).save(sys.argv[2])
+compile_programs(programs(sys.argv[1]), sys.argv[1], int(sys.argv[3]), topology=sys.argv[4]).save(sys.argv[2])
 """
 RUN = """
 import pickle
@@ -95,7 +96,9 @@ from dew.nn.kernels.generation import compile_only_gpus
 from dew.training.ahead import compile_ahead
 
 generation, path, multiprocessors, memory = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-target = MeshSpec().build(compile_only_gpus(generation, 1, memory, multiprocessors=multiprocessors))
+# Planned at the loading run's share (argv[5]), which its pool takes of the GPU's memory.
+target = MeshSpec().build(compile_only_gpus(generation, 1, memory, multiprocessors=multiprocessors,
+                                            share=float(sys.argv[5])))
 trainer = fine_tune(target, xla=True, split=2, inspection=Inspection(every=2), dtype="bfloat16")
 batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
 validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
@@ -105,6 +108,56 @@ compile_ahead(trainer, batch, fit=fit).save(path)
 """A step of two microbatches, sampled every second step, compiled ahead for the GPU argv[1] names, with
 argv[3] multiprocessors and argv[4] bytes of memory, with the programs of its fit's evaluations, and saved
 at argv[2], in a process that sees no GPU."""
+SAMPLED_BUILD = """
+import sys
+
+import jax
+import optax
+from test_loop_sampled import TRAINED, token_draw
+from test_pass_weights import looped
+
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.objectives.lm.objective import LMObjective
+from dew.training import Layout, MeshSpec, Trainer
+from dew.training.ahead import compile_ahead
+
+generation, path, multiprocessors, memory = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+# Planned at the loading run's share (argv[5]), which its pool takes of the GPU's memory.
+target = MeshSpec().build(compile_only_gpus(generation, 1, memory, multiprocessors=multiprocessors,
+                                            share=float(sys.argv[5])))
+trainer = Trainer(LMObjective(looped(steps=TRAINED.cap), 16), optax.sgd(0.1), key=jax.random.key(0),
+                  mesh=target, layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED)
+compile_ahead(trainer, {"text": token_draw()}).save(path)
+"""
+"""A run that draws its looped model's pass count per microbatch, its step compiled ahead for the GPU of the
+generation argv[1] names (as `QUIET_BUILD`'s), every count's beside the cap's, saved at argv[2], in a
+process that sees no GPU."""
+
+SAMPLED = """
+import sys
+
+import jax
+import optax
+from test_loop_sampled import TRAINED, token_draw
+from test_pass_weights import looped
+
+from dew.objectives.lm.objective import LMObjective
+from dew.telemetry.compiles import Compiles
+from dew.training import Layout, MeshSpec, Trainer
+from dew.training.ahead import AheadOfTime
+
+run = Trainer(LMObjective(looped(steps=TRAINED.cap), 16), optax.sgd(0.1), key=jax.random.key(0),
+              mesh=MeshSpec().build(jax.devices()[:1]), layout=Layout(min_shard=1, tolerance=1.0),
+              sampled_passes=TRAINED, ahead=AheadOfTime.load(sys.argv[1]))
+with Compiles(None) as compiles:
+    state = run.fit({"text": token_draw()}, steps=4, log_every=2)
+assert int(state.step) == 4
+compiled = [(program.name, program.where) for program in compiles.programs if program.kind == "compiled"]
+assert not compiled, compiled
+"""
+"""A fresh process whose sampled run trains four steps from the step at argv[1] (`SAMPLED_BUILD`'s), each
+microbatch at its drawn count, compiling nothing."""
+
 QUIET = """
 import sys
 
@@ -209,12 +262,21 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
     for name, text in (("build.py", BUILD), ("run.py", RUN), ("refused.py", REFUSED)):
         (tmp_path / name).write_text(text)
     environment = environment_of(tmp_path)
-    # Built where no GPU is visible, as a CPU host builds them.
+    arrays = {name: [np.asarray(array) for array in drawn] for name, drawn in arguments(generation).items()}
+    # Compiled here first, on this GPU, which tunes them and leaves its choices beside the compilation cache
+    # the build reads (row 8422: a node's programs compile tuned or are refused).
+    here = {}
+    for name, (function, _) in programs(generation).items():
+        # Under the facts the build used: this GPU's generation and its own multiprocessors.
+        with assumed(built_target(generation, own.multiprocessors)):
+            here[name] = np.asarray(owned_program(function)(*arrays[name]))
+    topology = tmp_path / "topology.bin"
+    topology.write_bytes(topologies.get_attached_topology("cuda").serialize())
+    # Built where no GPU is visible, as a CPU host builds them, over this GPU's serialized topology.
     # For this GPU: its generation and its own multiprocessors.
     build = [sys.executable, str(tmp_path / "build.py"), generation, str(tmp_path / "programs.dew-aot"),
-             str(own.multiprocessors)]
+             str(own.multiprocessors), str(topology)]
     subprocess.run(build, env={**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}, check=True)
-    arrays = {name: [np.asarray(array) for array in drawn] for name, drawn in arguments(generation).items()}
     (tmp_path / "arguments.pkl").write_bytes(pickle.dumps(arrays))
     # Loaded and run in a fresh process whose compilers' dumps must stay empty; refused in one whose XLA
     # computes otherwise.
@@ -225,11 +287,8 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
     subprocess.run([sys.executable, str(tmp_path / "refused.py"), str(tmp_path / "programs.dew-aot")],
                    env=computing_otherwise(environment), check=True)
     ahead = pickle.loads((tmp_path / "outputs.pkl").read_bytes())
-    for name, (function, _) in programs(generation).items():
-        # Under the facts the build used: this GPU's generation and its own multiprocessors.
-        with assumed(built_target(generation, own.multiprocessors)):
-            here = np.asarray(owned_program(function)(*arrays[name]))
-        assert ahead[name].dtype == here.dtype and ahead[name].tobytes() == here.tobytes(), name
+    for name, compiled in here.items():
+        assert ahead[name].dtype == compiled.dtype and ahead[name].tobytes() == compiled.tobytes(), name
 
 
 def test_a_run_compiled_ahead_for_this_gpu_compiles_nothing_on_it_and_is_refused_where_xla_computes_otherwise(
@@ -246,18 +305,39 @@ def test_a_run_compiled_ahead_for_this_gpu_compiles_nothing_on_it_and_is_refused
     for name, text in (("quiet_build.py", QUIET_BUILD), ("quiet.py", QUIET), ("refused.py", TRAIN_REFUSED)):
         (tmp_path / name).write_text(text)
     environment = environment_of(tmp_path)
-    # Its memory stated as the GPU's own (`CompileAhead.memory`, a capacity), which the build takes its pool's
-    # share of as the GPU's allocator does: the attached GPU's allocator limit (`own.memory`) is that share
-    # already, so the GPU's memory is it over the share (row 6717: stated as the limit, the build planned
-    # for the share of the share, 2.0 GB of an 80 GB GPU at the tier's fraction).
+    # Its memory stated as the GPU's own (`CompileAhead.memory`, a capacity), which the build takes the
+    # loading run's share of as the GPU's allocator does: the attached GPU's allocator limit (`own.memory`) is
+    # that share already, so the GPU's memory is it over the share (row 6717: stated as the limit, the build
+    # planned for the share of the share), and the build is told that share, not Dew's own (row 7935: at
+    # Dew's 0.95 it planned past a tier's packed fraction, which the loader refused).
     assert own.memory is not None
     build = [sys.executable, str(tmp_path / "quiet_build.py"), own.generation, str(tmp_path / "step.dew-aot"),
-             str(own.multiprocessors), str(round(own.memory / pool_share()))]
+             str(own.multiprocessors), str(round(own.memory / pool_share())), str(pool_share())]
     subprocess.run(build, env={**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}, check=True)
     subprocess.run([sys.executable, str(tmp_path / "quiet.py"), str(tmp_path / "step.dew-aot")],
                    env=environment, check=True)
     subprocess.run([sys.executable, str(tmp_path / "refused.py"), str(tmp_path / "step.dew-aot")],
                    env=computing_otherwise(environment), check=True)
+
+
+def test_a_sampled_run_compiled_ahead_for_this_gpu_compiles_none_of_its_counts_on_it(tmp_path):
+    """A run that draws its looped model's pass count per microbatch (`SampledPasses`), handed its step
+    compiled ahead for this GPU where no GPU is visible, trains in a fresh process compiling nothing on the
+    GPU: the file holds every count's step at its cap's plan beside the cap's own (`AheadOfTime.counts`, row
+    7924), which the run takes in place of compiling them. Its memory stated as
+    `test_a_run_compiled_ahead_for_this_gpu_compiles_nothing_on_it_and_is_refused_where_xla_computes_otherwise`
+    states it, at the loading run's share."""
+    own = BuildTarget.of(jax.devices()[:1])
+    for name, text in (("sampled_build.py", SAMPLED_BUILD), ("sampled.py", SAMPLED)):
+        (tmp_path / name).write_text(text)
+    environment = environment_of(tmp_path)
+    assert own.memory is not None
+    build = [sys.executable, str(tmp_path / "sampled_build.py"), own.generation,
+             str(tmp_path / "step.dew-aot"), str(own.multiprocessors), str(round(own.memory / pool_share())),
+             str(pool_share())]
+    subprocess.run(build, env={**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}, check=True)
+    subprocess.run([sys.executable, str(tmp_path / "sampled.py"), str(tmp_path / "step.dew-aot")],
+                   env=environment, check=True)
 
 
 def test_a_deviceless_compile_stores_nothing_a_device_run_reads(tmp_path):

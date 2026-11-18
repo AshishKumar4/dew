@@ -10,6 +10,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - finished_merged's mean is 0 where its slices' masses total past fp32's largest. [6904]
 - finished_merged's derivative along its denominators is NaN where (o - out) / W passes fp32 though its product with the tangent does not. [6905]
+- Wrong result found by the contract draws. [8428]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -31,6 +32,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-fsdp] took 613 s (a check-1 site: its longest draws task 550 s (1 draws),…. [7604]
 - A warp-uniform read of a shared-memory scalar for the Mosaic GPU toolkit. [7898]
 - A decode step's query and output pass through grouped_rows' transpose ([B,T,KV,G,D] to [B,T,G,KV,D] and back, attention.py:1113-1128) and a pad to the launch's…. [7926]
+- Attention tests to the bible's §6 and §7 test rules. [8437]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -61,6 +63,8 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Models and interop
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646, 1446]
+- Precision's error-free transforms marked where the compilers honour the fork's no-contract mark. [8378]
+- In-backward scanned walk loses its saving at scale. [8389]
 - Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [1506, 1437]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
@@ -92,9 +96,14 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Algebra
 
+- The merge law's derivative programs nearly doubled since the base review's fixes. [8427]
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Bit-level synthesis in dew.algebra. [3733]
 - The merge law's placed sum keeps two bands of a term's span, not three. [8061]
+- A ratio's transpose sums landed quotients along an axis its denominator varies over. [8292]
+- Tests/reference_error.py:1455 refuses to prepare a check-1 site with a library arm. [8468]
+- Tests/reference_error.py _arm_program (arm_arithmetic.py:193) traces a site's arm nested in make_jaxpr, so an arm that is a jit of its own compiler_options…. [8469]
+- The same program extracted twice in a decision run. [8472]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
@@ -115,5 +124,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## CI and tooling
 
 - Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
+- options.keeping holds one listener. [8450]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]

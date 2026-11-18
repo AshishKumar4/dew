@@ -96,7 +96,13 @@ def trained(policy: str, seed: int, steps: int) -> tuple[float, float]:
     state = trainer.fit(data, steps=steps, log_every=max(1, steps // 10))
     seconds = time.perf_counter() - start
     test = split("test").pipe(presets.images, SIZE, batch=TEST_BATCH)
-    predict = jax.jit(lambda variables, image: jnp.argmax(model.apply(variables, image), axis=-1))
+    def classes(variables, image):
+        logits = model.apply(variables, image)
+        if isinstance(logits, tuple):
+            raise TypeError("the classifier returned its variables beside its logits")
+        return jnp.argmax(logits, axis=-1)
+
+    predict = jax.jit(classes)
     right = total = 0
     for batch in test:
         predicted = np.asarray(predict(state.variables, batch["image"]))

@@ -107,6 +107,12 @@ def test_a_grouped_gemm_holds_every_order(edge):
     products near float32's ends."""
     sizes = jnp.asarray([3, 0, 5], jnp.int32)
     groups = jnp.repeat(jnp.arange(3), sizes, total_repeat_length=8)
+    def draw(seed: int) -> tuple:
+        # Each stream salted apart (`normal_draw`'s salt): one seed's cotangent is no other's input.
+        (cotangent,) = normal_draw([148, seed], (8, 4))
+        return (normal_draw([146, seed], (8, 16), (3, 16, 4)), normal_draw([147, seed], (8, 16), (3, 16, 4)),
+                cotangent)
+
     primals = normal_draw(146, (8, 16), (3, 16, 4), scale=EDGES[edge])
     direction = normal_draw(147, (8, 16), (3, 16, 4), scale=EDGES[edge])
     (cotangent,) = normal_draw(148, (8, 4))
@@ -118,7 +124,7 @@ def test_a_grouped_gemm_holds_every_order(edge):
         return jnp.einsum("rg,rk,gkn->rn", jax.nn.one_hot(groups, 3, dtype=rows.dtype), rows, matrices)
 
     assert_contract(grouped, primals, direction, cotangent, f"a grouped GEMM {edge}", truth_fn=plain,
-                    plain_fn=plain)
+                    plain_fn=plain, draw=draw if edge == "normal" else None)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -379,11 +385,16 @@ def test_a_gemm_prologue_holds_every_order(edge):
 
     prologued = _prologued(rms_producer, lambda *primals: lambda *tangents: jax.jvp(
         rms_producer, primals, tangents)[1])
+    def draw(seed: int) -> tuple:
+        # Each stream salted apart (`normal_draw`'s salt): one seed's cotangent is no other's input.
+        (cotangent,) = normal_draw([396, seed], (6, 16))
+        return normal_draw([394, seed], (6, 16), (16,)), normal_draw([395, seed], (6, 16), (16,)), cotangent
+
     primals = normal_draw(394, (6, 16), (16,), scale=EDGES[edge])
     direction = normal_draw(395, (6, 16), (16,), scale=EDGES[edge])
     (cotangent,) = normal_draw(396, (6, 16))
     assert_contract(prologued, primals, direction, cotangent, f"a GEMM prologue {edge}",
-                    truth_fn=rms_producer, plain_fn=rms_producer)
+                    truth_fn=rms_producer, plain_fn=rms_producer, draw=draw if edge == "normal" else None)
 
 
 def softly_rectified(scores):

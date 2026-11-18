@@ -317,3 +317,40 @@ def test_a_configs_defaults_read_back_as_the_records_it_wrote():
     assert config.defaults["activation"] == {"function": "dew.nn.activations:silu"}
     assert ModelConfig.from_dict(json.loads(json.dumps(to_record(config, ModelConfig)))) == config
     assert dataclasses.replace(config) == config
+
+
+class _Held[T]:
+    """A plain generic class no record builds: what a binder makes and hands a record's reader built."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _HoldsSubscripted:
+    held: _Held[int]
+    named: str = "plain"
+
+
+def test_a_field_of_a_subscripted_generic_keeps_the_instance_its_caller_built():
+    """A dataclass field annotated with a subscripted generic of a nominal class keeps a built instance of
+    the class as it is, as one annotated with the bare class does, its other fields read as before: a
+    condition's encoder, `ConditionEncoder[Any, Any]`, bound around a user's plain encoder."""
+    held = _Held[int]()
+    built = from_record(_HoldsSubscripted, {"held": held, "named": "kept"})
+    assert built.held is held and built.named == "kept"
+
+
+@dataclasses.dataclass(frozen=True)
+class _Boxed[T]:
+    size: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class _HoldsBoxed:
+    boxed: _Boxed[int]
+
+
+def test_a_record_of_a_field_of_a_subscripted_generic_builds_its_class():
+    """A dataclass field annotated with a subscripted generic of a dataclass is built from its record, as one
+    annotated with the bare class is, where the record was left a plain mapping: every reader of a field's
+    class reads a generic's origin (`nominal_class`), the record's reader as the built value's (row 8387)."""
+    built = from_record(_HoldsBoxed, {"boxed": {"size": 3}})
+    assert built.boxed == _Boxed(size=3)

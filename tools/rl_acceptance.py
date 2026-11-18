@@ -41,7 +41,7 @@ from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.env import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfig
 from dew.config.world_model import TokenizerConfig, WorldModelRunConfig
 from dew.data.dataset import Loader
-from dew.data.pipeline import Pipeline
+from dew.data.pipeline import Dataset, Pipeline
 from dew.optim import Linear, OptimConfig
 from dew.registry import ModelConfig
 from dew.training import LocalTracker
@@ -70,6 +70,9 @@ class _Tracker:
 
     def artifact(self, value, step) -> None:
         del value, step
+
+    def close(self) -> None:
+        """Nothing it holds needs releasing."""
 
 
 def tracked(directory: Path, began: float, *splits: str) -> tuple[list[dict], tuple[float, ...]]:
@@ -226,7 +229,7 @@ def dreamer(
     return report
 
 
-def flowers(size: int, batch: int, data: str) -> Loader:
+def flowers(size: int, batch: int, data: str) -> Dataset:
     """Oxford Flowers 102's every image, at `size` pixels a side in batches of `batch`, prepared as
     TFDS ArrayRecords under `data` (examples/train_flowers.py)."""
     from dew.data import TFDS, presets
