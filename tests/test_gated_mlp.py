@@ -216,8 +216,9 @@ def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, 
     is named (on an H100's routes), is one region of its activation (`derivatives.Activation('swiglu',
     gated=True)`) over its gate and up projection, whichever route it takes, the seam a fusion pass's
     epilogue replaces, its body holding the route's launch; and the region computes what its route
-    computes unmarked: the dispatcher's region over each route (`activations._dispatched`), the Pallas
-    kernel interpreted on a CPU, its value and its operands' gradients the route's own bit for bit. An
+    computes unmarked, its value and its operands' gradients the route's own bit for bit: the public product
+    on the XLA route, and the dispatcher's region over the Pallas kernel (`activations._dispatched`),
+    interpreted on a CPU. An
     ungated MLP's named activation is one region of it ungated, at each place it runs."""
     from jax.experimental.pallas import pallas_call_p
 
@@ -242,7 +243,10 @@ def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, 
         return norm_swiglu.swiglu(gate, up, portable)
 
     plain = portable if implementation == "xla" else functools.partial(kernel, portable=portable)
-    region = activations._dispatched("swiglu", portable, lambda gate, up: implementation, kernel)
+    # The public product itself on the XLA route; the dispatcher's region over the kernel, interpreted, on the
+    # Pallas route a CPU's selector takes none of.
+    region = (activations.gated_product("swiglu", implementation="xla") if implementation == "xla"
+              else activations._dispatched("swiglu", portable, lambda gate, up: implementation, kernel))
 
     def summed(function):
         return jax.jit(jax.value_and_grad(lambda g, u: jnp.sum(function(g, u).astype(jnp.float32)),
