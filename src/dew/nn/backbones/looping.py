@@ -30,7 +30,7 @@ from flax.core.scope import DenyList
 
 from ..precision import at_least_fp32, softplus
 from ..protocols import EXITS
-from .decoder_stack import OBSERVED, WRITTEN, Loop, PassView, SharedPassView
+from .decoder_stack import OBSERVED, WRITTEN, Loop, PassView, SharedPassView, sows_appended
 from .layer_names import group_layers
 
 
@@ -167,26 +167,8 @@ class PassStack:
                         {view._moved(name, view.offset - view.first): value
                          for name, value in entries.items() if group_layers(name) is not None})
                     entries = {name: value for name, value in entries.items() if group_layers(name) is None}
-                out[collection] = _merged(out.get(collection, {}), entries)
+                out[collection] = sows_appended(out.get(collection, {}), entries)
         return out
-
-
-def _merged(held: Mapping, sown: Mapping) -> dict:
-    """A collection's `held` entries with a pass's `sown` ones appended (`_appended`)."""
-    return {**held, **{name: _appended(held.get(name), value) for name, value in sown.items()}}
-
-
-def _appended(held, sown):
-    """`held` with `sown` appended at each leaf: a sown tuple extends the held one, a mapping merges
-    key by key, and any other value replaces the held one, as a sow's reduction does."""
-    if isinstance(sown, Mapping):
-        merged: dict[str, object] = dict(held or {})
-        for name, value in sown.items():
-            merged[name] = _appended(merged.get(name), value)
-        return merged
-    if isinstance(sown, tuple):
-        return (*(held or ()), *sown)
-    return sown
 
 
 def pass_offset(loop: Loop, layers: int, step: int) -> int:

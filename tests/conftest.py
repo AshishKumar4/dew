@@ -171,7 +171,9 @@ def pytest_runtest_makereport(item, call):
     # it unprepared, compiling its sites on its GPU as a test outside a part does, every site judged; in one
     # that prepared any site, a site its prepare did not reach runs unprepared too (`truths_ahead.running`),
     # and one prepared at another commit or for other shapes is a red (`truths_ahead.MissingTruth`).
-    if (call.when == "call" and call.excinfo is not None and tier_wire.preparing()
+    # A test its prepare skipped (a cell no GPU of the node runs) computed nothing: its run skips it too.
+    if (call.when == "call" and call.excinfo is not None
+            and not call.excinfo.errisinstance(pytest.skip.Exception) and tier_wire.preparing()
             and (store := _sites_store(item)) is not None and not any(store.glob("*/site.json"))):
         from truths_ahead import UNPREPARED, unprepared
 
@@ -304,9 +306,10 @@ def compiled_ahead(request):
     (tests/model_flows.py): its prepare, on the node's CPU, compiles each site's truths and arms for the
     node's GPU with that GPU's compile-only device this process's default, on which nothing computes, so a
     test computing more than its draws before its sites fails there (bible §8: no dense math on a node's
-    CPU), recorded where (`truths_ahead.UNPREPARED`); its run reads them, tracing, lowering and compiling
-    none, and runs a test so recorded unprepared, every site judged, named in its summary. Outside a part
-    with a store, nothing."""
+    CPU), recorded where (`truths_ahead.UNPREPARED`), and files its programs' needs under the part's unit
+    (`tier_wire.unit_needs`), by which the lane sizes its worker; its run reads them, tracing, lowering and
+    compiling none, and runs a test so recorded unprepared, every site judged, named in its summary. Outside
+    a part with a store, nothing."""
     store = _sites_store(request.node)
     if store is None:
         # Outside a part's store the gate's modules stay unloaded (a test outside the gate loads none).
@@ -329,11 +332,10 @@ def compiled_ahead(request):
             # (`truths_ahead.running`).
             request.config.stash.setdefault(UNPREPARED_RUN, []).append(json.loads(record.read_text()))
         return
-    from dew.nn.kernels.generation import compile_only_gpus
 
-    target = model_flows.node_target()
-    with (compiled_truths(store, prepare=True, stamp=model_flows.stamp(), target=target),
-          jax.default_device(compile_only_gpus(target.generation, 1)[0])):
+    from truths_ahead import prepared
+
+    with prepared(store, stamp=model_flows.stamp(), target=model_flows.node_target()):
         yield
 
 

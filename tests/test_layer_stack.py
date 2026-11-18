@@ -39,7 +39,7 @@ from dew.distributed.batches import shard_batch
 from dew.inference.banks import HeldBanks
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
-from dew.nn.backbones.decoder_stack import StackView, stacked_rows
+from dew.nn.backbones.decoder_stack import Loop, StackView, stacked_rows
 from dew.nn.backbones.layer_names import array_rows, stored_layers
 from dew.nn.mixers.attention import ATTENTION_AXES
 from dew.nn.mlp import MLP_AXES
@@ -904,6 +904,40 @@ def test_a_pipeline_trains_an_exchange_dispatch():
     assert abs(loss - piped) < 1e-5, (loss, piped)
     difference = largest_difference(grads, piped_grads)
     assert difference < 1e-5, f"max |gradient difference| {difference:.3e}"
+
+
+def router_counts_on(objective, spec, variables, batch, microbatches=None):
+    """The router counts `objective`'s balancing bias takes over `batch` (`ExpertBalance.effects`) on
+    `spec`'s mesh, placed as `loss_and_grads` places them, with the pipeline's schedule of `microbatches`
+    in context."""
+    mesh = spec.build()
+    with boxed(objective.parameter_axes):
+        placed = jax.device_put(variables, Layout(min_shard=TINY_SHARD).shardings(mesh, variables))
+    batch = shard_batch(mesh, batch)
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
+    with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
+        effects = jax.jit(lambda tree: objective.scalar_loss(tree, batch, step)[1].effects)(placed)
+    return {path: np.asarray(count) for path, count in flat_tree(effects).items()}
+
+
+@mesh_lane
+def test_a_pipelined_loop_counts_every_passs_routing():
+    """A whole stack a loop runs twice, pipelined over two stages: each pass sows its routers' choices at
+    its layers' own names entering none, so the pipeline's scan writes them (a collection entering it
+    holding the first pass's sows is one it broadcasts, which no sow may change), and every router's
+    counts are the slots both passes chose, each of a row's positions choosing `top_k` a pass, as the
+    unpipelined loop's are (row 7885)."""
+    model = routed(loop=Loop(2))
+    top_k = model.mixture.top_k
+    objective = LMObjective(model, SEQ_LEN, balance=ExpertBalance(balance_rate=0.01))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
+    batch = token_batch(PIPELINED_ROWS)
+
+    plain = router_counts_on(objective, MeshSpec(fsdp=4), variables, batch)
+    piped = router_counts_on(objective, MeshSpec(fsdp=2, stage=2), variables, batch, microbatches=4)
+    assert plain.keys() == piped.keys() and len(piped) == TINY["num_layers"]
+    for path, counts in piped.items():
+        assert int(counts.sum()) == int(plain[path].sum()) == 2 * PIPELINED_ROWS * SEQ_LEN * top_k, path
 
 
 @mesh_lane

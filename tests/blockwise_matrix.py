@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import cublas_compiled
+from generation_support import cublas_compiled, pinned
 from gpu_flow import cell
 from jax.sharding import Mesh
 from kernel_matrix import AXES
@@ -143,8 +143,7 @@ def truth(sizes) -> callable:
 
 
 @cell("blockwise_fp8", covers=lambda case: dict(zip(AXES["blockwise_fp8"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_blockwise_fp8_product_is_on_par(case: tuple[str, ...]) -> None:
     """The blockwise-scaled FP8 product of `case` on its GPU through the template on par with cuBLASLt's FP8

@@ -803,7 +803,7 @@ class FitSearch[LossT, EffectsT]:
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right, as the
         # step's own (`options`) are made; the target's own policy is the compile point's
         # (`report.targeted`).
-        self.required = compiler_options(*self.objective.towers()) or None
+        self.required = compiler_options() or None
 
     def admitted(self, candidates: Sequence[int], first: int) -> tuple[Planned, tuple[Probe, ...]]:
         """The first fitting plan the split-and-rung search finds (`searched`), and every compile it made:

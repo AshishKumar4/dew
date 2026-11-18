@@ -171,3 +171,32 @@ def test_a_classs_covering_holds_every_native_value_and_pair_and_every_named_fau
     mine = [cell for cell in cells if cell.generation is None]
     held = set().union(*(gpu_flow.held(cell.native) for cell in mine if cell.label in kept))
     assert held >= set().union(*(gpu_flow.held(cell.native) for cell in mine))
+
+
+def test_a_matrix_case_pinned_to_the_nodes_generation_runs_in_its_prepare(tmp_path, monkeypatch):
+    """A matrix case pinned to its generation (`generation_support.pinned`, as every *_matrix.py pins its
+    cases) runs in a GPU part's prepare on the node's CPU when the node is that generation, as its run runs
+    it, and skips there when it is another (rows 7868, 7886: pins read off the CPU at import skipped every
+    pinned case in the prepare, then compiled them on the held GPU)."""
+    import generation_support
+    import model_flows
+    import tier_wire
+    from jax.experimental import topologies
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    topology = tmp_path / "topology.bin"
+    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    ran: list[str] = []
+
+    # An unpinned case beside the pinned ones, so the flow runs and its test fails, never skips, where the
+    # pins skip both.
+    @pytest.mark.parametrize("case", [*(pytest.param(case, marks=generation_support.pinned(case))
+                                        for case in ("sm80", "sm90")), "unpinned"])
+    def a_case(case):
+        ran.append(case)
+
+    run_cells(cells_of(a_case))
+    assert ran == ["sm80", "unpinned"]

@@ -760,7 +760,7 @@ def parted_record(path: Path = session.DURATIONS) -> dict[str, dict[str, float]]
     parted: dict[str, dict[str, float]] = {}
     record = durations_record(path)
     for node in sorted(record):
-        parted.setdefault(node.split("::")[0], {})[node] = record[node]
+        parted.setdefault(grading.owning(node), {})[node] = record[node]
     return parted
 
 
@@ -1093,7 +1093,7 @@ def site_costs(python: str, name: str, test: str) -> dict[str, float]:
         record = json.loads(path.read_text())
         python_, _, rest = record["site"].partition("::")
         node = rest.rpartition("::")[0]
-        if (python_, node.split("::")[0]) == (python, name) and session.site_name(node, held) == test:
+        if (python_, grading.owning(node)) == (python, name) and session.site_name(node, held) == test:
             # The record's own words, those of what its draws paid once among them where it keeps them.
             records.append(costs.Drawn(**{word: record[word] for word in costs.Drawn.__annotations__
                                           if word in record}))
@@ -1727,7 +1727,7 @@ def resumed(tests: list[str]) -> dict[str, float]:
     passed = {}
     for line in kept.read_text().splitlines():
         found = json.loads(line)
-        if found["node"].split("::", 1)[0] in tests:
+        if grading.owning(found["node"]) in tests:
             passed[found["node"]] = float(found["seconds"])
     artifacts = os.environ.get("ARMADA_ARTIFACTS")
     if artifacts and passed:
@@ -2277,7 +2277,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     its draws, so its map tasks are weighed by armada's measures of them, never by the record
     (`site_entries`), and a judge armada did not run is a row of its task's name."""
     rows = verdict_rows(verdict)
-    kept = {node: seconds for node, seconds in record.items() if Path(node.split("::")[0]).is_file()}
+    kept = {node: seconds for node, seconds in record.items() if Path(grading.owning(node)).is_file()}
     for name, held in rows.items():
         splits = {parsed_row(row_["name"])[2] for row_ in held}
         counts = {int(split_.split("/")[1]) for split_ in splits if split_}
@@ -2288,7 +2288,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
             kept.update(raised(kept, held, marked))
             continue
         observed = {node: seconds for row_ in held for node, seconds in row_["tests"].items()}
-        own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name
+        own = {node: seconds for node, seconds in kept.items() if grading.owning(node) == name
                and session.site_name(node, marked) not in marked}
         took = sum(row_["seconds"] for row_ in held)
         if cuts.stale(session, own, observed, took, max(counts, default=1), target):
@@ -2364,7 +2364,7 @@ def slow(verdict: dict, target: float, base: dict[str, float] | None = None) -> 
         for test, seconds in (row_.get("tests") or {}).items():
             if seconds <= most or (base is not None and test in base and not mapped):
                 continue
-            found.append({"test": test, "file": test.partition("::")[0], "seconds": round(seconds, 1),
+            found.append({"test": test, "file": grading.owning(test), "seconds": round(seconds, 1),
                           "target": most,
                           **({"map_task": row_["name"], "fix": "fewer units a task (per_task, "
                               "conditioning_per_task)"} if mapped else {})})
@@ -2430,8 +2430,8 @@ def main() -> int:
         stored = cuts.refolded(session, session.stored_cuts(), runs, target, cut_by, after)
         if stored != session.stored_cuts():
             session.CUTS.write_text(json.dumps(stored, indent=0, sort_keys=True) + "\n")
-        changed = sorted({node.split("::")[0] for node in before.keys() ^ recorded.keys()}
-                         | {node.split("::")[0] for node in before.keys() & recorded.keys()
+        changed = sorted({grading.owning(node) for node in before.keys() ^ recorded.keys()}
+                         | {grading.owning(node) for node in before.keys() & recorded.keys()
                             if before[node] != recorded[node]})
         print(f"{len(changed)} files refolded in {session.DURATIONS}: {' '.join(changed) or 'none'}")
         return 0

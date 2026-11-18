@@ -36,11 +36,12 @@ SUMS_IN_IEEE = pytest.mark.skipif(
            "truncating each add, do not")
 
 
-def _here() -> str:
-    """This process's device generation as its kernels run (`runnable`, `lowers_as`): the node's GPU's in a
-    GPU tier part's prepare (`model_flows.node_target`), whose default device, a compile-only GPU, states no
-    generation of its own, so a cell pinned to the node's generation prepares there as its run runs it
-    (train 1013's review F4); else its device's."""
+def here() -> str:
+    """This process's device generation as its kernels run: the node's GPU's in a GPU tier part's prepare
+    (`model_flows.node_target`), whose default device, a compile-only GPU, states no generation of its own,
+    so a cell pinned to the node's generation prepares there as its run runs it (train 1013's review F4);
+    else its device's. The one prepare-aware reading of it: `runnable`, `lowers_as` and every matrix case's
+    pin (a `skipif` its module evaluates at import, rows 7868 and 7886) read it."""
     if tier_wire.preparing():
         import model_flows
 
@@ -51,21 +52,28 @@ def _here() -> str:
 
 
 
+def pinned(case_generation: str):
+    """A matrix case's pin (`pytest.param(case, marks=pinned(...))`): its cell skips unless this device's
+    generation (`here`, the node's in a GPU part's prepare) is the case's, `case_generation`."""
+    return pytest.mark.skipif(here() != case_generation,
+                              reason=f"a {case_generation} cell runs on its own device alone")
+
+
 def runnable(name: str) -> bool:
     """Whether this process runs the kernels `generation.assumed(name)` routes to: a CPU any (it
     interprets them); a TPU its own generation's; a GPU Hopper's warpgroup kernels only if it is that
     generation (capability 9.0 alone has the instructions), and any other generation's only if no newer than
     itself and its block
     holds the shared memory `name`'s launches are sized to (an L4's 99 KiB do not an A100's 163)."""
-    here = _here()
-    if not here.startswith("sm") or generation.capability(name) is None:
+    current = here()
+    if not current.startswith("sm") or generation.capability(name) is None:
         # A TPU's launches a CPU interprets, and that TPU runs.
-        return here in ("cpu", name)
+        return current in ("cpu", name)
     if generation.gpu_target(name).wgmma:
-        return name == here
-    return (generation.capability(name) <= generation.capability(here)
+        return name == current
+    return (generation.capability(name) <= generation.capability(current)
             and generation.shared_budget(generation.gpu_target(name))
-            <= generation.shared_budget(generation.gpu_target(here if tier_wire.preparing() else None)))
+            <= generation.shared_budget(generation.gpu_target(current if tier_wire.preparing() else None)))
 
 
 def runs(name: str):
@@ -84,8 +92,8 @@ def lowers_as(name: str) -> bool:
     709ddea7a)."""
     if not runnable(name):
         return False
-    here = _here()
-    return here == "cpu" or generation.architecture(name).tma == generation.architecture(here).tma
+    current = here()
+    return current == "cpu" or generation.architecture(name).tma == generation.architecture(current).tma
 
 
 def lowers(name: str):
