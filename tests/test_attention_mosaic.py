@@ -939,7 +939,7 @@ def test_a_lazy_walks_kept_anchor_never_passes_the_bound_its_unscaled_walk_takes
     def ours(query, key, value, dout):
         del dout
         pinned = _pinned(LAZY_BOUND_TILES[generation_name])
-        with _device(True, generation.gpu_target(generation_name)), pinned:
+        with _device(interpret=True, target=generation.gpu_target(generation_name)), pinned:
             return attention_mosaic.forward(query, key, value, spans, natural=False, interpret=True)
 
     def reference(query, key, value, dout):
@@ -965,7 +965,7 @@ def test_a_lazy_walks_dropped_weights_stay_within_fp16_interpreted():
 
     def ours(query, key, value, dout):
         del dout
-        with _device(True, generation.gpu_target("sm90")), _pinned(tiles):
+        with _device(interpret=True, target=generation.gpu_target("sm90")), _pinned(tiles):
             return attention_mosaic.forward(query, key, value, spans, hooks, natural=False, interpret=True)
 
     def reference(query, key, value, dout):

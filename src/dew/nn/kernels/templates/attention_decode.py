@@ -424,7 +424,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     # A lazy walk's weights reach its kept anchor's margin (`algebra.lazy_amplified`; a decode's is folded).
     weights = query.dtype if scales is not None else value.dtype
     may = algebra.bounded_past(largest, keys_axis=-1, initial=None if initial is None else initial.acc,
-                               amplified=algebra.lazy_amplified(False, weights))
+                               amplified=algebra.lazy_amplified(weights, natural=False))
     return jax.lax.cond(may, lambda: walked("scaled"), lambda: walked("bounded"))
 
 

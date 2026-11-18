@@ -546,7 +546,7 @@ class MosaicForward(_Mainloop[Tiles]):
         # A dropping call's weights reach its largest multiplier, a lazy walk's its kept anchor's margin.
         multiplied = 1.0 if drop is None else drop.bound
         weights = query.dtype if scales is not None else value.dtype
-        amplified = multiplied * algebra.lazy_amplified(self.natural, weights, multiplied)
+        amplified = multiplied * algebra.lazy_amplified(weights, multiplied, natural=self.natural)
         may = algebra.may_scale(product.joined(value, self.parts), keys_axis=1,
                                 initial=None if initial is None else initial.acc, amplified=amplified)
         arguments = (query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,

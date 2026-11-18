@@ -2277,7 +2277,7 @@ KEY_BINADES = 31
 """The binades a call's key count stays below: its positions are int32."""
 
 
-def lazy_binades(natural: bool, compensated: bool, weights, bound: float = 1.0) -> int | None:
+def lazy_binades(natural: bool, *, compensated: bool, weights, bound: float = 1.0) -> int | None:
     """The binades by which a tile's maximum may pass a row's kept one before the walk moves its anchor
     (`lazy_anchor`), or None where it moves on every larger maximum: the accurate form's (`natural`), whose
     held weights assume their anchor at least every logit (`derive`'s select of `exp(x - b)` under
@@ -2295,12 +2295,12 @@ def lazy_binades(natural: bool, compensated: bool, weights, bound: float = 1.0) 
     return max(min(jnp.finfo(weights).maxexp - 1, BOUND_UNIT - 1 - KEY_BINADES) - multiplied, 0)
 
 
-def lazy_amplified(natural: bool, weights, bound: float = 1.0) -> float:
+def lazy_amplified(weights, bound: float = 1.0, *, natural: bool) -> float:
     """The most a lazy walk's weight reaches (`lazy_binades`): `2^binades`, 1 where it anchors exactly. A
     host's bound on an unscaled walk's sums takes it (`may_scale`'s `amplified`): a kept anchor's tile
     whose maximum is past it by the margin weighs its values up to it (two tiles at logits 0 and 112, values
     2^110: the second's sums 2^136 against a bound of 2^117 that took every weight at most 1)."""
-    binades = lazy_binades(natural, False, weights, bound)
+    binades = lazy_binades(natural, compensated=False, weights=weights, bound=bound)
     return 1.0 if binades is None else 2.0 ** binades
 
 
@@ -2308,7 +2308,7 @@ def lazy_margin(spec: Forward, weights, bound: float = 1.0) -> float | None:
     """`lazy_binades` in the walk's logits' units (binades where it folds to base 2, `Forward.base2`, else
     nats). A kept anchor's factor is exactly 1, so a mainloop whose sums live apart (tcgen05's tensor memory)
     skips their rescale where no row's anchor moved."""
-    binades = lazy_binades(spec.natural, spec.compensated, weights, bound)
+    binades = lazy_binades(spec.natural, compensated=spec.compensated, weights=weights, bound=bound)
     if binades is None:
         return None
     return float(binades if spec.base2 else binades * np.log(2.0))
