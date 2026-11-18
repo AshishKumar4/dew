@@ -1422,7 +1422,7 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         return high, rounded(value - high)
 
     scale = None
-    if bit_split and not isinstance(left, np.generic | np.ndarray) and _odd(jnp.result_type(left, right)):
+    if bit_split and _odd(jnp.result_type(left, right)):
         # A rounded cut of the top binade's last values carries past the largest float: such an operand
         # is halved first, its product and residual doubled back after (each exact, a power of two).
         top = 2.0 ** (jnp.finfo(jnp.result_type(left, right)).maxexp - 1)
