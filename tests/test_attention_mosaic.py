@@ -950,13 +950,13 @@ def test_a_lazy_walks_kept_anchor_never_passes_the_bound_its_unscaled_walk_takes
                     f"a lazy walk's bound {generation_name}", seeds=SEEDS)
 
 
-def _second_review_draw(rise: float):
+def _second_review_draw(rise: float, noise: float):
     """Draws of a bf16 call `[1, 128, 1, 64]`: each query's first coordinate 8, the last 64 keys' first
-    `rise` (the first 64's 0), every other coordinate within 1/64, values 2^119 to 2^120 (the base review of
-    51158f2a9's probes, drawn)."""
+    `rise` (the first 64's 0), every other coordinate within `noise`, values 2^119 to 2^120 (the base review
+    of 51158f2a9's probes, drawn)."""
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 3)
-        query, key = (jax.random.uniform(stream, (1, 128, 1, 64), jnp.float32, -1 / 64, 1 / 64)
+        query, key = (jax.random.uniform(stream, (1, 128, 1, 64), jnp.float32, -noise, noise)
                       for stream in streams[:2])
         query = query.at[..., 0].set(8).astype(jnp.bfloat16)
         key = key.at[..., 0].set(0).at[:, 64:, :, 0].set(rise).astype(jnp.bfloat16)
@@ -994,7 +994,8 @@ def test_a_scaled_or_resumed_forward_past_a_lazy_walks_reach_is_on_par_interpret
         del dout
         return template.reference(query, key, value, spans, hooks, scale=options["scale"])
 
-    draw = _second_review_draw(31.0 if probe == "raw" else 1.0)
+    # The raw probe's logits exact, its tiles' raw maxima 31 apart, within a margin of 32 taken as raw units.
+    draw = _second_review_draw(31.0, 0.0) if probe == "raw" else _second_review_draw(1.0, 1 / 64)
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"a lazy walk's {probe} probe", seeds=SEEDS)
 
 
