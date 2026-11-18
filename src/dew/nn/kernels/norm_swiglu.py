@@ -296,18 +296,20 @@ def elementwise(function, shape: tuple[int, ...]) -> bool:
         for equation in jaxpr.eqns:
             avals = [variable.aval for variable in (*equation.invars, *equation.outvars)]
             # A custom reverse derivative has no forward one to state the tile's (`_tangents`).
-            if (equation.primitive not in lowered or equation.primitive is core.primitives.custom_vjp_call_p
+            if (equation.primitive is core.primitives.custom_vjp_call_p
                     or any(not isinstance(aval, ShapedArray) or aval.shape not in (tuple(shape), ())
                            for aval in avals)):
                 return False
-            # A call's program, or each branch of a conditional, mapped too; any other operation entrywise.
+            # A call's program (a declared tangent's primal and its marked span among them, Dew's one
+            # logistic's), or each branch of a conditional, mapped too, the call itself none the lowering
+            # reads; any other operation entrywise and one Pallas's Triton lowering takes.
             called = programs.called(equation)
             inner = ((called,) if called is not None
                      else programs.branches(equation) if equation.primitive is jax.lax.cond_p else None)
             if inner is not None:
                 if not all(mapped(each) for each in inner):
                     return False
-            elif not layout.entrywise(equation):
+            elif equation.primitive not in lowered or not layout.entrywise(equation):
                 return False
         return True
 
