@@ -142,12 +142,15 @@ def test_vllms_engine_streams_token_ids_as_the_other_engines_do(tmp_path):
     assert not {"decode_steps", "kv", "page_size"} & record.keys()
     settings = json.loads(engine.read_text())
     assert (settings["tensor_parallel_size"], record["mesh"]) == (2, {"tensor": 2})
-    # Dew's server's settings, which the engine never reads, are refused, not taken silently.
+    # Dew's server's settings, which the engine never reads, are refused, not taken silently: the run starts
+    # no engine and writes no record.
+    engine.unlink()
     refused = subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_lm_serving.py"),
                               "--backend", "vllm-engine", "--model", "a/model", "--kv", "paged",
                               "--page-size", "8", "--out", str(tmp_path / "refused.json")],
                              env=env, cwd=ROOT, capture_output=True, text=True)
-    assert refused.returncode == 2 and "--kv, --page-size set Dew's server" in refused.stderr
+    assert refused.returncode == 2
+    assert not engine.exists() and not (tmp_path / "refused.json").exists()
 
 
 @pytest.mark.parametrize("kv", ["dense", "paged"])
