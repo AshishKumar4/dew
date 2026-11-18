@@ -1559,7 +1559,7 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
         spent = time.monotonic() - reading
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
-    if left := child_groups.stop(done, grace=max(grace - spent, 0.0) if expired else 0.0,
+    if left := child_groups.stop([done], grace=max(grace - spent, 0.0) if expired else 0.0,
                                  interrupt=signal.SIGINT, settle=SETTLE):
         print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
     # A process of the group still running may yet open a file: no record of this task keeps a key.

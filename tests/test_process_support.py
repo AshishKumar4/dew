@@ -176,7 +176,7 @@ def test_groups_started_and_stopped_from_many_threads_at_once_each_end_as_their_
             # Ends by itself, its lifeline let go by a later start in any thread.
             return process.wait(timeout=60)
         process.wait(timeout=60)
-        terminate(process)
+        terminate([process])
         return process.returncode
 
     with ThreadPoolExecutor(16) as pool:

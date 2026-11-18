@@ -143,7 +143,7 @@ def gateway(tmp_path: Path, idle: int, *options: str, relaunch: str = "slow") ->
             time.sleep(0.2)
         yield port
     finally:
-        assert not groups.stop(served), "the gateway's group still ran after SIGKILL"
+        assert not groups.stop([served]), "the gateway's group still ran after SIGKILL"
 
 
 def test_a_kernel_no_connection_holds_is_culled_once_idle_for_the_live_contracts_idle_time(tmp_path):
