@@ -361,19 +361,44 @@ def packed_variables(variables) -> dict:
 
 def exact_banks(taken) -> dict:
     """What a packed flow's programs take (`packed_variables`) with each NVFP4 bank its exact matrix, in its
-    tensor scale's dtype (float64 where check 1 widens it): each value its code times its block's scale times
-    its expert's, which float64 holds exactly (2 + 3 + 24 significant bits), still frozen where the bank
-    lay, so a truth differentiates the parameters alone."""
+    tensor scale's dtype (float64 where check 1 widens it), computed in that dtype from the bank's bits: each
+    code's E2M1 value read from its stored word by integer arithmetic and casts alone (`exact_codes`), times
+    its block's scale and its expert's, which float64 holds exactly (2 + 3 + 24 significant bits); still
+    frozen where the bank lay, so a truth differentiates the parameters alone."""
     from dew.nn.kernels.formats import NvFp4
     from dew.quantization import QUANTIZATION
 
     def exact(bank: NvFp4) -> jax.Array:
         dtype = jnp.result_type(bank.scale)
+        codes = exact_codes(jnp.swapaxes(jnp.asarray(bank.words), -1, -2), dtype)
         blocks = jnp.repeat(jnp.swapaxes(jnp.asarray(bank.scales), -1, -2).astype(dtype), 16, axis=-2)
-        return bank.codes().astype(dtype) * blocks * jnp.asarray(bank.scale, dtype)[..., None, None]
+        return codes * blocks * jnp.asarray(bank.scale, dtype)[..., None, None]
 
     return {**taken, QUANTIZATION: jax.tree.map(exact, taken[QUANTIZATION],
                                                 is_leaf=lambda leaf: isinstance(leaf, NvFp4))}
+
+
+def exact_codes(words: jax.Array, dtype) -> jax.Array:
+    """The E2M1 values of an NVFP4 matrix's stored words (`[..., depth / 8, width]`, `NvFp4`'s staged order)
+    in `dtype`, in the depths' own order: the stored form's decode (`bits.NVFP4_BFLOAT16_FORM`, each code
+    times 2^-126 as a bfloat16's bits) restored to the code as `bits.restored` restores it, by integer
+    arithmetic and casts, its one product (a subnormal's mantissa times 2^-7) in `dtype`."""
+    from dew.algebra import bits
+    from dew.nn.kernels.formats import staged_rows
+
+    def one(words: jax.Array) -> jax.Array:
+        decoded = bits.NVFP4_BFLOAT16_FORM.values(words.T, jnp.bfloat16).T
+        pattern = jax.lax.bitcast_convert_type(decoded, jnp.uint16).astype(jnp.uint32)
+        normal = jax.lax.bitcast_convert_type((pattern << jnp.uint32(16)) + jnp.uint32(126 << 23),
+                                              jnp.float32).astype(dtype)
+        mantissa = (pattern & jnp.uint32(0x7F)).astype(dtype) * jnp.asarray(2.0 ** -7, dtype)
+        subnormal = jnp.where(pattern & jnp.uint32(0x8000) != 0, -mantissa, mantissa)
+        codes = jnp.where(pattern & jnp.uint32(0x7F80) == 0, subnormal, normal)
+        return codes[np.argsort(staged_rows(codes.shape[0]))]
+
+    for _ in range(words.ndim - 2):
+        one = jax.vmap(one)
+    return one(words)
 
 
 def drawn(flow: ModelFlow):

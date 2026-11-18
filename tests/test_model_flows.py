@@ -118,6 +118,32 @@ def test_a_flows_truth_computes_in_float64(name, store, monkeypatch):
         model_flows.judge(flow, {}, kind)
 
 
+def test_a_packed_flows_exact_banks_are_its_banks_values():
+    """A packed flow's truths read each bank's exact matrix from its bits (`model_flows.exact_banks`, by
+    integer arithmetic and casts, its products in the truth's dtype): the values a packed load's export
+    decodes (`dew.quantization.decoded_expert_banks`), bit for bit, at float32 and at float64."""
+    from flax.traverse_util import flatten_dict
+
+    from dew.quantization import QUANTIZATION, decoded_expert_banks
+
+    flow = next(flow for flow in model_flows.FLOWS if isinstance(flow, model_flows.Flow) and flow.packed)
+    drawn = flow.taken(flow.model.init(jax.random.key(0), *flow.initialized()))
+    decoded = flatten_dict(decoded_expert_banks(drawn)["params"])
+    def widened(leaf):
+        # As check 1 widens a draw's floats for its truth.
+        return jnp.asarray(leaf, jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+
+    for wide in (False, True):
+        with jax.enable_x64(new_val=wide):
+            exact = flatten_dict(model_flows.exact_banks(jax.tree.map(widened, drawn) if wide else drawn)[
+                QUANTIZATION])
+            assert exact
+            for path, matrix in exact.items():
+                assert matrix.dtype == (jnp.float64 if wide else jnp.float32)
+                np.testing.assert_array_equal(np.asarray(matrix, np.float64),
+                                              np.asarray(decoded[path], np.float64))
+
+
 def test_a_packed_flows_training_moves_its_parameters_and_never_its_banks():
     """A flow whose experts are packed NVFP4 banks (`Flow.packed`, row 8492) trains its parameters alone: two
     SGD steps over its training step's gradients, on the CPU's portable route, move its parameters and leave
