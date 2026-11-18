@@ -337,3 +337,30 @@ def test_a_read_whose_passes_keep_nothing_after_a_draw_says_so_at_every_empty_pa
             and isinstance(record.args, tuple) and len(record.args) == 3]
     assert [passes for _, passes, _ in told] == [2, 3, 4]
     assert all("share 0 of 1" in share and "jitter" in steps for share, _, steps in told)
+
+
+@dataclass(frozen=True)
+class _KeepsOnly:
+    """Keeps the one record of id `kept`, rejecting the rest."""
+
+    kept: int
+    identity = "keeps-only@1"
+    rejects = True
+
+    def __call__(self, row):
+        return row if int(row["id"]) == self.kept else Rejected("other")
+
+
+def test_a_shuffled_limit_rejected_for_passes_reads_on_to_the_pass_that_keeps_one():
+    """A shuffle reseeded each pass, a limit of one record after it, an endless repeat and a step after it
+    keeping one id alone: a pass holds whichever record the shuffle put first, so a run of rejected passes
+    is no proof that none is kept later. Each id is read, at whichever pass first holds it, where a run of
+    two rejected passes was refused as certain to read nothing forever."""
+    ids = Pipeline(Memory({"id": np.arange(1, 13, dtype=np.int32)})).shuffle(seed=0).take(1)
+    for kept in range(1, 13):
+        stream = compile(ids.read("indexed").repeat().filter_map(_KeepsOnly(kept)).batch(1),
+                         loading=Loading(workers=0)).train(DataPartition())
+        try:
+            assert np.asarray(next(stream)["id"]).ravel().tolist() == [kept]
+        finally:
+            stream.close()

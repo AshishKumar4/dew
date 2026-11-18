@@ -91,6 +91,7 @@ from dew.data.mixing import (
     Chunked,
     CorpusCounts,
     KeyedMix,
+    Streak,
     TokenDeficit,
     mix_end,
     mixed_indexed,
@@ -133,6 +134,7 @@ from dew.data.pipeline import (
     Shuffle,
     Slice,
     Stage,
+    TokenBudget,
     TokenSplit,
     Windows,
     Workers,
@@ -151,7 +153,6 @@ from dew.data.plan import Manifest
 from dew.data.readers import WorkerMirrors, _FillShare
 from dew.data.shards import _Sequential, bounded as shards_bounded, bounded_places, cut, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
-from dew.data.sources.urls import Fetch
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
@@ -1074,16 +1075,39 @@ class _PassesIterator(pygrain.DatasetIterator):
         self._yielded, self._ended = not rewinding, False
 
 
-def _same_each_pass(stage: Stage) -> bool:
-    """Whether `stage`, before a repeat, makes the same rows of a record on every pass, so a pass of a
-    share's records it keeps none of keeps none on any: none that draws, a shuffle reseeded each pass (the
-    records a share's cut takes after it differ), a native Grain step, which states nothing, or a fetch,
-    whose failure is transient (`Fetch`: dropped for a later pass to fetch again)."""
+def _varies(stage: Stage) -> bool:
+    """Whether `stage` may hold other records, or other rows of a record, on a later pass of the same
+    input: one that draws, a native Grain step, which states nothing, or one that reads what may change
+    (`_volatile`: a fetch whose failure is transient)."""
     match stage:
-        case RandomMap() | Shuffle() | Native() | Configured(random=True) | Map(step=Fetch()):
-            return False
-        case _:
+        case RandomMap() | Native() | Configured(random=True):
             return True
+        case _:
+            return _volatile(stage)
+
+
+def _varying(stages: Sequence[Stage]) -> tuple[str, ...]:
+    """The steps of `stages` that may hold other records on a later pass (`_same_each_pass`): those that
+    vary (`_varies`) and reseeded shuffles."""
+    return tuple(_identity(stage).name for stage in stages if _varies(stage) or isinstance(stage, Shuffle))
+
+
+def _same_each_pass(stages: Sequence[Stage], shares: int) -> bool:
+    """Whether every pass of an endless repeat after `stages` holds the same records for each of `shares`
+    shares, derived stage by stage from its input's: none that varies (`_varies`); a shuffle reseeded each
+    pass keeps its input's records in another order, so a step after it that keeps records by their place
+    (a limit, a slice, a layout, a batch) holds others, as does the cut of several shares
+    (`index::count`). So a pass that keeps no row keeps none on any (`_PassesIterator`, `Accepted`)."""
+    ordered = True
+    for stage in stages:
+        if _varies(stage):
+            return False
+        match stage:
+            case Shuffle():
+                ordered = False
+            case Limit() | Slice() | Pack() | Windows() | BatchStage() | TokenBudget() if not ordered:
+                return False
+    return ordered or shares == 1
 
 
 _UNCHANGING_BEFORE = (Shuffle, Slice, Limit, Map, MapWithIndex, Filter, Prefetch, Workers, Artifact)
@@ -1097,20 +1121,24 @@ each record's own, drawing nothing. A shuffle there reads across passes, a slice
 stride of them, an expansion counts its records' pieces, a random step draws by place."""
 
 
-def _barren_bound(stages: Sequence[Stage], passes: tuple[int, int] | None, ran: int) -> int | None:
-    """How many rejections in a row of the records the steps before `ran` read in order make it
-    certain they go on forever (`Accepted`): two whole passes of the endless repeat of indexed rows
-    written at `passes[0]`, each of `passes[1]` rows, where every pass is the same records, in
-    another order. That holds where the steps before the repeat are among `_UNCHANGING_BEFORE` and
-    those after it among `_UNCHANGING_AFTER`, none reading what may change (`_volatile`); None
-    elsewhere."""
+def _barren_bound(stages: Sequence[Stage], passes: tuple[int, int] | None, ran: int,
+                  shares: int) -> Streak | None:
+    """The run of rejections in a row of the records the steps before `ran` read in order that spans two
+    whole passes of the endless repeat of indexed rows written at `passes[0]`, each of `passes[1]` rows
+    (`Streak`, `Accepted`), where the steps before the repeat are among `_UNCHANGING_BEFORE` and those
+    after it among `_UNCHANGING_AFTER`, none reading what may change (`_volatile`); None elsewhere. It is
+    certain to go on forever where every pass holds the same records for each of `shares`
+    (`_same_each_pass`); else the steps that may hold others on a later pass are named (`varying`)."""
     if passes is None:
         return None
     at, rows = passes
-    before = all(isinstance(stage, _UNCHANGING_BEFORE) and not _volatile(stage) for stage in stages[:at])
+    before = all(isinstance(stage, _UNCHANGING_BEFORE) for stage in stages[:at])
     after = all(isinstance(stage, _UNCHANGING_AFTER) and not _volatile(stage)
                 for stage in stages[at + 1 : ran])
-    return 2 * rows if before and after and rows else None
+    if not (before and after and rows):
+        return None
+    varying = () if _same_each_pass(stages[:at], shares) else _varying(stages[:at])
+    return Streak(rows, varying)
 
 
 class _ElasticBatches(pygrain.IterDataset):
@@ -1751,7 +1779,8 @@ class _Build:
                 carried = index
             if index == carried and pool is not None:
                 rows = self.handed_on(rows, pipeline, partition, pool, carried, spread,
-                                      certain_after=_barren_bound(pipeline.stages, passes, carried))
+                                      streak=_barren_bound(pipeline.stages, passes, carried,
+                                                                partition.count))
             if isinstance(stage, (BatchStage, MapBatch)):
                 break
             if index == self.lowering.absorbed:
@@ -1783,7 +1812,8 @@ class _Build:
                 ran = index + len(run)
                 rows = self.record_stage(rows, run, pipeline, partition, index, marked=index < carried,
                                          unplaced=index <= last < ran,
-                                         certain_after=_barren_bound(pipeline.stages, passes, ran))
+                                         streak=_barren_bound(pipeline.stages, passes, ran,
+                                                                partition.count))
             elif index < carried and isinstance(stage, Repeat) and not isinstance(rows, pygrain.MapDataset):
                 # A worker's inputs hold a marker for each record dropped, so a pass with nothing
                 # in it holds no input: that worker reads no more, and the others read on.
@@ -1808,7 +1838,8 @@ class _Build:
                 rows = self.stage(rows, stage, pipeline, partition, index)
         if carried == len(pipeline.stages) and pool is not None:
             rows = self.handed_on(rows, pipeline, partition, pool, carried, spread,
-                                  certain_after=_barren_bound(pipeline.stages, passes, carried))
+                                  streak=_barren_bound(pipeline.stages, passes, carried,
+                                                                partition.count))
         return self.delivered(rows, pipeline, counting=counting, examples=examples)
 
     def skipping(self, rows: pygrain.MapDataset, pipeline: Pipeline, at: int) -> pygrain.MapDataset:
@@ -1849,17 +1880,17 @@ class _Build:
         return spread, (at, counted and not counting), examples, counting, carried
 
     def handed_on(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, pool: Workers, carried: int,
-                  spread: tuple[int, bool] | None, *, certain_after: int | None) -> Rows:
+                  spread: tuple[int, bool] | None, *, streak: Streak | None) -> Rows:
         """`rows` handed on by its workers at `carried` (`handed`), each spread input as its rows where the
         workers spread them from the expansion `spread` names (`unspread`)."""
-        rows = self.handed(rows, pipeline, partition, pool, carried, certain_after=certain_after)
+        rows = self.handed(rows, pipeline, partition, pool, carried, streak=streak)
         if spread is None:
             return rows
         at, counted_inputs = spread
-        return self.unspread(rows, pipeline, at, carried, counted_inputs, certain_after=certain_after)
+        return self.unspread(rows, pipeline, at, carried, counted_inputs, streak=streak)
 
     def unspread(self, rows: Rows, pipeline: Pipeline, at: int, carried: int, counted_inputs: bool, *,
-                 certain_after: int | None) -> pygrain.IterDataset:
+                 streak: Streak | None) -> pygrain.IterDataset:
         """A spread read's inputs (`_PerInput`) as the reading process reads them: counted as source examples
         where its expansion is an objective's and the run counts them before it (`counted_inputs`), as a read
         that expands in the reading process counts them, then as their rows, what the steps from the
@@ -1869,7 +1900,7 @@ class _Build:
                             rows=_counts_rows(pipeline, at))
         rows = gx.FlatMapIterDataset(_as_iter(rows, self.loading), _Unspread())
         if any(_drops(stage) for stage in pipeline.stages[at:carried]):
-            rows = Accepted(rows, _name(pipeline), _label(pipeline), certain_after=certain_after,
+            rows = Accepted(rows, _name(pipeline), _label(pipeline), streak=streak,
                             rows=_counts_rows(pipeline, carried), members=self.counted_members(pipeline))
         return rows
 
@@ -1917,8 +1948,9 @@ class _Build:
             return self.block_shuffle(rows, stage, pipeline, partition)
         if isinstance(stage, Repeat):
             before = pipeline.stages[:at]
-            varying = tuple(_identity(written).name for written in before if not _same_each_pass(written))
-            certain = not any(_drops(written) for written in before) or not varying
+            certain = (not any(_drops(written) for written in before)
+                       or _same_each_pass(before, partition.count))
+            varying = () if certain else _varying(before)
             share = f"{_name(pipeline)} (share {partition.index} of {partition.count})"
             return _repeated(rows, stage.epochs, share, self.loading, certain=certain, varying=varying)
         from dew.data.ordering import WindowShuffle
@@ -2036,11 +2068,11 @@ class _Build:
         return rows
 
     def handed(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, pool: Workers, at: int, *,
-               certain_after: int | None = None) -> pygrain.IterDataset:
+               streak: Streak | None = None) -> pygrain.IterDataset:
         """`rows`, read by this corpus's loading workers (`pool`), each handing on every row with
         a marker in place of each record its steps dropped, which the reading process drops here,
         before the stage at `at` (`_counts_rows`), counting each by its reason, and refusing a run of
-        `certain_after` rejections of inputs read in order (`_barren_bound`) as certain to go on
+        rejections of inputs read in order two passes long (`_barren_bound`, `Streak`) as certain to go on
         forever."""
         # A worker hands on its rows and markers a share's batch count at a time, the fields that
         # stack stacked as a batch's are, as many groups in flight as it had batches; an elastic read's
@@ -2054,20 +2086,20 @@ class _Build:
             # keeps every group: one position, whatever the count of workers it is read in.
             ordered = _StreamOrder(_as_iter(rows, self.loading), size, read, _Grouped,
                                    _Ungrouped(size).flat_map, alone=not pool.count)
-            return Accepted(ordered, _name(pipeline), _label(pipeline), certain_after=certain_after,
+            return Accepted(ordered, _name(pipeline), _label(pipeline), streak=streak,
                             rows=_counts_rows(pipeline, at))
         if self.in_order and isinstance(rows, pygrain.MapDataset):
             handed = _InputOrder(rows, size, read, _Grouped)
         else:
             grouped = _as_iter(rows, self.loading).batch(size, drop_remainder=False, batch_fn=_Grouped())
             handed = self.read_in(grouped, pipeline=pipeline, partition=partition, pool=pool)
-            if certain_after is not None:
+            if streak is not None:
                 # Each of Grain's W workers reads every W-th input a group at a time, and the reading
                 # process takes their groups in turn, so each round of W groups holds W consecutive
                 # groups' inputs in another order: a run of rejections spans two rounds more.
-                certain_after += 2 * pool.count * size
+                streak = dataclasses.replace(streak, slack=streak.slack + 2 * pool.count * size)
         flat = gx.FlatMapIterDataset(_as_iter(handed, self.loading), _Ungrouped(size))
-        return Accepted(flat, _name(pipeline), _label(pipeline), certain_after=certain_after,
+        return Accepted(flat, _name(pipeline), _label(pipeline), streak=streak,
                         rows=_counts_rows(pipeline, at))
 
     def read_in(self, groups: Rows, *, pipeline: Pipeline, partition: DataPartition,
@@ -2078,7 +2110,7 @@ class _Build:
 
     def record_stage(
         self, rows: Rows, run: tuple[RecordStage, ...], pipeline: Pipeline, partition: DataPartition, at: int,
-        *, marked: bool = False, unplaced: bool = False, certain_after: int | None = None,
+        *, marked: bool = False, unplaced: bool = False, streak: Streak | None = None,
     ) -> Rows:
         """`rows` through a run of adjacent record stages written from `at` (`_run`), as one Grain
         operator. A run that can drop records drops them after it, counted (`Accepted`), unless its
@@ -2090,7 +2122,7 @@ class _Build:
                         unplaced=unplaced)
         if not marked and any(_drops(stage) for stage in run):
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
-                            certain_after=certain_after, rows=_counts_rows(pipeline, at + len(run)),
+                            streak=streak, rows=_counts_rows(pipeline, at + len(run)),
                             members=self.counted_members(pipeline))
         return rows
 
