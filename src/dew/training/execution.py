@@ -450,8 +450,7 @@ class HostExecution:
                                                     paths=moving, layout=layout)
 
         with jax.set_mesh(self.accelerator):
-            compiled = owned_program(whole, *self.objective.towers(),
-                                     step=self.step_options(variables, batch))
+            compiled = owned_program(whole, step=self.step_options(variables, batch))
             arguments = (primal, frozen, rest, placed, here)
             refusals: list[RuntimeError] = []
             executable = compiled_if_it_fits(compiled.lower(*arguments), compiled.options, refusals,
