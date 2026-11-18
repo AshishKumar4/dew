@@ -1964,8 +1964,12 @@ class StepPhases(Forwarding):
         trained = [[node, member, frontier.record()] for (node, member), frontier in self._trained.items()]
         shared = ({"phases": self.CONTINUES, "carried": carried, "trained": trained}
                   if any(self._shared) else {})
+        from dew.data.plan import PLAN_VERSIONS
+
         return json.dumps({_position.STEP_PHASES: {
             "steps": self._steps, "phase": phase, "ends": self._ends[:phase], **shared,
+            # The plan version its identities describe their steps by, which a resume reads them under.
+            "version": PLAN_VERSIONS[-1],
             "identities": [self._identity(index) for index in range(phase + 1)],
             "position": base64.b64encode(own if isinstance(own, bytes)
                                          else json.dumps(own).encode()).decode(),
@@ -1986,7 +1990,9 @@ class StepPhases(Forwarding):
         from dew.data.plan import saved_identity
 
         identities = [saved_identity(held) for held in strings(saved["identities"], "saved phase identities")]
-        if phase >= len(self._make) or ends != self._ends[:phase] or not self._read_alike(identities, phase):
+        version = saved.get("version")
+        if phase >= len(self._make) or ends != self._ends[:phase] or not self._read_alike(
+                identities, phase, None if version is None else integer(version, "the saved plan version")):
             raise _position.PlanChanged(
                 ("phases",), f"the saved run finished phases ending at steps {ends}, and this run's phases "
                 f"end at {self._ends[:phase]}, or read them otherwise; a phase the run has read cannot "
@@ -2034,15 +2040,13 @@ class StepPhases(Forwarding):
         stream.set_state(own if encoded else json.loads(own))
         self._steps = steps
 
-    def _read_alike(self, saved: Sequence[str], phase: int) -> bool:
-        """Whether the phases before `phase` read what the `saved` identities say: as this Dew describes
-        their steps, or as plan version 15 did (`dew.data.plan.described_under`), whose identities a phase's
-        position holds without its version."""
+    def _read_alike(self, saved: Sequence[str], phase: int, version: int | None) -> bool:
+        """Whether the phases before `phase` read what the `saved` identities say, their steps described as
+        the plan `version` the position records described them (`dew.data.plan.described_under`); a
+        position that records none was saved under plan 15 or 14, whose rule describes them."""
         from dew.data.plan import REFERENCED, described_under
 
-        if list(saved[:phase]) == [self._identity(index) for index in range(phase)]:
-            return True
-        with described_under(REFERENCED):
+        with described_under(REFERENCED if version is None else version):
             return list(saved[:phase]) == [self._identity(index) for index in range(phase)]
 
     def _identity(self, phase: int) -> str:

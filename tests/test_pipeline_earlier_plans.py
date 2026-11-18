@@ -273,13 +273,40 @@ def test_a_position_saved_under_15_resumes_as_it_was_read(saved):
     chain stopped where it stopped reads after it; the record of a run saved since plan 15 hit PlanChanged
     on its steps (train 1013's review, F3)."""
     from hidden_field_positions import SAVED
+    from resumed_support import resumed_as_read
 
     loader, steps = SAVED[saved]
-    streams = [loader().train(DataPartition()) for _ in range(2)]
-    list(itertools.islice(streams[0], steps))
-    streams[1].set_state((SAVED_UNDER_15 / f"{saved}.position").read_bytes())
-    after = [[np.asarray(batch["id"]).tolist() for batch in itertools.islice(stream, 6)]
-             for stream in streams]
-    for stream in streams:
+    stopped, restored = resumed_as_read(loader, steps, (SAVED_UNDER_15 / f"{saved}.position").read_bytes(),
+                                        lambda batch: np.asarray(batch["id"]).tolist(), 6)
+    assert restored == stopped and stopped
+
+
+def test_a_phases_position_saved_now_refuses_a_finished_phase_whose_hidden_field_changed():
+    """A phases' position this Dew saves records its plan version (16), so a finished phase whose step's
+    table its repr hides changed since is refused, as every field that decides equality states the step;
+    the rule of plan 15 reads only a position that records no version (train 1015's review, F6)."""
+    from hidden_field_positions import Remapped
+    from saved_positions_support import READ, source
+
+    from dew.data import phases
+
+    def stepped(scale: int):
+        table = np.arange(8, dtype=np.int32) * scale
+        return compile(phases((source(1).map(Remapped(table)), 3), (source(2), None)), read="indexed",
+                       loading=READ).train(DataPartition())
+
+    stream = stepped(1)
+    try:
+        list(itertools.islice(stream, 5))
+        saved = stream.get_state()
+    finally:
         stream.close()
-    assert after[1] == after[0] and after[0]
+    assert json.loads(saved)["dew_step_phases"]["version"] == 16
+    same, changed = stepped(1), stepped(3)
+    try:
+        same.set_state(saved)
+        with pytest.raises(ValueError):
+            changed.set_state(saved)
+    finally:
+        same.close()
+        changed.close()
