@@ -147,7 +147,7 @@ def _get_activations(weights: str | None = None):
     _log.info("loading InceptionV3 FID weights from %s (cached for reuse)",
               "the hub" if weights is None else weights)
     model, variables = _extractor(weights)
-    return functools.partial(program(_activations, model, static_argnums=0), model, variables)
+    return functools.partial(program(_activations, static_argnums=0), model, variables)
 
 
 def _pooled_stats(batches: Iterable[ArrayLike], *, population: str,

@@ -450,8 +450,7 @@ class HostExecution:
                                                     paths=moving, layout=layout)
 
         with jax.set_mesh(self.accelerator):
-            compiled = owned_program(whole, *self.objective.towers(),
-                                     step=self.step_options(variables, batch))
+            compiled = owned_program(whole, step=self.step_options(variables, batch))
             arguments = (primal, frozen, rest, placed, here)
             refusals: list[RuntimeError] = []
             executable = compiled_if_it_fits(compiled.lower(*arguments), compiled.options, refusals,
@@ -484,7 +483,7 @@ class HostExecution:
             with jax.set_mesh(self.accelerator):
                 # The pullback runs its int8 dots here, apart from the forward's program, with an
                 # int8 backward (`Quantization.bwd_qtype`) on the options that ask for it.
-                pulled = program(_trainable_cotangent, *self.objective.towers(), step=options,
+                pulled = program(_trainable_cotangent, step=options,
                                  static_argnames=("sites", "paths", "layout"))
                 gradient = pulled(back, self.on_accelerator(cotangent), sites=self.own, paths=moving,
                                   layout=layout)

@@ -1232,10 +1232,11 @@ def triton_wrong(lowered: jax.stages.Lowered, target: generation.GpuTarget) -> b
     on every GPU measured (`GpuTarget.int8_triton_gemm`); with CUDA 13 cuBLAS refuses some int8 shapes
     (on an A100 a contraction of 16 or 48), and then the program does not compile rather than compute
     wrong;
-    or fp32 operands at IEEE fp32 products (a precision of `HIGHEST` on both, or an algorithm of fp32
-    operands one product a term, the F32_F32_F32 preset), which it sums farther from float64 than cuBLAS,
-    whose sum a float32 reference is (`dew.nn.precision.FP32_PRODUCTS`), as JAX lowers each dot at the
-    precision it resolved: the run's default, a model's, an operation's own."""
+    or fp32 operands at IEEE fp32 products (a precision of `HIGHEST` on either operand, XLA's GPU taking the
+    higher of a pair, or an algorithm of fp32 operands one product a term, the F32_F32_F32 preset), which it
+    sums farther from float64 than cuBLAS, whose sum a float32 reference is
+    (`dew.nn.precision.FP32_PRODUCTS`), as JAX lowers each dot at the precision it resolved: the run's
+    default, a model's, an operation's own."""
     from dew.nn.precision import FP32_PRODUCTS, declares_fp32_products
     from dew.nn.programs import algorithm_arithmetic, dot_arithmetic
 

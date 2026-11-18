@@ -256,7 +256,10 @@ def test_dropout_composite_replay_restarts_with_effects_and_ema_intact(tmp_path)
     assert int(resumed.updates) == 1
 
 
-def test_nonfinite_optimizer_candidate_rolls_back_all_cpu_owned_fields():
+def test_a_nonfinite_optimizer_candidate_of_a_finite_gradient_commits_alike_on_host_and_device():
+    """A scaled step whose loss and gradient are finite commits the update its optimizer forms, an infinite
+    one here, as a step's choice reads its loss and gradient alone (row 6748): the device and host layouts
+    commit it alike, and the scaler counts a finite step."""
     def update(updates, state, params=None):
         return jax.tree.map(lambda x: jnp.full_like(x, jnp.inf), updates), state
     optimizer = optax.GradientTransformation(lambda params: optax.EmptyState(), update)
@@ -268,18 +271,12 @@ def test_nonfinite_optimizer_candidate_rolls_back_all_cpu_owned_fields():
         data = batches()[0]
         # the step consumes the state
         assert initial.scale is not None
-        start_params, start_ema, start_opt = jax.tree.map(
-            np.asarray, (initial.variables, initial.ema, initial.opt_state))
         start_scale, start_fin = float(initial.scale.scale), int(initial.scale.fin_steps)
         final, _, _, finite, accepted, _ = trainer.compile(initial, data)(initial, data)
-        assert bool(finite) and not bool(accepted)
-        equal(start_params, final.variables)
-        equal(start_ema, final.ema)
-        equal(start_opt, final.opt_state)
-        assert int(final.microstep) == int(final.updates) == 0
-        assert int(final.step) == 1
-        # Preserve the existing distinction: candidate-state rejection rolls
-        # back the transaction, while the scaler tracks gradient finiteness.
+        assert bool(finite) and bool(accepted)
+        params = jax.tree.leaves(final.variables["params"])
+        assert not all(np.all(np.isfinite(np.asarray(leaf))) for leaf in params)
+        assert int(final.updates) == 1 and int(final.step) == 1
         assert final.scale is not None
         assert float(final.scale.scale) == start_scale
         assert int(final.scale.fin_steps) == start_fin + 1
@@ -1222,6 +1219,44 @@ def test_a_distillations_streamed_price_reads_its_teachers_banks():
         links.append(trainer.layout_choice.streamed.link)
     distilled, alone = links
     assert distilled > alone, links
+
+
+def test_a_streamed_step_on_gpus_is_priced_over_the_hosts_cpu_companion():
+    """The streamed step of a bf16 decoder on GPUs (one compile-only H100) is admitted over this host's CPUs
+    as its companion (`streaming.streamed`): the companion read outside the GPUs' mesh, whose trace no CPU
+    program may run in (M-MC-24b: a GH200's fit refused there)."""
+    from dew.distributed.batches import placed_abstract
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.training import streaming
+
+    trainer = streaming_decoder(dtype=jnp.bfloat16)
+    trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus("sm90", 1, 80 * 2 ** 30)))
+    trainer._laid_out(Layout(host=streaming.STREAMED))
+    start = trainer._started("never")
+    rows = placed_abstract(trainer.device_mesh, {"text": np.zeros((1, 8), np.int32)})
+    fits, _ = streaming.streamed(trainer, start, rows, jnp.bfloat16, ())
+    assert fits
+
+
+def test_a_lora_run_with_a_frozen_base_is_priced_streamed():
+    """A fresh bf16 LoRA run, its adapted weights' base frozen (the run's frozen collection), is priced
+    streamed, no longer refused: its frozen base's banks are read once a forward, its other leaves resident
+    (`streaming.streamed`)."""
+    from dew.lora import LoRA
+    from dew.training.ahead import stand_in_gpus
+
+    base = decoder(dtype=jnp.bfloat16)
+    variables = nn.unbox(base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(base, variables, key=1)
+    objective = LMObjective(adapter.model, 8, head_chunks=1, ema_decay=None,
+                            variables=jax.tree.map(np.asarray, adapter.variables))
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5))
+    rows = [{"text": np.arange(row, row + 9, dtype=np.int32) % 16} for row in range(16)]
+    data = Memory(rows).repeat().batch(jax.device_count()).read("memory").loading(Loading(workers=0))
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
+        trainer.fit(data, steps=1, log_every=100)
+    choice = trainer.layout_choice
+    assert choice.refused is None and choice.streamed is not None and choice.streamed.link > 0, choice
 
 
 def test_a_part_stating_no_host_link_prices_no_streamed_step():

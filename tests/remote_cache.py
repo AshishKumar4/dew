@@ -218,9 +218,32 @@ class RemoteCache:
         written = self.written.setdefault(self.file, [])
         written += sorted(fresh - set(written))
 
+    def mark(self) -> tuple[str | None, int]:
+        """Where the current bundle's compiled programs stand now (`compiled_since`), read through the watch
+        its account already keeps (`_moved_on`): the local watch's, which a remote given up keeps, so a
+        test that compiled while the Worker was unreachable is still timed cold."""
+        if not self.writes.watching:
+            return None, 0
+        with self.state:
+            self._moved_on()
+            return self.file, len(self.written.get(self.file, [])) if self.file else 0
+
+    def compiled_since(self, mark: tuple[str | None, int]) -> int | None:
+        """The programs compiled since `mark` (`mark`) under the same bundle: a program the shared cache did
+        not hold, so the test that ran meanwhile ran cold; None where it is not known (no shared cache,
+        the bundle moved on, the watch lost events)."""
+        if not self.writes.watching or mark[0] is None:
+            return None
+        with self.state:
+            self._moved_on()
+            if self.file != mark[0] or mark[0] in self.blind:
+                return None
+            return len(self.written.get(mark[0], [])) - mark[1]
+
     def opened(self, file: str) -> None:
-        """Bundle `file` in the local cache, and the programs compiled from here on its."""
-        if not self.available:
+        """Bundle `file` in the local cache, and the programs compiled from here on its: its account kept
+        while the directory is watched, its programs fetched while the remote is available."""
+        if not self.writes.watching:
             return
         try:
             with self.state:
@@ -234,7 +257,7 @@ class RemoteCache:
                 # A bundle written back and now running again (A, B, A) counts what it opens from here on: the
                 # opens since its close, its own reads among them, went to it while sealed (review).
                 self.sealed.discard(file)
-                if file in self.held:
+                if file in self.held or not self.available:
                     return
                 self.held[file] = set()
             # What a prepare fetched into the directory ahead for it (`prefetch`), its values there already,

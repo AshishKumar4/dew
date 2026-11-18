@@ -573,7 +573,7 @@ class GpuTarget:
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
-    `dew.nn.kernels.options.compiler_options`)."""
+    `dew.nn.kernels.templates.report.triton_wrong`)."""
     triton_gemm_fusions: bool = True
     """Whether a training step keeps XLA's Triton GEMM fusions on this GPU (`dew.training.memory`): off
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's

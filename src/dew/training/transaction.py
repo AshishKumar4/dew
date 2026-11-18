@@ -126,6 +126,10 @@ class Committed:
     unfinite_layer: jax.Array | None = None
     """The first layer the attempt's backward walk met whose gradient was not finite (`Applied`), -1 for
     none; None in a step that updates no layer in its backward, and past the step."""
+    unfinite_state: jax.Array | None = None
+    """A scaled step's committed state as `unfinite_state` reads it: its first leaf not finite (-1 for none)
+    and how many are not (`dew.training.interval.checked_finite` stops the run on one); None where the step
+    is not scaled."""
     finite: jax.Array | None = None
     """Whether an attempt with no loss scale was finite, its gradient and forward as well as its loss, which
     the step reports (`outcome`) and a run's streak of steps that are not reads (`dew.training.interval`): a
@@ -186,7 +190,8 @@ def _only_when(due, taken, kept, operand):
 
 
 def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux, committed: Committed | None,
-            batch: Batch, stepped: jax.typing.ArrayLike, consumed: jax.Array, *, split: int) -> tuple:
+            batch: Batch, stepped: jax.typing.ArrayLike, consumed: jax.Array, *, split: int,
+            part: Batch | None = None, passes: int | None = None) -> tuple:
     """What a compiled step returns (`Trainer.compile`) of the transaction it ran from `current` on
     `batch`, wherever it ran: the advanced state, its step counting `stepped` and its clock the source
     examples its microbatch `consumed` (`TrainState.consumed`, where the run keeps one), the loss, the
@@ -194,9 +199,10 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
     where it states none), the microbatch accepted and the window committed. A metric stated as a statistic
     (`Aux.pooled`) is its value where the step is read whole (`split` 1), and its statistic where it is one
     of `split` microbatches, which the step's whole
-    pools (`dew.training.planning.whole_step`)."""
+    pools (`dew.training.planning.whole_step`). A step of a sampled pass count's `passes` counts the work of
+    its microbatch `part` at its count (`step_counts`)."""
     pooled = aux.pooled if split > 1 else {name: value.mean()[0] for name, value in aux.pooled.items()}
-    metrics = {**aux.metrics, **pooled, **step_counts(batch)}
+    metrics = {**aux.metrics, **pooled, **step_counts(batch, part, passes)}
     if aux.record is not None:
         assert "evaluated" in aux.record, "a recording transaction stacks its evaluations (`recorded`)"
         metrics |= recorded_metrics(aux.record)
@@ -491,6 +497,17 @@ def _collections_kept(finite: jax.Array, numerical: TrainState, state: TrainStat
     return dataclasses.replace(numerical, variables={**numerical.variables, **kept})
 
 
+def unfinite_state(kept: dict[str, Variables | optax.OptState | None]) -> jax.Array:
+    """The first leaf of a committed state's kept trees (`checked`: parameters, optimizer state, averages), in
+    their order, that holds a value not finite (-1 for none) and how many such leaves they hold,
+    `int32[2]`. A scaled step accepted on its finite gradient can leave them so: an update that overflows a
+    parameter, or a gradient near 1e20 that overflows Adam's second moment to infinity, whose parameter then
+    stops moving with every loss and gradient after it finite (row 6748). Read off the state once it is
+    committed, choosing nothing, so it holds no second state; it reads the kept trees once a step."""
+    finite = jnp.stack([all_finite(leaf) for leaf in jax.tree.leaves(kept)])
+    return jnp.stack([jnp.where(jnp.all(finite), -1, jnp.argmin(finite)), jnp.sum(~finite)]).astype(jnp.int32)
+
+
 def _unfinite_layer(runs: Sequence[tuple[jax.Array, int]]) -> jax.Array:
     """The model layer that tops the first scanned slot the backward's walk met a gradient not finite in,
     of `runs`' per-slot counts in the model's order (their stage and slot axes, one stage), each slot of a
@@ -615,14 +632,17 @@ def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
     return flags
 
 
-def compact_qk(tree):
+def compact_qk(tree, calls: bool = False):
     """Reduce every sowed `max_logits` leaf over its rows, keeping the heads, and a layer's geometry
-    (`kv_heads`, `head_dim`, `qk_nope`) to the one count it is.
+    (`kv_heads`, `head_dim`, `qk_nope`) to the one count it is; and with `calls`, a layer's calls to one,
+    their elementwise largest (`dew.batch.sown_calls`: a looped layer's passes, each over the same
+    weights), the window of a run that draws its pass count per microbatch, whose microbatches call a
+    looped layer as many times as their counts.
 
     The clip reads each head's strongest logit alone, so a retained window
-    holds one row per layer instead of the batch's. A pipelined layer sows
-    its geometry once a microbatch (`StackView`), the same count each time,
-    and the clip reads it as one.
+    holds one row per layer instead of the batch's. A pipelined layer sows its
+    geometry once a microbatch (`StackView`), the same count each time, and
+    the clip reads it as one.
     """
     def compact(path, leaf):
         is_maximum = any(isinstance(entry, jax.tree_util.DictKey) and entry.key == "max_logits"
@@ -630,7 +650,14 @@ def compact_qk(tree):
         if is_maximum:
             return jnp.max(leaf, axis=-2, keepdims=True) if leaf.ndim > 1 else leaf
         return jnp.max(leaf) if leaf.ndim else leaf
-    return jax.tree_util.tree_map_with_path(compact, tree)
+
+    def folded(node: Mapping) -> dict:
+        return {name: folded(value) if isinstance(value, Mapping) else
+                (functools.reduce(jnp.maximum, value),) if isinstance(value, tuple) and value else value
+                for name, value in node.items()}
+
+    compacted = jax.tree_util.tree_map_with_path(compact, tree)
+    return folded(compacted) if calls and isinstance(compacted, Mapping) else compacted
 
 
 def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_scale_lib.DynamicScale | None:
@@ -825,7 +852,7 @@ class Transaction:
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
                  record: bool = False, resting: Mapping[str, object] | None = None,
                  inspection: Inspection | None = None, examples: int | None = None, placed=None,
-                 skip: bool = False):
+                 skip: bool = False, calls: bool = False):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -848,8 +875,11 @@ class Transaction:
         placement, which the commit's gradient is constrained to (`placed_as`). `examples`
         is a run's bound in source examples, where it counts no updates ahead: each update hands its
         optimizer the run's progress, the share of them its state has consumed (`TrainState.consumed`),
-        which a schedule over the run reads (`dew.optim_schedules.ScheduleBase.progressed`).
+        which a schedule over the run reads (`dew.optim_schedules.ScheduleBase.progressed`). `calls` folds
+        a looped layer's QK calls into the window as one (`compact_qk`), a run's that draws its pass count
+        per microbatch.
         """
+        self.calls = calls
         self.resting = dict(resting or {})
         self.placed = placed
         # Whether a step with no loss scale whose loss or gradient is not finite is skipped (the run's
@@ -952,7 +982,7 @@ class Transaction:
         everything = (loss, stats, aux.variables, aux.effects, *(() if unscaled else (gradient,)))
         local_finite = all_finite(loss) if unscaled and not self.skip else all_finite(everything)
         local_ok = jnp.asarray(a=True) if state.scale is None else local_finite
-        qk = compact_qk(aux.qk_stats)
+        qk = compact_qk(aux.qk_stats, self.calls)
         effects = tuple(jax.tree.leaves(aux.effects))
         candidate, pooled = previous, stats
         replay_required = jnp.asarray(a=False)
@@ -1336,12 +1366,10 @@ class Transaction:
         finite = finite & native_finite
         if gated:
             numerical = _collections_kept(finite, numerical, state, aux.variables)
-        if scale is not None or holding:
-            # A step taken whole or not at all reads what it formed: its whole new state finite. For an
-            # optimizer that holds updates back (`optax.MultiSteps`), that is its inner optimizer's state over
-            # the window's gathered gradient, which a sum of finite gradients can carry past what its
-            # moments hold.
-            accepted = finite & all_finite(checked(numerical))
+        if holding or scale is not None:
+            # Taken whole or not: holding updates back (`optax.MultiSteps`), on its whole new state finite; a
+            # scaled step on its loss and gradient alone, as GradScaler's `found_inf`, in place (row 6748).
+            accepted = finite & all_finite(checked(numerical)) if holding else finite
         if previous is not None:
             numerical = dataclasses.replace(
                 numerical, accumulation=self._retained_window(state, batch, pending, attempt, read))
@@ -1382,7 +1410,8 @@ class Transaction:
             jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted),
             own=pending.own if self.split > 1 else None,
             finite=(accepted if holding else finite) if scale is None else None,
-            unfinite_layer=None if pending.applied is None else pending.applied.unfinite_layer)
+            unfinite_layer=None if pending.applied is None else pending.applied.unfinite_layer,
+            unfinite_state=None if scale is None or holding else unfinite_state(checked(advanced)))
 
     def planned(self, state: TrainState) -> _Planned | None:
         """The plan by which the runs a one-stage scanned state holds stacked update in their backward
@@ -1591,9 +1620,8 @@ class Transaction:
         """
         realize = self.realize if realize is None else realize
         # Each host phase is a program over the objective's modules, compiled through Dew's compile point
-        # with their options as the step's own compile takes them (`program`).
-        towers = self.objective.towers()
-        compile_phase = (lambda phase: owned_program(phase, *towers)) if host else (lambda phase: phase)
+        # as the step's own compile is (`owned_program`).
+        compile_phase = owned_program if host else (lambda phase: phase)
         reduce = compile_phase(self.local_reduction)
         prepare = compile_phase(self.prepare_attempt)
         pooled = compile_phase(self.pooled_cotangent)

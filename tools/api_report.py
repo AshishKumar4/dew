@@ -341,7 +341,7 @@ def report() -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--write", action="store_true", help=f"write the report to {REPORT.relative_to(ROOT)}")
     mode.add_argument("--check", action="store_true",

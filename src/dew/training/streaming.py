@@ -99,7 +99,7 @@ def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
     step cannot be: a layout the run states (`stated`), a custom step, which owns its execution, or a process
     holding no CPU companion of the devices, which JAX makes only before it initializes. And what it is not
     built for yet (`NOT_BUILT`): a rollout, an inspected step, DiLoCo, a step compiled `ahead`,
-    a lowering for another target, AutoPGLE, a frozen collection, and a part whose table
+    a lowering for another target, AutoPGLE, and a part whose table
     states no host link to price it by (`GpuTarget.host_links`: a TPU's). Read before any plan is built."""
     unbuilt = (
         (trainer.rollout is not None, "a rollout"),
@@ -108,7 +108,6 @@ def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
         (ahead, "a step compiled ahead"),
         (trainer.lower_for is not None, "a lowering for another target"),
         (pgle_runs() > 0, "AutoPGLE"),
-        (FROZEN in trainer.objective.drawn_shapes(), "a state holding a frozen collection"),
     )
     if stated:
         return "the run states its layout"
@@ -149,10 +148,13 @@ def streamed(trainer, start: Start, batch, dtype, device_steps: tuple) -> tuple[
     # parameters again (`StepCompiler._compile_host`).
     split = trainer.split or 1
     whole_batch, batch = batch, microbatch_shapes(batch, split)
+    # The CPU companion read before the devices' mesh is in place: its probe runs a CPU program, which no
+    # trace under a GPU's mesh may (M-MC-24b: refused on a GH200).
+    companion = companion_mesh(mesh)
     with trainer._traced_on(mesh):
         variables, step = loss_arguments(trainer.objective, abstract, batch, split * trainer.accumulation,
                                          split)
-        execution = HostExecution(trainer.objective, trainer.layout, mesh, companion_mesh(mesh),
+        execution = HostExecution(trainer.objective, trainer.layout, mesh, companion,
                                   stack_sites(trainer.objective, abstract.variables), device=device_steps,
                                   gathered=layer_gathers(trainer.objective, abstract.variables,
                                                          mesh.devices.size))
@@ -166,12 +168,16 @@ def streamed(trainer, start: Start, batch, dtype, device_steps: tuple) -> tuple[
     fits, _ = step_fits(compiled, mesh, prefetched + built, built, placed=False)
     if not fits or compiled is None:
         return False, None
-    parameters = max(_shard_bytes((primal, frozen), device, memory=None) for device in devices)
-    # Read once an attempt, beside the parameters, and differentiated by nothing: the averaged weights the
-    # step reads (an EMA reference, `Step.ema`), and the banks of the frozen trees the host keeps
-    # (`frozen_trees`: a distillation's teacher whole, a LoRA base), each forward's fetch of them from host
-    # memory; their other leaves stay on the devices.
-    banked = [tree for _, tree, _ in frozen_trees(rest, execution.sites)]
+    # The parameters the step trains, the vjp's primal, moved there and back each attempt.
+    parameters = max(_shard_bytes(primal, device, memory=None) for device in devices)
+    # Read once an attempt, beside them, and differentiated by nothing: the averaged weights the step reads
+    # (an EMA reference, `Step.ema`), and the banks of every frozen tree the host keeps, its frozen
+    # parameters' (a LoRA base, the run's frozen collection) and its frozen roots' (`frozen_trees`: a
+    # distillation's teacher whole), each forward's fetch of them from host memory; their other leaves stay
+    # resident on the devices, which the admission counts.
+    # The run's own frozen collection is among the primal's frozen leaves (`frozen`), the snapshot's
+    # parameters holding it; its nested roots' trees are the snapshot's other collections' (`rest`).
+    banked = [frozen, *(tree for path, tree, _ in frozen_trees(rest, execution.sites) if path != (FROZEN,))]
     averaged = max(_shard_bytes(here.ema, device, memory=None)
                    + _shard_bytes(banked, device, memory="pinned_host") for device in devices)
     # The update, on the host's CPUs: each of this process's companion devices reads and writes its shards
@@ -180,7 +186,7 @@ def streamed(trainer, start: Start, batch, dtype, device_steps: tuple) -> tuple[
     updated = sum(_shard_bytes((weights, abstract.opt_state, abstract.ema), device,
                                (held, start.shardings.opt_state, start.shardings.ema), memory=None)
                   + _shard_bytes(weights, device, held, memory=None)
-                  for device in local_devices(companion_mesh(mesh)))
+                  for device in local_devices(companion))
     try:
         flops = step_flops(compiled)
         price = streamed_price(None if flops is None else split * flops, gpu_target(), dtype,

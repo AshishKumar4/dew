@@ -37,8 +37,7 @@ def pytest_collection_modifyitems(config, items):
     if group is None:
         return
     index, count = (int(part) for part in group.split("/"))
-    durations = session.cut_record()
-    recorded = json.loads(durations.read_text()) if durations.is_file() else {}
+    recorded = session.costs(session.cut_record())
     nodes = sorted(item.nodeid for item in items)
     known = [recorded[node] for node in nodes if node in recorded]
     mean = sum(known) / len(known) if known else 1.0

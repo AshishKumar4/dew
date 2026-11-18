@@ -184,15 +184,15 @@ def test_an_episode_schedulers_cohort_draws_what_its_policy_draws_whole(kind, se
     """An episode scheduler over a `TextGeneration` policy (`RolloutScheduler.episodes`): one drawing a row a
     prompt by sampling, its model declaring pages, it serves over those pages (`served_layout`), its later
     turns extending whole pages of their rows' histories, which they read back and prefill only what
-    follows; one searching beams, which a server over pages does not draw, it draws whole (a beam's model
-    declaring pages is refused where it decodes, row 7934). Either way its cohort is what the policy
+    follows; one searching beams, which a server over pages does not draw, it draws whole, its policy's
+    decode over its model's cache unpaged (`Regrouping`, row 7934). Either way its cohort is what the policy
     collects prefilling every turn whole: every turn's context and action token for token, over drawn
     weights (row 7905); a served cohort's likelihoods are held to check 1 beside."""
     from dew.objectives.rl import GRPOObjective
     from dew.objectives.rl.scheduler import RolloutScheduler, Synchronous
     from dew.sampling.strategies import Beam
 
-    model = MODELS[kind]() if searched else MODELS[kind]().with_kv_cache(KVCache(page_size=PAGE))
+    model = MODELS[kind]().with_kv_cache(KVCache(page_size=PAGE))
     # Every token but the pad ends a turn, so each episode runs its turns and its contexts grow past pages.
     sampling = replace(GREEDY if searched else SAMPLED, eos_token_ids=tuple(range(1, VOCAB)))
     initialized = jax.jit(model.init)

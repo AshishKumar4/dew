@@ -126,9 +126,8 @@ class AutoEncoder(ABC):
     for all of them (a wrapper holding statistics beside its weights names its weights')."""
 
     def towers(self) -> tuple[nn.Module, ...]:
-        """The networks this autoencoder runs, whose quantization the programs that call it compile for
-        (`dew.nn.kernels.options.compiler_options`): its `model`, none for one that computes without a
-        network (a pooling one)."""
+        """The networks this autoencoder runs, which key the programs that call it (`sampling_modules`): its
+        `model`, none for one that computes without a network (a pooling one)."""
         model = vars(self).get("model")
         return () if model is None else (model,)
 
@@ -304,8 +303,8 @@ class ModuleAutoEncoder[M: nn.Module](AutoEncoder):
     def __init__(self, model: M, params: Variables):
         self.model = model
         self.params = params
-        self.encode_single_frame = functools.partial(program(_encoded, model, static_argnums=0), model)
-        self.decode_single_frame = functools.partial(program(_decoded, model, static_argnums=0), model)
+        self.encode_single_frame = functools.partial(program(_encoded, static_argnums=0), model)
+        self.decode_single_frame = functools.partial(program(_decoded, static_argnums=0), model)
 
     def encode_batch(self, params, x, key=None, noise=None):
         return self.encode_single_frame(params, x, key, noise)

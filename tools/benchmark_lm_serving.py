@@ -205,6 +205,7 @@ def dew_points(args):
 
     import dew
     from dew.inference.serving import Server
+    from dew.inference.tasks import TextGeneration
     from dew.nn.kv_cache import KVCache
     from dew.sampling import Sampling
     from dew.telemetry.compiles import Compiles
@@ -213,6 +214,8 @@ def dew_points(args):
     began = time.perf_counter()
     mesh = None if args.mesh is None else MeshSpec(**args.mesh)
     task = dew.pipeline(args.model, mesh=mesh, dtype="bfloat16", param_dtype="bfloat16")
+    if not isinstance(task, TextGeneration):
+        raise ValueError(f"{args.model} loads a {type(task).__name__}, not a text generation it serves")
     task = dataclasses.replace(task, sampling=Sampling(temperature=0, eos_token_ids=None),
                                logits=None, stopping=())
     if args.vocab_limit > task.model.vocab_size:
@@ -302,7 +305,7 @@ async def async_open(slots, prompts, output, rate, streamed):
     began = time.perf_counter()
 
     async def arrive(index):
-        await asyncio.sleep(max(0.0, began + arrivals[index] - time.perf_counter()))
+        await asyncio.sleep(max(0.0, began + float(arrivals[index]) - time.perf_counter()))
         stamps = await streamed(prompts[index], output)
         assert len(stamps) == output, (len(stamps), output)
         return stamps[0] - (began + arrivals[index]), np.diff(stamps)
@@ -358,7 +361,7 @@ def closed_loop(streamed):
     return request
 
 
-def vllm_parallelism(mesh: dict[str, int] | None) -> dict[str, object]:
+def vllm_parallelism(mesh: dict[str, int] | None) -> dict[str, int | bool]:
     """vLLM's engine flags for a `--mesh` of 'tensor' and 'expert' sizes: tensor parallelism over
     their product, its experts split over those ranks where 'expert' is above 1
     (`enable_expert_parallel`), vLLM's one engine's way to spread an MoE's experts over GPUs."""
@@ -502,7 +505,8 @@ def main():
     hardware, points = dew_points(args) if args.backend == "dew" else asyncio.run(engines[args.backend](args))
     if args.backend == "dew":
         for point, peak in zip(points, peaks or [[None]] * len(points), strict=True):
-            point["peak_device_bytes"] = None if None in peak else max(peak)
+            kept = [held for held in peak if held is not None]
+            point["peak_device_bytes"] = max(kept) if kept and len(kept) == len(peak) else None
     # Each setting recorded where its backend applies it: Dew's server's steps, cache and pages, which every
     # other engine runs its own of, and the mesh, which places Dew's weights or sets vllm-engine's
     # parallelism (`vllm_parallelism`).
