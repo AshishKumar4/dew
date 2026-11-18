@@ -119,8 +119,20 @@ def call(launch: Callable, query, key, value, g, beta, state, skip, turn, starts
     (exact), so a gradient's components in a frame, up to its norm, stay finite where the true frame's
     are; its turns' in the crossing form (`turn_gradient`) from frames each root's first token composes
     (`_forked_frames`), its final memory's cotangent turned into them."""
+    if documents is not None:
+        # A forked call's documents begin at their first slots (`documents`' `firsts`), whatever `starts` it
+        # gave (base review fbb1c2f71 F4: a call giving its firsts alone read as one document).
+        starts = _first_tokens(documents[0], value.shape[1])
     return _turned(launch, scale, group, held, query, key, value, g, beta, state, skip, entry, turn, starts,
                    documents)
+
+
+def _first_tokens(firsts, length: int) -> jax.Array:
+    """Each document's first token `[B, T]` of its first slots `firsts` `[B, D]` (one past a row's last,
+    none)."""
+    firsts = jnp.asarray(firsts, jnp.int32)
+    rows = jnp.arange(firsts.shape[0])[:, None]
+    return jnp.zeros((firsts.shape[0], length), bool).at[rows, firsts].set(True, mode='drop')
 
 
 def _turned_primal(launch, scale, group, held, query, key, value, g, beta, state, skip, entry, turn, starts,
@@ -394,9 +406,13 @@ def _between(later, earlier) -> jax.Array:
 
 def _sides(q, k, log, b, reads, writes, scale: float):
     """A chunk's readers of the memory entering it, `q_s scale exp(G_s)`, and writers into the memory
-    leaving it, `k_u beta_u exp(G_end - G_u)`, of the chunk's document alone (`reads`, `writes`)."""
-    readers = q * (scale * jnp.exp(log[0] + log[1]) * reads)[..., None]
-    writers = k * (b * jnp.exp(_between(tuple(part[..., -1:] for part in log), log)) * writes)[..., None]
+    leaving it, `k_u beta_u exp(G_end - G_u)`, of the chunk's document alone (`reads`, `writes`): another
+    document's exponents taken out before `exp` (an earlier document's steep prefix less the last one's
+    restarted one is past fp32's largest, and its zero weight times `exp` of it NaN; base review fbb1c2f71
+    F2)."""
+    readers = q * (scale * jnp.exp(jnp.where(reads, log[0] + log[1], -jnp.inf)))[..., None]
+    lag = _between(tuple(part[..., -1:] for part in log), log)
+    writers = k * (b * jnp.exp(jnp.where(writes, lag, -jnp.inf)))[..., None]
     return readers, writers
 
 
