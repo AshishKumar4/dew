@@ -195,8 +195,11 @@ def assert_same_program(one, other) -> None:
     """`one` and `other` (closed jaxprs, as `jax.make_jaxpr` returns them) are the same program: equation for
     equation the same primitive over the same wiring of variables of the same avals, the same effects and
     parameters, each nested program (a call's, a kernel's body) compared as a program again, closed ones
-    with their captured constants, and the same captured constants."""
+    with their captured constants, a custom derivative's rule as the same function under the same
+    transformations, and the same captured constants."""
     from dew.nn.programs import computed
+
+    from jax.extend.linear_util import WrappedFun
 
     closed, opened = type(one), type(one.jaxpr)
 
@@ -224,6 +227,12 @@ def assert_same_program(one, other) -> None:
                     assert_same_program(value, theirs.params[key])
                 elif isinstance(value, opened):
                     same(value, theirs.params[key])
+                elif isinstance(value, WrappedFun):
+                    # A custom derivative's rule, which each trace wraps afresh: the same function under the
+                    # same transformations.
+                    rule = theirs.params[key]
+                    assert value.f is rule.f and [step for step, _ in value.transforms] == [
+                        step for step, _ in rule.transforms], (key, mine, theirs)
                 else:
                     assert value == theirs.params[key], (key, mine, theirs)
             for out_mine, out_theirs in zip(mine.outvars, theirs.outvars, strict=True):
