@@ -267,6 +267,34 @@ def test_an_arm_reading_another_flag_than_its_prepares_is_a_red(tmp_path, monkey
         assert_as_exact(flagged, reference, draw, "a flagged product", seeds=8)
 
 
+def test_a_prepared_sites_needs_are_filed_under_its_unit(tmp_path, monkeypatch):
+    """A test's sites prepared under a GPU tier part's unit (`truths_ahead.prepared`, the suite's prepare of
+    every test, `tier_wire.UNIT` and `TRUTHS` named) file their programs' needs under the unit as a flow's
+    are (`tier_wire.unit_needs`, row 7900): one admission for each program its run calls, its arms' and its
+    truths', every truth's with the arms' state held beside it, so the lane sizes the unit's worker by
+    them; before it filed none, and the lane admitted the unit on no needs at all."""
+    import tier_wire
+    from jax.experimental import topologies
+    from truths_ahead import compiled_memory, prepared
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    topology = tmp_path / "topology.bin"
+    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
+    monkeypatch.setenv(tier_wire.UNIT, "a unit")
+    monkeypatch.setenv(tier_wire.TRUTHS, str(tmp_path))
+    dew, reference, draw = _site()
+    store = tmp_path / "sites"
+    with prepared(store, stamp="a", target=model_flows.node_target()):
+        assert_as_exact(dew, reference, draw, "a product's arms", seeds=8)
+    arms, truths = compiled_memory(store, arms=True), compiled_memory(store)
+    filed = json.loads(tier_wire.needs_file(tmp_path, "a unit").read_text())["programs"]
+    assert arms and truths and len(filed) == len(arms) + len(truths)
+    state = max(memory["argument"] for memory in arms)
+    assert all(program["beside"] >= state for program in filed[len(arms):])
+
+
 def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     """Judged from programs compiled ahead (`compiled_truths(prepare=False)`), a site's run computes every
     draw's arms with them and runs none of its arms' code, which its prepare alone traced (a GPU run then
