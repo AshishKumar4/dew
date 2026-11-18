@@ -314,11 +314,12 @@ class _NoneKept:
 
 @pytest.mark.parametrize("shares", [1, 2])
 def test_a_shuffled_share_whose_records_a_step_keeps_none_of_is_refused_whatever_its_shares(shares):
-    """A seeded shuffle before a step that rejects every record and an endless repeat, read by one share and
-    by each of two: the repeat replays its first pass, the shuffle and the share's cut alike, so no pass
-    makes a row and every share's read is refused at its first batch, where a share of two read empty passes
-    forever, saying the shuffle might make a row (row 7942)."""
-    ids = Pipeline(Memory({"id": np.arange(1, 11, dtype=np.int32)})).shuffle(seed=0).filter_map(_NoneKept())
+    """A seeded shuffle, a take of five after it, a step that rejects every record and an endless repeat,
+    read by one share and by each of two: the repeat replays its first pass, the shuffle, the take and the
+    share's cut alike, so no pass makes a row and every share's read is refused at its first batch, where it
+    read empty passes forever, saying the shuffle might make a row (row 7942)."""
+    ids = Pipeline(Memory({"id": np.arange(1, 11, dtype=np.int32)})).shuffle(seed=0).take(5).filter_map(
+        _NoneKept())
     loader = compile(ids.read("indexed").repeat().batch(2), loading=Loading(workers=0))
     for index in range(shares):
         stream = loader.train(DataPartition(index, shares))
