@@ -80,18 +80,18 @@ def _operands(query_shape: tuple[int, ...], keys: int):
 @INTERPRETS
 @pytest.mark.parametrize("device", ["sm90", "sm80"])
 def test_a_decode_steps_rows_whose_sums_pass_fp32s_largest_walk_again_scaled_interpreted(device):
-    """A bf16 decode step (`attention_decode.attend`) whose first row's values are near 2^126, so its walk's
-    unscaled sums pass fp32's largest, beside a row of ordinary values, interpreted as an H100 or an A100
-    runs it: on par with the reference path (check 1), the first row's programs walking their keys again
-    scaled in their launch (`mosaic.Decided`) and the second's not, with no pass over the values before
-    the launch to choose its walk."""
+    """A bf16 decode step (`attention_decode.attend`) whose first row's values are positive and near 2^124,
+    so its walk's unscaled sums over its 200 keys pass fp32's largest, each value within bf16's, beside a
+    row of ordinary values, interpreted as an H100 or an A100 runs it: on par with the reference path
+    (check 1), the first row's programs walking their keys again scaled in their launch (`mosaic.Decided`)
+    and the second's not, with no pass over the values before the launch to choose its walk."""
     positions, heads, kv_heads = CALLS["one-query"]
     spans = _spans(positions)
     drawn = _drawn(positions, heads, kv_heads, jnp.bfloat16)
 
     def draw(seed: int):
         query, key, value, _ = drawn(seed)
-        return query, key, value.at[0].multiply(jnp.bfloat16(2.0 ** 126))
+        return query, key, value.at[0].set(jnp.abs(value[0]) * jnp.bfloat16(2.0 ** 124))
 
     def ours(query, key, value):
         with generation.assumed(device):
