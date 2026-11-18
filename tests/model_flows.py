@@ -134,12 +134,8 @@ class Flow:
         the CPU's in its last bits, so a draw on the GPU would be other parameters than its prepare's) where
         the flow prepares, or where no tier's store holds them; a run reads its prepare's (`PARAMS`), and
         initializes no model. The initializer runs compiled, one program: run eagerly, it compiled each of
-        its operations apart, 1,416 programs and 70 s over the flows' prepare on armada."""
-        if TRUTHS in os.environ and not preparing():
-            return pickle.loads((store_of(self) / PARAMS).read_bytes())
-        with jax.default_device(jax.devices("cpu")[0]):
-            initialized = jax.jit(self.model.init)(jax.random.key(5461), *self.initialized())
-            return jax.device_get(self.taken(initialized))
+        its operations apart, 1,416 programs and 70 s over the flows' prepare on armada (`drawn`)."""
+        return drawn(self)
 
     def initialized(self) -> tuple[jax.Array, ...]:
         """What the model's `init` reads beside its key: token ids of a draw's shape, zeros."""
@@ -264,12 +260,8 @@ class ImageFlow:
     def params(self):
         """The flow's variables, float32, drawn once on the host's CPU, or its prepare's (`Flow.params`): its
         parameters and its time embedding's frequencies (the `constants` collection), which its programs
-        read and differentiate none of."""
-        if TRUTHS in os.environ and not preparing():
-            return pickle.loads((store_of(self) / PARAMS).read_bytes())
-        with jax.default_device(jax.devices("cpu")[0]):
-            initialized = jax.jit(self.model.init)(jax.random.key(5461), *self.initialized())
-            return jax.device_get(self.taken(initialized))
+        read and differentiate none of (`drawn`)."""
+        return drawn(self)
 
     @staticmethod
     def taken(variables):
@@ -320,6 +312,17 @@ class ImageFlow:
 
 type ModelFlow = Flow | ImageFlow
 """A flow of any family (`FLOWS`): a decoder's, or a denoiser's."""
+
+
+def drawn(flow: ModelFlow):
+    """What the flow's programs take of its model's variables (`ModelFlow.taken`), float32, drawn once on the
+    host's CPU by its compiled initializer where the flow prepares, or where no tier's store holds them; a
+    run's its prepare's (`PARAMS`)."""
+    if TRUTHS in os.environ and not preparing():
+        return pickle.loads((store_of(flow) / PARAMS).read_bytes())
+    with jax.default_device(jax.devices("cpu")[0]):
+        initialized = jax.jit(flow.model.init)(jax.random.key(5461), *flow.initialized())
+        return jax.device_get(flow.taken(initialized))
 
 
 KINDS = Flow.kinds
