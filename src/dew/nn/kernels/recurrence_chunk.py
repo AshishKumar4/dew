@@ -224,6 +224,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # fla's simple GLA rounds at its release's placements, its write gated on the values
         # (`mainloop.Call.values_gated`).
         values_gated = simple_gla(hooks)
+        # Keys of unit norm (the op's `l2norm`, or as `write_bound` declares: `Hooks.inverse_bound`'s
+        # contract), which the template's own pairs may fold their decays against (`mainloop.Call.unit_keys`).
+        unit_keys = hooks.l2norm or hooks.write_bound is not None
         rounded = chunk_rounding(hooks.delta, jnp.result_type(query, key, value), released=values_gated)
         skip = given['skip'] if hooks.skip else None
         # Without the delta rule the template takes the skip, its output wide where an epilogue or the
@@ -235,7 +238,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                scale=scale, wide=fused_wide, bound=hooks.inverse_bound,
                                product=product, forked=forked, delta=hooks.delta,
                                decayed=hooks.decay != 'none', skip=None if hooks.delta else skip,
-                               rounded=rounded, values_gated=values_gated, firsts=firsts, readout=readout)
+                               rounded=rounded, values_gated=values_gated, unit_keys=unit_keys, firsts=firsts,
+                               readout=readout)
 
         def run(kernel, query, key, value, g, beta, skip, state, starts, firsts, *walked):
             # Every kernel walks the packed rows, each document from its own memory, its values read once
@@ -252,7 +256,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                            skip if fused else None, forked=carried,
                                            max_segments=max_segments, scale=scale, delta=hooks.delta,
                                            wide=fused_wide, bound=hooks.inverse_bound, rounded=rounded,
-                                           values_gated=values_gated)
+                                           values_gated=values_gated, unit_keys=unit_keys)
             elif kernel == 'fla':
                 out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
                                       max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
@@ -1043,7 +1047,8 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                 scale: float | None = None, wide: bool = False,
                 bound: float | None = None, product: str = 'forward', report: bool = True, delta: bool = True,
                 decayed: bool = True, forked: Forked | None = None, skip=None, rounded: bool | None = None,
-                values_gated: bool = False, firsts=None, readout: bool = True) -> str:
+                values_gated: bool = False, unit_keys: bool = False, firsts=None,
+                readout: bool = True) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
     ('forward', 'training'), of the form `delta` and `decayed` state and the chunk inverse's `bound` its form
     proves (`recurrence.Hooks.inverse_bound`; `PortCase`), the template's
@@ -1059,7 +1064,8 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     call = template_call(query, key, value, g, beta, state, starts, firsts, skip, forked,
                          max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound,
                          rounded=(chunk_rounding(delta, jnp.result_type(query, key, value))
-                                  if rounded is None else rounded), values_gated=values_gated)
+                                  if rounded is None else rounded), values_gated=values_gated,
+                         unit_keys=unit_keys)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1],
