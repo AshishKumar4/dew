@@ -290,7 +290,7 @@ class TracedWindow:
             self.end = end
         else:
             self.capture.stop()
-        if self.start is None:
+        if self.start is None or self.end is None:
             raise ValueError(f"the timed window never opened: warm-up {self.warmup} is past the run")
         return self.end - self.start - self.excluded
 

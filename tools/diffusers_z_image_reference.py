@@ -76,7 +76,7 @@ CASES: dict[str, Case] = {
 def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     """The case's saved transformer and its walk in float32 and in float64
     (`fp64.`), the same weights and inputs widened."""
-    from diffusers import ZImageTransformer2DModel
+    from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel
 
     config = {**BASE, **case.config}
     model, generator = seeded(lambda: ZImageTransformer2DModel(**config).eval(), SEED)
@@ -102,7 +102,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
 
     narrow = walk(model, torch.float32)
     with float64():
-        from diffusers import ZImageTransformer2DModel
+        from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel
 
         wide = walk(ZImageTransformer2DModel.from_pretrained(directory, torch_dtype=torch.float64).eval(),
                     torch.float64)
@@ -130,12 +130,10 @@ def text_encoder(tok):
 
 
 def build_pipeline(root: Path):
-    from diffusers import (
-        AutoencoderKL,
-        FlowMatchEulerDiscreteScheduler,
-        ZImagePipeline,
-        ZImageTransformer2DModel,
-    )
+    from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+    from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
+    from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel
     from make_tiny_tokenizer import qwen_byte_tokenizer
 
     metadata = json.loads((SOURCE / "tokenizer" / "tokenizer_config.json").read_text())
@@ -158,7 +156,7 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
     the unmodified call's walk from fixed latents at `STEPS` steps, guided at
     its default scale: the latent it ends on and the image it decodes; in
     float32 and, the saved pipeline loaded widened, in float64 (`fp64.`)."""
-    from diffusers import ZImagePipeline
+    from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
     from diffusers.pipelines.z_image import pipeline_z_image
     from diffusers.schedulers import scheduling_flow_match_euler_discrete
 
@@ -206,7 +204,7 @@ def main(destination: str) -> None:
                         for name, case in CASES.items()},
               "pipeline": {"config": PIPELINE, "vae": PIPELINE_VAE, "prompts": PROMPTS, "height": HEIGHT,
                            "width": WIDTH, "steps": STEPS, "guidance": GUIDANCE}}
-    np.savez_compressed(root / "z_image.npz", **arrays)
+    np.savez_compressed(root / "z_image.npz", allow_pickle=False, **arrays)
     (root / "z_image.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB, {len(CASES)} cases")

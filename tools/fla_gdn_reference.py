@@ -243,7 +243,7 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
               "float64",
         cross_check="Dew's token recurrence in float64; assert_computes_the_oracle with its traced "
                     "chain_roundings")
-    np.savez(out, **stored)
+    np.savez(out, allow_pickle=False, **stored)
     print(f"wrote {out}: {out.stat().st_size:,} bytes", flush=True)
 
 

@@ -30,7 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers import FlowMatchEulerDiscreteScheduler
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import compute_loss_weighting_for_sd3
 from reference_source import fetched, selected, simple_statements
 

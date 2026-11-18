@@ -57,6 +57,7 @@ nothing here reaches the Hub API that changed. With torch 2.8.0, CPU:
 
 from __future__ import annotations
 
+from typing import Any
 import json
 import sys
 from pathlib import Path
@@ -85,7 +86,7 @@ SEED = 41
 
 
 def build(name: str, root: Path) -> dict[str, np.ndarray]:
-    from diffusers import AutoencoderRAE
+    from diffusers.models.autoencoders.autoencoder_rae import AutoencoderRAE
 
     config = CONFIGS[name]
     torch.manual_seed(SEED)
@@ -165,7 +166,7 @@ def from_published(cls, repo: str, revision: str):
 
 
 def published(destination: str) -> None:
-    from diffusers import AutoencoderRAE
+    from diffusers.models.autoencoders.autoencoder_rae import AutoencoderRAE
 
     from _dew_torch.precision import float64, float64_twin
 
@@ -205,11 +206,11 @@ def published(destination: str) -> None:
     arrays["dinov2_plain.tokens"] = exact
     arrays["dinov2_plain.tokens.float32_gap"] = np.float64(gap(single, exact))
     print("dinov2_plain", float(arrays["dinov2_plain.tokens.float32_gap"]))
-    np.savez_compressed(destination, **arrays)
+    np.savez_compressed(destination, allow_pickle=False, **arrays)
     print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
 
-PLAIN = {"hidden_size": 64, "num_hidden_layers": 1, "num_attention_heads": 1, "image_size": 518, "patch_size": 14}
+PLAIN: dict[str, Any] = {"hidden_size": 64, "num_hidden_layers": 1, "num_attention_heads": 1, "image_size": 518, "patch_size": 14}
 PLAIN_INPUT = 112
 
 
@@ -236,7 +237,7 @@ def main(destination: str) -> None:
     root = Path(destination)
     for name in CONFIGS:
         (root / name).mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(root / name / "reference.npz", **build(name, root / name))
+        np.savez_compressed(root / name / "reference.npz", allow_pickle=False, **build(name, root / name))
     (root / "dinov2_plain").mkdir(parents=True, exist_ok=True)
     build_plain(root / "dinov2_plain")
     record = {"diffusers": DIFFUSERS, "transformers": TRANSFORMERS, "configs": CONFIGS, "statistics": STATISTICS,

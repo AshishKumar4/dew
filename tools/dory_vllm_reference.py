@@ -151,7 +151,7 @@ def record_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
     arrays: dict[str, np.ndarray] = dict(ids)
     for part, steps, prompt_rows in PARTS:
         arrays[f'{part}_generated'], arrays[f'{part}_logprobs'] = scored(llm, ids[part], steps, prompt_rows)
-    np.savez(directory / f'{tag(name(loops, mode, dtype))}.npz', **arrays)
+    np.savez(directory / f'{tag(name(loops, mode, dtype))}.npz', allow_pickle=False, **arrays)
     (directory / 'provenance.json').write_text(json.dumps({
         'reference': f"{PULL}, installed by vLLM's Python-only build over {WHEEL}",
         'vllm': vllm.__version__, 'torch': torch.__version__, 'cuda': torch.version.cuda,
@@ -174,7 +174,7 @@ def probe(directory: Path) -> None:
         key, recorded = name(*run), np.load(directory / f'{tag(name(*run))}.npz')
         found.update({part: recorded[part] for part, _, _ in PARTS})
         found.update({f'{key}/{part}_generated': recorded[f'{part}_generated'] for part, _, _ in PARTS})
-    np.savez(directory / 'probe.npz', **found)
+    np.savez(directory / 'probe.npz', allow_pickle=False, **found)
 
 
 def release() -> tuple[dict, dict]:

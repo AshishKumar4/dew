@@ -154,8 +154,8 @@ def main() -> None:
             logits[f"{case}/{question.question_id}/head64"] = on_fp32.double().numpy()
             logits[f"{case}/{question.question_id}/f64"] = whole.double().numpy()
     (OUT / "layouts.json").write_text(json.dumps(layouts) + "\n")
-    np.savez(OUT / "states.npz", **states)
-    np.savez(OUT / "logits.npz", **logits)
+    np.savez(OUT / "states.npz", allow_pickle=False, **states)
+    np.savez(OUT / "logits.npz", allow_pickle=False, **logits)
 
 
 def on_fla() -> None:
@@ -203,7 +203,7 @@ def on_fla() -> None:
         for question, fp32 in zip(encoded.questions, found, strict=True):
             logits[f"{case}/{question.question_id}"] = fp32.cpu().numpy()
     assert calls, "no layer ran fla's rule"
-    np.savez(OUT / "logits_fla.npz", **logits, precision=upstream_precision())
+    np.savez(OUT / "logits_fla.npz", allow_pickle=False, **logits, precision=upstream_precision())
 
 
 def upstream_precision() -> str:

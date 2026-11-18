@@ -375,6 +375,8 @@ venv = ".venv"
 # grain ships no py.typed, so its stubs live in stubs/: RandomMap.random_map
 # and MapDataset.__getitem__ as they really are, plus the used surface.
 stubPath = "stubs"
+# A tool imports the test helpers and the tools beside it by their names, as it runs with both on its path.
+extraPaths = ["tests", "tools"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

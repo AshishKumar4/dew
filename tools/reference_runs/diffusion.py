@@ -133,7 +133,7 @@ def load_tree(path: str | Path) -> dict:
 
 def save_tree(path: str | Path, tree) -> None:
     arrays: dict[str, Any] = {name: np.asarray(leaf) for name, leaf in flatten_dict(tree, sep="/").items()}
-    np.savez(path, **arrays)
+    np.savez(path, allow_pickle=False, **arrays)
 
 
 class NormState(NamedTuple):
@@ -299,6 +299,8 @@ def dew_side(args, images, total, attention):
         if not compiled:
             compiled["step"] = trainer.compile(state, batch)
         state, loss, _, _, _, committed = compiled["step"](state, batch)
+        if committed is None:
+            raise RuntimeError("the trainer's step reported no update it committed")
         # The norm of the update it committed, none (NaN) where it committed none.
         return state, loss, committed.norm / committed.count
 
@@ -330,7 +332,7 @@ def main() -> None:
     losses, norms = [], []
     trace_dir = Path(args.out).with_suffix("").resolve()
     window = TracedWindow(total, args.timing_warmup, args.profile_steps, trace_dir)
-    loss = None
+    loss = first_step_seconds = None
     compile_start = time.perf_counter()
     for step in range(total):
         window.before(step, loss)
@@ -365,7 +367,7 @@ def main() -> None:
         "host": host(),
         "loss": np.asarray(jax.device_get(losses), np.float64).tolist(),
         "grad_norm": np.asarray(jax.device_get(norms), np.float64).tolist(),
-        "lr": [float(schedule(step)) for step in range(total)],
+        "lr": [float(np.asarray(schedule(step))) for step in range(total)],
         "throughput": timed,
         "first_step_seconds": first_step_seconds,
         "flops_per_image": flops_image,

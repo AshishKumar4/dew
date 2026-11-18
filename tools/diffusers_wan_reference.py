@@ -129,7 +129,7 @@ def walk(model, inputs: dict[str, torch.Tensor], probe: torch.Tensor, dtype) -> 
 
 
 def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
-    from diffusers import WanTransformer3DModel
+    from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
 
     config = {**BASE, **case.config}
     model, generator = seeded(lambda: WanTransformer3DModel(**config).eval(), SEED)
@@ -169,7 +169,7 @@ def transformer(destination: str) -> None:
               "cases": {name: {"config": {**BASE, **case.config}, "size": list(case.size),
                                "length": case.length, "times": list(case.times)}
                         for name, case in CASES.items()}}
-    np.savez_compressed(root / "wan_transformer.npz", **arrays)
+    np.savez_compressed(root / "wan_transformer.npz", allow_pickle=False, **arrays)
     (root / "wan_transformer.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB, {len(CASES)} cases")
@@ -201,7 +201,10 @@ def text_encoder(vocab: int):
 
 
 def build_pipeline(root: Path):
-    from diffusers import AutoencoderKLWan, UniPCMultistepScheduler, WanPipeline, WanTransformer3DModel
+    from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
+    from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
+    from diffusers.pipelines.wan.pipeline_wan import WanPipeline
+    from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
 
     # A T5 tokenizer over single characters (`t5_reference.tiny_tokenizer`): the release's umt5
     # vocabulary is 256k pieces, and every character here is one.
@@ -235,7 +238,7 @@ def scheduler_replay() -> dict[str, np.ndarray]:
     """The published scheduler stepped on recorded model outputs, the one
     model evaluation per step a guided Wan walk makes, from a fixed latent:
     its timesteps and every step's sample, in float32 and widened."""
-    from diffusers import UniPCMultistepScheduler
+    from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
     from diffusers.schedulers import scheduling_unipc_multistep
 
     config = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
@@ -298,7 +301,7 @@ def pipeline(destination: str) -> None:
     latents = torch.randn(shape, generator=generator)
     arrays: dict[str, np.ndarray] = {"x_T": latents.numpy(), **encoded_and_walked(pipe, latents)}
     # The scheduler's tables are its module's own, widened around every call the walk makes into it.
-    from diffusers import WanPipeline
+    from diffusers.pipelines.wan.pipeline_wan import WanPipeline
     from diffusers.schedulers import scheduling_unipc_multistep
 
     # Read back from what it saved, inside `float64`, so every module's constructor computes in float64.
@@ -310,7 +313,7 @@ def pipeline(destination: str) -> None:
               "transformer": PIPELINE,
               "vae": PIPELINE_VAE, "prompts": PROMPTS, "frames": FRAMES, "height": HEIGHT, "width": WIDTH,
               "steps": STEPS, "guidance": GUIDANCE, "replay_steps": list(REPLAY_STEPS)}
-    np.savez_compressed(root / "wan_pipeline.npz", **arrays)
+    np.savez_compressed(root / "wan_pipeline.npz", allow_pickle=False, **arrays)
     (root / "wan_pipeline.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB")

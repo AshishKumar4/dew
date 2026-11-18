@@ -81,14 +81,18 @@ def dew_side(args) -> None:
         model = pretrained.model
 
         def states(variables, tokens, model=model):
-            return model.apply(variables, tokens, method=type(model).hidden_states)
+            return model.apply(variables, tokens, method="hidden_states")
 
         values = jax.jit(states)(pretrained.variables, jnp.asarray(rows[:, :-1]))
         hidden[f"dew-{implementation}"] = np.asarray(jnp.asarray(values, jnp.float32))
         if table is None:
             head = model.apply(pretrained.variables, method="output_table")
+            if isinstance(head, tuple):
+                raise TypeError("output_table applied without mutable collections returned its variables too")
             table = jnp.asarray(head.matrix.T if head.vocab_major else head.matrix, jnp.bfloat16)
 
+    if table is None:
+        raise ValueError("no implementation was loaded to read the output table from")
     width = next(iter(hidden.values())).shape[-1]
     # A tied head is the embedding table, [vocab, width]; a Dense kernel is [width, vocab].
     kernel = table.T if table.shape[-1] == width and table.shape[0] != width else table

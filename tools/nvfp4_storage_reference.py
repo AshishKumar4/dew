@@ -25,6 +25,7 @@ transformers 5.16.1, compressed-tensors 0.17.1, diffusers 0.34.0. Run:
         tools/nvfp4_storage_reference.py
 """
 
+from typing import Any
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +42,7 @@ from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 from _dew_torch.precision import float64, float64_twin
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "storage"
-ARGS = {
+ARGS: dict[str, Any] = {
     "fp8": {"num_bits": 8, "type": "float", "strategy": "tensor", "symmetric": True},
     "nvfp4": {"num_bits": 4, "type": "float", "strategy": "tensor_group", "group_size": 16,
               "symmetric": True},
@@ -133,7 +134,7 @@ def checkpoint(kind: str) -> None:
     with float64(), torch.no_grad():
         truth = exact(ids, use_cache=False).logits.numpy()
     np.savez(directory / "reference.npz", ids=ids.numpy(), logits=reference, logits_f64=truth,
-             published_logits=published, **decoded)
+             published_logits=published, allow_pickle=False, **decoded)
     print(kind, "reference RMS from float64", float(np.sqrt(np.mean((reference - truth) ** 2))))
 
 

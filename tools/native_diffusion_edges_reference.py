@@ -9,6 +9,7 @@ Run in the isolated reference environment on CPU:
   python tools/native_diffusion_edges_reference.py reload SOURCE EXPORTED
 No model or source downloads. The reload command executes actual source pipelines.
 """
+from typing import Any
 import argparse
 import json
 import sys
@@ -17,14 +18,12 @@ from pathlib import Path
 import diffusers
 import numpy as np
 import torch
-from diffusers import (
-    DDIMScheduler,
-    DiffusionPipeline,
-    DPMSolverMultistepScheduler,
-    EulerDiscreteScheduler,
-    PNDMScheduler,
-    UNet2DConditionModel,
-)
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
+from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
+from diffusers.schedulers.scheduling_pndm import PNDMScheduler
+from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 from diffusers_wan_reference import float64_scheduler
 from reference_releases import require
 
@@ -40,7 +39,7 @@ def generate(root):
     check_versions()
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    common = dict(num_train_timesteps=20, beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear")
+    common: dict[str, Any] = dict(num_train_timesteps=20, beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear")
     # 256 independent rows, so each walk's distance from float64 is an RMS over many roundings
     # rather than one draw.
     initial = torch.randn((256, 3), generator=torch.Generator().manual_seed(61), dtype=torch.float64) * 8
@@ -78,7 +77,7 @@ def generate(root):
             scheduler, trajectory = walk(torch.float64)
         arrays[name + ".betas.fp64"] = scheduler.betas.numpy()
         arrays[name + ".final.fp64"] = trajectory[-1]
-    np.savez_compressed(root / "schedulers.npz", **arrays)
+    np.savez_compressed(root / "schedulers.npz", allow_pickle=False, **arrays)
     torch.manual_seed(173)
     model = UNet2DConditionModel(sample_size=8, in_channels=4, out_channels=4,
         down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"),
@@ -107,7 +106,7 @@ def generate(root):
         arrays[name + ".context"] = context.numpy()
         arrays[name + ".time"] = time.numpy()
         arrays[name + ".probe"] = probe.numpy().transpose(0, 2, 3, 1)
-    np.savez_compressed(root / "unet_reference.npz", **arrays)
+    np.savez_compressed(root / "unet_reference.npz", allow_pickle=False, **arrays)
     print(json.dumps({"directory": str(root), "scheduler_cases": 5, "unet_cases": 2}))
 
 

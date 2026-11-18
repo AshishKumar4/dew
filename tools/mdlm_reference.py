@@ -183,7 +183,7 @@ def main() -> None:
                   reverse_categorical=(q / q.sum(-1, keepdim=True)).numpy())
     arrays["commit"] = np.array(COMMIT)
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE, **arrays)
+    np.savez(FIXTURE, allow_pickle=False, **arrays)
     recorded = record_case("nelbo", draw, lambda inputs: tuple(nelbo(reference, inputs, dtype)[1]
                                                                for dtype in (torch.float32, torch.float64)),
                            store_inputs=False, summary=True,

@@ -43,6 +43,7 @@ those masks:
 
 from __future__ import annotations
 
+from typing import Any
 import contextlib
 import json
 import sys
@@ -101,7 +102,7 @@ def adapter(case: str, settings: dict, out: Path):
 MASKS = "masks.npz"
 """The dropout case's keep masks, Dew's own (`dew_masks`), which the PEFT run reads."""
 
-SGD = {"lr": 0.1}
+SGD: dict[str, Any] = {"lr": 0.1}
 """The optimizer of the two training steps a case runs: torch's SGD, at a rate that moves the factors. Not
 AdamW: its second step divides by the root of its second moment, so a gradient entry that cancels
 carries its whole relative error into the step in both runs alike, and the factors it trained did not
@@ -200,7 +201,7 @@ def write_orders(out: Path) -> None:
                          variables={**decoder.variables, "params": variables["frozen"]})
             adapter.save(variables, out / case / str(k) / "adapter")
             if moved_masks is not None:
-                np.savez(out / case / str(k) / MASKS, **moved_masks)
+                np.savez(out / case / str(k) / MASKS, allow_pickle=False, **moved_masks)
         print(f"{out / case}: {len(drawn)} orders, residual branch inputs {sorted(residual_inputs)}")
 
 
@@ -303,7 +304,7 @@ def write_masks() -> None:
     adapter = LoRA.load(decoder.model, decoder.variables, FIXTURE / "dropout" / "adapter",
                         layouts=decoder.layouts)
     drawn = dew_masks(adapter, np.load(LLAMA / "input_ids.npy"))
-    np.savez(FIXTURE / "dropout" / MASKS, **drawn)
+    np.savez(FIXTURE / "dropout" / MASKS, allow_pickle=False, **drawn)
     print(f"{FIXTURE / 'dropout' / MASKS}: {len(drawn)} masks")
 
 
@@ -396,7 +397,7 @@ def main() -> None:
         for dtype in (torch.float32, torch.float64):
             tail = "_f64" if dtype == torch.float64 else ""
             arrays[f"loss{tail}"] = run(model, input_ids, dtype, drawn, rate)[f"loss{tail}"]
-        np.savez(FIXTURE / case / "reference.npz", **arrays)
+        np.savez(FIXTURE / case / "reference.npz", allow_pickle=False, **arrays)
         print(f"{FIXTURE / case}: loss {float(arrays['loss_f64']):.6f}")
 
 

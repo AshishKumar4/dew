@@ -200,12 +200,8 @@ def text_encoder(tok):
 
 
 def build_pipeline(root: Path):
-    from diffusers import (
-        AutoencoderKLQwenImage21,
-        FlowMatchEulerDiscreteScheduler,
-        QwenImage21Pipeline,
-        QwenImage21Transformer2DModel,
-    )
+    from diffusers import AutoencoderKLQwenImage21, QwenImage21Pipeline, QwenImage21Transformer2DModel
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
     directory = root / "pipeline"
     proc = processor()

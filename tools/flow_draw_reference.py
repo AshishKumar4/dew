@@ -33,7 +33,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import torch
-from diffusers import FlowMatchEulerDiscreteScheduler
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
 from recorded_draws import fixed_draws
 from reference_source import github, selected, simple_statements
@@ -116,7 +116,7 @@ def main() -> None:
                        f"{name}/arguments": np.frombuffer(json.dumps(arguments).encode(), np.uint8)})
         print(f"{name}: {arguments}")
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(FIXTURE, **arrays)
+    np.savez_compressed(FIXTURE, allow_pickle=False, **arrays)
     print(f"{FIXTURE}")
 
 

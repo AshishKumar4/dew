@@ -41,7 +41,7 @@ from typing import BinaryIO
 
 import numpy as np
 
-type Applied = Callable[[dict[str, object], dict[str, np.ndarray]], Mapping[str, object]]
+type Applied = Callable[[Mapping[str, object], dict[str, np.ndarray]], Mapping[str, object]]
 """The reference's run of a case: its parameters and inputs to its outputs by leaf."""
 
 
@@ -109,7 +109,7 @@ FRAME = struct.Struct("<Q")
 def send(stream: BinaryIO, arrays: Mapping[str, np.ndarray]) -> None:
     """`arrays` as one frame to the other end of a pipe (`received`)."""
     buffer = io.BytesIO()
-    np.savez(buffer, **arrays)
+    np.savez(buffer, allow_pickle=False, **arrays)
     stream.write(FRAME.pack(buffer.getbuffer().nbytes))
     stream.write(buffer.getvalue())
     stream.flush()
@@ -160,7 +160,7 @@ def serve(run: Callable[[dict[str, np.ndarray]], Mapping[str, np.ndarray]], read
     for line in requests:
         given, out = line.decode().split()
         with np.load(given) as cases:
-            np.savez(out, **run(dict(cases)))
+            np.savez(out, allow_pickle=False, **run(dict(cases)))
         answers.write(b"done\n")
         answers.flush()
 
@@ -236,7 +236,10 @@ class Session:
 
     def __init__(self, process: subprocess.Popen[bytes], script: str, directory: Path):
         self.process, self.script, self.directory = process, Path(script).name, directory
-        line = process.stdout.readline().decode().strip()
+        if process.stdin is None or process.stdout is None:
+            raise ValueError(f"{self.script}'s worker was started without its stdin and stdout piped")
+        self.stdin, self.stdout = process.stdin, process.stdout
+        line = self.stdout.readline().decode().strip()
         words = line.split(maxsplit=2)
         if words[:1] != ["ready"] or words[1:2] not in (["paths"], ["frames"]):
             raise self._ended("did not say it was ready", line)
@@ -263,15 +266,15 @@ class Session:
         return answer
 
     def _framed(self, arrays: Mapping[str, np.ndarray]) -> dict[str, np.ndarray] | None:
-        send(self.process.stdin, arrays)
-        return received(self.process.stdout)
+        send(self.stdin, arrays)
+        return received(self.stdout)
 
     def _by_paths(self, arrays: Mapping[str, np.ndarray]) -> dict[str, np.ndarray] | None:
         given, out = self.directory / "in.npz", self.directory / "out.npz"
-        np.savez(given, **arrays)
-        self.process.stdin.write(f"{given} {out}\n".encode())
-        self.process.stdin.flush()
-        reply = self.process.stdout.readline()
+        np.savez(given, allow_pickle=False, **arrays)
+        self.stdin.write(f"{given} {out}\n".encode())
+        self.stdin.flush()
+        reply = self.stdout.readline()
         if not reply:
             return None
         if reply != b"done\n":

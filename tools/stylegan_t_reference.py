@@ -59,7 +59,7 @@ def written() -> None:
     with torch.no_grad():
         arrays["logits"] = head(x, c)[:, 0].numpy()[:, None]
     FIXTURE.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE / "head.npz", **arrays)
+    np.savez(FIXTURE / "head.npz", allow_pickle=False, **arrays)
     print(f"{FIXTURE}: a DiscHead over {BATCH} sequences of {LENGTH} tokens, {sorted(arrays)}")
 
 

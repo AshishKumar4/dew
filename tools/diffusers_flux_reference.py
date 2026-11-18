@@ -22,6 +22,7 @@ Run in the isolated reference environment on CPU:
 
 from __future__ import annotations
 
+from typing import Any
 import json
 import os
 import sys
@@ -69,7 +70,7 @@ CASES: dict[str, Case] = {
 def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     """The case's saved transformer and its walk in float32 and in float64
     (`fp64.`), the same weights and inputs widened."""
-    from diffusers import FluxPipeline
+    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
     from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
 
     config = {**BASE, **case.config}
@@ -132,7 +133,7 @@ def reload(directory: str, recorded: str) -> None:
     loaded from those files and the actual transformer recomputes the forward
     the native model computed with the trained weights.
     """
-    from diffusers import FluxPipeline
+    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 
     arrays = np.load(recorded)
     pipe = FluxPipeline.from_pretrained(directory, torch_dtype=torch.float32,
@@ -174,7 +175,7 @@ def main(destination: str) -> None:
                        "batch": case.batch, "guidance": list(case.guidance[: case.batch])}
     import inspect
 
-    from diffusers import FluxPipeline
+    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 
     defaults = inspect.signature(FluxPipeline.__call__).parameters
     arrays.update(pipeline_record(root))
@@ -183,7 +184,7 @@ def main(destination: str) -> None:
                           "default_steps": defaults["num_inference_steps"].default,
                           "default_guidance": defaults["guidance_scale"].default,
                           "true_cfg": defaults["true_cfg_scale"].default}
-    np.savez_compressed(root / "flux_transformer.npz", **arrays)
+    np.savez_compressed(root / "flux_transformer.npz", allow_pickle=False, **arrays)
     (root / "flux_transformer.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB, {len(CASES)} cases")
@@ -191,7 +192,7 @@ def main(destination: str) -> None:
 
 # The pipeline half: one tiny Flux pipeline, saved the way a published
 # checkpoint is saved and walked through its own call.
-PIPELINE = dict(BASE, guidance_embeds=True, num_layers=1, num_single_layers=1)
+PIPELINE: dict[str, Any] = dict(BASE, guidance_embeds=True, num_layers=1, num_single_layers=1)
 PROMPTS = [{"text": "a red cat", "second": "a green bird"},
            {"text": "tiny photo", "second": "a blue dog"}]
 PIPELINE_SIZE = 16
@@ -199,7 +200,9 @@ SEQUENCE = 512
 
 
 def build_pipeline(root: Path):
-    from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, FluxPipeline
+    from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
     from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
     from transformers import CLIPTextConfig, CLIPTextModel, T5Config, T5EncoderModel
 
@@ -239,7 +242,7 @@ def build_pipeline(root: Path):
 def pipeline_record(root: Path) -> dict[str, np.ndarray]:
     """The prompt states and the unmodified call's walk from fixed latents, in
     float32 and, the saved pipeline loaded widened, in float64 (`fp64.`)."""
-    from diffusers import FluxPipeline
+    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 
     pipe, directory = build_pipeline(root)
     prompts = [row["text"] for row in PROMPTS]

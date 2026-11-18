@@ -107,7 +107,7 @@ def write_release() -> None:
     directory = FIXTURES / 'qwen3.8-flash-next'
     write_released_config(directory.name, *RELEASE)
     config = json.loads((directory / 'config.json').read_text())
-    np.savez(directory / 'release_ple_ids.npz', **release_ple_ids(config))
+    np.savez(directory / 'release_ple_ids.npz', allow_pickle=False, **release_ple_ids(config))
     print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
 
 

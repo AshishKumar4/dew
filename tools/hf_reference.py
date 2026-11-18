@@ -1200,7 +1200,7 @@ def write_gemma4_mm_tiny() -> None:
     merged = wrapper_tensors({"model.vision_tower": system["tower"],
                                "model.embed_vision": system["projector"]}, text.state_dict())
     text_config = dict(GEMMA4_MM_TEXT, model_type="gemma4_text")
-    tokens = {"boi_token_id": 61, "eoi_token_id": 62, "image_token_id": G4V_IMAGE}
+    tokens: dict[str, Any] = {"boi_token_id": 61, "eoi_token_id": 62, "image_token_id": G4V_IMAGE}
     ids = np.array([[60, 60, 60, 60, 9], [2, 60, 60, 60, 60]], np.int32)
     config = Gemma4Config(text_config=text_config, vision_config=system["vconf"], audio_config=None, **tokens)
     logits = wrapper_logits(Gemma4ForConditionalGeneration, config, merged, input_ids=ids,
@@ -1232,7 +1232,7 @@ def write_qwen35_mm_tiny() -> None:
     scatter_weights(text, seed=4321)
     merged = wrapper_tensors({"model.visual": system["tower"]}, text.state_dict())
     text_config = dict(QWEN35_MM_TEXT, model_type="qwen3_5_text")
-    tokens = {"image_token_id": QWEN_VISION_IMAGE, "video_token_id": 201,
+    tokens: dict[str, Any] = {"image_token_id": QWEN_VISION_IMAGE, "video_token_id": 201,
               "vision_start_token_id": 202, "vision_end_token_id": 203}
     ids = np.array([[2, 200, 200, 200, 200], [200, 200, 200, 200, 9]], np.int32)
     config = Qwen3_5Config(text_config=text_config, vision_config=system["vconf"].to_dict(), **tokens)

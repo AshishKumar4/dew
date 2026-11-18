@@ -151,7 +151,7 @@ def saved_fixture(path: Path, arrays: dict, meta: dict) -> None:
 
     arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(path, **arrays)
+    np.savez_compressed(path, allow_pickle=False, **arrays)
 
 
 def git_head(path: str | Path) -> str:

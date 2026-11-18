@@ -89,7 +89,7 @@ def twice(walk, model) -> dict[str, np.ndarray]:
 
 def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     """The case's saved transformer and its walk in float32 and in float64."""
-    from diffusers import Flux2Transformer2DModel
+    from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DModel
 
     config = {**BASE, **case.config}
     torch.manual_seed(SEED)
@@ -138,7 +138,8 @@ def build_vae(name: str, root: Path) -> dict[str, np.ndarray]:
     it: `_encode_vae_image` (posterior mode, 2x2 fold, batch-norm
     normalization) and the call's decode (the inverse, then `vae.decode`),
     with the gradients of fixed probes against the pixels and the latent."""
-    from diffusers import AutoencoderKLFlux2, Flux2Pipeline
+    from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
+    from diffusers.pipelines.flux2.pipeline_flux2 import Flux2Pipeline
 
     torch.manual_seed(SEED)
     model = AutoencoderKLFlux2(**VAE, **VAES[name]).eval()
@@ -187,7 +188,7 @@ def smooth_image() -> np.ndarray:
 
 def published_vae():
     """The published VAE (`PUBLISHED_VAE`), downloaded, on the CPU."""
-    from diffusers import AutoencoderKLFlux2
+    from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
 
     return AutoencoderKLFlux2.from_pretrained(PUBLISHED_VAE[0], subfolder="vae", revision=PUBLISHED_VAE[1]).eval()
 
@@ -195,7 +196,7 @@ def published_vae():
 def published_walk(model, dtype) -> dict[str, np.ndarray]:
     """`model`'s (the published VAE's) pipeline latent of `smooth_image()` and its decode's top-left `CROP`
     pixels at `dtype`, on the device `model` is on."""
-    from diffusers import Flux2Pipeline
+    from diffusers.pipelines.flux2.pipeline_flux2 import Flux2Pipeline
 
     device = next(model.parameters()).device
     with torch.no_grad():
@@ -214,7 +215,7 @@ def published(destination: str) -> None:
     and in float64 (`.fp64`), for `tests/fixtures/flux2_published.npz`."""
     arrays = {key.replace("fp64.vae.", "vae.") + (".fp64" if key.startswith("fp64.") else ""): value
               for key, value in twice(published_walk, published_vae()).items()}
-    np.savez_compressed(destination, **arrays)
+    np.savez_compressed(destination, allow_pickle=False, **arrays)
     print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
 
@@ -241,12 +242,10 @@ def text_encoder(tok):
 
 
 def build_pipeline(root: Path):
-    from diffusers import (
-        AutoencoderKLFlux2,
-        FlowMatchEulerDiscreteScheduler,
-        Flux2KleinPipeline,
-        Flux2Transformer2DModel,
-    )
+    from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+    from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline
+    from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DModel
     from make_tiny_tokenizer import qwen_byte_tokenizer
 
     tok = qwen_byte_tokenizer(json.loads((SOURCE / "tokenizer" / "tokenizer_config.json").read_text()),
@@ -331,7 +330,7 @@ def mistral_tokenizer():
 
 
 def build_mistral3(root: Path) -> dict[str, np.ndarray]:
-    from diffusers import Flux2Pipeline
+    from diffusers.pipelines.flux2.pipeline_flux2 import Flux2Pipeline
     from transformers import AutoModelForImageTextToText, Mistral3Config
 
     tok = mistral_tokenizer()
@@ -373,7 +372,7 @@ def main(destination: str) -> None:
                            "width": WIDTH, "steps": STEPS}, "tokens": TOKENS, "seed": SEED,
               "cases": {name: {"config": {**BASE, **case.config}, "grid": list(case.grid),
                                "guidance": list(case.guidance)} for name, case in CASES.items()}}
-    np.savez_compressed(root / "flux2_transformer.npz", **arrays)
+    np.savez_compressed(root / "flux2_transformer.npz", allow_pickle=False, **arrays)
     (root / "flux2_transformer.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB, {len(CASES)} cases")

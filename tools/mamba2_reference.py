@@ -113,7 +113,8 @@ def write_ssd() -> None:
     arrays = scan_fixture(generator)
     layer, geometry = layer_fixture(generator)
     arrays.update(layer)
-    np.savez(SSD / "ssd.npz", **{name: tensor.detach().numpy() for name, tensor in arrays.items()})
+    np.savez(SSD / "ssd.npz", allow_pickle=False,
+             **{name: tensor.detach().numpy() for name, tensor in arrays.items()})
     (SSD / "config.json").write_text(json.dumps(geometry, indent=2) + "\n")
     print(f"{SSD / 'ssd.npz'}: {(SSD / 'ssd.npz').stat().st_size / 1e3:.0f} kB")
 
@@ -151,7 +152,7 @@ def write_float64() -> None:
     for name, tensor in wides.items():
         assert tensor.dtype == torch.float64, f"{name} left float64"
         arrays[f"{name}_f64"] = tensor.detach().numpy()
-    np.savez(SSD / "ssd.npz", **arrays)
+    np.savez(SSD / "ssd.npz", allow_pickle=False, **arrays)
     print(f"{SSD / 'ssd.npz'}: {len(wides)} float64 outputs")
 
 

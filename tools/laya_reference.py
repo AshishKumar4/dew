@@ -205,7 +205,8 @@ def main() -> None:
 
         directory = Path(snapshot_download(LAYA_REPO, revision=LAYA_REVISION, allow_patterns=[
             "model.safetensors", "encoder/*", "tokenizer/*", "rl_agent_config.json"]))
-        np.savez(FIXTURES / "real" / "logits.npz", **references(directory, FIXTURES / "real"))
+        np.savez(FIXTURES / "real" / "logits.npz", allow_pickle=False,
+                 **references(directory, FIXTURES / "real"))
         (FIXTURES / "real" / "source.json").write_text(
             json.dumps({"repo": LAYA_REPO, "revision": LAYA_REVISION}) + "\n")
     print(sorted(path.name for path in FIXTURES.rglob("*") if path.is_file()), file=sys.stderr)

@@ -26,7 +26,7 @@ import json
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -34,7 +34,6 @@ import numpy as np
 import optax
 from common import (
     TracedWindow,
-    WorkloadWork,
     attach_xplane_profile,
     device_memory,
     documents,
@@ -51,6 +50,9 @@ from common import (
     write_record,
 )
 from reference_source import dew_revision
+
+if TYPE_CHECKING:
+    from dew.telemetry.workload import WorkloadWork
 
 
 def arguments() -> argparse.Namespace:
@@ -92,7 +94,7 @@ class Run:
     total: int
     schedule_steps: int
     compile_seconds: float
-    work: WorkloadWork
+    work: "WorkloadWork"
 
 
 def build(args: argparse.Namespace) -> Run:

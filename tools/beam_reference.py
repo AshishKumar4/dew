@@ -124,7 +124,7 @@ def write(name: str) -> None:
     print(f"{name}: EOS {eos}, pad {pad}, {ended} of {len(SETTINGS) * len(ids) * WIDTH} beams end on EOS")
     if not ended:
         raise SystemExit(f"{name}: no beam ends on EOS")
-    np.savez(FIXTURES / name / "beam.npz", **arrays)
+    np.savez(FIXTURES / name / "beam.npz", allow_pickle=False, **arrays)
 
 
 def main() -> None:

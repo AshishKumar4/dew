@@ -208,7 +208,7 @@ def _prediction(family: str, model, arrays: Mapping[str, np.ndarray], wide: bool
         output = model(hidden_states=tensor("latent").permute(0, 3, 1, 2), encoder_hidden_states=context,
                        pooled_projections=tensor("pooled"), timestep=times, return_dict=False)[0]
         return output.permute(0, 2, 3, 1).numpy()
-    from diffusers import FluxPipeline
+    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 
     # FLUX's own 2x2 latent packing, its inverse and its patches' ids, over Dew's channels-last latent.
     _, height, width, channels = latent.shape

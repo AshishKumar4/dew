@@ -142,7 +142,7 @@ def checkpoint(e4m3: bool) -> None:
         module.quantization_enabled = False
     with torch.no_grad():
         arrays["weight_only_logits"] = model(ids, use_cache=False).logits.numpy()
-    np.savez(directory / "reference.npz", **arrays)
+    np.savez(directory / "reference.npz", allow_pickle=False, **arrays)
     rms = float(np.sqrt(np.mean((reference - arrays["logits_f64"]) ** 2)))
     apart = float(np.sqrt(np.mean((reference - arrays["weight_only_logits"]) ** 2)))
     print(directory.name, "reference RMS from float64", rms,

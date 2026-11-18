@@ -88,7 +88,7 @@ def main() -> None:
         landed[f"grad{suffix}"] = offset.grad.numpy()
     gd._extract_into_tensor = published_read
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out, **landed)
+    np.savez(out, allow_pickle=False, **landed)
     print(f"{out}: loss {landed['loss_f64']}")
 
 

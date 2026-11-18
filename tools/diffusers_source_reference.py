@@ -529,7 +529,7 @@ def rounding(destination: Path) -> None:
             distances.append(distance(single, moved(truth)))
     arrays["orders"] = drawn.astype(np.uint8)
     arrays[f"{name}.distances"] = np.asarray(distances)
-    np.savez_compressed(destination, **arrays)
+    np.savez_compressed(destination, allow_pickle=False, **arrays)
     print(f"{destination}: {ORDERS} pixel orders")
 
 
@@ -720,7 +720,7 @@ def main(only: Sequence[str] = ()) -> None:
         for key, value in brownian_record().items():
             arrays[f"brownian.{key}"] = value
         print(f"brownian: torchsde tree over {arrays['brownian.bounds']}")
-    np.savez_compressed(FIXTURES / "source_schedulers.npz", **arrays)
+    np.savez_compressed(FIXTURES / "source_schedulers.npz", allow_pickle=False, **arrays)
     (FIXTURES / "source_schedulers.json").write_text(json.dumps(record, indent=1) + "\n")
     size = (FIXTURES / "source_schedulers.npz").stat().st_size
     print(f"{FIXTURES / 'source_schedulers.npz'}: {size / 1e3:.0f} kB, {len(CASES)} cases")

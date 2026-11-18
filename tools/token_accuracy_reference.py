@@ -134,8 +134,8 @@ def ties(statements) -> dict:
 def main() -> None:
     statements = accuracy_statements()
     FIXTURE.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE / "decoder.npz", **decoder(statements))
-    np.savez(FIXTURE / "ties.npz", **ties(statements))
+    np.savez(FIXTURE / "decoder.npz", allow_pickle=False, **decoder(statements))
+    np.savez(FIXTURE / "ties.npz", allow_pickle=False, **ties(statements))
     print(f"{FIXTURE}: decoder.npz and ties.npz")
 
 

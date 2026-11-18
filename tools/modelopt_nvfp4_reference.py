@@ -177,7 +177,7 @@ def tiny(*, mixed: bool = False) -> None:
             arrays[stem + "/qdq"] = author_qdq(probe, overall).cpu().numpy()
             arrays[stem + "/qdq_bf16"] = author_qdq(probe.bfloat16(), overall).float().cpu().numpy()
             arrays[stem + "/sm89_qdq"] = author_qdq(probe, overall, corrected=False).cpu().numpy()
-    np.savez(directory / "reference.npz", **arrays)
+    np.savez(directory / "reference.npz", allow_pickle=False, **arrays)
     print("tiny", directory, "reference RMS", float(np.sqrt(np.mean(
         (arrays["logits"] - arrays["logits_f64"]) ** 2))))
     differences = {stem: int(np.count_nonzero(

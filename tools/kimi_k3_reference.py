@@ -387,7 +387,7 @@ def write_truth(directory: Path, truth: Callable[[Path], dict[str, np.ndarray]])
                   f"and {np.sqrt(np.mean(np.square(recorded - exact))):.3e} (rms) from float64")
         print(f"{directory.name} loss: float64 {arrays['loss_f64']:.9f}, "
               f"the reference {float(stored['loss']):.9f}")
-    np.savez(directory / "numerics.npz", **arrays, precision="ieee")
+    np.savez(directory / "numerics.npz", allow_pickle=False, **arrays, precision="ieee")
 
 
 def orders(drawn: Path) -> None:
