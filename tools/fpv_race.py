@@ -55,7 +55,7 @@ import numpy as np
 from flax import serialization, traverse_util
 
 from dew._files import write_atomically
-from dew._records import JSON
+from dew._records import JSON, integer, real
 from dew.checkpoints import Checkpoints, Keep
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig, TeacherConfig
@@ -155,17 +155,6 @@ def warmed(path: Path, objective):
             grown[:held.shape[0]] = held
             fresh[name] = grown
     return serialization.from_state_dict(new, traverse_util.unflatten_dict(fresh))
-
-
-def counts(arguments, *names: str) -> tuple[int, ...]:
-    """The counts a rollout's `arguments` hold under `names`, refused where one is no count."""
-    counted: list[int] = []
-    for name in names:
-        value = arguments[name]
-        if not isinstance(value, int):
-            raise TypeError(f"a rollout states {name}={value!r}, not a count")
-        counted.append(value)
-    return tuple(counted)
 
 
 def _latest(directory: Path) -> int:
@@ -322,7 +311,9 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
             prepared.objective.variables = warmed(warm, prepared.objective)
         state = prepared.train(TEACHER_RUN)
         updates, objective = int(state.step), prepared.objective
-        epochs, minibatches, length = counts(run.rollout.arguments, "epochs", "minibatches", "unroll_length")
+        held = run.rollout.arguments
+        epochs, minibatches, length = (integer(held[name], name) for name in ("epochs", "minibatches",
+                                                                             "unroll_length"))
         point = {"updates": updates, "seconds": round(time.perf_counter() - began, 1),
                  "environment_steps": updates // (epochs * minibatches) * drones * length, "level": level,
                  **flown(judged_at(level, families_at(level)), objective, state.variables, jax.random.key(1),
@@ -526,10 +517,8 @@ def world(world: World, *, pretrain_updates: int = 50_000, dagger_updates: int =
                                   jax.random.key(4))
         write_atomically(path, json.dumps(report, indent=1))
     collecting = world.run("online", level).rollout.arguments
-    ratio = collecting["train_ratio"]
-    if not isinstance(ratio, int | float):
-        raise TypeError(f"the online run's rollout states no train_ratio: {ratio!r}")
-    batch, length = counts(collecting, "batch", "length")
+    ratio = real(collecting["train_ratio"], "train_ratio")
+    batch, length = integer(collecting["batch"], "batch"), integer(collecting["length"], "length")
     online = int(round(environment_seconds * world.hz) * ratio / (batch * length))
     filmed = {"pretrain": "cloned.npz", "dagger": "dagger.npz", "online": "video.npz"}
     for stage, updates, every in zip(STAGES, (pretrain_updates, dagger_updates, online), (None, 2000, 10_000),
