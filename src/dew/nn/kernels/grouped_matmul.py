@@ -1723,20 +1723,20 @@ class GroupedCase:
     """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run on its
     target (`placed`: a GPU of sm80 on, or a TPU; the template's dispatch runs in the branch its platform
     places), whether they see its operands whole (`whole`,
-    `dew.nn.sharding.seen_whole`), the `product` it declares, its `rows`, its launches bound to it
+    `dew.nn.sharding.seen_whole`), the `product` it declares, its `extents`, its launches bound to it
     (`call`) and the `kind` of call it is (`Kind`, as `gmm_call` and `tgmm_call` state it), which with the
     device's instruction family is its cell (`DECLARED`)."""
 
     placed: bool
     whole: bool
     product: Product
-    rows: int
     call: base.Call
     kind: Kind
+    extents: tuple[int, int, int]
+    """Its product's rows, depth and width (`_extents_of`): a kernel gradient's rows the ones it sums over,
+    a product's those it walks (`_rows_of`)."""
     paired: bool = False
     """Whether it multiplies its rows by a second matrix beside the first (`gmm_call`'s `paired`)."""
-    extents: tuple[int, int, int] = (1, 1, 1)
-    """Its product's rows, depth and width (`_extents_of`): a kernel gradient's rows the ones it sums over."""
 
     @property
     def gathered(self) -> bool:
@@ -1950,7 +1950,8 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     scattered = launches is not _TGMMS and len(arguments) > 8 and arguments[8] is not None
     call = base.call(launches, *arguments, **options)
     matrix = _matrix_of(launches, arguments) if options['dense'] else None
-    rows = _rows_of(launches, arguments)
+    extents = _extents_of(launches, arguments, options)
+    rows = extents[0]
     # A left operand a prologue forms (a norm's, fused by the algebra's recognition) is a cell of its own
     # where a receipt timed it formed; elsewhere it is its matrix's cell as any call's (train 977 F1: the
     # 4B's normed projections keep the template FOUR_B's receipts measured).
@@ -1969,8 +1970,7 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     # A pair, or matrices side by side: Mosaic GPU's launch alone takes either (`_takes_pair`).
     paired = any(bound.arguments.get('paired') is not None or bound.arguments.get('beside')
                  for _, bound in call.bound.values())
-    return GroupedCase(placed, whole, product, rows, call, kind, paired=paired,
-                       extents=_extents_of(launches, arguments, options))
+    return GroupedCase(placed, whole, product, call, kind, extents, paired=paired)
 
 
 def _matrix_of(launches, arguments) -> tuple[int, int]:

@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, SUMS_IN_IEEE, generations, lowers, runs
+from generation_support import COMPILES_ON_CPU, INTERPRETS, SUMS_IN_IEEE, generations, lowers, runs
 from jax.experimental.pallas import fuser
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import as_given, assert_as_exact, with_gradients
@@ -2441,6 +2441,7 @@ def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_its_float64
     assert float(product.interpreted(declared, lhs, rhs, (((1,), (0,)), ((), ())))[0, 0]) == 1.0
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "family"), [("sm80", "mma.sync"), ("sm90", "wgmma"),
                                                          ("sm100", "tcgen05")])
 @pytest.mark.parametrize("product", ["forward", "kernel gradient"])

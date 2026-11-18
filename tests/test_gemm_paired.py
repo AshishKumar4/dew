@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import generations, lowers, runs
+from generation_support import COMPILES_ON_CPU, generations, lowers, runs
 from jax.sharding import Mesh
 from reference_error import assert_as_exact, with_gradients
 from test_gemm_template import CASES, SEEDS, _dew, _draw, _drop, _rounded_through
@@ -486,4 +486,32 @@ def test_a_matrix_of_no_columns_side_by_side_has_an_empty_output_in_its_place(ke
     assert none.shape == (128, 0) and d_empty.shape == (128, 0)
     for got, want in ((out, expected), (d_rows, d_rows_alone), (d_matrix, d_matrix_alone)):
         np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(want, np.float32))
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("dense", [True, False], ids=["dense", "grouped"])
+def test_matrices_side_by_side_compile_for_an_h100_within_its_resources(dense):
+    """Three matrices side by side (widths 512, 128, 128) in one launch on an H100's rings, compiled by Mosaic
+    for a compile-only H100 through ptxas: within its resources, no register spilled, a dense call's L2
+    prefetch of each program's first tile reading that tile's own matrix (`BesideRefs.columns`), a grouped
+    call's none."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 4, 1, warpgroups=2, family="wgmma")
+    groups = 1 if dense else 3
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    operands = (shaped((4096, 2048)), *(shaped((groups, 2048, width)) for width in (512, 128, 128)),
+                jax.ShapeDtypeStruct((groups,), jnp.int32))
+
+    def launch(rows, first, second, third, sizes):
+        return mosaic_gpu.gmm(rows, first, None if dense else sizes, tiles=tiles, transpose_rhs=False,
+                              out_dtype=jnp.bfloat16, multiprocessors=132, dense=dense,
+                              beside=(second, third))
+
+    case = KernelCase(f"matrices side by side {'dense' if dense else 'grouped'}", lambda: (launch, operands))
+    with generation.assumed("sm90"):
+        found = compile_mosaic_kernels([case], "sm90")
+    assert found and all(record.get("kernels") for record in found), found
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 

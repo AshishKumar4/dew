@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import gemm, generation, grouped_launch, grouped_matmul, tuning
@@ -216,6 +216,7 @@ def tcgen05s_epilogues_hold_check_1_on_blackwell(case, tiles):
                     f"{case} at {tiles} on Blackwell", seeds=SEEDS, truth_fn=_plain(case, truth=True))
 
 
+@COMPILES_ON_CPU
 def test_tcgen05s_mainloop_compiles_for_a_b200_within_its_resources():
     """The shared mainloop at each tcgen05 tile, its deepest rings' (`DEEP`) and a pair's (`PAIRED`, each
     CTA's accumulators 256 columns), with a bias epilogue, compiled by Mosaic for a compile-only B200 on this
@@ -246,6 +247,7 @@ def test_tcgen05s_mainloop_compiles_for_a_b200_within_its_resources():
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
+@COMPILES_ON_CPU
 def test_an_eight_slot_kernel_gradient_compiles_within_its_predicates():
     """The dense kernel gradient (`mosaic_gpu.tgmm`) on an eight-slot tcgen05 ring (`DEEP`'s second), into
     fp32 and bf16, compiled by Mosaic for a compile-only B200 through ptxas: no spill, where its ring's
@@ -287,6 +289,7 @@ def _pair_gradient(out_dtype, *, k_major: bool = False, rows: int = 4096, depth:
     return product, shapes
 
 
+@COMPILES_ON_CPU
 def test_a_pairs_dense_kernel_gradient_compiles_for_a_b200_within_its_resources():
     """The dense kernel gradient on a pair (`_pair_gradient`), into fp32 and bf16, its operands laid
     rows-major and rows-contiguous, compiled by Mosaic for a
@@ -448,6 +451,7 @@ def _gated_product(tile):
     return product, shapes
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("tile", [dataclasses.replace(TILE, block_n=64),
                                   dataclasses.replace(PAIRED, block_n=64)], ids=["one CTA", "pair"])
 def test_a_gated_mlp_runs_as_one_paired_product_on_tcgen05_within_its_resources(tile):
