@@ -136,8 +136,8 @@ def test_check_refuses_a_large_recording_in_git_and_a_pin_not_uploaded_or_not_wh
 
 
 def _on_the_hub(store, tmp_path, monkeypatch) -> tuple[Path, Path, Path, list]:
-    """An uploaded recording's checkout, its stored file, the Hub's copy `hf_hub_download` answers with, and each
-    download it was asked for (repo, path, where)."""
+    """An uploaded recording's checkout, its stored file, the Hub's copy `hf_hub_download` answers with, and
+    each download it was asked for (repo, path, where)."""
     import huggingface_hub
 
     root = _checkout(tmp_path)

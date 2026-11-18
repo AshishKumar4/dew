@@ -1316,25 +1316,11 @@ def afforded(python: str, tests: list[str], group: str, kept: Container[str],
     return fitting, stale_rows
 
 
-def fetched_absent(python: str, deadline: float) -> float:
-    """The fixtures this commit pins and its environment's store lacks fetched, within `deadline` seconds, and
-    the seconds that took, which the task's own deadline loses: the environment holds the pins of the
-    commit it was built at, and its key reads no pin (tools/armada/install.sh). Where it lacks none, as for
-    a commit that moves no pin, nothing is started. A fetch that fails or outlasts `deadline` raises, the
-    task red with its reason, before any test or collection reads a fixture it lacks."""
-    began = time.monotonic()
-    if digests.fetched.absent(Path.cwd()):
-        subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch", "--absent"],
-                       check=True, timeout=deadline)
-    return time.monotonic() - began
-
-
 def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     """Import `tests` under `python` without running them and write one verdict row a file: red
     where collecting it errs or skips on a missing import, which running it would have."""
     began = time.monotonic()
-    command = [f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-rs",
-               *tests]
+    command = [f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-rs", *tests]
     done = subprocess.run(command, capture_output=True, text=True, timeout=deadline)
     output = done.stdout + done.stderr
     errors = dict.fromkeys(re.findall(r"ERROR collecting (tests/\S+\.py)", output), "")
@@ -2491,8 +2477,7 @@ def main() -> int:
         print(json.dumps({"include": plan(args.target, json.loads(args.timings.read_text())
                                           if args.timings.is_file() else {}, census=args.census)}))
         return 0
-    # A collection imports fixtures as a run reads them (a module-level recording), so both fetch first.
-    deadline = args.deadline - fetched_absent(args.python, args.deadline)
+    deadline = args.deadline - digests.fetched_absent(args.python, args.deadline)  # before a run reads them
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, deadline)
     return task(args.python, args.tests.split(), args.split, args.out, deadline, args.cache,

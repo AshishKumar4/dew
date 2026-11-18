@@ -11,6 +11,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
+import time
 import types
 from pathlib import Path
 
@@ -31,6 +33,19 @@ def _loaded(path: Path, name: str) -> types.ModuleType:
 followed = _loaded(Path(__file__).resolve().with_name("followed.py"), "armada_followed")
 fetched = _loaded(Path(__file__).resolve().parents[1] / "fetched_fixtures.py", "armada_fetched_fixtures")
 """tools/fetched_fixtures.py, whose `manifest` says where a fetched fixture's pin is."""
+
+
+def fetched_absent(python: str, deadline: float) -> float:
+    """The fixtures this commit pins and its environment's store lacks fetched, within `deadline` seconds, and
+    the seconds that took, which the task's own deadline loses (ci.py's `main`): the environment holds the
+    pins of the commit it was built at, and its key reads no pin (tools/armada/install.sh). Where it lacks
+    none, as for a commit that moves no pin, nothing is started. A fetch that fails or outlasts `deadline`
+    raises, the task red with its reason, before any test or collection reads a fixture it lacks."""
+    began = time.monotonic()
+    if fetched.absent(Path.cwd()):
+        subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch", "--absent"],
+                       check=True, timeout=deadline)
+    return time.monotonic() - began
 
 
 def code_of(name: str) -> bytes:

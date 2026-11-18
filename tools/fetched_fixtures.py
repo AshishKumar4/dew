@@ -313,10 +313,10 @@ def absent(root: Path = REPO_ROOT) -> dict[str, dict]:
 
 
 def fetch(root: Path = REPO_ROOT, only_absent: bool = False) -> None:
-    """Every pinned file into the local store, each checked against its pin; one already there and
-    whole is kept. With `only_absent`, those the store lacks (`absent`), one there kept unread. An armada
-    task fetches so (tools/armada/ci.py's `task`): its environment holds the pins of the commit it was
-    built at, and only a pin its own commit adds or moves goes over the network."""
+    """Every pinned file into the local store, each checked against its pin; one already there and whole is
+    kept. With `only_absent`, those the store lacks (`absent`), one there kept unread. An armada task
+    fetches so (tools/armada/digests.py's `fetched_absent`): its environment holds the pins of the commit
+    it was built at, and only a pin its own commit adds or moves goes over the network."""
     for name, pin in (absent(root) if only_absent else pins(root)).items():
         stored = _stored(pin, root)
         if not only_absent and stored.is_file() and digest(stored.read_bytes()) == pin["sha256"]:
