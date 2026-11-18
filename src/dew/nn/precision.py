@@ -1368,14 +1368,30 @@ def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
     return jnp.where(biased == 0xFF, x.astype(jnp.float32), rounded)
 
 
+_SPLIT_BITS = {jnp.dtype(jnp.float64): (np.uint64, 27), jnp.dtype(jnp.float32): (np.uint32, 12),
+               jnp.dtype(jnp.bfloat16): (np.uint16, 4), jnp.dtype(jnp.float16): (np.uint16, 6)}
+"""Each float's significand split for `two_product`'s `bit_split`: its unsigned bits and the low bits masked,
+`p - floor(p / 2)` of its `p`, so its high part holds `floor(p / 2)` bits. An even `p`'s truncated remainder
+holds the other half (fp32's 12, bfloat16's 4); an odd `p`'s would hold one bit more (float64's 27, float16's
+6), its low parts' product past `p` bits, so the cut rounds to nearest there, its remainder signed and at most
+half the high part's last bit: every product of two parts exact (Dekker's)."""
+
+
+def _odd(dtype) -> bool:
+    """Whether a float's significand holds an odd count of bits (`_SPLIT_BITS`' rounded cut)."""
+    return (jnp.finfo(dtype).nmant + 1) % 2 == 1
+
+
 @_protected
 def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
                 rounding: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
     """Dekker's rounded product and its residual, with a Veltkamp significand split.
 
-    Guidance keeps the multiply split, which also supports float64. `bit_split`
-    truncates fp32 significands instead, avoiding splitter overflow in norm
-    interpretation and quantizer division; near underflow the splits differ.
+    Guidance keeps the multiply split. `bit_split` truncates the significands
+    instead (`_SPLIT_BITS`: a float's low half of its bits masked, fp32's 12,
+    float64's 27, a 16-bit float's), with no splitter to overflow: the multiply
+    split's `2^(p/2) + 1` overflowed past 2^115 in fp32 and 2^996 in float64
+    (base reviews 9bc4326dd F1, 1fe546a10 F1); near underflow the splits differ.
     `subtract` keeps division's subtractive residual order and its signed zeros.
     Norm interpretation passes `optimization_barrier` as `rounding` to keep each
     product and residual step separate; the other callers allow fusion.
@@ -1392,14 +1408,28 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
             high = (constant.view(np.uint32) & np.uint32(0xfffff000)).view(np.float32)
             return jnp.asarray(high), jnp.asarray(constant - high)
         if bit_split:
-            bits = jax.lax.bitcast_convert_type(value, jnp.uint32) & jnp.uint32(0xfffff000)
-            high = jax.lax.bitcast_convert_type(bits, jnp.float32)
+            unsigned, low = _SPLIT_BITS[jnp.dtype(value.dtype)]
+            mask = np.array(~((1 << low) - 1) & np.iinfo(unsigned).max, unsigned)
+            bits = jax.lax.bitcast_convert_type(value, unsigned)
+            if _odd(value.dtype):
+                # Half the cut's last bit added to the magnitude's bits: the cut rounds to nearest.
+                bits = bits + np.array(1 << (low - 1), unsigned)
+            high = jax.lax.bitcast_convert_type(bits & mask, value.dtype)
         else:
             splitter = (1 << 27) + 1 if value.dtype == jnp.float64 else (1 << 12) + 1
             scaled = value * splitter
             high = scaled - (scaled - value)
         return high, rounded(value - high)
 
+    scale = None
+    if bit_split and not isinstance(left, np.generic | np.ndarray) and _odd(jnp.result_type(left, right)):
+        # A rounded cut of the top binade's last values carries past the largest float: such an operand
+        # is halved first, its product and residual doubled back after (each exact, a power of two).
+        top = 2.0 ** (jnp.finfo(jnp.result_type(left, right)).maxexp - 1)
+        halves = [jnp.abs(operand) >= top for operand in (left, right)]
+        left, right = (jnp.where(half, operand * 0.5, operand)
+                       for operand, half in zip((left, right), halves, strict=True))
+        scale = jnp.where(halves[0], 2.0, 1.0) * jnp.where(halves[1], 2.0, 1.0)
     lh, ll = split(left)
     rh, rl = split(right)
     product = rounded(left * right)
@@ -1410,7 +1440,8 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         term = rounded(first * second)
         lost = rounded(lost - term if subtract else lost + term)
     tail = rounded(ll * rl)
-    return product, rounded(tail - lost if subtract else lost + tail)
+    residual = rounded(tail - lost if subtract else lost + tail)
+    return (product, residual) if scale is None else (product * scale, residual * scale)
 
 
 def _correctly_rounded_divide(numerator: jax.typing.ArrayLike,
