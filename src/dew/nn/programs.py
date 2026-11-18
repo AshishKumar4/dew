@@ -145,21 +145,27 @@ def _preset_arithmetic(preset: jax.lax.DotAlgorithmPreset, lhs, rhs) -> DotArith
     conversion lowers it to (`DotAlgorithmPreset._convert_to_hlo_attr`, the one account of a preset's
     precision types, its component counts and its operations); None for the default preset, which names no
     algorithm."""
-    from jax.extend.mlir import ir
     from jax.interpreters import mlir
 
     with mlir.make_ir_context():
         lowered = preset._convert_to_hlo_attr(lhs, rhs)
-        if lowered is None:
-            return None
-        sides = (lowered.lhs_precision_type, lowered.rhs_precision_type)
-        # Each a float type of the bindings (`ir.FloatType`'s cast holds it to one), whose width is its bits.
-        left, right = (ir.FloatType(side).width for side in sides)
-        return DotArithmetic(operand_bits=(left, right),
-                             tf32=all(isinstance(side, ir.FloatTF32Type) for side in sides),
-                             accumulation_bits=ir.FloatType(lowered.accumulation_type).width,
-                             operations=lowered.num_primitive_operations,
-                             imprecise=lowered.allow_imprecise_accumulation)
+        return None if lowered is None else algorithm_arithmetic(lowered)
+
+
+def algorithm_arithmetic(algorithm) -> DotArithmetic:
+    """The arithmetic a lowered dot algorithm attribute states (a `stablehlo.DotAlgorithm`, as JAX lowers a
+    preset or a `jax.lax.DotAlgorithm`, and as a lowered program's dots carry it): its precision types,
+    their component counts and its operations, read where the attribute's context is current."""
+    from jax.extend.mlir import ir
+
+    sides = (algorithm.lhs_precision_type, algorithm.rhs_precision_type)
+    # Each a float type of the bindings (`ir.FloatType`'s cast holds it to one), whose width is its bits.
+    left, right = (ir.FloatType(side).width for side in sides)
+    return DotArithmetic(operand_bits=(left, right),
+                         tf32=all(isinstance(side, ir.FloatTF32Type) for side in sides),
+                         accumulation_bits=ir.FloatType(algorithm.accumulation_type).width,
+                         operations=algorithm.num_primitive_operations,
+                         imprecise=algorithm.allow_imprecise_accumulation)
 
 
 def dot_arithmetic(precision: jax.lax.PrecisionLike, lhs_dtype, rhs_dtype) -> DotArithmetic | None:
