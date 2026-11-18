@@ -9,7 +9,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import unflatten_dict
-from reference_runs import assert_as_exact_as_recorded
+from recorded_runs import assert_as_exact_as_recorded
 
 FIXTURE = Path(__file__).parent / "fixtures" / "maxtext" / "gpt3.npz"
 SHAPE = {"emb": 16, "heads": 2, "head_dim": 8, "mlp": 64, "layers": 2, "vocab": 64, "positions": 64,

@@ -11,8 +11,8 @@ import pytest
 from diffusion_support import TanhLayer
 from flax import linen as nn
 from interop_support import extract_fixture
+from recorded_runs import assert_as_exact_as_recorded
 from reference_error import assert_as_exact_over_orders, distance
-from reference_runs import assert_as_exact_as_recorded
 
 from dew.diffusion import presets
 from dew.inference import TextToImage
