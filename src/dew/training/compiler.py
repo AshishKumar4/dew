@@ -4,6 +4,7 @@ shape, and the links of its mesh's axes, and the compile of its step from what t
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import functools
 import json
@@ -38,8 +39,8 @@ from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
 from dew.state import Accumulation, TrainState, apart, occupied, together
-from dew.telemetry.compiles import executable_only
-from dew.telemetry.instrumentation import StepFlops
+from dew.telemetry.compiles import Compiles
+from dew.telemetry.instrumentation import StepFlops, count_step_misses
 from dew.training._candidates import Stepping, _shaped, candidate_for, lowered_for
 from dew.training._lowering import Lowered, routed
 from dew.training.distributed import (
@@ -155,7 +156,8 @@ class HostStartup(NamedTuple):
     (`StepCompiler._compile_host`): its programs' names, how many, the seconds it took, and by backend
     (`options.spending`: its CPU companion's, its accelerator's) each one's seconds tracing and lowering,
     and compiling or reading JAX's persistent cache: the run's own compiles of a step whose steps then
-    compile nothing."""
+    compile nothing. A lowering begun in another thread (`options.compiling`) is that thread's time: this
+    process's `lowered` reads near none of it."""
 
     names: tuple[str, ...]
     programs: int
@@ -185,10 +187,12 @@ STEADY = 3
 class HostRun:
     """A step that keeps its variables on the host, as its run calls it (`StepCompiler._compile_host`): each
     step's microbatches through the transaction's phases (`body`) and the glue between them, every
-    program of which a startup pass compiled over its shapes (`startup`), each step run where none
-    compiles (`executable_only`), refused by name where one is missing; a batch of shapes no pass stepped
-    over (a ramp's stage's), or a step called in a trace context none stepped in (a float64 replay's
-    precision), has a pass of its own before its step."""
+    program of which a startup pass compiled over its shapes (`startup`), so its steps compile nothing; a
+    batch of shapes no pass stepped over (a ramp's stage's), or a step called in a trace context none
+    stepped in (a float64 replay's precision), has a pass of its own before its step. A step that still
+    traces or compiles (an input no pass foresaw) does, and says so: each program named in a warning and
+    counted (`misses`, and the run's record's `train/step_misses`), never silent; a run held to its
+    loaded programs alone refuses it by its own `executable_only` (training.md §6)."""
 
     def __init__(self, stepping: Stepping, body: Callable, placement, prepared: TrainState, shapes,
                  split: int, window: int, empty, whole: Callable):
@@ -201,6 +205,8 @@ class HostRun:
         self.opened = owned_program(functools.partial(_opened, split=split))
         self.ended = owned_program(functools.partial(outcome_of, split=split))
         self.started: set[Hashable] = set()
+        # The programs steps traced or compiled past their passes, by name (`__call__`).
+        self.misses: collections.Counter[str] = collections.Counter()
 
     def __call__(self, current, batch, sampled: bool = False):
         # A host-master run inspects nothing (`compile` refuses it), so no step of it is sampled.
@@ -212,8 +218,16 @@ class HostRun:
             current = self.windowed(current, batch)
             if (abstract_signature(batch), trace_context()) not in self.started:
                 self.startup(current, batch)
-            with executable_only():
-                return self.stepped(current, batch, transfer)
+            with Compiles(None) as compiles:
+                stepped = self.stepped(current, batch, transfer)
+        missed = [program.name for program in compiles.programs if program.kind == "compiled"]
+        if missed:
+            self.misses.update(missed)
+            count_step_misses(len(missed))
+            _log.warning("a host step compiled %d programs its startup pass did not (%s): an input no pass "
+                         "stepped over; %d so far", len(missed), ", ".join(sorted(missed)),
+                         sum(self.misses.values()))
+        return stepped
 
     def windowed(self, current: TrainState, batch: Batch) -> TrainState:
         """`current` with the window its step reads: the one built with the step at a run's first, a

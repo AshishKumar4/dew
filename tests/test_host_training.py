@@ -170,13 +170,13 @@ def placed_batch(trainer: Trainer, batch):
 def test_a_host_window_that_replays_steps_on_its_startups_programs_alone():
     """A host step whose window replays (two microbatches an update, one rejected and replayed) runs its
     every step on the programs its startup compiled over its state's shapes (`HostStartup`), nothing
-    traced, lowered or compiled at any step: its run refuses one by name (`executable_only`), and the pass
-    took the replay's arm as well. Its state is bit for bit the same steps' each traced at its call
-    (`HostRun.stepped` with the startup's programs let go, `options.release`): the pass read and wrote
-    nothing of the run."""
+    traced, lowered or compiled at any step (`executable_only`): the pass took the replay's arm as well.
+    Its state is bit for bit the same steps' each traced at its call (`HostRun.stepped` with the startup's
+    programs let go, `options.release`): the pass read and wrote nothing of the run."""
     from dew.distributed.batches import batch_shardings
     from dew.distributed.host import transfer
     from dew.nn.kernels.options import release
+    from dew.telemetry.compiles import executable_only
 
     def run(quiet: bool):
         trainer = Trainer(Tiny(composite=True), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
@@ -192,7 +192,8 @@ def test_a_host_window_that_replays_steps_on_its_startups_programs_alone():
         cpu = trainer.state_mesh
         for batch in data:
             if quiet:
-                state, *_ = step(state, batch)
+                with executable_only():
+                    state, *_ = step(state, batch)
                 continue
             with jax.set_mesh(cpu):
                 batch = transfer(batch, batch_shardings(cpu, batch))
@@ -203,31 +204,37 @@ def test_a_host_window_that_replays_steps_on_its_startups_programs_alone():
     equal(run(quiet=True), run(quiet=False))
 
 
-def test_a_host_step_missing_a_program_is_refused_by_name_not_compiled():
-    """A host step whose startup's programs are let go (`options.release`) is refused at its next step
-    (`ExecutableOnly`), its run never tracing and compiling a program its startup did not: the boundary is
-    the run's, not a test's."""
+def test_a_host_step_missing_a_program_compiles_it_and_says_so(caplog):
+    """A host step whose startup's programs are let go (`options.release`), as an input no pass foresaw
+    would miss them, compiles them at its next step and says so: each named in a warning and counted
+    (`HostRun.misses`, and the run's record's `train/step_misses`), never silent; its run goes on."""
     from dew.nn.kernels.options import release
-    from dew.telemetry.compiles import ExecutableOnly
+    from dew.telemetry.instrumentation import step_miss_counts
 
     trainer = Trainer(Tiny(composite=True), optax.adamw(.03), key=jax.random.PRNGKey(9), layout=HOST)
     state, _, _ = trainer.place()
     batch = placed_batch(trainer, batches()[0])
     step = trainer.compile(state, batch)
     release()
-    with pytest.raises(ExecutableOnly):
-        step(state, batch)
+    with caplog.at_level("WARNING", logger="dew.training.compiler"):
+        state, *_ = step(state, batch)
+    assert int(state.step) == 1 and step.misses, step.misses
+    assert any("its startup pass did not" in record.message for record in caplog.records)
+    assert step_miss_counts()["train/step_misses"] >= sum(step.misses.values())
 
 
 def three_steps(trainer: Trainer, vocabulary: int):
-    """`trainer`'s run of three steps over one batch of `vocabulary`'s tokens, from its fresh start: the
-    state after them."""
+    """`trainer`'s run of three steps over one batch of `vocabulary`'s tokens, from its fresh start, held
+    to the programs its startup compiled (`executable_only`): the state after them."""
+    from dew.telemetry.compiles import executable_only
+
     state, _, _ = trainer.place()
     rows = np.stack([np.arange(row, row + 9) % vocabulary for row in range(jax.device_count())])
     batch = placed_batch(trainer, {"text": jnp.asarray(rows.astype(np.int32))})
     step = trainer.compile(state, batch)
     for _ in range(3):
-        state, *_ = step(state, batch)
+        with executable_only():
+            state, *_ = step(state, batch)
     return state
 
 
@@ -276,8 +283,8 @@ def test_a_frozen_embeddings_host_steps_run_on_its_startups_programs_alone():
 
 def test_a_host_decoders_steps_run_on_its_startups_programs_alone():
     """A host decoder's step, its layers banked and stacked on the CPU each step, runs every step on the
-    programs its startup compiled over its state's shapes, nothing traced, lowered or compiled (its run's
-    `executable_only`)."""
+    programs its startup compiled over its state's shapes, nothing traced, lowered or compiled
+    (`executable_only`)."""
     assert int(three_steps(streaming_decoder(HOST), 256).updates) == 3
 
 

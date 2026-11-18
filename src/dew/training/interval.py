@@ -35,6 +35,7 @@ from dew.telemetry.instrumentation import (
     StepFlops,
     compilation_cache_counts,
     model_flops_utilization,
+    step_miss_counts,
 )
 from dew.training.diloco import rated
 from dew.training.display import EXAMPLES_CONSUMED_SCALAR, TrainingDisplay
@@ -640,6 +641,7 @@ def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int
             scalars['train/grad_norm'] = float(norms / commits)
     scalars['train/compiles'] = float(counts.compiles)
     scalars.update(compilation_cache_counts())
+    scalars.update(step_miss_counts())
     peak = peak_memory_gib()
     if peak is not None:
         scalars['train/peak_memory_gib'] = peak
