@@ -595,7 +595,7 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     if programs:
         plain = any(_given(fn) for fn in (arms["dew"][0], arms["reference"][0]) if fn is not None)
         with arithmetic():
-            store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain))
+            store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain), arms=True)
 
 
 def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference: bool) -> None:
