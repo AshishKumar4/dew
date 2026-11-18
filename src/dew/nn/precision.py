@@ -1639,13 +1639,27 @@ def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...
     term at a time (`twice_scaled`) holds each term's range, not a sum's. Its error bound: the result is the
     plain float32 sum's rounding of the exactly scaled terms (each product's significands rounded twice),
     `(n + 2) 2^-24` of the terms' absolute sum over `n` terms, and a dropped term lies more than 2^126 below
-    the largest, under that bound. Elementwise and over
+    the largest, under that bound. Its tangent is its terms' own, each factor's direction times its term's
+    other factors, summed as a plain sum (`_aligned_tangent`): its bits carry none, so differentiated as
+    formed every factor's was zero; a reverse mode's sums are its transpose's, plain too. Elementwise and over
     a 2-D array's axes, so a Pallas TPU kernel forms it in place."""
-    parts = [[_binades(jnp.asarray(factor, jnp.float32)) for factor in term] for term in terms]
+    shape = tuple(len(term) for term in terms)
+    return _aligned(shape, axis, *(jnp.asarray(factor, jnp.float32) for term in terms for factor in term))
+
+
+def _regrouped(shape: tuple[int, ...], flat: Sequence[jax.Array]) -> list[tuple[jax.Array, ...]]:
+    """`aligned_sum`'s terms from their factors in a row, `shape` each term's count."""
+    ends = np.cumsum(shape)
+    return [tuple(flat[end - count:end]) for count, end in zip(shape, ends, strict=True)]
+
+
+def _aligned_value(shape: tuple[int, ...], axis, *flat: jax.Array) -> jax.Array:
+    """`aligned_sum` of its terms' factors in a row (`_regrouped`)."""
     products = []
-    for term in parts:
-        significand, exponent = term[0]
-        for more, power in term[1:]:
+    for term in _regrouped(shape, flat):
+        significand, exponent = _binades(term[0])
+        for factor in term[1:]:
+            more, power = _binades(factor)
             significand, exponent = significand * more, exponent + power
         products.append((significand, exponent))
 
@@ -1661,6 +1675,23 @@ def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...
     first = jnp.clip(top, -126.0, 127.0)
     second = jnp.clip(top - first, -126.0, 127.0)
     return total * _pow2(first) * _pow2(second) * _pow2(jnp.clip(top - first - second, -126.0, 127.0))
+
+
+def _aligned_tangent(shape: tuple[int, ...], axis, primals, tangents):
+    """`aligned_sum`'s value and tangent: each factor's direction times its term's other factors, every
+    term's summed (over `axis` too where given)."""
+    terms, moved = _regrouped(shape, primals), _regrouped(shape, tangents)
+    directions = [functools.reduce(jnp.multiply, (*term[:at], direction, *term[at + 1:]))
+                  for term, directions in zip(terms, moved, strict=True)
+                  for at, direction in enumerate(directions)]
+    tangent = sum(directions[1:], directions[0])
+    if axis is not None:
+        tangent = jnp.sum(tangent, axis=axis, keepdims=True)
+    return _aligned_value(shape, axis, *primals), tangent
+
+
+_aligned = contracted("test_an_aligned_sum_holds_every_order")(
+    declared_tangent(Protected(), _aligned_value, _aligned_tangent, nondiff_argnums=(0, 1)))
 
 
 def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax.Array:
