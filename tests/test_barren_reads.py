@@ -300,6 +300,34 @@ def test_a_share_whose_records_a_step_keeps_none_of_is_refused_not_read_forever(
         empty.close()
 
 
+
+@dataclass(frozen=True)
+class _NoneKept:
+    """Rejects every record, permanently: a step no pass gets a row from."""
+
+    identity = "none-kept@1"
+    rejects = True
+
+    def __call__(self, row):
+        return Rejected("unkept")
+
+
+@pytest.mark.parametrize("shares", [1, 2])
+def test_a_shuffled_share_whose_records_a_step_keeps_none_of_is_refused_whatever_its_shares(shares):
+    """A seeded shuffle before a step that rejects every record and an endless repeat, read by one share and
+    by each of two: the repeat replays its first pass, the shuffle and the share's cut alike, so no pass
+    makes a row and every share's read is refused at its first batch, where a share of two read empty passes
+    forever, saying the shuffle might make a row (row 7942)."""
+    ids = Pipeline(Memory({"id": np.arange(1, 11, dtype=np.int32)})).shuffle(seed=0).filter_map(_NoneKept())
+    loader = compile(ids.read("indexed").repeat().batch(2), loading=Loading(workers=0))
+    for index in range(shares):
+        stream = loader.train(DataPartition(index, shares))
+        try:
+            with pytest.raises(ValueError):
+                next(stream)
+        finally:
+            stream.close()
+
 def _jitter(row, rng):
     """A draw a record's generator makes, kept beside the record: a step that may make other rows on a
     later pass."""
