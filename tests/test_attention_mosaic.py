@@ -114,7 +114,8 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     """The backward form `form` names, `(accurate, config)`: two launches, the dQ launch one consumer's
     beside a producer and the keys-first dK/dV launch two consumers sharing a key block (`FED`), the
     accurate form's at its derivation's tiles (None) or its sums in two column halves where it is
-    `accurate-halves` (a width split's, `BackwardTiles.columns`); or the fast form's one launch (`fused`),
+    `accurate-halves` (a width split's, `BackwardTiles.columns`), or its keyed sums in a dQ launch of their
+    own where it is `accurate-apart` (`BackwardTiles.keyed_apart`); or the fast form's one launch (`fused`),
     queries first on the dQ launch's layout, or keys first on `FED`'s (`fused-keys-first`), each consumer
     64 of a slot's 128 queries, or queries first over keys its two consumers share on `FED`'s layout
     (`fused-shared-keys`); or the fast form at its derivation's tiles (`derived`)."""
@@ -127,6 +128,8 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
             # Its derived tiles, which its registers hold (a 64 x 64 tile of the call forms' at one column
             # block holds 280 a thread, past its 255).
             return form == "accurate", None
+        if form == "accurate-apart":
+            return True, attention_mosaic.BackwardTiles(64, 64, 2, 1, family=family, keyed_apart=True)
         # Its layout's narrow form in two column halves (`BackwardTiles.narrow`).
         return True, attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2, family=family, narrow=True)
     if form == "fused":
@@ -143,7 +146,7 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
         return False, None
     columns = 2 if form == "accurate-halves" else 1
     return form != "default", attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=columns, family=WGMMA,
-                                                             **FED)
+                                                             keyed_apart=form == "accurate-apart", **FED)
 
 
 def _form_tiles(generation_name: str | None = None) -> attention_mosaic.Tiles:
@@ -2163,6 +2166,24 @@ def test_a_width_split_backward_writes_its_score_parameters_gradients_once_inter
     whose gradient the dK/dV programs write (a key's parameter, a tile's): the first half's program writes
     it, and every gradient is the reference's, under the interpreter."""
     _check_hooked_backward(hooks, form="accurate-halves", interpret=True, width=128)
+
+
+@ON_EACH_FAMILY
+@INTERPRETS
+@pytest.mark.parametrize("hooks", [None, "alibi"], ids=["plain", "alibi"])
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
+def test_an_accurate_backward_its_keyed_sums_apart_is_on_par_interpreted(hooks, dtype):
+    """The accurate backward 64 wide whose keyed sums walk in a dQ launch of their own
+    (`BackwardTiles.keyed_apart`, the form an H100's dQ takes where its two sums spill, row 7938): the dQ
+    launch its sums alone, the keyed launch its logits' product and the keyed sums, their mass and exponent
+    into the dQ launch's rows; under no hook (the keyed sums of one product) and alibi (their row factor a
+    tile's, fp16's restored through their parts), in bf16 and fp16, every gradient the reference's (check 1),
+    under the interpreter."""
+    if hooks is None:
+        _check_backward("causal", SHAPES["interpreted"], form="accurate-apart", interpret=True, width=64,
+                        dtype=dtype)
+    else:
+        _check_hooked_backward(hooks, form="accurate-apart", interpret=True, width=64, dtype=dtype)
 
 
 @ON_HOPPER

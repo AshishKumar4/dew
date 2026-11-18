@@ -352,6 +352,13 @@ class BackwardTiles:
     (`transposed_swizzles`), where its family reads operands from registers: a load one instruction's depth
     of them (`Family.rhs_fragment_depth`), not a wide swizzle tile's, a wide stage's bandwidth traded for
     registers (ET-CENSUS80: a 64 x 192 forward's keys at the widest 162 of its 291 registers)."""
+    keyed_apart: bool = False
+    """Whether the accurate form's keyed sums (`gradient.DqSums.keyed`, the weights' product with the keys)
+    walk in a dQ launch of their own (`attention_mosaic_dq.PARTS`): each launch then carries one sum's
+    accumulator, the keyed launch its logits' product alone, no cotangents (the keyed sums read the weights
+    and the hook's slopes, `gradient.dq_issued`), where the one launch's two pass the registers (an H100's
+    accurate dQ at width 64 spilled at every query tile, 248 to 255 registers and a stack frame of 72 bytes
+    at 64 rows, row 7938)."""
     dkv_blocks: tuple[int, int] | None = None
     """The dK/dV launch's own query tile and key block where they are not the config's (`dkv`): a walk whose
     products a role issues (`placed.Tcgen05Walked`) holds a block of its issuer's rows, the dK/dV launch's
@@ -2074,7 +2081,11 @@ def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, valu
     anchor = _anchor_registers(family, block_q, block_k) if not family.scalars_whole else 0
     products = products[:2]
     pullback = products[1:] + [(block_q, block_k, jnp.float32)] * slopes + held
-    carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
+    # The keyed sums carried beside dQ's but where a launch of their own walks them (`keyed_apart`), whose
+    # step's live set is the dQ launch's but its output cotangents' product and what reads it: the larger
+    # launch the dQ one.
+    keyed = accurate and not config.keyed_apart
+    carried = [(block_q, width // config.columns, jnp.float32)] * (2 if keyed else 1)
     cotangents = [(block_q, block_k, jnp.float32), (block_q, block_k, dtype)]
     # Its per-query rows in the accumulator's row layout (`Family.row_registers`), live across the walk:
     # the maximum, the prior total, the anchor, D, the anchor key and the residual and mass sums
