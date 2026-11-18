@@ -106,6 +106,11 @@ def token_batch(seed: int = 2) -> dict:
     return {"text": jnp.asarray(np.random.default_rng(seed).integers(0, 256, (rows, 17)), jnp.int32)}
 
 
+def held(leaf):
+    """A state's leaf as its bits compare: a key's words (`jax.random.key_data`), any other leaf itself."""
+    return jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf
+
+
 def words(key) -> tuple[int, ...]:
     """A key's words, as a draw reads them."""
     return tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
@@ -142,7 +147,8 @@ def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count():
         np.testing.assert_array_equal(np.asarray(loss), np.asarray(own_loss), err_msg=f"microbatch {index}")
         for name, value in jax.device_get(metrics).items():
             np.testing.assert_array_equal(value, jax.device_get(own_metrics)[name], err_msg=f"{index} {name}")
-        ours, theirs = (jax.tree_util.tree_flatten_with_path(jax.device_get(tree))[0] for tree in (state, own))
+        ours, theirs = (jax.tree_util.tree_flatten_with_path(jax.device_get(jax.tree.map(held, tree)))[0]
+                        for tree in (state, own))
         unlike = [jax.tree_util.keystr(path) for (path, a), (_, b) in zip(ours, theirs, strict=True)
                   if not np.array_equal(a, b)]
         assert not unlike, f"microbatch {index} at {count} passes: {unlike}"
@@ -175,20 +181,42 @@ def test_a_sampled_runs_draws_go_on_through_another_split_and_a_resume():
     assert lacking.microbatches == 16
 
 
+class Tokens:
+    """`tokens` every step, a stream that keeps its place (`dew.data.dataset.Checkpointable`): the steps it
+    handed over."""
+
+    def __init__(self, tokens):
+        self.tokens, self.steps = jnp.asarray(tokens), 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.steps += 1
+        return {"text": self.tokens}
+
+    def get_state(self) -> bytes:
+        return str(self.steps).encode()
+
+    def set_state(self, state: bytes) -> None:
+        self.steps = int(state)
+
+
 def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path):
     """A sampled run of four steps stopped after two and resumed lands, bit for bit, where the run never
     stopped lands: its resume draws on from the microbatches its checkpoint counted."""
     from test_data_mixtures import assert_same, parameters
-    from test_pass_weights import phased_draw, phased_loader
 
+    from dew.data.dataset import Loader
     from dew.training import Checkpoints
 
-    tokens, _ = phased_draw(0)
+    tokens = np.asarray(token_batch(0)["text"])
+    loader = Loader(train=lambda partition: Tokens(tokens), val=None, records=None, batch=len(tokens))
 
     def fitted(directory, steps):
         return trainer_of(looped(steps=CAP), sampled_passes=TRAINED,
                           checkpoints=Checkpoints(str(directory), keep=8)).fit(
-            phased_loader(tokens), steps=steps, log_every=100, checkpoint_every=1)
+            loader, steps=steps, log_every=100, checkpoint_every=1)
 
     whole = fitted(tmp_path / "whole", 4)
     fitted(tmp_path / "resumed", 2)
