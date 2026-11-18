@@ -255,9 +255,13 @@ TRAINER_SHOWN = {"loss": Shown(better="lower"),
                  "mfu": Shown(better="higher", percent=True, group="throughput"),
                  "hfu": Shown(better="higher", percent=True, group="throughput"),
                  "hlo_flops_util": Shown(better="higher", percent=True, group="throughput"),
-                 # A utilization some launches' work went uncounted in is at least the value shown.
-                 **{f"{name}_lower_bound": Shown(better="higher", percent=True, group="throughput",
-                                                 label=f"{name} ≥") for name in ("hfu", "hlo_flops_util")},
+                 # A utilization some launches' work went uncounted in is at least the value shown; one a loop
+                 # was counted at its stated bound in at most it; one of both, an estimate
+                 # (`StepFlops.bound`).
+                 **{f"{name}{bound}": Shown(better="higher", percent=True, group="throughput",
+                                            label=f"{name} {mark}")
+                    for name in ("hfu", "hlo_flops_util")
+                    for bound, mark in (("_lower_bound", "≥"), ("_upper_bound", "≤"), ("_estimate", "≈"))},
                  "unsized_kernels": Shown(group="throughput", label="uncounted kernels"),
                  "tokens": Shown(group="throughput"),
                  "tokens_per_s": Shown(better="higher", group="throughput"),

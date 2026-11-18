@@ -22,7 +22,7 @@ import sys
 import threading
 import weakref
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import NamedTuple, Protocol
 
 import jax
@@ -810,6 +810,23 @@ def _call_counts(instruction: _Instruction, caller: _Computation,
     return counts
 
 
+def _bounded_calls(instruction: _Instruction, caller: _Computation,
+                   computations: dict[str, _Computation]) -> frozenset[str]:
+    """The computations `instruction` runs a number of times that is a stated bound, not its count: a
+    loop's body whose condition is a counted bound beside another predicate (`_counted_trips`), which runs
+    at most those trips; none for a loop XLA states the trips of, or one its counter alone ends."""
+    if instruction.op != 'while' or json.loads(instruction.config or '{}').get('known_trip_count'):
+        return frozenset()
+    root = _root_term(instruction, computations)
+    return frozenset({_body(instruction)}) if root is not None and root[0] == 'and' else frozenset()
+
+
+def _root_term(loop: _Instruction, computations: dict[str, _Computation]) -> tuple | None:
+    """A loop's condition's root as a term (`_term`), None where it has none."""
+    condition = computations.get(loop.called[1])
+    return None if condition is None else _term(condition, condition.root, computations)
+
+
 def _counted_trips(loop: _Instruction, caller: _Computation,
                    computations: dict[str, _Computation]) -> float:
     """The trip count of a loop that counts one integer tuple element from a
@@ -822,12 +839,11 @@ def _counted_trips(loop: _Instruction, caller: _Computation,
     executable wraps them in (`_term`). Infinite for any other loop, and for
     one whose last step overflows the counter's type, since a wrapped counter
     need never reach the bound."""
-    condition = computations.get(loop.called[1])
     body = computations.get(_body(loop))
-    if condition is None or body is None or not loop.operands:
+    root = _root_term(loop, computations)
+    if root is None or body is None or not loop.operands:
         return math.inf
-    root = _term(condition, condition.root, computations)
-    sides = root[2] if root is not None and root[0] == 'and' else (root,)
+    sides = root[2] if root[0] == 'and' else (root,)
     return min((_compared_trips(loop, caller, body, side, computations) for side in sides),
                default=math.inf)
 
@@ -1002,31 +1018,45 @@ class StepFlops:
     a Pallas kernel that states no cost (JAX's Triton lowering drops the
     kernel's `CostEstimate`; Mosaic's keep theirs), an attention over
     sequences its shapes do not state (`packed_attention`), or a call nothing
-    here knows, so where any runs both are lower bounds."""
+    here knows, so where any runs both are lower bounds. `bounded` is the
+    hardware FLOPs counted at a loop's stated bound rather than its count (a
+    counted bound beside a predicate, `_counted_trips`: a walk over the
+    segments its data holds, at most its bound's), so where any is, both are
+    upper bounds (`bound`)."""
 
     model: float
     hardware: float
     unsized: float = 0.0
+    bounded: float = 0.0
 
     def __add__(self, other: "StepFlops") -> "StepFlops":
         return StepFlops(self.model + other.model, self.hardware + other.hardware,
-                         self.unsized + other.unsized)
+                         self.unsized + other.unsized, self.bounded + other.bounded)
 
     def __rmul__(self, calls: float) -> "StepFlops":
         """The FLOPs of `calls` such calls (a step split into microbatches, a loop's trips)."""
-        return StepFlops(calls * self.model, calls * self.hardware, calls * self.unsized)
+        return StepFlops(calls * self.model, calls * self.hardware, calls * self.unsized,
+                         calls * self.bounded)
+
+    @property
+    def bound(self) -> str:
+        """What the counts are, as a reported figure's name ends: `_lower_bound` where a launch's work went
+        uncounted (`unsized`), `_upper_bound` where a loop was counted at its stated bound (`bounded`),
+        `_estimate` where both (neither bound), else nothing (the step's own count)."""
+        return {(False, False): "", (True, False): "_lower_bound", (False, True): "_upper_bound",
+                (True, True): "_estimate"}[bool(self.unsized), bool(self.bounded)]
 
     def utilizations(self, steps: int, step_time: float, peak: float | None = None) -> dict[str, float]:
         """The interval's HLO utilizations of `steps` steps of `step_time` seconds each, of `peak`
         (`model_flops_utilization`): train/hfu off `hardware` and train/hlo_flops_util off `model`,
-        both ending `_lower_bound` beside train/unsized_kernels, the launches a step, where any
-        launch's work went uncounted."""
-        bound = "_lower_bound" if self.unsized else ""
+        each named by what the counts are (`bound`), beside train/unsized_kernels, the launches a step,
+        where any launch's work went uncounted."""
+        bound = self.bound
         scalars = {f"train/{name}{bound}": utilization
                    for name, counted in (("hlo_flops_util", self.model), ("hfu", self.hardware))
                    if (utilization := model_flops_utilization(counted / steps, step_time, peak))
                    is not None}
-        return {**scalars, "train/unsized_kernels": self.unsized / steps} if bound else scalars
+        return {**scalars, "train/unsized_kernels": self.unsized / steps} if self.unsized else scalars
 
 
 NO_FLOPS = StepFlops(0.0, 0.0)
@@ -1101,7 +1131,7 @@ def hlo_flops(source: str | jax.stages.Compiled) -> StepFlops | None:
     if entry is None:
         return None
     found = _inclusive(entry, computations, {})
-    totals = (found.model, found.hardware, found.unsized)
+    totals = (found.model, found.hardware, found.unsized, found.bounded)
     return found if all(math.isfinite(total) for total in totals) else None
 
 
@@ -1121,12 +1151,16 @@ def _inclusive(name: str, computations: dict[str, _Computation], memo: dict[str,
                       sum(flops for _, flops, _ in sized), float(len(counted) - len(sized)))
     for instruction in computation.instructions.values():
         branches = _branches(instruction)
+        stated = _bounded_calls(instruction, computation, computations)
         for callee, times in _call_counts(instruction, computation, computations).items():
             if callee in computations and times and callee not in branches:
                 called = _inclusive(callee, computations, memo)
                 # A call that runs none adds none, however many times its loop would.
                 if called != NO_FLOPS:
-                    total = total + times * called
+                    made = times * called
+                    # A loop counted at its stated bound: all its work an upper bound's.
+                    total = total + (replace(made, bounded=made.hardware) if callee in stated
+                                     else made)
         ran = [_inclusive(branch, computations, memo) for branch in branches if branch in computations]
         if ran:
             total = total + max(ran, key=lambda flops: (flops.hardware, flops.model, flops.unsized))
