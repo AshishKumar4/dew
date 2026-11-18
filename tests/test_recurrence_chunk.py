@@ -467,9 +467,11 @@ def test_a_turned_forked_calls_cancelling_entry_write_keeps_every_gradient_finit
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda t: jnp.asarray(t, jnp.float64), (operands, seeded))
         exact = jax.jit(with_gradients(lambda given: document_by_document(TURNED, given)))(*wide)
-    for made, truth in zip(jax.tree.leaves(ours), jax.tree.leaves(exact), strict=True):
+    leaves = jax.tree_util.tree_leaves_with_path(ours)
+    for (path, made), truth in zip(leaves, jax.tree.leaves(exact), strict=True):
         held = normal_float32(np.asarray(truth))
-        assert np.all(np.isfinite(np.asarray(made)[held]))
+        wrong = held & ~np.isfinite(np.asarray(made))
+        assert not wrong.any(), (jax.tree_util.keystr(path), int(wrong.sum()))
 
 
 @pytest.mark.parametrize(('by_firsts', 'vanished'), [(False, False), (True, False), (False, True)],
