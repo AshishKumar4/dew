@@ -587,8 +587,8 @@ def test_epochs_of_a_memory_read_that_rejects_documents_before_it_packs_them_cou
 
 def test_epochs_of_a_streamed_mix_whose_member_rejects_records_count_no_pass_ahead():
     """A streamed mix of two corpora, one rejecting every third record, bounded after the mix where only the
-    rows it keeps reach the bound: no pass of it is counted ahead, so epochs are refused, where counting its
-    source's records read each pass of it past its end (train 1014's review)."""
+    rows it keeps reach the bound: no pass of it is counted ahead (a run of its epochs is refused), where
+    counting its source's records, 23 a pass, read each pass of it past its end (train 1014's review)."""
     from data_support import Questioned
 
     from dew.data.compile import fitted
@@ -596,5 +596,5 @@ def test_epochs_of_a_streamed_mix_whose_member_rejects_records_count_no_pass_ahe
     first = Pipeline(Memory({"id": np.arange(1, 13, dtype=np.int32)})).filter_map(Keeps(3)).named("first")
     second = Pipeline(Memory({"id": np.arange(21, 25, dtype=np.int32)})).named("second")
     chain = mix([first, second], weights=(1, 1)).read("streamed").batch(4)
-    with pytest.raises(ValueError):
-        fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    assert (loader.pass_examples, loader.examples) == (None, None)
