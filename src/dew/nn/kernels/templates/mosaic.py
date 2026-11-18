@@ -607,7 +607,7 @@ class Decided:
         """Consumer `wg`'s `verdict` (a scalar, uniform over its warpgroup) published, and whether any
         consumer's takes the walk again (`taken`)."""
         if self.words is None:
-            return _rare(verdict)
+            return _rare(_uniform(verdict.astype(jnp.int32)) != 0)
         self.words[wg] = verdict.astype(jnp.int32)
         plgpu.barrier_arrive(self.barrier)
         return self.taken()
@@ -617,11 +617,20 @@ class Decided:
         rare verdict (`derivatives.Rare`), which a count of the kernel's work reads as not taken."""
         plgpu.barrier_wait(self.barrier)
         published = (self.words[index] for index in range(self.consumers))
-        return _rare(functools.reduce(operator.or_, published) != 0)
+        return _rare(_uniform(functools.reduce(operator.or_, published)) != 0)
 
 
 _rare = derivatives.marked(derivatives.Rare(), lambda verdict: verdict)
 """A decided walk's verdict marked rare (`derivatives.Rare`)."""
+
+
+def _uniform(verdict: jax.Array) -> jax.Array:
+    """A verdict every lane holds alike read warp-uniform (`across.uniform`), so a branch on it is not
+    divergent and the copies issued under it address their tiles once, not lane by lane (row 7898); the
+    interpreter's its own."""
+    from dew.nn.kernels.templates import across  # across builds on the toolkit
+
+    return verdict if bodies.interpreting() else across.uniform(verdict)
 
 
 @dataclasses.dataclass(frozen=True)

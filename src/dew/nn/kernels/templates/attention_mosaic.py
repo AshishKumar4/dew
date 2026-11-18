@@ -493,11 +493,7 @@ class MosaicForward(_Mainloop[Tiles]):
         family = bundle_of(config, query.dtype)
         # A quantized cache's values read in the query's dtype (`_Codes`), its codes' own no float's.
         computed = query.dtype if scales is not None else value.dtype
-        # A paged call's producer addresses its pages by its table's entries, which under a branch on the
-        # verdict, a value of shared memory, ptxas holds lane by lane: its copies' issue an elect waterfall
-        # through R2UR (the compile gate's paged decode cells on sm90, sm100 and sm120). It takes the
-        # fallback until the toolkit reads the verdict warp-uniform (row 7898).
-        if (residuals is Kept.SPLIT or self.scaled or self.rounds is not None or table is not None
+        if (residuals is Kept.SPLIT or self.scaled or self.rounds is not None
                 or not algebra.headroom(computed) or family.places_on_role):
             return False
         registered = self.registered(query, value, score_params, residuals, table, sources, scales, initial)
