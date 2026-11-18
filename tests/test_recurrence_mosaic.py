@@ -15,6 +15,7 @@ the stability suite holds the mainloop under its regimes there (tests/test_recur
 import collections
 import dataclasses
 import functools
+import math
 import types
 from collections.abc import Callable
 
@@ -597,6 +598,45 @@ def test_a_turned_forked_call_lowers_for_a_gpu_under_a_mesh():
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(lambda given: chunk_on('mosaic_gpu', TURNED, given)).trace(operands).lower(
             lowering_platforms=("cuda",))
+
+
+@COMPILES_ON_CPU
+def test_a_forward_only_turned_call_keeps_no_more_than_its_frames():
+    """A bf16 turned call (`Hooks.turns`, Mamba-3's) without a gradient, compiled for a compile-only H100: its
+    temporaries at most the same call's unturned and its frames' own: its keys and queries turned, in their
+    dtype, and per token and head its frames' double float, their relative one and their rotation (six fp32
+    numbers a pair, `turned.frames`, `_in_last_frame`), where the turned wrapper traced its launch's
+    pullback for any call and its forward took the training launches, which keep each chunk's memories and
+    inverses for a backward no one runs (audit KPM-04)."""
+    from kernel_compile import lowered_for
+
+    rows, length, heads, keys, values = 1, 1024, 2, 128, 128
+    hooks = dataclasses.replace(recurrence.Hooks(decay='scalar', delta=False, write_gate=True, skip=True),
+                                turns=2)
+    pairs = (jax.ShapeDtypeStruct((rows, length, heads, keys), jnp.bfloat16),) * 2
+    rest = (jax.ShapeDtypeStruct((rows, length, heads, values), jnp.bfloat16),
+            jax.ShapeDtypeStruct((rows, length, heads), jnp.float32),
+            jax.ShapeDtypeStruct((rows, length, heads), jnp.float32),
+            jax.ShapeDtypeStruct((heads,), jnp.float32))
+    turn = jax.ShapeDtypeStruct((rows, length, heads, 2), jnp.float32)
+    framed = 2 * math.prod(pairs[0].shape) * 2 + 6 * math.prod(turn.shape) * 4
+
+    def temporaries(fn, *operands) -> int:
+        """The compiled program's temporaries' bytes (`memory_analysis`)."""
+        analysis = lowered_for(fn, operands, "sm90").compile().memory_analysis()
+        assert analysis is not None
+        return analysis.temp_size_in_bytes
+
+    def called(hooks):
+        def call(query, key, value, g, beta, skip, *turn):
+            operands = Chunk(query, key, value, log_decay=g, beta=beta, skip=skip,
+                             turn=turn[0] if turn else None)
+            return chunk_on('mosaic_gpu', hooks, operands)[0]
+        return call
+
+    whole = temporaries(called(hooks), *pairs, *rest, turn)
+    unturned = temporaries(called(dataclasses.replace(hooks, turns=0)), *pairs, *rest)
+    assert whole <= unturned + framed
 
 
 def test_a_ranged_calls_inverse_states_the_fp32_parts_its_merges_issue():

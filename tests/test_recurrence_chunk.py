@@ -382,9 +382,30 @@ def steep_draw(seed: int):
     return operands, cotangents(operands, seed)
 
 
-@pytest.mark.parametrize(('packed', 'steep'), [(False, False), (True, False), (True, True)],
-                         ids=['one sequence', 'packed', 'packed-steep'])
-def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(packed, steep):
+VANISHED = (5, 9, 30, 33)
+"""The tokens whose decays vanish in `vanishing`'s draws: two in one chunk of each row's first two
+documents (`TURNED_DOCUMENTS`, `CHUNK`)."""
+
+
+def vanishing(operands):
+    """`operands` with the decays at `VANISHED` vanishing, -2^127 each (a zero decay; two summed are past
+    fp32's range)."""
+    log_decay = np.asarray(operands.log_decay, np.float64).copy()
+    log_decay[:, list(VANISHED)] = -2.0 ** 127
+    return dataclasses.replace(operands, log_decay=hosted(log_decay))
+
+
+def vanishing_draw(seed: int):
+    """`draw`'s operands for `TURNED` and cotangents, the decays at `VANISHED` vanishing (`vanishing`)."""
+    (operands,) = draw(TURNED, packed=False, seed=seed)
+    operands = vanishing(operands)
+    return operands, cotangents(operands, seed)
+
+
+@pytest.mark.parametrize(('packed', 'regime'), [(False, None), (True, None), (True, 'steep'),
+                                                (False, 'vanishing')],
+                         ids=['one sequence', 'packed', 'packed-steep', 'vanishing'])
+def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(packed, regime):
     """A state that turns its key pairs (`Hooks.turns`, Mamba-3's rotating basis) through `chunk`'s portable
     math in `CHUNK`-token chunks against the same recurrence a token at a time: output, final memory and
     every operand's gradient, the turns' among them, from float64 (check 1). A turn's gradient is the
@@ -392,7 +413,8 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
     angle summed over a document cancelled across its tokens to 120 times the recurrence's error). Under
     steep decays (`steep_draw`) a chunk's earlier document's writers lie past fp32's exponents from its last
     one's end, which the turns' gradient weighed by `exp` of their difference before it took them out, NaN
-    (base review fbb1c2f71 F2). Its oracle the recurrence: `TURNED`'s note."""
+    (base review fbb1c2f71 F2); under vanishing decays (`vanishing_draw`, two of -2^127 in a chunk) its
+    prefix summed them to -inf, NaN (audit KPM-02). Its oracle the recurrence: `TURNED`'s note."""
     def turned(operands, starts=None):
         return chunk_on('xla', TURNED, dataclasses.replace(operands, starts=starts), chunk_size=CHUNK)
 
@@ -403,8 +425,9 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
         (operands,) = draw(TURNED, packed=False, seed=seed)
         return operands, cotangents(operands, seed)
 
-    assert_packed_on_par(turned, tokens, steep_draw if steep else drawn, f'{TURNED}', packed=packed,
-                         documents=TURNED_DOCUMENTS, length=LENGTH, seeds=32)
+    drawing = {None: drawn, 'steep': steep_draw, 'vanishing': vanishing_draw}[regime]
+    assert_packed_on_par(turned, tokens, drawing, f'{TURNED}', packed=packed, documents=TURNED_DOCUMENTS,
+                         length=LENGTH, seeds=32)
 
 
 def test_a_turned_readout_before_its_tokens_turn_is_refused():
@@ -416,18 +439,27 @@ def test_a_turned_readout_before_its_tokens_turn_is_refused():
         recurrence.Hooks(decay='scalar', delta=False, write_gate=True, reads='before', turns=1)
 
 
-@pytest.mark.parametrize('by_firsts', [False, True], ids=['starts', 'firsts'])
-def test_a_turned_states_forked_documents_are_as_exact_as_each_alone(by_firsts):
+def vanishing_entered_draw(seed: int):
+    """`entered_draw`'s turned operands, entry writes included, the decays at `VANISHED` vanishing."""
+    operands, seeded = entered_draw(TURNED, seed, entries=True)
+    return vanishing(operands), seeded
+
+
+@pytest.mark.parametrize(('by_firsts', 'vanished'), [(False, False), (True, False), (False, True)],
+                         ids=['starts', 'firsts', 'vanishing'])
+def test_a_turned_states_forked_documents_are_as_exact_as_each_alone(by_firsts, vanished):
     """A state that turns its key pairs (`Hooks.turns`) over a forked call through the portable math, each
     document taking up its table slot's memory with its entry write added, its stored finals in the walk's
     table (Mamba-3's prefix and its questions, a true-frame memory each: each document read in its own last
     token's frame, the memory it takes up turned in as its walk loads it, `templates.recurrence.turned`),
     against each document a sequence of its own the recurrence a token at a time (`assert_forked_on_par`,
     check 1); the call giving its documents by their starts or by their first slots alone (`Chunk.firsts`),
-    which the frames read as one document (base review fbb1c2f71 F4). Its oracle the recurrence: `TURNED`'s
-    note."""
-    assert_forked_on_par('xla', TURNED, functools.partial(entered_draw, TURNED, entries=True),
-                         f'xla {TURNED} a forked call\'s documents', seeds=32, by_firsts=by_firsts)
+    which the frames read as one document (base review fbb1c2f71 F4), and its decays vanishing in a chunk
+    (`vanishing_entered_draw`, audit KPM-02). Its oracle the recurrence: `TURNED`'s note."""
+    drawing = (vanishing_entered_draw if vanished
+               else functools.partial(entered_draw, TURNED, entries=True))
+    assert_forked_on_par('xla', TURNED, drawing, f'xla {TURNED} a forked call\'s documents', seeds=32,
+                         by_firsts=by_firsts)
 
 
 TURNED_LONG = 512
