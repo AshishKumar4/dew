@@ -1850,7 +1850,7 @@ def member_fields(member: type | Callable[..., Configured]) -> Iterator[tuple[st
         yield name, default, annotation
 
 
-def default_record(name: str, declared: object, annotation: Annotation) -> JSON:
+def default_record(name: str, declared: Configured, annotation: Annotation) -> JSON:
     """A member's default `declared` as a record holds it: a dtype by its
     name, a matmul precision by its level, anything else as `to_record`
     writes it. TypeError or ValueError for a value no record carries."""
@@ -1882,7 +1882,7 @@ def recorded_defaults(member: type | Callable[..., Configured], stated: Mapping[
             if name in stated:
                 continue
             if name in recorded:
-                kept[name] = default_record(name, recorded[name], annotation)
+                kept[name] = default_record(name, configured(recorded[name]), annotation)
                 continue
             if declared is dataclasses.MISSING:
                 continue
