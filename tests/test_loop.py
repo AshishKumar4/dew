@@ -337,7 +337,8 @@ def _theta_method(module, ids):
     cut = None if loop.backprop_steps is None else loop.steps - loop.backprop_steps
     for step in range(1, loop.steps):
         h = jax.lax.stop_gradient(h) if step == cut else h
-        z = a + module.loop_theta * (h - a)
+        theta = module.loop_theta if loop.theta_passes is None else module.loop_theta[step - 1]
+        z = a + theta * (h - a)
         h = module.stack(z, span=(first, end), **inputs) + (a - z)
     return module.logits_from_hidden(module.norm(module.stack(h, span=(end, module.num_layers), **inputs)))
 
@@ -365,6 +366,59 @@ def test_an_implicit_loop_at_drawn_theta_takes_the_theta_method(name, steps, loo
 
     assert_as_exact(_results(looped.apply), _results(unrolled(looped)), draw, name, seeds=THETA_SEEDS[name],
                     truth_fn=_results(unrolled(looped.clone(dtype=jnp.float64))))
+
+
+PER_PASS_SEEDS = 8
+"""Check 1's declared seeds for an implicit loop with a θ per pass against the θ-method unrolled here."""
+
+
+@pytest.mark.parametrize("steps", [3, 2], ids=["three passes", "two of three"])
+def test_an_implicit_loop_with_a_theta_per_pass_reads_each_pass_its_own(steps):
+    """Qwen 3.5 with an implicit loop whose θ holds a row for each later pass of three (`Loop.theta_passes`,
+    `loop_theta` `[2, d]`), its rows drawn apart: run at `steps` passes, its logits and the gradient of
+    every parameter on par with the θ-method unrolled pass by pass, pass t reading row t - 1 (check 1 against
+    it in float64); at two of its three passes θ keeps both rows, and the second, which no pass reads, has
+    no gradient (row 7661)."""
+    looped = _qwen35(3, theta_passes=3).with_passes(steps)
+    assert looped.loop.theta_passes == 3
+    vocab = looped.vocab_size
+    drawn = with_logit_cotangent(model_draw(looped, (8, 16), vocab), vocab, 0x7E7D + steps)
+
+    def draw(seed):
+        variables, ids, cotangent = drawn(seed)
+        theta = np.random.default_rng([0x7E7E, seed]).uniform(0.1, 0.9, (2, looped.emb_features))
+        params = {**variables["params"], "loop_theta": jnp.asarray(theta, jnp.float32)}
+        return {**variables, "params": params}, ids, cotangent
+
+    def unrolled(model):
+        return lambda variables, ids: model.apply(variables, ids, method=_theta_method)
+
+    assert_as_exact(_results(looped.apply), _results(unrolled(looped)), draw, f"a θ per pass at {steps}",
+                    seeds=PER_PASS_SEEDS, truth_fn=_results(unrolled(looped.clone(dtype=jnp.float64))))
+    variables, ids, cotangent = draw(0)
+    assert variables["params"]["loop_theta"].shape == (2, looped.emb_features)
+    gradient = _results(looped.apply)(variables, ids, cotangent)["gradients"]["params"]["loop_theta"]
+    assert np.any(np.asarray(gradient[0]) != 0)
+    assert np.any(np.asarray(gradient[1]) != 0) == (steps == 3)
+
+
+def test_an_implicit_loop_whose_rows_are_one_theta_computes_the_shared_theta():
+    """An implicit loop of three passes whose θ rows are each one vector computes what its loop of one θ of
+    that vector computes, bit for bit, its logits and its θ's gradient summed over the rows (row 7661); a
+    count past the passes its θ holds rows for is refused, a pass there reading no θ of its own."""
+    shared, per_pass = _qwen35(3), _qwen35(3, theta_passes=3)
+    vocab = shared.vocab_size
+    variables, ids, cotangent = with_logit_cotangent(model_draw(shared, (8, 16), vocab), vocab, 0x7E7F)(0)
+    theta = jnp.asarray(np.random.default_rng(0x7E80).uniform(0.1, 0.9, shared.emb_features), jnp.float32)
+    one = {**variables, "params": {**variables["params"], "loop_theta": theta}}
+    rows = {**variables, "params": {**variables["params"], "loop_theta": jnp.stack([theta, theta])}}
+    alike = _results(shared.apply)(one, ids, cotangent)
+    apart = _results(per_pass.apply)(rows, ids, cotangent)
+    np.testing.assert_array_equal(np.asarray(apart["logits"]), np.asarray(alike["logits"]))
+    np.testing.assert_array_equal(np.asarray(jnp.sum(apart["gradients"]["params"]["loop_theta"], axis=0)),
+                                  np.asarray(alike["gradients"]["params"]["loop_theta"]))
+    with pytest.raises(ValueError):
+        per_pass.with_passes(4)
 
 
 def test_a_loaded_decoder_gains_an_implicit_loop_at_zero_theta():

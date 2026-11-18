@@ -235,7 +235,10 @@ class Loop:
     `block(x) + (a - x)`: the block's own step taken from `a` (the θ-method of
     an implicit fixed point, a relaxation that reads the last pass's state as
     far as θ says). θ is the decoder's per-channel `loop_theta`, drawn at zero,
-    so at θ = 0 every later pass leaves the block's output over its input, and
+    one every later pass reads, or with `theta_passes` T a row for each later
+    pass of up to T, `loop_theta` `[T - 1, d]`, pass t reading row t - 1, its
+    shape T's at every count the loop runs (a count past T has no θ and is
+    refused); so at θ = 0 every later pass leaves the block's output over its input, and
     a decoder computes what it computes without the loop, whatever its count:
     a pretrained decoder gains passes without changing what it computes, where
     a plain repeat moves it. It reads the state as it is (no `step_norm`) and
@@ -264,6 +267,7 @@ class Loop:
     implicit: bool = False
     exit_threshold: float | None = None
     exits: bool = False
+    theta_passes: int | None = None
 
     PASSED: ClassVar[tuple[str, ...]] = ("steps", "backprop_steps", "remat", "implicit", "exit_threshold",
                                          "exits")
@@ -295,6 +299,12 @@ class Loop:
             object.__setattr__(self, "layers", (first, end))
             if not 0 <= first <= end:
                 raise ValueError(f"a loop's block is layers [first, end), first <= end, not {self.layers}")
+        if self.theta_passes is not None and (not self.implicit or self.theta_passes < 2):
+            raise ValueError("a θ per pass is an implicit loop's (implicit) over at least 2 passes, got "
+                             f"theta_passes={self.theta_passes} with implicit={self.implicit}")
+        if self.theta_passes is not None and self.steps > self.theta_passes:
+            raise ValueError(f"a loop of {self.steps} passes reads a θ row for each later pass, and its θ "
+                             f"holds rows for {self.theta_passes} passes: run at most {self.theta_passes}")
         if self.exit_threshold is not None and (not self.exit_gate or not 0 < self.exit_threshold <= 1):
             raise ValueError("an exit threshold is a cumulative probability in (0, 1] over the passes the "
                              f"exit gate weighs, got {self.exit_threshold} with exit_gate={self.exit_gate}")

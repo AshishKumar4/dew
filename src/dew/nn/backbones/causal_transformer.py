@@ -827,8 +827,10 @@ class CausalTransformer(LinearProducts):
                                               name='engram_hashes')
         self._final_norm()
         if self.loop is not None and self.loop.implicit:
-            # Per channel, as a norm's scale: no logical axes, placed whole (`Layout.min_shard`).
-            self.loop_theta = self.param('loop_theta', nn.initializers.zeros, (self.emb_features,),
+            # Per channel, as a norm's scale (a row of it per later pass under `theta_passes`): no logical
+            # axes, placed whole (`Layout.min_shard`).
+            rows = () if self.loop.theta_passes is None else (self.loop.theta_passes - 1,)
+            self.loop_theta = self.param('loop_theta', nn.initializers.zeros, (*rows, self.emb_features),
                                          jnp.float32)
         if self.loop is not None and self.loop.exit_gate:
             # Drawn at zero, every pass's hazard a half, where a loaded decoder gains the gate
