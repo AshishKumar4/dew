@@ -1316,6 +1316,19 @@ def afforded(python: str, tests: list[str], group: str, kept: Container[str],
     return fitting, stale_rows
 
 
+def fetched_absent(python: str, deadline: float) -> float:
+    """The fixtures this commit pins and its environment's store lacks fetched, within `deadline` seconds, and
+    the seconds that took, which the task's own deadline loses: the environment holds the pins of the
+    commit it was built at, and its key reads no pin (tools/armada/install.sh). Where it lacks none, as for
+    a commit that moves no pin, nothing is started. A fetch that fails or outlasts `deadline` raises, the
+    task red with its reason, before any test or collection reads a fixture it lacks."""
+    began = time.monotonic()
+    if digests.fetched.absent(Path.cwd()):
+        subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch", "--absent"],
+                       check=True, timeout=deadline)
+    return time.monotonic() - began
+
+
 def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     """Import `tests` under `python` without running them and write one verdict row a file: red
     where collecting it errs or skips on a missing import, which running it would have."""
@@ -1367,12 +1380,6 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     (`deadline_shares`): the file its tests were running in at least what it needs, a file that never
     started none. With `coverage`, pytest runs under coverage.py, whose data file goes there
     (`coverage_items`)."""
-    # The fixtures this commit pins and its environment's store lacks, fetched while the Hub is reachable:
-    # the environment holds those of the commit it was built at, and its key reads no pin
-    # (tools/armada/install.sh). Where it lacks none, as for a commit that moves no pin, nothing is started.
-    if digests.fetched.absent(Path.cwd()):
-        subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch", "--absent"],
-                       check=True)
     # Before any test writes under tests/, the inputs as the plan saw them; the rows its plan kept read
     # where it found their green runs (`kept_of`), a heavy file's kept groups each its own, and run where
     # their green run is not found there.
@@ -2484,9 +2491,11 @@ def main() -> int:
         print(json.dumps({"include": plan(args.target, json.loads(args.timings.read_text())
                                           if args.timings.is_file() else {}, census=args.census)}))
         return 0
+    # A collection imports fixtures as a run reads them (a module-level recording), so both fetch first.
+    deadline = args.deadline - fetched_absent(args.python, args.deadline)
     if args.split == COLLECT:
-        return collect(args.python, args.tests.split(), args.out, args.deadline)
-    return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
+        return collect(args.python, args.tests.split(), args.out, deadline)
+    return task(args.python, args.tests.split(), args.split, args.out, deadline, args.cache,
                 coverage=args.coverage, census=args.census == "1")
 
 

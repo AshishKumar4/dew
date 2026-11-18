@@ -309,10 +309,10 @@ def test_a_targeted_pytest_runs_a_group_as_its_ci_task_would(ci, tmp_path, monke
     assert sorted(test for test, *_ in ran("")) == ["test_other", "test_site"]
 
 
-def test_a_task_fetches_only_the_pins_its_environment_lacks(ci, tmp_path):
+def test_a_task_fetches_only_the_pins_its_environment_lacks_within_its_deadline(ci, tmp_path):
     """A commit that pins a fixture its environment's store lacks fetches it, and only it (`--absent`), before
-    its tests; one whose every pin is stored starts no fetch: the environment's key reads no pin."""
-    written(tmp_path, {"test_pass.py": "def test_ok(): pass\n"})
+    its tests or collection; one whose every pin is stored starts no fetch: the environment's key reads no
+    pin. A fetch past the task's deadline is stopped there."""
     interpreter(tmp_path, "3.12")
     (tmp_path / "tools").mkdir(exist_ok=True)
     (tmp_path / "tools/fetched_fixtures.py").write_text(
@@ -323,11 +323,14 @@ def test_a_task_fetches_only_the_pins_its_environment_lacks(ci, tmp_path):
     pin = tmp_path / "tests/fixtures/x/recorded.npz.fetched.json"
     pin.parent.mkdir(parents=True)
     pin.write_text(json.dumps({"sha256": "a" * 64, "bytes": 1, "revision": "r", "repo": "o/r", "path": "p"}))
-    out = tmp_path / "verdict.json"
-    assert ci.task("3.12", ["tests/test_pass.py"], "", out, 600.0) == 0
+    ci.fetched_absent("3.12", 600.0)
     assert (tmp_path / "fetches").read_text() == "fetch --absent\n"
-    assert ci.task("3.12", ["tests/test_pass.py"], "", out, 600.0) == 0
+    ci.fetched_absent("3.12", 600.0)
     assert (tmp_path / "fetches").read_text() == "fetch --absent\n"
+    (tmp_path / f"tests/fixtures/fetched/{'a' * 64}.npz").unlink()
+    (tmp_path / "tools/fetched_fixtures.py").write_text("import time\ntime.sleep(30)\n")
+    with pytest.raises(subprocess.TimeoutExpired):
+        ci.fetched_absent("3.12", 1.0)
 
 
 def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
