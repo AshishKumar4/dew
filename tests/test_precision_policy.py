@@ -1117,3 +1117,61 @@ def test_an_exact_product_at_a_dtypes_edge_keeps_its_residual(dtype, left, right
         product, residual = two_product(a, b, bit_split=True)
         exact = Fraction(float(a)) * Fraction(float(b))
         assert Fraction(float(product)) + Fraction(float(residual)) == exact
+
+
+TWO_PI_SPLIT = (np.float32(6.2831855), np.float32(-1.7484555e-07))
+"""2π as a float32 and the float32 nearest what it dropped: a constant a broadcast multiply reads."""
+
+
+def _compensated_shapes():
+    """The shapes an error-free transform's operand is made in under one jit, each a function of drawn
+    `(x, y, z)` float32 rows: a two_product of a broadcast constant fed into a compensated sum (a turn's
+    angle reduced by whole turns, the shape that split one value into its exact and rounded readings), a
+    two_product into a two_sum, a plain multiply by a broadcast constant into a two_sum, and one into a
+    compensated sum's pair."""
+    from dew.nn.precision import compensated_add, two_product, two_sum
+
+    def turned(x, y, z):
+        del y
+        turns = jnp.floor(x * np.float32(1 / (2 * np.pi)))
+        whole, dropped = two_product(-turns, jnp.full_like(turns, TWO_PI_SPLIT[0]))
+        return compensated_add((x, z * np.float32(2 ** -30)), (whole, dropped - turns * TWO_PI_SPLIT[1]))
+
+    def product_into_sum(x, y, z):
+        return two_sum(two_product(x, y)[0], z)
+
+    def scaled_into_sum(x, y, z):
+        del y
+        return two_sum(x * jnp.full_like(x, TWO_PI_SPLIT[0]), z)
+
+    def scaled_into_pair(x, y, z):
+        return compensated_add((x * jnp.full_like(x, TWO_PI_SPLIT[0]), jnp.zeros_like(x)), (z, y * z))
+
+    return {"turned": turned, "product into sum": product_into_sum, "scaled into sum": scaled_into_sum,
+            "scaled into pair": scaled_into_pair}
+
+
+COMPENSATED_SHAPES = ("turned", "product into sum", "scaled into sum", "scaled into pair")
+
+
+def compensated_primitives_hold_under_jit(shape: str) -> None:
+    """`_compensated_shapes`' `shape` jitted is its eager run, bit for bit, on the process's default device:
+    eagerly each operation is its own program, rounded on its own, the arithmetic an error-free transform is
+    stated in; under jit a compiler that contracted a multiply into the sum reading it (an FMA, XLA's CPU and
+    GPU) added its exact product where the transform's later steps read its rounded one, and the
+    compensated sum lost what it carried (a turn's angle off by 1.9e-6). The precision P0 of 2026-11-18."""
+    function = _compensated_shapes()[shape]
+    rng = np.random.default_rng(2026_1118)
+    x = jnp.asarray(rng.uniform(-3e4, 3e4, 4096), jnp.float32)
+    y = jnp.asarray(rng.standard_normal(4096), jnp.float32)
+    z = jnp.asarray(rng.standard_normal(4096) * 1e-3, jnp.float32)
+    eager = function(x, y, z)
+    jitted = jax.jit(function)(x, y, z)
+    for one, other in zip(jax.tree.leaves(jitted), jax.tree.leaves(eager), strict=True):
+        np.testing.assert_array_equal(np.asarray(one), np.asarray(other))
+
+
+@pytest.mark.parametrize("shape", COMPENSATED_SHAPES)
+def test_a_compensated_primitive_under_jit_is_its_eager_arithmetic(shape):
+    """`compensated_primitives_hold_under_jit` on the CPU (a GPU's in tests/test_gpu_numerics.py)."""
+    compensated_primitives_hold_under_jit(shape)
