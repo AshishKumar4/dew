@@ -168,16 +168,16 @@ def pytest_runtest_makereport(item, call):
     # A part's test that failed in its prepare before any check-1 site (`compiled_ahead`) computed before its
     # sites, on a device that computes nothing: it is recorded where it did (`truths_ahead.UNPREPARED`, the
     # tier's list of unprepared tests read from these records alone, a ledger row each), and its run runs
-    # it unprepared, compiling its sites on its GPU as a test outside a part does, every site judged; one
-    # that prepared any site is strict, a site it reaches unprepared a red (`truths_ahead.MissingTruth`).
-    if (call.when == "call" and call.excinfo is not None and os.environ.get(tier_wire.PREPARE) == "1"
+    # it unprepared, compiling its sites on its GPU as a test outside a part does, every site judged; in one
+    # that prepared any site, a site its prepare did not reach runs unprepared too (`truths_ahead.running`),
+    # and one prepared at another commit or for other shapes is a red (`truths_ahead.MissingTruth`).
+    if (call.when == "call" and call.excinfo is not None and tier_wire.preparing()
             and (store := _sites_store(item)) is not None and not any(store.glob("*/site.json"))):
-        from truths_ahead import UNPREPARED
+        from truths_ahead import UNPREPARED, unprepared
 
-        where = _computed_at(item, call.excinfo)
-        store.mkdir(parents=True, exist_ok=True)
-        (store / UNPREPARED).write_text(json.dumps({"test": item.nodeid, "where": where,
-                                                    "error": call.excinfo.exconly().splitlines()[0][:400]}))
+        frames = [(str(entry.path), entry.lineno + 1) for entry in reversed(call.excinfo.traceback)]
+        unprepared(store, item.nodeid, frames, call.excinfo.exconly().splitlines()[0][:400])
+        where = json.loads((store / UNPREPARED).read_text())["where"]
         report = outcome.get_result()
         report.outcome, report.longrepr = "skipped", (str(item.path), item.location[1] or 0,
                                                       f"computes before its first check-1 site, at {where}: "
@@ -276,7 +276,7 @@ def pytest_runtest_setup(item):
         # other in the lane's; both select a file's tests alike, so the tier cuts its groups alike.
         pytest.skip("runs in the lane's process" if users else "runs in a process that computes as a user's "
                     f"does ({lane_environment.USERS_ARITHMETIC}=1)")
-    if os.environ.get(tier_wire.PREPARE) == "1":
+    if tier_wire.preparing():
         # A GPU part's prepare, on its node's CPU (tests/model_flows.py): a flow prepares there, and every
         # other test of the part's files compiles its check-1 sites' programs (`compiled_ahead`), however it
         # is marked: the part's run runs each of them on its GPU. One that prepares none runs in the run.
@@ -285,18 +285,6 @@ def pytest_runtest_setup(item):
         marker = item.get_closest_marker(backend)
         if marker and jax.default_backend() != backend:
             pytest.skip(marker.kwargs.get("reason", f"runs on {device}"))
-
-
-def _computed_at(item, excinfo) -> str:
-    """Where a test computed before its first site (`truths_ahead.UNPREPARED`): the deepest frame of its own
-    file, else its failure's deepest frame, as `path:line`, its path from the suite's root
-    (`tests/test_x.py:104`)."""
-    entries = list(excinfo.traceback)
-    own = [entry for entry in entries if Path(str(entry.path)) == Path(str(item.path))]
-    entry = (own or entries)[-1]
-    path = Path(str(entry.path))
-    root = item.config.rootpath
-    return f"{path.relative_to(root) if path.is_relative_to(root) else path}:{entry.lineno + 1}"
 
 
 def _sites_store(item) -> Path | None:
@@ -327,7 +315,7 @@ def compiled_ahead(request):
     import model_flows
     from truths_ahead import UNPREPARED, compiled_truths
 
-    if not model_flows.preparing():
+    if not tier_wire.preparing():
         record = store / UNPREPARED
         if record.exists():
             # Its prepare computed before its first site: it runs unprepared, named in the run's summary.

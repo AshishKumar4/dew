@@ -56,29 +56,36 @@ def windows(draw, count: int):
     return drawn
 
 
+@dataclasses.dataclass(frozen=True)
 class _Windowed:
     """An arm of one draw (`fn`) over `windows`' stacked arguments, window by window (`over_windows`):
-    the gate compiles `fn` as it compiles any arm (`_arms`) and runs the windows through that program."""
+    the gate compiles `fn` as it compiles any arm (`_arms`) and runs the windows through that program. A
+    frozen record, stated by its arm (`reference_error._arm_role`)."""
 
-    def __init__(self, fn):
-        self.fn = fn
+    fn: Callable
 
     def __call__(self, *arguments):
         return stacked_on_host([self.fn(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
                             for index in range(_window_count(arguments))])
 
 
+@dataclasses.dataclass(frozen=True)
 class _RunToRun:
     """An arm whose outputs vary in their last bits from run to run on the same inputs (`run_to_run`):
-    the gate compiles `fn` as it compiles any arm (`_arms`) and judges each draw by the one run it makes."""
+    the gate compiles `fn` as it compiles any arm (`_arms`) and judges each draw by the one run it makes. A
+    frozen record, stated by its arm and its reason (`reference_error._arm_role`)."""
 
-    def __init__(self, fn, why: str):
-        self.fn, self.why = fn, why
+    fn: Callable
+    why: str
 
     def __call__(self, *inputs, **options):
         return self.fn(*inputs, **options)
 
     def __getattr__(self, name):
+        # Its arm's marks and mode; its own field, before it is set, and no dunder (a jit's `__wrapped__`,
+        # which would state the record as the wrapper it is not, `dew._stated.stated`).
+        if name == "fn" or name.startswith("__"):
+            raise AttributeError(name)
         return getattr(self.fn, name)
 
 
