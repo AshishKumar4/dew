@@ -1636,9 +1636,11 @@ def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...
     within float32's normal exponents, so a sum in range is its value though its terms leave float32's
     range: entry writes of keys of +-2^60 and values of 2^-20 under a weight of 2^100, each term 2^140 and
     their sum zero, where summed as formed it was inf - inf, NaN (base review ead11c83a F1). A product a
-    term at a time (`twice_scaled`) holds each term's range, not a sum's. The roundings are a plain sum's,
-    but a term below the largest by more than float32's normal exponents is dropped, below the sum's error
-    bound. Elementwise and over a 2-D array's axes, so a Pallas TPU kernel forms it in place."""
+    term at a time (`twice_scaled`) holds each term's range, not a sum's. Its error bound: the result is the
+    plain float32 sum's rounding of the exactly scaled terms (each product's significands rounded twice),
+    `(n + 2) 2^-24` of the terms' absolute sum over `n` terms, and a dropped term lies more than 2^126 below
+    the largest, under that bound. Elementwise and over
+    a 2-D array's axes, so a Pallas TPU kernel forms it in place."""
     parts = [[_binades(jnp.asarray(factor, jnp.float32)) for factor in term] for term in terms]
     products = []
     for term in parts:

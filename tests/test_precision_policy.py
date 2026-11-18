@@ -26,6 +26,7 @@ from dew.nn.precision import (
     ACCURATE,
     Numerics,
     _rounded_significand,
+    aligned_sum,
     compensated_add,
     compensated_difference,
     exact_products,
@@ -1088,3 +1089,35 @@ def test_a_float64_value_asked_for_without_x64_fails_rather_than_computing_in_fl
         jnp.ones(3, jnp.float64)
     with jax.enable_x64(new_val=True):
         assert jnp.ones(3, jnp.float64).dtype == jnp.float64
+
+
+ALIGNED_CASES = {
+    "cancelling": ([(2.0 ** 100, 2.0 ** -20, 2.0 ** 60), (2.0 ** 100, 2.0 ** -20, -(2.0 ** 60))], 0.0),
+    "in range though its terms are not": ([(1 + 2.0 ** -20, 2.0 ** 70, 2.0 ** 70),
+                                           (-1.0, 2.0 ** 70, 2.0 ** 70)], 2.0 ** 120),
+    "past the largest": ([(1.0, 2.0 ** 70, 2.0 ** 70), (1.0, 2.0 ** 70, 2.0 ** 70)], float("inf")),
+    "into the subnormals": ([(1.0, 2.0 ** -70, 2.0 ** -70), (1.0, 2.0 ** -70, 2.0 ** -70)], 2.0 ** -139),
+}
+"""`aligned_sum`'s cases: three-factor terms whose products leave fp32's range, and their sum, exact in any
+order of summing (two terms, their sum a float32)."""
+
+
+@pytest.mark.parametrize("case", list(ALIGNED_CASES))
+def test_an_aligned_sum_is_exact_where_its_terms_leave_fp32s_range(case):
+    """`aligned_sum` of fp32 terms each past fp32's range where their sum is in it, past it, or below the
+    least normal: exactly the sum, as a float32 holds it. Summed as formed, two terms of +-2^140 were inf -
+    inf, NaN (base review ead11c83a F1)."""
+    terms, total = ALIGNED_CASES[case]
+    found = aligned_sum([tuple(jnp.float32(factor) for factor in term) for term in terms])
+    assert float(found) == total
+
+
+def test_an_aligned_sum_along_an_axis_sums_each_rows_terms():
+    """`aligned_sum` over an axis: each row's two columns `(1 + 2^-20) 2^(140 + i)` and `-2^(140 + i)`, each
+    past fp32's range, summed along the row to `2^(120 + i)` exactly."""
+    rows = np.arange(6)
+    first = np.stack([np.full(6, 1 + 2.0 ** -20), np.full(6, -1.0)], axis=1).astype(np.float32)
+    second = np.broadcast_to(np.float32(2.0 ** 70), (6, 2))
+    third = np.broadcast_to((2.0 ** (70 + rows)).astype(np.float32)[:, None], (6, 2))
+    found = aligned_sum([(jnp.asarray(first), jnp.asarray(second), jnp.asarray(third))], axis=1)
+    np.testing.assert_array_equal(np.asarray(found)[:, 0], 2.0 ** (120 + rows))
