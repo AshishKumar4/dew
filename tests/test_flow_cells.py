@@ -2,6 +2,8 @@
 failure is kept and raised together, a cell's own skip is reported and the cells after it still run,
 and a flow of no cell that runs is skipped, never passed."""
 
+import inspect
+
 import gpu_flow
 import pytest
 from gpu_flow import Cell, CellsFailed, cells_of, run_cells
@@ -11,10 +13,12 @@ def test_a_flow_runs_every_cell_and_raises_every_failure_together():
     """A failing cell is kept, the cells after it run, and every failure is raised together after the
     last, each by its label."""
     ran = []
+    raised_at: list[int] = []
 
     def failing(name):
         def run():
             ran.append(name)
+            raised_at.append(inspect.currentframe().f_lineno + 1)
             raise AssertionError(f"{name} is off")
         return run
 
@@ -23,6 +27,9 @@ def test_a_flow_runs_every_cell_and_raises_every_failure_together():
                    Cell("last", failing("last"))])
     assert ran == ["first", "passing", "last"]
     assert raised.value.labels == ["first", "last"]
+    # Each failure kept with the frame it was raised at, the cell's own (its report names where it failed).
+    assert [raised.value.where[label][-1] for label in ("first", "last")] == [(__file__, line)
+                                                                              for line in raised_at]
 
 
 def test_a_cell_that_skips_itself_is_reported_and_the_cells_after_it_run():
