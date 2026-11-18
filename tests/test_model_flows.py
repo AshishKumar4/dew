@@ -295,6 +295,38 @@ def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     assert dew_traced and reference_traced
 
 
+@pytest.mark.parametrize("jitted", [False, True], ids=["a plain reference", "a jitted reference"])
+def test_a_qualification_run_sizes_a_prepared_site_through_its_stored_arms(tmp_path, monkeypatch, jitted):
+    """A qualification run (`check1_wire.QUALIFY`) of a site prepared for it sizes the site's seeds and then
+    judges it through the programs its prepare compiled, the sizing draws' among them (row 7606): no arm
+    traces at its float32 inputs in its run, where clearing the store compiled both on its GPU, the
+    reference traced only as its sizing's float64 truth, on the host, plain or jitted; the count it sizes is
+    recorded."""
+    from check1_wire import QUALIFY
+
+    dew, reference, draw = _site()
+    narrow: list[bool] = []
+
+    def dew_arm(a, b):
+        narrow.append(a.dtype == jnp.float32)
+        return dew(a, b)
+
+    def reference_arm(a, b):
+        narrow.append(a.dtype == jnp.float32)
+        return reference(a, b)
+
+    reference_fn = jax.jit(reference_arm) if jitted else reference_arm
+    record = tmp_path / "qualified.jsonl"
+    monkeypatch.setenv(QUALIFY, str(record))
+    with compiled_truths(tmp_path / "store", prepare=True, stamp="a"):
+        assert_as_exact(dew_arm, reference_fn, draw, "a product's arms", seeds=8)
+    narrow.clear()
+    with compiled_truths(tmp_path / "store", prepare=False, stamp="a"):
+        assert_as_exact(dew_arm, reference_fn, draw, "a product's arms", seeds=8)
+    assert not any(narrow)
+    assert json.loads(record.read_text().splitlines()[-1])["sized"] <= 8
+
+
 def test_a_compiled_sites_window_loop_and_run_to_run_arms_are_traced_by_its_prepare_alone(tmp_path):
     """Arms over a site's windows (`over_windows`) and declared to vary from run to run (`run_to_run`), each
     a record of its arm: judged from programs compiled ahead, the run traces neither (their prepare did), as
