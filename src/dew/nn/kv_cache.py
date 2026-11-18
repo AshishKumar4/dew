@@ -1617,18 +1617,21 @@ def regrouped_layout(layout: KVCache, prompts: int, width: int, prompt: int, new
     lie in another group's part. An undivided pool keeps its pages, a regrouped row sharing its parent's
     written ones (`gather_cache_rows`), sized for both phases: the prefill's tables give each prompt row
     its whole block (`default_page_table`, `refuse_unassigned`), `prompts * per_row` pages; past the branch,
-    the pages any step holds are each prompt's whole pages, shared by its rows, at most
-    `prompts * (prompt // page_size)`, and each row's own past them, at most `ceil(new_tokens / page_size)
-    + 1` (the prompt's last part page, its decoded tokens' pages; the page its next token lands in among
-    them), `prompts * width` rows of them. A layout naming a smaller pool is refused, with the least it
-    can be. A dense layout is the layout."""
+    a prompt of `f` whole pages, which its rows share, holds at most `f + width * min(own, per_row - f)`,
+    each row's own pages past them at most `own = ceil(new_tokens / page_size) + 1` (the prompt's last part
+    page and its decoded tokens' pages, the page its next token lands in among them) and no more than its
+    table's columns past the shared ones. That count grows with `f` while `own` binds and falls after, so a
+    prompt of at most `prompt // page_size` whole pages holds the most at the least of that and
+    `per_row - own`; never more than its rows' whole blocks, the dense cache's slots. A layout naming a
+    smaller pool is refused, with the least it can be. A dense layout is the layout."""
     if layout.page_size is None:
         return layout
     if layout.groups > 1:
         return unpaged(layout)
     size = layout.page_size
-    least = max(prompts * (capacity // size),
-                prompts * (prompt // size) + prompts * width * (-(-new_tokens // size) + 1))
+    per_row, own = capacity // size, -(-new_tokens // size) + 1
+    whole = min(prompt // size, max(0, per_row - own))
+    least = max(prompts * per_row, prompts * (whole + width * min(own, per_row - whole)))
     if layout.pages is None:
         return dataclasses.replace(layout, pages=least)
     if layout.pages < least:

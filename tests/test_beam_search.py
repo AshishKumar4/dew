@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from model_support import initialized_decoder
 from reference_runs import assert_arms_as_recorded
 
@@ -293,8 +294,10 @@ def test_a_search_over_a_paged_model_draws_what_it_draws_over_the_dense_one(mode
     five tokens, whose whole pages every beam of the prompt reads and whose part page the first child
     keeps and its siblings copy, decoded six tokens across their pages' ends, draw the dense search's
     tokens, lengths and scores bit for bit (row 8034); and the pool holds fewer slots than the dense
-    cache's rows."""
-    decoder, params = model
+    cache's rows, by the prompts' whole pages its beams share."""
+    # Rows long enough that a beam's own pages leave the prompt's shared ones to save.
+    decoder = model[0].clone(max_seq_len=24)
+    params = nn.unbox(decoder.init(jax.random.key(0), jnp.ones((1, 3), jnp.int32)))
     prompts = jnp.asarray([[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]], jnp.int32)
     layout = KVCache(page_size=page_size)
     found = {name: generate(held, params, prompts, 6, key=jax.random.key(0),
