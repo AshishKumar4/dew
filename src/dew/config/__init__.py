@@ -1743,9 +1743,10 @@ class DecoderRunConfig(RunConfig):
     at zero (`Loop.implicit`), so the looped decoder starts as the one loaded
     computes; False keeps a checkpoint's own choice."""
     loop_theta_per_pass: bool = False
-    """Give each later pass of an implicit loop (`loop_implicit`) a θ of its own (`Loop.theta_passes`),
-    rows for the largest count the run takes (`loop_steps`, or a phase's largest), each drawn at zero;
-    False keeps a checkpoint's own choice."""
+    """Give each later pass of an implicit loop (`loop_implicit`, or a checkpoint's own) a θ of its own
+    (`Loop.theta_passes`), rows for the largest count the run takes (`loop_steps`, or a phase's largest,
+    else the checkpoint's own count), each drawn at zero, or each a checkpoint's one θ (`looping`); a loop
+    that is not implicit refuses it. False keeps a checkpoint's own choice."""
     loop_exit_gate: bool = False
     """Weigh each pass's exit by a gate drawn at zeros over its states (`Loop.exit_gate`), which the
     objective's `exit_entropy` trains as Ouro does, at `EXIT_ENTROPY` where the run states none
@@ -1756,9 +1757,6 @@ class DecoderRunConfig(RunConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.loop_theta_per_pass and not self.loop_implicit:
-            raise ValueError("--loop-theta-per-pass gives each later pass of an implicit loop its own θ: it "
-                             "needs --loop-implicit")
         if isinstance(self.loop_steps, tuple) and self.data is not None:
             # Refused before anything loads: a count a phase the data reads in.
             phases = self.data.phase_count
@@ -1808,8 +1806,13 @@ class DecoderRunConfig(RunConfig):
         """`start` with its block run as the run asks (`looping`), as loaded where it asks nothing."""
         if not self.loops:
             return start
+        from dew.nn.protocols import Looped
+
         counts = self.loop_steps if isinstance(self.loop_steps, tuple) else (self.handed_passes,)
         rows = max((count for count in counts if count is not None), default=None)
+        if rows is None and isinstance(start.model, Looped) and start.model.loop is not None:
+            # The checkpoint's own count, where the run keeps it.
+            rows = start.model.loop.steps
         return looping(start, self.handed_passes, self.loop_layers, backprop_steps=self.loop_backprop_steps,
                        remat=self.loop_remat or None, implicit=self.loop_implicit or None,
                        exit_gate=self.loop_exit_gate or None, exit_threshold=self.loop_exit_threshold,
@@ -1825,8 +1828,9 @@ def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | No
     which gives a decoder with no loop one over its own layers. Refused where neither names a block,
     or a new block's passes are not stated. `backprop_steps` and `remat` choose
     the loop's backward memory, `implicit` its later passes' rule (`Loop.implicit`), and `exit_gate` and
-    `exit_threshold` its exits (`Loop.exit_gate`) and `theta_passes` its θ's rows (`Loop.theta_passes`);
-    None keeps a looped checkpoint's own value. A loop
+    `exit_threshold` its exits (`Loop.exit_gate`) and `theta_passes` its θ's rows (`Loop.theta_passes`),
+    each row a checkpoint's one θ where it held one, so the loop computes what the checkpoint's did; None
+    keeps a looped checkpoint's own value. A loop
     that gives its layers parameters of their own (an implicit loop's θ, an exit gate) draws them from
     `key` beside the loaded weights, fresh (`Pretrained.with_model`)."""
     from dew.nn.protocols import Looping
@@ -1838,7 +1842,22 @@ def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | No
     if looped is None:
         raise ValueError(f"this {type(start.model).__name__} has no loop: --loop-layers names the block of "
                          "its layers to repeat and --loop-steps how many times")
+    if theta_passes is not None:
+        start = dataclasses.replace(start, variables=_theta_rows(start.variables, theta_passes))
     return start.with_model(looped, key=key)
+
+
+def _theta_rows(variables, passes: int):
+    """`variables` with each implicit loop's one θ (`loop_theta` `[d]`) a row for each later pass of
+    `passes` (`[passes - 1, d]`), every row that θ, which computes what the one θ did (`Loop.theta_passes`);
+    a θ that holds rows already, as it is."""
+    import jax.numpy as jnp
+
+    def rowed(path, leaf):
+        named = isinstance(path[-1], jax.tree_util.DictKey) and path[-1].key == "loop_theta"
+        return jnp.broadcast_to(leaf, (passes - 1, *leaf.shape)) if named and leaf.ndim == 1 else leaf
+
+    return jax.tree_util.tree_map_with_path(rowed, variables)
 
 
 __all__ = ["DecoderRunConfig", "MetricConfig", "ObjectiveConfig", "Prepared", "Release", "RunConfig",

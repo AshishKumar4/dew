@@ -10,6 +10,7 @@ import itertools
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from run_kinds import MostlyKept, trained
@@ -149,8 +150,32 @@ def test_a_phased_run_with_a_theta_per_pass_keeps_its_rows_through_its_phases_an
     assert Config.load(str(tmp_path / "runs" / "stopped")).loop_theta_per_pass
     loaded = Decide.from_run(str(tmp_path / "runs" / "stopped"))
     assert loaded.model.backbone.loop.theta_passes == STEPS[-1]
+
+
+def test_a_theta_per_pass_over_a_checkpoints_implicit_loop_starts_each_row_at_its_theta():
+    """A run asking only for a θ per pass over a checkpoint whose implicit loop holds one θ takes it at the
+    checkpoint's own count, each row the checkpoint's θ, so it computes what the checkpoint computed; over a
+    checkpoint whose loop is not implicit it is refused, by the loop (row 7661)."""
+    from dew.config import looping
+    from dew.interop.pretrained import Pretrained
+
+    loaded = Pretrained.load(str(QWEN35), dtype="float32", attention_impl="reference")
+    implicit = looping(loaded, 3, (1, 3), implicit=True)
+    theta = np.random.default_rng(7661).uniform(0.1, 0.9, loaded.model.emb_features).astype(np.float32)
+    implicit = dataclasses.replace(implicit, variables={**implicit.variables, "params": {
+        **implicit.variables["params"], "loop_theta": theta}})
+    asked = dataclasses.replace(run(Path(), None, None), loop_layers=None, loop_implicit=False,
+                                loop_theta_per_pass=True)
+    per_pass = asked.looped(implicit)
+    assert per_pass.model.loop.theta_passes == 3 and per_pass.model.loop.steps == 3
+    np.testing.assert_array_equal(np.asarray(per_pass.variables["params"]["loop_theta"]),
+                                  np.stack([theta] * 2))
+    ids = jnp.arange(12, dtype=jnp.int32).reshape(2, 6)
+    np.testing.assert_array_equal(np.asarray(per_pass.model.apply(per_pass.variables, ids)),
+                                  np.asarray(implicit.model.apply(implicit.variables, ids)))
+    plain = looping(loaded, 3, (1, 3))
     with pytest.raises(ValueError):
-        dataclasses.replace(run(tmp_path, STEPS, data), loop_implicit=False, loop_theta_per_pass=True)
+        asked.looped(plain)
 
 
 @pytest.mark.parametrize("phase", range(len(STEPS)), ids=[f"{passes}-passes" for passes in STEPS])
