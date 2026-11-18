@@ -1082,10 +1082,10 @@ def _prologued(family: mosaic.Family, mod: Callable | None, hooks: Hooks, refs: 
                q_smem, power: float) -> None:
     """The query block in its stage under the query prologue (`Hooks.query_mod`, none where None), once a
     tile where the consumer loads it: read in its family's tile layout (`Family.tile_of`), taken at its rows'
-    indices `[rows, 1]` with its parameters, a head's scalar and a width's and a query's as the tile's entries,
-    which the hook reads as it reads the reference's `[1, D]` and `[rows, 1]` (`attention.prologued`) where
-    it broadcasts them, rounded to its dtype as the reference rounds it, taken by
-    the launch's power of two (`attention.by_power`, its caller's `prescale`, exact), written back and
+    indices `[rows, 1]` with its parameters, a head's scalar and a width's and a query's as the tile's
+    entries, which the hook reads as it reads the reference's `[1, D]` and `[rows, 1]`
+    (`attention.prologued`) where it broadcasts them, rounded to its dtype as the reference rounds it, taken
+    by the launch's power of two (`attention.by_power`, its caller's `prescale`, exact), written back and
     made visible to the products that read it (`Family.published`). Mosaic GPU lowers a norm's reduction
     over the width and a rotation's halves so (sm90 and sm100, a 64 x 256 bf16 tile, et-prologue-lowers)."""
     row, head = place[:2]
