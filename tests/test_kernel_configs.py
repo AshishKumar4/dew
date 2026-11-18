@@ -1749,4 +1749,3 @@ def test_a_grouped_calls_walk_takes_every_column_tile_and_a_dense_ones_a_power_o
         tile = launch.derived(arguments, generation.gpu_target())
     columns = 768 // tile.block_n  # three or six: no power of two, so the two bands differ
     assert (tile.grid_block_n & (tile.grid_block_n - 1) == 0) if dense else tile.grid_block_n == columns, tile
-

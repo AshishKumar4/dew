@@ -9,9 +9,10 @@ import numpy as np
 import pytest
 from arm_arithmetic import float64_held, stored_as
 from check1_judge import STAGES_LOG
+from contract_support import assert_contract
 from reference_error import NarrowTruth, as_given, assert_as_exact, over_windows, windows
 
-from dew.parity import GateFailure
+from dew.parity import FEWEST_SEEDS, GateFailure
 
 WEIGHT = np.random.default_rng(5430).normal(size=(64, 8)).astype(np.float32)
 """A parameter the arms close over, as a model's variables are."""
@@ -278,3 +279,44 @@ def test_a_judgement_logs_whether_its_reference_equalled_the_truth(tmp_path, mon
     assert_as_exact(product, product, drawn, "a product that rounds", seeds=8)
     logged = {entry["label"]: entry["exact"] for entry in map(json.loads, log.read_text().splitlines())}
     assert logged == {"whole numbers": True, "a product that rounds": False}
+
+
+def hypotenuse(x, y):
+    """Each pair's hypotenuse, scaled by the larger first, so no square passes float32's range."""
+    larger = jnp.maximum(jnp.abs(x), jnp.abs(y))
+    held = jnp.where(larger > 0, larger, 1)
+    return larger * jnp.sqrt(jnp.square(x / held) + jnp.square(y / held))
+
+
+def squared_out(x, y):
+    """The hypotenuse as written, its squares near 1e50: float64's, past float32's range."""
+    return jnp.sqrt(jnp.square(x) + jnp.square(y))
+
+
+def far(seed):
+    """Pairs of float32 values near 1e25, whose squares float32 cannot hold."""
+    rng = np.random.default_rng(seed)
+    return tuple(np.asarray(rng.uniform(0.5, 2.0, (64, 128)) * 1e25, np.float32) for _ in range(2))
+
+
+@pytest.mark.tpu(reason="a TPU emulates float64 within float32's range; its truths compute on its host")
+def test_a_tpus_truth_is_float64s_past_float32s_range():
+    """A truth whose intermediates pass float32's range (squares near 1e50) on a TPU, whose float64 is pairs
+    of float32s within float32's range: its truth is IEEE float64's, computed on the host
+    (`arm_arithmetic.float64_host`), so a hypotenuse its arms scale on the TPU is on par; computed on the TPU
+    its squares overflowed and every seed's truth was infinite (row 7226: a splash cell's dV, NaN on 40
+    seeds)."""
+    assert_as_exact(jax.jit(hypotenuse), jax.jit(hypotenuse), far, "a hypotenuse past float32's squares",
+                    seeds=FEWEST_SEEDS, truth_fn=squared_out)
+
+
+@pytest.mark.tpu(reason="a TPU emulates float64 within float32's range; its truths compute on its host")
+def test_a_tpus_derivative_contract_holds_where_float64_is_past_float32s_squares():
+    """A derivative contract's float64 run (`contract_support.assert_contract`) on a TPU is IEEE float64's,
+    on its host: a hypotenuse squared as written overflows in float32 at every order where its float64 run
+    is a normal float32, and the contract fails it; emulated on the TPU its float64 squares overflowed
+    too, so the contract read no position and passed it (row 7226)."""
+    x, y = far(0)
+    with pytest.raises(AssertionError):
+        assert_contract(squared_out, (x, y), (np.ones_like(x), np.ones_like(y)), np.ones_like(x),
+                        "a hypotenuse squared as written")

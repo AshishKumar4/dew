@@ -9,6 +9,7 @@ import itertools
 import json
 import math
 import threading
+import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
@@ -24,7 +25,7 @@ from PIL import Image
 from dew import _records
 from dew._files import write_atomically
 from dew._records import JSON, json_value, record
-from dew.batch import Batch, SegmentBound, Variables
+from dew.batch import Batch, SegmentBound, Variables, part, thaw
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.mixing import CorpusCounts
@@ -47,11 +48,11 @@ from dew.decision.laya import LAYA
 from dew.decision.layout import (
     QUESTION_FIELDS,
     Bounds,
+    ContextReader,
     Encoded,
     Laid,
     Layout,
     Specials,
-    context_tokens,
     per_question,
     render,
     with_context,
@@ -78,6 +79,7 @@ from dew.inference.tasks import (
     shape_bucket,
     traced_in_its_form,
 )
+from dew.inputs.spec import Condition
 from dew.interop.processors import Processor
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.sources import SourceReference
@@ -246,19 +248,24 @@ class Usage:
         return "instructions" in self.cut or "options" in self.cut
 
 
-def contexted(usage: Usage, rows: Sequence[Encoded], given: int) -> Usage:
-    """`usage` with the request's context of `given` tokens and those its rows read: every row reads the one
-    context, each cutting it alike where it cuts it, so the most any row cut is the context's cut, which a
-    sum over rows (`cut_counts`) would count once a row (train 986's review)."""
-    return replace(usage, context_tokens=given,
-                   context_kept=given - max((row.context_cut for row in rows), default=0))
+def _told(answers: dict[str, "Answer"], usage: Usage) -> dict[str, "Answer"]:
+    """`answers`, a caller of the call told where its context was cut (`Usage.context_cut`), as a served
+    answer states it (`usage.context_kept`): a warning naming the tokens it read of the tokens given."""
+    if usage.context_cut:
+        warnings.warn(f"the request's context is {usage.context_tokens} tokens, of which the cross-attention "
+                      f"read its first {usage.context_kept}", stacklevel=3)
+    return answers
 
 
 def usage_of(rows: Sequence[Encoded]) -> Usage:
-    """What a request's `rows` cost: their tokens, the state's, the least of it any row kept, and each
-    cut's rows and tokens."""
+    """What a request's `rows` cost: their tokens, the state's, the least of it any row kept, each cut's rows
+    and tokens, and its context's tokens and those every row read: every row reads the one context, each
+    cutting it alike where it cuts it, so the most any row cut is the context's cut, which a sum over rows
+    (`cut_counts`) would count once a row (train 986's review)."""
+    given = max((row.context_given for row in rows), default=0)
     return Usage(sum(len(row.tokens) for row in rows), max((row.state_tokens for row in rows), default=0),
-                 min((row.state_kept for row in rows), default=0), cut_counts(row.cuts for row in rows))
+                 min((row.state_kept for row in rows), default=0), cut_counts(row.cuts for row in rows),
+                 given, given - max((row.context_cut for row in rows), default=0))
 
 
 def _head_changes(first: Mapping[str, object], other: Mapping[str, object]) -> list[str]:
@@ -274,17 +281,32 @@ def _head_changes(first: Mapping[str, object], other: Mapping[str, object]) -> l
     return [f"head.{name}" for name in registry.computing_differences(
         registry.imported(str(first["class"])), *stated, kept=(_records.NUMBERS,))]
 
-def _tokenizer_held(settings: "DecideSettings", run: str) -> Mapping[str, str] | str | None:
-    """What the text tokenizer of the run in `run` is, which runs compare by: the hashes of the files it
-    reads (`PinnedTokenizer.files`), whether its record states them or was saved before records did
-    (`dew.inference.tasks.saved_tokenizer`); the byte vocabulary, which has no files, by its name."""
+def _tokenizer_held(settings: "DecideSettings", run: str) -> "Tokenizer | str | None":
+    """The text tokenizer of the run in `run`, which runs compare by (`_same_tokenizer`): whether its record
+    states its files or was saved before records did (`dew.inference.tasks.saved_tokenizer`); the byte
+    vocabulary, which has no files, by its name."""
     from dew.data.text import HFTokenizer
     from dew.inference.tasks import saved_tokenizer
 
     if settings.tokenizer is None:
         return None
     found = saved_tokenizer(settings.tokenizer, settings.tokenizer_files, run)
-    return found.pinned.files if isinstance(found, HFTokenizer) else settings.tokenizer
+    return found if isinstance(found, HFTokenizer) else settings.tokenizer
+
+
+def _same_tokenizer(one: "Tokenizer | str | None", other: "Tokenizer | str | None") -> bool:
+    """Whether two runs read one tokenizer: their files' hashes alike (`PinnedTokenizer.files`), else their
+    files each written again by this host's transformers alike (`dew.data.text.canonical_files`), which a
+    release exported before releases copied their run's files (`HFTokenizer.save_pretrained`) is read by:
+    transformers rewrote its tokenizer.json, so its hashes differ from its run's though it is one
+    tokenizer, which a run continued from it averages with its start by. A byte vocabulary by its name."""
+    from dew.data.text import HFTokenizer, canonical_files
+
+    match one, other:
+        case HFTokenizer(), HFTokenizer():
+            return one.pinned.files == other.pinned.files or canonical_files(one) == canonical_files(other)
+        case _:
+            return one == other
 
 
 @dataclass(frozen=True)
@@ -315,6 +337,10 @@ class DecideSettings:
     """What the text tokenizer is: each of its files' hash (`dew.inference.tasks.recorded_files`), which a
     load holds the files it finds to and runs compare by; None where a run recorded none, as runs before
     it did."""
+    context: Mapping[str, object] | None = field(default=None, metadata={_records.ADDED: True})
+    """The context's condition where the run configured its encoder (`DecisionModel.context`), as any
+    condition records (`dew.registry.to_record`), rebuilt over the run's `context` weights
+    (`Condition.bound`); None, the backbone's own (`context_encoder`)."""
 
 
 CALIBRATIONS = "calibrations"
@@ -486,8 +512,10 @@ class Decide(SavedRunTask, InItsForm):
     def released(cls, bundle: "PretrainedDecision", *, name: str | None = None) -> Self:
         """The declared decision task over the bundle's own tree, its projections as the model holds
         them: what a run trains from a release (`DecisionObjective`), where `of` packs them to serve."""
-        model = DecisionModel(bundle.model, bundle.head, bundle.context_encoder)
-        variables = joined({"backbone": bundle.variables, "head": bundle.head_variables})
+        model = DecisionModel(bundle.model, bundle.head, bundle.context_encoder, bundle.context)
+        # A run's configured context encoder's trained weights, as its bundle carries them bound.
+        context = {} if bundle.context is None else {"context": {"params": bundle.context.encoder.params}}
+        variables = joined({"backbone": bundle.variables, "head": bundle.head_variables, **context})
         # A release lays its rows out as it states them, sharing a state only where it says so.
         return cls(model, variables, bundle.layout, bundle.decision_tokenizer, bundle.specials,
                    bundle.calibration, name=name or str(bundle.origin or bundle.source),
@@ -507,8 +535,10 @@ class Decide(SavedRunTask, InItsForm):
         head = Head.from_record(settings.head, width)
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
+        context = None if settings.context is None else Condition.bound(
+            settings.context, params=thaw(part(variables, "context"))["params"])
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
-                              settings.context_encoder)
+                              settings.context_encoder, context)
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
@@ -643,7 +673,7 @@ class Decide(SavedRunTask, InItsForm):
                          and entry.name not in ("head", "tokenizer", "tokenizer_files")
                          and getattr(own, entry.name) != getattr(settings[0], entry.name)]
             differing += _head_changes(settings[0].head, own.head)
-            differing += ["tokenizer"] if held != tokenizers[0] else []
+            differing += [] if _same_tokenizer(held, tokenizers[0]) else ["tokenizer"]
             if differing:
                 raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
                                  f"{', '.join(differing)}, so their weights are not one task's to average")
@@ -796,15 +826,15 @@ class Decide(SavedRunTask, InItsForm):
             if images or context is not None:
                 raise ValueError("a batch of requests reads no one request's images or context: give each "
                                  "request's context in contexts=, and ask a request with images alone")
-            return [answers for answers, _ in self._answered(self.rows(state, contexts=contexts),
-                                                             [asked for _, asked in state])]
+            answered = self._answered(self.rows(state, contexts=contexts), [asked for _, asked in state])
+            return [_told(answers, usage) for answers, usage in answered]
         if contexts is not None:
             raise ValueError("one request reads its context in context=; contexts= is a batch's, each "
                              "request's own")
         if images:
-            return self._seen(state, questions, images, context, request=request)[0]
-        return self._answered([self._encoded(state, questions, context=context, request=request)],
-                              [questions])[0][0]
+            return _told(*self._seen(state, questions, images, context, request=request))
+        return _told(*self._answered([self._encoded(state, questions, context=context, request=request)],
+                                     [questions])[0])
 
     def rows(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
              contexts: Sequence[JSON | None] | None = None) -> list[list[Encoded]]:
@@ -1018,6 +1048,12 @@ class Decide(SavedRunTask, InItsForm):
         """The most context tokens a request carries (`DecisionModel.context_length`)."""
         return self.model.context_length
 
+    @property
+    def context_reader(self) -> "Tokenizer | ContextReader":
+        """What a request's context is tokenized by (`dew.decision.layout.context_tokens`)."""
+        reader = self.model.context_reader
+        return self.tokenizer if reader is None else reader
+
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None,
                  request: Mapping[str, Question] | None = None,
@@ -1033,7 +1069,7 @@ class Decide(SavedRunTask, InItsForm):
             if self.layout.refusal(row, self.context_length) == "unfit":
                 raise Refused("unfit", f"the question needs {len(row.context or ())} context tokens, more "
                                        f"than the {self.context_length} the backbone's cross-attention reads")
-        rows = with_context(laid, self.tokenizer, context, self.context_length)
+        rows = with_context(laid, self.context_reader, context, self.context_length)
         self.model.head.validate_rows(rows)
         for laid in (laid for row in rows for laid in row.questions):
             count = len(questions[laid.name].options)
@@ -1149,9 +1185,9 @@ class Decide(SavedRunTask, InItsForm):
             played = {}
             for name, options in playing.items():
                 parts = -(-len(options) // group)
-                for part in range(parts):
-                    chosen = options[part * len(options) // parts:(part + 1) * len(options) // parts]
-                    played[f"{name}/{part}"] = _restricted(questions[name], chosen)
+                for piece in range(parts):
+                    chosen = options[piece * len(options) // parts:(piece + 1) * len(options) // parts]
+                    played[f"{name}/{piece}"] = _restricted(questions[name], chosen)
             answers = self._played(state, played, questions)
             remaining |= {name: [_choice(answers[key]) for key in played if key.rsplit("/", 1)[0] == name]
                           for name in playing}
@@ -1187,8 +1223,8 @@ class Decide(SavedRunTask, InItsForm):
         finalists: dict[str, list[str]] = {}
         for name, groups in wide.items():
             kept = []
-            for part in range(len(groups)):
-                answer = answers[f"{name}/{part}"]
+            for piece in range(len(groups)):
+                answer = answers[f"{name}/{piece}"]
                 assert isinstance(answer, ChoiceAnswer)
                 seen = dict(zip(answer.options, map(float, answer.probabilities), strict=True))
                 first[name] |= seen
@@ -1566,8 +1602,6 @@ class _Admitted:
 
     questions: dict[str, Question]
     rows: tuple[Encoded, ...]
-    admitted: Usage | None = None
-    """What admission read of the body's context (`contexted`), which its answer states."""
 
 
 @dataclass(frozen=True)
@@ -1702,8 +1736,7 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
             with self.counting:
                 self.counts.dropped(Rejected(refused.reason))
             raise
-        usage = contexted(usage_of([row.encoded for row in rows]), [row.encoded for row in rows],
-                          len(context_tokens(decide.tokenizer, context)))
+        usage = usage_of([row.encoded for row in rows])
         if self.whole and (usage.truncated or usage.trimmed or usage.context_cut):
             # Counted as a run counts a row it refused: its reason and the tokens its cut removed.
             removed = {kind: tokens for kind, (_, tokens) in usage.cut.items()}
@@ -1715,14 +1748,12 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
                                  f"{decide.layout.max_len} tokens, without cutting its {cut}")
         with self.counting:
             self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
-        return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows), usage))
+        return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
-        answers, usage = self.decide._replied(payload.questions, payload.rows, outputs)
-        if payload.admitted is not None:
-            usage = replace(usage, context_tokens=payload.admitted.context_tokens,
-                            context_kept=payload.admitted.context_kept)
-        return self.decide._wire_response(payload.questions, answers, usage, details=self.details)
+        return self.decide._wire_response(payload.questions,
+                                          *self.decide._replied(payload.questions, payload.rows, outputs),
+                                          details=self.details)
 
 
 def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -> Variables:
@@ -1734,12 +1765,18 @@ def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -
     whole (`inference_projections`). A run that held some of them frozen packs as its export does,
     its whole tree's groups, each frozen where all its members were (ledger 2439). An adapter binds
     and an export writes the model's own tree (`unpacked`)."""
-    from dew.batch import part
     from dew.nn.projections import inference_projections, packed_owned
 
     pack = packed_owned if owned else inference_projections
     return joined({"backbone": pack(model.backbone, part(variables, "backbone")),
-                   "head": part(variables, "head")})
+                   "head": part(variables, "head"), **_context_part(model, variables)})
+
+
+def _context_part(model: DecisionModel, variables: Variables) -> dict[str, Variables]:
+    """A configured context encoder's weights (`DecisionModel.context`), which a task's trees carry
+    beside the backbone's and the head's; none for the backbone's own."""
+
+    return {} if model.context is None else {"context": part(variables, "context")}
 
 
 def trained_tree(model: DecisionModel, variables: Variables) -> Variables:
@@ -1747,13 +1784,14 @@ def trained_tree(model: DecisionModel, variables: Variables) -> Variables:
     to serve (`_served`), split back (`unpacked`, ledger 2299), so a run trains, and its resume builds,
     one tree wherever it runs: a trunk held frozen splits back frozen (ledger 2439). A task that holds
     no weights (a scoring task's, `Decide.scoring`) has none to split."""
-    from dew.batch import FROZEN, part
+    from dew.batch import FROZEN
     from dew.nn.projections import unpacked
 
     backbone = part(variables, "backbone")
     if "params" not in backbone and FROZEN not in backbone:
         return variables
-    return joined({"backbone": unpacked(model.backbone, backbone), "head": part(variables, "head")})
+    return joined({"backbone": unpacked(model.backbone, backbone), "head": part(variables, "head"),
+                   **_context_part(model, variables)})
 
 
 def decoded_images(images: object) -> list[Image.Image]:

@@ -59,7 +59,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.algebra.scan import RESET_DECAY
-from dew.mesh import SEQUENCE_AXIS, LayoutRefused
+from dew.mesh import SEQUENCE_AXIS
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
@@ -78,6 +78,7 @@ from dew.nn.linear import (
     over_sequence,
     scan_cache,
     sequence_conv,
+    sequence_split,
 )
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step, log_index
@@ -91,7 +92,6 @@ from dew.nn.precision import (
     softplus,
 )
 from dew.nn.residuals import Residual
-from dew.nn.sharding import sequence_shards
 
 CHUNK_SIZE = 256
 """The reference's default `chunk_size` (configuration_mamba2.py). The
@@ -246,7 +246,8 @@ class Mamba2(nn.Module):
     Under a mesh sequence axis above one, training and scoring run the conv and
     scan in a `shard_map` (`_sequence_mix`): the conv reads the previous shard's
     last `K-1` tokens by `ppermute` and the scan adds the earlier shards' state
-    (`recurrence_algebra.entering`); decoding and padded rows are refused there.
+    (`recurrence_algebra.entering`); a decode call runs whole there, its state replicated over the axis
+    (`linear.sequence_split`).
     """
 
     reads: ClassVar[frozenset[str]] = frozenset({"forks"})
@@ -413,12 +414,8 @@ class Mamba2(nn.Module):
             _ssd, num_heads=self.num_heads, head_dim=self.head_dim, n_groups=self.n_groups,
             state_size=self.state_size, chunk_size=self.chunk_size,
             time_step_limit=self.time_step_limit)
-        shards = sequence_shards()
-        if shards > 1 and tokens.forks is None:
-            if decode:
-                raise LayoutRefused(
-                    f"mamba2 under a sequence axis of {shards} runs whole training sequences; a decode "
-                    "step holds one state per row. Decode on a mesh with sequence=1.")
+        shards = sequence_split(decode, tokens)
+        if shards > 1:
             # Wide across the shards, so a halo's gradient and its shard's own add before rounding.
             out = over_sequence(functools.partial(_sequence_mix, scan=scan, dtype=compute), shards,
                                 (mixed.astype(wide), dt, tokens.segments, tokens.starts, valid),

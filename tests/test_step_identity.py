@@ -5,6 +5,7 @@ resume holds where it declares no identity."""
 from __future__ import annotations
 
 import dataclasses
+import functools
 import importlib
 import json
 import os
@@ -383,7 +384,8 @@ def test_a_step_reading_a_container_that_holds_itself_resumes_exactly_until_it_c
 
 
 GENERATED = """import dataclasses
-from typing import ClassVar
+import typing
+from typing import Annotated, ClassVar
 
 import attrs
 
@@ -527,7 +529,13 @@ setter leaves as it is (`attrs.setters.NO_OP`)."""
 GENERATED_AT = {"by": 1, "scale": 1, "over": 20, "value": 3, "slots": "", "span": 2, "mark": 5, "factor": 7,
                 "hook": 7, "modulus": 2, "sign": 1, "kinds": "int", "classhook": 7, "flag": "True",
                 "eq": "True", "compare": "True", "pipe": 3, "attrs_eq": "", "keyword": "False",
-                "takes_self": "False", "annotation": "int", "alias": "value"}
+                "takes_self": "False", "annotation": "list[Annotated[int, 'tag']] | None", "alias": "value"}
+
+
+def shifting_reader(generated, resume="exact"):
+    """A read of `ROWS` through the step of `generated`'s `Shifting`, resuming as `resume` says."""
+    pipeline = Pipeline(ROWS).map(generated.Shifting()).shuffle(0).repeat().batch(2)
+    return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
 
 
 @pytest.mark.parametrize(("edit", "assigned"), [
@@ -537,14 +545,15 @@ GENERATED_AT = {"by": 1, "scale": 1, "over": 20, "value": 3, "slots": "", "span"
     ({"kinds": "(int, float)"}, None), ({"classhook": 70}, None), ({"flag": "False"}, None),
     ({}, ("by", 10)), ({}, ("scale", 10)), ({"eq": "False"}, None), ({"compare": "False"}, None),
     ({"pipe": 30}, None), ({"attrs_eq": ", eq=False"}, None), ({"keyword": "True"}, None),
-    ({"takes_self": "True"}, None), ({"annotation": "float"}, None), ({"alias": "renamed"}, None)],
+    ({"takes_self": "True"}, None), ({"annotation": "float"}, None), ({"alias": "renamed"}, None),
+    ({"annotation": "typing.List[Annotated[int, 'tag']] | None"}, None)],
     ids=["slotted field", "mangled field", "slotted child's override", "factory", "slotted factory",
          "attrs default", "attrs factory", "attrs converter", "attrs setter hook", "attrs eq key",
          "attrs order key", "attrs validators", "attrs class setter hook", "attrs eq flag",
          "a default set at run time", "a class variable set at run time", "dataclass eq option",
          "dataclass field compare flag", "attrs nested converter", "attrs eq option",
          "dataclass keyword-only field", "attrs factory taking self", "attrs annotation a converter reads",
-         "an attrs field part named nowhere (its alias)"])
+         "an attrs field part named nowhere (its alias)", "attrs annotation's generic form"])
 def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factory_changed(
         tmp_path, monkeypatch, edit, assigned):
     """A step of a class of the user's file, stated by its members, whose code builds classes of the file
@@ -565,7 +574,9 @@ def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factor
     converter reads went unstated, each a part of a field no hand list named (the evening audit of
     2026-11-16); every part is stated now, an attrs field's alias among them, which no code of Dew names. A
     field whose setter attrs leaves as it is (`attrs.setters.NO_OP`, a bare sentinel) left the step inexact,
-    refusing an unchanged exact resume (train 974's review)."""
+    refusing an unchanged exact resume (train 974's review). A field annotated with `Annotated` metadata in
+    a union crashed the step's statement, and its generic form (`list[...]` or `typing.List[...]`, which the
+    converter tells apart) went unstated (the base review of 25b3f299c)."""
     module = tmp_path / f"generated_{uuid4().hex}.py"
     # Saved and edited under the same slotting, so an edit changes the factory alone.
     start = {**GENERATED_AT, **{name: value for name, value in edit.items() if name == "slots"}}
@@ -573,9 +584,7 @@ def test_an_exact_resume_refuses_a_step_whose_generated_classs_default_or_factor
     monkeypatch.syspath_prepend(str(tmp_path))
     generated = importlib.import_module(module.stem)
 
-    def reader(resume="exact"):
-        pipeline = Pipeline(ROWS).map(generated.Shifting()).shuffle(0).repeat().batch(2)
-        return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
+    reader = functools.partial(shifting_reader, generated)
 
     state = saved_after_one(reader)
     assert resumed_changes(reader(), state) == ()
@@ -603,14 +612,40 @@ print(json.dumps([identity.exact, identity.config, list(identity.held), list(ide
 """
 
 
-def test_a_generated_classs_step_is_stated_alike_in_processes_of_different_string_hashing(tmp_path):
-    """The step of `GENERATED`, which reaches hashable attrs classes, is stated alike, exactly, by two fresh
-    processes of different string hashing, so a position one saves resumes exactly in the other. attrs
-    writes a hashable class's `__hash__` with this process's salted string hash, and the generated
-    methods' code was stated, differing in every process: an exact resume of an unchanged pipeline was
-    refused (train 974's review)."""
-    module = tmp_path / f"generated_{uuid4().hex}.py"
-    module.write_text(GENERATED.format(**GENERATED_AT))
+ANNOTATED = """import dataclasses
+from typing import Annotated, Callable
+
+
+def marker(value):
+    return value
+
+
+@dataclasses.dataclass(frozen=True)
+class Shifting:
+    by: Annotated[int, marker] = 1
+    each: list[Annotated[int, marker]] = dataclasses.field(default_factory=list)
+    then: Callable[[Annotated[int, marker]], int] | None = None
+
+    def __call__(self, row):
+        return {{"x": row["x"] + self.by}}
+"""
+
+
+
+@pytest.mark.parametrize("source", ["generated", "annotated"])
+def test_a_steps_dataclass_or_attrs_class_is_stated_alike_in_two_processes(tmp_path, source):
+    """A step reaching generated or annotated classes is stated alike, exactly, by two fresh processes of
+    different string hashing, so a position one saves resumes exactly in the other, as an unchanged run's
+    exact resume after a restart reads on.
+
+    `generated` (`GENERATED`) reaches hashable attrs classes, whose `__hash__` attrs writes with the
+    process's salted string hash: the generated methods' code was stated, differing in every process
+    (train 974's review). `annotated` (`ANNOTATED`) is a dataclass whose fields' annotations hold
+    `typing.Annotated` metadata, a module's function whose text is its address in a process, alone and
+    inside a list and a callable's parameters: the annotation's text was stated (train 977's review; the
+    morning audit of 2026-11-17, CROSS-AM-01)."""
+    module = tmp_path / f"{source}_{uuid4().hex}.py"
+    module.write_text(GENERATED.format(**GENERATED_AT) if source == "generated" else ANNOTATED.format())
     stated = []
     for seed in ("1", "2"):
         done = subprocess.run([sys.executable, "-c", STATED_IN_A_PROCESS, str(tmp_path), module.stem],

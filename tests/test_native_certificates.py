@@ -59,7 +59,7 @@ from native_certificates import (
 )
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32, TFLOAT32, Format, truncated
 
-from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels import gemm, generation, grouped_matmul, grouped_triton, tuning
 from dew.nn.kernels.templates.recurrence import mainloop
 
 pytestmark = pytest.mark.gpu(reason="a native kernel, certified on the GPU that compiles it")
@@ -98,10 +98,10 @@ CUTLASS = launches(("cutlass", "sm90"))
 """The vendored CUTLASS grouped GEMM's launch (`grouped_matmul.CutlassGmm`, the dew-cutlass wheel's): bf16
 operands on Hopper, its one tile, no exact sums or steps of its own, so its products' cell alone (row 2084
 (a)); a GPU whose installed wheel holds no sm90 kernels refuses it."""
-GRADIENTS = {"mosaic": grouped_matmul.MosaicTgmm, "triton": grouped_matmul.Tgmm}
+GRADIENTS = {"mosaic": grouped_matmul.MosaicTgmm, "triton": grouped_triton.Tgmm}
 """Each kernel's kernel-gradient launch."""
-STEPS = {grouped_matmul.MosaicTgmm: ("block_k", True), grouped_matmul.Tgmm: ("block_m", False),
-         grouped_matmul.Gmm: ("block_k", False)}
+STEPS = {grouped_matmul.MosaicTgmm: ("block_k", True), grouped_triton.Tgmm: ("block_m", False),
+         grouped_triton.Gmm: ("block_k", False)}
 """Each launch of exact sums: its tile's field that is its depth step's width, and whether its steps are
 the global blocks of that many rows a group's rows meet (Mosaic GPU's kernel gradient,
 `row_tiles.group_blocks`) rather than runs from the contraction's first (Triton's: a kernel gradient's
@@ -382,7 +382,7 @@ def the_forwards_exact_sums_certify_natively_a_depth_step_at_a_time(kernel, gene
         return gemm.gemm(x, w, jnp.asarray(SIZES, jnp.int32), out_dtype=jnp.float32, precision="highest")
 
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
-        width, _ = depth_step(grouped_matmul.Gmm, forward, jax.ShapeDtypeStruct((ROWS, DEPTH), jnp.bfloat16),
+        width, _ = depth_step(grouped_triton.Gmm, forward, jax.ShapeDtypeStruct((ROWS, DEPTH), jnp.bfloat16),
                               jax.ShapeDtypeStruct((len(SIZES), DEPTH, WIDTH), jnp.bfloat16))
         steps = [[np.s_[:, at:at + width] for at in range(0, DEPTH, width)]]
         for seed in range(SEEDS):

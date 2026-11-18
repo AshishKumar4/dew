@@ -7,6 +7,30 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A launch whose derived config spills certifies its ladder's rungs one after another and takes the first
+  that holds, where it certified them in threaded rounds as wide as the host's cores: a rung's certification
+  is its launch's trace and Mosaic GPU lowering, Python under the GIL, so a round of 13 rungs cost 13 rungs'
+  work and every rung past the one that held was spent for nothing (a 4B decision step's cold start on a
+  GH200, M-MC-18). `report.certified_together`, `report.rung_round` and `Certification.round` are gone.
+
+- A decision's context is an ordinary condition of its objective's inputs (`DecisionObjective.inputs`), and a
+  run may configure its encoder as any registered condition encoder (`--context-text.encoder`,
+  `--context-text.checkpoint`, as a diffusion run's text condition), in place of the backbone's own token table
+  or pass: its tokenization reads the context, its states reach the context layers at its width, its weights
+  are the model's `context` module, a run records it and its task rebuilds it.
+- A fit's search climbs the remat ladder in its order where the step does not fit at its own rung and settles
+  the first rung that fits, every lighter rung asked and missed in that start: what a rung keeps orders its
+  residuals and not XLA's peak (a scanned delta decoder needed more recomputing its scans and convolutions
+  too), so no rung is passed over, where the search galloped and bisected the ladder. On a GPU each attempt
+  stops after buffer assignment past the devices' limit (`xla_gpu_memory_limit_early_exit_bytes`), so a miss
+  costs no code generation, and its live set computes the split asked next at that rung: the buffers a
+  microbatch's rows scale, by their dimensions' provenance. The log names every rung asked with what it was
+  short by. A plan made before the state is placed is searched again where the placed devices' room covers one
+  of its misses (a fine-tune's copied sources let go). A decoder whose layers scan keeps, with no rung or the
+  one recomputing the delta rule's memory, the products and `minimal_with_scan_and_conv`'s residuals (with its
+  layers updating in the backward, those residuals), where the recomputing rung kept every value, more than no
+  rung.
+
 - Programs a process keeps (`dew.training.ahead.keeping`) are kept and handed by their fingerprint: the
   digest of the lowered program, its trees and its arguments' types under the XLA options it compiled
   with (`dew.nn.kernels.options.program_digest`), with the target they were built for (`BuildTarget`).
@@ -60,12 +84,43 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   file edited in place, or a wheel rebuilt at the same version, which it states by its version) ran its
   stale program by default.
 
+- A fresh state's program draws on a GPU as rolled loops over threefry's rounds
+  (`jax_threefry_rolled_lowering`, Dew's JAX build's, at its lowering alone, `dew.training.distributed.drawing`)
+  in place of each draw's rounds unrolled: the same bits, and the program, a draw for nearly every leaf,
+  compiles on a GH200 in 4.9 s where it took 23.8 s (a 142M DiT; a 4x1024 MoE decoder's, 5.4 s where it took
+  26.5 s), its state placed in 7.6 s where it took 26.7 s (20.2 s where 41.5 s). A step keeps JAX's default,
+  its draws fused into what reads them.
+
 - A run refused before it takes its start, whose start program still compiles in its own thread, exits with
   its refusal's status once that compile ends: JAX's exit cleanup and the C runtime's exit tore XLA down under
   the running compile, and 12 of 48 such exits ended by a segmentation fault
   (`dew.nn.kernels.options.compiling`). A run's cooldown branches are checked before its start begins to
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
+
+- Dew requires its JAX build 0.12.0.1.post106 and, on Linux x86_64 and aarch64, its own jaxlib build
+  0.12.0.1.post103, with its CUDA and PJRT plugins 0.12.0.1.post103 (post96's until now). A GPU compile takes a
+  device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
+  whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
+  executables' buffer assignment, which jaxlib's client of it reads, so `Compiled.peak_live()` lists the buffers
+  live at a GPU program's peak (bytes, shape, dtype, parameter, output or temporary, the instruction and its
+  `op_name`, its checkpoint names and the axes each dimension descends from). jax adds
+  `jax_threefry_rolled_lowering`, off unless set: GPU threefry lowered as rolled loops over its rounds, as on CPU.
+  Four wrong results are fixed: XLA:CPU's YNNPACK unary kernels read a broadcast input past its end, a bfloat16
+  conversion of a broadcast scalar differing from one process to the next (row 5495); XLA:GPU's Triton GEMM fusion
+  of a residual add took the residual as its accumulator's start, a scanned stack's float32 error 1.2 to 1.9 times
+  the unscanned one's (row 6759), which a Pallas Triton kernel's own accumulation still folds, as Triton does;
+  Mosaic GPU converted an integer to a boolean by its low bit, 2 to False (row 6941), and negates a boolean as its
+  integer's exclusive or with 1; and XLA's HLO evaluator left a float32 dot over an empty contraction
+  uninitialized, zeros now (row 6942). Pallas Triton lowers an optimization barrier, a one-element slice, boolean
+  reductions and hijax primitives (the attention's merge kernel), and which devices a process sees no longer
+  splits a Mosaic GPU lowering's key (row 6717). Elsewhere jaxlib stays the stock 0.12.0.1.
+
+- A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
+  anything, where its run states no `ns_group`: a step that fits only with them joined one at a time takes
+  that (`FitSearch.searched`, its rung's `ns_group`; 11.3 GB of a 4B step's peak for 82 ms a step), kept
+  only where it brought the step nearer to fitting, as the narrow copies' drop is; a run that states its
+  group keeps it. Its rung records it, which a resumed run compiles at.
 
 - A fit searches its step's plan once: the search made before the state is placed keeps the plan it finds
   even where candidates missed on the way, and the run's first compile takes it, its executable compiled

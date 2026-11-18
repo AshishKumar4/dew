@@ -680,8 +680,7 @@ def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_only_where_dropping_t
     own = {probe["narrow"]: probe for probe in probes if {key: probe[key] for key in rung} == at_base}
     with_copies, without = own[True], own[False]
     assert not with_copies["fits"] and not without["fits"]
-    recomputing = [index for index, probe in enumerate(probes) if probe["remat"] != base["remat"]]
-    assert probes.index(without) < min(recomputing)
+    assert all(probe["remat"] == base["remat"] for probe in probes[:probes.index(without) + 1])
     # The plan, a rung above, holds them dropped where dropping them left the step less short, and back where
     # it did not, and the run trains on the plan it found.
     kept = without["headroom"] <= with_copies["headroom"]
@@ -741,3 +740,24 @@ def test_a_restored_state_drops_its_templates_copies():
     assert isinstance(restored, TrainState)
     assert restored.compute is None
 
+
+
+@pytest.mark.parametrize("resident,beside,temporaries", [(0, 0, 1), (3 << 30, 1 << 30, 5 << 30),
+                                                         (12345, 678, 91011)])
+def test_a_gpu_of_the_memory_a_step_needs_admits_it_and_one_byte_less_does_not(resident, beside, temporaries):
+    """`needed` is the inverse of `admitted`: a GPU stated to hold the bytes it returns admits the step
+    (headroom zero or more, read by `admitted` through that GPU's stated memory), and one stated a byte
+    fewer does not; the bytes a pool of GPUs is sized by, through the one admission the planner reads."""
+    from dew.training.ahead import stand_in_gpus
+    from dew.training.memory import admitted, needed
+
+    device = jax.devices("cpu")[0]
+    least = needed(device, resident, beside, temporaries)
+
+    def headroom(memory: int) -> int:
+        with stand_in_gpus([device], memory) as stood:
+            spare = admitted(stood, resident, beside, temporaries)
+        assert spare is not None
+        return spare
+
+    assert headroom(least) >= 0 > headroom(least - 1)

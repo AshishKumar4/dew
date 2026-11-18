@@ -36,7 +36,7 @@ from tuned import each_config, taken
 
 from dew.nn.activations import exact_gelu, gated_product, swiglu_clamped
 from dew.nn.gpt_oss import GptOssExperts
-from dew.nn.kernels import generation, grouped_matmul, tuning
+from dew.nn.kernels import generation, grouped_triton, tuning
 from dew.nn.kernels.generation import chosen as kernel_choices
 from dew.nn.moe import EXPERT_AXES, ExpertMLP, Layered, expert_dispatch, expert_projection, paired_projections
 from dew.training import MeshSpec
@@ -257,9 +257,9 @@ def test_the_tile_gate_fails_a_launch_off_by_a_rounding():
     with its forward off by one part in 2^7, an error no rounding of its sums makes: the reference arm is
     XLA's, not the launch under test."""
     with generation.assumed("sm80"):
-        gate = _tile_gate(grouped_matmul.Gmm, 64, 128)
+        gate = _tile_gate(grouped_triton.Gmm, 64, 128)
         with kernel_choices(grouped_matmul='triton'):
-            config, *_ = taken(grouped_matmul.Gmm, _tile_gate_arm('pallas'), *gate.draw(0))
+            config, *_ = taken(grouped_triton.Gmm, _tile_gate_arm('pallas'), *gate.draw(0))
         gate.check(config)
         with pytest.raises(AssertionError):
             gate.check(config, fault=1 + 2.0 ** -7)

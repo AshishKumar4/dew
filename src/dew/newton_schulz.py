@@ -4,10 +4,12 @@ names its width (`headed`), each update's stack spread whole across the mesh's d
 chunk of matrices at a time (`orthogonalized`), in the run's numerics or a stated dot algorithm
 (`ns_operands`), at Jordan's coefficients or Polar Express's (`polar_express`)."""
 
+import contextlib
+import contextvars
 import functools
 import inspect
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Literal
 
 import jax
@@ -16,6 +18,7 @@ import numpy as np
 import optax
 from optax.contrib import _muon
 
+from dew import _cache
 from dew.mesh import STAGE_AXIS
 from dew.nn.kernels.gemm import batched_product
 from dew.nn.precision import configured_precision, iteration_dtype
@@ -61,6 +64,43 @@ def polar_express(steps: int, safety: float = 1.01) -> tuple[tuple[float, float,
     return tuple(table[:steps] + [table[-1]] * (steps - len(table)))
 
 
+_RELEASED: contextvars.ContextVar[int | None] = contextvars.ContextVar("dew_newton_schulz_group",
+                                                                       default=None)
+"""The stacks of one shape a plan has `orthogonalized` join at a time where the run states none
+(`released`), as a step's settings carry it (`dew.training._candidates.StepSettings.ns_group`): None joins
+them all. A context every trace reads, so a trace kept outside the compile point keys on it
+(`dew.nn.kernels.options.trace_context`)."""
+
+_JOINED: contextvars.ContextVar[list[bool] | None] = _cache.untraced(
+    contextvars.ContextVar("dew_newton_schulz_joined", default=None))
+"""Where a trace within `joining` notes that it joined stacks a release could part (`joining`)."""
+
+
+@contextlib.contextmanager
+def released(group: int | None) -> Iterator[None]:
+    """Within the block, an `orthogonalized` whose run states no group joins `group` stacks of one shape at
+    a time, all where None: a plan's release of the joined stacks' copies
+    (`dew.training.planning.FitSearch`)."""
+    token = _RELEASED.set(group)
+    try:
+        yield
+    finally:
+        _RELEASED.reset(token)
+
+
+@contextlib.contextmanager
+def joining() -> Iterator[list[bool]]:
+    """Within the block, a list holding True once a trace joined two or more stacks of one shape where its
+    run states no group (`spread_stacks`): what a plan's release of them would part (`released(1)`), read
+    off the program the step traced, so a step whose updates join none asks no release."""
+    joined: list[bool] = []
+    token = _JOINED.set(joined)
+    try:
+        yield joined
+    finally:
+        _JOINED.reset(token)
+
+
 def muon_leaf(node) -> bool:
     """A leaf of a tree of Muon's dimension numbers: a parameter's, or None for AdamW's."""
     return node is None or isinstance(node, optax.contrib.MuonDimensionNumbers)
@@ -100,14 +140,18 @@ def orthogonalized(updates: optax.Updates, numbers, coeffs, steps: int, eps: flo
     where None (`spread_stacks`), and padded so no device idles on a remainder: on a GH200 a 4B decision
     step's update ran its 222 TFLOP of products as 31 joined stacks at 0.74 of peak and as 317 stacks one at
     a time (`group=1`) at 0.58, 82 ms a step slower, where the joined copies held 11.3 GB more at the step's
-    peak (row 5669); a run states its `group` (`OptimConfig`'s `ns_group`), which no plan sets. On a mesh
+    peak (row 5669); a run states its `group` (`OptimConfig`'s `ns_group`), else its plan does, joining
+    them all unless the step fits only one at a time (`released`, row 5889). On a mesh
     with Explicit axes the spreading runs with them Auto (`jax.sharding.auto_axes`), where a constraint may
     name them and a split stack slices, each update leaving where it came; on one device, or none in
     context, each stack iterates whole. A tree of head `widths` (`head_widths`) splits an update's output
     side into heads, each one matrix."""
     mesh = jax.sharding.get_abstract_mesh()
+    # A run's own group stands; else the plan's (`released`), whose joins a trace notes (`joining`).
+    stated, group = group is not None, _RELEASED.get() if group is None else group
     spread = functools.partial(_spread_orthogonalized, numbers=numbers, coeffs=coeffs, steps=steps, eps=eps,
                                preconditioning=preconditioning, algorithm=algorithm, group=group,
+                               stated=stated,
                                widths=jax.tree.map(lambda _: None, updates) if widths is None else widths)
     if mesh.empty or not mesh.explicit_axes:
         return spread(updates)
@@ -118,11 +162,13 @@ def orthogonalized(updates: optax.Updates, numbers, coeffs, steps: int, eps: flo
 
 def _spread_orthogonalized(updates, *, numbers, coeffs, steps: int, eps: float,
                            algorithm: jax.lax.DotAlgorithmPreset | None, widths,
-                           preconditioning: Preconditioning, group: int | None) -> optax.Updates:
+                           preconditioning: Preconditioning, group: int | None,
+                           stated: bool) -> optax.Updates:
     """`orthogonalized`'s iteration over a mesh of Auto axes: each stack laid out `[devices, share, rows,
     columns]`, its first axis split across every axis of the mesh but a pipeline's stages, so each device
     iterates its own share, which no exchange crosses; the stacks of one shape joined `group` at a time
-    (`spread_stacks`)."""
+    (`spread_stacks`), a join of two or more where the run `stated` no group noted for a plan's release
+    (`joining`)."""
     mesh = jax.sharding.get_abstract_mesh()
     axes = () if mesh.empty else tuple(axis for axis, size in mesh.shape.items()
                                        if size > 1 and axis != STAGE_AXIS)
@@ -152,7 +198,10 @@ def _spread_orthogonalized(updates, *, numbers, coeffs, steps: int, eps: float,
         heads, apart = headed(matrices, width)
         stacks.append((heads, lambda done, back=back, apart=apart: back(apart(done))))
     done: list[jax.Array | None] = [None] * len(leaves)
-    for members in spread_stacks([stack for stack, _ in stacks], group):
+    sets = spread_stacks([stack for stack, _ in stacks], group)
+    if not stated and (joined := _JOINED.get()) is not None and any(len(members) > 1 for members in sets):
+        joined.append(True)
+    for members in sets:
         if len(members) == 1 and not stacks[members[0]][0].shape[0] % devices:
             (index,) = members
             done[index] = stacks[index][1](iterated(stacks[index][0]))
