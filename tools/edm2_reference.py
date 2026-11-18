@@ -28,11 +28,11 @@ into a whole step's difference.
 
 from __future__ import annotations
 
-from typing import Any
 import contextlib
 import json
 import types
 from pathlib import Path
+from typing import Any
 
 import jax
 import numpy as np

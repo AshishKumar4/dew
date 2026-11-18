@@ -18,7 +18,10 @@ from typing import Any
 import numpy as np
 import torch
 from mimo_reference import FIXTURES, packed_rows, padded, scatter, write
-from transformers.models.muse_glimmer.configuration_muse_glimmer import MuseGlimmerConfig, MuseGlimmerVisionConfig
+from transformers.models.muse_glimmer.configuration_muse_glimmer import (
+    MuseGlimmerConfig,
+    MuseGlimmerVisionConfig,
+)
 from transformers.models.muse_glimmer.image_processing_muse_glimmer import MuseGlimmerImageProcessor
 from transformers.models.muse_glimmer.modeling_muse_glimmer import (
     MuseGlimmerRMSNorm,

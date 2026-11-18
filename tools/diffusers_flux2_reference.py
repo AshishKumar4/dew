@@ -256,9 +256,9 @@ def text_encoder(tok):
 
 def build_pipeline(root: Path):
     from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
-    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
-    from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline
     from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DModel
+    from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
     from make_tiny_tokenizer import qwen_byte_tokenizer
 
     tok = qwen_byte_tokenizer(json.loads((SOURCE / "tokenizer" / "tokenizer_config.json").read_text()),

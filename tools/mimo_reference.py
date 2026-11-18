@@ -33,12 +33,12 @@ fixture's tokenizer.
     PYTHONPATH=src:tests python tools/mimo_reference.py --record-images
 """
 
-from typing import Any
 import argparse
 import json
 import runpy
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import torch

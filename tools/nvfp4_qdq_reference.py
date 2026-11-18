@@ -26,8 +26,8 @@ from unittest.mock import patch
 import numpy as np
 import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme, QuantizationStatus
-from compressed_tensors.quantization.quant_args import DynamicType
 from compressed_tensors.quantization.lifecycle.forward import forward_quantize
+from compressed_tensors.quantization.quant_args import DynamicType
 from compressed_tensors.quantization.utils.helpers import generate_gparam
 from compressed_tensors_mxfp4_reference import TIES
 from nvfp4_storage_reference import ARGS, compress, set_state

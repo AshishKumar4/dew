@@ -57,10 +57,10 @@ nothing here reaches the Hub API that changed. With torch 2.8.0, CPU:
 
 from __future__ import annotations
 
-from typing import Any
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch

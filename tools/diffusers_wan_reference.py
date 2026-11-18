@@ -210,9 +210,9 @@ def text_encoder(vocab: int):
 
 def build_pipeline(root: Path):
     from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
-    from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
-    from diffusers.pipelines.wan.pipeline_wan import WanPipeline
     from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
+    from diffusers.pipelines.wan.pipeline_wan import WanPipeline
+    from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
     # A T5 tokenizer over single characters (`t5_reference.tiny_tokenizer`): the release's umt5
     # vocabulary is 256k pieces, and every character here is one.
@@ -250,8 +250,8 @@ def scheduler_replay() -> dict[str, np.ndarray]:
     """The published scheduler stepped on recorded model outputs, the one
     model evaluation per step a guided Wan walk makes, from a fixed latent:
     its timesteps and every step's sample, in float32 and widened."""
-    from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
     from diffusers.schedulers import scheduling_unipc_multistep
+    from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
     config = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
     arrays: dict[str, np.ndarray] = {}

@@ -22,12 +22,12 @@ Run in the isolated reference environment on CPU:
 
 from __future__ import annotations
 
-from typing import Any
 import json
 import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
@@ -70,8 +70,8 @@ CASES: dict[str, Case] = {
 def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     """The case's saved transformer and its walk in float32 and in float64
     (`fp64.`), the same weights and inputs widened."""
-    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
     from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
+    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 
     config = {**BASE, **case.config}
     torch.manual_seed(SEED)
@@ -201,9 +201,9 @@ SEQUENCE = 512
 
 def build_pipeline(root: Path):
     from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
-    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
-    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
     from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
+    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
     from transformers import CLIPTextConfig, CLIPTextModel, T5Config, T5EncoderModel
 
     directory = root / "pipeline"

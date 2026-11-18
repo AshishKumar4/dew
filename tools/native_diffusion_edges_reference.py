@@ -9,21 +9,21 @@ Run in the isolated reference environment on CPU:
   python tools/native_diffusion_edges_reference.py reload SOURCE EXPORTED
 No model or source downloads. The reload command executes actual source pipelines.
 """
-from typing import Any
 import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import diffusers
 import numpy as np
 import torch
-from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
 from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
 from diffusers.schedulers.scheduling_pndm import PNDMScheduler
-from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 from diffusers_wan_reference import float64_scheduler
 from reference_releases import require
 

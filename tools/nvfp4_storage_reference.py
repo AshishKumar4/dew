@@ -25,8 +25,8 @@ transformers 5.16.1, compressed-tensors 0.17.1, diffusers 0.34.0. Run:
         tools/nvfp4_storage_reference.py
 """
 
-from typing import Any
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -34,8 +34,8 @@ from compressed_tensors.compressors.naive_quantized.base import FloatQuantizatio
 from compressed_tensors.compressors.nvfp4.base import NVFP4PackedCompressor
 from compressed_tensors.compressors.nvfp4.helpers import unpack_fp4_from_uint8
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme, QuantizationStatus
-from compressed_tensors.quantization.quant_args import DynamicType
 from compressed_tensors.quantization.lifecycle.forward import dequantize, set_forward_quantized
+from compressed_tensors.quantization.quant_args import DynamicType
 from compressed_tensors.quantization.utils.helpers import calculate_qparams, generate_gparam
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM

@@ -65,8 +65,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Any, cast
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import reference_worker

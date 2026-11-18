@@ -139,9 +139,9 @@ def text_encoder(tok):
 
 def build_pipeline(root: Path):
     from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
-    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
-    from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
     from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel
+    from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
     from make_tiny_tokenizer import qwen_byte_tokenizer
 
     metadata = json.loads((SOURCE / "tokenizer" / "tokenizer_config.json").read_text())
@@ -168,8 +168,8 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
     the unmodified call's walk from fixed latents at `STEPS` steps, guided at
     its default scale: the latent it ends on and the image it decodes; in
     float32 and, the saved pipeline loaded widened, in float64 (`fp64.`)."""
-    from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
     from diffusers.pipelines.z_image import pipeline_z_image
+    from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
     from diffusers.schedulers import scheduling_flow_match_euler_discrete
 
     pipe = build_pipeline(root)
