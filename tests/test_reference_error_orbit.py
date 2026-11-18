@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import GateFailure, _drawn, as_given, assert_as_exact, seeds_for
+from reference_error import GateFailure, _drawn, as_given, as_recorded, assert_as_exact, seeds_for
 
 from dew.parity import RESOLUTION
 
@@ -154,9 +154,9 @@ def test_an_orbit_still_fails_a_sum_that_differs():
 def test_an_orbit_of_a_recorded_reference_or_of_one_order_is_refused():
     """A recorded reference (`indexed_recording`'s, which it marks `recorded`), the site's or a further one,
     holds its recorded draws alone, and an orbit holds the draw's own order and another."""
+    @as_recorded
     def recorded(terms):
         return _outer_first(terms)
-    recorded.recorded = True
 
     with pytest.raises(ValueError):
         _drawn(_left_to_right, recorded, _cancelling_draw, range(2), orders=_swapped)

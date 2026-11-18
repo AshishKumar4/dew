@@ -19,6 +19,7 @@ from reference_error import (
     Rounded,
     UnrecordedTruth,
     UnroundedDecisions,
+    as_recorded,
     assert_as_exact,
     indexed_recording,
     widened,
@@ -134,8 +135,7 @@ def test_values_rounded_that_are_not_the_arms_are_charged():
 def test_a_live_arm_marked_as_a_recording_is_held_as_any_live_arm():
     """A recording's decisions are the reference's own (`indexed_recording`'s arm); a live reference that
     marks itself as recorded is still a live arm, its zeroed decisions refused."""
-    zeroed = layer(product, decided=jnp.zeros_like)
-    zeroed.recorded = True
+    zeroed = as_recorded(layer(product, decided=jnp.zeros_like))
     with pytest.raises(UnroundedDecisions):
         assert_as_exact(layer(product), zeroed, draw, "a live arm marked recorded", seeds=SEEDS,
                         followed=followed)

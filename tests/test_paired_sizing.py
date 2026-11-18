@@ -4,7 +4,7 @@ compared with itself does not, and a fault still fails at the count they declare
 
 import numpy as np
 import pytest
-from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact, seeds_for
+from reference_error import GateFailure, Inconclusive, as_given, as_recorded, assert_as_exact, seeds_for
 
 
 @pytest.fixture(scope="module")
@@ -63,9 +63,9 @@ def test_a_recorded_reference_is_refused_a_paired_sizing(heavy):
     so a paired sizing, whose draws start at SIZING_FROM, refuses it."""
     reference = _summed(0)
 
+    @as_recorded
     def recorded(x):
         return reference(x)
-    recorded.recorded = True
 
     with pytest.raises(ValueError):
         seeds_for(recorded, heavy, "recorded sums", truth_fn=_truth, dew_fn=_summed(1))
