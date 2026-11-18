@@ -745,19 +745,19 @@ class Keeping:
         except Unestablished as refusal:
             self.refused[named] = str(refusal)
             return
+        runtime = communicators.loaded(executable)
+        if runtime is None:
+            # Compiled for devices this process has not loaded (a compile-only GPU's), refused before it is
+            # serialized: no program of its default backend.
+            self.refused[named] = "it was compiled for devices this process has not loaded (a compile-only " \
+                                  "target's), outside the process's default backend"
+            return
         try:
             serialized = Executable.of(executable)
         except (NotImplementedError, ValueError) as refusal:
             # As `compile_programs` reads it: an array a program closed over is a constant of its
             # program, which no executable serializes.
             self.refused[named] = f"its executable does not serialize: {refusal}"
-            return
-        runtime = executable.runtime_executable()
-        if runtime is None or not isinstance(runtime, xla_client.LoadedExecutable):
-            # Compiled for devices this process has not loaded (a compile-only GPU's,
-            # `dew.nn.kernels.generation.compile_only_gpus`): no program of its default backend.
-            self.refused[named] = "it was compiled for devices this process has not loaded (a compile-only " \
-                                  "target's), outside the process's default backend"
             return
         ran = runtime.local_devices()
         if not set(ran) <= set(jax.devices()):
