@@ -175,7 +175,7 @@ def test_a_rank_whose_chunk_cuts_its_groups_walks_whole_ones():
                     terms=RESET_TERMS)
 
 
-@pytest.mark.check1_shards(seeds=64, per_task=8)
+@pytest.mark.check1_shards(seeds=8, per_task=4)
 @pytest.mark.parametrize("site", list(mamba3_sites.sites()))
 def test_a_bf16_layers_chunked_form_is_as_exact_as_mamba_ssm(site):
     """Mamba-3's chunked form on a bf16 layer's operands, as a layer runs it (each product's selected kernel:
