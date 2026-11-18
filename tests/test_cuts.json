@@ -1536,6 +1536,9 @@
 "tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[False-altup]",
 "tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[True-altup]"
 ],
+"tests/test_decoding_strategies.py": [
+"tests/test_decoding_strategies.py::test_an_undefined_distribution_raises_instead_of_returning_a_token"
+],
 "tests/test_deepest_rings.py": [
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention backward 64-sm86]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 128-sm100]",
@@ -1609,13 +1612,13 @@
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge[values at the largest-float16-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a cotangent on a small column beside an overflowing one-as drawn-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a logit near fp32's largest-as drawn-fast]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a resumed state of a denominator near fp32's largest beside an overflowing column-float16-accurate]",
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a resumed state of a large denominator-as drawn-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a row of small values beside one that overflows in its tile, float32-as drawn-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a sink and one key, its logit near fp32's largest-float16-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a small weight on a large value, bfloat16-as drawn-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a subnormal share beside 255 equal weights, bfloat16-as drawn-accurate]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a tiny value beside an overflowing column at equal weights-as drawn-accurate]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[causal queries before every key-float16-accurate]",
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a subnormal share of an overflowing row, float32-float16-fast]",
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[causal queries before every key-as drawn-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[keys near fp32's largest at equal logits-float16-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[small values beside unseen ones near fp32's largest, float32-float16-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[ties at scale 1/4-as drawn-fast]",
@@ -2038,8 +2041,8 @@
 ],
 "tests/test_host_training.py": [
 "tests/test_host_training.py::test_a_fit_its_devices_hold_only_streamed_trains_as_the_streamed_layout_states",
-"tests/test_host_training.py::test_a_frozen_embeddings_host_steps_run_on_its_startups_programs_alone",
-"tests/test_host_training.py::test_a_host_step_missing_a_program_compiles_it_and_says_so",
+"tests/test_host_training.py::test_a_host_decoders_steps_run_on_its_startups_programs_alone",
+"tests/test_host_training.py::test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companions_here",
 "tests/test_host_training.py::test_a_resumed_run_continues_on_the_programs_its_first_process_compiled[device]",
 "tests/test_host_training.py::test_a_run_that_chose_to_stream_resumes_streamed_where_it_would_have_stood",
 "tests/test_host_training.py::test_a_shared_text_owner_sums_both_block_losses_through_one_bank[False]",
@@ -2392,8 +2395,12 @@
 "tests/test_loop_phases_decision.py::test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_counts_its_flops[2-passes]"
 ],
 "tests/test_loop_sampled.py": [
+"tests/test_loop_sampled.py::test_a_phased_run_keeps_its_loops_horizon_at_every_count",
 "tests/test_loop_sampled.py::test_a_sampled_run_resumed_steps_as_the_run_never_stopped",
-"tests/test_loop_sampled.py::test_a_sampled_runs_draws_go_on_through_another_split_and_a_resume"
+"tests/test_loop_sampled.py::test_a_sampled_run_whose_window_replays_its_microbatches_is_refused[diloco]",
+"tests/test_loop_sampled.py::test_a_sampled_runs_draws_go_on_through_another_split_and_a_resume",
+"tests/test_loop_sampled.py::test_each_count_of_a_sampled_run_steps_at_its_caps_plan",
+"tests/test_loop_sampled.py::test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count[every-pass]"
 ],
 "tests/test_lora.py": [
 "tests/test_lora.py::test_a_pipeline_adapts_its_denoiser_alone_and_starts_as_the_source[flux]",
@@ -3551,7 +3558,7 @@
 "tests/test_saved_sources.py::test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time[looped]",
 "tests/test_saved_sources.py::test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time[scanned]",
 "tests/test_saved_sources.py::test_a_pool_reads_a_saved_decision_runs_release_through_one_publisher",
-"tests/test_saved_sources.py::test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_does[flux]",
+"tests/test_saved_sources.py::test_a_release_record_of_another_shape_is_refused[record0]",
 "tests/test_saved_sources.py::test_a_run_resumes_under_another_kernel_choice_and_refuses_its_experts_packed_otherwise",
 "tests/test_saved_sources.py::test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches_lack_its_releases",
 "tests/test_saved_sources.py::test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_on",
@@ -3997,9 +4004,6 @@
 "tests/test_wan_source.py": [
 "tests/test_wan_source.py::test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone",
 "tests/test_wan_source.py::test_pipeline_walk_matches_the_source[streamed]"
-],
-"tests/test_weighed_check.py": [
-"tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",
