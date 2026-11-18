@@ -196,7 +196,16 @@ def assert_same_program(one, other) -> None:
     equation the same primitive over the same wiring of variables of the same avals, the same effects and
     parameters, each nested program (a call's, a kernel's body) compared as a program again, closed ones
     with their captured constants, and the same captured constants."""
+    from dew.nn.programs import computed
+
     closed, opened = type(one), type(one.jaxpr)
+
+    def read(names: dict, value):
+        # A variable by the other program's it stands for, a literal by its type and bits.
+        return names[value] if computed(value) else (value.aval, np.asarray(value.val).tobytes())
+
+    def own(value):
+        return value if computed(value) else (value.aval, np.asarray(value.val).tobytes())
 
     def same(left, right) -> None:
         names = {}
@@ -207,7 +216,8 @@ def assert_same_program(one, other) -> None:
             names[mine] = theirs
         for mine, theirs in zip(left.eqns, right.eqns, strict=True):
             assert mine.primitive is theirs.primitive and mine.effects == theirs.effects, (mine, theirs)
-            assert [names.get(var, var) for var in mine.invars] == list(theirs.invars), (mine, theirs)
+            assert [read(names, var) for var in mine.invars] == [own(var) for var in theirs.invars], (
+                mine, theirs)
             assert mine.params.keys() == theirs.params.keys(), (mine, theirs)
             for key, value in mine.params.items():
                 if isinstance(value, closed):
@@ -219,7 +229,7 @@ def assert_same_program(one, other) -> None:
             for out_mine, out_theirs in zip(mine.outvars, theirs.outvars, strict=True):
                 assert out_mine.aval == out_theirs.aval
                 names[out_mine] = out_theirs
-        assert [names.get(var, var) for var in left.outvars] == list(right.outvars)
+        assert [read(names, var) for var in left.outvars] == [own(var) for var in right.outvars]
 
     same(one.jaxpr, other.jaxpr)
     assert len(one.consts) == len(other.consts)
