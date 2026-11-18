@@ -1615,20 +1615,25 @@ def vanishing(dtype, base2: bool = False) -> float:
 
 
 def _binades(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """A float `x` (fp32 or float64) as its significand in [1, 2) (its sign kept; a subnormal's below one,
-    zero's zero) and its binary exponent as a whole number of its dtype, a subnormal's the least normal
-    binade's: exactly `x = significand 2^exponent`."""
+    """A float `x` (fp32 or float64) as its significand in [1, 2) (its sign kept; zero's zero) and its
+    binary exponent as a whole number of its dtype, a subnormal's below the least normal: exactly `x =
+    significand 2^exponent`, from its bits alone, a subnormal normalized by its fraction's leading bit
+    (`raised_exactly`'s way), so a process whose multiply flushes a subnormal operand (XLA's CPU) keeps it:
+    lifted by a multiply, `2^-140 2^100` summed to zero (base review 675f2c056 F2)."""
     limits = jnp.finfo(x.dtype)
     signed = jnp.dtype(f"int{limits.bits}")
     bias, width = limits.maxexp - 1, limits.nmant
     bits = jax.lax.bitcast_convert_type(x, signed)
     biased = (bits >> width) & (2 * limits.maxexp - 1)
-    # Its sign and its significand's bits kept, its exponent's set to the bias: its significand in [1, 2).
-    kept = np.array(-(1 << (limits.bits - 1)) | ((1 << width) - 1), signed)
-    significand = jax.lax.bitcast_convert_type((bits & kept) | (bias << width), x.dtype)
-    lifted = x * _power_of_two(jnp.full(x.shape, bias - 1, signed), x.dtype)
-    return (jnp.where(biased == 0, lifted, significand),
-            (jnp.maximum(biased, 1) - bias).astype(x.dtype))
+    fraction = bits & ((1 << width) - 1)
+    sign = bits & np.array(-(1 << (limits.bits - 1)), signed)
+    # A subnormal's leading bit moved up to a normal significand's, its exponent below the least normal.
+    up = jnp.clip(width - (limits.bits - 1 - jax.lax.clz(fraction)), 0, width)
+    normalized = jnp.where(biased > 0, fraction, (fraction << up) & ((1 << width) - 1))
+    significand = jax.lax.bitcast_convert_type(sign | (bias << width) | normalized, x.dtype)
+    exponent = jnp.where(biased > 0, biased - bias, limits.minexp - up).astype(x.dtype)
+    zero = (biased == 0) & (fraction == 0)
+    return jnp.where(zero, jnp.zeros_like(x), significand), exponent
 
 
 def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...] | None = None) -> jax.Array:
@@ -1695,13 +1700,14 @@ def _aligned_tangent(shape: tuple[int, ...], axis, primals, tangents):
     """`aligned_sum`'s value and tangent: each factor's direction times its term's other factors, every
     term's summed (over `axis` too where given)."""
     terms, moved = _regrouped(shape, primals), _regrouped(shape, tangents)
+    # Each term's direction reduced over the axis before the terms add, as the value's are: summed after,
+    # a term broadcast across the axis counted once a row (base review 675f2c056 F1).
     directions = [functools.reduce(jnp.multiply, (*term[:at], direction, *term[at + 1:]))
                   for term, directions in zip(terms, moved, strict=True)
                   for at, direction in enumerate(directions)]
-    tangent = sum(directions[1:], directions[0])
     if axis is not None:
-        tangent = jnp.sum(tangent, axis=axis, keepdims=True)
-    return _aligned_value(shape, axis, *primals), tangent
+        directions = [jnp.sum(direction, axis=axis, keepdims=True) for direction in directions]
+    return _aligned_value(shape, axis, *primals), sum(directions[1:], directions[0])
 
 
 _aligned = contracted("test_an_aligned_sum_holds_every_order")(
