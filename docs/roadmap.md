@@ -33,6 +33,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-data] took 683 s (a check-1 site: its longest draws task 621 s (1 draws),…. [7603]
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-fsdp] took 613 s (a check-1 site: its longest draws task 550 s (1 draws),…. [7604]
 - A warp-uniform read of a shared-memory scalar for the Mosaic GPU toolkit. [7898]
+- A decode step's query and output pass through grouped_rows' transpose ([B,T,KV,G,D] to [B,T,G,KV,D] and back, attention.py:1113-1128) and a pad to the launch's…. [7926]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
