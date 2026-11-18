@@ -487,7 +487,8 @@ class LoadedProgram:
     """A compiled program as this process loaded it (`loaded_program`): the devices it runs on and its
     runtime's fingerprint, None where the runtime states none."""
 
-    devices: tuple[jax.Device, ...]
+    devices: tuple
+    """The devices it runs on (JAX's `Device`s)."""
     fingerprint: bytes | None
 
 
@@ -497,7 +498,7 @@ def loaded_program(executable: jax.stages.Compiled) -> LoadedProgram | None:
     here: no devices, fingerprint or room of this process's. The one reading of it `admit`, a kept program
     (`dew.training.ahead`) and a step's flops (`dew.training.rungs`) take."""
     runtime = executable.runtime_executable()
-    if not isinstance(runtime, LoadedExecutable):
+    if runtime is None or not isinstance(runtime, LoadedExecutable):
         return None
     fingerprint = runtime.fingerprint
     return LoadedProgram(tuple(runtime.local_devices()),
