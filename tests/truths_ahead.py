@@ -40,6 +40,7 @@ from pathlib import Path
 
 import jax
 import numpy as np
+from tool_support import load
 
 
 class MissingTruth(AssertionError):
@@ -269,7 +270,8 @@ def running() -> tuple[CompiledTruths, str] | None:
 def where(test: str) -> str:
     """Where test `test` (a node id) stands in this process's stack: the deepest frame of its own file, as
     `path:line` from the working directory; the test's file where no frame of it is on the stack."""
-    path = Path(test.split("::", 1)[0])
+    # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
+    path = Path(load("grading", "tools/armada").owning(test))
     frames = [frame for frame in inspect.stack() if Path(frame.filename).name == path.name]
     if not frames:
         return str(path)
