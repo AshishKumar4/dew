@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import LessFinite, assert_contract
+from contract_support import LessFinite, assert_contract, normal_draw
 
 
 def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
@@ -20,6 +20,63 @@ def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
     with pytest.raises(LessFinite):
         assert_contract(lambda x: jnp.sqrt(x * x), x, direction, cotangent, "a squared root",
                         plain_fn=jnp.abs)
+
+
+def _split_over_the_mesh(specs: int):
+    """A product of two operands split over the context mesh's data axis by a shard map given `specs` of their
+    specs, as a template's launch reads the mesh it runs under (row 7973's: one whose specs left two of its
+    operands out); off a mesh, the product itself."""
+    from jax.sharding import PartitionSpec as P
+
+    def product(x, y):
+        if jax.sharding.get_abstract_mesh().empty:
+            return x * y
+        return jax.shard_map(lambda a, b: a * b, in_specs=(P("data"),) * specs, out_specs=P("data"))(x, y)
+
+    return product
+
+
+def _summed_over_the_mesh(psums: int):
+    """A product's sum split over the context mesh's data axis by a shard map, each device's part summed
+    across the devices `psums` times (a launch counting its sum twice at two); off a mesh, the sum itself."""
+    from jax.sharding import PartitionSpec as P
+
+    def total(x, w):
+        if jax.sharding.get_abstract_mesh().empty:
+            return jnp.sum(x * w, keepdims=True)
+
+        def local(a, b):
+            summed = jax.lax.psum(jnp.sum(a * b, keepdims=True), "data")
+            for _ in range(psums - 1):
+                summed = jax.lax.psum(jax.lax.pvary(summed, ("data",)), "data")
+            return summed
+
+        return jax.shard_map(local, in_specs=(P("data"), P()), out_specs=P())(x, w)
+
+    return total
+
+
+def test_the_contract_runs_every_order_on_trainings_mesh():
+    """Every order is a check-1 site on training's mesh of two devices (`contract_support._on_a_mesh`), as a
+    training step runs it, its reference the order off a mesh: a launch given its operands' specs holds,
+    and one a spec short, the same product off a mesh, raises there (row 7973: Mamba-3's forked launch, two
+    specs short, raised under any mesh, and the contract cells, run off one, passed it); a sum split over the
+    devices holds, and one counted twice fails check 1 by its own size."""
+    x = tuple(jnp.asarray(value, jnp.float32) for value in ([1.5, -2.0, 3.0, 0.25], [2.0, 0.5, -1.0, 4.0]))
+    cotangent = jnp.ones((4,), jnp.float32)
+    assert_contract(_split_over_the_mesh(2), x, x, cotangent, "a product split over the mesh")
+    with pytest.raises(AssertionError):
+        assert_contract(_split_over_the_mesh(1), x, x, cotangent, "a product a spec short")
+
+    # A sum of 1024 products, its rounding errors check 1's to resolve (four of them resolve no ratio).
+    def draw(seed):
+        summed = normal_draw(seed, (1024,), (1,))
+        return summed, normal_draw(seed + 1, (1024,), (1,)), normal_draw(seed + 2, (1,))[0]
+
+    summed = draw(0)
+    assert_contract(_summed_over_the_mesh(1), *summed, "a split sum", draw=draw)
+    with pytest.raises(AssertionError):
+        assert_contract(_summed_over_the_mesh(2), *summed, "a split sum counted twice", draw=draw)
 
 
 def test_the_contract_refuses_a_bfloat16_formula_less_finite_than_the_plain_one():

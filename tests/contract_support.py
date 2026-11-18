@@ -122,7 +122,7 @@ def ran(order, label: str, name: str):
 
 
 def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=None, plain_fn=None,
-                    without: tuple[str, ...] = ()) -> None:
+                    without: tuple[str, ...] = (), draw=None) -> None:
     """Every order of `fn` runs at the draw, and each leaf is finite at every position the contract holds:
     where the same order of its float64 run is a normal float32; where, given `plain_fn` (the plain float32
     formula, JAX's own derivatives of it), the plain formula's is finite; and where no order of summation
@@ -136,7 +136,11 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     held to neither order (row 5426: two orders each overflow partials the other does not). The
     float64 run is `fn`'s own, or `truth_fn`'s, the plain float64 formula, where `fn` computes in a fixed
     precision whatever its inputs' (a declared dot algorithm). `without` names orders the contract does not
-    take yet, each joining with its row's fix (a row's head brings its own test)."""
+    take yet, each joining with its row's fix (a row's head brings its own test).
+
+    And every order runs on training's mesh of two devices (`_on_a_mesh`), as a training step runs it (row
+    7973: a launch whose specs left out two of its operands raised under any mesh, and the suite, run off
+    one, passed it), a check-1 site there over the cell's seeded `draw` where it gives one."""
 
     def orders_of(f, *drawn):
         return {name: order for name, order in orders(f, *drawn).items() if name not in without}
@@ -173,6 +177,57 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
                   for index, where in lost.items() if where.any()]
         if broken:
             raise LessFinite(broken[0])
+    _on_a_mesh(fn, primals, direction, cotangent, label, truth_fn=truth_fn, without=without, draw=draw)
+
+
+def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, without, draw) -> None:
+    """Each order of `fn` on training's mesh of two of this process's devices (`MeshSpec`'s, its data axis
+    two), its inputs placed on it whole: run at the cell's own inputs, so a split its specs do not fit
+    raises (row 7973's class); and where the cell gives its seeded `draw` (a seed's primals, direction and
+    cotangent, in its inputs' domain), a check-1 site (`reference_error.assert_as_exact`) against the float64
+    truth (`truth_fn`'s orders where given), its reference the same order off a mesh, over the seeds
+    `seeds_for` sizes: the mesh's program is another, partitioned, whose floats no common bits hold
+    (docs/design/testing.md), and a sum it counts twice fails by its own size. Where the cell set its own
+    mesh, its orders already run under it."""
+    from arm_forms import as_given
+    from jax.sharding import NamedSharding, PartitionSpec
+    from reference_error import assert_as_exact, seeds_for
+
+    from dew.training import MeshSpec
+
+    if not jax.sharding.get_abstract_mesh().empty:
+        return
+    mesh = MeshSpec().build(jax.devices()[:2])
+    whole = NamedSharding(mesh, PartitionSpec())
+    for name in orders(fn, primals, direction, cotangent):
+        if name in without:
+            continue
+        site = f"{label}, {name}, on training's mesh of two"
+
+        # The mesh's run a placement and the program run there, compiled once an order (each seed's draw of
+        # one shape), which the gate runs as given (`as_given`).
+        program = jax.jit(lambda primals, direction, cotangent, name=name: orders(
+            fn, primals, direction, cotangent)[name]())
+
+        @as_given
+        def on(primals, direction, cotangent, program=program, name=name, site=site):
+            with jax.set_mesh(mesh):
+                placed = jax.device_put((primals, direction, cotangent), whole)
+                return ran(lambda: program(*placed), site, name)
+
+        if draw is None:
+            on(primals, direction, cotangent)
+            continue
+
+        def off(primals, direction, cotangent, name=name):
+            return orders(fn, primals, direction, cotangent)[name]()
+
+        def truth(primals, direction, cotangent, name=name):
+            return orders(truth_fn, primals, direction, cotangent)[name]()
+
+        truth_of = None if truth_fn is None else truth
+        seeds = seeds_for(off, draw, site, truth_fn=truth_of, dew_fn=on)
+        assert_as_exact(on, off, draw, site, seeds=seeds, truth_fn=truth_of)
 
 
 EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.0**-63}
