@@ -1865,6 +1865,17 @@ def default_record(name: str, declared: Configured, annotation: Annotation) -> J
     return record
 
 
+def _written(value: Configured) -> bool:
+    """Whether `value` is JSON as a record holds it: a scalar, or a list or tuple of them, or a mapping of
+    them by string keys (`to_record`'s)."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_written(configured(entry)) for entry in value)
+    return isinstance(value, Mapping) and all(
+        isinstance(key, str) and _written(configured(entry)) for key, entry in value.items())
+
+
 def recorded_defaults(member: type | Callable[..., Configured], stated: Mapping[str, object],
                       recorded: Mapping[str, object]) -> JsonDict:
     """The record of each field or argument `member` defaults that `stated`
@@ -1873,7 +1884,8 @@ def recorded_defaults(member: type | Callable[..., Configured], stated: Mapping[
     a recorded one the class no longer takes is refused. A recorded default
     is held as its record whether it arrives as one or as the value a read
     rebuilt from one (a function a record names, `from_record`), so a run
-    read back holds the defaults it was written with."""
+    read back holds the defaults it was written with: a record, JSON
+    (`_written`), kept as it is, any other value recorded."""
     defaults, kept, named = {}, {}, set()
     # One record: a module two defaults share is written once.
     with recording():
@@ -1882,7 +1894,8 @@ def recorded_defaults(member: type | Callable[..., Configured], stated: Mapping[
             if name in stated:
                 continue
             if name in recorded:
-                kept[name] = default_record(name, configured(recorded[name]), annotation)
+                held = configured(recorded[name])
+                kept[name] = held if _written(held) else default_record(name, held, annotation)
                 continue
             if declared is dataclasses.MISSING:
                 continue

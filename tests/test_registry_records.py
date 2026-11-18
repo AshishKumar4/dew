@@ -294,3 +294,21 @@ model = ModelConfig.from_dict({"name": "users_dense", "fields": {"features": 5}}
 print(type(model).__name__, model.features)
 """)
     assert aliased.split() == ["UsersDense", "5"]
+
+
+def test_a_recorded_default_is_held_as_its_record_however_it_arrives():
+    """A member's defaults as a record holds them (`recorded_defaults`): recorded again from that record (a
+    config replaced or read back), each is the record it was, a mapping's integer keys still its strings;
+    arriving as the value a read rebuilt from it (a function a record names), it is recorded again."""
+    from dew.nn.activations import silu
+    from dew.registry import recorded_defaults
+
+    @dataclasses.dataclass(frozen=True)
+    class Defaulted:
+        weights: dict[int, float] = dataclasses.field(default_factory=lambda: {1: 0.5})
+        activation: Callable = silu
+
+    first = recorded_defaults(Defaulted, {}, {})
+    assert first == {"weights": {"1": 0.5}, "activation": {"function": "dew.nn.activations:silu"}}
+    assert recorded_defaults(Defaulted, {}, first) == first
+    assert recorded_defaults(Defaulted, {}, {**first, "weights": {1: 0.5}, "activation": silu}) == first
