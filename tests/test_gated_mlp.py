@@ -195,8 +195,7 @@ def assert_same_program(one, other) -> None:
     """`one` and `other` (closed jaxprs, as `jax.make_jaxpr` returns them) are the same program: equation for
     equation the same primitive over the same wiring of variables of the same avals, the same effects and
     parameters, each nested program (a call's, a kernel's body) compared as a program again, closed ones
-    with their captured constants, a rule a trace wraps afresh by its kind and how it reads, and the same
-    captured constants."""
+    with their captured constants, and the same captured constants."""
     from dew.nn.programs import computed
 
     closed, opened = type(one), type(one.jaxpr)
@@ -226,11 +225,7 @@ def assert_same_program(one, other) -> None:
                 elif isinstance(value, opened):
                     same(value, theirs.params[key])
                 else:
-                    # A rule a trace wraps afresh (a custom derivative's, its program the equation's own
-                    # bodies, compared above) is the same rule where it reads as the same, of the same kind.
-                    other_value = theirs.params[key]
-                    assert value == other_value or (type(value) is type(other_value)
-                                                    and str(value) == str(other_value)), (key, mine, theirs)
+                    assert value == theirs.params[key], (key, mine, theirs)
             for out_mine, out_theirs in zip(mine.outvars, theirs.outvars, strict=True):
                 assert out_mine.aval == out_theirs.aval
                 names[out_mine] = out_theirs
@@ -264,9 +259,11 @@ def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, 
     """A gated product (`gated_product`, 'swiglu'), its XLA arithmetic or SwiGLU's Pallas kernel where it
     is named (on an H100's routes), is one region of its activation (`derivatives.Activation('swiglu',
     gated=True)`) over its gate and up projection, whichever route it takes, the seam a fusion pass's
-    epilogue replaces: the region's body is the program the route unmarked traces, equation for equation,
-    so inlined it computes what the route computes; and the XLA route's value and operands' gradients are
-    that route's unmarked, bit for bit, run (a CPU runs no Pallas GPU kernel its selector takes). An
+    epilogue replaces: the region's body, with its tangent, is the program the route unmarked traces with
+    its tangent, equation for equation (every custom derivative's rule applied), so inlined it computes
+    what the route computes and differentiates as it does; and the XLA route's value and operands'
+    gradients are that route's unmarked, bit for bit, run (a CPU runs no Pallas GPU kernel its selector
+    takes). An
     ungated MLP's named activation is one region of it ungated, at each place it runs."""
     from jax.experimental.pallas import pallas_call_p
 
@@ -281,13 +278,17 @@ def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, 
     portable = activations._portable(activations.silu, lambda gate, up: (gate, up))
     plain = portable if implementation == "xla" else (
         lambda gate, up: norm_swiglu.swiglu(gate, up, portable))
+    def forward_and_tangent(function):
+        # The program and its derivative's rules at once: a custom derivative's rule, which its primal's trace
+        # holds as a function, is applied here, so the two programs are compared whole.
+        return jax.make_jaxpr(lambda g, u, dg, du: jax.jvp(function, (g, u), (dg, du)))(gate, up, up, gate)
+
     with generation.assumed("sm90"):
-        traced, unmarked = (jax.make_jaxpr(function)(gate, up) for function in (product, plain))
+        traced, unmarked = (forward_and_tangent(function) for function in (product, plain))
     (span,) = traced.jaxpr.eqns
-    body = span.params["call_jaxpr"]
     assert span.primitive is derivatives.marked_call_p
     assert span.params["kind"] == derivatives.Activation("swiglu", gated=True)
-    assert_same_program(body, unmarked)
+    assert_same_program(span.params["call_jaxpr"], unmarked)
     launched = {equation.primitive for equation in equations(unmarked.jaxpr)}
     assert (pallas_call_p in launched) == (implementation == "pallas")
     if implementation == "xla":
