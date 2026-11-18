@@ -563,6 +563,10 @@ def _arm_compile(plain: bool) -> Callable:
     (`dew.training.ahead.compile_programs`' `compiled`): as Dew's users compile them (`jax.jit`) beside an arm
     run as given (`plain`), else without YNNPACK's fusions (`without_ynn`, `jax.jit` off the CPU lane)."""
     def compiled(function, *, out_shardings):
+        # An arm held whole (`_Whole`) is a jit of its own compiler options, lowered as itself: no other jit
+        # may hold it.
+        if isinstance(function, _Whole):
+            return function.fn
         return (jax.jit if plain else without_ynn)(function, out_shardings=out_shardings)
 
     return compiled
@@ -620,8 +624,20 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         _arm_program(programs, held, role, fn.fn, jax.tree.map(lambda leaf: leaf[0], inputs),
                      reference=reference)
         return
-    traced_fn = unrewritten(fn) if reference and not _declared(fn) else fn
     name = named(role, inputs)
+    if getattr(fn, "without_ynn", False) and hasattr(fn, "trace"):
+        # A jit of its own compiler options (`without_ynn`'s: a library arm's cuBLAS,
+        # `generation_support.cublas_compiled`), which JAX lowers only as a top-level program: held whole
+        # (`_Whole`), never traced inside another, as the gate runs it as it is (`_compiled`).
+        leaves = jax.tree.leaves(inputs)
+        if list(inputs) != leaves:
+            raise ValueError(f"{name}: an arm compiled with its own compiler options is held whole, over its "
+                             "inputs as arrays, and these inputs are a tree of them")
+        programs[name] = (_Whole(fn), [*map(jax.typeof, leaves)])
+        out = fn.trace(*inputs).out_info
+        held[name] = {"constants": [], "tree": jax.tree.structure(out)}
+        return
+    traced_fn = unrewritten(fn) if reference and not _declared(fn) else fn
     closed, shapes = jax.make_jaxpr(traced_fn, return_shape=True)(*inputs)
     structure = jax.tree.structure(inputs)
     schema = [jax.typeof(constant) for constant in closed.consts]
@@ -638,6 +654,17 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         return retraced
 
     _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Whole:
+    """An arm's program held whole (`_arm_program`): `fn`, a jit of its own compiler options, which the
+    store's compile lowers as itself (`_arm_compile`) over its inputs' leaves."""
+
+    fn: Callable
+
+    def __call__(self, *leaves):
+        return self.fn(*leaves)
 
 
 def _arm_role(role: str, fn, label: str) -> str | None:

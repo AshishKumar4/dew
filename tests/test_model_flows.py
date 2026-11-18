@@ -381,6 +381,31 @@ def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     assert dew_traced and reference_traced
 
 
+def test_an_arm_of_its_own_compiler_options_is_prepared_whole(tmp_path):
+    """A site whose reference arm is a jit of its own compiler options (`without_ynn`, which on the CPU lane
+    turns YNNPACK's fusions off by them: a library arm's cuBLAS on a GPU,
+    `generation_support.cublas_compiled`) prepares it whole, lowered as itself, and its run computes it from
+    that program, tracing none, with no test of it recorded unprepared (row 8469: traced inside the arms'
+    program, the prepare refused it, 'compiler_options can only be passed to top-level jax.jit', and its test
+    ran unprepared)."""
+    from arm_forms import without_ynn
+
+    dew, reference, draw = _site()
+    traced: list[None] = []
+
+    def counted(a, b):
+        traced.append(None)
+        return reference(a, b)
+
+    whole = without_ynn(counted, compiler_options={"xla_cpu_use_thunk_runtime": True})
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(dew, whole, draw, "a product of a compiled reference", seeds=8)
+    traced.clear()
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(dew, whole, draw, "a product of a compiled reference", seeds=8)
+    assert not traced and not (tmp_path / UNPREPARED).exists()
+
+
 def test_a_site_free_arm_runs_its_prepared_program(tmp_path):
     """A computation with no check-1 site (a bitwise check's kernel, `reference_error.ahead_arm`) is
     prepared as an arm is: its prepare traces it and gives zeros of its outputs' shapes, its run computes it
