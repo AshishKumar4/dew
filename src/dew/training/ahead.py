@@ -65,7 +65,7 @@ from jaxlib import xla_client
 
 from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
-from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, device_memory, pool_share
+from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, device_memory
 from dew._records import JSON, boolean, record
 from dew._stated import Unestablished, traceback_frames
 from dew.batch import Batch
@@ -129,17 +129,18 @@ def compile_only_tpus(topology: str) -> tuple:
 
 
 @contextlib.contextmanager
-def stand_in_gpus(devices: Sequence, memory: int, share: float | None = None) -> Iterator[tuple]:
+def stand_in_gpus(devices: Sequence, memory: int, share: float = DEW_SHARE) -> Iterator[tuple]:
     """`devices`, a host's own CPU devices (`jax.devices("cpu")`), each stated to hold a GPU's `memory`, its
-    total bytes as the GPU states them, at `share`, the pool's share in the run they stand in for (this
-    process's own, `pool_share`, read as the block opens, where none is given), while the block runs: every
+    total bytes as the GPU states them, at `share`, the pool's share in the run they stand in for (Dew's
+    own, `DEW_SHARE`, where none is given, as `compile_only_gpus` and `host_gpus` take it, never this
+    process's), while the block runs: every
     layout check and admission on them reads the allocator's limit derived from them
     (`dew._devices.allocator_limit`, `StatedGpu`), as `compile_only_gpus`' do, where JAX's CUDA plugin,
     which those need, does not install. `Trainer.validate` checks a run's layout on them against the GPUs'
     limits; a program compiles for the CPU."""
     positive_memory(memory)
     devices = tuple(devices)
-    STATED_GPUS.update(dict.fromkeys(devices, StatedGpu(memory, pool_share() if share is None else share)))
+    STATED_GPUS.update(dict.fromkeys(devices, StatedGpu(memory, share)))
     try:
         yield devices
     finally:
