@@ -1166,6 +1166,8 @@ def compensated_primitives_hold_under_jit(shape: str) -> None:
     high part thousands of times its eager error on a CPU, 1.9e-6 off in Mamba-3). A contraction that only
     rounds a low part's own arithmetic once keeps the pair as exact as eager. The precision P0 of
     2026-11-18."""
+    from arm_forms import as_given
+
     function = _compensated_shapes()[shape]
 
     def draw(seed):
@@ -1174,7 +1176,8 @@ def compensated_primitives_hold_under_jit(shape: str) -> None:
                 jnp.asarray(rng.standard_normal(4096), jnp.float32),
                 jnp.asarray(rng.standard_normal(4096) * 1e-3, jnp.float32))
 
-    assert_as_exact(jax.jit(function), function, draw, f"a compensated {shape} under jit", seeds=8)
+    # The reference run as given, op by op (`as_given`); the gate compiles Dew's as its users do.
+    assert_as_exact(function, as_given(function), draw, f"a compensated {shape} under jit", seeds=8)
 
 
 @pytest.mark.parametrize("shape", COMPENSATED_SHAPES)
