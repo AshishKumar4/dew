@@ -20,8 +20,9 @@ def plus(x, factor):
 
 def test_a_jitted_function_is_what_it_wraps_and_how_it_is_wrapped():
     """Two wrappings of one function under the same options state alike, a static argument named or
-    placed; another function, no static argument, or a donated one, states otherwise. A jitted function of the user's was refused, so a program or an arm
-    that called one had no identity (train 1015's review)."""
+    placed; another function, no static argument, or a donated one, states otherwise. A jitted function of
+    the user's was refused, so a program or an arm that called one had no identity (train 1015's
+    review)."""
     one = stated(jax.jit(times, static_argnums=(1,)), "jit")
     # A static argument named or placed is one option: JAX reads each from the other by the signature.
     assert one == stated(jax.jit(times, static_argnums=(1,)), "jit") == stated(
