@@ -389,6 +389,49 @@ def test_a_turned_states_forked_documents_are_as_exact_as_each_alone():
                          f'xla {TURNED} a forked call\'s documents', seeds=32)
 
 
+def _forked_rows(operands, rows: tuple, length: int):
+    """`operands`' first row's first `length` tokens as a forked call of `rows`: each a row's documents' first
+    tokens, table slots and stored slots (`Chunk.loads`, `Chunk.stores`), over `GIVEN` given memories and
+    `HELD` stored slots; every row the same tokens."""
+    def taken(x):
+        return None if x is None else jnp.broadcast_to(x[:1, :length], (len(rows), length, *x.shape[2:]))
+    starts = jnp.zeros((len(rows), length), bool)
+    for row, (begins, _, _) in enumerate(rows):
+        starts = starts.at[row, jnp.asarray(begins)].set(True)
+    named = {name: taken(getattr(operands, name)) for name in ('query', 'key', 'value', 'log_decay', 'beta',
+                                                               'turn')}
+    return dataclasses.replace(
+        operands, **{name: value for name, value in named.items() if value is not None},
+        state=jnp.broadcast_to(operands.state[:1], (len(rows), *operands.state.shape[1:])), starts=starts,
+        loads=jnp.asarray([loads for _, loads, _ in rows], jnp.int32),
+        stores=jnp.asarray([stores for _, _, stores in rows], jnp.int32), held=HELD)
+
+
+@pytest.mark.parametrize('case', ['two trees', 'a later sibling'])
+def test_a_turned_forked_documents_arithmetic_reads_only_its_ancestors(case):
+    """A turned forked call's documents read no document but their ancestors (test_mixers' no token reaches
+    another document, for forks): `two trees` a row of a document and its child, then an independent root
+    and its child, against a row of the first tree alone; `a later sibling` a document and its child, then a
+    second child of the same document, against the row without it. The shared documents' outputs bit for
+    bit: a row's last token's frame moved an earlier tree's rotations by a rounding (row 7419)."""
+    (operands,) = draw(TURNED, packed=False, seed=0)
+    operands = dataclasses.replace(operands, state=jnp.zeros((ROWS, GIVEN, *operands.state.shape[1:])))
+    if case == 'two trees':
+        rows = (((0, 23, 40, 55), (0, 2, 0, 3), (1, 0, 2, 0)), ((0, 23, 40, 55), (0, 2, 0, 3), (1, 0, 2, 0)))
+        alone = (((0, 23), (0, 2), (1, 0)), ((0, 23), (0, 2), (1, 0)))
+        shared, length = 40, 70
+    else:
+        rows = (((0, 23, 40), (0, 2, 2), (1, 0, 0)), ((0, 23, 40), (0, 2, 2), (1, 0, 0)))
+        alone = (((0, 23), (0, 2), (1, 0)), ((0, 23), (0, 2), (1, 0)))
+        shared, length = 40, 64
+    def run(forked):
+        return chunk_on('xla', TURNED, forked, chunk_size=CHUNK)[0]
+
+    together = run(_forked_rows(operands, rows, length))
+    apart = run(_forked_rows(operands, alone, shared))
+    np.testing.assert_array_equal(np.asarray(together[:, :shared]), np.asarray(apart))
+
+
 DOCUMENTS = ((0, 23, 40), (0, 9, 48))
 """Each row's packed documents' first tokens under `draw`'s `packed`."""
 
