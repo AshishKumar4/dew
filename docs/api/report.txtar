@@ -406,12 +406,12 @@ dew.config.DecoderRunConfig
 dew.config.MetricConfig
   name: str
   fields: JsonDict = builtins.dict()
-  defaults: JsonDict = builtins.dict()
+  defaults: JsonRecords = builtins.dict()
   split: str | None = None
 dew.config.ObjectiveConfig
   name: str
   fields: JsonDict = builtins.dict()
-  defaults: JsonDict = builtins.dict()
+  defaults: JsonRecords = builtins.dict()
 dew.config.Prepared
   run: RunConfig
   objective: dew.objectives.base.Objective[LossT, EffectsT]
@@ -466,7 +466,7 @@ dew.config.diffusion.FlowRolloutConfig
 dew.config.env.EnvConfig
   name: str
   fields: JsonDict = builtins.dict()
-  defaults: JsonDict = builtins.dict()
+  defaults: JsonRecords = builtins.dict()
   count: int | None = None
   episode_length: int | None = None
   action_repeat: int = 1
@@ -498,7 +498,7 @@ dew.config.env.EpisodesConfig
 dew.config.env.RolloutConfig
   name: str = 'dreamer'
   fields: JsonDict = builtins.dict()
-  defaults: JsonDict = builtins.dict()
+  defaults: JsonRecords = builtins.dict()
 dew.config.env.TeacherConfig
   run: str
   step: int | str | None = None
@@ -1002,7 +1002,7 @@ dew.quantization.Quantization
 dew.registry.ModelConfig
   name: str = 'simple_dit'
   fields: JsonDict = builtins.dict()
-  defaults: JsonDict = builtins.dict()
+  defaults: JsonRecords = builtins.dict()
   wrappers: tuple[Wrapper, ...] = ()
 dew.sampling.text.Sampling
   temperature: float = 1.0
