@@ -217,8 +217,6 @@ def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, 
     so inlined it computes what the route computes; and the XLA route's value and operands' gradients are
     that route's unmarked, bit for bit, run (a CPU runs no Pallas GPU kernel its selector takes). An
     ungated MLP's named activation is one region of it ungated."""
-    from jax.extend.core import ClosedJaxpr
-
     from dew.nn import derivatives
     from dew.nn.kernels import norm_swiglu
     from dew.nn.mlp import GatedMLP
@@ -235,7 +233,7 @@ def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype, 
     body = span.params["call_jaxpr"]
     assert span.primitive is derivatives.marked_call_p
     assert span.params["kind"] == derivatives.Activation("swiglu", gated=True)
-    assert str(body.jaxpr if isinstance(body, ClosedJaxpr) else body) == str(unmarked.jaxpr)
+    assert str(body.jaxpr) == str(unmarked.jaxpr)
     assert ("pallas_call" in str(unmarked)) == (implementation == "pallas")
     if implementation == "xla":
         def summed(function):
