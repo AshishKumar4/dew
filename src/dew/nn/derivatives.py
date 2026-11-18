@@ -310,6 +310,16 @@ class Protected:
     computes: Callable | None = None
 
 
+def stated_operation(equation) -> Callable | None:
+    """The operation a protected span states it computes (`Protected.computes`: Dew's one logistic its
+    `precision.logistic_value`), None for any other equation: what the algebra's normal form reads such a
+    span as, while a declaration traced inline keeps the span itself, Dew's arithmetic."""
+    if equation.primitive is not marked_call_p:
+        return None
+    kind = equation.params["kind"]
+    return kind.computes if isinstance(kind, Protected) else None
+
+
 @dataclasses.dataclass(frozen=True)
 class Surrogate:
     """A surrogate's bodies (`surrogate`): rewritten within, never related to autodiff's derivative of its
