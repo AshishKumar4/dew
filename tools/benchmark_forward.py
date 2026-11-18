@@ -59,8 +59,9 @@ def main() -> None:
              for index in range(len(args.cases))]
     results = {}
     for name, peak in zip(args.cases, peaks, strict=True):
+        held = [value for value in peak if value is not None]
         results[name] = {"ms": measure(name, args.warmup, args.repeats),
-                         "peak_device_bytes": None if None in peak else max(peak)}
+                         "peak_device_bytes": max(held) if len(held) == len(peak) else None}
         print(f"{name}: {results[name]['ms']:.2f} ms", flush=True)
     if args.json_out:
         with open(args.json_out, "w") as handle:

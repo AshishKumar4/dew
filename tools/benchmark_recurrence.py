@@ -491,7 +491,10 @@ def _kernel_milliseconds(torch, fn, repeats: int) -> float:
         for _ in range(repeats):
             fn()
             torch.cuda.synchronize()
-    return sum(event.device_time for event in profiled.events()
+    events = profiled.events()
+    if events is None:
+        raise RuntimeError("the profiler's capture held no events")
+    return sum(event.device_time for event in events
                if event.device_type == torch.autograd.DeviceType.CUDA) / 1e3 / repeats
 
 
@@ -535,7 +538,7 @@ def markdown(rows: list[dict], sha: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('jax', 'torch', 'row'))
     parser.add_argument('runs', nargs='?', help="row mode: the JSON lines the other modes wrote")
     parser.add_argument('--shape', default='all', help=f"one of {sorted(SHAPES)} or 'all'")
