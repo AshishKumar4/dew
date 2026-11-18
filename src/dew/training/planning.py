@@ -201,12 +201,11 @@ class SampledStep(NamedTuple):
 
 def whole_step_program[L, E](objective: Objective[L, E], parted_work: bool = False) -> OuterProgram:
     """`whole_step` over `objective`'s statistics (`Objective.reduce_loss`), the one program a split step
-    runs on its microbatches' outputs, compiled under its towers' options, which a run compiled ahead
+    runs on its microbatches' outputs, compiled through Dew's compile point, which a run compiled ahead
     compiles with its step (`dew.training.ahead`); `parted_work` where each microbatch counts its own
     work (a sampled pass count's, `step_counts`)."""
     return owned_program(functools.partial(whole_step, reduce=objective.reduce_loss,
-                                           shown=frozenset(objective.shown), parted_work=parted_work),
-                         *objective.towers())
+                                           shown=frozenset(objective.shown), parted_work=parted_work))
 
 
 def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],

@@ -1606,9 +1606,8 @@ class Transaction:
         """
         realize = self.realize if realize is None else realize
         # Each host phase is a program over the objective's modules, compiled through Dew's compile point
-        # with their options as the step's own compile takes them (`program`).
-        towers = self.objective.towers()
-        compile_phase = (lambda phase: owned_program(phase, *towers)) if host else (lambda phase: phase)
+        # as the step's own compile is (`owned_program`).
+        compile_phase = owned_program if host else (lambda phase: phase)
         reduce = compile_phase(self.local_reduction)
         prepare = compile_phase(self.prepare_attempt)
         pooled = compile_phase(self.pooled_cotangent)

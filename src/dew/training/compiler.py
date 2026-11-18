@@ -713,7 +713,7 @@ class StepCompiler[L, E]:
                     released([current.compute])
                     # A run handed a step compiled ahead runs the program compiled with it: `fit` runs its
                     # steps within the hand (`Trainer._taking`).
-                    copies = narrowing(candidate.copies, self.objective.towers(), candidate.shardings.compute)
+                    copies = narrowing(candidate.copies, candidate.shardings.compute)
                     current = dataclasses.replace(current, compute=copies(current.variables))
                 if stepping.builds_window(current, candidate, window):
                     # The window, and with it the split, is the state's from here on, built over the one it
