@@ -50,7 +50,7 @@ from dew import _cache
 from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
-from dew.nn.derivatives import Protected, contracted
+from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.nested import nested
 from dew.nn.precision import accurate_exp, at_least_fp32, compensated_add, vanishing
 from dew.nn.programs import read_by
@@ -299,7 +299,14 @@ def _walked_tokens(declaration: Scan, chunk: Mapping) -> tuple[dict, dict]:
 def _token_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping) -> tuple:
     """A chunk's tokens' exponents and the affine map's parts at each (`_at_token`), every token at once."""
     along, every = _walked_tokens(declaration, chunk)
-    return jax.vmap(lambda token: _at_token(declaration, names, affine, {**token, **every}))(along)
+    return _with_reader_scale(
+        affine, jax.vmap(lambda token: _at_token(declaration, names, affine, {**token, **every}))(along))
+
+
+def _with_reader_scale(affine, parts: tuple) -> tuple:
+    """The chunk forms' reader includes its scalar, as their products and range bounds read it."""
+    exponent, b, u, strength, c, q, r = parts
+    return exponent, b, u, strength, c, affine.reader_scale * q, r
 
 
 def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h) -> tuple:
@@ -332,7 +339,7 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
         entering = None
         if declaration.reads == "before":
             read = h if declaration.reset is None else jnp.where(step[declaration.reset], 0.0, h)
-            entering = _read(read, q, affine.values_read) + r
+            entering = _read(read, q, affine.values_read, affine.reader_scale) + r
         floor = vanishing(z.dtype, affine.base2)
         h = jnp.where((z <= floor)[:, None], 0.0, h)
         decay = jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],))
@@ -341,20 +348,18 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             # since it: the group's first takes the state as it enters (`h`, its vanishing decay's zero).
             apart = jnp.where(index % group == 0, h, jnp.where((z <= floor)[:, None], 0.0, apart))
             apart = apart * decay[:, None]
-            entering = _read(apart, q, affine.values_read) + r
+            entering = _read(apart, q, affine.values_read, affine.reader_scale) + r
         if not affine.per_key:
             correction = jnp.sum(c[:, None] * h, axis=0)
             transitioned = (h - b[:, None] * (strength * correction)[None, :]) * decay[:, None]
             h = transitioned + b[:, None] * u[None, :]
-            if affine.values_read:
-                output = jnp.sum(transitioned * q[None, :], axis=1) + b * jnp.sum(u * q) + r
-            else:
-                output = jnp.sum(q[:, None] * transitioned, axis=0) + jnp.sum(q * b) * u + r
+            output = (_read(transitioned, q, affine.values_read, affine.reader_scale)
+                      + _read((b, u), q, affine.values_read, affine.reader_scale) + r)
         else:
             decayed = h * decay[:, None]
             correction = jnp.sum(c[:, None] * decayed, axis=0)
             h = decayed + b[:, None] * (u - strength * correction)[None, :]
-            output = _read(h, q, affine.values_read) + r
+            output = _read(h, q, affine.values_read, affine.reader_scale) + r
         return (h, apart, index + 1), output if entering is None else entering
 
     carried = at_least_fp32(h.dtype)
@@ -446,13 +451,18 @@ def _entered(outputs, entering: tuple, values_read: bool, h):
     forms' outputs each the next token's, the first token's read of the state `h` entering the chunk before
     them, and every token's part free of the state added."""
     reader, free = entering
-    first = _read(h, reader, values_read)
+    first = _read(h, reader, values_read, 1.0)
     return jnp.concatenate([first[None].astype(outputs.dtype), outputs[:-1]]) + free
 
 
-def _read(h, reader, values_read: bool):
-    """The state `h` read by a token's `reader`: along its keys, or along its values where `values_read`."""
-    return jnp.sum(h * reader[None, :], axis=1) if values_read else jnp.sum(reader[:, None] * h, axis=0)
+def _read(h, reader, values_read: bool, scale: float):
+    """A scaled read along the state's keys or values, its rank-one part contracted before it is formed."""
+    if isinstance(h, tuple):
+        left, right = h
+        return (_scaled_contract("j,j,i->i", scale)(reader, right, left) if values_read
+                else _scaled_contract("i,i,j->j", scale)(reader, left, right))
+    return (_scaled_contract("j,ij->i", scale)(reader, h) if values_read
+            else _scaled_contract("i,ij->j", scale)(reader, h))
 
 
 class Walk(NamedTuple):
@@ -588,7 +598,7 @@ def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
                                                                           strict=True)
                                          if axis != declaration.walked), chunk[name].dtype)
               for name in names]
-    closed = jax.make_jaxpr(lambda *xs: _token(affine, xs)[1:])(*tokens)
+    closed = jax.make_jaxpr(lambda *xs: _with_reader_scale(affine, _token(affine, xs))[1:])(*tokens)
     declared = {index: declaration.ranges[name] for index, name in enumerate(names)
                 if name in declaration.ranges}
     region = terms.region(closed, declared)
@@ -802,6 +812,46 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     exponent = along(parts.exponent, keys if parts.per_key else 1)
     reader, out = (values, keys) if parts.values_read else (keys, values)
     return exponent, B, U, s, C, along(parts.reader, reader), along(parts.free, out)
+
+
+@functools.cache
+def _scaled_contract(subscripts: str, scale: float):
+    """A multilinear contraction whose transposes apply its scalar before their products."""
+    from jax.custom_derivatives import SymbolicZero
+
+    from dew.nn.kernels import generation
+
+    inputs, output = subscripts.split("->")
+    axes = inputs.split(",")
+
+    def value(*operands):
+        return _portable_einsum(subscripts, scale * operands[0], *operands[1:])
+
+    def tangent(primals, tangents):
+        out = value(*primals)
+        live = tuple(index for index, part in enumerate(tangents) if not isinstance(part, SymbolicZero))
+        if not live:
+            return out, jnp.zeros_like(out)
+        moving = tuple(tangents[index] for index in live)
+
+        def applied(held, directions):
+            return sum(rule(*(direction if at == index else part for at, part in enumerate(held)))
+                       for index, direction in zip(live, directions, strict=True))
+
+        def pulled(held, cotangent):
+            results = []
+            for index in live:
+                others = tuple(part for at, part in enumerate(held) if at != index)
+                remaining = [axis for at, axis in enumerate(axes) if at != index]
+                transposed = ",".join((*remaining, output)) + "->" + axes[index]
+                results.append(_scaled_contract(transposed, scale)(*others, cotangent))
+            return tuple(results)
+
+        return out, generation.linear_map(applied, pulled, primals, moving)
+
+    rule = contracted("test_the_chunked_delta_rule_holds_every_order")(
+        declared_tangent(Protected(), value, tangent, symbolic_zeros=True))
+    return rule
 
 
 def _pairing_role(left) -> str:
