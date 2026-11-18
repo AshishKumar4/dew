@@ -23,7 +23,14 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence, short_conv, tuning
 from dew.nn.kernels.templates import mosaic, resources, scan
-from dew.nn.precision import L2NORM_EPS, accurate_exp, logistic_value, rms_weighted, softplus_series
+from dew.nn.precision import (
+    L2NORM_EPS,
+    accurate_exp,
+    activation_and_slope,
+    logistic_value,
+    rms_weighted,
+    softplus_series,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -603,5 +610,5 @@ def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, interpret:
     # As `precision.rms_statistics` takes it: the sum times the count's reciprocal, over a head's columns.
     total = scan.summed((out * out).reshape(-1), exchanged, interpret=interpret)
     mean = total * (1.0 / token.block.columns)
-    return rms_weighted(out, lax.rsqrt(mean + hooks.output.epsilon), weight=weight, gate=gate,
-                        activation=hooks.output.activation)
+    return rms_weighted(out, lax.rsqrt(mean + hooks.output.epsilon), weight=weight,
+                        gate=activation_and_slope(gate, hooks.output.activation)[0])

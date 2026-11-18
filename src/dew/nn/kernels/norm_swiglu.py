@@ -722,7 +722,8 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, mean
                 else plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32))
         # The gate multiplies the weighted norm in fp32, before the one cast.
         y = rms_weighted(x, _rounded_inverse(inverse, inverse_rounded, y_ref.dtype, interpret)[:, None],
-                         weight=weight, gate=gate, activation=activation,
+                         weight=weight,
+                         gate=None if gate is None else activation_and_slope(gate, activation)[0],
                          rounded=functools.partial(_round, dtype=y_ref.dtype, interpret=interpret)
                          if after_cast and weight is not None
                          else None, weight_first=weight_first)

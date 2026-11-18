@@ -20,7 +20,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
 from dew.batch import Coordinates
-from dew.nn.activations import logistic, silu
+from dew.nn.activations import GATE_ACTIVATIONS, logistic
 from dew.nn.attention import (
     AttentionImpl,
     attention_case,
@@ -84,7 +84,7 @@ from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import at_least_fp32, divided, float32_dot_general, l2norm, rounded_to, scaled, softplus
+from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.qsa import QSA, QSAIndexer, qsa_selection
 from dew.nn.residuals import QKV_RESIDUALS, Residual
@@ -351,17 +351,6 @@ class _Masking(NamedTuple):
     whose blocks they read whole past their window, or None where its queries are its last keys."""
 
 
-
-GATE_ACTIVATIONS = {
-    'sigmoid': logistic,
-    'silu': silu,
-    # torch's softplus at beta log 2, log(1 + exp(x log 2)) / log 2.
-    'softplus2': lambda gate: divided(softplus(gate * math.log(2)), math.log(2)),
-    # torch's softplus in at least float32, Laguna's `F.softplus(g_proj(x).float())`, which the branch's
-    # product casts back (modeling_laguna.py:410).
-    'softplus': lambda gate: softplus(gate.astype(at_least_fp32(gate.dtype))),
-}
-"""The output gate's activations (`MixerContext.output_gate_activation`)."""
 
 INDEX_KEYS, INDEX_PLACES = "index_keys", "index_places"
 """QSA's cache leaves beside a layer's keys: each slot's raw indexer key and its rotary place."""

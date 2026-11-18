@@ -16,7 +16,7 @@ from flax import linen as nn, struct
 from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
 
-from .activations import gate_activation, logistic, silu
+from .activations import GATE_ACTIVATIONS, logistic, silu
 from .dense import Dense
 from .derivatives import portable_formed
 from .kernels import norm_swiglu
@@ -165,9 +165,8 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
         wide = at_least_fp32(x.dtype)
         x = x.astype(wide)
         weight = None if scale is None else scale.astype(wide)
-        activated = gate_activation(activation)(gate.astype(wide))
-        return rms_weighted(x, rms_statistics(x, epsilon)[1], weight=weight, gate=activated,
-                            activation=None).astype(dtype)
+        activated = GATE_ACTIVATIONS[activation](gate.astype(wide))
+        return rms_weighted(x, rms_statistics(x, epsilon)[1], weight=weight, gate=activated).astype(dtype)
 
     chosen = norm_swiglu.gated_rms_kernel(implementation, x, gate, scale, dtype, activation, axes=axes)
     if chosen == 'pallas':

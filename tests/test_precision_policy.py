@@ -1095,7 +1095,7 @@ def test_a_float64_value_asked_for_without_x64_fails_rather_than_computing_in_fl
 def test_a_gated_norms_gate_gradient_is_a_number_where_its_exp_overflows(activation):
     """A gated norm's gate on JAX's derivative (the portable path, `norms.gated_rms_normalized`) at gates of
     -100 and -1000, where `e^-gate` overflows fp32: every gradient a number, as the one logistic's declared
-    tangent gives it (`activations.gate_activation`), where JAX's derivative of the logistic's arithmetic
+    tangent gives it (`activations.GATE_ACTIVATIONS`), where JAX's derivative of the logistic's arithmetic
     made the gate's zero times infinity. Its values are the gated norm's own check 1's
     (tests/test_norm_swiglu.py)."""
     from dew.nn.norms import gated_rms_normalized

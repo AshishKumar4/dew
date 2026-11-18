@@ -35,7 +35,7 @@ from flax.typing import Dtype
 
 from .derivatives import Protected, contracted, declared_tangent
 from .kernels import norm_swiglu
-from .precision import at_least_fp32, capped_logits, logistic_value, rounded_to, softplus
+from .precision import at_least_fp32, capped_logits, divided, logistic_value, rounded_to, softplus
 
 
 def gelu_exact(x: jax.Array) -> jax.Array:
@@ -117,12 +117,20 @@ HIDDEN_ACT: dict[str, Activation] = {'gelu': gelu_exact, 'gelu_pytorch_tanh': ge
 """The activations Hugging Face's `hidden_act` names, as Dew computes them."""
 
 
-def gate_activation(name: str) -> Activation:
-    """A gated norm's gate activation by its name, 'silu' or 'sigmoid' (`precision.activation_and_slope`'s
-    names), as JAX differentiates it: Dew's one logistic and its silu, their tangents declared, where a
-    kernel's body takes their arithmetic (`precision.activation_and_slope`), whose derivative JAX's autodiff
-    makes no number where `e^-x` overflows."""
-    return {'silu': silu, 'sigmoid': logistic}[name]
+GATE_ACTIVATIONS: dict[str, Activation] = {
+    'sigmoid': logistic,
+    'silu': silu,
+    # torch's softplus at beta log 2, log(1 + exp(x log 2)) / log 2.
+    'softplus2': lambda gate: divided(softplus(gate * math.log(2)), math.log(2)),
+    # torch's softplus in at least float32, Laguna's `F.softplus(g_proj(x).float())`, which the branch's
+    # product casts back (modeling_laguna.py:410).
+    'softplus': lambda gate: softplus(gate.astype(at_least_fp32(gate.dtype))),
+}
+"""A gate's activations by name, as JAX differentiates them: an attention output gate's
+(`MixerContext.output_gate_activation`) and a gated norm's, 'silu' or 'sigmoid' (`norms.gated_rms_norm`, the
+recurrence's gated output norm; their kernels refuse the softplus gates), Dew's one logistic and its silu
+their tangents declared, where a kernel's body takes their arithmetic (`precision.activation_and_slope`),
+whose derivative JAX's autodiff makes no number where `e^-x` overflows."""
 
 
 def activation(name: str) -> Activation:

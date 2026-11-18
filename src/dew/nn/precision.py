@@ -195,15 +195,15 @@ def activation_and_slope(gate, activation: str) -> tuple[jax.Array, jax.Array]:
 
 
 def rms_weighted(x: jax.Array, inverse: jax.Array, *, weight: jax.Array | None = None,
-                 gate: jax.Array | None = None, activation: str | None = 'silu',
+                 gate: jax.Array | None = None,
                  rounded: Callable[[jax.Array], jax.Array] | None = None, weight_first: bool = False
                  ) -> jax.Array:
     """An RMS norm's arithmetic past its statistics: `x` times its rows' `inverse` RMS (`rms_statistics`'s, or
-    a kernel's own), times `weight`, times `activation(gate)` (`activation_and_slope`: Qwen3-Next's gated
-    norm; `gate` itself for `activation` None, a gate JAX differentiates activated by Dew's one logistic,
-    `activations.gate_activation`), in that order and in `x`'s dtype, which the caller widens (at least fp32)
-    and rounds once after; with `weight_first`, the weight folded into the inverse before the rows (Flax's
-    `nn.RMSNorm`, `x * (inverse * weight)`). `rounded` rounds the normalized rows, before any weight
+    a kernel's own), times `weight`, times the activated `gate` (Qwen3-Next's gated norm: a kernel's body
+    activates it by `activation_and_slope`, a gate JAX differentiates by `activations.GATE_ACTIVATIONS`),
+    in that order and in `x`'s dtype, which the caller widens (at least fp32) and rounds once after; with
+    `weight_first`, the weight folded into the inverse before the rows (Flax's `nn.RMSNorm`,
+    `x * (inverse * weight)`). `rounded` rounds the normalized rows, before any weight
     multiplies them (Llama's and Qwen3's cast first, `RMSNorm.scale_after_cast`; a norm computing in its
     input's dtype), which a weight folded first has none of. The fused norm kernel, the recurrence's gated
     output norm, the portable norm and the portable gated norm compute it alike, each keeping its own
@@ -216,9 +216,7 @@ def rms_weighted(x: jax.Array, inverse: jax.Array, *, weight: jax.Array | None =
         y = x * inverse if rounded is None else rounded(x * inverse)
         if weight is not None:
             y = y * weight
-    if gate is None:
-        return y
-    return y * (gate if activation is None else activation_and_slope(gate, activation)[0])
+    return y if gate is None else y * gate
 
 
 def weighted_total(x: jax.Array, weights: jax.Array, axis=None) -> tuple[jax.Array, jax.Array]:

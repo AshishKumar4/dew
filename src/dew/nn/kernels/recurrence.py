@@ -26,7 +26,7 @@ from jax.experimental import pallas as pl
 
 from dew._hashing import fmix32
 from dew.algebra.scan import Reads, turned
-from dew.nn.activations import gate_activation, logistic, silu
+from dew.nn.activations import GATE_ACTIVATIONS, logistic, silu
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels import launches
 from dew.nn.precision import (
@@ -277,8 +277,7 @@ def gated_rms(out, z, weight, norm: OutputNorm):
     """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`, its
     inverse RMS the one statistic every norm takes (`rms_statistics`)."""
     inverse = rms_statistics(out, norm.epsilon)[1]
-    return rms_weighted(out, inverse, weight=weight, gate=gate_activation(norm.activation)(z),
-                        activation=None)
+    return rms_weighted(out, inverse, weight=weight, gate=GATE_ACTIVATIONS[norm.activation](z))
 
 
 ROW = {"rows": True}
