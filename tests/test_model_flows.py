@@ -387,7 +387,8 @@ def test_an_arm_of_its_own_compiler_options_is_prepared_whole(tmp_path):
     `generation_support.cublas_compiled`) prepares it whole, lowered as itself, and its run computes it from
     that program, tracing none, with no test of it recorded unprepared (row 8469: traced inside the arms'
     program, the prepare refused it, 'compiler_options can only be passed to top-level jax.jit', and its test
-    ran unprepared)."""
+    ran unprepared). Its truth its own float64 function, as such a site's is (`blockwise_matrix`'s cuBLASLt
+    reference beside its truth): a truth is walked by its trace, which no jit of compiler options lives in."""
     from arm_forms import without_ynn
 
     dew, reference, draw = _site()
@@ -399,10 +400,10 @@ def test_an_arm_of_its_own_compiler_options_is_prepared_whole(tmp_path):
 
     whole = without_ynn(counted, compiler_options={"xla_cpu_use_thunk_runtime": True})
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
-        assert_as_exact(dew, whole, draw, "a product of a compiled reference", seeds=8)
+        assert_as_exact(dew, whole, draw, "a product of a compiled reference", seeds=8, truth_fn=reference)
     traced.clear()
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
-        assert_as_exact(dew, whole, draw, "a product of a compiled reference", seeds=8)
+        assert_as_exact(dew, whole, draw, "a product of a compiled reference", seeds=8, truth_fn=reference)
     assert not traced and not (tmp_path / UNPREPARED).exists()
 
 
@@ -448,8 +449,9 @@ def test_a_site_free_arm_runs_its_prepared_program(tmp_path):
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
         stored = ahead_arm(jax.jit(scaled), "a scaled product")(a, b)
     assert not traced and np.asarray(stored).tolist() == (a * b + 1.0).tolist()
+    # Another function's jit, which JAX's own cache of traces (of `scaled`, the prepare's) does not hold.
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
-        unreached = ahead_arm(jax.jit(scaled), "a product no prepare reached")(a, b)
+        unreached = ahead_arm(jax.jit(lambda a, b: scaled(a, b)), "a product no prepare reached")(a, b)
     assert traced and np.asarray(unreached).tolist() == (a * b + 1.0).tolist()
     assert (tmp_path / UNPREPARED).is_file()
 
