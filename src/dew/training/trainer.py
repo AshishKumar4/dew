@@ -174,7 +174,7 @@ from dew.training.distributed import (
 )
 from dew.training.evaluation import EvalSuite, Evaluator, episodic
 from dew.training.inspection import Inspection
-from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, logged_scalars
+from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, leaf_paths, logged_scalars
 from dew.training.memory import first_run, recompute_record, refuse_wide_floats, split_share
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, model_batch, prepare_counts, uncounted
 from dew.training.observe import Observe
@@ -1475,9 +1475,9 @@ class Trainer(Generic[Loss, Effects]):
         from dew.held_updates import holds_back
 
         held = abstract.opt_state if abstract.inner is None else abstract.inner.opt_state
-        return Interval.resumed(run.stop_control, last_saved=(
-            current if checkpoints is not None and checkpoints.latest is not None else None),
-            skips_nonfinite=self.skip_nonfinite or self.dynamic_scale or holds_back(held))
+        saved = current if checkpoints is not None and checkpoints.latest is not None else None
+        return Interval.resumed(run.stop_control, last_saved=saved, kept_paths=leaf_paths(checked(abstract)),
+                                skips_nonfinite=self.skip_nonfinite or self.dynamic_scale or holds_back(held))
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:

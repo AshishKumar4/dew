@@ -256,7 +256,10 @@ def test_dropout_composite_replay_restarts_with_effects_and_ema_intact(tmp_path)
     assert int(resumed.updates) == 1
 
 
-def test_nonfinite_optimizer_candidate_rolls_back_all_cpu_owned_fields():
+def test_a_nonfinite_optimizer_candidate_of_a_finite_gradient_commits_alike_on_host_and_device():
+    """A scaled step whose loss and gradient are finite commits the update its optimizer forms, an infinite
+    one here, as a step's choice reads its loss and gradient alone (row 6748): the device and host layouts
+    commit it alike, and the scaler counts a finite step."""
     def update(updates, state, params=None):
         return jax.tree.map(lambda x: jnp.full_like(x, jnp.inf), updates), state
     optimizer = optax.GradientTransformation(lambda params: optax.EmptyState(), update)
@@ -268,18 +271,12 @@ def test_nonfinite_optimizer_candidate_rolls_back_all_cpu_owned_fields():
         data = batches()[0]
         # the step consumes the state
         assert initial.scale is not None
-        start_params, start_ema, start_opt = jax.tree.map(
-            np.asarray, (initial.variables, initial.ema, initial.opt_state))
         start_scale, start_fin = float(initial.scale.scale), int(initial.scale.fin_steps)
         final, _, _, finite, accepted, _ = trainer.compile(initial, data)(initial, data)
-        assert bool(finite) and not bool(accepted)
-        equal(start_params, final.variables)
-        equal(start_ema, final.ema)
-        equal(start_opt, final.opt_state)
-        assert int(final.microstep) == int(final.updates) == 0
-        assert int(final.step) == 1
-        # Preserve the existing distinction: candidate-state rejection rolls
-        # back the transaction, while the scaler tracks gradient finiteness.
+        assert bool(finite) and bool(accepted)
+        params = jax.tree.leaves(final.variables["params"])
+        assert not all(np.all(np.isfinite(np.asarray(leaf))) for leaf in params)
+        assert int(final.updates) == 1 and int(final.step) == 1
         assert final.scale is not None
         assert float(final.scale.scale) == start_scale
         assert int(final.scale.fin_steps) == start_fin + 1
