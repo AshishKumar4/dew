@@ -6,13 +6,14 @@ tests/fixtures/fetched/, under its SHA-256, and pinned beside where it would sit
 `<fixture>.fetched.json`: the store's repo, the revision its file was uploaded in, its path there
 (recordings/<sha256>.npz), its sha256 and bytes, and the reference it records with that reference's
 license. `fetch` fills the local store before the tests run (armada's environment build,
-tools/armada/install.sh, whose key holds every pin, or by hand), and the tests read it offline
-(`local`), checking every file against its pin as they read it: CI's tests never reach the Hub
-(tools/armada/ci.py's CLOSED_HUB). A file for GitHub's store never passes through the machine that holds
-the store's token: `stage`, on the recording's own host, puts each due file in the GPU outputs bucket and
-answers a presigned URL of an hour; `dispatch`, where the token is, asks the store's own workflow
-(upload.yml, in GITHUB) to fetch it, check its sha256, upload it as its asset and read it back anonymously,
-and pins the release GitHub then holds it in at its sha256 (bible §8: no data routed through the PC).
+tools/armada/install.sh, then each task the pins its commit adds to that environment's, `--absent`; or by
+hand), and the tests read it offline (`local`), checking every file against its pin as they read it: CI's
+tests never reach the Hub (tools/armada/ci.py's CLOSED_HUB). A file for GitHub's store never passes through
+the machine that holds the store's token: `stage`, on the recording's own host, puts each due file in the GPU
+outputs bucket and answers a presigned URL of an hour; `dispatch`, where the token is, asks the store's own
+workflow (upload.yml, in GITHUB) to fetch it, check its sha256, upload it as its asset and read it back
+anonymously, and pins the release GitHub then holds it in at its sha256 (bible §8: no data routed through the
+PC).
 `upload`, run by whoever holds the Hub store's token, commits every Hub pin awaiting its revision, with the
 store's catalog of every file it has held and the card made from it, reads each file back anonymously at
 that commit and checks it before the pin takes the revision.
@@ -28,6 +29,7 @@ reads it from as it reads the store's, and which `upload` leaves alone.
 
 Usage, from the checkout:
   python tools/fetched_fixtures.py fetch
+  python tools/fetched_fixtures.py fetch --absent   # only the pins whose file the store lacks
   python tools/fetched_fixtures.py check
   python tools/fetched_fixtures.py upload   # the Hub store's pins
   python tools/fetched_fixtures.py stage --settings <outputs bucket settings> > staged.jsonl  # on the host
@@ -303,12 +305,21 @@ def save(path, arrays: dict, *, reference: str, license: str, root: Path = REPO_
     return stored
 
 
-def fetch(root: Path = REPO_ROOT) -> None:
+def absent(root: Path = REPO_ROOT) -> dict[str, dict]:
+    """The pins whose file the local store lacks, by their fixture's name. A file there is taken as whole
+    unread: the store names each by its sha256 and writes it only once checked (`_checked`, then a rename
+    into place), and every read checks it again (`local`)."""
+    return {name: pin for name, pin in pins(root).items() if not _stored(pin, root).is_file()}
+
+
+def fetch(root: Path = REPO_ROOT, only_absent: bool = False) -> None:
     """Every pinned file into the local store, each checked against its pin; one already there and
-    whole is kept."""
-    for name, pin in pins(root).items():
+    whole is kept. With `only_absent`, those the store lacks (`absent`), one there kept unread. An armada
+    task fetches so (tools/armada/ci.py's `task`): its environment holds the pins of the commit it was
+    built at, and only a pin its own commit adds or moves goes over the network."""
+    for name, pin in (absent(root) if only_absent else pins(root)).items():
         stored = _stored(pin, root)
-        if stored.is_file() and digest(stored.read_bytes()) == pin["sha256"]:
+        if not only_absent and stored.is_file() and digest(stored.read_bytes()) == pin["sha256"]:
             continue
         if not pin["revision"]:
             raise SystemExit(f"{name}: pinned with no revision and not in {LOCAL}: its upload is due")
@@ -321,7 +332,8 @@ def fetch(root: Path = REPO_ROOT) -> None:
             cached = Path(hf_hub_download(pin["repo"], pin["path"], repo_type=kind, revision=pin["revision"]))
             data = _checked(cached.read_bytes(), pin, name)
         stored.parent.mkdir(parents=True, exist_ok=True)
-        partial = stored.with_name(f".{stored.name}.partial")
+        # The process's own partial file: an armada container's tasks may fetch one pin at once.
+        partial = stored.with_name(f".{stored.name}.{os.getpid()}.partial")
         partial.write_bytes(data)
         partial.replace(stored)
         print(f"fetched {name} ({pin['bytes']} bytes)", flush=True)
@@ -572,6 +584,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("command", choices=("fetch", "check", "upload", "move", "stage", "dispatch"))
     parser.add_argument("staged", nargs="?", type=Path, help="dispatch: stage's lines")
     parser.add_argument("--settings", type=Path, help="stage: the GPU outputs bucket's settings")
+    parser.add_argument("--absent", action="store_true",
+                        help="fetch: only the pins whose file the store lacks, a stored one kept unread")
     parsed = parser.parse_args(argv)
     command = parsed.command
     if command == "stage":
@@ -594,7 +608,10 @@ def main(argv: list[str]) -> int:
         print("\n".join(problems) if problems else "fetched fixtures: every pin whole, no recording over "
               f"{IN_GIT:,} bytes in git")
         return 1 if problems else 0
-    (fetch if command == "fetch" else upload)()
+    if command == "fetch":
+        fetch(only_absent=parsed.absent)
+    else:
+        upload()
     return 0
 
 

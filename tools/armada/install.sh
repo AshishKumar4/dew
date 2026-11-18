@@ -3,7 +3,9 @@
 # environment (locks/cpu.txt) for each Python CI proves, its modules compiled to bytecode as installed, the
 # interpreter's own standard library and Dew's src/ (tools/armada/compiled.sh) too, so no task compiles them from
 # source as it imports them (row 3215), and the recorded fixtures the tests read from the fetched store
-# (tools/fetched_fixtures.py), which the environment's key pins by their pins.
+# (tools/fetched_fixtures.py) as this commit pins them. The pins are no part of the environment's key: a task
+# fetches those its own commit adds or moves (tools/armada/ci.py's `task`), where every re-pinned fixture
+# rebuilt the whole environment, 6.5-16 minutes, for each run of a commit that moved one (2026-11-18).
 set -eu
 for python in $(python3 tools/armada/ci.py pythons); do
   uv venv -q --python "$python" ".venv-$python"

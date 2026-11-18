@@ -309,6 +309,27 @@ def test_a_targeted_pytest_runs_a_group_as_its_ci_task_would(ci, tmp_path, monke
     assert sorted(test for test, *_ in ran("")) == ["test_other", "test_site"]
 
 
+def test_a_task_fetches_only_the_pins_its_environment_lacks(ci, tmp_path):
+    """A commit that pins a fixture its environment's store lacks fetches it, and only it (`--absent`), before
+    its tests; one whose every pin is stored starts no fetch: the environment's key reads no pin."""
+    written(tmp_path, {"test_pass.py": "def test_ok(): pass\n"})
+    interpreter(tmp_path, "3.12")
+    (tmp_path / "tools").mkdir(exist_ok=True)
+    (tmp_path / "tools/fetched_fixtures.py").write_text(
+        "import sys\nfrom pathlib import Path\n"
+        "with open('fetches', 'a') as out:\n    out.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "Path('tests/fixtures/fetched').mkdir(parents=True, exist_ok=True)\n"
+        f"Path('tests/fixtures/fetched/{'a' * 64}.npz').write_bytes(b'x')\n")
+    pin = tmp_path / "tests/fixtures/x/recorded.npz.fetched.json"
+    pin.parent.mkdir(parents=True)
+    pin.write_text(json.dumps({"sha256": "a" * 64, "bytes": 1, "revision": "r", "repo": "o/r", "path": "p"}))
+    out = tmp_path / "verdict.json"
+    assert ci.task("3.12", ["tests/test_pass.py"], "", out, 600.0) == 0
+    assert (tmp_path / "fetches").read_text() == "fetch --absent\n"
+    assert ci.task("3.12", ["tests/test_pass.py"], "", out, 600.0) == 0
+    assert (tmp_path / "fetches").read_text() == "fetch --absent\n"
+
+
 def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     """A failed test, a skip on a missing import and a file that does not
     collect each turn their own file's row red; a passing file and an

@@ -1367,6 +1367,12 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     (`deadline_shares`): the file its tests were running in at least what it needs, a file that never
     started none. With `coverage`, pytest runs under coverage.py, whose data file goes there
     (`coverage_items`)."""
+    # The fixtures this commit pins and its environment's store lacks, fetched while the Hub is reachable:
+    # the environment holds those of the commit it was built at, and its key reads no pin
+    # (tools/armada/install.sh). Where it lacks none, as for a commit that moves no pin, nothing is started.
+    if digests.fetched.absent(Path.cwd()):
+        subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch", "--absent"],
+                       check=True)
     # Before any test writes under tests/, the inputs as the plan saw them; the rows its plan kept read
     # where it found their green runs (`kept_of`), a heavy file's kept groups each its own, and run where
     # their green run is not found there.

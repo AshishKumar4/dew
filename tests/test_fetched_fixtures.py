@@ -159,6 +159,32 @@ def test_fetch_keeps_a_whole_file_and_takes_a_download_only_as_its_pin(store, tm
     assert not stored.exists()
 
 
+def test_an_absent_fetch_downloads_only_the_pins_the_store_lacks_and_reads_no_stored_file(store, tmp_path,
+                                                                                         monkeypatch):
+    import huggingface_hub
+
+    root = _checkout(tmp_path)
+    stored = _saved(store, root)
+    _uploaded(store, root)
+    hub = tmp_path / "hub.npz"
+    hub.write_bytes(stored.read_bytes())
+    asked = []
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda repo, path, **where: asked.append(path) or str(hub))
+    assert store.absent(root) == {}
+    # A stored file is kept unread: one damaged in place is no download (every read checks it, `local`).
+    stored.write_bytes(_flipped(stored.read_bytes()))
+    store.fetch(root, only_absent=True)
+    assert asked == []
+    with pytest.raises(AssertionError):
+        store.local(LARGE, root)
+    stored.unlink()
+    assert list(store.absent(root)) == [LARGE]
+    store.fetch(root, only_absent=True)
+    assert len(asked) == 1 and stored.read_bytes() == hub.read_bytes() and store.absent(root) == {}
+    assert not list(stored.parent.glob(".*.partial"))
+
+
 def test_upload_pins_a_revision_only_once_each_file_reads_back_anonymously_as_its_pin(store, tmp_path,
                                                                                     monkeypatch):
     import huggingface_hub
