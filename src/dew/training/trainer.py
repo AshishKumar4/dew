@@ -971,7 +971,6 @@ class Trainer(Generic[Loss, Effects]):
                 fill=jnp.zeros((), jnp.int32))
 
         pending = jax.eval_shape(allocate)
-        state = dataclasses.replace(state, accumulation=window_calls_folded(state.accumulation))
         # The microbatches the state's window holds are read only where it is replaced (`kept_window`).
         if kept_window(state.accumulation, pending, read=not shape_only):
             return state
@@ -1170,7 +1169,9 @@ class Trainer(Generic[Loss, Effects]):
         """`state` to run step `step`: its window of `window_size` microbatches dropped where the step, of
         the attempt count a resumed run restores, begins a ramp's stage after the first and a rejection
         left the window part filled, so an update pools one stage's batches. Only the window's fields
-        are compiled (`window_dropped`), so a host-master state's resident weights stay where they are."""
+        are compiled (`window_dropped`), so a host-master state's resident weights stay where they are. A
+        window saved holding a layer's QK maxima a call each holds their largest (`window_calls_folded`)."""
+        state = window_calls_folded(state)
         if step not in self._shape.stage_starts or state.window is None:
             return state
         return dropped(state)

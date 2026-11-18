@@ -650,10 +650,17 @@ def calls_folded(tree):
     return folded(tree) if isinstance(tree, Mapping) else tree
 
 
-def window_calls_folded(window: Accumulation | None) -> Accumulation | None:
-    """`window` holding its QK maxima as `compact_qk` makes them (`calls_folded`), from one a run saved a
-    call each (a looped layer's passes, before windows held one), its pooled maxima kept."""
-    return None if window is None else dataclasses.replace(window, qk_stats=calls_folded(window.qk_stats))
+def window_calls_folded(state: TrainState) -> TrainState:
+    """`state` with its window (`TrainState.window`) holding its QK maxima as `compact_qk` makes them
+    (`calls_folded`), from one a run saved a call each (a looped layer's passes, before windows held one),
+    its pooled maxima kept; `state` itself where it holds them so."""
+    def called(node) -> bool:
+        return isinstance(node, Mapping) and any(
+            called(value) or (isinstance(value, tuple) and len(value) > 1) for value in node.values())
+    window = state.window
+    if window is None or not called(window.qk_stats):
+        return state
+    return state.with_window(dataclasses.replace(window, qk_stats=calls_folded(window.qk_stats)))
 
 
 def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_scale_lib.DynamicScale | None:
