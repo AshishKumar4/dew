@@ -740,7 +740,7 @@ class TextToImage(SavedRunTask, InItsForm):
         plan, process = settled.plan, settled.process
         given = plan.place(plan.pad(settled.tokens))
         if "given" not in settled.encoded:
-            given = _encoder(plan.sharding, self.inputs.encoders)(self.inputs.encoders, self.variables, given)
+            given = _encoder(plan.sharding)(self.inputs.encoders, self.variables, given)
         if settled.null_tokens is None:
             null = {}
         elif "null" in settled.encoded:
