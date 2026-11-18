@@ -24,13 +24,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from reference_runs.common import warmup_cosine
 from reference_worker import drawn, serve
 from transformers import AutoModelForCausalLM
 
 from _dew_torch.precision import float64
-
-sys.path.insert(0, str(Path(__file__).resolve().parent / "reference_runs"))
-from common import warmup_cosine
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKPOINT = ROOT / "tests/fixtures/hf/qwen3-tiny"

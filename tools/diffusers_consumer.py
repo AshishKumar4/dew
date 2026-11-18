@@ -89,15 +89,17 @@ def load_flax(export: Path, name: str, *, wide: bool = False):
     its parameters, refused unless the tree is the one the class itself
     initializes, leaf for leaf and shape for shape. `wide` builds it in
     float64 with the parameters widened."""
-    from flax.traverse_util import flatten_dict
-
     library, declared = weighted_components(export)[name]
     cls = getattr(library_module(library), declared)
     model, params = cls.from_pretrained(str(export), subfolder=name,
                                         dtype=jnp.float64 if wide else jnp.float32)
-    expected = {key: value.shape for key, value in flatten_dict(
-        jax.eval_shape(model.init_weights, jax.random.key(0))).items()}
-    loaded = {key: np.shape(value) for key, value in flatten_dict(params).items()}
+    def shapes(tree) -> dict[str, tuple[int, ...]]:
+        # Each leaf by its path in the tree, as flax's flattening names it.
+        return {jax.tree_util.keystr(path): tuple(np.shape(leaf))
+                for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
+
+    expected = shapes(jax.eval_shape(model.init_weights, jax.random.key(0)))
+    loaded = shapes(params)
     if loaded != expected:
         reshaped = [key for key in expected.keys() & loaded.keys() if expected[key] != loaded[key]]
         raise AssertionError(f"{export}/{name} ({declared}) msgpack differs from the class's tree: "
@@ -116,7 +118,7 @@ def assert_components_load(export: Path) -> None:
     """Every weighted component loads cleanly, its Flax class too where
     Diffusers declares one, but those `unread` names; a PyTorch-declared
     pipeline loads whole, without them."""
-    from diffusers import DiffusionPipeline
+    from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
     skipped = unread(export)
     for name, (library, declared) in weighted_components(export).items():

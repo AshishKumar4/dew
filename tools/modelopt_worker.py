@@ -31,6 +31,9 @@ from modelopt.torch.quantization.tensor_quant import fp8_eager
 from safetensors.torch import load_file
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
+COHORT = "modelopt"
+"""The releases this file runs against, which its type check reads (tools/reference_releases.RELEASES)."""
+
 ROOT = Path(__file__).resolve().parents[1]
 CODECS = ROOT / "tests" / "fixtures" / "codecs" / "modelopt"
 

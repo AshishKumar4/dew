@@ -45,15 +45,19 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, get_args
 
 if TYPE_CHECKING:
     from dew.interop.torchax_fallback import TorchAdmission
     from dew.interop.verify import ProbeUnavailable, Unmapped, VerifiedMapping
 
 
+type Order = Literal["created_at", "downloads", "last_modified", "likes", "trending_score"]
+"""The orders the Hub sorts a listing by (`huggingface_hub.HfApi.list_models`' `sort`)."""
+
+
 def census(out: Path, limit: int, tags: Sequence[str] = ("text-generation",),
-           orders: Sequence[str] = ("downloads",), filters: Sequence[str] = ()) -> None:
+           orders: Sequence[Order] = ("downloads",), filters: Sequence[str] = ()) -> None:
     from huggingface_hub import HfApi, hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError, GatedRepoError, RepositoryNotFoundError
 
@@ -330,7 +334,8 @@ if __name__ == "__main__":
     parser.add_argument("out", type=Path)
     parser.add_argument("models", type=int, nargs="?", default=3000, help="census: models a tag and order")
     parser.add_argument("--tags", nargs="+", default=["text-generation"], help="census: pipeline tags")
-    parser.add_argument("--orders", nargs="+", default=["downloads"], help="census: Hub sort orders")
+    parser.add_argument("--orders", nargs="+", default=["downloads"], choices=get_args(Order.__value__),
+                        help="census: Hub sort orders")
     parser.add_argument("--filters", nargs="+", default=[], help="census: Hub tags a model must hold")
     parser.add_argument("--jobs", type=int, default=2, help="loads: loads at once")
     arguments = parser.parse_args()

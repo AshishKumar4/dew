@@ -44,6 +44,7 @@ import json
 import os
 import statistics
 from dataclasses import dataclass
+from typing import TypedDict
 
 # tests/conftest.py defaults the platform to cpu, and it is imported after
 # this module, so the backends this asks for have to be named before jax opens
@@ -99,9 +100,19 @@ def parity(config: QualifyConfig) -> dict[str, int | str]:
             "verdict": "parity holds" if code == 0 else "parity failed"}
 
 
-def call_arguments(shape: str, batch: int, seq: int, heads: int) -> dict[str, object]:
+class CallArguments(TypedDict, total=False):
+    """The keyword arguments of `scaled_dot_product_attention` the shapes name."""
+
+    causal: bool
+    softcap: float
+    sinks: jax.Array
+    segment_ids: jax.Array
+    sliding_window: int
+
+
+def call_arguments(shape: str, batch: int, seq: int, heads: int) -> CallArguments:
     """The keyword arguments of `scaled_dot_product_attention` one shape names."""
-    arguments: dict[str, object] = {"causal": True}
+    arguments: CallArguments = {"causal": True}
     if shape == 'softcap':
         arguments["softcap"] = 50.0
     elif shape == 'sinks':
@@ -115,7 +126,7 @@ def call_arguments(shape: str, batch: int, seq: int, heads: int) -> dict[str, ob
     return arguments
 
 
-def kernel_fn(kernel: str, arguments: dict[str, object]):
+def kernel_fn(kernel: str, arguments: CallArguments):
     """One callable per kernel, all reading Dew's own [B, S, H, D] layout.
 
     'splash' and 'flash' are both `attention_impl 'tpu'`; the dispatch picks
