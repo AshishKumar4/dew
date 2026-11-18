@@ -777,6 +777,29 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
 
 
 @COMPILES_ON_CPU
+def test_a_ladder_that_spills_throughout_certifies_its_ends_alone():
+    """The accurate backward under an alibi hook 64 wide on an H100, whose dQ spills at every query block the
+    derivation offers (row 7938): certification refuses each of them, as it would certifying every rung,
+    having certified fewer of its configs than it refused, the rungs between a regime's two refused ends
+    refused by inference (`tuning.KernelOp._spanned`)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    op, ba, derived = _gated_backward("sm90", 64, accurate=True, hooks="alibi")
+    assert derived is not None
+    with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]):
+        before = len(report.certifications())
+        taken = op._certified(ba, derived)
+        certified = {certification.config for certification in report.certifications()[before:]
+                     if certification.op == type(op).__name__}
+        rungs = tuple(dataclasses.replace(derived, block_q=block) for block in (256, 192, 128, 64)
+                      if block <= derived.block_q)
+        refused = {rung for rung in rungs if report.refused(op, ba, rung)}
+    assert taken is None or taken not in refused, taken
+    assert refused == set(rungs), (rungs, refused)
+    assert len(certified & set(rungs)) < len(rungs), (certified, rungs)
+
+
+@COMPILES_ON_CPU
 def test_a_start_runs_the_kernels_its_launches_certified():
     """A launch's derived config certified as it traces (`report.certified`: its kernels compiled alone as
     the GPU's compiler assembles them) on a compile-only B200, and then compiled within its program: every
