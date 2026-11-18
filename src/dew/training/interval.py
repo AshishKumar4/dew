@@ -723,6 +723,11 @@ def on_host[TreeT](counters: TreeT, step: int) -> TreeT:
                            "at the loss counters that read its loss (jit_bookkeep)") from error
 
 
+def leaf_paths(tree) -> tuple[str, ...]:
+    """`tree`'s leaves by their paths, in its order, by which a stop names one (`Interval.kept_paths`)."""
+    return tuple(jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(tree))
+
+
 def checked_finite(streak: Streak, step: int, display: TrainingDisplay, *, skips: bool,
                    kept: Sequence[str] = ()) -> None:
     """Stop the run (RuntimeError) at the first step since the last check, ending at `step`, whose loss or

@@ -174,7 +174,7 @@ from dew.training.distributed import (
 )
 from dew.training.evaluation import EvalSuite, Evaluator, episodic
 from dew.training.inspection import Inspection
-from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, logged_scalars
+from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, leaf_paths, logged_scalars
 from dew.training.memory import first_run, local_devices, recompute_record, refuse_wide_floats, split_share
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, model_batch, prepare_counts, uncounted
 from dew.training.observe import Observe
@@ -1469,8 +1469,7 @@ class Trainer(Generic[Loss, Effects]):
         return Interval.resumed(run.stop_control, last_saved=(
             current if checkpoints is not None and checkpoints.latest is not None else None),
             skips_nonfinite=self.skip_nonfinite or self.dynamic_scale or holds_back(held),
-            kept_paths=tuple(jax.tree_util.keystr(path) for path, _ in
-                             jax.tree_util.tree_leaves_with_path(checked(abstract))))
+            kept_paths=leaf_paths(checked(abstract)))
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
