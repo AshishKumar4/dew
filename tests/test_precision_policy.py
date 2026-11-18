@@ -117,6 +117,47 @@ def test_an_fp32_call_stating_highest_multiplies_every_product_at_highest(implem
     assert precisions and not narrowed, narrowed
 
 
+@pytest.mark.parametrize("operand, stated, run, cublas", [
+    (jnp.float32, jax.lax.Precision.HIGHEST, None, True), (jnp.float32, None, "highest", True),
+    (jnp.float32, None, None, False), (jnp.bfloat16, jax.lax.Precision.HIGHEST, None, False),
+    (jnp.int8, None, None, True)],
+    ids=["an operation's fp32 at highest", "the run's fp32 at highest", "fp32 at the default",
+         "bf16 at highest", "int8"])
+def test_a_program_holding_an_ieee_fp32_dot_compiles_its_gemm_on_cublas(operand, stated, run, cublas,
+                                                                        monkeypatch):
+    """A program holding a dot XLA's Triton GEMM computes wrong on an A100 compiles it on cuBLAS
+    (`report.targeted` reads the program's own dots and its device's target, `report.triton_wrong`): fp32
+    operands at IEEE fp32 products, whose cuBLAS sum is nearer float64 (rows 5026/5028/5029: a Wan walk
+    1.59 times the reference's distance where 1.5 holds), one an operation states 'highest' in a run at
+    the default as one the run states; and an int8 product, which Triton computes as two or four times
+    it (openxla/xla#51016), whoever made it. At the default precision, or of bf16 operands, the dot stays
+    XLA's own, a Triton GEMM. Compiled through Dew's one compile for a compile-only
+    A100 (`report.xla_compiled`), its instructions read as XLA's schema states them."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.templates.report import xla_compiled
+    from dew.telemetry.instrumentation import custom_call_kind, hlo_instructions
+
+    monkeypatch.setenv("XLA_FLAGS", "")
+    mesh = Mesh(np.array(compile_only_gpus("sm80", 1, 80 * 2**30)), ("data",))
+    placed = NamedSharding(mesh, PartitionSpec())
+
+    def product(x, w):
+        return jnp.dot(x, w, precision=stated,
+                       preferred_element_type=jnp.int32 if operand == jnp.int8 else None)
+
+    shapes = [jax.ShapeDtypeStruct(shape, operand, sharding=placed) for shape in ((256, 512), (512, 384))]
+    with jax.default_matmul_precision(run):
+        lowered = jax.jit(product).trace(*shapes).lower()
+    instructions = hlo_instructions(xla_compiled(lowered, None)).values()
+    # No dot left to XLA's own fusions (a Triton GEMM), the product a GEMM library call, whichever of
+    # cuBLAS's the device's compile takes (`custom_call_kind`).
+    own = [each.op for each in instructions if each.op == "dot" or "dot" in each.fused]
+    library = [each.target for each in instructions if custom_call_kind(each.target) == "gemm"]
+    assert (bool(library) and not own) == cublas, (library, own)
+
+
 @pytest.mark.parametrize("scope", ["plain", "forward mode"])
 def test_an_fp32_call_stating_highest_takes_its_forward_derivative_on_jax_nn_s_xla_attention(scope):
     """jax.nn's xla attention is JAX's own products, which forward mode differentiates as written: an fp32
