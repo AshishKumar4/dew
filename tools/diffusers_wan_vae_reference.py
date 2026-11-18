@@ -109,7 +109,6 @@ def bfloat16_walk(fixture: Path) -> dict[str, np.ndarray]:
 
 
 def main(destination: str) -> None:
-    import diffusers
 
     require("diffusers")
     torch.set_num_threads(2)
@@ -129,7 +128,6 @@ if __name__ == "__main__":
 
         bundle(sys.argv[2], sys.argv[3])
     elif len(sys.argv) > 3 and sys.argv[1] == "bfloat16":
-        import diffusers
 
         require("diffusers")
         torch.set_num_threads(2)

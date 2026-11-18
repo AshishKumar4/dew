@@ -28,6 +28,7 @@ import tyro
 import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.inference.banks import SafetensorsBanks
 from dew.interop.hf_decoders import translate_config
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.registry import models
 from dew.sampling.text import decode_ops, prefill_state
@@ -107,6 +108,8 @@ def measure(config: DiskConfig):
         record["max_seq_len"] = config.prompt + config.tokens + 1
         model = models.build("causal_transformer", {**record, "dtype": config.dtype, "attention_impl": "xla",
                                                    "scan_layers": True, "bank_layers": config.bank_layers})
+        if not isinstance(model, CausalTransformer):
+            raise TypeError(f"a causal_transformer record builds a {type(model).__name__}")
         variables = source.stream(model, mesh=MeshSpec().build([device]),
                                    layout=Layout(min_shard=1, tolerance=1.0))
         print("non-decoder weights loaded", resident_status(), file=sys.stderr, flush=True)

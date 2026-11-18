@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-import transformers
 from numerics_reference import FIXTURES, NEW_TOKENS, decoder, prompts, teacher_forced
 
 FAMILIES = ("llama-tiny", "qwen3-tiny")

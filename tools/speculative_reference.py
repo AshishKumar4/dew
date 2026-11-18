@@ -26,7 +26,6 @@ from pathlib import Path
 import jax
 import numpy as np
 import torch
-import transformers
 from transformers.generation.utils import _speculative_sampling
 
 from _dew_torch.precision import replaced

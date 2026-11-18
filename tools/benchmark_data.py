@@ -48,7 +48,7 @@ import tyro
 from absl import flags
 
 from dew.data import Loading
-from dew.data.dataset import Forwarding
+from dew.data.dataset import Closeable, Forwarding
 from dew.data.storage import EXPORT_MANIFEST, object_info
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1006,7 +1006,8 @@ def run_caching(config: Caching) -> None:
                                                       batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)),
                                                       strict=True) if valid]
             finally:
-                stream.close()
+                if isinstance(stream, Closeable):
+                    stream.close()
             if len(read) != config.records:
                 raise ValueError(f"a pass read {len(read)} of the {config.records} records")
             return time.perf_counter() - started, read

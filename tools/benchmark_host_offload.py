@@ -189,8 +189,11 @@ def build(config: OffloadConfig, depth: int) -> CausalTransformer:
               "mlp": "swiglu"}
     if config.cache_length is not None:
         fields["max_seq_len"] = config.cache_length
-    return models.build("causal_transformer", **fields, dtype=config.dtype,
-                        attention_impl=config.attention_impl)
+    model = models.build("causal_transformer", {**fields, "dtype": config.dtype,
+                                                "attention_impl": config.attention_impl})
+    if not isinstance(model, CausalTransformer):
+        raise TypeError(f"a causal_transformer record builds a {type(model).__name__}")
+    return model
 
 
 def shapes_of(model: CausalTransformer, tokens, dtype: str) -> dict:

@@ -205,11 +205,16 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
     else:
         config = dict(LM_MOE)
         if args is not None:
-            config["mixture"] = {**LM_MOE["mixture"], "implementation": args.implementation}
+            mixture = LM_MOE["mixture"]
+            if not isinstance(mixture, dict):
+                raise TypeError(f"LM_MOE's mixture is a record, not {mixture!r}")
+            config["mixture"] = {**mixture, "implementation": args.implementation}
     config["remat"] = None if remat in (None, "none") else remat
+    length = config["max_seq_len"]
+    if not isinstance(length, int):
+        raise TypeError(f"the case's max_seq_len is a count, not {length!r}")
     # The decoder's whole context, a window a row.
-    return Case("causal_transformer", config, dtype="bfloat16",
-                               batch_size=batch, seq_len=config["max_seq_len"])
+    return Case("causal_transformer", config, dtype="bfloat16", batch_size=batch, seq_len=length)
 
 
 def step(args: argparse.Namespace) -> dict[str, object]:
@@ -234,7 +239,7 @@ def step(args: argparse.Namespace) -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     modes = parser.add_subparsers(dest="mode", required=True)
     project = modes.add_parser("projection")
     project.add_argument("--kernel", type=kernel_name, default="auto",
