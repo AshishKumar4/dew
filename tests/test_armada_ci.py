@@ -334,8 +334,8 @@ def test_a_task_fetches_only_the_pins_its_environment_lacks_within_its_deadline(
 
 
 def test_a_targeted_run_and_the_gpu_tier_fetch_the_pins_their_store_lacks_first(ci, tmp_path, monkeypatch):
-    """The pytest operation (a lane's targeted run, the gangs) and the GPU tier's collection fetch the pins their
-    store lacks first, as a task does: the environment's key reads no pin (train 1049's review, F6)."""
+    """The pytest operation (a lane's targeted run, the gangs) and the GPU tier's collection fetch the pins
+    their store lacks first, as a task does: the environment's key reads no pin (train 1049's review, F6)."""
     order = []
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(ci.digests.fetched, "absent", lambda root: {"x": {}})
