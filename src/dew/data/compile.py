@@ -1687,9 +1687,12 @@ def _shared(phases: Phases) -> tuple[dict[str, str], ...]:
         for index, held in read:
             mix = phases.pipelines[index].source
             if not isinstance(mix, Mixture) or not any(held is child for child in mix.pipelines):
-                raise ValueError(f"phases {first} and {index} both read {_name(held)}, and phase {index} "
-                                 "reads it other than as a member of its own mix, where a phase continues a "
-                                 "corpus it shares by the member's key: read it as one "
+                # The phase that reads it otherwise may be the first that reads it: name another beside it.
+                other = next(at for at, _ in read if at != index)
+                raise ValueError(f"phases {min(index, other)} and {max(index, other)} both read "
+                                 f"{_name(held)}, and phase {index} reads it other than as a member of its own "
+                                 "mix, where a phase continues a corpus it shares by the member's key: read it as "
+                                 "one "
                                  f"(`mix([({_name(held)}, 1.0)])` where the phase reads it alone)")
             if len(held.stages) != len(chain.stages) or not all(
                     same_stage(made, kept) for made, kept in zip(held.stages, chain.stages, strict=True)):
