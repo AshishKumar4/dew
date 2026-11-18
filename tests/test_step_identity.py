@@ -1059,3 +1059,27 @@ def test_a_step_made_inside_a_function_resumes_exactly_by_its_code_closure_and_r
     assert resumed_changes(reader(jax.random.key(0)), state) == ()
     with pytest.raises(ValueError):
         resumed_changes(reader(jax.random.key(1)), state)
+
+
+def library_scaled_by(factor: int):
+    """A step made inside a function of a library's module (its `__module__` the standard library's
+    `json`), multiplying each id by `factor`, which its closure holds."""
+    def scale(row):
+        return {**row, "id": row["id"] * factor}
+    scale.__module__ = "json"
+    return scale
+
+
+def test_a_step_a_library_made_inside_a_function_resumes_exactly_only_with_its_closure():
+    """A step made inside a function of a module no file of the user's holds (an installed library's, the
+    standard library's, Dew's) is stated by its code and its closure: its run resumes exactly where the
+    closure holds the same factor, and is refused where it holds another. Held by its module's version
+    alone, scale_by(3) and scale_by(4) shared an identity (train 1022's review)."""
+    def reader(factor: int):
+        pipeline = Pipeline(ROWS).map(library_scaled_by(factor)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(lambda: reader(3))
+    assert resumed_changes(reader(3), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(4), state)
