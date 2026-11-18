@@ -70,5 +70,5 @@ def hidden_phases():
 
 
 SAVED = {"hidden": (hidden, 3), "hidden_phases": (hidden_phases, 5), "hidden_global": (hidden_global, 3),
-         "hidden_global_phases": (hidden_global_phases, 5)}
+         "hidden_global_phases": (hidden_global_phases, 7)}
 """Each saved position's loader and the steps read before it was saved."""

@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import dataclasses
 import importlib.metadata
-import json
 import os
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -329,7 +328,7 @@ class _PerShare(Forwarding):
                 "chain that saved it (without .elastic())" if self._replicated else
                 "the saved position is an elastic read's, and this read is per share; resume it with "
                 ".elastic() on the chain")
-        decoded = record(json.loads(state), "saved per-share position") if held is None else held
+        decoded = _position.per_share(state)
         written = record(decoded.get(_position.PLAN), "saved data plan")
         self._plan.check(written, resume=self._resume)
         saved = record(decoded.get("iterator"), "saved Grain iterator")
