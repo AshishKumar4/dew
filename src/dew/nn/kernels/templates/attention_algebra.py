@@ -2354,6 +2354,7 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     drop = keys.coords.drop
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
     bound = 1.0 if drop is None else drop.bound
+    anchor = lazy_anchor(lazy_margin(spec, keys.values.dtype, bound))
     after: list[Partial] = []
 
     def own(states, parts):
@@ -2385,15 +2386,21 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
                               bound=bound, held=held)
             return stepped(state, state.m, added.factor, added.terms.sum(axis=axis), products, scale, held)
 
-        # The tile's maximum as the forms' step reaches it, read only where a tile is scaled.
-        raised = raised_weights(spec, keys.logits, lambda: peak(spec, state.m, keys.logits, keys.products,
-                                                                axis=axis)[0], keys.coords)
+        # The anchor the forms' step selects (`anchor`: of the kept maximum and the tile's), read only where a
+        # tile is scaled: its small weights' tier at the anchor its normal tier's weights take. At the tile's
+        # maximum, 10 past an anchor kept, a row's small weights fell e^-10 below their due (the base review
+        # of 319e49cee, F1).
+        def selected() -> jax.Array:
+            exact = peak(spec, state.m, keys.logits, keys.products, axis=axis)[0]
+            return exact if anchor is None else anchor(state.m, exact)
+
+        raised = raised_weights(spec, keys.logits, selected, keys.coords)
         after.append(scaled_step(state, scale, step, raised=raised, branched=held_by is None))
         return tuple(getattr(after[0], field) if field in ("acc", "total") else None for field in fields)
 
     derived = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
                          stepped=None if held_by is None and plain and state.scale is None and drop is None
-                         else own, anchor=lazy_anchor(lazy_margin(spec, keys.values.dtype, bound)))
+                         else own, anchor=anchor)
     found = Partial(**dict(zip(fields, derived, strict=True)))
     return found if not after else found._replace(scale=after[0].scale, low=after[0].low)
 

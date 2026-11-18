@@ -1026,6 +1026,49 @@ def test_a_lazy_walks_dropped_weights_stay_within_fp16_interpreted():
                     "a lazy walk's dropped weights", seeds=SEEDS)
 
 
+def _small_tier_draw(seed: int):
+    """Draws of a bf16 call `[1, 128, 1, 64]` at its scale of 1/8 (the base review of 319e49cee's witness):
+    each query's first coordinate 8, the first 64 keys' 0 and the last 64's 10 but two drawn keys' -76 (their
+    logits so), every other coordinate within 1/64; values 0 but the 62 keys' first column and the two's
+    second, 2^125 to 2^126."""
+    streams = jax.random.split(jax.random.key(seed), 4)
+    query, key = (jax.random.uniform(stream, (1, 128, 1, 64), jnp.float32, -1 / 64, 1 / 64)
+                  for stream in streams[:2])
+    low = 64 + jax.random.choice(streams[2], 64, (2,), replace=False)
+    first = jnp.zeros(128).at[64:].set(10.0).at[low].set(-76.0)
+    query, key = (query.at[..., 0].set(8).astype(jnp.bfloat16),
+                  key.at[0, :, 0, 0].set(first).astype(jnp.bfloat16))
+    lows = jnp.zeros(128, bool).at[low].set(True)
+    scales = 2.0 ** 125 * jax.random.uniform(streams[3], (128,), jnp.float32, 1, 2)
+    value = (jnp.zeros((1, 128, 1, 64)).at[0, 64:, 0, 0].set(jnp.where(lows, 0.0, scales)[64:])
+             .at[0, :, 0, 1].set(jnp.where(lows, scales, 0.0)))
+    return query, key, value.astype(jnp.bfloat16), jnp.zeros_like(query)
+
+
+@INTERPRETS
+def test_a_scaled_lazy_walks_small_weights_take_its_kept_anchor_interpreted():
+    """A bf16 forward on wgmma, interpreted, whose second key tile's logits pass the first's by 10 (within
+    the lazy walk's margin, `algebra.lazy_margin`, so its anchor stays at 0) over values near 2^126, so it
+    walks scaled, two of its keys at -76 weighing in its small tier (`at_scale`): on par with the reference
+    (check 1), their column near 0.12. Its small tier took its weights at the tile's maximum, 10, against
+    its normal tier's kept anchor, the column e^-10 below its due, 5.6e-6 (the base review of 319e49cee,
+    F1)."""
+    spans = template.spans(128, 128, 1)
+    tiles = attention_mosaic.Tiles(64, 64, 2, 2, family=WGMMA)
+
+    def ours(query, key, value, dout):
+        del dout
+        with _device(interpret=True, target=generation.gpu_target("sm90")), _pinned(tiles):
+            return attention_mosaic.forward(query, key, value, spans, natural=False, interpret=True)
+
+    def reference(query, key, value, dout):
+        del dout
+        return template.reference(query, key, value, spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _small_tier_draw, "a scaled lazy walk's small weights",
+                    seeds=SEEDS)
+
+
 @INTERPRETS
 @on_each_family_for(("form", "dtype"),
                     [*((form, jnp.bfloat16) for form in (*HOOKED_FORMS, "fused")), ("derived", jnp.float16)],
