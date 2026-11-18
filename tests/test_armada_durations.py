@@ -344,6 +344,7 @@ def test_a_cold_run_is_kept_as_its_tests_cold_times_and_every_cut_weighs_them(ci
     time too; a test the record drops loses both. Every cut and weight reads a test's cost, its cold time
     where one is recorded, so 14 cells recorded at 1 s warm and 60 s cold are no longer one group of 14 s
     (row 7939: such a group took 1,107 s cold)."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
     (tmp_path / "tests/test_cells.py").write_text("".join(f"def test_{name}(): pass\n" for name in "abc"))
     record = {"tests/test_cells.py::test_a": 1.0, "tests/test_cells.py::test_b": [2.0, 50.0],
               "tests/test_gone.py::test_x": [3.0, 9.0]}
