@@ -1035,6 +1035,7 @@ dew.training.ahead.AheadTarget
   multiprocessors: int | None = None
   topology: str | None = None
   phases: tuple[int, ...] = ()
+  share: float = 0.95
 dew.training.budget.Pause
   fraction: float
 dew.training.budget.Plateau
