@@ -1602,12 +1602,20 @@ def _ssd_tpu(x, dt, A, B, C, D, carried, chunk_size: int, starts, platform, work
     def kernel(x, B, C, a, carried, documents):
         return _chunk_scan(x, B, C, a, carried, documents, chunk_size, platform, held)
 
+    specs, out_specs = ssd_specs(scaled.shape, documents)
+    scanned, final = manual_map(kernel, specs, out_specs)(scaled, B, C, a, carried, documents)
+    return scanned[:, :length] + skip, final
+
+
+def ssd_specs(shape: tuple[int, ...], documents=None) -> tuple[tuple, tuple]:
+    """The TPU scan's per-shard placements (`manual_map`) over chunk-scan operands of `shape` `[B, T, H, P]`
+    (`ssd_operands`'): its operands' `(x, B, C, a, memory, documents)` and its outputs' `(scanned, memory)`,
+    each shard its own rows and heads; `_ssd_tpu`'s launch and the TPU scan's contract's."""
     # The groups are expanded, so any split of the heads divides them.
-    rows, split = grouped_heads(scaled.shape, scaled.shape[2])
+    rows, split = grouped_heads(shape, shape[2])
     four, state = P(rows, None, split, None), P(rows, split, None, None)
     specs = (four, four, four, P(rows, None, split), state, _ported_specs(documents, rows, split))
-    scanned, final = manual_map(kernel, specs, (four, state))(scaled, B, C, a, carried, documents)
-    return scanned[:, :length] + skip, final
+    return specs, (four, state)
 
 
 @dataclasses.dataclass(frozen=True)
