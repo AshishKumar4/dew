@@ -7,6 +7,7 @@ block [1, 3) run once in the first and twice in the second (`DecoderRunConfig.lo
 import csv
 import dataclasses
 import itertools
+import json
 from pathlib import Path
 
 import jax
@@ -133,7 +134,7 @@ def test_a_phased_run_with_a_theta_per_pass_keeps_its_rows_through_its_phases_an
     inside the second phase and resumed, it lands where the run nobody stopped lands, bit for bit; its
     record states the choice and its saved run loads with its rows; and the choice without an implicit loop
     is refused before anything loads (row 7661)."""
-    from dew.decision.config import DecisionRunConfig as Config
+    from dew.checkpoints import RUN_FILE
 
     data = phased(tmp_path)
 
@@ -147,9 +148,25 @@ def test_a_phased_run_with_a_theta_per_pass_keeps_its_rows_through_its_phases_an
     resumed = per_pass("stopped", 4)
     for name, leaf in parameters(whole).items():
         np.testing.assert_array_equal(leaf, parameters(resumed)[name], err_msg=name)
-    assert Config.load(str(tmp_path / "runs" / "stopped")).loop_theta_per_pass
+    # The run's record states the choice (its data built in Python, which no record reads back).
+    assert recorded(json.loads((tmp_path / "runs" / "stopped" / RUN_FILE).read_text()), "loop_theta_per_pass")
     loaded = Decide.from_run(str(tmp_path / "runs" / "stopped"))
     assert loaded.model.backbone.loop.theta_passes == STEPS[-1]
+
+
+def recorded(record, name: str):
+    """The value a run's record (`run.json`'s JSON) holds for its field `name`, wherever it states it."""
+    if isinstance(record, dict):
+        if name in record:
+            return record[name]
+        found = [recorded(value, name) for value in record.values()]
+    elif isinstance(record, list):
+        if len(record) == 2 and record[0] == name:
+            return record[1]
+        found = [recorded(value, name) for value in record]
+    else:
+        return None
+    return next((value for value in found if value is not None), None)
 
 
 def test_a_theta_per_pass_over_a_checkpoints_implicit_loop_starts_each_row_at_its_theta():
