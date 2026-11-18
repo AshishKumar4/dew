@@ -316,15 +316,12 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
     Returns its sums, in `walked`'s order, and the rows."""
     batch, queries, heads, width = query.shape
     kv_heads, value_width = key.shape[2], value.shape[-1]
-    program, consumers, kinds = walk.program, walk.consumers, walk.kinds
-    family = program.family
-    block_q, block_k = program.tiles.block_q, program.tiles.block_k
+    program, consumers, kinds, summed = walk.program, walk.consumers, walk.kinds, walk.summed
+    family, block_q, block_k = program.family, program.tiles.block_q, program.tiles.block_k
     pair = consumers * block_q
-    summed = walk.summed
     # A launch of the keyed sums alone reads no output cotangents (`BackwardTiles.keyed_apart`).
     cotangents = "dq" in walked
-    rows_count = len(DQ_ROWS) + 2 * sum(summed) if cotangents else len(KEYED_ROWS)
-    read = 2 if cotangents else 1
+    rows_count, read = (len(DQ_ROWS) + 2 * sum(summed), 2) if cotangents else (len(KEYED_ROWS), 1)
     leaves, treedef = jax.tree.flatten((spans, score_params, drop))
 
     def body(*refs, streams, after=None):
@@ -335,9 +332,10 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         stages, refs = refs[:read], refs[read:]
         # Its output stage the program's where no scope after the walks holds it (`stages_after_walks`).
         out_smem, refs = (None, refs) if after is not None else (refs[0], refs[1:])
-        row_smem, loaded, relay = refs[0], refs[1:1 + read], refs[1 + read:]
-        (q_smem, do_smem), (q_loaded, do_loaded) = (stages, loaded) if cotangents else (
-            (stages[0], None), (loaded[0], None))
+        row_smem, loaded, relay = refs[0], refs[1:1 + read], list(refs[1 + read:])
+        q_smem, q_loaded = stages[0], loaded[0]
+        # The output cotangents' stage and barrier, a launch reading them alone (`cotangents`).
+        do_smem, do_loaded = (stages[1], loaded[1]) if cotangents else (None, None)
         row, head, views, streams, pair_first, streamed = _query_program(
             program, streams, k_ref, v_ref if cotangents else None, spans_of, score=(score_refs, kinds),
             heads=heads, kv_heads=kv_heads, queries=queries, consumers=consumers)
@@ -349,7 +347,8 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
                           for ref in (peak_ref, prior_ref, anchor_ref, delta_ref, index_ref))
             lo, hi, whole = program.reach(first, spans_of, row)
             nothing = family.zeros((block_q,))
-            operands = family.held(q_smem.at[index]), family.held(do_smem.at[index]) if cotangents else None
+            operands = (family.held(q_smem.at[index]),
+                        None if do_smem is None else family.held(do_smem.at[index]))
             shape = (block_q, block_k)
             # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
             coords_of = functools.partial(_coords, family, spans_of, row, first, shape=shape,
