@@ -17,7 +17,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import Generic
 
 import jax
@@ -46,7 +46,7 @@ from dew.nn.inspection import (
     probes_of,
     unscaled,
 )
-from dew.nn.kernels.options import owned_program, program
+from dew.nn.kernels.options import abstract_signature, owned_program, program, trace_context
 from dew.nn.moe import fixed_routers
 from dew.nn.precision import at_least_fp32
 from dew.nn.programs import called, computed
@@ -201,16 +201,69 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
     of `split` microbatches, which the step's whole
     pools (`dew.training.planning.whole_step`). A step of a sampled pass count's `passes` counts the work of
     its microbatch `part` at its count (`step_counts`)."""
+    step, clock, *rest = outcome_of(current.step, current.consumed, current.microstep, advanced.microstep,
+                                    loss, aux, committed, batch, stepped, consumed, split=split, part=part,
+                                    passes=passes)
+    return dataclasses.replace(advanced, step=step, consumed=clock), *rest
+
+
+class Read:
+    """`read` (`Transaction.read`: the narrow copies merged, the parameters projected) as a host step reads
+    its variables, tracing and compiling nothing at a step: its first call, over the variables' shapes (a
+    run's startup pass, `options.collecting`), traces it once and keeps which of its results are its inputs as
+    given (a leaf no projection changes), the program computing the others alone (`_unforwarded`, compiled
+    there): each later call over arrays runs that program, if any leaf is computed, and hands the others
+    back as the arrays they are, no copy of a parameter the projection leaves as it is."""
+
+    def __init__(self, read: Callable):
+        self.read = read
+        # Per variables' tree: which result is which input as given, the results' tree, and the program.
+        self.plans: dict[Hashable, tuple] = {}
+
+    def __call__(self, variables, compute):
+        leaves = jax.tree.leaves((variables, compute))
+        # Which results are inputs as given is the traced program's: its inputs' types and the trace
+        # context decide it (a cast is no copy of a leaf already of its dtype), as they key its lowering.
+        key = abstract_signature((variables, compute)), trace_context()
+        plan = self.plans.get(key)
+        if plan is None:
+            traced, shapes = jax.make_jaxpr(self.read, return_shape=True)(variables, compute)
+            given = list(traced.jaxpr.invars)
+            forwarded = tuple(given.index(out) if isinstance(out, jcore.Var) and out in given else None
+                              for out in traced.jaxpr.outvars)
+            computed = tuple(index is None for index in forwarded)
+            program = owned_program(functools.partial(_unforwarded, self.read, computed)) if any(
+                computed) else None
+            plan = self.plans[key] = (forwarded, jax.tree.structure(shapes), program)
+        forwarded, read_structure, program = plan
+        made = iter(() if program is None else program(variables, compute))
+        return jax.tree.unflatten(read_structure, [leaves[index] if index is not None else next(made)
+                                            for index in forwarded])
+
+
+def _unforwarded(read: Callable, computed: tuple[bool, ...], variables, compute) -> tuple:
+    """`read`'s results that are no input as given (`Read`), in their order."""
+    return tuple(leaf for leaf, made in zip(jax.tree.leaves(read(variables, compute)), computed, strict=True)
+                 if made)
+
+
+def outcome_of(step: jax.Array, clock: jax.Array | None, microstep: jax.Array, advanced: jax.Array,
+               loss: jax.Array, aux: Aux, committed: Committed | None, batch: Batch,
+               stepped: jax.typing.ArrayLike, consumed: jax.Array, *, split: int, part: Batch | None = None,
+               passes: int | None = None) -> tuple:
+    """`outcome` of the fields it reads of the states (their `step`, `consumed` clock and `microstep`,
+    the advanced state's `advanced`), and nothing else of them: the step and clock the advanced state
+    takes, then `outcome`'s other results. A host step runs it as a program of its own over those fields
+    (`dew.training.compiler`), its states' other leaves read by no program."""
     pooled = aux.pooled if split > 1 else {name: value.mean()[0] for name, value in aux.pooled.items()}
     metrics = {**aux.metrics, **pooled, **step_counts(batch, part, passes)}
     if aux.record is not None:
         assert "evaluated" in aux.record, "a recording transaction stacks its evaluations (`recorded`)"
         metrics |= recorded_metrics(aux.record)
-    clock = None if current.consumed is None else (current.consumed + consumed).astype(current.consumed.dtype)
+    clock = None if clock is None else (clock + consumed).astype(clock.dtype)
     finite = jnp.isfinite(loss) if committed is None or committed.finite is None else committed.finite
-    return (dataclasses.replace(advanced, step=current.step + stepped, consumed=clock), loss, metrics,
-            finite, advanced.microstep > current.microstep, dataclasses.replace(committed, finite=None)
-            if committed is not None else None)
+    return (step + stepped, clock, loss, metrics, finite, advanced > microstep,
+            dataclasses.replace(committed, finite=None) if committed is not None else None)
 
 
 def probed_loss(objective: Objective, variables: Variables, batch: Batch, step: Step):
@@ -1049,25 +1102,92 @@ class Transaction:
             return jnp.asarray(factor / pooled.mass, jnp.result_type(current_stats))
         return self.pooled_cotangent(pooled, current_stats, factor)
 
-    def replay_input(self, state, fill, index):
+    def phases(self, host: bool) -> tuple[Callable, ...]:
+        """The step's phases (`step`), each a program over the objective's modules for a host step, compiled
+        through Dew's compile point as the step's own compile is (`owned_program`); traced in place for a
+        resident one. Among them its glue between the others (`begun`, the replay's
+        and the records' arithmetic), each a program of its own: an eager operation would trace and compile
+        at a host step's first call, where the run steps on the programs its startup compiled
+        (`dew.training.compiler`, `options.collecting`)."""
+        def compile_phase(phase: Callable) -> Callable:
+            return owned_program(phase) if host else phase
+
+        return tuple(compile_phase(phase) for phase in (
+            self.local_reduction, self.prepare_attempt, self.pooled_cotangent, self.finish_attempt,
+            self.unscaled, self.add_contribution, self.begun, self.replayed_input, self.unreplayed,
+            self.recorded_into, self.kept_into))
+
+    def replay_input(self, state, fill, index, phase=None, read=None):
         """Rebuild the inputs of the window's `index`-th microbatch.
 
         The batch and the mutable collections come from the retained buffers.
         The key folds in the attempt that first read them, so a replayed
-        microbatch draws the randomness it drew before.
+        microbatch draws the randomness it drew before. `phase` runs their
+        arithmetic (`replayed_input`), and `read` the variables' (`Read`), a
+        host step's programs; traced in place where None.
         """
+        batch, mutable, step_info = (phase or self.replayed_input)(state, fill, index)
+        variables = state.variables if mutable is None else {**state.variables, **mutable}
+        step_info = dataclasses.replace(step_info, ema=with_ema(variables, self.fetched(state).ema))
+        return (read or self.read)(variables, state.compute), batch, step_info
+
+    def replayed_input(self, state, fill, index):
+        """`replay_input`'s arithmetic: the window's `index`-th microbatch, its mutable collections where
+        the window keeps them, and its `Step` but for its averaged weights beside its variables
+        (`with_ema`), which the replay reads as the state holds them."""
         previous = state.accumulation
         assert previous is not None and previous.attempts is not None
         batch = jax.tree.map(lambda x: x[index], previous.batches)
-        variables = state.variables if previous.variables is None else {
-            **state.variables, **jax.tree.map(lambda x: x[index], previous.variables)}
+        mutable = (None if previous.variables is None
+                   else jax.tree.map(lambda x: x[index], previous.variables))
+        variables = state.variables if mutable is None else {**state.variables, **mutable}
         accepted, attempt = state.microstep - fill + index, previous.attempts[index]
         # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
         replayed_stats = (previous.batch_statistics if previous.replayed_statistics is None
                           else tuple(x[index] for x in previous.replayed_statistics))
         step_info = self.attempt(state, variables, batch, attempt, attempt % self.split, index,
                                  microstep=accepted, batch_statistics=replayed_stats)
-        return self.read(variables, state.compute), batch, step_info
+        return batch, mutable, dataclasses.replace(step_info, ema=None)
+
+    def begun(self, state, read, batch, part, closes, whole):
+        """An attempt's arithmetic before its realization: the window's held batch statistics and their
+        stamp where they are computed (`_step_attempt`; None where the window holds none), the attempt's
+        `Step` but for its averaged weights beside its variables (`with_ema`), which the step reads as the
+        state holds them, the loss scale's factor, the attempt's count (`step` times `split` plus its
+        `part`) and whether it closes the window (`closes`, at the step's last part)."""
+        # Every attempt the run made and did not accept draws afresh (`attempt_step`'s rejections).
+        attempt = state.step * self.split + part
+        slot = occupancy(state.accumulation)
+        factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
+        stepped, step_info = self._step_attempt(state, read, batch, attempt, part, slot, whole)
+        held = stepped.accumulation
+        statistics = (None if held is state.accumulation or held is None
+                      else (held.batch_statistics, held.statistics_stamp))
+        # A run whose stream ends inside the window closes it at the step's last part (`closes`).
+        closing = None if closes is None else jnp.logical_and(closes, part == self.split - 1)
+        return statistics, dataclasses.replace(step_info, ema=None), factor, attempt, closing
+
+    def unreplayed(self, state, own: Evaluated, part):
+        """The records of the window's other microbatches before a replay writes them: zeros, in the slots
+        it holds."""
+        return [jax.tree.map(jnp.zeros_like, (own, self._places(occupancy(state.accumulation), own, part)))
+                for _ in range(self.size - 1)]
+
+    def kept_into(self, state, kept, record: Evaluated, index):
+        """`kept`, the window's records, with the `index`-th microbatch's replayed `record` in its slot."""
+        assert state.accumulation is not None and state.accumulation.attempts is not None
+        attempt = state.accumulation.attempts[index]
+        evaluated = (record, self._places(index, record, attempt % self.split))
+        return [jax.tree.map(lambda held, new, slot=slot: jnp.where(slot == index, new, held), held,
+                             evaluated) for slot, held in enumerate(kept)]
+
+    def recorded_into(self, state, part, own, replays, fill, replayed) -> Recorded:
+        """The window's records (`recorded`): this microbatch's (`own`, in its slot) and each other one's
+        the replay ran (`replays`, those of the `fill` slots the window holds where it `replayed`)."""
+        evaluations = [(own, self._places(occupancy(state.accumulation), own, part)), *replays]
+        held = jnp.arange(len(replays)) < fill
+        ran = jnp.concatenate([jnp.ones((1,), bool), jnp.logical_and(held, replayed)])
+        return recorded(evaluations, ran)
 
     def attempt(self, state, variables, batch, attempt, part, slot, microstep=None, *,
                 batch_statistics: tuple[jax.Array, ...] | None = None,
@@ -1297,11 +1417,11 @@ class Transaction:
         """Commit the window when it is due, then advance the state's clocks.
 
         A rejected attempt costs the same trace as an accepted one. With a
-        dynamic scaler an attempt is admitted only when every value it
-        produced is finite, the committed parameters and optimizer state
-        included; a rejected attempt returns `state` with its window dropped
-        (`dropped_window`), its parameters, optimizer state and EMA untouched,
-        and the scaler moved.
+        dynamic scaler an attempt is admitted on its loss and gradient finite alone, as GradScaler's
+        `found_inf` (row 6748), its committed state's finiteness reported after (`unfinite_state`); one
+        whose optimizer holds updates back on its whole new state finite. A rejected attempt returns `state`
+        with its window dropped (`dropped_window`), its parameters, optimizer state and EMA untouched, and
+        the scaler moved.
 
         A window of one microbatch commits on every step it can, by elementwise selects; a longer window
         under `lax.cond`, which skips the optimizer on the microbatches that do not close it. A GPU
@@ -1562,16 +1682,6 @@ class Transaction:
         refuse_fixed_routers(fixed)
         return realized
 
-    def _recorded_with(self, realized: Realization, state: TrainState, part, own, replays, fill, replayed
-                       ) -> Realization:
-        """`realized` with the window's records: this microbatch's (`own`, in its slot) and each other one's
-        the replay ran (`replays`, those of the `fill` slots the window holds where it `replayed`)."""
-        evaluations = [(own, self._places(occupancy(state.accumulation), own, part)), *replays]
-        held = jnp.arange(len(replays)) < fill
-        ran = jnp.concatenate([jnp.ones((1,), bool), jnp.logical_and(held, replayed)])
-        return dataclasses.replace(realized, aux=dataclasses.replace(realized.aux,
-                                                                    record=recorded(evaluations, ran)))
-
     def _step_attempt(self, state, read: Variables, batch: Batch, attempt, part, slot,
                       whole: Batch | None):
         """`state` and the `Step` for `part`, computing `batch_statistics` at `part` 0 or whenever the
@@ -1619,15 +1729,10 @@ class Transaction:
         device and stay the arrays the state holds (`apart`).
         """
         realize = self.realize if realize is None else realize
-        # Each host phase is a program over the objective's modules, compiled through Dew's compile point
-        # as the step's own compile is (`owned_program`).
-        compile_phase = owned_program if host else (lambda phase: phase)
-        reduce = compile_phase(self.local_reduction)
-        prepare = compile_phase(self.prepare_attempt)
-        pooled = compile_phase(self.pooled_cotangent)
-        finish = compile_phase(self.finish_attempt)
-        unscale = compile_phase(self.unscaled)
-        add = compile_phase(self.add_contribution)
+        (reduce, prepare, pooled, finish, unscale, add, begin, replayed_in, unreplayed_of, recorded_into,
+         kept_into) = self.phases(host)
+        # The variables a host step's forward reads, their projection's arithmetic a program (`Read`).
+        reading = Read(self.read) if host else self.read
 
         def run(state, batch, part, tokens, closes=None, whole=None):
             # The `part`th microbatch of the step's batch is attempt step *
@@ -1635,13 +1740,16 @@ class Transaction:
             # count steps, however many microbatches each is read in. `tokens`
             # is its real tokens, which the trainer reads off the accounting
             # columns the objective's batch no longer holds (`model_batch`).
-            attempt = state.step * self.split + part
-            # Every attempt the run made and did not accept draws afresh (`attempt_step`'s rejections).
-            slot = occupancy(state.accumulation)
-            factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             # A watched cotangent is read unscaled by the factor its backward is seeded with.
-            read = self.read(state.variables, state.compute)
-            state, step_info = self._step_attempt(state, read, batch, attempt, part, slot, whole)
+            read = reading(state.variables, state.compute)
+            statistics, step_info, factor, attempt, closing = begin(state, read, batch, part, closes, whole)
+            if statistics is not None:
+                assert state.accumulation is not None
+                state = dataclasses.replace(state, accumulation=dataclasses.replace(
+                    state.accumulation, batch_statistics=statistics[0], statistics_stamp=statistics[1]))
+            # The averaged weights the attempt reads beside its variables, as the state holds them (`begun`
+            # hands none back: `attempt_step`'s `with_ema`).
+            step_info = dataclasses.replace(step_info, ema=with_ema(state.variables, self.fetched(state).ema))
             # The runs a one-stage scanned state holds update in their backward where the step's update
             # reads each gradient alone (`planned`); a host step, or one realized otherwise, as before.
             realized, planned = self._realized_in(state, realize, read, batch, step_info, factor, host=host)
@@ -1658,8 +1766,6 @@ class Transaction:
             # and a copied parameter's gradient stays bf16 until the update
             # widens it as it reads it. A window of several microbatches
             # widens it as it pools it, so the window sums in fp32.
-            # A run whose stream ends inside the window closes it at the step's last part (`closes`).
-            closing = None if closes is None else jnp.logical_and(closes, part == self.split - 1)
             pending = prepare(state, realized.stats, realized.aux, loss, gradient, closing)
             pending = pending.replace(applied=applied)
             if probing is not None and not whole:
@@ -1669,38 +1775,42 @@ class Transaction:
 
             # The record of each of the window's other microbatches the commit replays, in its slot.
             own = evaluation_of(realized.aux)
-            unreplayed = None if own is None else [jax.tree.map(jnp.zeros_like, (own, self._places(
-                occupancy(state.accumulation), own, part))) for _ in range(self.size - 1)]
+            unreplayed = None if own is None else unreplayed_of(state, own, part)
+            # A host step's pass over shapes (its run's startup, `options.collecting`) reads no value: it
+            # takes each arm a value chooses, a replay of one microbatch among them, so every program the
+            # step can call compiles there.
+            over_shapes = host and isinstance(pending.fill, jax.ShapeDtypeStruct)
 
             def replay(_):
                 cot = pooled(pending.pooled, realized.stats, factor)
                 combined = unscale(realized.pullback(cot), factor)
                 def one(index, carried):
                     accumulated, kept = carried
-                    replayed, records, step_info = self.replay_input(state, pending.fill, index)
+                    replayed, records, step_info = self.replay_input(state, pending.fill, index,
+                                                                     replayed_in if host else None,
+                                                                     reading)
                     realized = realize(replayed, records, step_info)
                     replayed_record = evaluation_of(realized.aux)
                     if kept is not None and replayed_record is not None:
-                        assert state.accumulation is not None and state.accumulation.attempts is not None
-                        attempt = state.accumulation.attempts[index]
-                        places = self._places(index, replayed_record, attempt % self.split)
-                        evaluated = (replayed_record, places)
-                        kept = [jax.tree.map(lambda held, new, slot=slot: jnp.where(slot == index, new, held),
-                                             held, evaluated) for slot, held in enumerate(kept)]
+                        kept = kept_into(state, kept, replayed_record, index)
                     return add(accumulated, realized.pullback(cot), factor), kept
                 # The window's other microbatches stand in its slots before this one's: all of them
                 # where the window is whole, those it holds where a closing attempt ends it early.
                 if host:
                     carried = (combined, unreplayed)
-                    for index in range(int(pending.fill)):
-                        carried = one(index, carried)
+                    for index in range(1 if over_shapes else int(pending.fill)):
+                        carried = one(np.int32(index), carried)
                     return carried
                 return jax.lax.fori_loop(0, pending.fill, one, (combined, unreplayed))
 
-            replayed = jnp.zeros((), bool)
+            # A constant, which a host step's commit reads with no program of its own.
+            replayed = np.zeros((), bool)
             if state.accumulation is not None and not self.shared:
                 replayed = pending.replay_required
-                if host:
+                if over_shapes:
+                    replay(None)
+                    gradient, replays = pending.gradient, unreplayed
+                elif host:
                     gradient, replays = replay(None) if bool(replayed) else (pending.gradient, unreplayed)
                 else:
                     gradient, replays = jax.lax.cond(
@@ -1708,8 +1818,8 @@ class Transaction:
             else:
                 gradient, replays = pending.gradient, []
             if own is not None:
-                realized = self._recorded_with(realized, state, part, own, replays or [], pending.fill,
-                                               replayed)
+                realized = dataclasses.replace(realized, aux=dataclasses.replace(realized.aux, record=(
+                    recorded_into(state, part, own, replays or [], pending.fill, replayed))))
             if not host:
                 # The commit compiles as the host-master step's does, over values
                 # already computed: without the barrier XLA fuses the gradient's

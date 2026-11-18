@@ -65,7 +65,7 @@ from jaxlib import xla_client
 
 from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
-from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, device_memory, pool_share
+from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, device_memory
 from dew._records import JSON, boolean, record
 from dew._stated import Unestablished, traceback_frames
 from dew.batch import Batch
@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     from dew.data.pipeline import Dataset
     from dew.state import TrainState
     from dew.training._fit import FitArguments, FitPlan, Start
+    from dew.training.compiler import HostStartup
     from dew.training.planning import Planned
     from dew.training.trainer import Trainer
 
@@ -129,17 +130,18 @@ def compile_only_tpus(topology: str) -> tuple:
 
 
 @contextlib.contextmanager
-def stand_in_gpus(devices: Sequence, memory: int, share: float | None = None) -> Iterator[tuple]:
+def stand_in_gpus(devices: Sequence, memory: int, share: float = DEW_SHARE) -> Iterator[tuple]:
     """`devices`, a host's own CPU devices (`jax.devices("cpu")`), each stated to hold a GPU's `memory`, its
-    total bytes as the GPU states them, at `share`, the pool's share in the run they stand in for (this
-    process's own, `pool_share`, read as the block opens, where none is given), while the block runs: every
+    total bytes as the GPU states them, at `share`, the pool's share in the run they stand in for (Dew's
+    own, `DEW_SHARE`, where none is given, as `compile_only_gpus` and `host_gpus` take it, never this
+    process's), while the block runs: every
     layout check and admission on them reads the allocator's limit derived from them
     (`dew._devices.allocator_limit`, `StatedGpu`), as `compile_only_gpus`' do, where JAX's CUDA plugin,
     which those need, does not install. `Trainer.validate` checks a run's layout on them against the GPUs'
     limits; a program compiles for the CPU."""
     positive_memory(memory)
     devices = tuple(devices)
-    STATED_GPUS.update(dict.fromkeys(devices, StatedGpu(memory, pool_share() if share is None else share)))
+    STATED_GPUS.update(dict.fromkeys(devices, StatedGpu(memory, share)))
     try:
         yield devices
     finally:
@@ -1463,6 +1465,32 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices), capacity, topology=topology),
         refusals=report.refused_launches(), sampled=sampled, starts=starts)
+
+
+def prepare_host_step[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> HostStartup:
+    """Compile the programs `trainer`'s host step calls (`Layout(host=("variables",))`) for the GPUs its mesh
+    is built over (compile-only GPUs of a generation, or a host's own topology's, `host_gpus`), over its
+    fresh state's and `batch`'s shapes as its run's startup does (`StepCompiler._compile_host`), its CPU
+    companion this process's CPUs: JAX's persistent cache, keyed by what each program lowers to under its
+    options and target, then holds each, and the run's startup on those GPUs reads them, compiling none
+    (training.md's warm start; Main's choice for row 7908: no file, the shared cache). What the pass
+    compiled, by backend (`HostStartup`)."""
+    if not trainer.host_master:
+        raise ValueError("prepare_host_step prepares a step that keeps its variables on the host "
+                         "(Layout(host=('variables',))); compile a device step ahead with compile_ahead")
+    devices = list(trainer.device_mesh.devices.flat)
+    generations = {gpu_target(device.device_kind).generation for device in devices}
+    if {device.platform for device in devices} != {"gpu"} or len(generations) != 1:
+        raise ValueError("prepare_host_step compiles for the compile-only GPUs of one generation a trainer's "
+                         f"mesh is built over; this mesh holds {sorted({d.device_kind for d in devices})}")
+    (generation,) = generations
+    stated = built_target(generation, devices[0].core_count, stated_limit(devices))
+    start = trainer._started()
+    trainer.phase_passes.at(batch)
+    with (assumed(stated, portable=not set(devices) <= _HOSTS_GPUS), report.certifying(devices[0]),
+          trainer.phase_passes.scoped(trainer, trainer._compiler)):
+        return trainer._compiler.prepared_host(trainer._stepping(), start.abstract,
+                                               step_batch(trainer, batch))
 
 
 def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,

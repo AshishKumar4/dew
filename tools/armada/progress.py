@@ -62,33 +62,55 @@ def pytest_runtest_logreport(report) -> None:
             cold = any(name == "compiled" and int(value) > 0 for name, value in report.user_properties)
             Path(artifacts).mkdir(parents=True, exist_ok=True)
             with (Path(artifacts) / PROGRESS).open("a") as progress:
+                # The attempt's peak by then, which bounds this test (`task_peak`).
+                peak = task_peak()
                 progress.write(json.dumps({"node": report.nodeid, "seconds": seconds,
-                                           **({"cold": True} if cold else {})}) + "\n")
+                                           **({"cold": True} if cold else {}),
+                                           **({"peak": peak} if peak is not None else {})}) + "\n")
 
 
-def resumed(tests: list[str], owning: Callable[[str], str]) -> tuple[dict[str, float], set[str]]:
+def task_peak() -> int | None:
+    """This task's resident peak in bytes so far: its cgroup's (cgroup v2's memory.peak, which every process
+    the task started counts in, a test's ranks with it), each of its tests' bound above (row 6003: a test's
+    four ranks peaked at 7.17 GiB, packed beside another on a medium). None where the task runs in no
+    cgroup this process can read."""
+    cgroup = Path("/proc/self/cgroup")
+    line = cgroup.read_text().split("\n")[0] if cgroup.is_file() else ""
+    # cgroup v2's one hierarchy, `0::<path>`; under v1 (no such line) no peak is kept.
+    if "::" not in line:
+        return None
+    peak = Path("/sys/fs/cgroup") / line.split("::", 1)[1].lstrip("/") / "memory.peak"
+    return int(peak.read_text()) if peak.is_file() else None
+
+
+def resumed(tests: list[str], owning: Callable[[str], str]) -> tuple[dict[str, float], set[str], int | None]:
     """The tests of `tests` (each node's file as `owning` reads it) an earlier attempt of this task passed
     before the fleet recalled it (armada keeps a recalled attempt's artifacts and hands them to the next as
-    ARMADA_RESUME, #4544), each with its seconds, as this plugin kept them, and those of them that ran cold
-    (`cold`); copied into this attempt's progress, so a second recall keeps them too. Read by ci.py, which
-    runs a task's pytest. None outside a resumed task."""
+    ARMADA_RESUME, #4544), each with its seconds, as this plugin kept them, and those of them that ran
+    cold (`cold`), and the most memory those attempts had held by then (`peak`), which bounds them, as
+    this attempt's own cgroup did not run them; copied into this attempt's progress, so a second recall
+    keeps them too. Read by ci.py, which runs a task's pytest. None outside a resumed task."""
     kept = Path(os.environ.get("ARMADA_RESUME", "/nonexistent")) / PROGRESS
     if not kept.is_file():
-        return {}, set()
-    passed, cold = {}, set()
+        return {}, set(), None
+    passed, cold, peaks = {}, set(), []
     for line in kept.read_text().splitlines():
         found = json.loads(line)
         if owning(found["node"]) in tests:
             passed[found["node"]] = float(found["seconds"])
             if found.get("cold"):
                 cold.add(found["node"])
+            if found.get("peak") is not None:
+                peaks.append(int(found["peak"]))
+    peak = max(peaks, default=None)
     artifacts = os.environ.get("ARMADA_ARTIFACTS")
     if artifacts and passed:
         Path(artifacts).mkdir(parents=True, exist_ok=True)
-        lines = ({"node": node, "seconds": seconds, **({"cold": True} if node in cold else {})}
+        lines = ({"node": node, "seconds": seconds, **({"cold": True} if node in cold else {}),
+                  **({"peak": peak} if peak is not None else {})}
                  for node, seconds in passed.items())
         with (Path(artifacts) / PROGRESS).open("a") as carried:
             carried.writelines(json.dumps(line) + "\n" for line in lines)
     if passed:
         print(f"resumed: {len(passed)} tests an earlier attempt passed set aside", flush=True)
-    return passed, cold
+    return passed, cold, peak

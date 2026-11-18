@@ -95,7 +95,9 @@ from dew.nn.kernels.generation import compile_only_gpus
 from dew.training.ahead import compile_ahead
 
 generation, path, multiprocessors, memory = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-target = MeshSpec().build(compile_only_gpus(generation, 1, memory, multiprocessors=multiprocessors))
+# Planned at the loading run's share (argv[5]), which its pool takes of the GPU's memory.
+target = MeshSpec().build(compile_only_gpus(generation, 1, memory, multiprocessors=multiprocessors,
+                                            share=float(sys.argv[5])))
 trainer = fine_tune(target, xla=True, split=2, inspection=Inspection(every=2), dtype="bfloat16")
 batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
 validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
@@ -246,13 +248,14 @@ def test_a_run_compiled_ahead_for_this_gpu_compiles_nothing_on_it_and_is_refused
     for name, text in (("quiet_build.py", QUIET_BUILD), ("quiet.py", QUIET), ("refused.py", TRAIN_REFUSED)):
         (tmp_path / name).write_text(text)
     environment = environment_of(tmp_path)
-    # Its memory stated as the GPU's own (`CompileAhead.memory`, a capacity), which the build takes its pool's
-    # share of as the GPU's allocator does: the attached GPU's allocator limit (`own.memory`) is that share
-    # already, so the GPU's memory is it over the share (row 6717: stated as the limit, the build planned
-    # for the share of the share, 2.0 GB of an 80 GB GPU at the tier's fraction).
+    # Its memory stated as the GPU's own (`CompileAhead.memory`, a capacity), which the build takes the
+    # loading run's share of as the GPU's allocator does: the attached GPU's allocator limit (`own.memory`) is
+    # that share already, so the GPU's memory is it over the share (row 6717: stated as the limit, the build
+    # planned for the share of the share), and the build is told that share, not Dew's own (row 7935: at
+    # Dew's 0.95 it planned past a tier's packed fraction, which the loader refused).
     assert own.memory is not None
     build = [sys.executable, str(tmp_path / "quiet_build.py"), own.generation, str(tmp_path / "step.dew-aot"),
-             str(own.multiprocessors), str(round(own.memory / pool_share()))]
+             str(own.multiprocessors), str(round(own.memory / pool_share())), str(pool_share())]
     subprocess.run(build, env={**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}, check=True)
     subprocess.run([sys.executable, str(tmp_path / "quiet.py"), str(tmp_path / "step.dew-aot")],
                    env=environment, check=True)

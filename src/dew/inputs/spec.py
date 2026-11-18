@@ -20,7 +20,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -161,9 +161,10 @@ class Field:
 @dataclass(frozen=True)
 class Condition:
     """Names one conditioning input: its encoder, the batch field holding its
-    tokens, and the raw datum for the unconditional branch."""
+    tokens, and the raw datum for the unconditional branch. Its encoder takes any raw and encoded type,
+    which its readers treat generically (`ConditionEncoder`'s type variables are invariant)."""
 
-    encoder: ConditionEncoder
+    encoder: ConditionEncoder[Any, Any]
     field: str = "text"
     unconditional: str | float | Mapping[str, object] = ""
 
