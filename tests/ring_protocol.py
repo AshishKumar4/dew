@@ -59,7 +59,7 @@ import numpy as np
 from jax.extend import core as jcore
 
 from dew.nn import derivatives
-from dew.nn.kernels.templates import gathered
+from dew.nn.kernels.templates import across, gathered
 from dew.nn.programs import called
 
 THREAD_AXIS = "wg"
@@ -408,8 +408,13 @@ def _gathers(self: _Interpreter, body: gathered.Gathers, values, located) -> Non
         self.emit("copy", (*slot, tile), barrier)
 
 
+def _unsynchronized(self: _Interpreter, body, values, located) -> None:
+    """A body of no synchronization: a register's move between lanes (`across.LaneZero`, a shuffle)."""
+    del self, body, values, located
+
+
 INLINED: dict[type, Callable] = {gathered.Initialized: _initialized, gathered.Waited: _waited,
-                                 gathered.Gathers: _gathers}
+                                 gathered.Gathers: _gathers, across.LaneZero: _unsynchronized}
 """Each inlined body a checked kernel takes (`plgpu.inline_mgpu`'s function, by its type), as the `Event`s
 its fields and its operands state: the arrivals a phase of the barriers a gathered ring initializes, its
 parity waits at a turn's rotation, and its load warps' gathers. A body of no synchronization (a fence, a

@@ -2,6 +2,7 @@
 programs to arrive at a semaphore (`arrived`), and the consumer warpgroups' parts of one tile summed in their
 order and stored once (`summing`, `summed_across`)."""
 
+import dataclasses
 from collections.abc import Callable
 
 import jax
@@ -65,19 +66,28 @@ def uniform(value) -> jax.Array:
     from its page table) are formed once, not by an elect loop over the lanes (row 7898). Where every lane
     holds the same value it is that value."""
     scalar = plgpu.Layout.WG_SPLAT(())
+    inline = plgpu.inline_mgpu(arg_types=(scalar,),
+                               return_type=plgpu.ShapeDtypeStruct((), jnp.dtype(jnp.int32), layout=scalar))
+    return inline(LANE_ZERO)(jnp.asarray(value, jnp.int32))
 
-    # One shuffle a thread: an operation of the CUDA cores, no memory read or written.
-    @emission.stating(lambda value: Work(operations=1))
-    def lane_zero(ctx, value):
+
+@dataclasses.dataclass(frozen=True)
+class LaneZero:
+    """`uniform`'s body (`plgpu.inline_mgpu`'s): a thread's scalar as its warp's lane 0 holds it, one
+    `shfl.sync.idx` a thread, a register's move between lanes, no synchronization of shared memory or a
+    barrier (the checker reads its type, tests/ring_protocol.py)."""
+
+    def __call__(self, ctx, value):
         del ctx
         i32 = ir.IntegerType.get_signless(32)
         broadcast = mgpu_utils.inline_ptx("shfl.sync.idx.b32 $0, $1, 0, 0x1f, 0xffffffff;",
                                           value.registers.item(), result_types=i32, convergent=True)
         return mgpu_fragments.FragmentedArray.splat(broadcast, (), is_signed=True)
 
-    inline = plgpu.inline_mgpu(arg_types=(scalar,),
-                               return_type=plgpu.ShapeDtypeStruct((), jnp.dtype(jnp.int32), layout=scalar))
-    return inline(lane_zero)(jnp.asarray(value, jnp.int32))
+
+# One shuffle a thread: an operation of the CUDA cores, no memory read or written.
+LANE_ZERO = emission.stating(lambda value: Work(operations=1))(LaneZero())
+"""The one `LaneZero` body every `uniform` inlines, its work stated once (`emission.stating`)."""
 
 
 def summing(shape: tuple[int, ...], consumers: int) -> dict:
