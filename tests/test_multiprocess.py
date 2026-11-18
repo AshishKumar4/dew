@@ -271,6 +271,23 @@ def test_a_pool_bounded_in_examples_trains_its_bound_once_however_its_read_deals
 
 
 @pytest.mark.distributed
+def test_a_pool_counting_its_passes_evaluates_at_their_ends_whichever_rank_prefetches_ahead(tmp_path):
+    """A pool bounded in steps that counts its passes for its evaluation and checkpoints (`count_passes`),
+    each share reading records of its own: its first rank prefetching eight batches deep, ahead of the
+    pool's evaluation and checkpoint rounds, and its second one, behind them, then the other way round. Its
+    clock is the pool's: every rank evaluates at the steps one process of two devices does, each pass's
+    end, and saves the examples the whole pool consumed, as the pool's read round counts them on the
+    loop's thread (`pooled_read`) whatever its prefetch runs ahead to."""
+    alone = run_pool("counted_passes", tmp_path / "alone", 1, script=EXAMPLES_CLOCK, devices=2)[0]
+    assert alone["pass"] == 10 and len(alone["evaluated"]) >= 2
+    for lagging in (0, 1):
+        reports = run_pool("counted_passes", tmp_path / f"lag{lagging}", 2, script=EXAMPLES_CLOCK, lag=8,
+                           lag_rank=lagging)
+        assert [report["evaluated"] for report in reports[:1]] == [alone["evaluated"]]
+        assert [report["consumed"] for report in reports] == [alone["consumed"]] * 2
+
+
+@pytest.mark.distributed
 def test_a_pool_whose_shares_two_processes_each_read_counts_each_share_once(tmp_path):
     """Four processes, two to each share of the data (a tensor axis across them, `DataPartition.readers`):
     each share's examples count once, by its first reader, so the run trains its bound once

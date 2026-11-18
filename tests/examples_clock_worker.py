@@ -1,5 +1,6 @@
-"""Workers for a pool's run on the examples clock (`dew.training._fit.pooled_read`): each process a rank
-of a run bounded in examples whose shares run out at steps apart.
+"""Workers for a pool's run that counts the examples it consumes (`dew.training._fit.pooled_read`): each
+process a rank of a run bounded in examples whose shares run out at steps apart, or of one bounded in steps
+that counts its passes.
 
 dew is imported inside the modes, as `multiprocess_worker`'s are, so the pool starts before JAX does.
 """
@@ -141,7 +142,65 @@ def examples_clock(args) -> dict:
             "logged": [scalars.get("train/examples_consumed") for scalars in trained]}
 
 
-MODES = {"examples_clock": examples_clock}
+def counted_passes(args) -> dict:
+    """A run bounded to `--steps` steps over RECORDS records each share reads its own of, an objective making
+    `id % 3 + 1` rows of each, which counts its passes for its evaluation (`dew.data.compile`'s
+    `count_passes`, evaluated at each pass's end, `Counted`): its process `--lag` prefetches as deep as
+    `--lag` batches, so its prefetch runs ahead of the pool's evaluation rounds where another's runs
+    behind. Reports the steps it evaluated at, as its first process logs them, and the examples its host
+    counted (`Interval.consumed`, read off its last checkpoint's control)."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.data import Memory
+    from dew.data.compile import fitted
+    from dew.data.pipeline import ObjectiveData, Pipeline
+    from dew.objectives.base import Objective
+    from dew.optim import OptimConfig
+    from dew.training import Checkpoints, Trainer
+    from dew.training.budget import Counted
+
+    class Pulled(Objective):
+        """A weight pulled toward each row's id."""
+
+        def fresh_variables(self, key, held):
+            return {"params": {"w": jnp.zeros(FEATURES)}}
+
+        def loss(self, variables, batch, step):
+            x = jnp.repeat(batch["id"].astype(jnp.float32)[:, None], FEATURES, axis=1)
+            return self.row_mean(jnp.square(variables["params"]["w"] - x), batch), {}
+
+        def data(self):
+            return ObjectiveData(train=(Questioned(),))
+
+    class Logged:
+        def __init__(self):
+            self.scalars: list[tuple[int, dict]] = []
+
+        def log(self, scalars, step):
+            self.scalars.append((step, dict(scalars)))
+
+        def artifact(self, value, step):
+            pass
+
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids})).shuffle(seed=3).read("memory").batch(BATCH)
+    held = Pipeline(Memory({"id": ids[:BATCH]})).read("memory").batch(BATCH)
+    loader, _ = fitted(chain, None, objective=Pulled().data(), steps=args.steps, count_passes=True)
+    tracker = Logged()
+    checkpoints = Checkpoints(str(args.out.parent / "run"))
+    optim = OptimConfig(optimizer="optax:sgd", learning_rate=1e-2)
+    trainer = Trainer(Pulled(), optim, key=jax.random.key(0), tracker=tracker, checkpoints=checkpoints)
+    lag = args.lag if jax.process_index() == args.lag_rank else 1
+    every = Counted(loader.pass_examples, "examples")
+    trainer.fit(loader, steps=args.steps, validation=held, eval_every=every, checkpoint_every=every,
+                log_every=1, device_prefetch=lag)
+    evaluated = sorted({step for step, scalars in tracker.scalars if "val/loss" in scalars})
+    consumed = checkpoints.control(checkpoints.latest).get("consumed_examples")
+    return {"pass": loader.pass_examples, "evaluated": evaluated, "consumed": consumed}
+
+
+MODES = {"examples_clock": examples_clock, "counted_passes": counted_passes}
 
 
 def main(argv=None) -> None:
@@ -153,6 +212,9 @@ def main(argv=None) -> None:
     parser.add_argument("--cooldown", action="store_true")
     parser.add_argument("--further", action="store_true")
     parser.add_argument("--refusing", action="store_true")
+    parser.add_argument("--steps", type=int, default=8)
+    parser.add_argument("--lag", type=int, default=1)
+    parser.add_argument("--lag-rank", type=int, default=0)
     serve_mode(MODES, parser.parse_args(argv))
 
 
