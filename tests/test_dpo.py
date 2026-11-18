@@ -60,7 +60,7 @@ def reference():
     return recording(FIXTURE)
 
 
-def composed(arrays, beta: float):
+def dew_preference(arrays, beta: float):
     """Dew's own composition over a batch in TRL's layout (tools/parity_dpo.py's recording), at TRL's `beta`:
     token log-probabilities off the shifted logits and `preference_logsigmoid_terms` over the halves, the
     loss, its gradient in the policy logits and the chosen and rejected rewards."""
@@ -93,7 +93,7 @@ def test_dpo_loss_rewards_and_gradient_match_trl(reference):
 
     @jax.jit
     def dew(index, arrays):
-        return composed(arrays, beta)
+        return dew_preference(arrays, beta)
 
     assert_as_exact(dew, recorded, draw, "DPO loss, gradient and rewards", seeds=seeds, truth_fn=truth)
 
