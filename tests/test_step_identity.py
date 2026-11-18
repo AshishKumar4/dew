@@ -1044,26 +1044,46 @@ def read_exactly(step):
     return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
 
 
-def shifted_by(key):
-    """A step made inside a function: each id bumped (`BUMPED`) and shifted by a draw of its typed `key`."""
+def shifted_by(seed: int):
+    """A step made inside a function (`shifted_by_key`) closing over the typed key of `seed`."""
+    return shifted_by_key(jax.random.key(seed))
+
+
+def shifted_by_key(key):
+    """A step made inside a function: each id bumped (`BUMPED`) and shifted by a draw of its typed `key`,
+    which its closure holds."""
     def shift(row):
         return {**row, "id": np.int32(BUMPED(row["id"]) + int(jax.random.randint(key, (), 0, 3)))}
     return shift
 
 
-def test_a_step_made_inside_a_function_resumes_exactly_by_its_code_closure_and_reads():
-    """A step made inside a function, which reads a jitted function of the user's and closes over a typed
-    PRNG key, is stated by its code and what it reads (`dew._stated.stated`): its run resumes exactly where
-    its key is the same, and is refused where its key changed. Such a step was inexact (its name's
-    `<locals>`), a jitted function of the user's had no statement, and a typed key crashed the statement
-    that fetched its bits (row 7814; train 1019's review, F1 and F3)."""
-    def reader(key):
-        return read_exactly(shifted_by(key))
+def library_scaled_by(factor: int):
+    """A step made inside a function of a library's module (its `__module__` the standard library's
+    `json`), multiplying each id by `factor`, which its closure holds."""
+    def scale(row):
+        return {**row, "id": row["id"] * factor}
+    scale.__module__ = "json"
+    return scale
 
-    state = saved_after_one(lambda: reader(jax.random.key(0)))
-    assert resumed_changes(reader(jax.random.key(0)), state) == ()
+
+@pytest.mark.parametrize(("made", "same", "other"), [
+    (shifted_by, 0, 1), (library_scaled_by, 3, 4)], ids=["own", "library"])
+def test_a_step_made_inside_a_function_resumes_exactly_only_with_its_closure(made, same, other):
+    """A step made inside a function is stated by its code and what it reads, its closure among it
+    (`dew._stated.stated`), whosever module made it: one of the user's own, which reads a jitted function
+    of the user's and closes over a typed PRNG key, and one a library's module made (`library_scaled_by`).
+    Its run resumes exactly where its closure holds the same value, and is refused where it holds another.
+    Such a step was inexact (its name's `<locals>`); then a jitted function of the user's had no
+    statement, a typed key crashed the statement that fetched its bits (row 7814; train 1019's review, F1
+    and F3), and a library's held by its module's version alone shared one identity over any closure
+    (train 1022's review)."""
+    def reader(value):
+        return read_exactly(made(value))
+
+    state = saved_after_one(lambda: reader(same))
+    assert resumed_changes(reader(same), state) == ()
     with pytest.raises(ValueError):
-        resumed_changes(reader(jax.random.key(1)), state)
+        resumed_changes(reader(other), state)
 
 
 def shifted_where_weak(value):
@@ -1108,7 +1128,7 @@ def test_a_captured_array_differing_only_in_what_its_bytes_do_not_hold_refuses_e
     else:
         saved, other = _tagged_alike(flipped=False), _tagged_alike(flipped=True)
         assert str(saved.dtype) == str(other.dtype)
-        step = shifted_by
+        step = shifted_by_key
 
     state = saved_after_one(lambda: read_exactly(step(saved)))
     assert resumed_changes(read_exactly(step(saved)), state) == ()
