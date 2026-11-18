@@ -16,6 +16,8 @@ of its own, run through it in one process (`gpu_flow`), each cell its own file's
 - The paged BF16 decode kernel's value and derivatives are the gathered attention's, every width, window,
   softcap and sink, and a softcapped model decodes a paged cache on par with its compact one, one flow on
   sm80 or later (test_kv_cache).
+- A VAE encoder and its VJP, and a strided convolution's every linearization, compiled for the GPU are on
+  par with its host's (test_models: a device whose compiler is not the host's, which a CPU lane is not).
 """
 
 import functools
@@ -26,6 +28,7 @@ import test_decision_packing as decision_packing
 import test_hf_decoders as decoders
 import test_hf_modernbert as modernbert
 import test_kv_cache as kv_cache
+import test_models as models
 import test_rollout_servers as rollout
 from gpu_flow import BF16_PRODUCTS, Cell, run_cells, when
 
@@ -51,6 +54,12 @@ def test_the_models_run_their_gpu_kernels(without_deterministic_ops):
         Cell("the paged decode kernel decodes on par with the gathered attention, a softcapped model too",
              when(bf16_dot_runs(), BF16_PRODUCTS,
                   kv_cache.the_paged_decode_kernel_decodes_on_par_with_the_gathered_attention)),
+        *(Cell(f"a VAE encoder keeps its host's precision: batch {batch}, {'vjp' if backward else 'encode'}",
+               functools.partial(models.a_vae_encoder_keeps_the_host_reference_precision, batch, backward))
+          for batch in (1, 4) for backward in (False, True)),
+        *(Cell(f"a strided convolution's {transform} keeps its host's precision",
+               functools.partial(models.strided_convolution_linearizations_keep_host_precision, transform))
+          for transform in ("jvp", "transpose", "forward_over_reverse", "reverse_over_forward")),
     ])
 
 
