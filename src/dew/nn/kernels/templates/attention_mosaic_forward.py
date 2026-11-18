@@ -1223,11 +1223,12 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         # (`Family.walk_own`), `turns` past the rings' first.
         state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
                                          between=lambda: (turn(), turn()), counted=turns)
-        return state, trained, merged
-
-    def store(spec: algebra.Forward, state: algebra.Partial, trained, merged: bool) -> None:
         if merged:
+            # The initial state merged in at the walk's end, before a decided walk's verdict reads the sums.
             state = algebra.merge(spec, _initial(family, spec, hooked, state_rows), state)
+        return state, trained
+
+    def store(spec: algebra.Forward, state: algebra.Partial, trained) -> None:
         keep = None if kept is None else _kept_of(program, kept, rows=(row, head, first))
         if training:
             # The split sums as the walk left them (at its rows' scale, `algebra.split_residuals`).
@@ -1262,20 +1263,20 @@ def _walks_stored(walk: Callable, store: Callable, spec: algebra.Forward, consum
         pl.when(consumer == 0)(turn)
         return found
 
-    def stored(spec: algebra.Forward, state: algebra.Partial, trained, merged: bool) -> None:
+    def stored(spec: algebra.Forward, state: algebra.Partial, trained) -> None:
         if past is not None:
             past()
-        store(spec, state, trained, merged)
+        store(spec, state, trained)
 
-    state, trained, merged = walked(spec, 0)
+    state, trained = walked(spec, 0)
     if decided is None:
-        stored(spec, state, trained, merged)
+        stored(spec, state, trained)
         return
     # A row's verdict its sums times zero summed along it, no number exactly where one of them is none; the
     # rows' then the warpgroup's vote (`bar.red.or.pred`, a vector's alone: a tile's own refused layouts).
     rows = jnp.isnan(jnp.sum(state.acc * 0.0, axis=-1))
     taken = decided.stated(consumer, jnp.any(rows))
-    pl.when(jnp.logical_not(taken))(lambda: stored(spec, state, trained, merged))
+    pl.when(jnp.logical_not(taken))(lambda: stored(spec, state, trained))
 
     @pl.when(taken)
     def _():

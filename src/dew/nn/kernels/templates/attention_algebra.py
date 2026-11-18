@@ -2305,13 +2305,16 @@ def lazy_amplified(weights, bound: float = 1.0, *, natural: bool) -> float:
 
 
 def lazy_margin(spec: Forward, weights, bound: float = 1.0) -> float | None:
-    """`lazy_binades` in the walk's logits' units (binades where it folds to base 2, `Forward.base2`, else
-    nats). A kept anchor's factor is exactly 1, so a mainloop whose sums live apart (tcgen05's tensor memory)
-    skips their rescale where no row's anchor moved."""
+    """`lazy_binades` in the walk's logits' units (`Forward.naturalized`'s: binades where it folds to base 2,
+    raw products where it keeps them raw, `Forward.raw`, whose exponent scales their difference after it is
+    taken, else nats): a raw fold's margin of 32 binades kept an anchor 31 below a tile's raw maximum at a
+    scale of 1.92, weights of e^59.5 (the base review of 51158f2a9, F1). A kept anchor's factor is exactly
+    1, so a mainloop whose sums live apart (tcgen05's tensor memory) skips their rescale where no row's
+    anchor moved."""
     binades = lazy_binades(spec.natural, compensated=spec.compensated, weights=weights, bound=bound)
     if binades is None:
         return None
-    return float(binades if spec.base2 else binades * np.log(2.0))
+    return float(binades * LN2 / spec.naturalized(1.0))
 
 
 def lazy_anchor(margin: float | None) -> Callable | None:

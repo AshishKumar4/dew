@@ -950,6 +950,54 @@ def test_a_lazy_walks_kept_anchor_never_passes_the_bound_its_unscaled_walk_takes
                     f"a lazy walk's bound {generation_name}", seeds=SEEDS)
 
 
+def _second_review_draw(rise: float):
+    """Draws of a bf16 call `[1, 128, 1, 64]`: each query's first coordinate 8, the last 64 keys' first
+    `rise` (the first 64's 0), every other coordinate within 1/64, values 2^119 to 2^120 (the base review of
+    51158f2a9's probes, drawn)."""
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query, key = (jax.random.uniform(stream, (1, 128, 1, 64), jnp.float32, -1 / 64, 1 / 64)
+                      for stream in streams[:2])
+        query = query.at[..., 0].set(8).astype(jnp.bfloat16)
+        key = key.at[..., 0].set(0).at[:, 64:, :, 0].set(rise).astype(jnp.bfloat16)
+        value = 2.0 ** 119 * jax.random.uniform(streams[2], (1, 128, 1, 64), jnp.float32, 1, 2)
+        return query, key, value.astype(jnp.bfloat16), jnp.zeros_like(query)
+
+    return draw
+
+
+@INTERPRETS
+@pytest.mark.parametrize("probe", ["raw", "initial"])
+def test_a_scaled_or_resumed_forward_past_a_lazy_walks_reach_is_on_par_interpreted(probe):
+    """A bf16 forward on wgmma, interpreted (the base review of 51158f2a9's probes): `raw`, a raw fold
+    (`subtracted`, at a scale of 0.24 its prescale leaves 1.92) whose second key tile's raw products pass
+    the first's by 31, its lazy margin in raw units (`algebra.lazy_margin` through `Forward.naturalized`:
+    in binades it kept the anchor and weighed e^59.5); `initial`, a call resumed from a state of total 1
+    and sums 2^127 at a maximum of 0, whose walk stays finite and whose merge with it does not, the merge
+    before the decided walk's verdict reads the sums. On par with the reference (check 1), finite where it
+    is: both were infinite."""
+    spans = template.spans(128, 128, 1)
+    tiles = attention_mosaic.Tiles(64, 64, 2, 2, family=WGMMA)
+    hooks, options = None, {"scale": 0.24, "subtracted": True, "scaled": True}
+    if probe == "initial":
+        hooks = template.Hooks(initial=template.Initial(jnp.zeros((1, 1, 128)), jnp.ones((1, 1, 128)),
+                                                        jnp.full((1, 1, 128, 64), 2.0 ** 127)))
+        options = {"scale": 0.125}
+
+    def ours(query, key, value, dout):
+        del dout
+        with _device(interpret=True, target=generation.gpu_target("sm90")), _pinned(tiles):
+            return attention_mosaic.forward(query, key, value, spans, hooks, natural=False, interpret=True,
+                                            **options)
+
+    def reference(query, key, value, dout):
+        del dout
+        return template.reference(query, key, value, spans, hooks, scale=options["scale"])
+
+    draw = _second_review_draw(31.0 if probe == "raw" else 1.0)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"a lazy walk's {probe} probe", seeds=SEEDS)
+
+
 @INTERPRETS
 def test_a_lazy_walks_dropped_weights_stay_within_fp16_interpreted():
     """An fp16 folded forward under probability dropout at 0.75 (each kept weight times 4) whose second key

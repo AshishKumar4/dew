@@ -382,7 +382,7 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
     # A step whose walks derive no config refuses as it traces (`_planned_step`).
     (work,) = plans
     kernels = (equation for equation in programs.equations(traced.jaxpr)
-               if equation.primitive.name in ("pallas_call", "mpmd_map"))
+               if equation.primitive in programs.NATIVE_KERNELS)
     launches = [found for kernel in kernels if (found := emission.work_of(kernel)) is not None]
     priced = dataclasses.replace(sum(launches, Work()), span=sum(each.span for each in launches))
     if max(plan.slices for plan in work.values()) > 1:
