@@ -74,6 +74,7 @@ from dew.data.pipeline import (
     _declares_rejects,
     chains,
     children,
+    counting_only,
     examples_bound,
     record_stage,
     runs,
@@ -1028,7 +1029,10 @@ def _order(source: Source | Combined, lowered: Sequence[_Lowering], stages: Sequ
         read_of = {"source": source.describe()}
     written = stages if isinstance(source, Combined) else _written(source, stages)
     kept = (Shuffle, Repeat, Slice, Limit, TokenSplit, Pack, Windows, BatchStage)
-    return {**read_of, "stages": [stage for stage in written if isinstance(stage, kept)]}
+    # A bound that bounds nothing (a run counting its passes, `counting_only`) orders nothing.
+    uncounted = counting_only(written)
+    return {**read_of, "stages": [stage for at, stage in enumerate(written)
+                                  if isinstance(stage, kept) and at not in uncounted]}
 
 
 def _states_its_targets(pipeline: Pipeline) -> bool:

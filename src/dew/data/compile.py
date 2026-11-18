@@ -102,6 +102,7 @@ from dew.data.materialize import _materialize, _Memory
 from dew.data.mixing import CorpusCounts, Proportions, _weights, mixed_indexed
 from dew.data.ordering import place_of
 from dew.data.pipeline import (
+    UNCOUNTED,
     Artifact,
     Batched,
     BatchStage,
@@ -141,6 +142,7 @@ from dew.data.pipeline import (
     Windows,
     Workers,
     children,
+    counting_only,
     examples_bound,
     record_stage,
     runs,
@@ -477,6 +479,19 @@ def _bounded(pipeline: Pipeline, examples: int, *, passes: bool = False, countin
                                                  batch, *pipeline.stages[batched + 1:]))
 
 
+def _countable(pipeline: Pipeline) -> bool:
+    """Whether a run bounded in steps can count the examples `pipeline`'s read consumes where a pass is
+    counted (`_bounded`'s `counting`): a bound it can place there, so a read whose bound would be refused
+    (phases, a corpus that packs inside a mix, a repeat after the place or one with a count before it)
+    reads as it would counting none, its passes uncounted."""
+    if isinstance(pipeline.source, Phases) or any(
+            isinstance(stage, (Pack, Windows)) for child in children(pipeline) for stage in _steps(child)):
+        return False
+    at = _one_example_until(pipeline, passes=True)
+    return not any(isinstance(stage, Repeat) and (index >= at or stage.epochs is not None)
+                   for index, stage in enumerate(pipeline.stages))
+
+
 def _expands(stage: Stage) -> bool:
     """Whether `stage` is an objective's step that makes, or once it binds will make, several rows of a
     source example (`FlatMap.examples`, `Configured.examples`)."""
@@ -703,8 +718,10 @@ def _measure(
         )
     # A memory read whose expansion it would hold is bounded before that expansion as it holds the rest, to
     # a count set once it holds them (`_staged`).
+    # A run that counts its passes (`counting`) holds no pass of a pack ahead, as it reads on without end,
+    # nor bounds a read it cannot count (`_countable`).
+    counting = counting and training and _countable(branches[0])
     ahead = None if (epochs is None and not counting) or not training else _held_ahead(branches[0], read)
-    # A run that counts its passes (`counting`) holds no pass of a pack ahead: it reads on without end.
     ahead = None if counting and ahead == "layout" else ahead
     examples = _UNCOUNTED if ahead is not None else examples
     if examples is not None and training:
@@ -977,8 +994,8 @@ def _staged(
         # A run bounded in steps whose cadence counts its passes (`compile`'s `count_passes`): where its read
         # has no record count but states a pass's source examples, the examples it consumes are marked
         # where a pass is counted, with no bound (`_bounded`'s `counting`); read endlessly otherwise.
-        passes = None if epoch_records(train, build) is not None else _pass_examples(train, read, build,
-                                                                                     passes=True)
+        passes = (None if epoch_records(train, build) is not None or not _countable(train)
+                  else _pass_examples(train, read, build, passes=True))
         original, train = ((_endless(original), _endless(train)) if passes is None else
                            (_bounded(original, _UNCOUNTED, passes=True, counting=True),
                             _bounded(train, _UNCOUNTED, passes=True, counting=True)))
@@ -987,9 +1004,10 @@ def _staged(
                    mirrored=measured.mirrored)
 
 
-_UNCOUNTED = 1 << 62
+_UNCOUNTED = UNCOUNTED
 """The bound in examples a memory read whose expansion it would hold takes before it holds them, past any
-count, set to its epochs' passes once it holds them (`_rebound`, `_staged`)."""
+count, set to its epochs' passes once it holds them (`_rebound`, `_staged`), or left so where the run counts
+its passes (`counting_only`)."""
 
 
 def _pass_examples(train: Pipeline, read: Read, build: _Build, *, passes: bool) -> int | None:
@@ -1163,8 +1181,11 @@ def _compiled(
     )
     sources = [source for _, source in _leaves(original)]
     # The plan of this read, whole: its manifest, its facts, its members' digests, its caches and its rules.
-    described = [stage for stage in written(tuple(_steps(original)))
-                 if not isinstance(stage, (Workers, Prefetch))]
+    stated = written(tuple(_steps(original)))
+    # A bound that bounds nothing, which only marks what a run counting its passes consumes, is no step.
+    uncounted = counting_only(stated)
+    described = [stage for at, stage in enumerate(stated)
+                 if not isinstance(stage, (Workers, Prefetch)) and at not in uncounted]
     def planned() -> Plan:
         """The plan, its steps described under the field rule in force (`dew.data.plan.described_under`),
         which a position saved under an earlier version is compared with (`Plan.under`)."""

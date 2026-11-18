@@ -771,6 +771,26 @@ def _main_importable() -> bool:
     return main.get("__file__") is not None
 
 
+UNCOUNTED = 1 << 62
+"""A bound in examples past any count: a run's bound before a memory read holds the examples it counts
+(`dew.data.compile._rebound`), or the bound of a run that counts its passes and bounds nothing
+(`dew.data.compile`'s `count_passes`), whose read marks them alone (`counting_only`)."""
+
+
+def counting_only(stages: Sequence[object]) -> frozenset[int]:
+    """The places among `stages` of a bound that bounds nothing (`UNCOUNTED`, a run counting its passes):
+    its limit and its mark (`MarkConsumed`), which change no row and no record the read makes, so no plan
+    or order states them, a run counting its passes resuming one saved without them, and its own resumed
+    by one that counts none."""
+    at = examples_bound(stages)
+    if at is None or at == 0:
+        return frozenset()
+    limit = stages[at - 1]
+    if not isinstance(limit, Limit) or limit.count != UNCOUNTED or limit.passes is not None:
+        return frozenset()
+    return frozenset({at - 1, at})
+
+
 def examples_bound(stages: Sequence[object]) -> int | None:
     """Where a run bounded in examples marks the source examples it reads (`MarkConsumed`), the stage
     after the bound's limit (`dew.data.compile._bounded`): its index in `stages`, None for a read the run

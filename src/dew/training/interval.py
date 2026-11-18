@@ -12,6 +12,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import functools
+import logging
 import math
 import queue
 import threading
@@ -24,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew import _position
 from dew.batch import CONSUMED_COUNT, Batch, ConsumedCount
 from dew.data.dataset import rows_of
 from dew.nn.kernels.options import program
@@ -41,6 +43,8 @@ from dew.training.display import EXAMPLES_CONSUMED_SCALAR, TrainingDisplay
 from dew.training.inspection import Summaries, logged
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS
 from dew.training.transaction import Committed
+
+_log = logging.getLogger(__name__)
 
 # Consecutive non-finite losses that stop a run.
 BAD_LOSS_STEPS = 5
@@ -306,6 +310,22 @@ class Interval:
         streak = self.streak()
         if streak is not None:
             checked_finite(on_host(streak, step), step, display, skips=self.skips_nonfinite)
+
+    @staticmethod
+    def counted_before(control: dict, position: bytes | None) -> None:
+        """Set `control`'s consumed examples (`CONSUMED_EXAMPLES`) where a run that now counts its passes
+        (`dew.data.compile`'s `count_passes`) resumes a checkpoint saved before it counted them: a global
+        position's records, the source examples its order read, the same on every process. A per-share
+        position states no count of what its shares read, so such a run counts its passes from where it
+        resumes, which it logs."""
+        if CONSUMED_EXAMPLES in control or position is None:
+            return
+        place = _position.decode(position)
+        if place is None:
+            _log.info("the checkpoint resumed holds no count of the examples its run consumed, and its "
+                      "per-share data position states none: the run counts its passes from here")
+            return
+        control[CONSUMED_EXAMPLES] = place.records
 
     @classmethod
     def resumed(cls, control: dict, *, last_saved: int | None, skips_nonfinite: bool = False) -> Interval:
