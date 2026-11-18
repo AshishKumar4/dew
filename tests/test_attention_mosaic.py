@@ -904,12 +904,20 @@ def test_the_forward_is_on_par_dropping_interpreted(call, training, dtype):
 
 
 def _rising_draw(dtype, rise: float, value: float):
-    """A full call's operands, one batch row and head, 256 queries over 128 keys 64 wide: every query's first
-    coordinate 1, the first 64 keys' first coordinate 0 and the last 64's `rise` (their logits that much
-    above the first tile's, times the call's scale), values `value` and the cotangent 0, in `dtype`."""
-    query = jnp.zeros((1, 256, 1, 64), dtype).at[..., 0].set(1)
-    key = jnp.zeros((1, 128, 1, 64), dtype).at[:, 64:, :, 0].set(rise)
-    return query, key, jnp.full((1, 128, 1, 64), value, dtype), jnp.zeros_like(query)
+    """Draws of a full call's operands, one batch row and head, 256 queries over 128 keys 64 wide: every
+    query's first coordinate 1, the first 64 keys' first coordinate 0 and the last 64's `rise` (their
+    logits that much above the first tile's, times the call's scale), every other coordinate drawn within
+    1/64, values `value` times a draw in [1, 2) and the cotangent 0, in `dtype`."""
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        small = [jax.random.uniform(stream, shape, jnp.float32, -1 / 64, 1 / 64)
+                 for stream, shape in zip(streams[:2], ((1, 256, 1, 64), (1, 128, 1, 64)), strict=True)]
+        query = small[0].at[..., 0].set(1).astype(dtype)
+        key = small[1].at[..., 0].set(0).at[:, 64:, :, 0].set(rise).astype(dtype)
+        values = value * jax.random.uniform(streams[2], (1, 128, 1, 64), jnp.float32, 1, 2)
+        return query, key, values.astype(dtype), jnp.zeros_like(query)
+
+    return draw
 
 
 LAZY_BOUND_TILES = {"sm100": attention_mosaic.Tiles(128, 64, 2, 2, family="tcgen05.rows"),
@@ -921,11 +929,11 @@ LAZY_BOUND_TILES = {"sm100": attention_mosaic.Tiles(128, 64, 2, 2, family="tcgen
 @pytest.mark.parametrize("generation_name", sorted(LAZY_BOUND_TILES))
 def test_a_lazy_walks_kept_anchor_never_passes_the_bound_its_unscaled_walk_takes_interpreted(generation_name):
     """A bf16 forward whose second key tile's logits pass the first's by 14 (112 times the call's scale, 20
-    binades: within the lazy walk's margin, `algebra.lazy_binades`, so its anchor stays) over values of 2^110,
-    interpreted on tcgen05's rows (whose launch decides no scaled walk) and on wgmma: on par with the
-    reference (check 1), its output 2^110 finite. Its host's bound takes the lazy weights' reach
-    (`algebra.lazy_amplified`), so the call walks scaled: the bound of weights at most 1 took 2^117 for
-    sums of 2^136, past fp32's largest (the base review of a59590b06, F1)."""
+    binades: within the lazy walk's margin, `algebra.lazy_binades`, so its anchor stays) over values of 2^109
+    to 2^110, interpreted on tcgen05's rows (whose launch decides no scaled walk) and on wgmma: on par with
+    the reference (check 1), its output 2^110 finite. Its host's bound takes the lazy weights' reach
+    (`algebra.lazy_amplified`), so the call walks scaled: the bound of weights at most 1 took 2^117 for sums
+    of 2^136, past fp32's largest (the base review of a59590b06, F1)."""
     spans = template.spans(256, 128, 1)
 
     def ours(query, key, value, dout):
@@ -938,12 +946,8 @@ def test_a_lazy_walks_kept_anchor_never_passes_the_bound_its_unscaled_walk_takes
         del dout
         return template.reference(query, key, value, spans)
 
-    def draw(seed):
-        del seed
-        return _rising_draw(jnp.bfloat16, 112.0, 2.0 ** 110)
-
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"a lazy walk's bound {generation_name}",
-                    seeds=1)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _rising_draw(jnp.bfloat16, 112.0, 2.0 ** 109),
+                    f"a lazy walk's bound {generation_name}", seeds=SEEDS)
 
 
 @INTERPRETS
@@ -967,12 +971,9 @@ def test_a_lazy_walks_dropped_weights_stay_within_fp16_interpreted():
         del dout
         return template.reference(query, key, value, spans, hooks)
 
-    def draw(seed):
-        del seed
-        # Logits natural: the second tile's 10 above the first's at the call's scale of 1/8.
-        return _rising_draw(jnp.float16, 80.0, 1.0)
-
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "a lazy walk's dropped weights", seeds=1)
+    # Logits natural: the second tile's 10 above the first's at the call's scale of 1/8.
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _rising_draw(jnp.float16, 80.0, 1.0),
+                    "a lazy walk's dropped weights", seeds=SEEDS)
 
 
 @INTERPRETS
