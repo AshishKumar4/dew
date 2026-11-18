@@ -300,10 +300,21 @@ def dew_next_token_loss(loaded, params, ids):
     return -jnp.mean(token_log_probs(logits[:, :-1], ids[:, 1:])), logits
 
 
-def extract_fixture(archive: Path, directory: Path) -> Path:
+def extract_fixture(archive: Path, directory: Path, *folders: str) -> Path:
+    """`archive` unpacked under `directory`, which this returns: only its members under `folders` where
+    named (each a path inside it, `sd` or `sd/tokenizer`), else whole."""
     with tarfile.open(archive) as source:
-        source.extractall(directory, filter="data")
+        members = None if not folders else [member for member in source.getmembers() if any(
+            member.name == folder or member.name.startswith(f"{folder}/") for folder in folders)]
+        source.extractall(directory, members=members, filter="data")
     return directory
+
+
+def tiny_pipeline(directory: Path, name: str) -> Path:
+    """The tiny Diffusers pipeline `name` of tests/fixtures/tiny_diffusers.tar.xz (`sd`, `xl`, `inpaint`,
+    ...) unpacked under `directory`: its folder."""
+    archive = Path(__file__).parent / "fixtures" / "tiny_diffusers.tar.xz"
+    return extract_fixture(archive, directory, name) / name
 
 
 def hub_cache(cache: Path, repo_id: str, source: Path,

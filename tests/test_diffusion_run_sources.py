@@ -20,7 +20,7 @@ import optax
 import pytest
 from diffusion_stubs import PROMPTS, batch_for
 from diffusion_support import images_of
-from interop_support import allocated_bytes
+from interop_support import allocated_bytes, tiny_pipeline
 from reference_error import as_given, assert_as_exact
 
 from dew.config import ObjectiveConfig, TrainerConfig
@@ -50,11 +50,8 @@ def pipelines(tmp_path_factory):
     for family in ("sd3", "flux", "qwen_image"):
         with tarfile.open(FIXTURES / f"{family}_source.tar.xz") as archive:
             archive.extractall(root / family, filter="data")
-    with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
-        archive.extractall(root / "unet", members=[member for member in archive.getmembers()
-                                                   if member.name.split("/")[0] == "sd"], filter="data")
     (root / "sd").mkdir()
-    (root / "unet" / "sd").rename(root / "sd" / "pipeline")
+    tiny_pipeline(root / "unet", "sd").rename(root / "sd" / "pipeline")
     return root
 
 

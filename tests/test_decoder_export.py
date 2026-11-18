@@ -1353,13 +1353,11 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
 
 
 @pytest.mark.parametrize("variant", ["released", "native_geometry"])
-def test_a_standalone_glm5_exports_prediction_depths_that_draft_as_they_did(variant, tmp_path):
+def test_a_standalone_glm5_exports_prediction_depths_whose_logits_are_its_own(variant, tmp_path):
     """A GLM-5 decoder with prediction depths (the dense variant has none), written standalone: its
-    reloaded depths' logits are its own and transformers' over the export, and the reload drafts
-    speculatively the greedy tokens the original decodes."""
+    reloaded depths' logits are its own and transformers' over the export; that the reload drafts as the
+    original decodes is the test beside it, where the two in one took 159 s (train 1003, row 7452)."""
     import jax.numpy as jnp
-
-    from dew.sampling import Sampling, Speculative, generate
 
     model, variables, ids, restored = glm5_exported(variant, tmp_path)
     assert model.num_nextn_predict_layers and restored.model.num_nextn_predict_layers
@@ -1370,6 +1368,18 @@ def test_a_standalone_glm5_exports_prediction_depths_that_draft_as_they_did(vari
     np.testing.assert_allclose(reloaded_prediction, prediction, atol=LOGITS, rtol=0)
     np.testing.assert_allclose(tool.glm5_prediction_logits(CASES["glm5_next"], tmp_path, ids),
                                prediction, atol=LOGITS, rtol=0)
+
+
+@pytest.mark.parametrize("variant", ["released", "native_geometry"])
+def test_a_standalone_glm5_exports_prediction_depths_that_draft_as_they_did(variant, tmp_path):
+    """A GLM-5 decoder with prediction depths, written standalone: the reload drafts speculatively the
+    greedy tokens the original decodes."""
+    import jax.numpy as jnp
+
+    from dew.sampling import Sampling, Speculative, generate
+
+    model, variables, ids, restored = glm5_exported(variant, tmp_path)
+    assert model.num_nextn_predict_layers and restored.model.num_nextn_predict_layers
     ordinary = generate(model, variables, jnp.asarray(ids[:, :5]), 4, key=jax.random.key(0),
                         sampling=Sampling(temperature=0)).host()
     speculative = restored.text_generation(sampling=Sampling(temperature=0))(
