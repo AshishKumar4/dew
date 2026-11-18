@@ -638,6 +638,37 @@ def test_a_raw_folds_kept_anchor_holds_its_weights_within_the_margins_binades():
         assert_as_exact(program, as_given(exact), draw, f"a raw fold's lazy walk, {run}", seeds=LAZY_SEEDS)
 
 
+def test_a_raw_folds_lazy_anchor_moves_where_the_maximum_passes_it_by_more_than_the_margin():
+    """An fp16 raw fold's walk (scale 0.24, its margin 43.3 raw units) over two tiles whose raw maxima are
+    2^29 and 2^29 + 64, fp32's next value there, over values near 1: the tile's maximum passes the kept one
+    by 64, past the margin, so the anchor moves and the output is on par with the softmax at each row's
+    exact maximum (check 1), jitted and op by op. The kept maximum plus the margin rounded at 2^29 up to
+    the tile's, so the anchor stayed and a weight of e^15.4 narrowed to fp16's infinity (the base review of
+    a71e85d7a, F2)."""
+    spec = algebra.Forward("full", 64, ids=False, scale=0.24, natural=False, subtracted=True)
+    assert spec.raw
+
+    def draw(seed):
+        streams = jax.random.split(jax.random.key(seed), 2)
+        # Each tile's raw logits its maximum less a few of fp32's steps there (64 each).
+        steps = jax.random.randint(streams[0], (2, 16, 32), 0, 4).astype(jnp.float32) * 64
+        logits = jnp.asarray([2.0 ** 29, 2.0 ** 29 + 64], jnp.float32)[:, None, None] - steps
+        logits = logits.at[:, :, 0].set(jnp.asarray([2.0 ** 29, 2.0 ** 29 + 64], jnp.float32)[:, None])
+        values = jax.random.uniform(streams[1], (2, 32, 16), jnp.float32, 1, 2).astype(jnp.float16)
+        return logits, values
+
+    def exact(logits, values):
+        joined = jnp.concatenate(list(logits), axis=-1)
+        weights = jnp.exp((joined - jnp.max(joined, axis=-1, keepdims=True)) * spec.scale)
+        summed = jnp.matmul(weights.astype(values.dtype), jnp.concatenate(list(values), axis=0),
+                            preferred_element_type=jnp.float32)
+        return summed / jnp.sum(weights, axis=-1, keepdims=True)
+
+    walk = _lazy_walk(spec)
+    for program, run in ((jax.jit(walk), "jitted"), (as_given(walk), "op by op")):
+        assert_as_exact(program, as_given(exact), draw, f"a raw fold's moved anchor, {run}", seeds=LAZY_SEEDS)
+
+
 ANCHORED_SEEDS = 8
 """The anchored training walk's site's declared draws (check 1)."""
 

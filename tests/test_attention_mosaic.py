@@ -932,7 +932,7 @@ def test_a_lazy_walks_kept_anchor_never_passes_the_bound_its_unscaled_walk_takes
     binades: within the lazy walk's margin, `algebra.lazy_binades`, so its anchor stays) over values of 2^109
     to 2^110, interpreted on tcgen05's rows (whose launch decides no scaled walk) and on wgmma: on par with
     the reference (check 1), its output 2^110 finite. Its host's bound takes the lazy weights' reach
-    (`algebra.lazy_amplified`), so the call walks scaled: the bound of weights at most 1 took 2^117 for sums
+    (`algebra.walk_reach`), so the call walks scaled: the bound of weights at most 1 took 2^117 for sums
     of 2^136, past fp32's largest (the base review of a59590b06, F1)."""
     spans = template.spans(256, 128, 1)
 

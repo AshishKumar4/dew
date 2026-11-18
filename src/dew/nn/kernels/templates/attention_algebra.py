@@ -2290,7 +2290,7 @@ def lazy_binades(natural: bool, *, compensated: bool, weights, bound: float = 1.
     bound leaves for its keys (`BOUND_UNIT` less `KEY_BINADES`: each term of `weighed_reach` a weight times
     a value below 2^128, held at `2^-BOUND_UNIT`, summed over fewer than `2^KEY_BINADES` keys), each less
     the multiplier's binades (a weight of 4 e^10 at a rate of 0.75 narrowed to fp16's infinity), none below
-    0, the exact anchor. An unscaled walk's sums reach `lazy_amplified` times a weight of 1's
+    0, the exact anchor. An unscaled walk's sums reach `walk_reach` times a weight of 1's
     (`may_scale`'s `amplified`)."""
     if natural or compensated:
         return None
@@ -2298,13 +2298,17 @@ def lazy_binades(natural: bool, *, compensated: bool, weights, bound: float = 1.
     return max(min(jnp.finfo(weights).maxexp - 1, BOUND_UNIT - 1 - KEY_BINADES) - multiplied, 0)
 
 
-def lazy_amplified(weights, bound: float = 1.0, *, natural: bool) -> float:
-    """The most a lazy walk's weight reaches (`lazy_binades`): `2^binades`, 1 where it anchors exactly. A
-    host's bound on an unscaled walk's sums takes it (`may_scale`'s `amplified`): a kept anchor's tile
-    whose maximum is past it by the margin weighs its values up to it (two tiles at logits 0 and 112, values
-    2^110: the second's sums 2^136 against a bound of 2^117 that took every weight at most 1)."""
-    binades = lazy_binades(natural, compensated=False, weights=weights, bound=bound)
-    return 1.0 if binades is None else 2.0 ** binades
+def walk_reach(weights, drop: Dropout | None = None, *, natural: bool) -> float:
+    """The most a walk's weight reaches, which every host's bound on an unscaled walk's sums takes
+    (`may_scale`'s and `bounded_past`'s `amplified`: the template's, the decode's and Triton's walks alike):
+    a dropping call's largest multiplier (`Dropout.bound`) times a lazy walk's kept anchor's reach,
+    `2^binades` (`lazy_binades`, 1 where it anchors exactly), a kept anchor's tile whose maximum is past it
+    by the margin weighing its values up to it (two tiles at logits 0 and 112, values 2^110: the second's
+    sums 2^136 against a bound of 2^117 that took every weight at most 1; Triton's walk at 14 nats over
+    2^109 the same, the base review of a71e85d7a, F1)."""
+    multiplied = 1.0 if drop is None else drop.bound
+    binades = lazy_binades(natural, compensated=False, weights=weights, bound=multiplied)
+    return multiplied * (1.0 if binades is None else 2.0 ** binades)
 
 
 def lazy_margin(spec: Forward, weights, bound: float = 1.0) -> float | None:
@@ -2325,7 +2329,11 @@ def lazy_anchor(margin: float | None) -> Callable | None:
     than `margin` (`lazy_margin`), then the tile's; None where the walk anchors at every larger maximum."""
     if margin is None:
         return None
-    return lambda kept, exact: jnp.where(exact > kept + np.float32(margin), exact, kept)
+    # The tile's maximum's distance from the kept one against the margin, exact where they are close
+    # (Sterbenz): the kept one plus the margin rounded at 2^29 (an fp16 raw fold's, scale 0.24) up to a
+    # maximum 64 past it, past a margin of 43.3, so the anchor stayed and weighed e^15.4, fp16's infinity
+    # (the base review of a71e85d7a, F2).
+    return lambda kept, exact: jnp.where(exact - kept > np.float32(margin), exact, kept)
 
 
 def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:

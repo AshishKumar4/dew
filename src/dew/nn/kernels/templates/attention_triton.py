@@ -369,8 +369,10 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
                                                                      interpret=interpret)) as taken:
                 return taken(*arguments, residuals=residuals, interpret=interpret)
 
-        return jax.lax.cond(algebra.may_scale(value, keys_axis=1, initial=acc0), rare,
-                            functools.partial(walk, scaled=False)), None
+        # Its bound the walk's weights' reach (`algebra.walk_reach`: a lazy walk's kept anchor's).
+        may = algebra.may_scale(value, keys_axis=1, initial=acc0,
+                                amplified=algebra.walk_reach(value.dtype, natural=self.natural))
+        return jax.lax.cond(may, rare, functools.partial(walk, scaled=False)), None
 
     def _walk(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, m0,
               total0, acc0, *, residuals: Kept, interpret: bool, config: Tiles, scaled: bool):
