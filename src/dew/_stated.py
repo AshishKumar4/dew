@@ -22,8 +22,10 @@ from pathlib import Path
 
 import jax
 import numpy as np
+from jax._src.named_sharding import UNSPECIFIED
 from jax.experimental.layout import Format, Layout
 from jaxlib import xla_client
+from jaxlib._jax import PjitFunction
 
 from dew import _hashing, _sources
 from dew._records import JSON
@@ -51,8 +53,8 @@ def _coded(module: str | None, at: str) -> str:
 
 
 def _named(value, at: str) -> list | None:
-    """`value` as the name its module holds it under (a class, a module's function, a jitted one, a
-    singleton), where it has one: its definition is its module's code, the process record's. None for a
+    """`value` as the name its module holds it under (a class, a module's function, a library's jitted one,
+    a singleton), where it has one: its definition is its module's code, the process record's. None for a
     value its module does not hold under its own name (a local function, an instance), and for one of
     `__main__`, whose code no process record holds: it is stated by what it is instead, as the user's own
     code is (`_own`)."""
@@ -96,9 +98,9 @@ def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
     a call's key (an abstract value, a tree's structure node by node, a format, a device) by their parts. A
     value among `known` (by its `id`) is what its caller says of it.
 
-    Refused, naming `at` and the value's type, for anything else, an array of JAX's among them (a constant
-    of the program, which its executable cannot serialize): an object with no such form could differ
-    between two processes with nothing in the identity to show it."""
+    An array of JAX's is its values and sharding (`_jax_array`); a function `jax.jit` wraps, what it wraps
+    and its options (`_jitted`). Refused, naming `at` and the value's type, for anything else: an object
+    with no such form could differ between two processes with nothing in the identity to show it."""
     return _stated(value, at, known, ())
 
 
@@ -115,8 +117,8 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
     # A value of exactly Python's own type; a subclass (an enumeration's member) is stated as what it is.
     if value is None or type(value) in (bool, int, str):
         return value
-    if isinstance(value, jax.Array):
-        raise Unestablished(f"{at}: an array of JAX's, a constant of the program")
+    if (computed := _computed(value, at, again)) is not None:
+        return computed
     if isinstance(value, types.ModuleType):
         # A module of the user's is everything it holds: code that names it may read any of it.
         held = _module_state(value, at, known, walking) if _sources.own_source(value.__name__) else None
@@ -126,8 +128,8 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
     if isinstance(value, (types.FunctionType, type)) and _sources.own_source(value.__module__):
         return _own(value, at, known, walking)
     if _sources.hand_written(getattr(value, "__wrapped__", None)):
-        # A callable that is no function and wraps one of the user's (a cache, a jitted function): what
-        # it holds beside the function (its cache, its options) is its type's, which nothing here states.
+        # A callable that is no function and wraps one of the user's, a jitted one aside (`_computed`): what
+        # it holds beside the function (a cache's entries) is its type's, which nothing here states.
         raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} wrapping a "
                             "function of the user's own code")
     if (named := _named(value, at)) is not None:
@@ -188,6 +190,69 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         return converted
     raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} has no form an "
                         "identity can state")
+
+
+
+
+def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
+    """One of JAX's values a program computes from or with: an array (`_jax_array`), a function `jax.jit`
+    wraps, by its module's name for it where a library's (`_named`), else by what it wraps (`_jitted`); None
+    for any other."""
+    if isinstance(value, jax.Array):
+        return _jax_array(value, at, again)
+    if isinstance(value, PjitFunction):
+        # A library's jitted function its module names (`jax.nn.silu`) is that name, as the library's code
+        # is its version's; one wrapping the user's code is what it wraps, with its options.
+        if not _sources.hand_written(value.__wrapped__) and (named := _named(value, at)) is not None:
+            return named
+        return _jitted(value, at, again)
+    return None
+
+
+def _jitted(value, at: str, again: Callable[..., JSON]) -> JSON:
+    """A function `jax.jit` wraps by what it wraps (`__wrapped__`, stated as any function is: a user's own by
+    its code and reads) and every option its wrapping records (`PjitInfo`: static and donated arguments,
+    shardings and layouts, their trees, `keep_unused`, `inline`, a backend or device, compiler options),
+    each stated as its value is: two wrappings of one function under other options trace other
+    programs."""
+    recorded = value._jit_info
+    options = {name: _jit_option(getattr(recorded, name), f"{at} (jit option {name})", again)
+               for name in sorted(_JIT_OPTIONS)}
+    return ["jit", again(value.__wrapped__, at=at), options]
+
+
+def _jit_option(value, at: str, again: Callable[..., JSON]) -> JSON:
+    """One option a jit records, a tuple of shardings or layouts entry by entry, JAX's mark of a sharding
+    the call left to JAX (`UNSPECIFIED`) as that."""
+    if value is UNSPECIFIED:
+        return "unspecified"
+    if isinstance(value, tuple):
+        return [_jit_option(each, f"{at}[{index}]", again) for index, each in enumerate(value)]
+    return again(value, at=at)
+
+
+_JIT_OPTIONS = frozenset({"static_argnums", "static_argnames", "donate_argnums", "donate_argnames",
+                          "in_shardings_treedef", "in_shardings_leaves", "out_shardings_treedef",
+                          "out_shardings_leaves", "in_layouts_treedef", "in_layouts_leaves",
+                          "out_layouts_treedef", "out_layouts_leaves", "keep_unused", "inline", "backend",
+                          "device", "compiler_options_kvs", "user_specified_in_shardings"})
+"""The parts of a jit's recorded options (`PjitInfo`) that decide what it traces and compiles; its source
+line, signature and counters, which a function's own statement holds or which decide nothing, apart."""
+
+
+def _jax_array(value: jax.Array, at: str, again: Callable[..., JSON]) -> JSON:
+    """An array of JAX's by its values, fetched to the host, as a NumPy array's (`_data`: its dtype, shape
+    and bytes; a typed PRNG key's its key type and key data, `terms.held_bits`), its weak type and its
+    sharding: a trace that closes over it bakes all of them into its program, and may branch on its weak
+    type. A typed key's dtype is stated as any value is, by its implementation's parts, which its printed
+    tag alone does not tell apart (two implementations may print one). Refused where this process holds
+    only part of it, whose bytes no one process reads."""
+    if not value.is_fully_addressable:
+        raise Unestablished(f"{at}: an array of JAX's this process holds only part of")
+    # A typed PRNG key's bits are its key data, its dtype the key type, which NumPy cannot read whole.
+    dtype, bits = terms.held_bits(value)
+    return ["jax array", again(dtype, at=f"{at}.dtype"), jax.typeof(value).weak_type, _data(bits, at),
+            again(value.sharding, at=f"{at}.sharding")]
 
 
 def _data(value, at: str) -> JSON | None:
@@ -328,10 +393,13 @@ def _own(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) ->
     stated_name = ["own", module, value.__qualname__]
     if id(value) in walking:
         return [*stated_name, "itself"]
-    if "<locals>" in value.__qualname__:
-        raise Unestablished(f"{at}: {value.__module__}.{value.__qualname__}, made inside a function")
     if isinstance(value, types.FunctionType):
+        # A function made inside another (`<locals>`) among them: its code and what it reads, its closure's
+        # cells too, are all it is, however many its maker made.
         return [*stated_name, _code(value.__code__), reads(value, at, known, walking)]
+    if "<locals>" in value.__qualname__:
+        raise Unestablished(f"{at}: the class {value.__module__}.{value.__qualname__}, made inside a "
+                            "function")
     within = (*walking, id(value))
     return [*stated_name, [_class(held, at, known, within) for held in _sources.own_classes(value)]]
 

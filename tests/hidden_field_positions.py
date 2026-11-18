@@ -1,6 +1,8 @@
 """The chains whose positions main saved under plan 15 (tests/fixtures/positions, `SAVED_UNDER_15` of
 test_pipeline_earlier_plans), which described a step without the fields its repr hides: a read and phases
-through such a step (`Remapped`), and a global order batched by such a function (`Stacked`). A module of
+through such a step (`Remapped`), and a global order and phases of global orders batched by such a
+function (`Stacked`); under plan 16, before a phases' position's version was read from its reader's,
+phases through such a step. A module of
 their own, whose bytes their positions hold, so an edit to another leaves them resumable."""
 
 import dataclasses
@@ -43,6 +45,17 @@ def hidden_global():
     return compile(chain, read="memory", loading=READ)
 
 
+def hidden_global_phases():
+    """Two global orders read in two phases on the record clock, the first's batched by a function whose
+    table its repr hides (`Stacked`), its order holding that function."""
+    first = Memory({"id": np.arange(1, 41, dtype=np.int32)}, shard_rows=4)
+    second = Memory({"id": np.arange(101, 141, dtype=np.int32)}, shard_rows=4)
+    stacked = Stacked(np.zeros(4, dtype=np.int32))
+    return compile(phases((Pipeline(first).shuffle(seed=3).repeat().batch(2, batch_fn=stacked), 6),
+                          (Pipeline(second).shuffle(seed=4).repeat().batch(2, batch_fn=stacked), None)),
+                   read="memory", loading=READ)
+
+
 def hidden():
     """40 ids shuffled through a step whose table its repr hides (`Remapped`), in batches of two."""
     rows = Memory({"id": np.arange(1, 41, dtype=np.int32)}, shard_rows=4)
@@ -56,5 +69,6 @@ def hidden_phases():
                    read="indexed", loading=READ)
 
 
-SAVED = {"hidden": (hidden, 3), "hidden_phases": (hidden_phases, 5), "hidden_global": (hidden_global, 3)}
+SAVED = {"hidden": (hidden, 3), "hidden_phases": (hidden_phases, 5), "hidden_global": (hidden_global, 3),
+         "hidden_global_phases": (hidden_global_phases, 7)}
 """Each saved position's loader and the steps read before it was saved."""

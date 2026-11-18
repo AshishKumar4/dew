@@ -5,7 +5,6 @@ trains the model and not the autoencoder, and the autoencoder's own loss
 trains it and not the model."""
 
 import functools
-import tarfile
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +16,7 @@ import optax
 import pytest
 from diffusion_stubs import label_table
 from flax import linen as nn
+from interop_support import extract_fixture
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -411,8 +411,7 @@ def _repae_task(tmp_path: Path, dtype) -> SimpleNamespace:
         return jax.tree.map(leaf_at, tree)
 
     tail = "_f64" if dtype == jnp.float64 else ""
-    with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
-        archive.extractall(tmp_path, filter="data")
+    extract_fixture(FIXTURES / "tiny_diffusers.tar.xz", tmp_path)
     representation = cast({"params": {"Conv_0": module("representation")}})
     alignment = Alignment("block_0", encoder=Representation(), width=PROJECTOR, resolution=None)
     table = label_table(range(CLASSES), null=CLASSES)
@@ -683,8 +682,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     from dew.registry import ModelConfig
 
     for name in ("tiny_diffusers", "rae"):
-        with tarfile.open(FIXTURES / f"{name}.tar.xz") as archive:
-            archive.extractall(tmp_path / name, filter="data")
+        extract_fixture(FIXTURES / f"{name}.tar.xz", tmp_path / name)
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 2, "num_heads": 2,
                                          "mlp_ratio": 1, "dtype": "float32", "attention_impl": "xla"}),

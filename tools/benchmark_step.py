@@ -381,13 +381,14 @@ def rates(trainer: Trainer, rows: int, steps: int, elapsed: float,
           work: float | None) -> tuple[float | None, float | None]:
     """`steps` steps of `rows` rows over `elapsed` seconds, each `work` training FLOPs, rated as the
     trainer's interval rates them (`dew.training.interval.throughput`): the step's HLO utilization, a
-    lower bound where it runs launches whose work went uncounted (`StepFlops.unsized`), and its MFU, the
+    bound named by what its count is (`StepFlops.bound`: a lower bound where launches' work went
+    uncounted, an upper bound where a loop was counted at its stated bound), and its MFU, the
     work over the mesh's peak; each None where nothing counts it."""
     flops = trainer.step_flops
     scalars = throughput(elapsed, steps, rows * steps, None if flops is None else steps * flops,
                          trainer.device_mesh.devices.size,
                          training_flops=None if work is None else steps * work)
-    bound = "_lower_bound" if flops is not None and flops.unsized else ""
+    bound = "" if flops is None else flops.bound
     return scalars.get(f"train/hfu{bound}"), scalars.get("train/mfu")
 
 

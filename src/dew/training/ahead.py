@@ -65,7 +65,7 @@ from jaxlib import xla_client
 
 from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
-from dew._devices import COMPILE_ONLY_MEMORY, device_memory
+from dew._devices import COMPILE_ONLY_MEMORY, COMPILE_ONLY_SHARE, DEW_SHARE, device_memory
 from dew._records import JSON, boolean, record
 from dew._stated import Unestablished, traceback_frames
 from dew.batch import Batch
@@ -745,6 +745,13 @@ class Keeping:
         except Unestablished as refusal:
             self.refused[named] = str(refusal)
             return
+        loaded = communicators.loaded_program(executable)
+        if loaded is None:
+            # Compiled for devices this process has not loaded (a compile-only GPU's), refused before it is
+            # serialized: no program of its default backend.
+            self.refused[named] = "it was compiled for devices this process has not loaded (a compile-only " \
+                                  "target's), outside the process's default backend"
+            return
         try:
             serialized = Executable.of(executable)
         except (NotImplementedError, ValueError) as refusal:
@@ -752,9 +759,7 @@ class Keeping:
             # program, which no executable serializes.
             self.refused[named] = f"its executable does not serialize: {refusal}"
             return
-        runtime = executable.runtime_executable()
-        assert runtime is not None, "a program compiled on this process's devices is loaded"
-        ran = runtime.local_devices()
+        ran = loaded.devices
         if not set(ran) <= set(jax.devices()):
             # The file's target is the process's default backend's (`save`), which this program is none of.
             self.refused[named] = f"it runs on {sorted({device.platform for device in ran})} devices, " \
@@ -985,6 +990,15 @@ class AheadTarget:
     """The run's data phases whose steps are compiled in place of the first's, each over a batch of its own
     (`phase_batch`), into the run's persistent compilation cache, where that phase's first compile in the
     run finds them: none, the first step's alone."""
+    share: float = DEW_SHARE
+    """The share of each GPU XLA's pool takes in the run that loads the step (`dew._devices.pool_share`):
+    Dew's own as Dew prepares a training process, or the run's named one. Its plan is admitted against the
+    limit it derives (`COMPILE_ONLY_SHARE`), not this process's own share, which a prepare packed beside
+    another job holds of its own GPU alone (row 7644: 6.78 GiB of an 80 GiB target)."""
+
+    def __post_init__(self) -> None:
+        if not 0 < self.share <= 1:
+            raise ValueError(f"a pool's share of a GPU is in (0, 1], not {self.share!r}")
 
     @property
     def memory(self) -> int | None:
@@ -999,9 +1013,10 @@ class AheadTarget:
             if self.multiprocessors is not None or self.capacity_gib is not None:
                 raise ValueError("a host's topology states its GPUs' memory and multiprocessors; set neither "
                                  "capacity_gib nor multiprocessors with it")
-            return host_gpus(self.generation, self.topology, self.devices)
+            return self._shared(host_gpus(self.generation, self.topology, self.devices))
         if ":" not in self.generation:
-            return compile_only_gpus(self.generation, self.devices, self.memory, self.multiprocessors)
+            return self._shared(compile_only_gpus(self.generation, self.devices, self.memory,
+                                                  self.multiprocessors))
         if self.multiprocessors is not None:
             raise ValueError(f"a TPU topology ({self.generation}) states its own cores; set no "
                              "multiprocessors")
@@ -1011,6 +1026,12 @@ class AheadTarget:
         if len(devices) != self.devices:
             raise ValueError(f"the TPU topology {self.generation} holds {len(devices)} devices, not "
                              f"{self.devices}")
+        return devices
+
+    def _shared(self, devices: tuple) -> tuple:
+        """`devices`, compile-only GPUs, stated to take the loading run's pool share (`share`,
+        `COMPILE_ONLY_SHARE`)."""
+        COMPILE_ONLY_SHARE.update(dict.fromkeys(devices, self.share))
         return devices
 
     def compiled[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], loader: Loader,

@@ -776,7 +776,7 @@ class Server:
                 state_shardings(self.mesh, shapes, offloaded=_offloaded(model)), self._admitted, transforms,
                 stopping, grammar, progress)
             self._step, self._admitting = map(dispatched, decode_programs(formats, self._admitted,
-                                                                          compiler_options(model)))
+                                                                          compiler_options()))
             if chosen is not None:
                 # The compile that chose the layout is the decoding step: compiling it again at the
                 # formats would repeat the server's largest compile (`resident_formats`).

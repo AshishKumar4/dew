@@ -641,11 +641,12 @@ def rated(seconds: float, steps: int, rows: int, hlo_flops, model_flops: float |
     (`StepFlops`, each device's) and the objective's `model_flops` (the whole mesh's), rated as the
     trainer's interval rates its steps (`dew.training.interval.throughput`) on `devices` devices of dense
     bf16 `peak` (the device's own by default): the objective's work over the whole mesh's peak, and the
-    compiled work a lower bound where a launch's went uncounted (`StepFlops.unsized`)."""
+    compiled work named by what its count is (`StepFlops.bound`: a lower bound where a launch's went
+    uncounted, an upper bound where a loop was counted at its stated bound)."""
     from dew.training.interval import throughput
 
     rates = throughput(seconds, steps, rows, hlo_flops, devices, training_flops=model_flops, peak=peak)
-    bound = "_lower_bound" if hlo_flops is not None and hlo_flops.unsized else ""
+    bound = "" if hlo_flops is None else hlo_flops.bound
     return {"model_mfu_bf16_peak": rates.get("train/mfu"),
             "model_flops_scope": "objective.training_flops on real host lengths and layout, over the mesh's "
                                  "dense bf16 peak; custom image-mean model and frozen legacy API have no "
@@ -653,7 +654,8 @@ def rated(seconds: float, steps: int, rows: int, hlo_flops, model_flops: float |
             "hlo_utilization_bf16_peak": rates.get(f"train/hfu{bound}"),
             "unsized_kernels_per_step": None if hlo_flops is None else hlo_flops.unsized / steps,
             "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; "
-                                 "a lower bound where unsized_kernels_per_step is not zero; "
+                                 "a lower bound where unsized_kernels_per_step is not zero, an upper "
+                                 "bound where a loop was counted at its stated bound; "
                                  "not an analytic real-token MFU"}
 
 

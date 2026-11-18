@@ -31,7 +31,7 @@ from jax.experimental.profiler import get_profiled_instructions_proto
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
-from dew._devices import device_memory, pool_share, pool_statement
+from dew._devices import COMPILE_ONLY_SHARE, device_memory, pool_share, pool_statement
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
@@ -634,8 +634,9 @@ def pool_record(devices: Sequence) -> dict[str, JSON]:
     plan against the memory stated for them (`compile_only`), at the share their loading run takes."""
     limits = [limit for device in devices if (limit := device_memory(device).get("bytes_limit")) is not None]
     attached = set(jax.local_devices())
-    stated = {"share": pool_share(), "source": "compile_only"} if not attached.issuperset(devices) else (
-        pool_statement())
+    # Devices this process does not attach plan at the share their loading run states (`COMPILE_ONLY_SHARE`).
+    shares = [COMPILE_ONLY_SHARE.get(device, pool_share()) for device in devices if device not in attached]
+    stated = {"share": min(shares), "source": "compile_only"} if shares else pool_statement()
     return {"limit": min(limits, default=None), **stated}
 
 
@@ -799,7 +800,7 @@ class FitSearch[LossT, EffectsT]:
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right, as the
         # step's own (`options`) are made; the target's own policy is the compile point's
         # (`report.targeted`).
-        self.required = compiler_options(*self.objective.towers()) or None
+        self.required = compiler_options() or None
 
     def admitted(self, candidates: Sequence[int], first: int) -> tuple[Planned, tuple[Probe, ...]]:
         """The first fitting plan the split-and-rung search finds (`searched`), and every compile it made:

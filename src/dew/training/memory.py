@@ -21,7 +21,7 @@ from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding
 
 from dew import communicators
-from dew._devices import device_memory, fresh_pool, gpu_free_bytes, xla_flag
+from dew._devices import COMPILE_ONLY_SHARE, device_memory, fresh_pool, gpu_free_bytes, xla_flag
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
@@ -46,11 +46,19 @@ COLLECTIVES = {
     'xla_gpu_reduce_scatter_combine_threshold_bytes': 1 << 27,
     'xla_gpu_enable_all_gather_combine_by_dim': False,
     'xla_gpu_enable_reduce_scatter_combine_by_dim': False,
+    'xla_disable_hlo_passes': 'rematerialization',
 }
 """NVIDIA JAX-Toolbox's collective options for a GPU step over several devices: the scheduler overlaps
 each collective with compute, and the collectives combine into few large ones. Measured in
 docs/performance.md, "Collectives over several GPUs". A step that gathers its layers' parameters combines
-its all-gathers up to one layer's instead (`gathered_layer_bytes`)."""
+its all-gathers up to one layer's instead (`gathered_layer_bytes`).
+
+XLA's rematerialization pass is off, as MaxText runs it (row 1307): the plan fits a step to the devices'
+room by its own ladder (`dew.training.planning.FitSearch`), and XLA's pass, against a limit of its own below
+the plan's, recomputes what it picks at a rung that already fits, a sharded weight's all-gather among them.
+Qwen3-8B's step over four compile-only H100s (fsdp 2 x tensor 2, two 4096-token rows a data shard, 48 GiB
+stated) settled at `minimal` either way, 19.2 GB of temporaries; with the pass on it gathered 14
+rematerialized all-gathers more, 16.8 GB a step against 11.7, 78 of them synchronous against 66."""
 
 GATHER_THRESHOLD = 'xla_gpu_all_gather_combine_threshold_bytes'
 """The bytes XLA combines a step's all-gathers up to (`COLLECTIVES`, `step_compiler_options`)."""
@@ -165,7 +173,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool, devices: int, 
             and modules and not any(isinstance(module, TritonGemm) and module.keeps_triton_gemm
                                     for module in modules)):
         options['xla_gpu_enable_triton_gemm'] = False
-    options.update(compiler_options(*objective.towers()))
+    options.update(compiler_options())
     return options or None
 
 
@@ -413,7 +421,8 @@ def needed(device, resident: int, beside: int, temporaries: int) -> int:
     pool of GPUs is sized by."""
 
     def headroom(memory: int) -> int:
-        spare = _admitted([device], [fresh_pool(memory, resident)], beside, temporaries)
+        spare = _admitted([device], [fresh_pool(memory, resident, COMPILE_ONLY_SHARE.get(device))], beside,
+                          temporaries)
         assert spare is not None
         return spare
 

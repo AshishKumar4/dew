@@ -1163,6 +1163,15 @@ def sown_nodes(tree, *markers: str) -> list[tuple[tuple[str, ...], Mapping]]:
     return found
 
 
+def sown_calls(tree, *markers: str) -> list[tuple[tuple[str, ...], tuple]]:
+    """Every call of a module that sowed all of `markers` (`sown_nodes`), with its module path: what the call
+    sowed under each marker, in `markers`' order, a path's calls in the order they ran. A module called
+    more than once in a forward sows once a call, each an application of the same weights: a layer a loop
+    runs again, once a pass (`dew.nn.backbones.decoder_stack.OBSERVED`)."""
+    return [(path, call) for path, node in sown_nodes(tree, *markers)
+            for call in zip(*(node[marker] for marker in markers), strict=True)]
+
+
 __all__ = [
     "BLOCKS_FIELD",
     "COORDINATES_FIELD",
@@ -1203,6 +1212,7 @@ __all__ = [
     "scored_targets",
     "select",
     "shifted_span",
+    "sown_calls",
     "sown_nodes",
     "thaw",
     "token_id",

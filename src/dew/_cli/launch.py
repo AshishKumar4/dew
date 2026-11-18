@@ -519,9 +519,10 @@ def _stop(running: Sequence[subprocess.Popen], grace: float, forced: threading.E
         if not (child.stdin is not None and _interrupted(child)):
             signal_group(child, signal.SIGTERM)
     groups_ended(running, grace, forced)
-    # Each rank's group killed and its lifeline let go (`stop`), then its leader reaped.
-    for child in (*running[1:], *running[:1]):
-        stop(child)
+    # Every rank's group killed together and its lifeline let go (`stop`), rank 0's last, then each leader
+    # reaped.
+    stop([*running[1:], *running[:1]])
+    for child in running:
         child.wait()
 
 

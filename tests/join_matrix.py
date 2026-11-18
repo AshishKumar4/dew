@@ -25,6 +25,7 @@ no use of (a delta net has no gated product, bias or gate multiplier) takes its 
 
 import contextlib
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -114,8 +115,7 @@ CASES = (
 
 
 @cell("join", covers=lambda case: dict(zip(AXES["join"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The layer's training step of `case` on its GPU with its two projections joined on par with the

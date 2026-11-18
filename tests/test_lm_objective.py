@@ -151,9 +151,12 @@ SHIFTED_SEEDS = 8
 # --- the loss --------------------------------------------------------------
 
 def test_loss_is_the_cross_entropy_of_the_shifted_sequence():
-    """Over drawn decoders and tokens, the loss on par with the cross entropy of each token's next
-    (check 1), which differs from the unshifted one, the mistake this guards."""
-    objective = make_objective()
+    """Over drawn decoders and tokens, the loss of the objective the registry builds (`objectives.build`,
+    as a configured run's is) on par with the cross entropy of each token's next (check 1), which differs
+    from the unshifted one, the mistake this guards."""
+    from dew.registry import objectives
+
+    objective = objectives.build("lm", model=tiny_decoder(), seq_len=SEQ)
 
     def loss(params, tokens):
         return objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())[0]

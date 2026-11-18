@@ -85,7 +85,11 @@ availability checks, independently of the analytical model count. A Pallas kerne
 lowers to a Triton call whose work the HLO does not state (JAX's Triton lowering
 drops the kernel's `CostEstimate`), so a step that runs one reports both as
 `train/hfu_lower_bound` and `train/hlo_flops_util_lower_bound`, beside
-`train/unsized_kernels`, the launches a step that neither counts.
+`train/unsized_kernels`, the launches a step that neither counts. A loop that
+stops on its data before its bound (a walk over the segments a packed batch
+holds) is counted at its bound, so a step that runs one reports both as
+`train/hfu_upper_bound` and `train/hlo_flops_util_upper_bound`; a step with
+both reports `_estimate`, neither bound.
 
 MFU previously used the HLO model count. It now uses analytical real-token
 model work: old `train/mfu` and new `train/mfu` values are not directly comparable.

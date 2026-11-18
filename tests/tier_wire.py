@@ -4,6 +4,9 @@ unit's worker. Read by tests/model_flows.py, which writes it, and by tools/armad
 lane), which loads this file by its path as it loads check1_wire: it imports nothing of Dew's."""
 
 import hashlib
+import json
+import os
+from collections.abc import Mapping
 from pathlib import Path
 
 PREPARE = "DEW_TIER_PREPARE"
@@ -15,8 +18,28 @@ UNIT = "DEW_TIER_UNIT"
 of either), set in the prepare's environment: the unit's flows' needs are filed under it (`needs_file`)."""
 
 
+def preparing(environ: Mapping[str, str] = os.environ) -> bool:
+    """Whether a process of `environ` (this one's by default) is a GPU tier part's prepare (`PREPARE`): on
+    the node's CPU, before its run."""
+    return environ.get(PREPARE) == "1"
+
+
 def needs_file(store: Path, unit: str) -> Path:
     """Where under the tier's `store` (`TRUTHS`) `unit`'s programs' memory is filed, in bytes: `{"unit":
     unit, "programs": [{"resident", "beside", "temporaries"}, ...]}`, each flow its prepare runs adding its
     own."""
     return store / "needs" / f"{hashlib.sha256(unit.encode()).hexdigest()[:16]}.json"
+
+
+def unit_needs(programs: list[dict[str, int]]) -> None:
+    """`programs` (each a program's admission, `truths_ahead.admitted_needs`) added to the needs of the
+    tier's unit this prepare runs (`UNIT`), its file under the tier's store (`needs_file`), from which its
+    lane sizes the unit's worker: the one publisher of a prepare's needs, a flow's and a test's check-1
+    sites' alike; none outside the tier's prepare, which names no unit."""
+    unit = os.environ.get(UNIT)
+    if unit is None or not programs:
+        return
+    path = needs_file(Path(os.environ[TRUTHS]), unit)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    held = json.loads(path.read_text())["programs"] if path.exists() else []
+    path.write_text(json.dumps({"unit": unit, "programs": [*held, *programs]}))

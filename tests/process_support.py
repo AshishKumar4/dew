@@ -239,7 +239,7 @@ def relayed(command: Sequence[str], environment: Mapping[str, str], *, timeout: 
             os.kill(process.pid, signal.SIGABRT)
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(60)
-        terminate(process)
+        terminate([process])
         tail = drained(process).text()[-12000:]
         pytest.fail(f"{' '.join(command)} did not end within {timeout:.0f} s\n{tail}")
     return Relayed(process.returncode, written)
@@ -269,22 +269,12 @@ def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,
                          environment=environment)
 
 
-def terminate_all(processes: Sequence[subprocess.Popen[str]]) -> None:
-    """Kill every session `processes` lead, all of them first, then return once none still runs
-    (`terminate`): a worker of a pool killed after its peer's settling outlived it long enough to see the
-    peer gone and end on its own, its exit no SIGKILL (row 7678)."""
-    for process in processes:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(process.pid, signal.SIGKILL)
-    for process in processes:
-        terminate(process)
-
-
-def terminate(process: subprocess.Popen[str]) -> None:
-    """Kill the session even if its leader already exited and left descendants,
-    and return once none of them still runs (tools/armada/child_groups.py's `stop`)."""
-    running = groups.stop(process, settle=120.0)
-    assert not running, f"session {process.pid} still runs {running} after SIGKILL"
+def terminate(processes: Sequence[subprocess.Popen[str]]) -> None:
+    """Kill every session `processes` lead, together, even where a leader already exited and left
+    descendants, and return once none of them still runs (tools/armada/child_groups.py's `stop`): a pool's
+    workers killed one after another's settling saw a peer gone and ended on their own (row 7678)."""
+    running = groups.stop(processes, settle=120.0)
+    assert not running, f"sessions {[process.pid for process in processes]} still run {running} after SIGKILL"
 
 
 class ProcessGroup:
@@ -298,8 +288,7 @@ class ProcessGroup:
 
     def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
                  traceback: TracebackType | None) -> None:
-        for process in self.running:
-            terminate(process)
+        terminate(self.running)
         if error is not None:
             print(worker_outputs(self.running))
         else:
@@ -329,13 +318,11 @@ def stuck(pool: Sequence[subprocess.Popen[str]], what: str) -> Stuck:
     for process in pool:
         with contextlib.suppress(ProcessLookupError):
             os.kill(process.pid, signal.SIGABRT)
+    deadline = time.monotonic() + 60
     for process in pool:
-        try:
-            process.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            terminate(process)
-    for process in pool:
-        terminate(process)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=max(deadline - time.monotonic(), 0.0))
+    terminate(pool)
     return Stuck(f"the pool did not {what}\n" + worker_outputs(pool),
                  tuple(process.returncode for process in pool))
 

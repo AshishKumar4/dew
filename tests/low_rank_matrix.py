@@ -17,6 +17,7 @@ What the route serves is read from the adapter's own selector: the projection tr
 case's generation with `fused` named, the route its choice reports for the site the `fused` kernel.
 """
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -143,8 +144,7 @@ def _drawn(case: dict[str, str], variables):
 
 
 @cell("low_rank", covers=lambda case: dict(zip(AXES["low_rank"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def an_adapted_projections_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The adapted projection's training step of `case` on its GPU with its base product and update fused

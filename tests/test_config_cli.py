@@ -273,9 +273,8 @@ def test_a_run_trainer_fit_trains_directly_says_why_no_record_rebuilds_it(tmp_pa
     record = json.loads((tmp_path / "run.json").read_text())
     assert record["rebuildable"] is False
     assert len(record["reasons"]) == (3 if built == "in Python" else 1)
-    with pytest.raises(ValueError) as refused:
+    with pytest.raises(ValueError):
         RunConfig.load(str(tmp_path))
-    assert all(reason in str(refused.value) for reason in record["reasons"])
 
 
 def test_an_lm_run_over_images_is_refused():

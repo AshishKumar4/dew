@@ -6,6 +6,7 @@ float64 over drawn models and tokens (check 1)."""
 
 import dataclasses
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import jax
@@ -16,9 +17,16 @@ from flax import linen as nn
 from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, with_gradients
 
+from dew.batch import leaves_by_path
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.embeddings import prepared_embeddings
+from dew.nn.inspection import QK
+from dew.objectives.base import Step
+from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
+from dew.optim import QKClipState, scale_by_qk_clip
 
 VOCAB = 37
 
@@ -215,6 +223,114 @@ def test_a_loop_over_a_block_is_the_stack_with_the_block_repeated_cache_and_all(
                     seeds=SEEDS['scanned'], truth_fn=wide(looped))
 
 
+UNROLLED = (0, 1, 2, 1, 2, 3)
+"""The layers a four-layer stack whose layers 1 and 2 run twice computes, in order."""
+
+
+def repeated(variables, order=UNROLLED):
+    """`variables` of a stack whose layer i is layer `order[i]`'s, in every collection: a loop unrolled."""
+    def unrolled(tree):
+        layers = {f'layers_{index}': tree[f'layers_{source}'] for index, source in enumerate(order)}
+        return {**{name: value for name, value in tree.items() if not name.startswith('layers_')}, **layers}
+    return {collection: unrolled(tree) for collection, tree in variables.items()}
+
+
+def copies(layer: int, order=UNROLLED) -> list[int]:
+    """The layers of the unrolled stack (`repeated`) that are calls of the looped stack's `layer`."""
+    return [index for index, source in enumerate(order) if source == layer]
+
+
+def by_layer(tree) -> dict[int, dict[tuple[str, ...], np.ndarray]]:
+    """A collection's leaves by each layer's index, then by their path below it."""
+    found: dict[int, dict[tuple[str, ...], np.ndarray]] = {}
+    for path, leaf in leaves_by_path(tree).items():
+        found.setdefault(int(path[0].removeprefix('layers_')), {})[path[1:]] = np.asarray(leaf)
+    return found
+
+
+@pytest.mark.parametrize("shared_cache", [False, True])
+def test_a_looped_router_moves_its_bias_by_the_load_of_every_pass(rng, shared_cache):
+    """A mixture a loop runs twice routes tokens at both passes, and its one balancing bias balances them
+    all: the counts a run's objective takes (`ExpertBalance.effects`, which the commit applies) are, to the
+    count, the sums of the unrolled stack's over its two calls of each looped layer, whose second pass
+    routes otherwise than its first; and the bias moves by them (row 7885). A shared cache's passes,
+    which sow at the block's names alike, step and count alike."""
+    mixture = Mixture(experts=4, top_k=2, bias=True)
+    looped = tiny(num_layers=4, mixture=mixture,
+                  loop=Loop(2, step_norm=False, layers=(1, 3), shared_cache=shared_cache))
+    deep = tiny(num_layers=6, mixture=mixture, loop=None)
+    ids = tokens(rng)
+    variables = nn.unbox(looped.init(rng, ids))
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
+
+    def counted(model, variables):
+        objective = LMObjective(model, ids.shape[1] - 1, balance=ExpertBalance(balance_rate=0.01))
+        effects = objective.scalar_loss(variables, {"text": ids}, step)[1].effects
+        assert effects is not None
+        return objective, effects
+
+    objective, ours = counted(looped, variables)
+    theirs = by_layer(counted(deep, repeated(variables))[1])
+    summed = {layer: jax.tree.map(lambda *counts: sum(counts), *(theirs[index] for index in copies(layer)))
+              for layer in range(4)}
+    first, second = copies(1)
+    assert any(not np.array_equal(theirs[first][path], theirs[second][path]) for path in theirs[first])
+    assert by_layer(ours).keys() == summed.keys()
+    for layer, counts in by_layer(ours).items():
+        assert counts.keys() == summed[layer].keys(), layer
+        for path, count in counts.items():
+            np.testing.assert_array_equal(count, summed[layer][path], err_msg=f"layers_{layer} {path}")
+    moved = by_layer(objective.apply_effects(variables, ours)['moe'])
+    assert any(not np.array_equal(moved[1][path], by_layer(variables['moe'])[1][path]) for path in moved[1])
+
+
+def test_qk_clip_bounds_a_looped_layer_by_the_largest_logit_of_every_pass(rng):
+    """QK-Clip rescales a looped layer's queries and keys by the largest attention logit any of its passes
+    reads: from a looped stack's sows its factors are, bit for bit, those of the unrolled stack's logit
+    maxima maxed over each layer's calls, and at a threshold between a head's first pass's maximum and
+    its second's, larger, the head is clipped otherwise than the first pass's alone clips it (row 7885)."""
+    looped = tiny(num_layers=4, qk_norm=False, loop=Loop(2, step_norm=False, layers=(1, 3)))
+    deep = tiny(num_layers=6, qk_norm=False, loop=None)
+    ids = tokens(rng)
+    variables = nn.unbox(looped.init(rng, ids))
+    ours = looped.apply(variables, ids, mutable=[QK])[1][QK]
+    theirs = deep.apply(repeated(variables), ids, mutable=[QK])[1][QK]
+
+    def called(layers: list[int]) -> dict:
+        """The unrolled stack's sows at `layers`, calls of one looped layer, as one call: their maxima's
+        elementwise largest, the geometry they share."""
+        sown = [theirs[f'layers_{index}']['self_attn'] for index in layers]
+        return {'self_attn': {**sown[0], 'max_logits': (jax.tree.map(
+            lambda *maxima: jnp.max(jnp.stack(maxima), axis=0), *(held['max_logits'] for held in sown)))}}
+
+    def heads(index: int) -> jax.Array:
+        """Each head's largest logit over the rows at the unrolled stack's layer `index`."""
+        return jnp.max(jnp.asarray(theirs[f'layers_{index}']['self_attn']['max_logits'][0]), axis=-2)
+
+    # The looped layer and head whose second pass reads the larger logit by the most.
+    gaps = {(layer, head): float(gap) for layer in (1, 2)
+            for head, gap in enumerate(heads(copies(layer)[1]) - heads(copies(layer)[0]))}
+    layer, head = max(gaps, key=gaps.__getitem__)
+    assert gaps[layer, head] > 0, "a head whose second pass reads a larger logit than its first"
+    tau = float((heads(copies(layer)[0])[head] + heads(copies(layer)[1])[head]) / 2)
+    every = {f'layers_{index}': called(copies(index)) for index in range(4)}
+    first_only = {**every, f'layers_{layer}': called(copies(layer)[:1])}
+    clip, params = scale_by_qk_clip(tau), variables['params']
+
+    def rescales(qk) -> Mapping[str, jax.Array]:
+        state = clip.update(jax.tree.map(jnp.zeros_like, params), clip.init(params), params, qk_stats=qk)[1]
+        assert isinstance(state, QKClipState)
+        return state.rescales
+
+    expected = rescales(every)
+    jax.tree.map(np.testing.assert_array_equal, rescales(ours), expected)
+    clipped = [key for key, factor in expected.items()
+               if f"'layers_{layer}'" in key and bool(jnp.any(factor < 1))]
+    assert clipped, "the second pass's logit clips its layer"
+    alone = rescales(first_only)
+    assert any(not np.array_equal(alone[key], expected[key]) for key in clipped)
+
+
 def test_a_decoder_gains_a_loop_over_its_own_block_that_one_pass_leaves_as_it_was(rng):
     plain = tiny(num_layers=4, loop=None)
     ids = tokens(rng)
@@ -337,7 +453,8 @@ def _theta_method(module, ids):
     cut = None if loop.backprop_steps is None else loop.steps - loop.backprop_steps
     for step in range(1, loop.steps):
         h = jax.lax.stop_gradient(h) if step == cut else h
-        z = a + module.loop_theta * (h - a)
+        theta = module.loop_theta if loop.theta_passes is None else module.loop_theta[step - 1]
+        z = a + theta * (h - a)
         h = module.stack(z, span=(first, end), **inputs) + (a - z)
     return module.logits_from_hidden(module.norm(module.stack(h, span=(end, module.num_layers), **inputs)))
 
@@ -365,6 +482,59 @@ def test_an_implicit_loop_at_drawn_theta_takes_the_theta_method(name, steps, loo
 
     assert_as_exact(_results(looped.apply), _results(unrolled(looped)), draw, name, seeds=THETA_SEEDS[name],
                     truth_fn=_results(unrolled(looped.clone(dtype=jnp.float64))))
+
+
+PER_PASS_SEEDS = 8
+"""Check 1's declared seeds for an implicit loop with a θ per pass against the θ-method unrolled here."""
+
+
+@pytest.mark.parametrize("steps", [3, 2], ids=["three passes", "two of three"])
+def test_an_implicit_loop_with_a_theta_per_pass_reads_each_pass_its_own(steps):
+    """Qwen 3.5 with an implicit loop whose θ holds a row for each later pass of three (`Loop.theta_passes`,
+    `loop_theta` `[2, d]`), its rows drawn apart: run at `steps` passes, its logits and the gradient of
+    every parameter on par with the θ-method unrolled pass by pass, pass t reading row t - 1 (check 1 against
+    it in float64); at two of its three passes θ keeps both rows, and the second, which no pass reads, has
+    no gradient (row 7661)."""
+    looped = _qwen35(3, theta_passes=3).with_passes(steps)
+    assert looped.loop.theta_passes == 3
+    vocab = looped.vocab_size
+    drawn = with_logit_cotangent(model_draw(looped, (8, 16), vocab), vocab, 0x7E7D + steps)
+
+    def draw(seed):
+        variables, ids, cotangent = drawn(seed)
+        theta = np.random.default_rng([0x7E7E, seed]).uniform(0.1, 0.9, (2, looped.emb_features))
+        params = {**variables["params"], "loop_theta": jnp.asarray(theta, jnp.float32)}
+        return {**variables, "params": params}, ids, cotangent
+
+    def unrolled(model):
+        return lambda variables, ids: model.apply(variables, ids, method=_theta_method)
+
+    assert_as_exact(_results(looped.apply), _results(unrolled(looped)), draw, f"a θ per pass at {steps}",
+                    seeds=PER_PASS_SEEDS, truth_fn=_results(unrolled(looped.clone(dtype=jnp.float64))))
+    variables, ids, cotangent = draw(0)
+    assert variables["params"]["loop_theta"].shape == (2, looped.emb_features)
+    gradient = _results(looped.apply)(variables, ids, cotangent)["gradients"]["params"]["loop_theta"]
+    assert np.any(np.asarray(gradient[0]) != 0)
+    assert np.any(np.asarray(gradient[1]) != 0) == (steps == 3)
+
+
+def test_an_implicit_loop_whose_rows_are_one_theta_computes_the_shared_theta():
+    """An implicit loop of three passes whose θ rows are each one vector computes what its loop of one θ of
+    that vector computes, bit for bit, its logits and its θ's gradient summed over the rows (row 7661); a
+    count past the passes its θ holds rows for is refused, a pass there reading no θ of its own."""
+    shared, per_pass = _qwen35(3), _qwen35(3, theta_passes=3)
+    vocab = shared.vocab_size
+    variables, ids, cotangent = with_logit_cotangent(model_draw(shared, (8, 16), vocab), vocab, 0x7E7F)(0)
+    theta = jnp.asarray(np.random.default_rng(0x7E80).uniform(0.1, 0.9, shared.emb_features), jnp.float32)
+    one = {**variables, "params": {**variables["params"], "loop_theta": theta}}
+    rows = {**variables, "params": {**variables["params"], "loop_theta": jnp.stack([theta, theta])}}
+    alike = _results(shared.apply)(one, ids, cotangent)
+    apart = _results(per_pass.apply)(rows, ids, cotangent)
+    np.testing.assert_array_equal(np.asarray(apart["logits"]), np.asarray(alike["logits"]))
+    np.testing.assert_array_equal(np.asarray(jnp.sum(apart["gradients"]["params"]["loop_theta"], axis=0)),
+                                  np.asarray(alike["gradients"]["params"]["loop_theta"]))
+    with pytest.raises(ValueError):
+        per_pass.with_passes(4)
 
 
 def test_a_loaded_decoder_gains_an_implicit_loop_at_zero_theta():

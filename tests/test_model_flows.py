@@ -5,6 +5,7 @@ computed by programs compiled ahead (`truths_ahead.compiled_truths`) judge as th
 itself, a missing or stale program refused."""
 
 import dataclasses
+import functools
 import json
 import os
 import sys
@@ -19,7 +20,7 @@ import numpy as np
 import pytest
 import tier_wire
 from process_support import relayed
-from reference_error import assert_as_exact, over_windows, windows
+from reference_error import assert_as_exact, over_windows, run_to_run, windows
 from truths_ahead import UNPREPARED, MissingTruth, compiled_truths
 
 from dew.nn.kernels import generation
@@ -266,6 +267,34 @@ def test_an_arm_reading_another_flag_than_its_prepares_is_a_red(tmp_path, monkey
         assert_as_exact(flagged, reference, draw, "a flagged product", seeds=8)
 
 
+def test_a_prepared_sites_needs_are_filed_under_its_unit(tmp_path, monkeypatch):
+    """A test's sites prepared under a GPU tier part's unit (`truths_ahead.prepared`, the suite's prepare of
+    every test, `tier_wire.UNIT` and `TRUTHS` named) file their programs' needs under the unit as a flow's
+    are (`tier_wire.unit_needs`, row 7900): one admission for each program its run calls, its arms' and its
+    truths', every truth's with the arms' state held beside it, so the lane sizes the unit's worker by
+    them; before it filed none, and the lane admitted the unit on no needs at all."""
+    import tier_wire
+    from jax.experimental import topologies
+    from truths_ahead import compiled_memory, prepared
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    topology = tmp_path / "topology.bin"
+    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
+    monkeypatch.setenv(tier_wire.UNIT, "a unit")
+    monkeypatch.setenv(tier_wire.TRUTHS, str(tmp_path))
+    dew, reference, draw = _site()
+    store = tmp_path / "sites"
+    with prepared(store, stamp="a", target=model_flows.node_target()):
+        assert_as_exact(dew, reference, draw, "a product's arms", seeds=8)
+    arms, truths = compiled_memory(store, arms=True), compiled_memory(store)
+    filed = json.loads(tier_wire.needs_file(tmp_path, "a unit").read_text())["programs"]
+    assert arms and truths and len(filed) == len(arms) + len(truths)
+    state = max(memory["argument"] for memory in arms)
+    assert all(program["beside"] >= state for program in filed[len(arms):])
+
+
 def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     """Judged from programs compiled ahead (`compiled_truths(prepare=False)`), a site's run computes every
     draw's arms with them and runs none of its arms' code, which its prepare alone traced (a GPU run then
@@ -292,6 +321,64 @@ def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     assert not dew_traced and not reference_traced
     assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
     assert dew_traced and reference_traced
+
+
+@pytest.mark.parametrize("jitted", [False, True], ids=["a plain reference", "a jitted reference"])
+def test_a_qualification_run_sizes_a_prepared_site_through_its_stored_arms(tmp_path, monkeypatch, jitted):
+    """A qualification run (`check1_wire.QUALIFY`) of a site prepared for it sizes the site's seeds and then
+    judges it through the programs its prepare compiled, the sizing draws' among them (row 7606): no arm
+    traces at its float32 inputs in its run, where clearing the store compiled both on its GPU, the
+    reference traced only as its sizing's float64 truth, on the host, plain or jitted; the count it sizes is
+    recorded."""
+    from check1_wire import QUALIFY
+
+    dew, reference, draw = _site()
+    narrow: list[bool] = []
+
+    def dew_arm(a, b):
+        narrow.append(a.dtype == jnp.float32)
+        return dew(a, b)
+
+    def reference_arm(a, b):
+        narrow.append(a.dtype == jnp.float32)
+        return reference(a, b)
+
+    reference_fn = jax.jit(reference_arm) if jitted else reference_arm
+    record = tmp_path / "qualified.jsonl"
+    monkeypatch.setenv(QUALIFY, str(record))
+    with compiled_truths(tmp_path / "store", prepare=True, stamp="a"):
+        assert_as_exact(dew_arm, reference_fn, draw, "a product's arms", seeds=8)
+    narrow.clear()
+    with compiled_truths(tmp_path / "store", prepare=False, stamp="a"):
+        assert_as_exact(dew_arm, reference_fn, draw, "a product's arms", seeds=8)
+    assert not any(narrow)
+    assert json.loads(record.read_text().splitlines()[-1])["sized"] <= 8
+
+
+def test_a_compiled_sites_window_loop_and_run_to_run_arms_are_traced_by_its_prepare_alone(tmp_path):
+    """Arms over a site's windows (`over_windows`) and declared to vary from run to run (`run_to_run`), each
+    a record of its arm: judged from programs compiled ahead, the run traces neither (their prepare did), as
+    a plain arm's (train 1016's F2: such adapters went unstated, so unprepared)."""
+    dew, reference, draw = _site()
+    traced = []
+
+    def dew_arm(a, b):
+        traced.append(None)
+        return dew(a, b)
+
+    def windowed(seed):
+        return tuple(np.stack([x, x]) for x in draw(seed))
+
+    # A jitted arm under both adapters: each a record of its arm, never stated as the wrapper it holds.
+    arm = run_to_run(over_windows(jax.jit(dew_arm)), "a product summed in arrival order")
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(arm, over_windows(reference), windowed, "a product's adapted arms", seeds=8)
+    assert traced
+    traced.clear()
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(arm, over_windows(reference), windowed, "a product's adapted arms", seeds=8)
+    assert not traced
+    assert not (tmp_path / UNPREPARED).exists()
 
 
 def test_a_window_loops_truth_is_computed_window_by_window_from_its_windows_program(tmp_path):
@@ -359,3 +446,40 @@ def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
     # rows of float64 zero.
     assert [finding.rule for finding in stored.value.findings] == [
         finding.rule for finding in computing.value.findings]
+
+
+def test_a_gpu_tier_parts_prepare_runs_under_its_runs_flags():
+    """A GPU tier part's prepare (`DEW_TIER_PREPARE`, on the node's CPU) is configured under the XLA flags
+    its run is (`lane_environment.configure_lane`'s cuda lane), so the programs it compiles load where the
+    run holds them to its own (`dew.training.ahead.BuildTarget.held`: the prepare's CPU lane's devices and
+    scheduler beside the run's deterministic GPU ops refused test_gpu_numerics' vocabulary cell)."""
+    import lane_environment
+
+    node = {"CUDA_VISIBLE_DEVICES": "0"}
+    prepare = lane_environment.configured({**node, "JAX_PLATFORMS": "cpu", "DEW_TIER_PREPARE": "1"})
+    run = lane_environment.configured({**node, "JAX_PLATFORMS": "cuda"})
+    assert prepare["XLA_FLAGS"] == run["XLA_FLAGS"]
+
+
+def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):
+    """A GPU part's prepare on its node's CPU (`DEW_TIER_PREPARE=1`, the node an A100 by its serialized
+    topology) runs every cell of a flow pinned to the node's generation, Mosaic's among them, as its run
+    does (`gpu_flow.run_cells`, `generation_support.runnable` reading the node's generation): none skipped
+    for a GPU the prepare's process holds none of (row 7868: the recurrence matrix's five cells skipped
+    there, then compiled on the held GPU)."""
+    import gpu_flow
+    from jax.experimental import topologies
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    topology = store / "topology.bin"
+    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    ran: list[int] = []
+    cells = [gpu_flow.Cell(f"cell {index}", functools.partial(ran.append, index), generation="sm80",
+                           mosaic=index % 2 == 1) for index in range(5)]
+    # The node's compile-only GPU the default device, as a part's prepare holds it (`compiled_ahead`).
+    with jax.default_device(compile_only_gpus("sm80", 1)[0]):
+        assert gpu_flow.run_cells(cells) == []
+    assert ran == list(range(5))

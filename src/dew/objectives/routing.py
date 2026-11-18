@@ -31,6 +31,7 @@ from dew.batch import (
     leaves_by_path,
     merge,
     shifted_span,
+    sown_calls,
     sown_nodes,
     token_layout,
 )
@@ -323,16 +324,18 @@ def router_counts(moe: Variables, routing: Variables, queries: jax.Array | None 
     The routers that ran are the ones `routing` holds sown `indices` for, so
     a router the forward skipped (a prediction depth left out, a draft stage)
     counts nothing; one that selects by a hash table keeps no bias and counts
-    nothing either.
+    nothing either. A router called more than once (a looped layer's, once a
+    pass, `sown_calls`) counts the slots of every call: each routes tokens to
+    the experts its one bias balances.
     """
     biases = leaves_by_path(moe)
-    counts = {}
-    for path, node in sown_nodes(routing, ROUTER_INDICES):
-        if (*path, EXPERT_BIAS) in biases:
-            (indices,) = node[ROUTER_INDICES]
+    counts: dict[tuple[str, ...], jax.Array] = {}
+    for path, (indices,) in sown_calls(routing, ROUTER_INDICES):
+        bias = (*path, EXPERT_BIAS)
+        if bias in biases:
             valid = _router_queries(indices.shape[:2], queries, documents)
-            counts[(*path, EXPERT_BIAS)] = jnp.sum(
-                _selected_counts(indices, valid, biases[(*path, EXPERT_BIAS)].shape[0]), axis=0)
+            counted = jnp.sum(_selected_counts(indices, valid, biases[bias].shape[0]), axis=0)
+            counts[bias] = counts[bias] + counted if bias in counts else counted
     return unflatten_dict(counts)
 
 
@@ -344,7 +347,7 @@ def _updated_bias(bias: jax.Array, counts: jax.Array, rate: float) -> jax.Array:
 
 def router_z_terms(routing: Variables, weight: float, batch: Batch, queries: jax.Array | None = None,
                    documents: jax.Array | None = None) -> tuple[Ratio, ...]:
-    """Return ST-MoE's router z-loss, one `Ratio` per router.
+    """Return ST-MoE's router z-loss, one `Ratio` per router call (a looped router's, one a pass).
 
     This is eq. 5 of ST-MoE (arXiv 2202.08906): `weight` times the squared log
     partition of the gate logits, summed over the positions the router saw and
@@ -355,8 +358,7 @@ def router_z_terms(routing: Variables, weight: float, batch: Batch, queries: jax
     """
     terms = []
     # lm-engine: moe/module.py at 45b6b57b, before its 0.1 and router_aux_loss_coef.
-    for _, node in sown_nodes(routing, ROUTER_LOG_Z):
-        (log_z,) = node[ROUTER_LOG_Z]
+    for _, (log_z,) in sown_calls(routing, ROUTER_LOG_Z):
         valid = _router_queries(log_z.shape, queries, documents)
         dtype = at_least_fp32(log_z.dtype)
         total = Objective.row_mean(jnp.where(valid, jnp.square(log_z.astype(dtype)), 0), batch).total
@@ -384,9 +386,6 @@ def router_moments(scores: jax.Array, indices: jax.Array, batch: Batch,
 
 
 def router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
-    """Collect every router's sown (scores, indices), in the tree's key order."""
-    found: list[tuple[jax.Array, jax.Array]] = []
-    for _, node in sown_nodes(routing, ROUTER_SCORES, ROUTER_INDICES):
-        (scores,), (indices,) = node[ROUTER_SCORES], node[ROUTER_INDICES]
-        found.append((scores, indices))
-    return found
+    """Collect every router call's sown (scores, indices), in the tree's key order, a router's calls in the
+    order they ran (`sown_calls`)."""
+    return [(scores, indices) for _, (scores, indices) in sown_calls(routing, ROUTER_SCORES, ROUTER_INDICES)]
