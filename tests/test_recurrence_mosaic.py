@@ -2182,7 +2182,8 @@ with report.refusals(), generation.assumed(facts), report.certifying(device):
     found = report._misses_of([dataclasses.replace(binary, frame=8)])
     report._held(found, programs[1])
     (identity, _), _, refused = found[0]
-    stored = [tuning.stored_verdict(device.device_kind, report._verdict_key(identity, rung, refused.reverse))
+    stored = [tuning.stored_verdict(report.verdict_target(device),
+                                    report._verdict_key(identity, rung, refused.reverse))
               is not None for rung in rungs]
 print(json.dumps({"stored": stored}))
 """

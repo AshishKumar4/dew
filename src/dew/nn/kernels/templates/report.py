@@ -662,9 +662,9 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     assembly the PTX compiler rejects), which its program's compile reads as before (`settled`) and
     `uncertified` names;
     a launch Mosaic refuses as it lowers (a block past its shared memory) raises here as its program's
-    lowering would. Once a process, by launch (`certifications`), and once a GPU model a
+    lowering would. Once a process, by launch (`certifications`), and once a compile target a
     machine: each verdict, an accepted config's and a refused one's, is stored beside the kernel picks
-    (`_verdict_key`), so a warm start traces and compiles nothing to certify."""
+    (`_verdict_key`, `verdict_target`), so a warm start traces and compiles nothing to certify."""
     device = _certifying_device()
     if device is None or arguments.arguments.get("interpret"):
         return ()
@@ -678,7 +678,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
         if key in _UNCERTIFIED:
             return None
     stored = _verdict_key(_identity(op, arguments), config, reverse)
-    verdict = None if stored is None else tuning.stored_verdict(device.device_kind, stored)
+    verdict = None if stored is None else tuning.stored_verdict(verdict_target(device), stored)
     if isinstance(verdict, dict):
         kernels = verdict
     else:
@@ -693,21 +693,31 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
                 _UNCERTIFIED[key] = str(error)[:400]
             return None
         if stored is not None:
-            tuning.store_verdict(device.device_kind, stored, kernels)
+            tuning.store_verdict(verdict_target(device), stored, kernels)
     found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None, device)
     with _GUARD:
         _CERTIFIED[key] = found
     return found.refused
 
 
+def verdict_target(device) -> str:
+    """The compile target whose verdicts a certification on `device` stores and reads
+    (`tuning.stored_verdict`): its generation (`generation.device_target`), which names what the assembler
+    builds a launch's kernels for, the verdict's one hardware input. An H100, a GH200 and a compile-only H100
+    share sm90's, so a build certifying for a compile-only GPU stores the verdicts a run on its GPU reads,
+    where by GPU model a GH200's run read none of them (row 6717)."""
+    return generation.device_target(device).generation
+
+
 def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
-    """What decides a launch's certification on a GPU model (the store's file, `tuning.stored_verdict`) before
-    it traces, as its stored verdict's key: the launch's `identity` (`_identity`, the same in every process),
-    its config, whether reverse mode runs it, Dew's code (`package_digest`: a Dew edit certifies again), the
-    installed JAX, jaxlib and CUDA plugins, whose Mosaic GPU and XLA lower and compile it (the Pallas lowering
-    cache's seal of them), the ptxas that assembles it (`_assemblers`), and the environment a kernel's
-    lowering and compile read (that cache's policy). None where the installation has no seal (an edited or a
-    source install of JAX), whose code no key states: its verdicts are not stored."""
+    """What decides a launch's certification for a compile target (the store's file, `verdict_target`,
+    `tuning.stored_verdict`) before it traces, as its stored verdict's key: the launch's `identity`
+    (`_identity`, the same in every process), its config, whether reverse mode runs it, Dew's code
+    (`package_digest`: a Dew edit certifies again), the installed JAX, jaxlib and CUDA plugins, whose Mosaic
+    GPU and XLA lower and compile it (the Pallas lowering cache's seal of them), the ptxas that assembles it
+    (`_assemblers`), and the environment a kernel's lowering and compile read (that cache's policy). None
+    where the installation has no seal (an edited or a source install of JAX), whose code no key states: its
+    verdicts are not stored."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
@@ -1470,7 +1480,7 @@ def _held(found: list, program: jax.stages.Lowered) -> None:
         verdicts.setdefault((identity, config, launch.reverse), {})[name] = (modules.get(name, ""), binary)
     for (identity, config, reverse), kernels in verdicts.items():
         if (key := _verdict_key(identity, config, reverse)) is not None:
-            tuning.store_verdict(device.device_kind, key, kernels)
+            tuning.store_verdict(verdict_target(device), key, kernels)
 
 
 def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashable], Refused]]
