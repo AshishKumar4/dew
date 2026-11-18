@@ -1486,7 +1486,7 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
             variables = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
                                                                                  sharding=sharding),
                                      start.abstract.variables, start.shardings.variables)
-            narrowing(candidate.copies, trainer.objective.towers(), candidate.shardings.compute).compiled(
+            narrowing(candidate.copies, candidate.shardings.compute).compiled(
                 variables)
     collected.update(_results_programs(trainer, start, planned, plan))
     return {digest: Executable.of(executable) for digest, executable in collected.items()}
