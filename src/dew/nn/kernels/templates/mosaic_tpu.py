@@ -331,6 +331,11 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             raise ValueError("a TPU ring's streams take their views where they open (its walk copies)")
         return Streams(allocated, views)
 
+    def decided_scratch(self, consumers: int) -> dict:
+        # One core a program, its walk its one role: it decides a second walk alone (`mosaic.Decided`).
+        del consumers
+        return {}
+
     def stream(self, streams, views, lo, hi, *, again=None) -> None:
         # No producer role: the walk issues its own copies, a decided walk's second pass's too.
         del streams, views, lo, hi, again
