@@ -160,7 +160,7 @@ def pytest_runtest_teardown(item, nextitem):
     yield
     if _remote is not None and (mark := item.stash.get(_COMPILE_MARK, None)) is not None:
         compiled = _remote.compiled_since(mark)
-        if compiled is not None:
+        if compiled:
             item.user_properties.append(("compiled", compiled))
 
 
