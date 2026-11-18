@@ -55,6 +55,7 @@ import numpy as np
 from flax import serialization, traverse_util
 
 from dew._files import write_atomically
+from dew._records import JSON
 from dew.checkpoints import Checkpoints, Keep
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig, TeacherConfig
@@ -143,7 +144,8 @@ def warmed(path: Path, objective):
     weight its own, each first layer's weights from the view's new entries zero, so it acts as it did."""
     new = jax.device_get(objective.init(jax.random.key(0)))
     previous = traverse_util.flatten_dict(serialization.msgpack_restore(path.read_bytes()))
-    fresh = traverse_util.flatten_dict(serialization.to_state_dict(new))
+    fresh = {name: np.asarray(value)
+             for name, value in traverse_util.flatten_dict(serialization.to_state_dict(new)).items()}
     for name, value in fresh.items():
         held = np.asarray(previous[name])
         if held.shape == value.shape:
@@ -153,6 +155,17 @@ def warmed(path: Path, objective):
             grown[:held.shape[0]] = held
             fresh[name] = grown
     return serialization.from_state_dict(new, traverse_util.unflatten_dict(fresh))
+
+
+def counts(arguments, *names: str) -> tuple[int, ...]:
+    """The counts a rollout's `arguments` hold under `names`, refused where one is no count."""
+    counted: list[int] = []
+    for name in names:
+        value = arguments[name]
+        if not isinstance(value, int):
+            raise TypeError(f"a rollout states {name}={value!r}, not a count")
+        counted.append(value)
+    return tuple(counted)
 
 
 def _latest(directory: Path) -> int:
@@ -248,10 +261,11 @@ def teacher_policy(objective):
 
 def check(out: Path, *, assets: Path, hz: float = 60.0) -> dict:
     """The race's first frames, and frames a second with images and without."""
-    report = {"device": str(jax.devices()[0])}
+    report: dict[str, JSON] = {"device": str(jax.devices()[0])}
     sample = race(16, ("image", "passed"), hz=hz, assets=assets)
     frames = [np.asarray(sample.reset(0)["image"])]
-    for _ in range(30):
+    stepped = sample.step(jnp.zeros((16, 4)))
+    for _ in range(29):
         stepped = sample.step(jnp.zeros((16, 4)))
     frames.append(np.asarray(stepped.observation["image"]))
     frames = np.concatenate(frames)
@@ -262,7 +276,8 @@ def check(out: Path, *, assets: Path, hz: float = 60.0) -> dict:
         timed = race(drones, views, hz=hz, assets=assets)
         timed.reset(0)
         actions = jnp.zeros((drones, 4))
-        for _ in range(5):
+        stepped = timed.step(actions)
+        for _ in range(4):
             stepped = timed.step(actions)
         jax.block_until_ready(stepped.reward)
         began = time.perf_counter()
@@ -300,13 +315,14 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
     while time.perf_counter() - began < seconds:
         done = _latest(out / TEACHER_RUN)
         run = teacher_run(out, hz=hz, level=level, drones=drones)
+        if run.trainer.steps is None:
+            raise ValueError("the teacher's run is bounded in steps")
         prepared = run.override({"trainer.steps": done + run.trainer.steps}).prepare()
         if warm is not None and not done:
             prepared.objective.variables = warmed(warm, prepared.objective)
         state = prepared.train(TEACHER_RUN)
         updates, objective = int(state.step), prepared.objective
-        epochs, minibatches, length = (prepared.run.rollout.arguments[name]
-                                       for name in ("epochs", "minibatches", "unroll_length"))
+        epochs, minibatches, length = counts(run.rollout.arguments, "epochs", "minibatches", "unroll_length")
         point = {"updates": updates, "seconds": round(time.perf_counter() - began, 1),
                  "environment_steps": updates // (epochs * minibatches) * drones * length, "level": level,
                  **flown(judged_at(level, families_at(level)), objective, state.variables, jax.random.key(1),
@@ -507,8 +523,11 @@ def world(world: World, *, pretrain_updates: int = 50_000, dagger_updates: int =
                                   jax.random.key(4))
         write_atomically(path, json.dumps(report, indent=1))
     collecting = world.run("online", level).rollout.arguments
-    online = int(round(environment_seconds * world.hz) * collecting["train_ratio"]
-                 / (collecting["batch"] * collecting["length"]))
+    ratio = collecting["train_ratio"]
+    if not isinstance(ratio, int | float):
+        raise TypeError(f"the online run's rollout states no train_ratio: {ratio!r}")
+    batch, length = counts(collecting, "batch", "length")
+    online = int(round(environment_seconds * world.hz) * ratio / (batch * length))
     filmed = {"pretrain": "cloned.npz", "dagger": "dagger.npz", "online": "video.npz"}
     for stage, updates, every in zip(STAGES, (pretrain_updates, dagger_updates, online), (None, 2000, 10_000),
                                      strict=True):
