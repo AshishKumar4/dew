@@ -381,20 +381,25 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, 
             for slot in range(held):
                 dtable[slot] = dtable[slot] + jnp.where(load == count_given + slot + 1, dmemory, 0.0)
         if entry is not None and dentry is not None:
-            key, value, weight = (ref[document] for ref in entry)
-            taken = (load >= 0).astype(jnp.float32)
-            dkey, dvalue, dweight = dentry
-            # Each term's gradients, its key row's, its value column's and the weight's, each a sum of
-            # three-factor products formed range-preserving (`_product`), no two-factor partial of them.
-            rows = range(key.shape[0])
-            dkey[document] = dkey[document] + taken * jnp.concatenate(
-                [jnp.sum(_product(weight, value[:, r:r + 1], dmemory), axis=0, keepdims=True) for r in rows],
-                axis=0)
-            dvalue[document] = dvalue[document] + taken * jnp.concatenate(
-                [jnp.sum(_product(weight, key[r:r + 1, :], dmemory), axis=1, keepdims=True) for r in rows],
-                axis=1)
-            dweight[document] = dweight[document] + taken * sum(
-                jnp.sum(_product(value[:, r:r + 1], key[r:r + 1, :], dmemory), keepdims=True) for r in rows)
+            # Formed only where the segment opens its document: a continuation's memory gradient is the
+            # chunk's, against which a term's products left fp32's range where the document's are in it,
+            # and masked after, inf times zero gave every key gradient NaN (base review 13abb0d6b F1).
+            @pl.when(load >= 0)
+            def _():
+                key, value, weight = (ref[document] for ref in entry)
+                dkey, dvalue, dweight = dentry
+                # Each term's gradients, its key row's, its value column's and the weight's, each a sum of
+                # three-factor products formed range-preserving (`_product`), no two-factor partial of them.
+                rows = range(key.shape[0])
+                dkey[document] = dkey[document] + jnp.concatenate(
+                    [jnp.sum(_product(weight, value[:, r:r + 1], dmemory), axis=0, keepdims=True)
+                     for r in rows], axis=0)
+                dvalue[document] = dvalue[document] + jnp.concatenate(
+                    [jnp.sum(_product(weight, key[r:r + 1, :], dmemory), axis=1, keepdims=True)
+                     for r in rows], axis=1)
+                dweight[document] = dweight[document] + sum(
+                    jnp.sum(_product(value[:, r:r + 1], key[r:r + 1, :], dmemory), keepdims=True)
+                    for r in rows)
         return (jnp.where(inside, dx + wx, dx), jnp.where(inside, db + wb, db),
                 jnp.where(inside, dc + wc, dc), jnp.where(within, da + wa, da),
                 jnp.where(load < 0, dmemory, dprev))
