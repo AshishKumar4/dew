@@ -79,12 +79,10 @@ def unspelled(text: str) -> str:
 def row_place(row_name: str, held: str) -> str:
     """Row `row_name`'s place on class `held` under a record prefix: `<class>/<test file>/<group>`, a group
     `whole` or a split's `<index>-of-<count>` (`key_parts`), a process variant's (`varied`) with
-    `-as-<variant>` after it, in the Worker's key alphabet: a check-1 site's group (`test[id]`) and a test
-    node's name after its file `spelled`."""
+    `-as-<variant>` after it, in the Worker's key alphabet: a check-1 site's group (`test[id]`) `spelled`."""
     _, name, split = parsed_row(row_name)
     variant = split.partition(VARIED)[2]
-    file, colons, node = name.partition("::")
-    return (f"{held}/{file}{spelled(colons + node) if colons else ''}/"
+    return (f"{held}/{name}/"
             + (spelled("-of-".join(cut.split("/"))) if (cut := cut_of(split)) else "whole")
             + (f"-as-{variant}" if variant else ""))
 
@@ -94,9 +92,7 @@ def key_parts(key: str) -> tuple[str, str, str]:
     its test file and its group (`whole`, or a split's `<index>-of-<count>`)."""
     held, rest = key.split("/", 1)
     name, group = rest.rsplit("/", 1)
-    # The file's path as it is (`row_place` spells only a test node's part after it, from its colons on).
-    file, colons, node = name.partition(spelled("::"))
-    return held, file + (unspelled(colons + node) if colons else ""), unspelled(group)
+    return held, name, unspelled(group)
 
 
 def place_variant(group: str) -> str:
