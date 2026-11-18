@@ -20,7 +20,7 @@ import pytest
 import tier_wire
 from process_support import relayed
 from reference_error import assert_as_exact, over_windows, windows
-from truths_ahead import MissingTruth, compiled_truths
+from truths_ahead import UNPREPARED, MissingTruth, compiled_truths
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
@@ -186,8 +186,9 @@ def _site(salt: int = 5461):
 def test_a_prepared_site_judges_as_one_that_computes_its_truth_and_refuses_a_missing_or_stale_one(tmp_path):
     """A site prepared (`compiled_truths(prepare=True)`) compiles its truth's programs and its arms' for every
     shape its stages' draws take and runs no arm; judged from that store it passes as it passes computing
-    its own; a store of another stamp, of another site, of other shapes than a draw's, or of another Dew arm
-    than the run's is a red (`MissingTruth`), never a program compiled in its place."""
+    its own; a store of another stamp, of other shapes than a draw's, or of another Dew arm than the run's is
+    a red (`MissingTruth`), never a program compiled in its place; a site its prepare did not reach runs
+    unprepared, every draw judged, recorded in the store (`UNPREPARED`)."""
     dew, reference, draw = _site()
     def scaled(factor):
         def arm(a, b):
@@ -204,8 +205,10 @@ def test_a_prepared_site_judges_as_one_that_computes_its_truth_and_refuses_a_mis
         assert_as_exact(scaled(1.0), reference, draw, "a prepared product", seeds=8)
     with compiled_truths(tmp_path, prepare=False, stamp="b"), pytest.raises(MissingTruth):
         assert_as_exact(scaled(1.0), reference, draw, "a prepared product", seeds=8)
-    with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
+    # A site its prepare did not reach runs unprepared, every draw judged, recorded in the store.
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(scaled(1.0), reference, draw, "another product", seeds=8)
+    assert (tmp_path / UNPREPARED).is_file()
 
     def wider(seed):
         a, b = draw(seed)

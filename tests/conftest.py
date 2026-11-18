@@ -166,15 +166,18 @@ def pytest_runtest_makereport(item, call):
     the phase it failed: what a promotion matches a candidate's failures to its parent's by."""
     outcome = yield
     # A part's test that failed in its prepare before any check-1 site (`compiled_ahead`) computed before its
-    # sites, on a device that computes nothing: it is recorded where it did (`_unprepared`), and its run runs
+    # sites, on a device that computes nothing: it is recorded where it did (`truths_ahead.UNPREPARED`, the
+    # tier's list of unprepared tests read from these records alone, a ledger row each), and its run runs
     # it unprepared, compiling its sites on its GPU as a test outside a part does, every site judged; one
     # that prepared any site is strict, a site it reaches unprepared a red (`truths_ahead.MissingTruth`).
     if (call.when == "call" and call.excinfo is not None and os.environ.get(tier_wire.PREPARE) == "1"
             and (store := _sites_store(item)) is not None and not any(store.glob("*/site.json"))):
+        from truths_ahead import UNPREPARED
+
         where = _computed_at(item, call.excinfo)
         store.mkdir(parents=True, exist_ok=True)
-        _unprepared(store).write_text(json.dumps({"test": item.nodeid, "where": where,
-                                                  "error": call.excinfo.exconly().splitlines()[0][:400]}))
+        (store / UNPREPARED).write_text(json.dumps({"test": item.nodeid, "where": where,
+                                                    "error": call.excinfo.exconly().splitlines()[0][:400]}))
         report = outcome.get_result()
         report.outcome, report.longrepr = "skipped", (str(item.path), item.location[1] or 0,
                                                       f"computes before its first check-1 site, at {where}: "
@@ -247,14 +250,15 @@ def pytest_sessionfinish(session, exitstatus):
         _remote.drain()
 
 
-UNPREPARED = pytest.StashKey[list]()
-"""This run's tests run unprepared (`compiled_ahead`, `_unprepared`): their records, in the order they ran."""
+UNPREPARED_RUN = pytest.StashKey[list]()
+"""This run's tests run unprepared (`compiled_ahead`, `truths_ahead.UNPREPARED`): their records, in the
+order they ran."""
 
 
 def pytest_terminal_summary(terminalreporter):
     if _remote is not None:
         terminalreporter.write_line(_remote.summary())
-    for record in terminalreporter.config.stash.get(UNPREPARED, []):
+    for record in terminalreporter.config.stash.get(UNPREPARED_RUN, []):
         terminalreporter.write_line(f"unprepared, its sites compiled on its GPU: {record['test']} computes "
                                     f"before its first check-1 site at {record['where']}")
 
@@ -283,16 +287,10 @@ def pytest_runtest_setup(item):
             pytest.skip(marker.kwargs.get("reason", f"runs on {device}"))
 
 
-def _unprepared(store: Path) -> Path:
-    """A test's record that its prepare computed before its first check-1 site (`compiled_ahead`): its node
-    id, where, and the error the compile-only device raised there; written by the prepare of the run that
-    reads it, the tier's list of unprepared tests derived from these records alone (a ledger row each)."""
-    return store / "unprepared.json"
-
-
 def _computed_at(item, excinfo) -> str:
-    """Where a test computed before its first site (`_unprepared`): the deepest frame of its own file, else
-    its failure's deepest frame, as `path:line`, its path from the suite's root (`tests/test_x.py:104`)."""
+    """Where a test computed before its first site (`truths_ahead.UNPREPARED`): the deepest frame of its own
+    file, else its failure's deepest frame, as `path:line`, its path from the suite's root
+    (`tests/test_x.py:104`)."""
     entries = list(excinfo.traceback)
     own = [entry for entry in entries if Path(str(entry.path)) == Path(str(item.path))]
     entry = (own or entries)[-1]
@@ -318,25 +316,30 @@ def compiled_ahead(request):
     (tests/model_flows.py): its prepare, on the node's CPU, compiles each site's truths and arms for the
     node's GPU with that GPU's compile-only device this process's default, on which nothing computes, so a
     test computing more than its draws before its sites fails there (bible §8: no dense math on a node's
-    CPU), recorded where (`_unprepared`); its run reads them, tracing, lowering and compiling none, and runs
-    a test so recorded unprepared, every site judged, named in its summary. Outside a part with a store,
-    nothing."""
+    CPU), recorded where (`truths_ahead.UNPREPARED`); its run reads them, tracing, lowering and compiling
+    none, and runs a test so recorded unprepared, every site judged, named in its summary. Outside a part
+    with a store, nothing."""
     store = _sites_store(request.node)
     if store is None:
         # Outside a part's store the gate's modules stay unloaded (a test outside the gate loads none).
         yield
         return
     import model_flows
-    from truths_ahead import compiled_truths
+    from truths_ahead import UNPREPARED, compiled_truths
 
     if not model_flows.preparing():
-        if (record := _unprepared(store)).exists():
+        record = store / UNPREPARED
+        if record.exists():
             # Its prepare computed before its first site: it runs unprepared, named in the run's summary.
-            request.config.stash.setdefault(UNPREPARED, []).append(json.loads(record.read_text()))
+            request.config.stash.setdefault(UNPREPARED_RUN, []).append(json.loads(record.read_text()))
             yield
             return
         with compiled_truths(store, prepare=False, stamp=model_flows.stamp()):
             yield
+        if record.exists():
+            # A site its prepare did not reach, or an arm no statement names, ran unprepared
+            # (`truths_ahead.running`).
+            request.config.stash.setdefault(UNPREPARED_RUN, []).append(json.loads(record.read_text()))
         return
     from dew.nn.kernels.generation import compile_only_gpus
 
