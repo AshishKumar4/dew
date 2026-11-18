@@ -699,8 +699,10 @@ class Issuer[Accumulator](abc.ABC):
         del rows, depth
         return 0
 
-    rows_whole: bool = True
-    """Whether each warp of a consumer holds whole rows of its tiles, a row's reduction its own."""
+    @property
+    def rows_whole(self) -> bool:
+        """Whether each warp of a consumer holds whole rows of its tiles, a row's reduction its own."""
+        return True
 
     def row_shifted(self, tile, shift, *, period: int, interpret: bool) -> jax.Array:
         """`tile` (a register tile in the accumulator's layout, `tile_of`'s) with each row `i` holding row
